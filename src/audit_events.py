@@ -1210,15 +1210,37 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     # -- 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The
     # sweep job itself (connectors/sharepoint/acl_sync.py::run_subtree_sweep)
-    # writes no audit row of its own (state persisted into the connection's
-    # config, no log_safe call) -- only the admin-facing per-subtree
-    # "include anyway" override gets one, since it is a deliberate,
-    # security-relevant decision (spec §3(b)'s should_not-only escape hatch).
+    # originally wrote no audit row of its own (state persisted into the
+    # connection's config, no log_safe call) -- only the admin-facing
+    # per-subtree "include anyway" override got one, since it is a
+    # deliberate, security-relevant decision (spec §3(b)'s should_not-only
+    # escape hatch). The 2026-08-31 plan (sweep v2, Tasks 3/6, below) gave
+    # the sweep job three genuinely new state transitions of its own —
+    # zone creation/dissolution and retroactive content removal — each
+    # security-relevant enough to earn its own audit row.
     "sharepoint_acl.subtree_override": AuditEvent(
         "sharepoint_acl.subtree_override",
         "mutation",
         "An admin overrode a detected broken-inheritance subtree exclusion "
         "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
+    ),
+    # -- 2026-08-31 plan, Tasks 3/6: sweep v2 — permission zones + retroactive
+    # cleanup (connectors/sharepoint/acl_sync.py: _reconcile_zones,
+    # _cleanup_connection_content).
+    "sharepoint_acl.zone_created": AuditEvent(
+        "sharepoint_acl.zone_created",
+        "mutation",
+        "Broken-inheritance subtree promoted to a permission zone with its own collection.",
+    ),
+    "sharepoint_acl.zone_dissolved": AuditEvent(
+        "sharepoint_acl.zone_dissolved",
+        "mutation",
+        "Permission zone dissolved after its folder re-linked inheritance; content re-homes to the parent scope.",
+    ),
+    "sharepoint_acl.content_purged": AuditEvent(
+        "sharepoint_acl.content_purged",
+        "mutation",
+        "Already-ingested content removed because its source subtree/file lost inheritance or a permission zone dissolved.",
     ),
 }
 

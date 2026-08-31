@@ -111,6 +111,20 @@ def _last_run(connection_id: str = CONN_ID) -> dict:
     return (row.get("config") or {}).get("acl_sweep_last_run") or {}
 
 
+def _zones(connection_id: str = CONN_ID) -> list:
+    from src.repositories import source_connections_repo
+
+    row = source_connections_repo().get(connection_id)
+    return (row.get("config") or {}).get("acl_zones") or []
+
+
+def _audit_count(action: "str | None" = None) -> int:
+    from src.repositories import audit_repo
+
+    rows, _ = audit_repo().query(action=action, limit=1000)
+    return len(rows)
+
+
 # ---------------------------------------------------------------------------
 # graph fakes — a fixed tree: root -> A(unique), B(clean); B -> C(unique).
 # A's children must NEVER be listed/probed (the whole point of "exclude,
@@ -342,3 +356,334 @@ class TestUnknownProbeFailsClosed:
         scope = _connection_scope(conn_id, "root")
         assert scope["excluded_subtrees"][0]["item_id"] == "X"
         assert _last_run(conn_id)["unknown_probes"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 plan, Task 3 — file-level probes, drive-relative paths,
+# permission zones.
+# ---------------------------------------------------------------------------
+
+
+class TestFileProbing:
+    def test_file_with_unique_permissions_is_excluded(self, sweep_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("File Probe Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        descended: list = []
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [
+                    {"id": "A", "name": "A", "is_folder": True, "child_count": 0},
+                    {"id": "F", "name": "F.docx", "is_folder": False, "child_count": 0},
+                ]
+            if item_id == "A":
+                descended.append(item_id)
+                return []
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            flags = {"A": False, "F": True}
+            return {i: flags.get(i) for i in item_ids}
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        scope = _connection_scope(conn_id, "root")
+        excluded = scope["excluded_subtrees"]
+        assert len(excluded) == 1
+        entry = excluded[0]
+        assert entry["item_id"] == "F"
+        assert entry["kind"] == "file"
+        assert entry["rel_path"] == "F.docx"
+        assert entry["path"] == "Root/F.docx"
+        assert descended == ["A"], "folder A must still be descended into"
+
+
+class TestPermissionZones:
+    def test_folder_break_becomes_zone_when_switch_on(self, sweep_env, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "true")
+        conn_id = _make_connection()
+        col_id = _make_collection("Zone Parent Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        descended: list = []
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [{"id": "Z", "name": "Z", "is_folder": True, "child_count": 1}]
+            if item_id == "Z":
+                descended.append(item_id)
+                return [{"id": "C", "name": "Child", "is_folder": True, "child_count": 0}]
+            if item_id == "C":
+                descended.append(item_id)
+                return []
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            flags = {"Z": True, "C": False}
+            return {i: flags.get(i) for i in item_ids}
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        scope = _connection_scope(conn_id, "root")
+        assert scope["excluded_subtrees"] == [], "the zone root itself must never be excluded"
+        assert descended == ["Z", "C"], "the walk must descend into a newly-created zone"
+
+        zones = _zones(conn_id)
+        assert len(zones) == 1
+        zone = zones[0]
+        assert zone["zone_item_id"] == "Z"
+        assert zone["status"] == "active"
+        assert zone["parent_scope_id"] == "root"
+        assert zone["collection_id"].startswith("col_")
+
+        from src.repositories import file_corpora_repo
+
+        assert file_corpora_repo().get(zone["collection_id"]) is not None
+        assert _audit_count("sharepoint_acl.zone_created") == 1
+
+    def test_zone_dissolves_when_inheritance_relinks(self, sweep_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Zone Dissolve Parent Col")
+        zone_col_id = _make_collection("Zone Dissolve Zone Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        from src.repositories import source_connections_repo
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        config = dict(row["config"])
+        config["acl_zones"] = [
+            {
+                "zone_item_id": "Z",
+                "parent_scope_id": "root",
+                "drive_id": "drive-1",
+                "name": "Z",
+                "display_path": "Root/Z",
+                "rel_path": "Z",
+                "collection_id": zone_col_id,
+                "detected_at": "2026-08-20T00:00:00+00:00",
+                "status": "active",
+            }
+        ]
+        repo.update(conn_id, config=config)
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [{"id": "Z", "name": "Z", "is_folder": True, "child_count": 0}]
+            if item_id == "Z":
+                return []
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            return {i: False for i in item_ids}
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        zones = _zones(conn_id)
+        assert len(zones) == 1
+        assert zones[0]["status"] == "dissolved"
+        assert _audit_count("sharepoint_acl.zone_dissolved") == 1
+
+    def test_unknown_probe_never_creates_zone(self, sweep_env, monkeypatch):
+        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "true")
+        conn_id = _make_connection()
+        col_id = _make_collection("Zone Unknown Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [{"id": "U", "name": "U", "is_folder": True, "child_count": 0}]
+            raise AssertionError(f"U must never be probed further: {item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            return {i: None for i in item_ids}
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        scope = _connection_scope(conn_id, "root")
+        assert scope["excluded_subtrees"][0]["item_id"] == "U"
+        assert scope["excluded_subtrees"][0]["kind"] == "folder"
+        assert _zones(conn_id) == []
+
+    def test_rel_path_is_drive_relative(self, sweep_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Rel Path Col")
+        _add_scope(
+            conn_id,
+            source_scope_id="root2",
+            collection_id=col_id,
+            display_path="Site/Documents/Team",
+        )
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root2":
+                return [{"id": "Sub", "name": "Sub", "is_folder": True, "child_count": 0}]
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            return {i: True for i in item_ids}
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        scope = _connection_scope(conn_id, "root2")
+        entry = scope["excluded_subtrees"][0]
+        assert entry["item_id"] == "Sub"
+        assert entry["rel_path"] == "Team/Sub"
+        assert entry["path"] == "Site/Documents/Team/Sub"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 plan, Task 6 — retroactive cleanup (DuckDB path-matching path;
+# stable-id matching on PG is covered by
+# tests/db_pg/test_sharepoint_acl_phase_pg.py).
+# ---------------------------------------------------------------------------
+
+
+def _add_corpus_file(collection_id: str, *, path: str, filename: "str | None" = None) -> str:
+    from src.repositories import corpus_files_repo
+
+    return corpus_files_repo().add(
+        corpus_id=collection_id,
+        filename=filename or path.rsplit("/", 1)[-1],
+        sha256="0" * 64,
+        file_type="text/plain",
+        size_bytes=1,
+        storage_path=None,
+        path=path,
+    )
+
+
+def _corpus_file_paths(collection_id: str) -> set:
+    from src.repositories import corpus_files_repo
+
+    return {row["path"] for row in corpus_files_repo().list_for_corpus(collection_id)}
+
+
+class TestRetroactiveCleanup:
+    def test_excluded_folder_purges_matching_files_keeps_the_rest(self, sweep_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Cleanup Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        _add_corpus_file(col_id, path="Secret/a.docx")
+        _add_corpus_file(col_id, path="open/keep.docx")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [{"id": "Secret", "name": "Secret", "is_folder": True, "child_count": 0}]
+            raise AssertionError(f"Secret must never be probed further: {item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            return {i: True for i in item_ids}  # broken inheritance -> excluded (zones off)
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        assert _corpus_file_paths(col_id) == {"open/keep.docx"}
+        assert _audit_count("sharepoint_acl.content_purged") == 1
+        last_run = _last_run(conn_id)
+        assert last_run["removed_files"] == 1
+        assert last_run["dissolved_zones"] == 0
+
+    def test_dissolved_zone_is_fully_retired(self, sweep_env, monkeypatch):
+        from app.resource_types import ResourceType
+        from src.repositories import file_corpora_repo, resource_grants_repo, source_connections_repo, user_groups_repo
+
+        conn_id = _make_connection()
+        col_id = _make_collection("Dissolve Parent Col")
+        zone_col_id = _make_collection("Dissolve Zone Col")
+        _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
+
+        repo = source_connections_repo()
+        row = repo.get(conn_id)
+        config = dict(row["config"])
+        config["acl_zones"] = [
+            {
+                "zone_item_id": "Z",
+                "parent_scope_id": "root",
+                "drive_id": "drive-1",
+                "name": "Z",
+                "display_path": "Root/Z",
+                "rel_path": "Z",
+                "collection_id": zone_col_id,
+                "detected_at": "2026-08-20T00:00:00+00:00",
+                "status": "active",
+            }
+        ]
+        repo.update(conn_id, config=config)
+
+        _add_corpus_file(zone_col_id, path="Z/report.docx")
+
+        group = user_groups_repo().create(
+            name="entra:zone-sentinel", description=None, created_by=acl_sync.ACL_SYNC_SENTINEL
+        )
+        resource_grants_repo().ensure_grant(
+            group["id"], ResourceType.COLLECTION.value, zone_col_id, assigned_by=acl_sync.ACL_SYNC_SENTINEL
+        )
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+
+        async def fake_children(token, drive_id, item_id):
+            if item_id == "root":
+                return [{"id": "Z", "name": "Z", "is_folder": True, "child_count": 0}]
+            if item_id == "Z":
+                return []
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
+
+        async def fake_probe(token, drive_id, item_ids):
+            return {i: False for i in item_ids}  # inheritance re-linked -> dissolve
+
+        monkeypatch.setattr(graph_client, "list_item_children", fake_children)
+        monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)
+
+        result = acl_sync.run_subtree_sweep({"connection_id": conn_id})
+
+        assert result["errors"] == []
+        assert _corpus_file_paths(zone_col_id) == set()
+        assert file_corpora_repo().get(zone_col_id) is None, "the dissolved zone's collection must be soft-deleted"
+        assert [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g.get("resource_id") == zone_col_id
+        ] == [], "resource_grants rows for the dissolved zone's collection must be gone"
+
+        last_run = _last_run(conn_id)
+        assert last_run["removed_files"] == 1
+        assert last_run["dissolved_zones"] == 1

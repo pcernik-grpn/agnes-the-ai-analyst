@@ -95,6 +95,42 @@ def _make_collection(name: str) -> str:
     )
 
 
+def _add_zone(
+    connection_id: str,
+    *,
+    zone_item_id: str,
+    parent_scope_id: str,
+    collection_id: str,
+    drive_id: str = "drive-1",
+    rel_path: str = "Zone",
+    status: str = "active",
+) -> None:
+    """Seed one ``config["acl_zones"]`` row — the shape written by
+    ``connectors.sharepoint.acl_sync._reconcile_zones`` (2026-08-31 plan,
+    Task 3)."""
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id)
+    config = dict(row.get("config") or {})
+    zones = list(config.get("acl_zones") or [])
+    zones.append(
+        {
+            "zone_item_id": zone_item_id,
+            "parent_scope_id": parent_scope_id,
+            "drive_id": drive_id,
+            "name": zone_item_id,
+            "display_path": f"{parent_scope_id}/{rel_path}",
+            "rel_path": rel_path,
+            "collection_id": collection_id,
+            "detected_at": "2026-08-30T00:00:00+00:00",
+            "status": status,
+        }
+    )
+    config["acl_zones"] = zones
+    repo.update(connection_id, config=config)
+
+
 def _make_user(user_id: str, email: str, name: str = "Test User") -> None:
     from src.repositories import users_repo
 
@@ -478,3 +514,113 @@ class TestConfigPatchRaceRegression:
         )
         assert "acl_sync_last_run" in config
         assert config.get("acl_sync_last_success_at") is not None
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 plan, Task 4 — ACL sync v2: mirror zone ACLs, suspend zone
+# grants.
+# ---------------------------------------------------------------------------
+
+
+class TestZoneAclSync:
+    def test_zone_acl_is_mirrored(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_parent = _make_collection("Zone Parent Col")
+        col_zone = _make_collection("Zone Col")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_parent, access_mode="mirrored")
+        _add_zone(conn_id, zone_item_id="zone-1", parent_scope_id="scope-1", collection_id=col_zone, drive_id="drive-1")
+        _make_user("u-zoe", "zoe@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "zone-1"): [_group_perm("g-9")]}),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake({"g-9": [{"mail": "zoe@example.com", "userPrincipalName": "zoe@example.com"}]}),
+        )
+
+        result = acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        group = _group_by_name("entra:g-9")
+        assert group is not None
+
+        zone_grants = _grants_for_collection(col_zone)
+        assert len(zone_grants) == 1
+        assert zone_grants[0]["group_id"] == group["id"]
+        assert zone_grants[0]["assigned_by"] == ACL_SYNC_SENTINEL
+
+        # The parent scope's own collection is untouched by the zone's ACL.
+        assert _grants_for_collection(col_parent) == []
+        # "scopes" in the run report counts only real scopes, not zones.
+        assert result["scopes"] == 1
+
+    def test_zone_revocation_removes_grant(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_parent = _make_collection("Zone Parent Col 2")
+        col_zone = _make_collection("Zone Col 2")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_parent, access_mode="mirrored")
+        _add_zone(conn_id, zone_item_id="zone-1", parent_scope_id="scope-1", collection_id=col_zone, drive_id="drive-1")
+        _make_user("u-yan", "yan@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "zone-1"): [_group_perm("g-9")]}),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake({"g-9": [{"mail": "yan@example.com", "userPrincipalName": "yan@example.com"}]}),
+        )
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+        assert len(_grants_for_collection(col_zone)) == 1
+        removed_before = _audit_count(action="sharepoint_acl.grant_removed")
+
+        monkeypatch.setattr(graph_client, "list_item_permissions", _perms_fake({}))
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        assert _grants_for_collection(col_zone) == []
+        assert _audit_count(action="sharepoint_acl.grant_removed") == removed_before + 1
+
+    def test_suspension_covers_zone_collections(self, acl_env, monkeypatch):
+        from app.resource_types import ResourceType
+        from src.repositories import resource_grants_repo, source_connections_repo, user_groups_repo
+
+        monkeypatch.setenv("AGNES_ACL_GUARANTEE_MODE", "must_not")
+
+        conn_id = _make_connection()
+        col_parent = _make_collection("Zone Parent Col 3")
+        col_zone = _make_collection("Zone Col 3")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_parent, access_mode="mirrored")
+        _add_zone(conn_id, zone_item_id="zone-1", parent_scope_id="scope-1", collection_id=col_zone, drive_id="drive-1")
+
+        groups_repo = user_groups_repo()
+        parent_group = groups_repo.create(name="entra:existing-parent", description=None, created_by=ACL_SYNC_SENTINEL)
+        zone_group = groups_repo.create(name="entra:existing-zone", description=None, created_by=ACL_SYNC_SENTINEL)
+        grants = resource_grants_repo()
+        grants.ensure_grant(
+            parent_group["id"], ResourceType.COLLECTION.value, col_parent, assigned_by=ACL_SYNC_SENTINEL
+        )
+        grants.ensure_grant(zone_group["id"], ResourceType.COLLECTION.value, col_zone, assigned_by=ACL_SYNC_SENTINEL)
+
+        # Mark the connection's last successful run far enough in the past
+        # to exceed the default 72h cap.
+        row = source_connections_repo().get(conn_id)
+        config = dict(row.get("config") or {})
+        config["acl_sync_last_success_at"] = "2020-01-01T00:00:00+00:00"
+        source_connections_repo().update(conn_id, config=config)
+
+        async def _boom(*args, **kwargs):
+            raise SharePointGraphError("token request failed", status_code=502)
+
+        monkeypatch.setattr(graph_client, "get_app_token", _boom)
+
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        assert _grants_for_collection(col_parent) == []
+        assert _grants_for_collection(col_zone) == []

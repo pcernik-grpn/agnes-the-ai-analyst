@@ -60,12 +60,42 @@ HONORING it is out of this repo's scope (see that function's docstring).
 Own job kind (``sharepoint-subtree-sweep``), own weekly scheduler cadence
 (§6.2's cost model: a full probe pass over a large library is multi-hour,
 not a nightly job) — see :func:`run_subtree_sweep`'s own docstring.
+
+**Sweep v2 — file probes, permission zones, retroactive cleanup (2026-08-31
+plan, Tasks 3/4/6).** Three additions layered onto the sweep above without
+changing its detection-only mandate at the folder level:
+
+1. The walk now probes **files** too, not just folders — a file with
+   unique permissions is excluded (``kind="file"``, fail-closed, never
+   mirrored per-file — see :func:`_walk_subtree_sweep`).
+2. Behind the ``acl_zones`` switch (default off), a broken-inheritance
+   FOLDER is no longer merely excluded — it is promoted to its own
+   **permission zone**: a fresh, grant-less collection
+   (:func:`_create_zone_collection`) that :func:`_sync_connection` (Task 4)
+   mirrors an ACL into exactly like a normal scope, and the walk
+   *descends* into it instead of stopping (:func:`_reconcile_zones`); a
+   zone whose root re-links inheritance is marked ``status="dissolved"``,
+   never removed from the list (audit trail).
+3. :func:`_cleanup_connection_content` (Task 6) retroactively purges
+   already-ingested ``corpus_files`` rows that fall under a subtree/file
+   excluded — or a zone activated — on THIS OR ANY PRIOR run, and fully
+   retires a dissolved zone's collection (files, grants, the collection
+   row itself) — using the exact machinery ``DELETE /files/{id}`` uses
+   (``app.api.collections._purge_file_row`` and friends), never a bespoke
+   delete path.
+
+Zones live in the connection's OWN top-level ``config["acl_zones"]`` key —
+never inside ``scopes`` rows (that stays the wizard's own automated-writer
+boundary, spec §5's race contract) — and are exported via :func:`zone_rows`
+/ :func:`active_zone_rows` for every other task to read.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,6 +107,10 @@ from connectors.sharepoint.graph_client import SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.audit_helpers import log_safe
 from src.repositories import (
+    RequiresPostgresBackend,
+    corpus_file_sources_repo,
+    corpus_files_repo,
+    file_corpora_repo,
     resource_grants_repo,
     source_connections_repo,
     user_group_members_repo,
@@ -101,6 +135,9 @@ ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS = (
     # 2026-08-30 plan, Task 7 — written by :func:`_sweep_connection`.
     "acl_sweep_last_run",
     "acl_sweep_last_full",
+    # 2026-08-31 plan, Task 3 — permission zone rows, written by the SAME
+    # function (:func:`_sweep_connection`) via :func:`_reconcile_zones`.
+    "acl_zones",
 )
 """Keys THIS module (a worker job, not an ``app/api/admin_sharepoint.py``
 endpoint) writes into a SharePoint connection's ``config`` — see
@@ -120,7 +157,7 @@ Note the sweep does NOT add anything to ``SHAREPOINT_SERVER_WRITTEN_CONFIG_
 KEYS`` even though it rewrites the ``scopes`` key too (each scope row's own
 ``excluded_subtrees``) — that key is already declared there (written by
 ``admin_sharepoint.py``'s own ``confirm_scope``/``remove_scope``), so the
-carry-forward already covers it; only the two genuinely NEW top-level keys
+carry-forward already covers it; only the genuinely NEW top-level keys
 above need adding."""
 
 
@@ -137,6 +174,17 @@ def direct_group_name(source_scope_id: str) -> str:
     a scope's direct (non-group) user role assignments — one group per
     scope, not one per user, so grant counts stay O(principal-classes)."""
     return f"sp-direct:{source_scope_id}"
+
+
+def scope_rel_root(display_path: str) -> str:
+    """Drive-relative prefix of a scope root, derived from the wizard
+    breadcrumb the same way ``corpus_map._map_key`` does: segments are
+    slash-split and stripped; segment[0] is the site, segment[1] the
+    document library (both absent from drive-relative paths). ``"Site"`` or
+    ``"Site/Documents"`` -> ``""``; ``"Site/Documents/Team/Sub"`` ->
+    ``"Team/Sub"``."""
+    segments = [s.strip() for s in (display_path or "").split("/") if s.strip()]
+    return "/".join(segments[2:])
 
 
 @dataclass
@@ -271,6 +319,28 @@ def _mirrored_scopes(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [s for s in scopes if isinstance(s, dict) and s.get("access_mode") == "mirrored"]
 
 
+def zone_rows(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """This connection's ``config["acl_zones"]`` rows (2026-08-31 plan,
+    Task 3) — tolerant of the key being entirely absent (a connection swept
+    before this plan, or ``acl_zones`` never enabled). Each row:
+    ``{zone_item_id, parent_scope_id, drive_id, name, display_path,
+    rel_path, collection_id, detected_at, status}`` with
+    ``status in {"active", "dissolved"}``. Never mutate a row returned from
+    here in place — callers that need to change one must copy first (see
+    :func:`_reconcile_zones`)."""
+    zones = (connection.get("config") or {}).get("acl_zones")
+    if not isinstance(zones, list):
+        return []
+    return [z for z in zones if isinstance(z, dict)]
+
+
+def active_zone_rows(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """This connection's ACTIVE permission zones — see :func:`zone_rows`.
+    Consumed by :func:`_sync_connection` (Task 4, mirrors each zone's own
+    ACL), the ingest gate (Task 5) and the producer handoff (Task 7)."""
+    return [z for z in zone_rows(connection) if z.get("status") == "active"]
+
+
 def run_acl_sync(payload: dict) -> dict:
     """Entry point for the ``sharepoint-acl-sync`` worker job kind (spec §5).
 
@@ -293,6 +363,13 @@ def run_acl_sync(payload: dict) -> dict:
     REMOVES so a scope never passes through a granted-to-nobody window it
     did not already have (spec §5.1 step 4).
 
+    Every ACTIVE permission zone (2026-08-31 plan, Task 3/4) is synced right
+    after its parent connection's real scopes, as its own pseudo-scope keyed
+    on the zone's ``zone_item_id``/``collection_id``/``drive_id`` — see the
+    zone loop inside :func:`_sync_connection`. A zone's ACL is re-read on
+    every run exactly like a scope's, so a zone-level revocation lands
+    within the same window as a scope-level one.
+
     A group whose ``transitiveMembers`` read fails keeps its PREVIOUS
     membership (fail-soft on identity resolution, not on reachability — the
     Google-sync precedent) and marks that scope stale in the run report; a
@@ -301,8 +378,8 @@ def run_acl_sync(payload: dict) -> dict:
 
     Records a last-run block into the connection's own
     ``config["acl_sync_last_run"]`` (matched/unmatched counts, unhonored
-    permission types, per-collection grant deltas, stale scopes, the error if
-    any) — the source card's data, no new table. ``config
+    permission types, per-collection grant deltas, stale scopes, the zone
+    count, the error if any) — the source card's data, no new table. ``config
     ["acl_sync_last_success_at"]`` tracks the last time a connection's run
     completed WITHOUT error, independent of the (possibly-failing) last run,
     so ``acl_sync.guarantee_mode == "must_not"`` can measure staleness
@@ -311,11 +388,12 @@ def run_acl_sync(payload: dict) -> dict:
     Staleness (Q7 fork, ``acl_guarantee_mode`` switch): under ``must_not``, a
     FAILED run past ``acl_sync.max_stale_hours`` (default 72) since the last
     success suspends every sentinel-owned grant on that connection's
-    mirrored collections (deleted, not merely flagged — the next successful
-    sync rewrites them; ``accessible_collection_ids`` itself is never
-    touched, spec §5.4) and audits ``sharepoint_acl.grants_suspended``.
-    Under ``should_not``, staleness is never enforced — the connection's
-    mirrored grants persist with the staleness visible on the source card.
+    mirrored collections AND active zone collections (deleted, not merely
+    flagged — the next successful sync rewrites them;
+    ``accessible_collection_ids`` itself is never touched, spec §5.4) and
+    audits ``sharepoint_acl.grants_suspended``. Under ``should_not``,
+    staleness is never enforced — the connection's mirrored grants persist
+    with the staleness visible on the source card.
 
     Returns ``{"connections": N, "scopes": M, "matched": X, "unmatched": Y,
     "errors": [...]}`` (aggregated across every connection processed), or
@@ -360,25 +438,29 @@ async def _run_acl_sync_async(payload: dict) -> dict:
 
 
 async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
-    """Sync one connection's mirrored scopes; persists the last-run block,
-    audits the run-level actions, and applies must_not staleness suspension.
-    See :func:`run_acl_sync` for the full contract.
+    """Sync one connection's mirrored scopes (and, 2026-08-31 plan Task 4,
+    its active permission zones); persists the last-run block, audits the
+    run-level actions, and applies must_not staleness suspension. See
+    :func:`run_acl_sync` for the full contract.
 
     Invariant: this and ``_sweep_connection`` never write a whole-``config``
     snapshot — both patch only their own bookkeeping keys via
     ``source_connections_repo().config_patch`` (re-reads ``config`` fresh
-    inside its own transaction), so a nightly sync and the weekly sweep
+    inside its own transaction), so a nightly sync and the daily sweep
     landing together on one connection can never drop each other's
     just-written key (never grants — those live in ``resource_grants``)."""
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
+    zones = active_zone_rows(connection)
     t0 = time.monotonic()
 
     error: Optional[str] = None
     token: Optional[str] = None
     try:
         settings = resolve_sharepoint_settings(connection)
-        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret)
+        token = await graph_client.get_app_token(
+            settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret
+        )
     except (SharePointSettingsError, SharePointGraphError) as exc:
         error = str(exc)
 
@@ -403,6 +485,32 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
             if scope_report.get("error") and error is None:
                 error = scope_report["error"]
 
+        # 2026-08-31 plan, Task 4: every ACTIVE permission zone (Task 3) is
+        # synced as its own pseudo-scope, keyed on the zone's OWN item id
+        # and collection. `_sync_scope` needs no change to support this —
+        # `direct_group_name(zone_item_id)` already yields a unique
+        # `sp-direct:<zone_item_id>` group and `_reconcile_grants` already
+        # scopes strictly to the collection it is passed.
+        for zone in zones:
+            pseudo_scope = {
+                "source_scope_id": zone.get("zone_item_id"),
+                "collection_id": zone.get("collection_id"),
+                "drive_id": zone.get("drive_id"),
+            }
+            zone_report = await _sync_scope(connection_id, pseudo_scope, token)
+            matched_total += zone_report["matched"]
+            unmatched_total += zone_report["unmatched"]
+            unhonored_all.extend(
+                {**item, "scope": zone_report["source_scope_id"], "zone_rel_path": zone.get("rel_path")}
+                for item in zone_report["unhonored"]
+            )
+            if zone_report.get("stale"):
+                stale_scopes.append(zone_report["source_scope_id"])
+            if zone_report.get("grant_delta"):
+                grant_deltas[zone_report["collection_id"]] = zone_report["grant_delta"]
+            if zone_report.get("error") and error is None:
+                error = zone_report["error"]
+
     ok = error is None
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
@@ -417,6 +525,7 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
             "unhonored": unhonored_all,
             "grant_deltas": grant_deltas,
             "stale_scopes": stale_scopes,
+            "zones": len(zones),
             "error": error,
             "duration_ms": duration_ms,
         }
@@ -600,7 +709,12 @@ def _reconcile_grants(
     §5.1 step 4) so the collection never passes through a
     granted-to-nobody window it did not already have. Grants owned by any
     OTHER ``assigned_by`` (an admin's manual grant) are never read from or
-    written to here — the sentinel-segregation contract."""
+    written to here — the sentinel-segregation contract.
+
+    ``target_group_ids=[]`` removes every sentinel-owned grant on
+    ``collection_id`` — used by :func:`_cleanup_connection_content`
+    (2026-08-31 plan, Task 6) as the first step of a dissolved zone's
+    teardown, before the harder ``delete_by_resource`` sweep."""
     grants = resource_grants_repo()
     current = [
         g
@@ -682,10 +796,12 @@ def _handle_staleness(connection: Dict[str, Any], connection_id: str, ok: bool, 
 
 def _suspend_connection_grants(connection: Dict[str, Any]) -> int:
     """Delete every sentinel-owned grant on this connection's mirrored
-    scopes' collections. ``accessible_collection_ids`` is never touched
-    directly — deleting the grant IS the suspension (spec §5.4); the next
-    successful sync's :func:`_reconcile_grants` rewrites them."""
+    scopes' AND active permission zones' collections (2026-08-31 plan,
+    Task 4 extended the zone half). ``accessible_collection_ids`` is never
+    touched directly — deleting the grant IS the suspension (spec §5.4);
+    the next successful sync's :func:`_reconcile_grants` rewrites them."""
     collection_ids = {s.get("collection_id") for s in _mirrored_scopes(connection) if s.get("collection_id")}
+    collection_ids |= {z.get("collection_id") for z in active_zone_rows(connection) if z.get("collection_id")}
     if not collection_ids:
         return 0
     grants = resource_grants_repo()
@@ -698,19 +814,21 @@ def _suspend_connection_grants(connection: Dict[str, Any]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Broken-inheritance subtree sweep (2026-08-30 plan, Task 7). See the module
-# docstring's "Subtree sweep" paragraph for the wider picture.
+# Broken-inheritance subtree sweep (2026-08-30 plan, Task 7; sweep v2 —
+# file probes, permission zones, retroactive cleanup — 2026-08-31 plan,
+# Tasks 3/6). See the module docstring's "Subtree sweep" / "Sweep v2"
+# paragraphs for the wider picture.
 # ---------------------------------------------------------------------------
 
 #: must_not/should_not-independent default cadence (days) between two full
 #: sweeps of one connection's mirrored scopes — overridable via the
 #: ``acl_sweep_interval_days`` switch (``acl_sync.sweep_interval_days``).
-#: The scheduler row itself already fires WEEKLY (native cron, see
-#: services/scheduler/__main__.py) rather than nightly — this per-connection
-#: self-guard is defense-in-depth against a restart-refire (scheduler
-#: ``last_run`` state can be lost across a container recreate), the same
-#: risk ``app/api/store_lint_admin.py``'s own min-interval self-guard
-#: protects against for its weekly row.
+#: The scheduler row itself fires DAILY (native cron, see
+#: services/scheduler/__main__.py) — this per-connection self-guard is
+#: defense-in-depth against a restart-refire (scheduler ``last_run`` state
+#: can be lost across a container recreate), the same risk
+#: ``app/api/store_lint_admin.py``'s own min-interval self-guard protects
+#: against for its own row.
 _DEFAULT_SWEEP_INTERVAL_DAYS = 7
 
 #: Safety cap on folders visited in ONE scope's walk — a pathological or
@@ -738,7 +856,7 @@ def _sweep_due(connection: Dict[str, Any]) -> bool:
     than :func:`_sweep_interval_days`. A connection whose last attempt
     FAILED (``acl_sweep_last_run.ok`` false) but never completed keeps
     ``acl_sweep_last_full`` at its previous value (or absent), so a failed
-    run does not push the next attempt a further week out."""
+    run does not push the next attempt a further interval out."""
     last_full_raw = (connection.get("config") or {}).get("acl_sweep_last_full")
     if not last_full_raw:
         return True
@@ -752,51 +870,108 @@ def _sweep_due(connection: Dict[str, Any]) -> bool:
     return elapsed_days >= _sweep_interval_days()
 
 
-async def _walk_subtree_sweep(token: str, drive_id: str, root_item_id: str, root_path: str) -> Dict[str, Any]:
+def _zone_slugify(text: str) -> str:
+    """Local mirror of ``app.api.admin_sharepoint._slugify`` — cannot import
+    it directly: that module already imports ``ACL_SYNC_SENTINEL`` from
+    here, so the reverse import would be circular."""
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")[:80].strip("-") or "sharepoint-zone"
+
+
+def _create_zone_collection(*, name: str, zone_item_id: str) -> str:
+    """Idempotent-by-caller creation of one permission zone's collection.
+
+    Grant-less on purpose (module docstring's "Semantics locked here", Task
+    3): invisible to everyone until Task 4's ACL sync mirrors the zone
+    root's own permissions into it — that ordering is what keeps zone
+    creation MUST-NOT-safe.
+
+    Collision handling mirrors ``admin_sharepoint.py::_create_scope_
+    collection`` (one retry with a short, stable sha256-derived suffix) —
+    the retry SHAPE is mirrored rather than the function imported (see
+    :func:`_zone_slugify`'s note on why that import would be circular).
+    """
+    repo = file_corpora_repo()
+    slug = _zone_slugify(name)
+    description = f"SharePoint permission zone · {name}"
+    try:
+        return repo.create(name=name, slug=slug, description=description, created_by=ACL_SYNC_SENTINEL)
+    except Exception as exc:  # noqa: BLE001 — DuckDB ConstraintException / PG IntegrityError, message-sniffed elsewhere too
+        err = str(exc).lower()
+        if "unique" not in err and "duplicate" not in err and "constraint" not in err:
+            raise
+        suffix = hashlib.sha256(zone_item_id.encode()).hexdigest()[:8]
+        return repo.create(name=name, slug=f"{slug}-{suffix}", description=description, created_by=ACL_SYNC_SENTINEL)
+
+
+async def _walk_subtree_sweep(
+    token: str,
+    drive_id: str,
+    root_item_id: str,
+    root_path: str,
+    *,
+    rel_root: str = "",
+    zones_enabled: bool = False,
+    known_zone_ids: "frozenset[str] | set[str]" = frozenset(),
+) -> Dict[str, Any]:
     """Breadth-first walk of one scope's folder tree, probing
-    ``hasUniqueRoleAssignments`` per folder (``graph_client
-    .probe_unique_permissions``, already ``$batch``-based — 20 items per
-    call) and collecting the ROOT of every broken-inheritance subtree —
-    **never descending into a detected subtree** (spec §3(b): its children
-    are excluded wholesale, never individually probed or crawled).
+    ``hasUniqueRoleAssignments`` per child — folder OR file (2026-08-31
+    plan, Task 3 — earlier this only probed folders) — via
+    ``graph_client.probe_unique_permissions`` (already ``$batch``-based —
+    20 items per call).
+
+    Per child, in order:
+
+    * a FILE with a ``True``/``None`` flag is excluded (``kind="file"``) —
+      files are never descended into either way (spec §3, file-grain
+      fidelity is fail-closed exclusion, never per-file mirroring);
+    * a FOLDER with flag ``None`` (unknown — the probe's own honest answer
+      when the signal could not be read) is excluded (``kind="folder"``),
+      never descended — fail-closed, same as a confirmed break;
+    * a FOLDER with flag ``True`` and ``zones_enabled``: becomes a
+      **permission zone candidate** (``zone_candidates``) and the walk
+      DESCENDS into it — nested breaks become further candidates, unlike
+      the exclude-and-stop path;
+    * a FOLDER with flag ``True`` and NOT ``zones_enabled``: excluded
+      (``kind="folder"``), never descended — the pre-Task-3 behavior;
+    * a FOLDER with flag ``False``: inheritance intact, the walk descends
+      normally; if its id is in ``known_zone_ids`` (an ACTIVE zone from a
+      PRIOR run rooted here), it is recorded in ``relinked_zone_ids`` — its
+      folder re-linked inheritance since the zone was created.
 
     The scope ROOT ITSELF is never probed or excluded here — its own
     permissions are what :func:`_sync_scope` already mirrors; this sweep
-    only ever excludes something FINER than the scope.
-
-    A folder whose probe comes back ``None`` ("unknown" —
-    ``probe_unique_permissions``'s own honest answer when the signal could
-    not be read) is treated THE SAME as a detected break: fail-closed, never
-    silently rendered as "clean" just because the signal was unavailable.
+    only ever excludes/zones something FINER than the scope.
 
     Raises :class:`SharePointGraphError` on a fatal read failure partway
     through the walk — the caller (:func:`_sweep_scope`) treats that as
-    "leave this scope's previous exclusion list untouched" (fail-closed, no
-    partial diff is ever persisted), mirroring :func:`_sync_scope`'s own
-    "a scope-root read failure aborts that scope's reconciliation entirely"
-    posture.
+    "leave this scope's previous exclusion/zone state untouched"
+    (fail-closed, no partial diff is ever persisted).
+
+    Returns ``{"excluded_subtrees", "zone_candidates", "relinked_zone_ids",
+    "requests", "unknown_probes", "truncated"}``.
     """
     excluded: List[Dict[str, Any]] = []
+    zone_candidates: List[Dict[str, Any]] = []
+    relinked_zone_ids: List[str] = []
     requests = 0
     unknown_probes = 0
     visited = 0
     truncated = False
-    queue: List[tuple] = [(root_item_id, root_path)]
+    queue: List[tuple] = [(root_item_id, root_path, rel_root)]
 
     while queue:
         if visited >= _MAX_SWEEP_FOLDERS_VISITED:
             truncated = True
             break
-        item_id, path = queue.pop(0)
+        item_id, path, rel_path_prefix = queue.pop(0)
         visited += 1
 
         children = await graph_client.list_item_children(token, drive_id, item_id)
         requests += 1
-        folders = [c for c in children if c.get("is_folder")]
-        if not folders:
+        if not children:
             continue
 
-        ids = [f["id"] for f in folders]
+        ids = [c["id"] for c in children]
         flags = await graph_client.probe_unique_permissions(token, drive_id, ids)
         # One `$batch` POST per up-to-20 items (graph_client._GRAPH_BATCH_SIZE_CAP)
         # — matches probe_unique_permissions's own batching exactly, so the
@@ -804,45 +979,103 @@ async def _walk_subtree_sweep(token: str, drive_id: str, root_item_id: str, root
         # separate guess.
         requests += -(-len(ids) // graph_client._GRAPH_BATCH_SIZE_CAP)
 
-        for folder in folders:
-            child_path = f"{path}/{folder['name']}" if path else folder["name"]
-            flag = flags.get(folder["id"])
+        for child in children:
+            child_path = f"{path}/{child['name']}" if path else child["name"]
+            child_rel_path = f"{rel_path_prefix}/{child['name']}" if rel_path_prefix else child["name"]
+            flag = flags.get(child["id"])
+            is_folder = bool(child.get("is_folder"))
+
             if flag is None:
                 unknown_probes += 1
-            if flag is None or flag is True:
+
+            if not is_folder:
+                if flag is None or flag is True:
+                    excluded.append(
+                        {
+                            "item_id": child["id"],
+                            "path": child_path,
+                            "rel_path": child_rel_path,
+                            "kind": "file",
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                continue  # a file is never descended into either way
+
+            if flag is None:
                 excluded.append(
                     {
-                        "item_id": folder["id"],
+                        "item_id": child["id"],
                         "path": child_path,
+                        "rel_path": child_rel_path,
+                        "kind": "folder",
                         "detected_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-                continue  # never descend into a detected/unknown subtree
-            queue.append((folder["id"], child_path))
+                continue  # never descend into an unknown-signal subtree
+
+            if flag is True:
+                if zones_enabled:
+                    zone_candidates.append(
+                        {
+                            "zone_item_id": child["id"],
+                            "name": child["name"],
+                            "path": child_path,
+                            "rel_path": child_rel_path,
+                        }
+                    )
+                    queue.append((child["id"], child_path, child_rel_path))
+                else:
+                    excluded.append(
+                        {
+                            "item_id": child["id"],
+                            "path": child_path,
+                            "rel_path": child_rel_path,
+                            "kind": "folder",
+                            "detected_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+                continue
+
+            # flag is False -> inheritance intact, descend normally.
+            if child["id"] in known_zone_ids:
+                relinked_zone_ids.append(child["id"])
+            queue.append((child["id"], child_path, child_rel_path))
 
     return {
         "excluded_subtrees": excluded,
+        "zone_candidates": zone_candidates,
+        "relinked_zone_ids": relinked_zone_ids,
         "requests": requests,
         "unknown_probes": unknown_probes,
         "truncated": truncated,
     }
 
 
-async def _sweep_scope(token: str, scope: Dict[str, Any]) -> Dict[str, Any]:
+async def _sweep_scope(
+    token: str,
+    scope: Dict[str, Any],
+    *,
+    zones_enabled: bool = False,
+    known_zone_ids: "frozenset[str] | set[str]" = frozenset(),
+) -> Dict[str, Any]:
     """Sweep one mirrored scope. Returns ``{"source_scope_id",
-    "excluded_subtrees", "requests", "unknown_probes", "truncated",
-    "error"}`` — ``excluded_subtrees`` is ``None`` on a fatal error (missing
-    ``drive_id``, or a Graph read failure partway through the walk): the
-    caller must then leave this scope's PREVIOUSLY recorded exclusion list
-    untouched rather than persist a partial/incomplete one.
+    "excluded_subtrees", "zone_candidates", "relinked_zone_ids", "requests",
+    "unknown_probes", "truncated", "error"}`` — ``excluded_subtrees`` is
+    ``None`` on a fatal error (missing ``drive_id``, or a Graph read failure
+    partway through the walk): the caller must then leave this scope's
+    PREVIOUSLY recorded exclusion/zone state untouched rather than persist a
+    partial/incomplete one.
     """
     source_scope_id = scope.get("source_scope_id")
     drive_id = scope.get("drive_id")
     root_path = scope.get("display_path") or source_scope_id or ""
+    rel_root = scope_rel_root(scope.get("display_path") or "")
 
     base: Dict[str, Any] = {
         "source_scope_id": source_scope_id,
         "excluded_subtrees": None,
+        "zone_candidates": [],
+        "relinked_zone_ids": [],
         "requests": 0,
         "unknown_probes": 0,
         "truncated": False,
@@ -855,33 +1088,140 @@ async def _sweep_scope(token: str, scope: Dict[str, Any]) -> Dict[str, Any]:
         return {**base, "error": "missing_drive_id"}
 
     try:
-        walk = await _walk_subtree_sweep(token, drive_id, source_scope_id, root_path)
+        walk = await _walk_subtree_sweep(
+            token,
+            drive_id,
+            source_scope_id,
+            root_path,
+            rel_root=rel_root,
+            zones_enabled=zones_enabled,
+            known_zone_ids=known_zone_ids,
+        )
     except SharePointGraphError as exc:
         return {**base, "error": str(exc)}
 
     return {
         **base,
         "excluded_subtrees": walk["excluded_subtrees"],
+        "zone_candidates": walk["zone_candidates"],
+        "relinked_zone_ids": walk["relinked_zone_ids"],
         "requests": walk["requests"],
         "unknown_probes": walk["unknown_probes"],
         "truncated": walk["truncated"],
     }
 
 
+def _reconcile_zones(
+    connection_id: str,
+    scope: Dict[str, Any],
+    walk: Dict[str, Any],
+    existing_zones: List[Dict[str, Any]],
+    now_iso: str,
+) -> "tuple[list[dict], list[dict]]":
+    """Merge one scope's walk output (``zone_candidates``,
+    ``relinked_zone_ids``) into the zone rows THIS SCOPE owns. Idempotent on
+    ``zone_item_id`` — a zone's collection is created once and reused
+    forever. Returns ``(this scope's updated zone rows, newly dissolved
+    rows)`` — the caller folds the first into the connection-wide
+    ``acl_zones`` list; the second is informational only
+    (:func:`_cleanup_connection_content` independently discovers dissolved
+    zones that still need tearing down, so it does not need this list).
+    """
+    source_scope_id = scope.get("source_scope_id")
+    by_item_id = {
+        z["zone_item_id"]: dict(z)
+        for z in existing_zones
+        if z.get("parent_scope_id") == source_scope_id and z.get("zone_item_id")
+    }
+
+    newly_dissolved: List[Dict[str, Any]] = []
+
+    for zone_item_id in walk.get("relinked_zone_ids") or []:
+        row = by_item_id.get(zone_item_id)
+        if row is not None and row.get("status") == "active":
+            row["status"] = "dissolved"
+            newly_dissolved.append(row)
+            log_safe(
+                action="sharepoint_acl.zone_dissolved",
+                resource=f"source_connection:{connection_id}",
+                params={
+                    "zone_item_id": zone_item_id,
+                    "collection_id": row.get("collection_id"),
+                    "scope": source_scope_id,
+                },
+                result="success",
+                client_kind="scheduler",
+            )
+
+    parent_label = scope.get("display_path") or source_scope_id
+
+    for candidate in walk.get("zone_candidates") or []:
+        zone_item_id = candidate["zone_item_id"]
+        row = by_item_id.get(zone_item_id)
+        if row is None:
+            name = f"{parent_label}/{candidate['name']}"
+            collection_id = _create_zone_collection(name=name, zone_item_id=zone_item_id)
+            row = {
+                "zone_item_id": zone_item_id,
+                "parent_scope_id": source_scope_id,
+                "drive_id": scope.get("drive_id"),
+                "name": candidate["name"],
+                "display_path": f"{parent_label}/{candidate['path']}",
+                "rel_path": candidate["rel_path"],
+                "collection_id": collection_id,
+                "detected_at": now_iso,
+                "status": "active",
+            }
+            by_item_id[zone_item_id] = row
+            log_safe(
+                action="sharepoint_acl.zone_created",
+                resource=f"source_connection:{connection_id}",
+                params={"zone_item_id": zone_item_id, "collection_id": collection_id, "scope": source_scope_id},
+                result="success",
+                client_kind="scheduler",
+            )
+        else:
+            # An existing active zone re-seen as a candidate: refresh the
+            # detection timestamp only — no audit (transition-only
+            # auditing, same posture as membership replacement). A
+            # previously DISSOLVED zone re-seen as a candidate (its folder
+            # broke inheritance again after re-linking) reactivates the same
+            # way — it is still the SAME zone_item_id/collection, so no new
+            # collection is minted.
+            row["detected_at"] = now_iso
+            row["status"] = "active"
+
+    return (list(by_item_id.values()), newly_dissolved)
+
+
 async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     """Sweep one connection's mirrored scopes; persists each swept scope's
-    ``excluded_subtrees`` and the connection's own ``acl_sweep_last_run``/
-    ``acl_sweep_last_full`` bookkeeping. See :func:`run_subtree_sweep` for
-    the full contract."""
+    ``excluded_subtrees``, the connection's own ``acl_sweep_last_run``/
+    ``acl_sweep_last_full``/``acl_zones`` bookkeeping, then (2026-08-31 plan,
+    Task 6) retroactively purges already-ingested content that now falls
+    under an excluded subtree/file or an active zone, and fully retires any
+    zone dissolved this (or a prior, incompletely-torn-down) run. See
+    :func:`run_subtree_sweep` for the full contract."""
+    from app.switches import switch_value
+
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
     t0 = time.monotonic()
+
+    zones_enabled = bool(switch_value("acl_zones"))
+    existing_zones = zone_rows(connection)
+    known_zone_ids_by_scope: Dict[str, set] = {}
+    for z in existing_zones:
+        if z.get("status") == "active" and z.get("parent_scope_id"):
+            known_zone_ids_by_scope.setdefault(z["parent_scope_id"], set()).add(z["zone_item_id"])
 
     error: Optional[str] = None
     token: Optional[str] = None
     try:
         settings = resolve_sharepoint_settings(connection)
-        token = await graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret)
+        token = await graph_client.get_app_token(
+            settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret
+        )
     except (SharePointSettingsError, SharePointGraphError) as exc:
         error = str(exc)
 
@@ -890,20 +1230,25 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     unknown_total = 0
     truncated_any = False
     exclusions_by_scope: Dict[str, List[Dict[str, Any]]] = {}
+    zone_updates_by_scope: Dict[str, "tuple[list[dict], list[dict]]"] = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     if token is not None:
         for scope in scopes:
-            report = await _sweep_scope(token, scope)
+            known_ids = known_zone_ids_by_scope.get(scope.get("source_scope_id"), set())
+            report = await _sweep_scope(token, scope, zones_enabled=zones_enabled, known_zone_ids=known_ids)
             requests_total += report["requests"]
             unknown_total += report["unknown_probes"]
             truncated_any = truncated_any or report["truncated"]
             if report["excluded_subtrees"] is not None:
                 excluded_total += len(report["excluded_subtrees"])
                 exclusions_by_scope[report["source_scope_id"]] = report["excluded_subtrees"]
+                zone_updates_by_scope[report["source_scope_id"]] = _reconcile_zones(
+                    connection_id, scope, report, existing_zones, now_iso
+                )
             if report.get("error") and error is None:
                 error = report["error"]
 
-    now_iso = datetime.now(timezone.utc).isoformat()
     duration_ms = int((time.monotonic() - t0) * 1000)
 
     # A full sweep walk can run for a long time (module docstring: "multi-hour,
@@ -928,8 +1273,18 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
         for s in all_scopes
     ]
 
+    # Zone rows from scopes NOT touched this run (a manual scope, a
+    # missing_drive_id scope, or the whole connection failing before any
+    # scope was swept) pass through unchanged; touched scopes contribute
+    # their freshly reconciled rows (new/refreshed/dissolved).
+    touched_scope_ids = set(zone_updates_by_scope.keys())
+    all_zone_rows = [z for z in existing_zones if z.get("parent_scope_id") not in touched_scope_ids]
+    for updated_rows, _dissolved in zone_updates_by_scope.values():
+        all_zone_rows.extend(updated_rows)
+
     config_patch: Dict[str, Any] = {
         "scopes": updated_scopes,
+        "acl_zones": all_zone_rows,
         "acl_sweep_last_run": {
             "at": now_iso,
             "ok": error is None,
@@ -954,12 +1309,196 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
         config_patch["acl_sweep_last_full"] = now_iso
     source_connections_repo().config_patch(connection_id, config_patch)
 
+    # 2026-08-31 plan, Task 6: retroactive cleanup. Runs AFTER the detection
+    # state above is durably persisted, so a crash mid-cleanup never loses
+    # the sweep's own findings — the next sweep (or an admin re-check) would
+    # simply re-attempt the same cleanup, which is idempotent by design (see
+    # _cleanup_connection_content's own docstring).
+    exclusions_by_scope_full = {
+        s["source_scope_id"]: s.get("excluded_subtrees") or [] for s in updated_scopes if s.get("source_scope_id")
+    }
+    cleanup = _cleanup_connection_content(connection, exclusions_by_scope_full, all_zone_rows)
+    if cleanup["removed_files"] or cleanup["dissolved_zones"]:
+        source_connections_repo().config_patch(
+            connection_id,
+            {"acl_sweep_last_run": {**config_patch["acl_sweep_last_run"], **cleanup}},
+        )
+
     return {"scopes": len(scopes), "excluded": excluded_total, "error": error}
+
+
+def _cleanup_connection_content(
+    connection: Dict[str, Any],
+    exclusions_by_scope: Dict[str, List[Dict[str, Any]]],
+    zone_rows_all: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Retroactive cleanup (2026-08-31 plan, Task 6): purge already-ingested
+    content whose source subtree/file has since been excluded — or whose
+    parent-side copy now falls under an ACTIVE zone (re-homing to a zone's
+    OWN collection is a COPY, not a move; the parent copy must die too) —
+    and fully retire any permission zone whose folder has re-linked
+    inheritance (``status == "dissolved"``).
+
+    Matching, per the plan's "Semantics locked here": stable-id matching is
+    EXACT (``graph:<item-id>`` against a ``kind="file"`` exclusion entry's
+    ``item_id``); path matching is component-safe prefix (``path == p or
+    path.startswith(p + "/")``) against a ``kind="folder"`` exclusion
+    entry's ``rel_path`` and an active zone's ``rel_path``. A legacy
+    exclusion entry with no ``rel_path`` (pre-Task-3) cannot be path-matched
+    — its subtree was never crawled, so nothing arrives for it under that
+    path anyway.
+
+    Deletion uses the EXACT machinery ``DELETE /files/{id}`` uses
+    (``app.api.collections._purge_file_row`` / ``_record_corpus_file_event``
+    / ``_sweep_facts_orphans_after_delete`` — imported locally to avoid a
+    module-level dependency from a connector onto the API layer), one
+    ``content_purged`` audit row per collection with a non-zero removal
+    count (never per-file — volume), and one orphan sweep per connection
+    when anything was actually removed.
+
+    Stable-id matching needs ``corpus_file_sources_repo()`` (PG-only,
+    :class:`RequiresPostgresBackend` on a DuckDB-backed instance) — the
+    first such failure flips an internal flag so every LATER candidate row
+    in this same call skips the lookup instead of raising again; path
+    matching (which needs no PG-only table) still runs fully. A DuckDB-
+    backed instance can never have facts/claims either way, so this only
+    narrows WHICH files get caught by this pass, never breaks it.
+
+    Dissolved-zone teardown order (never relax): purge files → sentinel
+    grant removal (``_reconcile_grants(collection_id, [], zone_item_id)``)
+    → ``resource_grants_repo().delete_by_resource`` (closes the verified
+    dangling-grants gap — ``DELETE /api/collections/{id}`` never touches
+    ``resource_grants``) → ``file_corpora_repo().soft_delete``. Idempotent:
+    a dissolved zone whose collection is already soft-deleted (``get()``
+    returns ``None``) is skipped — this also means a PRIOR run's partially
+    completed teardown is safely retried on the next sweep.
+
+    Returns ``{"removed_files": int, "dissolved_zones": int}``.
+    """
+    from app.api.collections import _purge_file_row, _record_corpus_file_event, _sweep_facts_orphans_after_delete
+
+    scopes_by_id = {s["source_scope_id"]: s for s in _mirrored_scopes(connection) if s.get("source_scope_id")}
+
+    removed_files = 0
+    any_removed = False
+    stable_ids_available = True
+
+    def _stable_id_for(corpus_file_id: str) -> Optional[str]:
+        nonlocal stable_ids_available
+        if not stable_ids_available:
+            return None
+        try:
+            anchor = corpus_file_sources_repo().get(corpus_file_id)
+        except RequiresPostgresBackend:
+            stable_ids_available = False
+            return None
+        return anchor.get("source_stable_id") if anchor else None
+
+    zones_by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for zone in zone_rows_all:
+        parent = zone.get("parent_scope_id")
+        if parent:
+            zones_by_parent.setdefault(parent, []).append(zone)
+
+    for source_scope_id, scope in scopes_by_id.items():
+        collection_id = scope.get("collection_id")
+        if not collection_id:
+            continue
+
+        exclusions = exclusions_by_scope.get(source_scope_id) or []
+        folder_prefixes = [e["rel_path"] for e in exclusions if e.get("kind") == "folder" and e.get("rel_path")]
+        excluded_file_ids = {
+            f"graph:{e['item_id']}" for e in exclusions if e.get("kind") == "file" and e.get("item_id")
+        }
+        zone_prefixes = [
+            z["rel_path"]
+            for z in zones_by_parent.get(source_scope_id, [])
+            if z.get("status") == "active" and z.get("rel_path")
+        ]
+        prefixes = folder_prefixes + zone_prefixes
+        if not prefixes and not excluded_file_ids:
+            continue
+
+        removed_here = 0
+        for row in corpus_files_repo().list_for_corpus(collection_id):
+            path = row.get("path")
+            matched = bool(path and any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes))
+            if not matched and excluded_file_ids:
+                matched = _stable_id_for(row["id"]) in excluded_file_ids
+            if not matched:
+                continue
+            _purge_file_row(collection_id, row)
+            _record_corpus_file_event(
+                corpus_id=collection_id,
+                file_id=row["id"],
+                change="deleted",
+                name=row.get("filename"),
+                path=path,
+                source_stable_id=None,
+            )
+            removed_here += 1
+
+        if removed_here:
+            removed_files += removed_here
+            any_removed = True
+            log_safe(
+                action="sharepoint_acl.content_purged",
+                resource=f"file_corpus:{collection_id}",
+                params={"collection_id": collection_id, "removed": removed_here, "trigger": "sharepoint-acl-cleanup"},
+                result="success",
+                client_kind="scheduler",
+            )
+
+    dissolved_zones = 0
+    for zone in zone_rows_all:
+        if zone.get("status") != "dissolved":
+            continue
+        zone_collection_id = zone.get("collection_id")
+        if not zone_collection_id or file_corpora_repo().get(zone_collection_id) is None:
+            continue  # never had a collection, or already torn down — idempotent skip
+
+        zone_removed = 0
+        for row in corpus_files_repo().list_for_corpus(zone_collection_id):
+            _purge_file_row(zone_collection_id, row)
+            _record_corpus_file_event(
+                corpus_id=zone_collection_id,
+                file_id=row["id"],
+                change="deleted",
+                name=row.get("filename"),
+                path=row.get("path"),
+                source_stable_id=None,
+            )
+            zone_removed += 1
+
+        _reconcile_grants(zone_collection_id, [], zone.get("zone_item_id"))
+        resource_grants_repo().delete_by_resource(ResourceType.COLLECTION.value, zone_collection_id)
+        file_corpora_repo().soft_delete(zone_collection_id)
+        dissolved_zones += 1
+
+        if zone_removed:
+            removed_files += zone_removed
+            any_removed = True
+            log_safe(
+                action="sharepoint_acl.content_purged",
+                resource=f"file_corpus:{zone_collection_id}",
+                params={
+                    "collection_id": zone_collection_id,
+                    "removed": zone_removed,
+                    "trigger": "sharepoint-acl-cleanup-zone-dissolved",
+                },
+                result="success",
+                client_kind="scheduler",
+            )
+
+    if any_removed:
+        _sweep_facts_orphans_after_delete(trigger="sharepoint-acl-cleanup")
+
+    return {"removed_files": removed_files, "dissolved_zones": dissolved_zones}
 
 
 def run_subtree_sweep(payload: dict) -> dict:
     """Entry point for the ``sharepoint-subtree-sweep`` worker job kind
-    (spec §3(b), §6.2, §6.3).
+    (spec §3(b), §6.2, §6.3; sweep v2 — 2026-08-31 plan, Tasks 3/6).
 
     ``payload = {"connection_id": str | None}`` — same shape as
     :func:`run_acl_sync`. A specific id sweeps just that connection and
@@ -968,31 +1507,33 @@ def run_subtree_sweep(payload: dict) -> dict:
     flag); ``None`` sweeps every ``source_type='sharepoint'`` connection
     with at least one mirrored scope THAT IS DUE (see :func:`_sweep_due`).
 
-    Cadence: the scheduler row fires this job WEEKLY via native cron (see
-    ``services/scheduler/__main__.py`` — the same grammar
-    ``store-lint-audit`` already uses for its own weekly row), not nightly —
-    §6.2's cost model puts one full probe pass over a large library at
-    multi-hour, so nightly would starve the shared per-app-per-tenant Graph
-    throttle budget the content crawl also depends on. Each connection ALSO
-    tracks its own ``config["acl_sweep_last_full"]`` and is skipped by the
-    unconditional sweep-all payload (``connection_id=None``) until
-    ``acl_sync.sweep_interval_days`` (default 7) has elapsed since its last
+    Cadence: the scheduler row fires this job DAILY via native cron (see
+    ``services/scheduler/__main__.py``). Each connection ALSO tracks its own
+    ``config["acl_sweep_last_full"]`` and is skipped by the unconditional
+    sweep-all payload (``connection_id=None``) until
+    ``acl_sync.sweep_interval_days`` (default 1) has elapsed since its last
     FULL (error-free) sweep — defense-in-depth against a restart-refire, not
     a second scheduling mechanism.
 
-    Detection only — this job decides WHAT is excluded (writes each mirrored
-    scope's ``excluded_subtrees``: ``{item_id, path, detected_at}`` per
-    detected root) but never crawls or decides access on its own. The
-    exclusion list is handed to the external producer via
+    Detection AND, since Task 3/6, three further actions: (1) probes files
+    as well as folders; (2) behind the ``acl_zones`` switch, promotes a
+    broken-inheritance folder to its own permission zone (mirrored by
+    :func:`run_acl_sync`) instead of excluding it outright, and dissolves a
+    zone whose root re-links inheritance; (3) retroactively purges
+    already-ingested content that now falls under an exclusion or an active
+    zone, and fully retires a dissolved zone's collection. Each mirrored
+    scope's ``excluded_subtrees`` (``{item_id, path, rel_path, kind,
+    detected_at}`` per detected root/file) and the connection's
+    ``acl_zones`` are handed to the external producer via
     ``app/worker/kinds.py::_run_corpus_extraction``'s
-    ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` env var — HONORING the list (actually
-    skipping those subtrees during crawl) is external-producer work (spec
-    §6.3's division of labor; §10's repo boundary), out of this repo.
+    ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` env var / corpus map (2026-08-31 plan,
+    Task 7) — HONORING them on the crawl side stays external-producer work;
+    Agnes now also enforces them server-side at ingest time (Task 5).
 
     Feature-gated by ``acl_mirroring.enabled`` (same flag as
     :func:`run_acl_sync`) — disabled instance returns ``{"skipped":
     "acl_mirroring disabled"}``, harmless for the scheduler's unconditional
-    weekly enqueue.
+    daily enqueue.
 
     Returns ``{"connections": N, "scopes": M, "excluded": X, "skipped_not_due":
     Y, "errors": [...]}`` aggregated across every connection actually swept.
