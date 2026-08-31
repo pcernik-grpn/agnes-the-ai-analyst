@@ -186,6 +186,58 @@ class TestNoDeadEnds:
         assert "Seam seam-locked" in r.text, "the copy names the package"
         assert "copy-access-request" in r.text
 
+    def test_the_same_door_opens_for_a_memory_domain(self, seeded_app) -> None:
+        """A memory domain the caller cannot reach was a bare `access_denied`
+        printed verbatim — the machine string the package page stopped showing.
+
+        It is the same situation for the reader: it exists, an admin can share
+        it, and there is a sentence to send them. So it is the same page, with
+        the noun swapped. Naming the domain leaks nothing the 403 has not
+        already confirmed (the route 404s one that does not exist).
+        """
+        from src.repositories import memory_domains_repo
+
+        memory_domains_repo().create(
+            name="Locked Domain",
+            slug="seam-locked-domain",
+            description="d",
+            icon=None,
+            color=None,
+            created_by="admin",
+        )
+        r = seeded_app["client"].get(
+            "/memory/d/seam-locked-domain",
+            headers={**_auth(seeded_app["analyst_token"]), **_HTML},
+        )
+        assert r.status_code == 403
+        assert "access_denied" not in r.text, "the machine token must not print"
+        assert "not_shared" not in r.text
+        assert "Not shared with you yet" in r.text
+        assert "Locked Domain" in r.text
+        assert "memory domain" in r.text, "the copy uses the right noun"
+        assert "copy-access-request" in r.text
+
+    def test_a_draft_package_is_not_reachable_by_its_slug(self, seeded_app) -> None:
+        """Draft means hidden from every member-facing list. The detail route
+        read the package straight from the repo, so an unpublished page was one
+        guessed slug away from any member holding a grant — and it rendered as
+        though it had shipped.
+
+        404, not 403: browse behaves as though a draft is not there, and a 403
+        would confirm the name of something the admin has not published.
+        """
+        from src.repositories import data_packages_repo
+
+        pkg_id = _make_package(seeded_app, "seam-draft", granted=True)
+        data_packages_repo().update(pkg_id, status="draft")
+        c = seeded_app["client"]
+        r = c.get("/catalog/p/seam-draft", headers={**_auth(seeded_app["analyst_token"]), **_HTML})
+        assert r.status_code == 404
+        # The admin who is writing it still opens it — that is the whole point
+        # of a draft, and a gate that locked the author out would be worse than
+        # the leak it closed.
+        assert c.get("/catalog/p/seam-draft", headers={**_auth(seeded_app["admin_token"]), **_HTML}).status_code == 200
+
     def test_an_admin_url_bridges_to_the_page_the_reader_can_try(self, seeded_app) -> None:
         pkg_id = _make_package(seeded_app, "seam-bridge", granted=True)
         c = seeded_app["client"]
@@ -341,4 +393,4 @@ class TestTheLibraryShapedPreview:
         # could least afford to say it. See tests/test_access_vocabulary.py.
         assert "Required by your admin" in src
         assert "In their Library" in src
-        assert "Available, no local copy yet" in src
+        assert "Optional — no local copy yet" in src

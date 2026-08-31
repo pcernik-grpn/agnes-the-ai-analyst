@@ -28,6 +28,7 @@ the sequence of HTTP calls the module makes.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -37,6 +38,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 JS = ROOT / "app" / "web" / "static" / "js" / "components"
 SHELL = JS / "builder_shell.js"
+#: The MCP builder renders its apps section through this, so the harness has
+#: to load it for the same reason the page does.
+APPS_PANEL = JS / "linked_apps_panel.js"
 MCP = JS / "mcp_builder.js"
 LINKED = JS / "linked_apps_builder.js"
 
@@ -83,7 +87,13 @@ global.document = {
   body: el(),
 };
 const mount = el();
-global.window = { location: { href: '' }, document: global.document };
+// `window` IS the global object in a browser, so a module that does
+// `window.X = ...` and then reads a bare `X` works there. A shim that made
+// `window` a plain object broke exactly that, and every builder reads the
+// shell through a bare `BuilderShell` somewhere — so the shim aliases the
+// global instead of standing in for it.
+global.window = global;
+global.window.location = { href: '' };
 global.self = global.window;
 
 // A synthetic target: `closest` returns itself so the module's delegation
@@ -150,12 +160,15 @@ def _load(*paths: Path) -> str:
 def test_a_failed_grant_does_not_make_the_retry_register_a_second_source():
     script = (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   // The create succeeds and hands back an id. Keyed exactly, so the
   // builder's own opening turn (POST .../builder/turn) cannot consume it.
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search', description: 'find things', read_only: true }] },
+  },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-1' } }],
   // ...and the FIRST grant attempt fails. The retry's grant is unqueued, so
   // it answers 200 — the resumed save must then finish.
@@ -164,9 +177,13 @@ installFetch({
 window.AgnesMcpBuilder.open({ mount });
 (async () => {
   await flush();
-  // Type a name and a url, the two things canSave() needs.
+  // Type a name and a url, then check the connection — Register source is
+  // gated on a real introspection, because a source with no tools is a source
+  // that can answer nothing.
   fire('input', { 'data-mcp-field': 'name', value: 'CRM' });
   fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
   // Pick a group so there is a grant step at all. The picker has to be opened
   // first: `toggleGroup` resolves the id against the loaded group list, and
   // the picker is what loads it. Without this the group list stayed empty, the
@@ -201,10 +218,13 @@ window.AgnesMcpBuilder.open({ mount });
 def test_an_already_granted_group_does_not_fail_the_mcp_save():
     script = (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'POST /api/admin/mcp-sources/preview-introspect': {
+    status: 200, body: { tools: [{ name: 'search', description: 'find things', read_only: true }] },
+  },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-2' } }],
   // 409 = the group can already reach it, which is the end state Save wants.
   'POST /api/admin/mcp-sources/src-2/grants': {
@@ -216,6 +236,8 @@ window.AgnesMcpBuilder.open({ mount });
   await flush();
   fire('input', { 'data-mcp-field': 'name', value: 'CRM' });
   fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
   fire('click', { 'data-mcp-openpick': '1' });
   for (let i = 0; i < 8; i++) await flush();
   fire('click', { 'data-mcp-pick': 'g1' });
@@ -232,30 +254,31 @@ window.AgnesMcpBuilder.open({ mount });
     )
 
 
-# ── Linked apps: 409 is done, and one failure does not hide the rest ─────────
+# ── Publishing apps: 409 is done, and one failure does not hide the rest ────
 
 
-def _linked_script(grant_responses: str, tail: str) -> str:
-    """Drive the linked-apps builder as far as Save.
+def _apps_script(grant_responses: str, tail: str) -> str:
+    """Drive the MCP builder through registration and into the apps section.
 
-    The apps come from the fetch step (a Keboola MCP source + its lister tool),
-    so the harness answers those three reads before Save has anything to grant.
+    This used to be its own builder (`linked_apps_builder.js`) and its own
+    page. It could not stand alone — its first step asked which MCP source to
+    read apps from, and dead-ended if none was registered — so it is now the
+    last section of the builder that registers the source, and these are the
+    same two invariants against the folded code.
     """
     return (
         _HARNESS
-        + _load(SHELL, LINKED)
+        + _load(SHELL, APPS_PANEL, MCP)
         + r"""
 installFetch({
-  'GET /api/admin/mcp-sources': { status: 200, body: [
-    { id: 's1', name: 'keboola', url: 'https://connection.example.com/mcp', enabled: true },
-  ] },
-  // One lister tool, so `loadTools` picks it without the admin choosing.
-  'GET /api/admin/mcp-tools?source_id=s1': { status: 200, body: [
-    { id: 't1', tool_id: 't1', source_id: 's1', name: 'list_data_apps', enabled: true },
-  ] },
+  // A lister tool, which is what makes the apps section appear at all.
+  'POST /api/admin/mcp-sources/preview-introspect': { status: 200, body: { tools: [
+    { name: 'list_data_apps', description: 'apps hosted upstream', read_only: true },
+  ] } },
   'GET /api/admin/groups': { status: 200, body: [
     { id: 'g1', name: 'Analysts' }, { id: 'g2', name: 'Finance' },
   ] },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 's1' } }],
   'GET /api/data-apps?kind=linked&source=s1': { status: 200, body: { apps: [
     { id: 'app-a', name: 'Churn' }, { id: 'app-b', name: 'Revenue' },
   ] } },
@@ -263,15 +286,25 @@ installFetch({
         + grant_responses
         + r"""
 });
-window.AgnesLinkedAppsBuilder.open({ mount });
+window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: true });
 (async () => {
   await flush();
-  // Pick the source (which loads and auto-picks its one lister tool), then
-  // fetch the catalogue — every app comes back chosen by default.
-  fire('click', { 'data-la-source': 's1' });
+  fire('input', { 'data-mcp-field': 'name', value: 'keboola' });
+  fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
   for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-fetch': '1' });
-  for (let i = 0; i < 12; i++) await flush();
+  // Pick the group before registering: the same groups that get the source
+  // get its apps, which is the whole reason the section lives here.
+  fire('click', { 'data-mcp-openpick': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { 'data-mcp-pick': 'g1' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 14; i++) await flush();
+  // Registered — and still here, because there are apps to catalogue.
+  const hrefAfterRegister = window.location.href;
+  fire('click', { 'data-la-read': '1' });
+  for (let i = 0; i < 14; i++) await flush();
 """
         + tail
         + r"""
@@ -280,23 +313,105 @@ window.AgnesLinkedAppsBuilder.open({ mount });
     )
 
 
-def test_linked_apps_treats_an_existing_grant_as_done():
-    """Every pair 409s — the apps are already granted to those groups. That is
-    the state the admin asked for, so Save must complete."""
-    script = _linked_script(
+def test_registering_a_source_that_lists_apps_stays_on_the_page():
+    """The fold is only worth anything if the builder does not navigate away
+    from the section it just revealed."""
+    script = _apps_script(
+        "",
+        r"""
+  process.stdout.write(JSON.stringify({
+    hrefAfterRegister,
+    href: window.location.href,
+    all: CALLS,
+    materialized: CALLS.filter((c) => c.indexOf('/materialize') >= 0).length,
+  }));
+""",
+    )
+    res = _node(script)
+    assert res["hrefAfterRegister"] == "", f"it redirected instead of showing the apps: {res['all']}"
+    assert res["materialized"] == 1, f"the lister was never materialized: {res['all']}"
+
+
+def test_an_instance_with_data_apps_off_is_never_offered_the_section():
+    """The retired builder's whole failure mode: it was reachable on an
+    instance where data apps are switched off, and every path through it ended
+    at `data_apps_disabled` — AFTER it had already switched a shared tool to
+    materialize mode. Off means the section does not exist."""
+    script = (
+        _HARNESS
+        + _load(SHELL, APPS_PANEL, MCP)
+        + r"""
+installFetch({
+  'POST /api/admin/mcp-sources/preview-introspect': { status: 200, body: { tools: [
+    { name: 'list_data_apps', description: 'apps hosted upstream', read_only: true },
+  ] } },
+  'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 's9' } }],
+});
+window.AgnesMcpBuilder.open({ mount, dataAppsEnabled: false });
+(async () => {
+  await flush();
+  fire('input', { 'data-mcp-field': 'name', value: 'keboola' });
+  fire('input', { 'data-mcp-field': 'url', value: 'https://mcp.example.com/sse' });
+  fire('click', { 'data-mcp-check': '1' });
+  for (let i = 0; i < 8; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 14; i++) await flush();
+  process.stdout.write(JSON.stringify({ href: window.location.href, all: CALLS }));
+})();
+"""
+    )
+    res = _node(script)
+    assert res["href"] == "/admin/mcp-sources/s9", (
+        f"it waited for an apps section that cannot exist here: {res['all']}"
+    )
+    assert not [c for c in res["all"] if "/materialize" in c], (
+        f"it materialized a lister on an instance that cannot show apps: {res['all']}"
+    )
+
+
+def test_reading_the_app_list_sends_what_the_registry_requires():
+    """The mode is what makes the read possible — the projection reads a table
+    the run writes — and `tool_registry.upsert` refuses `materialize` without
+    a schedule string, so both go.
+
+    What was removed is the UI's claim ABOUT that schedule. Nothing in the
+    scheduler reads a `tool_registry` row, so the `daily 03:00` the old wizard
+    wrote never fired; a "keep this list current" switch would have promised a
+    refresh the product does not perform. The panel says the catalogue is a
+    snapshot instead, which is true.
+    """
+    script = _apps_script(
+        "",
+        r"""
+  process.stdout.write(JSON.stringify({
+    bodies: BODIES['PUT /api/admin/mcp-tools/s1__list_data_apps'] || [],
+    all: CALLS,
+  }));
+""",
+    )
+    res = _node(script)
+    assert res["bodies"], "the lister tool was never put into materialize mode"
+    assert res["bodies"][0] == {"mode": "materialize", "schedule": "daily 03:00"}, (
+        f"the registry would refuse this: {res['bodies'][0]}"
+    )
+    panel = (JS / "linked_apps_panel.js").read_text(encoding="utf-8")
+    assert "data-la-refresh" not in panel, (
+        "the refresh switch is back — nothing refreshes these tools, so it promises what "
+        "the product does not do"
+    )
+
+
+def test_an_existing_app_grant_is_read_as_done():
+    """Every pair 409s — the apps are already granted to that group. That is
+    the state the admin asked for, so Done must complete."""
+    script = _apps_script(
         r"""  'POST /api/admin/grants': [
     { status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' } },
     { status: 409, body: { detail: 'Grant already exists for this group/resource_type/resource_id' } },
   ],""",
         r"""
-  // Open the picker before picking: `toggleGroup` resolves the id against the
-  // loaded group list, and the picker is what loads it.
-  fire('click', { 'data-la-openpick': '1' });
-  for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-pick': 'g1' });
-  for (let i = 0; i < 4; i++) await flush();
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   process.stdout.write(JSON.stringify({
     href: window.location.href,
     grants: CALLS.filter((c) => c === 'POST /api/admin/grants').length,
@@ -305,16 +420,17 @@ def test_linked_apps_treats_an_existing_grant_as_done():
 """,
     )
     res = _node(script)
-    assert res["href"] == "/library?kind=data_app", (
+    assert res["grants"] == 2, f"both apps should have been granted: {res['all']}"
+    assert res["href"] == "/admin/mcp-sources/s1", (
         f"409s were read as failures: href={res['href']!r}, calls={res['all']}"
     )
 
 
-def test_linked_apps_retry_only_repeats_what_is_still_missing():
-    """One pair fails for real. The save must report which, keep the admin on
-    the page, and — on retry — reach the success path once the 409s from the
-    first attempt are counted as done."""
-    script = _linked_script(
+def test_a_failed_app_grant_is_named_and_keeps_the_admin_on_the_page():
+    """A grant that did not land is the difference between "shared" and
+    "invisible", and the admin is the only one who can retry it — so it is
+    reported here rather than carried silently through a redirect."""
+    script = _apps_script(
         r"""  'POST /api/admin/grants': [
     { status: 200, body: {} },
     { status: 500, body: { detail: 'boom' } },
@@ -322,17 +438,11 @@ def test_linked_apps_retry_only_repeats_what_is_still_missing():
     { status: 200, body: {} },
   ],""",
         r"""
-  // Open the picker before picking: `toggleGroup` resolves the id against the
-  // loaded group list, and the picker is what loads it.
-  fire('click', { 'data-la-openpick': '1' });
-  for (let i = 0; i < 8; i++) await flush();
-  fire('click', { 'data-la-pick': 'g1' });
-  for (let i = 0; i < 4; i++) await flush();
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   const hrefAfterPartial = window.location.href;
-  fire('click', { id: 'la-save' });
-  for (let i = 0; i < 12; i++) await flush();
+  fire('click', { id: 'mcp-done' });
+  for (let i = 0; i < 14; i++) await flush();
   process.stdout.write(JSON.stringify({
     hrefAfterPartial,
     href: window.location.href,
@@ -342,10 +452,11 @@ def test_linked_apps_retry_only_repeats_what_is_still_missing():
 """,
     )
     res = _node(script)
-    assert res["hrefAfterPartial"] == "", "a partial failure navigated away, so the admin never saw which pairs failed"
-    assert res["href"] == "/library?kind=data_app", (
-        f"the retry could not finish: href={res['href']!r}, calls={res['all']}"
+    assert res["hrefAfterPartial"] == "", f"a partial failure navigated away: {res['all']}"
+    assert res["href"] == "/admin/mcp-sources/s1", (
+        f"the retry never finished: href={res['href']!r}, calls={res['all']}"
     )
+
 
 
 # ── MCP source: the tool toggles have to reach the registry ──────────────────
@@ -369,7 +480,7 @@ def _mcp_script(responses_js: str, drive_js: str) -> str:
     """Open the MCP builder, introspect two tools, then run `drive_js`."""
     return (
         _HARNESS
-        + _load(SHELL, MCP)
+        + _load(SHELL, APPS_PANEL, MCP)
         + "installFetch("
         + responses_js
         + """);
@@ -389,12 +500,16 @@ window.AgnesMcpBuilder.open({ mount });
     )
 
 
+#: One read-only tool and one the server does not vouch for. That split is
+#: what the builder's defaults key on — read-only arrives ON, anything that
+#: could write arrives OFF — so the curation these tests exercise starts from
+#: the state a real admin sees.
 _TWO_TOOLS = """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
     status: 200,
     body: { tools: [
-      { name: 'search_crm', description: 'Search', input_schema: { type: 'object' } },
+      { name: 'search_crm', description: 'Search', read_only: true, input_schema: { type: 'object' } },
       { name: 'delete_account', description: 'Danger' },
     ] },
   },
@@ -403,10 +518,14 @@ _TWO_TOOLS = """{
 
 
 def test_the_tools_left_on_are_registered_so_an_agent_can_call_them():
+    """Both end up registered here — but only because the admin turns the
+    write-capable one on. It does not arrive that way."""
     res = _node(
         _mcp_script(
             _TWO_TOOLS,
             r"""
+  fire('click', { 'data-mcp-tool': 'delete_account' });
+  for (let i = 0; i < 4; i++) await flush();
   fire('click', { id: 'mcp-save' });
   for (let i = 0; i < 16; i++) await flush();
   process.stdout.write(JSON.stringify({
@@ -436,11 +555,14 @@ def test_the_tools_left_on_are_registered_so_an_agent_can_call_them():
 
 
 def test_a_tool_toggled_off_is_never_registered():
+    """`search_crm` is read-only, so it arrives on; switching it off must
+    keep it out of the registry entirely — and `delete_account`, which arrives
+    off, must stay out without being touched."""
     res = _node(
         _mcp_script(
             _TWO_TOOLS,
             r"""
-  fire('click', { 'data-mcp-tool': 'delete_account' });
+  fire('click', { 'data-mcp-tool': 'search_crm' });
   for (let i = 0; i < 4; i++) await flush();
   fire('click', { id: 'mcp-save' });
   for (let i = 0; i < 16; i++) await flush();
@@ -452,8 +574,8 @@ def test_a_tool_toggled_off_is_never_registered():
         )
     )
     names = [b["original_name"] for b in res["bodies"]]
-    assert names == ["search_crm"], (
-        f"a tool the admin switched off was registered anyway (or the on one was not): {names}"
+    assert names == [], (
+        f"a tool the admin switched off was registered anyway: {names}"
     )
 
 
@@ -491,7 +613,7 @@ def test_a_second_save_does_not_duplicate_the_tool_rows():
             """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
-    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search', read_only: true }] },
   },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-r' } }],
   // The tool registers fine; the GRANT fails once, so Save is retried with
@@ -553,7 +675,9 @@ def test_a_no_tools_registered_409_is_a_failure_not_a_shrug():
             """{
   'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
   'POST /api/admin/mcp-sources/preview-introspect': {
-    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search' }] },
+    // Read-only, so it arrives switched ON — which is what makes the click
+    // below a deliberate "turn everything off", the state this test is about.
+    status: 200, body: { tools: [{ name: 'search_crm', description: 'Search', read_only: true }] },
   },
   'POST /api/admin/mcp-sources': [{ status: 201, body: { id: 'src-n' } }],
   'POST /api/admin/mcp-sources/src-n/grants': {
@@ -627,4 +751,182 @@ def test_the_structured_detail_survives_to_the_caller():
     assert "e.detail = d;" in src
     assert "kind !== 'no_tools_registered'" in src, (
         "the 409 swallow must exclude no_tools_registered by its stable error code"
+    )
+
+
+# ── Editing a registered source: save sends the DIFFERENCE ──────────────────
+
+
+def _edit_script(tail: str) -> str:
+    """Open the builder on a source that already exists and drive one edit.
+
+    Registering was a builder and revising was the detail page's own form, so
+    the connection, the tool curation and the grants were entered in one
+    vocabulary and changed in another. Now it is one surface — and the save it
+    performs cannot be the create path's "post everything", because a tool
+    turned off has to be DELETED and a group unpicked has to be REVOKED.
+    """
+    return (
+        _HARNESS
+        + _load(SHELL, APPS_PANEL, MCP)
+        + r"""
+installFetch({
+  'GET /api/admin/groups': { status: 200, body: [
+    { id: 'g1', name: 'Analysts' }, { id: 'g2', name: 'Finance' },
+  ] },
+  'GET /api/admin/mcp-sources/s1': { status: 200, body: {
+    id: 's1', name: 'acme_crm', transport: 'http', url: 'https://mcp.example.com/sse',
+    auth_method: '', auth_secret_env: '', scope: 'shared',
+    tools: [
+      { tool_id: 's1__search', original_name: 'search', description: 'read', mutating: false },
+      { tool_id: 's1__write', original_name: 'write_row', description: 'writes', mutating: true },
+    ],
+    grants: ['g2'], partial_grants: [],
+  } },
+});
+window.AgnesMcpBuilder.open({ mount, editSourceId: 's1' });
+(async () => {
+  for (let i = 0; i < 10; i++) await flush();
+"""
+        + tail
+        + r"""
+})();
+"""
+    )
+
+
+def test_the_loaded_source_is_the_panel_and_the_baseline():
+    """Both, from one read: what the admin sees, and what save compares to."""
+    res = _node(_edit_script(r"""
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "GET /api/admin/mcp-sources/s1" in res["all"], f"the source was never loaded: {res['all']}"
+    # The group list is fetched too — a grant is stored as an id, and a chip
+    # reading "g2" is not access an admin can check at a glance.
+    assert "GET /api/admin/groups" in res["all"], "grants would render as raw ids"
+
+
+def test_a_tool_turned_off_is_disabled_not_deleted():
+    """Off has to take the tool out of the callable set — and nothing more.
+
+    It used to DELETE the registration. The toggle reads "✓ On / Off", which
+    is the vocabulary of a reversible switch, and the source's detail page
+    offers exactly that for the same row; deleting instead threw away the
+    exposed-name override, the description and the input schema, with no
+    confirmation and no undo, for an admin doing the cautious thing after
+    seeing a tool marked "writes".
+    """
+    res = _node(_edit_script(r"""
+  fire('click', { 'data-mcp-tool': 'write_row' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    all: CALLS, href: window.location.href,
+    body: (BODIES['PUT /api/admin/mcp-tools/s1__write'] || [])[0] || null,
+  }));
+"""))
+    assert not [c for c in res["all"] if c.startswith("DELETE /api/admin/mcp-tools")], (
+        f"turning a tool off still destroys its registration: {res['all']}"
+    )
+    assert res["body"] == {"enabled": False}, f"the tool was not disabled: {res['body']}"
+    assert "PUT /api/admin/mcp-tools/s1__search" not in res["all"], "it touched a tool that was left on"
+    assert res["href"] == "/admin/mcp-sources/s1", f"the save never finished: {res['all']}"
+
+
+def _mixed_source_script(tail: str) -> str:
+    """A source whose two tools disagree: one enabled, one deliberately not."""
+    return (
+        _HARNESS
+        + _load(SHELL, APPS_PANEL, MCP)
+        + r"""
+installFetch({
+  'GET /api/admin/groups': { status: 200, body: [{ id: 'g1', name: 'Analysts' }] },
+  'GET /api/admin/mcp-sources/s1': { status: 200, body: {
+    id: 's1', name: 'acme_crm', transport: 'http', url: 'https://mcp.example.com/sse',
+    auth_method: '', auth_secret_env: '', scope: 'shared',
+    tools: [
+      { tool_id: 's1__search', original_name: 'search', mutating: false, enabled: true },
+      { tool_id: 's1__danger', original_name: 'delete_customer', mutating: true, enabled: false },
+    ],
+    grants: [], partial_grants: [],
+  } },
+});
+window.AgnesMcpBuilder.open({ mount, editSourceId: 's1' });
+(async () => {
+  for (let i = 0; i < 10; i++) await flush();
+"""
+        + tail
+        + r"""
+})();
+"""
+    )
+
+
+def test_an_untouched_panel_does_not_rewrite_the_tool_rows():
+    """The loader marked every returned tool enabled, so a tool an admin had
+    deliberately switched off rendered "✓ On" — with a "writes" badge beside
+    it, on the one that matters most. Opening and saving would then have
+    silently re-enabled it."""
+    res = _node(_mixed_source_script(r"""
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    tools: CALLS.filter((c) => c.indexOf('/api/admin/mcp-tools') >= 0),
+  }));
+"""))
+    assert res["tools"] == [], f"opening and saving rewrote the tool rows: {res['tools']}"
+
+
+def test_switching_a_disabled_tool_back_on_re_enables_it():
+    """The other direction of the same toggle — and it must not create a
+    second registration for a row that already exists."""
+    res = _node(_mixed_source_script(r"""
+  fire('click', { 'data-mcp-tool': 'delete_customer' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({
+    body: (BODIES['PUT /api/admin/mcp-tools/s1__danger'] || [])[0] || null,
+    posts: CALLS.filter((c) => c === 'POST /api/admin/mcp-tools').length,
+  }));
+"""))
+    assert res["body"] == {"enabled": True}, f"it was not re-enabled: {res['body']}"
+    assert res["posts"] == 0, "a registered-but-disabled tool was re-created instead of re-enabled"
+
+
+def test_a_group_unpicked_is_revoked():
+    res = _node(_edit_script(r"""
+  fire('click', { 'data-mcp-unpick': 'g2' });
+  for (let i = 0; i < 4; i++) await flush();
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "DELETE /api/admin/mcp-sources/s1/grants/g2" in res["all"], (
+        f"unpicking a group left its access live: {res['all']}"
+    )
+
+
+def test_an_unchanged_edit_registers_nothing_twice():
+    """Saving without changing anything must not re-register the tools that
+    are already there — the create path's POST per tool would duplicate them."""
+    res = _node(_edit_script(r"""
+  fire('click', { id: 'mcp-save' });
+  for (let i = 0; i < 16; i++) await flush();
+  process.stdout.write(JSON.stringify({ all: CALLS }));
+"""))
+    assert "POST /api/admin/mcp-tools" not in res["all"], f"tools were re-registered: {res['all']}"
+    assert "POST /api/admin/mcp-sources" not in res["all"], f"a second source was created: {res['all']}"
+    assert "PUT /api/admin/mcp-sources/s1" in res["all"], "the source itself was never updated"
+
+
+def test_editing_never_overwrites_the_draft_slot():
+    """`persistDraft` is keyed on one localStorage entry shared with the create
+    path — writing an opened source into it would replace whatever half-typed
+    connection the admin had, and offer to resume one already registered."""
+    src = MCP.read_text(encoding="utf-8")
+    body = re.search(r"function persistDraft\(\) \{(.*?)\n  \}", src, re.S)
+    assert body and "if (editing) return" in body.group(1), (
+        "an edit is being parked as a draft"
     )

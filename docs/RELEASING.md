@@ -315,7 +315,14 @@ matches what you're shipping.
 
 ### `release.yml` — auto-build on every push
 
-Runs on **every** push to **every** branch.
+Runs on **every** push to **every** branch — except a push whose diff only
+touches `docs/**`, root-level `*.md`, or `LICENSE` (a `decide` job replicates
+the old `paths-ignore` semantics via `scripts/ci/docs_only_change.py`), which
+renders `build-and-push` as a neutral SKIPPED check and produces no image at
+all. A docs-only push to `main` therefore does not publish a new `:stable`.
+A zero-diff branch-create (a fresh branch off `main` with no extra commits)
+still builds, so a dev VM pinned to a `:dev-<slug>` floating tag always gets
+an image.
 - Push to `main` → `:stable`, `:stable-YYYY.MM.N` (CalVer).
 - Push to non-main `<prefix>/<branch>` → `:dev`, `:dev-YYYY.MM.N`,
   `:dev-<branch-slug>`, and (when prefix isn't a Git Flow convention)

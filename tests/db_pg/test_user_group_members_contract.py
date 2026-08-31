@@ -367,3 +367,41 @@ def test_google_sync_summary_empty_user_returns_zero(repos):
 
     summary = members.google_sync_summary("u-only-admin-2")
     assert summary == {"count": 0, "last_added_at": None}
+
+
+def test_replace_group_members_for_source_segregation(repos):
+    """`replace_group_members_for_source` is the group-oriented transpose of
+    `replace_synced_groups` — a resource-driven sync (e.g. the SharePoint ACL
+    mirror) computes one GROUP's full member set per sweep, rather than one
+    user's group set per login. DELETE+INSERT is scoped to (group_id,
+    source): an admin-added row on the same group survives, and a second
+    call with a different user set replaces only its own source's rows —
+    on both engines."""
+    ug, members, users, _, _ = repos
+    users.create(id="u-sp-1", email="sp1@example.com", name="SP1")
+    users.create(id="u-sp-2", email="sp2@example.com", name="SP2")
+    users.create(id="u-sp-3", email="sp3@example.com", name="SP3")
+    group = ug.ensure("entra:g-123")
+
+    members.add_member("u-sp-1", group["id"], source="admin", added_by="admin-user")
+    members.replace_group_members_for_source(
+        group["id"],
+        ["u-sp-1", "u-sp-2"],
+        source="sharepoint_sync",
+        added_by="system:sharepoint-acl-sync",
+    )
+    # u-sp-1's admin row survives (ON CONFLICT DO NOTHING skips the dup
+    # insert); u-sp-2 is newly added.
+    member_ids = {r["id"] for r in members.list_members_for_group(group["id"])}
+    assert member_ids == {"u-sp-1", "u-sp-2"}
+
+    # Replacement removes only its own source's rows: u-sp-2 (sharepoint_sync)
+    # is gone, u-sp-1 (admin) is untouched, u-sp-3 is newly added.
+    members.replace_group_members_for_source(
+        group["id"],
+        ["u-sp-3"],
+        source="sharepoint_sync",
+        added_by="system:sharepoint-acl-sync",
+    )
+    member_ids = {r["id"] for r in members.list_members_for_group(group["id"])}
+    assert member_ids == {"u-sp-1", "u-sp-3"}

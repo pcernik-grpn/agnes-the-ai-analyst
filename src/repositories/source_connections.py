@@ -8,9 +8,21 @@ is unique per source_type — enforced here (both backends), not by the DB.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import duckdb
+
+# config_patch() is the fix for a genuine write-write conflict: the nightly
+# ACL sync and the weekly subtree sweep (connectors/sharepoint/acl_sync.py)
+# both patch bookkeeping keys on the SAME connection's config. Two concurrent
+# patches of the same row can lose an optimistic-concurrency race under
+# DuckDB the same way concurrent logins race in
+# user_group_members.replace_synced_groups — reuse that retry idiom here.
+# Postgres serializes via a row lock (SELECT ... FOR UPDATE), so its sibling
+# needs no retry.
+_CONFIG_PATCH_CONFLICT_RETRIES = 3
+_CONFIG_PATCH_CONFLICT_BACKOFF_S = 0.05
 
 
 class SourceConnectionsRepository:
@@ -148,6 +160,75 @@ class SourceConnectionsRepository:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+
+    def config_patch(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Atomically merge ``patch``'s TOP-LEVEL keys into this row's
+        current ``config``, leaving every other key untouched — including a
+        key some OTHER writer committed after the caller's own last read.
+        Returns the updated row, or ``None`` if ``connection_id`` doesn't
+        exist.
+
+        Closes a real bug (spec: NB-1 review finding on the SharePoint ACL
+        sync): ``update(connection_id, config=snapshot)`` merges in Python
+        against a caller-held snapshot, so two writers racing on one
+        connection — e.g. the nightly ACL sync and the weekly subtree sweep
+        (``connectors/sharepoint/acl_sync.py``) — can silently drop
+        whichever wrote second's bookkeeping keys. This method re-reads
+        ``config`` from the DB inside its own transaction instead, so the
+        merge always starts from the latest committed value.
+
+        Retries on a DuckDB write-write conflict the same way
+        ``user_group_members.replace_synced_groups`` does (see that
+        method's docstring) — two concurrent patches of the SAME row can
+        lose an optimistic-concurrency race under DuckDB; Postgres
+        serializes via a row lock, so its sibling needs no retry.
+        """
+        last_err: Optional[duckdb.Error] = None
+        for attempt in range(_CONFIG_PATCH_CONFLICT_RETRIES):
+            try:
+                self.conn.execute("BEGIN")
+                row = self.conn.execute(
+                    "SELECT config FROM source_connections WHERE id = ?",
+                    [connection_id],
+                ).fetchone()
+                if row is None:
+                    self.conn.execute("ROLLBACK")
+                    return None
+                current = row[0]
+                if isinstance(current, str):
+                    try:
+                        current = json.loads(current)
+                    except (json.JSONDecodeError, TypeError):
+                        current = {}
+                elif not isinstance(current, dict):
+                    current = {}
+                merged = {**current, **patch}
+                self.conn.execute(
+                    "UPDATE source_connections SET config = ? WHERE id = ?",
+                    [json.dumps(merged), connection_id],
+                )
+                self.conn.execute("COMMIT")
+                return self.get(connection_id)
+            except duckdb.TransactionException as e:
+                # Lost an optimistic-concurrency race with a concurrent
+                # config_patch on the same row. Roll back (best-effort — the
+                # txn may already be aborted) and retry with a short backoff.
+                self._safe_rollback()
+                last_err = e
+                time.sleep(_CONFIG_PATCH_CONFLICT_BACKOFF_S * (attempt + 1))
+            except Exception:
+                self._safe_rollback()
+                raise
+        # Exhausted retries — surface the last conflict to the caller.
+        if last_err is not None:
+            raise last_err
+        return None
+
+    def _safe_rollback(self) -> None:
+        try:
+            self.conn.execute("ROLLBACK")
+        except Exception:
+            pass
 
     def delete(self, connection_id: str) -> None:
         self.conn.execute("DELETE FROM source_connections WHERE id = ?", [connection_id])

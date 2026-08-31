@@ -14,12 +14,24 @@ from __future__ import annotations
 
 from jinja2 import Environment, FileSystemLoader
 
+from app.web import vocabulary
+
 
 def _env():
-    return Environment(
+    """Standalone, but complete.
+
+    Still no FastAPI — the point of these tests is that a break in the macro
+    surfaces without the app in the traceback. `vocabulary.install` only adds
+    the shared words the macro reads, which the app registers the same way;
+    without it the macro raises `'words' is undefined` here and renders fine
+    in production, which is the worst of both.
+    """
+    env = Environment(
         loader=FileSystemLoader("app/web/templates"),
         autoescape=True,
     )
+    vocabulary.install(env)
+    return env
 
 
 def _render(entry: dict) -> str:
@@ -42,7 +54,7 @@ def test_default_available_card_renders_add_button():
     })
     assert 'class="stack-card"' in html
     assert "Sales bundle" in html
-    assert "+ Add to stack" in html
+    assert "+ " + vocabulary.ADD in html
     assert "Automatic" not in html
     assert "Remove" not in html
 

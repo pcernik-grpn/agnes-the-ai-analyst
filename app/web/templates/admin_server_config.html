@@ -650,6 +650,14 @@ const SECTION_META = {
     title: "Fact graph",
     help: "Typed facts and edges extracted from Collections documents, each claim carrying its evidencing document and a verbatim quote. Postgres-only; visibility derives from collection grants. visibility_mode: any_evidence (default) shows a subject when any readable claim evidences it, all_evidence requires every claim to be readable.",
   },
+  acl_mirroring: {
+    title: "ACL mirroring",
+    help: "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope access_mode='mirrored', and the admin sync-now endpoint. OFF by default — turning it on changes nothing until a scope opts into mirroring.",
+  },
+  acl_sync: {
+    title: "ACL sync posture",
+    help: "Cross-audience-leak posture (design Q7). guarantee_mode: must_not (default, fail closed) suspends stale mirrored grants past max_stale_hours and treats untagged claims in a tiered scope as admin-only; should_not (best effort) keeps stale grants with a warning instead.",
+  },
   extraction: {
     title: "Document extraction",
     help: "Document extraction as its own worker lane. Turning enabled on is not enough by itself to run the worker — see docs/DEPLOYMENT.md#multi-process. This command is executed by the extraction worker process on the server. A Terraform-provisioned deployment may pin enabled/producer.command/producer.module via an env var; a pinned field renders read-only below (\"set by deployment (Terraform)\") and cannot be saved from this panel.",
@@ -1240,7 +1248,7 @@ function renderSection(section, payload, knownForSection) {
 
 const SECTION_GROUPS = [
   { label: "General",      sections: ["instance", "data_source", "email", "theme", "features"] },
-  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "extraction", "mcp", "studio"] },
+  { label: "Integrations", sections: ["telegram", "ai", "corporate_memory", "materialize", "guardrails", "marketplace", "connectors", "library", "access_policies", "facts", "acl_mirroring", "acl_sync", "extraction", "mcp", "studio"] },
   // `sections: ["chat"]` alongside `bespoke` — the two aren't mutually
   // exclusive (buildSidenav()/renderAll() read them independently). "Chat
   // access" is a real registry section (SECTION_META above) that belongs in

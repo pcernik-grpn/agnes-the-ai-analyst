@@ -116,6 +116,10 @@ class TestFeatureFlagsRegistry:
             "facts",
             "facts_visibility_mode",
             "extraction",
+            "acl_mirroring",
+            "acl_guarantee_mode",
+            "acl_max_stale_hours",
+            "acl_sweep_interval_days",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -325,6 +329,10 @@ class TestServerConfigFeatureFlagsInventory:
             "facts",
             "facts_visibility_mode",
             "extraction",
+            "acl_mirroring",
+            "acl_guarantee_mode",
+            "acl_max_stale_hours",
+            "acl_sweep_interval_days",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

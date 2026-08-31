@@ -9,20 +9,6 @@ on:
     branches:
       - main
       - "**"  # build :dev-<slug> image for any branch push (e.g. feature/x, zs/edit, fix/y)
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
-      - "LICENSE"
-  # Branch creation. Required because `paths-ignore` on the `push` event
-  # diffs the new ref against the default branch — a branch created from
-  # main with no extra commits has zero diff, so every file matches
-  # paths-ignore and the workflow is skipped. Devs spinning up a personal
-  # branch off main to deploy main's exact state to their dev VM
-  # (`:dev-<user>-latest` floating tag) need an image to be published, so
-  # we trigger explicitly on branch create. Tag creates are filtered out
-  # at the job level so we don't double-build with `keboola-deploy.yml`
-  # (which owns `keboola-deploy-*` tag pushes).
-  create:
   workflow_dispatch:  # manual trigger for explicit dev-<slug> builds
 
 permissions:
@@ -38,19 +24,68 @@ permissions:
   # rollback-on-smoke-fail job-level permissions below.
   issues: write
 
-# When a developer pushes a brand-new branch with code changes, GitHub fires
-# both a `create` and a `push` event for the same commit. Without
-# concurrency control, both runs would claim distinct CalVer version tags
-# (dev-YYYY.MM.N and dev-YYYY.MM.N+1) and race to push overlapping floating
-# tags (:dev, :dev-<slug>, :dev-<prefix>-latest). Group by ref and cancel
-# in-progress duplicates so only the most recent event survives — the
-# zero-diff case (only `create` fires, no `push`) is unaffected since
-# there's only one run.
+# GitHub used to fire BOTH a `create` and a `push` event for a brand-new
+# branch's first commit — without concurrency control both runs would claim
+# distinct CalVer version tags (dev-YYYY.MM.N and dev-YYYY.MM.N+1) and race
+# to push overlapping floating tags (:dev, :dev-<slug>, :dev-<prefix>-latest).
+# That pairing is gone now (see the `decide` job below, which replaces the
+# `create:` trigger + `paths-ignore` combination outright), so this group's
+# remaining job is narrower: deduplicating rapid successive pushes to the
+# SAME branch (e.g. two force-pushes seconds apart), where the older run is
+# genuinely superseded and should be cancelled rather than racing the newer
+# one for CalVer tags.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Cheap gate that replaces the removed `paths-ignore` push filter. GitHub's
+  # `paths-ignore` diffs the new ref against the default branch, which made a
+  # zero-diff branch (created off main with no extra commits) match every
+  # ignore pattern and skip the whole workflow — so a `create:` trigger used
+  # to exist solely to still publish a `:dev-<slug>` image for that case
+  # (dev VMs pin to it). GitHub fires both `create` and `push` for the same
+  # first commit, so that pairing produced two runs per branch-create, and
+  # `cancel-in-progress` above killed one of them — leaving a cancelled run's
+  # job check-contexts stuck red on the PR until someone manually reran it.
+  #
+  # `decide` computes the same "was this push docs-only" answer in-workflow
+  # instead, so `build-and-push` renders as a neutral SKIPPED check on a
+  # docs-only push rather than the workflow not running at all (the old
+  # `paths-ignore` behavior) or a stuck red check (the old duplicate-run
+  # behavior). The actual glob-matching rules live in a tested script —
+  # `scripts/ci/docs_only_change.py` — rather than bash-in-YAML.
+  decide:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # This gate only needs commit history + paths, never blob content —
+          # `filter: blob:none` keeps the "cheap gate" claim true against a
+          # repo whose `.git` directory is otherwise hundreds of MB.
+          filter: blob:none
+
+      - name: Decide whether this push needs an image build
+        id: decide
+        # SHAs travel through `env:` rather than being interpolated directly
+        # into the `run:` script — cheap hygiene per the security playbook
+        # (untrusted-looking template expressions belong in env vars, not
+        # inline in shell), even though both values are GitHub-computed and
+        # not attacker-controlled today. The script itself re-validates each
+        # against a strict SHA-shaped regex before it ever reaches `git`.
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          output=$(python3 scripts/ci/docs_only_change.py "$BEFORE_SHA" "$HEAD_SHA")
+          echo "$output" | head -1 >> "$GITHUB_OUTPUT"
+          echo "$output" | tail -1
+
   # Tests + lint live in `ci.yml` (the sharded `test-shard` matrix and the
   # `lint` job). `release.yml` is the image-build pipeline only — it no
   # longer re-runs the suite, which previously meant the full ~10 min test
@@ -67,14 +102,16 @@ jobs:
   # accepted cost of not running the suite twice. `build-and-push` is gated
   # only by its own `if:` below.
   build-and-push:
+    needs: decide
     # Publish on:
-    #   - any push (main → :stable-* / non-main → :dev-* + :dev-<slug>);
-    #   - branch creation (a fresh branch off main with no extra commits
-    #     should still produce a `:dev-<slug>` + `:dev-<prefix>-latest`
-    #     image so the developer's VM, which pins to that floating tag,
-    #     can deploy main's exact state without manually changing code);
-    #   - manual workflow_dispatch.
-    # Tag creates are excluded — `keboola-deploy.yml` owns tag pushes.
+    #   - any push whose diff isn't docs-only per the `decide` job above
+    #     (main → :stable-* / non-main → :dev-* + :dev-<slug>) — this also
+    #     covers a zero-diff branch-create push (a fresh branch off main with
+    #     no extra commits should still produce a `:dev-<slug>` +
+    #     `:dev-<prefix>-latest` image so a developer's VM, pinned to that
+    #     floating tag, can deploy main's exact state; `decide` always
+    #     returns build=true for a before-SHA of all zeros);
+    #   - manual workflow_dispatch (never gated by `decide`).
     # `*-autopilot` branches are excluded: they are short-lived per-issue PR
     # branches that no VM pins to, so a `:dev-<slug>` image is pure waste —
     # and worse, each force-push (rebase / review fix) cancels the prior run
@@ -84,11 +121,22 @@ jobs:
     # makes every autopilot PR look broken. Skipping the dev-image build for
     # these branches keeps them visually clean without touching main, real
     # dev branches, or the merge gate.
+    #
+    # `always() && ... != 'false'` (not `== 'true'`) is deliberate: without
+    # an explicit status function, `needs: decide` defaults to implicit
+    # `success()`, so an infra blip in `decide` (e.g. a flaky checkout) would
+    # SKIP `build-and-push` on `main` — and even on `workflow_dispatch`,
+    # despite the comment above claiming that trigger is never gated by
+    # `decide`, since a failed/skipped dependency skips its dependents
+    # regardless of the `event_name` branch of the condition. `always()`
+    # makes this job's own `if:` the only thing that decides whether it
+    # runs, and comparing against `!= 'false'` fails OPEN on a missing/empty
+    # output (a `decide` failure never sets its output at all) exactly like
+    # every other uncertain case in `scripts/ci/docs_only_change.py`.
     if: |
-      !endsWith(github.ref, '-autopilot') && (
-        github.event_name == 'push' ||
+      always() && !endsWith(github.ref, '-autopilot') && (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'create' && github.event.ref_type == 'branch')
+        (github.event_name == 'push' && needs.decide.outputs.build != 'false')
       )
     runs-on: ubuntu-latest
     outputs:

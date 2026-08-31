@@ -489,6 +489,40 @@ def test_list_filters_by_publisher_kind_and_owner_split(store_repos):
     assert [i["id"] for i in theirs] == ["e-theirs"]
 
 
+def test_list_includes_granted_hidden_entities(store_repos):
+    """`include_ids` is the browse half of a `store_entity` grant: a hidden
+    entity a group holds a grant for belongs in that group's listing, because
+    private means "not everyone", not "nobody but me". Hand-maintained in two
+    dialects beside `include_owner_id`, so both are asserted."""
+    repos, _, _ = store_repos
+    repos["users"].create(id="user-1", email="alice@x.com", name="Alice")
+    se = repos["entities"]
+    _make_entity(se, id="e-pub", name="public-skill", visibility_status="approved")
+    _make_entity(se, id="e-shared", name="shared-skill", visibility_status="hidden")
+    _make_entity(se, id="e-secret", name="secret-skill", visibility_status="hidden")
+
+    plain, _ = se.list(visibility_status=["approved"])
+    assert [i["id"] for i in plain] == ["e-pub"]
+
+    granted, total = se.list(visibility_status=["approved"], include_ids=["e-shared"])
+    assert sorted(i["id"] for i in granted) == ["e-pub", "e-shared"]
+    assert total == 2, "the count has to agree with the rows, or paging lies"
+
+    # ...and only what was granted: the id list is matched, not counted.
+    assert "e-secret" not in [i["id"] for i in granted]
+
+
+def test_granted_archived_entities_stay_out_of_browse(store_repos):
+    """Archived is admin-only across browse — the same carve-out
+    `include_owner_id` makes for the caller's own rows."""
+    repos, _, _ = store_repos
+    repos["users"].create(id="user-1", email="alice@x.com", name="Alice")
+    se = repos["entities"]
+    _make_entity(se, id="e-gone", name="archived-skill", visibility_status="archived")
+    rows, _ = se.list(visibility_status=["approved"], include_ids=["e-gone"])
+    assert [i["id"] for i in rows] == []
+
+
 def test_list_filters_by_verification_state(store_repos):
     repos, _, _ = store_repos
     repos["users"].create(id="user-1", email="alice@x.com", name="Alice")

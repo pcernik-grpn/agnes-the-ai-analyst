@@ -930,19 +930,19 @@ def test_wrong_correction_reattaches_after_the_subject_is_deleted_and_recreated(
 
 
 def test_merge_facts_unions_claims_and_aliases_then_split_reverses_it(pg_env, repo):
-    doc_id = _seed_ready_doc(pg_env, text="Myers Diligence work started. Myers-Diligence continued.")
+    doc_id = _seed_ready_doc(pg_env, text="Fabrikam Diligence work started. Fabrikam-Diligence continued.")
     repo.ingest_batch(
         nodes=[
-            _node("engagement:myers-diligence", doc_id, "Myers Diligence work started."),
+            _node("engagement:fabrikam-diligence", doc_id, "Fabrikam Diligence work started."),
         ]
     )
-    duplicate_id = repo.create_fact(type="engagement", natural_key="engagement:myers-dilligence")  # misspelling
+    duplicate_id = repo.create_fact(type="engagement", natural_key="engagement:fabrikam-dilligence")  # misspelling
     repo.add_claim(
         fact_id=duplicate_id,
         corpus_file_id="cf_a1",
         corpus_id=CORPUS_A,
         file_sha256="sha1",
-        quote="Myers-Diligence continued.",
+        quote="Fabrikam-Diligence continued.",
     )
     canonical_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
     if canonical_id == duplicate_id:
@@ -955,7 +955,7 @@ def test_merge_facts_unions_claims_and_aliases_then_split_reverses_it(pg_env, re
     merged = repo.search(_admin(), type="engagement")
     assert len(merged["subjects"]) == 1
     assert merged["subjects"][0]["claim_count"] == 2
-    assert set(merged["subjects"][0]["aliases"]) == {"engagement:myers-diligence", "engagement:myers-dilligence"}
+    assert set(merged["subjects"][0]["aliases"]) == {"engagement:fabrikam-diligence", "engagement:fabrikam-dilligence"}
 
     new_id = repo.split_fact(canonical_id=canonical_id, snapshot=snapshot, split_by="admin1")
     after_split = repo.search(_admin(), type="engagement")

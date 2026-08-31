@@ -43,6 +43,7 @@ _FLAGS = (
     "AGNES_KNOWLEDGE_DIGESTS_ENABLED",
     "AGNES_CONTRIBUTE_SKILL_ENABLED",
     "AGNES_STORE_MODERATION_ENABLED",
+    "AGNES_DATA_APPS_ENABLED",
 )
 
 # Item rows from the GROUP sections only — see the module docstring for why the

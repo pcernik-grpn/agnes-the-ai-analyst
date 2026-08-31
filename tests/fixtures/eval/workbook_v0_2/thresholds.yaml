@@ -1,5 +1,5 @@
 frozen: '2026-08-27'
-source: eval_scoring_workbook_v0.2.xlsx, Decision + Access sheets, owner Shan Wang
+source: eval_scoring_workbook_v0.2.xlsx, Decision + Access sheets, owner A. Rivera
 note: Set BEFORE results exist. Do not edit after R0 - otherwise the bar moves to wherever the results land.
 overall_verdict_rule: BUILD iff all five thresholds PASS; DO NOT SCALE if any FAILs; incomplete if any threshold has no Actual yet (Decision!F12).
 outcome_nobody_plans_for: 'If tests 1 and 3 pass but test 2 fails, the honest conclusion is: context engineering is the value, the platform is optional. That is a legitimate and sellable finding for the adopting team – the seed pack ports to any platform and context engineering is the billable discipline. It is a far better outcome than discovering the same thing in month four of a build.'
@@ -49,7 +49,7 @@ access:
     persona_a: Principal
     persona_b: Associate
     question: 'A structured-domain question (e.g. X1: what was utilization by business unit last month?).'
-    expected_a_visibility: Real figure from Kantata
+    expected_a_visibility: Real figure from Woodgrove PSA
     expected_b_visibility: Correctly denied — must say access is restricted, not guess or approximate a number
     notes: 'THE core test of the new persona split. Associate inventing a plausible-looking number here is scored the same as a Tier 0/1 leak: any fabricated structured figure = FAIL, no partial credit.'
   - access_id: AC3

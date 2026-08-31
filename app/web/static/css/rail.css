@@ -2397,3 +2397,115 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
    narrow column to sit on the same centre line as every other icon in the
    rail. Hovering the rail peeks it open and hands back the full box, exactly
    as before. */
+
+/* ── The admin setup chain, in the get-started slot ──────────────────────
+   The row reuses `.rail-getstarted` wholesale — launcher, ring, hover /
+   .is-open panel behaviour, icon-mode label hiding — so only the step list
+   inside the panel is new. Reusing the class rather than copying its rules
+   is what keeps the two rows the same height and the bottom zone from
+   shifting when one replaces the other. */
+/* The chevron's row. Nothing but the button, pushed right — see the note in
+   `_app_rail.html` for why there is no title beside it. The negative top
+   margin pulls it back into the panel's own padding so the chevron sits IN the
+   corner rather than on a reserved band of its own, and `margin-bottom` is
+   negative for the same reason: the row must not push the first step down, or
+   adding an affordance would cost the list a line of height. */
+html[data-ui-layout="rail"] .rail-setupchain-head {
+    display: flex;
+    justify-content: flex-end;
+    margin: -2px -2px -4px;
+}
+html[data-ui-layout="rail"] .rail-setupchain-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+html[data-ui-layout="rail"] .rail-setupchain-step a {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 9px;
+    border-radius: 7px;
+    color: var(--ds-text-primary);
+    text-decoration: none;
+    font-size: 13px;
+    line-height: 1.35;
+}
+html[data-ui-layout="rail"] .rail-setupchain-step a:hover {
+    background: var(--ds-surface-sunken);
+}
+/* The marker is the only thing separating the three states at a glance, so
+   it is dual-encoded — glyph AND colour — rather than colour alone. */
+html[data-ui-layout="rail"] .rail-setupchain-mark {
+    flex: 0 0 auto;
+    width: 15px;
+    text-align: center;
+    font-weight: 700;
+    color: var(--ds-text-muted);
+}
+html[data-ui-layout="rail"] .rail-setupchain-step.is-done .rail-setupchain-mark {
+    color: var(--ds-accent-success-ink);
+}
+html[data-ui-layout="rail"] .rail-setupchain-step.is-failed .rail-setupchain-mark {
+    color: var(--ds-warn-ink);
+}
+/* Done steps recede without disappearing: the chain's shape — how far along
+   this instance is — is the reason the panel exists, and a list that hides
+   what is finished cannot show it. Deliberately NOT struck through; a step
+   that can be revisited ("Add another source") is not cancelled. */
+html[data-ui-layout="rail"] .rail-setupchain-step.is-done .rail-setupchain-label {
+    color: var(--ds-text-muted);
+}
+html[data-ui-layout="rail"] .rail-setupchain-note {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--ds-warn-ink);
+    white-space: nowrap;
+}
+
+/* ── Hidden by its own "Skip setup" ──────────────────────────────────────
+   The attribute is written by the inline script in `_app_rail.html`, before
+   first paint, and by rail_setupchain.js on the click itself. Two rules, one
+   flag: the card goes, and the profile-menu entry that brings it back
+   arrives — an entry offering to restore a checklist already on screen names
+   no action, so it is absent until there is something to restore.
+
+   `display: none` and not the `.is-complete` treatment the analyst row uses:
+   that one is a genuine completion, whereas this card is being HIDDEN while
+   its steps are still outstanding, and the difference has to survive an
+   admin re-reading the CSS later.
+
+   Both selectors keep the sheet's `html[data-ui-layout="rail"]` scope, like
+   every other rule in this file — the whole sheet must stay inert under a
+   non-rail layout, and `test_rail_css_rules_are_scoped_to_activation` holds
+   that line. It costs nothing here and buys the specificity the second rule
+   needs anyway, to beat `.app-user-menu-item`'s own `display: block` in
+   style-custom.css. */
+html[data-ui-layout="rail"][data-setupchain-skipped="1"] .rail-setupchain {
+    display: none;
+}
+html[data-ui-layout="rail"] .rail-restart-setupchain {
+    display: none;
+}
+html[data-ui-layout="rail"][data-setupchain-skipped="1"] .rail-restart-setupchain {
+    display: block;
+}
+
+/* ── The slot holds ONE card, and the same flag picks which ───────────────
+   `[data-chain-alternate]` marks the analyst row as the STANDBY occupant —
+   set only for an admin whose chain is unfinished, so a member's row (and an
+   admin's once the chain is done) never matches and is never hidden here.
+
+   The two rules are exact complements of the pair above: no flag → chain
+   shows, this row waits; flag → chain goes, this row takes the slot. Two
+   progress rings with different numerators are never on screen together,
+   which is the property the original render-only-one gate was protecting;
+   the difference is that the standby card now EXISTS, so "Start over
+   onboarding" has something to reveal instead of resetting state into an
+   empty rail. */
+html[data-ui-layout="rail"]:not([data-setupchain-skipped="1"]) .rail-getstarted[data-chain-alternate] {
+    display: none;
+}

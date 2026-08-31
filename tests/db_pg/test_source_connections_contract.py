@@ -135,3 +135,34 @@ def test_update_promotes_default_and_demotes_siblings(repo):
     repo.update("c2", is_default=False)
     assert not repo.get("c2")["is_default"]
     assert repo.get_default("keboola") is None
+
+
+def test_config_patch_merges_top_level_keys_without_touching_others(repo):
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"stack_url": "https://a", "keep": "me"})
+    row = repo.config_patch("c1", {"acl_sync_last_run": {"ok": True}})
+    assert row["id"] == "c1"
+    assert row["config"]["acl_sync_last_run"] == {"ok": True}
+    assert row["config"]["stack_url"] == "https://a"
+    assert row["config"]["keep"] == "me"
+    # Persisted, not just returned.
+    assert repo.get("c1")["config"]["acl_sync_last_run"] == {"ok": True}
+
+
+def test_config_patch_unknown_id_returns_none(repo):
+    assert repo.config_patch("nope", {"k": "v"}) is None
+
+
+def test_config_patch_preserves_concurrently_written_other_key(repo):
+    # Regression for NB-1: a patch of ONE key must not clobber a DIFFERENT
+    # key some other writer already committed after this caller's own last
+    # read of the row (config_patch re-reads fresh rather than trusting a
+    # caller-held snapshot).
+    repo.create(id="c1", name="a", source_type="sharepoint", config={"scopes": []})
+    stale_snapshot = repo.get("c1")  # e.g. what a long-running sync holds onto
+    # A concurrent writer (e.g. the weekly sweep) commits its own key first.
+    repo.config_patch("c1", {"acl_sweep_last_full": "2026-08-30T00:00:00+00:00"})
+    # The sync patches its own key without ever re-reading `stale_snapshot`.
+    assert "acl_sweep_last_full" not in (stale_snapshot["config"] or {})
+    row = repo.config_patch("c1", {"acl_sync_last_run": {"ok": True}})
+    assert row["config"]["acl_sweep_last_full"] == "2026-08-30T00:00:00+00:00"
+    assert row["config"]["acl_sync_last_run"] == {"ok": True}

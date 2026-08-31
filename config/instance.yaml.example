@@ -1378,6 +1378,45 @@ studio:
   enabled: false
 
 
+# --- SharePoint ACL mirroring (optional, off by default) ---
+# Mirrors source-system (SharePoint) permissions into Agnes — groups,
+# memberships, collection grants, broken-inheritance exclusions and
+# index-time audience variants — as a third source-segregated sync writer
+# (the same pattern as the Google-nightly group sync). See
+# docs/superpowers/specs/2026-08-28-sharepoint-acl-mirroring-design.md.
+#
+# `acl_mirroring.enabled` / `acl_sync.guarantee_mode` / `acl_sync.
+# max_stale_hours` are registered switches (app/switches.py) — set them
+# here, via the settings panel, or their env vars (see
+# docs/feature-flags.md), not by hand-editing some other key.
+# acl_mirroring:
+#   # Gates the sharepoint-acl-sync job, per-scope access_mode='mirrored',
+#   # and the admin sync-now endpoint. OFF by default — turning it on
+#   # changes nothing until a scope opts into mirroring. Env override:
+#   # AGNES_ACL_MIRRORING_ENABLED.
+#   enabled: false
+#
+# acl_sync:
+#   # Cross-audience-leak posture (design Q7). must_not (default): fail
+#   # closed — broken-inheritance subtrees are always excluded, mirrored
+#   # grants are suspended past max_stale_hours below, and untagged claims
+#   # in an audience-tiered scope are admin-only. should_not: best effort —
+#   # advisory overrides allowed, stale grants persist with warnings,
+#   # untagged claims stay unrestricted within their collection. Env
+#   # override: AGNES_ACL_GUARANTEE_MODE.
+#   guarantee_mode: "must_not"       # must_not | should_not
+#   # must_not mode only: hours a failed ACL sync may leave mirrored grants
+#   # standing before they are suspended (deleted until the next successful
+#   # sync rewrites them). Env override: AGNES_ACL_MAX_STALE_HOURS.
+#   max_stale_hours: 72
+#   # Days between full sharepoint-subtree-sweep passes (broken-inheritance
+#   # folder detection) for one connection's mirrored scopes. The scheduler
+#   # row itself already fires weekly (native cron) — this is a
+#   # per-connection self-guard against a restart-refire, not the primary
+#   # cadence. Env override: AGNES_ACL_SWEEP_INTERVAL_DAYS.
+#   sweep_interval_days: 7
+
+
 # --- Initial Workspace Template (optional) ---
 #
 # When configured, Agnes serves the contents of <repo>/workspace/ to analysts

@@ -1808,6 +1808,179 @@ class TestFilePreview:
         assert outside_err.value.detail == "file_not_found"
 
 
+class TestTieredAudienceDocumentText:
+    """SharePoint ACL-mirroring Slice 4c (2026-08-30 plan, Task 11): a
+    TIERED collection's document TEXT — raw bytes, text preview, and
+    chunk-backed search snippets — is narrowed to the caller holding the
+    scope's top audience class (or an admin); collection *reachability* is
+    unaffected. See ``app.api.collections._document_text_visible``.
+    """
+
+    def _tiered_collection(self, seeded_app, name: str) -> tuple[str, str]:
+        """A collection reachable by both ``analyst1`` and ``km_admin1``
+        (Everyone grant) whose SharePoint scope carries two audience classes
+        — ``full`` (most-privileged, held by ``analyst1`` alone via a
+        dedicated group) and ``redacted`` (nobody). Same ``config.scopes``
+        shape ``app/api/admin_sharepoint.py::confirm_scope`` persists (Task
+        8), matching ``tests/test_audience_classes.py``'s seeding idiom.
+        """
+        import uuid
+
+        from src.repositories import source_connections_repo, user_group_members_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        r = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 201, r.text
+        cid = r.json()["id"]
+        _seed_collection_grant(cid, "analyst1")
+        _seed_collection_grant(cid, "km_admin1")
+
+        top_group = user_groups_repo().create(name=f"top-{uuid.uuid4().hex[:8]}")["id"]
+        user_group_members_repo().add_member("analyst1", top_group, source="admin", added_by="test")
+
+        source_connections_repo().create(
+            id=uuid.uuid4().hex,
+            name=f"sp-{cid}",
+            source_type="sharepoint",
+            config={
+                "scopes": [
+                    {
+                        "source_scope_id": f"drive:{cid}",
+                        "display_path": name,
+                        "collection_id": cid,
+                        "audience_classes": [
+                            {"name": "full", "group_ids": [top_group]},
+                            {"name": "redacted", "group_ids": []},
+                        ],
+                    }
+                ]
+            },
+        )
+        return cid, top_group
+
+    def _upload(self, seeded_app, cid: str, filename: str, body: bytes, ctype: str) -> str:
+        r = seeded_app["client"].post(
+            f"/api/collections/{cid}/files",
+            files={"files": (filename, io.BytesIO(body), ctype)},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code in (200, 201, 422), r.text
+        return r.json()[0]["file_id"]
+
+    def test_top_class_caller_gets_raw_and_preview(self, seeded_app):
+        cid, _top_group = self._tiered_collection(seeded_app, "Tiered Top")
+        text_fid = self._upload(seeded_app, cid, "notes.md", b"# Title\n\ntop secret body", "text/markdown")
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 40
+        img_fid = self._upload(seeded_app, cid, "shot.png", png, "image/png")
+
+        c = seeded_app["client"]
+        tok = _auth(seeded_app["analyst_token"])
+
+        preview = c.get(f"/api/collections/{cid}/files/{text_fid}/preview", headers=tok)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["kind"] == "text"
+        assert "top secret body" in preview.json()["text"]
+
+        raw = c.get(f"/api/collections/{cid}/files/{img_fid}/raw", headers=tok)
+        assert raw.status_code == 200, raw.text
+        assert raw.content == png
+
+    def test_lower_class_caller_gets_404_raw_and_no_text_preview(self, seeded_app):
+        cid, _top_group = self._tiered_collection(seeded_app, "Tiered Lower")
+        text_fid = self._upload(seeded_app, cid, "notes.md", b"# Title\n\ntop secret body", "text/markdown")
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 40
+        img_fid = self._upload(seeded_app, cid, "shot.png", png, "image/png")
+
+        c = seeded_app["client"]
+        # km_admin1 holds the collection grant (reachable) but no audience class.
+        tok = _auth(seeded_app["km_admin_token"])
+
+        preview = c.get(f"/api/collections/{cid}/files/{text_fid}/preview", headers=tok)
+        assert preview.status_code == 200, preview.text
+        body = preview.json()
+        assert body["kind"] == "none"
+        assert body["reason"]
+        assert body.get("text") is None
+
+        raw = c.get(f"/api/collections/{cid}/files/{img_fid}/raw", headers=tok)
+        assert raw.status_code == 404, raw.text
+        assert raw.json()["detail"] == "file_not_found"
+
+    def test_admin_sees_regardless_of_audience_class(self, seeded_app):
+        cid, _top_group = self._tiered_collection(seeded_app, "Tiered Admin")
+        text_fid = self._upload(seeded_app, cid, "notes.md", b"# Title\n\ntop secret body", "text/markdown")
+        png = b"\x89PNG\r\n\x1a\n" + b"0" * 40
+        img_fid = self._upload(seeded_app, cid, "shot.png", png, "image/png")
+
+        c = seeded_app["client"]
+        tok = _auth(seeded_app["admin_token"])
+
+        preview = c.get(f"/api/collections/{cid}/files/{text_fid}/preview", headers=tok)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["kind"] == "text"
+        assert "top secret body" in preview.json()["text"]
+
+        raw = c.get(f"/api/collections/{cid}/files/{img_fid}/raw", headers=tok)
+        assert raw.status_code == 200, raw.text
+        assert raw.content == png
+
+    def test_search_excludes_tiered_chunks_below_top_class_admin_sees_all(self, seeded_app):
+        cid, _top_group = self._tiered_collection(seeded_app, "Tiered Search")
+        from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+        fid = corpus_files_repo().add(
+            corpus_id=cid, filename="d.txt", sha256="s", file_type="txt", size_bytes=1, storage_path="/x"
+        )
+        corpus_chunks_repo().add_many(
+            [{"corpus_id": cid, "file_id": fid, "ordinal": 0, "text": "the confidential keyword appears here"}]
+        )
+
+        c = seeded_app["client"]
+
+        top = c.get(
+            "/api/collections/search",
+            params={"q": "confidential keyword"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert top.status_code == 200, top.text
+        assert any("confidential" in (r.get("text") or "") for r in top.json()["results"])
+
+        lower = c.get(
+            "/api/collections/search",
+            params={"q": "confidential keyword"},
+            headers=_auth(seeded_app["km_admin_token"]),
+        )
+        assert lower.status_code == 200, lower.text
+        # The collection is still reachable (Everyone grant) — the chunk is
+        # silently excluded, not turned into an access-denied hint.
+        assert lower.json()["results"] == []
+
+        admin = c.get(
+            "/api/collections/search",
+            params={"q": "confidential keyword"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert admin.status_code == 200, admin.text
+        assert any("confidential" in (r.get("text") or "") for r in admin.json()["results"])
+
+    def test_plain_collection_regression_unchanged(self, seeded_app):
+        """Non-tiered collection: raw/preview/search behave exactly as before
+        Task 11 — ``top_class_for`` has no entry, so ``_document_text_visible``
+        is always True and this is byte-for-byte the pre-existing behavior."""
+        c = seeded_app["client"]
+        r = c.post("/api/collections", json={"name": "Plain Regression"}, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 201, r.text
+        cid = r.json()["id"]
+        _seed_collection_grant(cid, "analyst1")
+        fid = self._upload(seeded_app, cid, "notes.md", b"plain text body", "text/markdown")
+
+        tok = _auth(seeded_app["analyst_token"])
+        preview = c.get(f"/api/collections/{cid}/files/{fid}/preview", headers=tok)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["kind"] == "text"
+        assert "plain text body" in preview.json()["text"]
+
+
 class TestListingPastTheRepoCap:
     """A 201st collection is still listed and still authorized.
 

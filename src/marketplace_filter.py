@@ -185,6 +185,25 @@ def required_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: 
     }
 
 
+def granted_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | None) -> set[str]:
+    """``store_entities.id`` values granted to any of the user's groups, at any
+    tier.
+
+    Its Required sibling above answers "what must this person carry"; this
+    answers "what may they be served". Private stops meaning "nobody but me"
+    and starts meaning "not everyone", so a hidden entity a group was granted
+    reaches its members — which the grant always looked like it did.
+
+    Same reason as the sibling for living here rather than importing from
+    ``app.auth.access``: the serve path stays importable without the app.
+    """
+    group_ids = _user_group_ids(user_id, conn) if user_id else set()
+    if not group_ids:
+        return set()
+    rows = resource_grants_repo().list_for_groups(list(group_ids), "store_entity")
+    return {r["resource_id"] for r in rows if r.get("resource_id")}
+
+
 def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | None) -> set[tuple[str, str]]:
     """``(marketplace_id, plugin_name)`` keys held at the ``required`` tier
     by any of the user's groups.
@@ -673,7 +692,9 @@ def resolve_user_marketplace(
     required_entity_ids = required_store_entity_keys(conn, user_id)
     if required_entity_ids:
         installs_repo.install_required_for_user(user_id, sorted(required_entity_ids))
-    installs = installs_repo.list_for_user(user_id)
+    # A granted hidden entity is served to the group it was granted to; the
+    # repo does not read grants, so the set is resolved here.
+    installs = installs_repo.list_for_user(user_id, sorted(granted_store_entity_keys(conn, user_id)))
     if store_install_filter is not None:
         installs = [row for row in installs if store_install_filter(row)]
     store_plugin_entries: List[dict] = []
