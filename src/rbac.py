@@ -48,11 +48,24 @@ def table_not_in_stack_message(table_id: str) -> str:
     "then run `agnes pull` to refresh" tail would name a next step that
     cannot work. Same convention as ``cli/query_hints.py``: a denial says
     what to do next, and only things that actually help.
+
+    An internal table whose source exists only on Postgres (``agnes_turns``)
+    gets a third wording on a DuckDB-backed instance: it is not registered
+    there at all, so the package sentence would send the analyst to an admin
+    for a grant they may already hold and that could never surface the table.
     """
     from connectors.internal.access import is_internal_table
 
     if is_internal_table(table_id):
-        from connectors.internal.registry import USAGE_PACKAGE_SLUG
+        from connectors.internal.registry import USAGE_PACKAGE_SLUG, internal_table_available
+
+        if not internal_table_available(table_id):
+            return (
+                f"Table '{table_id}' is not available on this instance: it "
+                f"projects app state that exists only on the Postgres backend, "
+                f"and this server runs the DuckDB backend. Run `agnes catalog` "
+                f"for the tables this instance does serve."
+            )
 
         return (
             f"Table '{table_id}' is not in your stack. It carries your own "

@@ -24,6 +24,7 @@ from connectors.internal.registry import (
     USAGE_PACKAGE_SLUG,
     ensure_internal_package_seeded,
     ensure_internal_tables_registered,
+    registrable_internal_tables,
 )
 from src.db import _ensure_schema
 from src.repositories import data_packages_repo
@@ -75,7 +76,12 @@ def test_fresh_boot_seeds_package_with_every_internal_table(system_db):
     assert pkg["publisher_kind"] == "organization"
     assert pkg["created_by"] == "system_seed"
 
-    assert _member_ids(pkg["id"]) == {t.registry_id for t in INTERNAL_TABLES}
+    # ``registrable_internal_tables()`` rather than ``INTERNAL_TABLES``: this
+    # fixture is DuckDB-backed, where a Postgres-only projection
+    # (``agnes_turns`` → ``usage_turns``) is deliberately neither registered
+    # nor packaged. Its own coverage is
+    # tests/test_agnes_turns_internal_table.py + the db_pg twin.
+    assert _member_ids(pkg["id"]) == {t.registry_id for t in registrable_internal_tables()}
 
 
 # ---------------------------------------------------------------------------
@@ -150,14 +156,18 @@ def test_removed_member_is_not_re_added_but_a_brand_new_table_is(system_db, monk
     # An admin decides the audit log does not belong in the package.
     assert repo.remove_table(pkg_id, "agnes_audit") is True
 
-    # A later release ships a fourth internal table.
+    # A later release ships one more internal table. The id is fictional on
+    # purpose: every REAL id is either already a member here or (like
+    # ``agnes_turns``, which projects Postgres-only state) deliberately not
+    # registrable on this DuckDB fixture, and neither can stand in for
+    # "appears for the first time".
     future = InternalTable(
-        registry_id="agnes_turns",
-        source_table="usage_turns",
+        registry_id="agnes_future",
+        source_table="usage_future",
         filter_column="user_id",
         filter_kind="user_id",
-        display_name="Agnes turns",
-        description="Per-turn token usage.",
+        display_name="Agnes future",
+        description="A table a later release adds.",
     )
     monkeypatch.setattr(
         "connectors.internal.registry.INTERNAL_TABLES",
@@ -167,7 +177,7 @@ def test_removed_member_is_not_re_added_but_a_brand_new_table_is(system_db, monk
     _boot()
 
     members = _member_ids(pkg_id)
-    assert "agnes_turns" in members, "a first-time internal table joins the package"
+    assert "agnes_future" in members, "a first-time internal table joins the package"
     assert "agnes_audit" not in members, "an admin's removal must stick across boots"
 
 
@@ -204,7 +214,9 @@ def test_registration_reports_only_freshly_inserted_ids(system_db):
     """The add-once key: an id is 'new' exactly once — the boot that first
     inserts its ``table_registry`` row."""
     first = ensure_internal_tables_registered()
-    assert first == {t.registry_id for t in INTERNAL_TABLES}
+    # Only what this backend registers at all — see the note in the fresh-boot
+    # test above.
+    assert first == {t.registry_id for t in registrable_internal_tables()}
 
     second = ensure_internal_tables_registered()
     assert second == set()

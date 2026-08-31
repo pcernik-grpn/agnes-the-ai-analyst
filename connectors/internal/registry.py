@@ -21,10 +21,19 @@ from __future__ import annotations
 import logging
 from typing import Collection, Optional
 
-from connectors.internal.access import INTERNAL_TABLES
-from src.repositories import data_packages_repo, table_registry_repo
+from connectors.internal.access import INTERNAL_TABLES, InternalTable
+from src.repositories import data_packages_repo, table_registry_repo, use_pg
 
 logger = logging.getLogger(__name__)
+
+#: Internal tables whose PHYSICAL source table exists only on the Postgres
+#: app-state backend. ``usage_turns`` arrived after the A3 freeze (Alembic
+#: revision ``0094_usage_turns``; the DuckDB ladder deliberately has no
+#: matching ``_vN_to_v(N+1)`` step), so on a DuckDB-backed instance a
+#: ``table_registry`` row for it would advertise a table that is not there —
+#: /catalog would list it and every query against it would fail. The id is
+#: therefore not registered at all there, and an existing row is pruned.
+PG_ONLY_INTERNAL_TABLE_IDS: frozenset[str] = frozenset({"agnes_turns"})
 
 #: Stable identity of the seeded package that carries the internal tables.
 #: The slug — not the name or the generated id — is what grants, tests and
@@ -36,6 +45,27 @@ USAGE_PACKAGE_DESCRIPTION = (
     "telemetry, and the audit trail of actions performed against this "
     "instance. Members see only their own rows; admins see everything."
 )
+
+
+def internal_table_available(table_id: str) -> bool:
+    """True when *table_id* can exist in ``table_registry`` on THIS instance.
+
+    False only for a :data:`PG_ONLY_INTERNAL_TABLE_IDS` member while the
+    active app-state backend is DuckDB. Callers that need to explain a denial
+    (``src.rbac.table_not_in_stack_message``) use this to say "not available
+    here" rather than pointing at a Data Package that cannot carry the table.
+    """
+    return table_id not in PG_ONLY_INTERNAL_TABLE_IDS or use_pg()
+
+
+def registrable_internal_tables() -> tuple[InternalTable, ...]:
+    """The internal tables this instance's backend can actually serve.
+
+    Read from the module-level ``INTERNAL_TABLES`` at CALL time (never
+    captured at import) so the set follows the active backend — and so a test
+    that patches the tuple still sees its own value.
+    """
+    return tuple(t for t in INTERNAL_TABLES if internal_table_available(t.registry_id))
 
 
 def ensure_internal_tables_registered() -> set[str]:
@@ -50,13 +80,22 @@ def ensure_internal_tables_registered() -> set[str]:
     (e.g. agnes_usage → agnes_telemetry). Without this the old row
     would linger in /catalog forever.
 
+    The set is narrowed to :func:`registrable_internal_tables` — on a
+    DuckDB-backed instance a Postgres-only id (``agnes_turns``) is neither
+    registered nor kept: it drops out of ``canonical_ids`` too, so a row left
+    behind by an instance that used to run on Postgres is pruned by the same
+    eviction that handles a rename. A registered id whose source table does
+    not exist is the one outcome to avoid — it would advertise the table in
+    /catalog and fail on every read.
+
     Returns the ids this call inserted for the FIRST time (a row that did
     not exist beforehand). That set is the add-once key
     :func:`ensure_internal_package_seeded` reconciles on — see its
     docstring. An id whose registration raised is never reported.
     """
     repo = table_registry_repo()
-    canonical_ids = [t.registry_id for t in INTERNAL_TABLES]
+    registrable = registrable_internal_tables()
+    canonical_ids = [t.registry_id for t in registrable]
     try:
         repo.delete_internal_except(canonical_ids)
     except Exception:
@@ -65,7 +104,7 @@ def ensure_internal_tables_registered() -> set[str]:
             "renamed internal tables may still appear under their old ids"
         )
     newly_registered: set[str] = set()
-    for table in INTERNAL_TABLES:
+    for table in registrable:
         # Read BEFORE the upsert: `register` is ON CONFLICT (id) DO UPDATE,
         # so afterwards a first insert is indistinguishable from the boot-th
         # refresh (it even resets `registered_at`). "Did the row exist?" is
@@ -125,7 +164,7 @@ def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]
     row-level filter is unchanged and independent: a member sees only their
     own rows, an admin sees everything.
 
-    Three things this must never do:
+    Four things this must never do:
 
     * **Duplicate.** Creation is keyed on the stable slug, not the name.
     * **Resurrect.** A soft-deleted package stays deleted — the delete was an
@@ -134,6 +173,9 @@ def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]
       because the slug is UNIQUE across live and deleted rows alike, so a
       missing *live* row alone cannot distinguish the two cases.
     * **Re-add a member an admin removed.** Membership is add-once per id.
+    * **Offer a table this backend cannot serve.** Membership follows
+      :func:`registrable_internal_tables`, so a Postgres-only id never
+      reaches the FK on a DuckDB instance.
 
     The add-once mechanism: an id is offered to an existing package **only on
     the boot that first inserted its ``table_registry`` row** (what
@@ -165,11 +207,14 @@ def ensure_internal_package_seeded(*, newly_registered: Optional[Collection[str]
             pkg_id = _create_usage_package(repo)
             if pkg_id is None:
                 return
-            # First creation owns the full membership.
-            member_ids = [t.registry_id for t in INTERNAL_TABLES]
+            # First creation owns the full membership — of the tables this
+            # backend actually registered. The junction has an FK onto
+            # ``table_registry``, so offering an unregistered Postgres-only id
+            # here would just log a constraint violation every boot.
+            member_ids = [t.registry_id for t in registrable_internal_tables()]
         else:
             pkg_id = pkg["id"]
-            member_ids = [t.registry_id for t in INTERNAL_TABLES if t.registry_id in fresh]
+            member_ids = [t.registry_id for t in registrable_internal_tables() if t.registry_id in fresh]
         for table_id in member_ids:
             # Per-member so one failure doesn't cost the others their only
             # chance: add-once means a member skipped here is never retried.

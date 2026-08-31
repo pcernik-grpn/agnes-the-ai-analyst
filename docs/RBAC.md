@@ -47,8 +47,9 @@ or co-sessions, a `TABLE` grant has no live effect at all.
 ### Internal usage tables: the `agnes-usage` package
 
 The internal tables — `agnes_sessions` (Claude Code sessions),
-`agnes_telemetry` (tool/skill invocations) and `agnes_audit` (the audit
-trail) — are registered like any other table and are **members of a seeded
+`agnes_telemetry` (tool/skill invocations), `agnes_audit` (the audit trail)
+and, on Postgres-backed instances, `agnes_turns` (per-assistant-turn token
+usage) — are registered like any other table and are **members of a seeded
 data package with the stable slug `agnes-usage`** ("Agnes Usage"). Access
 works exactly like any other table:
 

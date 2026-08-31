@@ -65,14 +65,22 @@ block.
 
 ### Self-service usage data — the `agnes-usage` package
 
-Three of those trails are also queryable as ordinary tables, so a user can
-analyze their own usage with `agnes query` instead of an admin page:
+Those trails are also queryable as ordinary tables, so a user can analyze
+their own usage with `agnes query` instead of an admin page:
 
 | Table | Source | Row scope |
 |---|---|---|
 | `agnes_sessions` | `usage_session_summary` | own rows (non-admin) / all (admin) |
 | `agnes_telemetry` | `usage_events` | own rows (non-admin) / all (admin) |
 | `agnes_audit` | `audit_log` | own rows (non-admin) / all (admin) |
+| `agnes_turns` | `usage_turns` | own rows (non-admin) / all (admin) |
+
+`agnes_turns` (token usage per assistant turn, including prompt-cache reads
+and writes, across Claude Code and every chat surface) exists **only on
+Postgres-backed instances** — its source table has no DuckDB counterpart. On a
+DuckDB-backed instance the id is not registered at all: it never appears in
+`agnes catalog`, and a `SELECT` against it says the table is unavailable here
+rather than pointing at a package grant that could not surface it.
 
 They are server-side only — `agnes pull` never downloads them — and they are
 **members of a seeded data package with the slug `agnes-usage`**, so who may

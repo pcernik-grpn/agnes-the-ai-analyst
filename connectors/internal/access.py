@@ -93,6 +93,24 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
         display_name="Agnes audit log",
         description="Server-side actions performed against Agnes. Also available locally for analysis.",
     ),
+    # Postgres-only: `usage_turns` landed after the A3 freeze (Alembic
+    # revision 0094, no `src/db.py` ladder step), so it exists on the
+    # Postgres app-state backend alone. The tuple is static — the derived
+    # constants below are built at import time — and the BACKEND decides
+    # whether the id is registered, in
+    # `connectors.internal.registry.ensure_internal_tables_registered`. No
+    # `legacy_username_column`: `usage_turns` has no `username` column, so
+    # the OR fallback the older tables carry would be a Binder error here.
+    InternalTable(
+        registry_id="agnes_turns",
+        source_table="usage_turns",
+        filter_column="user_id",
+        filter_kind="user_id",
+        display_name="Agnes turns",
+        description=(
+            "Per-assistant-turn token usage (incl. cache) across Claude Code and chat. Postgres-backed instances only."
+        ),
+    ),
 )
 
 INTERNAL_TABLES_BY_ID: dict[str, InternalTable] = {t.registry_id: t for t in INTERNAL_TABLES}
