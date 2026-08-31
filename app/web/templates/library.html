@@ -626,7 +626,6 @@
     border-radius: 9px;
   }
   .lib-loaderr svg { width: 16px; height: 16px; flex: none; margin-top: 1px; }
-  .lib-lede { margin: 3px 0 0; max-width: 68ch; font-size: 13px; line-height: 1.45; color: var(--ds-text-muted); }
   /* The controls left the title row for the browsing block above the list —
      `.lib-head__controls` is kept as their class so the page-scoped `.fbar`
      rules below still address exactly this toolbar and not /chats's. */
@@ -672,10 +671,9 @@
   .library-page .lib-connect--foot .cbn h3,
   .library-page .lib-connect--foot .cbn strong { font-size: 13.5px; }
   .library-page .lib-connect--foot .cbn p { font-size: 12.5px; }
-  .lib-head h1 { font-size: 22px; margin: 0 0 2px; display: flex; align-items: center; gap: 10px; }
+  .lib-head h1 { display: flex; align-items: center; gap: 10px; }
   /* Metadata, not a subtitle: it states the size of the thing and gets out of
      the way. */
-  .lib-head .lede { color: var(--ds-text-muted); font-size: 12.5px; margin: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
   /* "+ Add" — a single primary button whose chevron opens the per-kind menu, so
      the page keeps one call to action as the Library grows more kinds. Rides
@@ -1949,7 +1947,7 @@
      is a property of a header that scrolls, not of a header. #}
   <div class="lib-head__bar">
     <div class="lib-head__titles">
-      <h1>Library</h1>
+      <h1 class="page-title">Library</h1>
       {# ONE sentence, permanent, not a dismissible banner. The page has two
          rules that look arbitrary until they are stated together — granted
          data needs no button while a skill does — and this is the whole of
@@ -1958,7 +1956,7 @@
          asymmetry above is the one thing a first-time reader gets wrong. The
          page's other banner sits BELOW the list, so this is the only prose
          above row one. #}
-      <p class="lib-lede">Everything here is what your agents can draw on. Your admin decides
+      <p class="page-lede">Everything here is what your agents can draw on. Your admin decides
         what data you can reach; you choose what your agents can do with it.</p>
       {# The count line. `#lib-item-count` is the element the filter engine
          rewrites, so it moved here whole rather than being duplicated. #}

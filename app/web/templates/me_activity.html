@@ -32,8 +32,6 @@
 /* ── Head band — the same anatomy as /me/profile's ── */
 .act-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 2px 0 0; }
 .act-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
-.act-head h1 { font-size: 24px; margin: 2px 0 0; }
-.act-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
 .act-head-acts { display: flex; align-items: center; gap: 10px; flex-shrink: 0; margin-top: 4px; }
 /* The tab strip is the head band's last row, so the shell flushes it against
    the content band below. It carries a top margin instead of the component's
@@ -102,8 +100,8 @@
 <div class="act-head">
   <div>
     <div class="act-kicker">Your account</div>
-    <h1>Activity</h1>
-    <p class="lede">Your Claude Code sessions, what they spent in tokens, the data they read, and when your workspace last synced.</p>
+    <h1 class="page-title">Activity</h1>
+    <p class="page-lede">Your Claude Code sessions, what they spent in tokens, the data they read, and when your workspace last synced.</p>
   </div>
   <div class="act-head-acts">
     <a class="cc-btn" href="/me/profile">Profile</a>
