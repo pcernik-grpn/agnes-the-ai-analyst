@@ -18,8 +18,8 @@ this feature shipped, and any producer build that doesn't yet send it)
 should read back as "no usage figure available", not "zero tokens spent",
 so ``NULL`` is the honest default, not ``'{}'::jsonb``.
 
-Revision ID: 0086_ingest_runs_llm_usage
-Revises: 0085_alias_edge_backfill
+Revision ID: 0088_ingest_runs_llm_usage
+Revises: 0087_corpus_file_events
 Create Date: 2026-08-31
 """
 

@@ -211,5 +211,5 @@ class IngestRun(Base):
     #: reported usage (every run before this feature, or a producer build
     #: that doesn't send it yet) reads back as "no figure available", never
     #: a fabricated `{}`/zero — see
-    #: ``migrations/versions/0086_ingest_runs_llm_usage.py``.
+    #: ``migrations/versions/0088_ingest_runs_llm_usage.py``.
     llm_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
