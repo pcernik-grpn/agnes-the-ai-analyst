@@ -1300,6 +1300,7 @@ async function deleteSession(chatId) {
   await loadSidebar();
   if (currentChatId === chatId) {
     currentChatId = null;
+    _syncSessionUrl(null);
     markActiveSidebar(null);
     if (ws) { ws.close(); ws = null; }
     $("chat-messages").innerHTML = "";
@@ -1352,6 +1353,33 @@ function _takeAgentSlugFromUrl() {
     return slug;
   } catch (_) {
     return null;
+  }
+}
+
+/** Keep ``?session=<id>`` in the address bar aligned with the OPEN
+ * conversation (issue #1914) — refreshing re-reads this into
+ * ``data-initial-session`` (chat.html) and reopens the same session instead
+ * of landing on a brand-new "Untitled chat" every time.
+ *
+ * Same replaceState pattern as ``_takeAgentSlugFromUrl`` above: no
+ * ``pushState`` (this page wires no ``popstate`` handling, so a history
+ * entry per open would just be dead Back-button clutter), and every other
+ * param (``?q=``, …) survives untouched since only the one key is ever
+ * touched. Pass a falsy ``chatId`` to clear the param — used both when the
+ * page resets to no session and when the open session has no turns yet (a
+ * just-created "Untitled chat" must not become a refreshable/shareable
+ * URL). */
+function _syncSessionUrl(chatId) {
+  try {
+    const u = new URL(window.location.href);
+    if (chatId) {
+      u.searchParams.set("session", chatId);
+    } else {
+      u.searchParams.delete("session");
+    }
+    window.history.replaceState({}, "", u.toString());
+  } catch (_) {
+    // Best-effort — a malformed location must never break the chat itself.
   }
 }
 
@@ -1412,6 +1440,11 @@ function _markConversationStarted() {
   _syncAgentPicker();
   const meta = _sessionsCache.find(s => s.id === currentChatId);
   setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // #1914: the moment a conversation has a turn is the moment it deserves a
+  // refreshable URL. Reads `currentChatId` rather than taking a parameter —
+  // every caller (loadAndRenderHistory's history>0 branch, submitUserMessage's
+  // pre/post-send calls) has already settled it by the time this runs.
+  _syncSessionUrl(currentChatId);
 }
 
 /** The inverse: no turns, so the empty-state dashboard and the live picker,
@@ -1877,6 +1910,15 @@ async function openSession(chatId, wsUrlOverride) {
   // Only a genuinely different conversation starts out "no turns yet";
   // loadAndRenderHistory raises the flag again if this one has messages.
   if (_switchingSession) _sessionHasTurns = false;
+  // #1914: mirror `_sessionHasTurns` into the URL right away rather than
+  // waiting on loadAndRenderHistory below — a history/sidebar/palette/
+  // deep-link open of an ALREADY-started conversation (the common case,
+  // `_sessionHasTurns` untouched because this wasn't a switch, or already
+  // known true) gets its `?session=` immediately; a switch into an unknown
+  // or genuinely empty one starts cleared and `_markConversationStarted`
+  // (called from within loadAndRenderHistory) puts it back the moment the
+  // fetch below confirms this session actually has messages.
+  _syncSessionUrl(_sessionHasTurns ? chatId : null);
   _syncAgentPicker();
   setStatus("");
 
@@ -4785,6 +4827,7 @@ $("new-chat")?.addEventListener("click", async (e) => {
     // while the user believes they're starting fresh.
     if (ws) { ws.close(); ws = null; }
     currentChatId = null;
+    _syncSessionUrl(null);
     markActiveSidebar(null);
     $("chat-messages").innerHTML = "";
     showCapabilities();
