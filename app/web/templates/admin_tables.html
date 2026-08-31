@@ -20,6 +20,13 @@
    opened from "+ New". Without the sheet the two panes stack. #}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+{# `.cc-btn` / `.cc-btn--primary` — the shared button the Library's "+ Add"
+   wears, taken rather than reimplemented, the way admin_data_packages,
+   admin_mcp_builder and admin_linked_apps already take it. This page's one
+   primary action ("+ Register new table") is the same component as theirs, so
+   it is the same 38px control the rest of the `.fbar` toolbar is built from.
+   Every selector in the sheet is `.cc-`-prefixed — nothing here collides. #}
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 {# The shared right-side drawer — the chrome Connect-source, the Add-data
    wizard and the group editor already open in. Registering a table is a setup
@@ -1038,19 +1045,35 @@
         .tbl-register { flex: 0 0 auto; position: relative; }
         /* One button visually, two targets: the label shortcuts, the caret
            always opens the menu. Hairline seam in the primary's own colour
-           so the pair still reads as a single CTA. */
+           so the pair still reads as a single CTA.
+
+           BOTH halves are `.cc-btn--primary` — the Library's "+ Add", the same
+           component and not a lookalike. This pair used to be `.btn.btn-primary`
+           (style-custom.css: 10px/20px padding, `--text-base`, weight 500, no
+           border, `--radius`), which put a ~41px (14px/1.5 + 20px), softer, larger-type control at
+           the right end of a `.fbar` whose every other member is 38px / 13px /
+           600 / 9px radius over a 1px border. Beside the search field and the
+           Filter button it read as a different, bigger species of control — the
+           one thing on the page that should look native to that bar. */
         .tbl-register__split { display: inline-flex; align-items: stretch; }
-        .tbl-register__split > .btn { border-radius: 0; }
-        .tbl-register__main {
-            border-top-left-radius: var(--ds-radius-btn);
-            border-bottom-left-radius: var(--ds-radius-btn);
+        /* The two halves' radii are written from ONE selector each, at the same
+           specificity as the reset that squares the inner edge — the pair used
+           to reset with `.tbl-register__split > .btn` (two classes) and re-round
+           with `.tbl-register__main` (one), so the reset won every corner and the
+           CTA rendered as a hard-cornered rectangle at the end of a toolbar of
+           9px-radius controls. */
+        .tbl-register__split > .tbl-register__main {
+            border-radius: var(--ds-radius-btn) 0 0 var(--ds-radius-btn);
         }
-        .tbl-register__more {
-            padding-left: 10px; padding-right: 10px;
+        .tbl-register__split > .tbl-register__more {
+            padding-left: 8px; padding-right: 8px;
             border-left: 1px solid color-mix(in srgb, var(--ds-surface) 35%, transparent);
-            border-top-right-radius: var(--ds-radius-btn);
-            border-bottom-right-radius: var(--ds-radius-btn);
+            border-radius: 0 var(--ds-radius-btn) var(--ds-radius-btn) 0;
         }
+        /* Same caret, same 15px, same open-state flip as the Library's. */
+        .tbl-register__caret { width: 15px; height: 15px; transition: transform var(--ds-motion-fast) var(--ds-ease-standard); }
+        .tbl-register__more[aria-expanded="true"] .tbl-register__caret { transform: rotate(180deg); }
+        @media (prefers-reduced-motion: reduce) { .tbl-register__caret { transition: none; } }
         .tbl-register__menu {
             display: none; position: absolute; top: calc(100% + 4px); right: 0; z-index: 40;
             min-width: 240px; padding: 6px;
@@ -1514,15 +1537,20 @@
                behaviour and the Jira docs link plus the other connectors'
                register items would be unreachable from this page. #}
             <div class="tbl-register__split">
-              <button id="registerNewTableBtn" class="btn btn-primary tbl-register__main" type="button"
+              <button id="registerNewTableBtn" class="cc-btn cc-btn--primary tbl-register__main" type="button"
                       onclick="toggleRegisterNewTableMenu(event)">
                 + Register new table
               </button>
-              <button id="registerNewTableMoreBtn" class="btn btn-primary tbl-register__more" type="button"
+              <button id="registerNewTableMoreBtn" class="cc-btn cc-btn--primary tbl-register__more" type="button"
                       aria-haspopup="true" aria-expanded="false" aria-controls="registerNewTableMenu"
                       aria-label="Choose which source to register from"
                       title="Register from another source"
-                      onclick="openRegisterNewTableMenu(event)">▾</button>
+                      onclick="openRegisterNewTableMenu(event)">
+                {# The Library's own caret, not a ▾ text glyph: the glyph is a
+                   font's picture of a triangle, it sits off the optical centre
+                   and it cannot rotate on open. #}
+                <svg class="tbl-register__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
             </div>
             <div id="registerNewTableMenu" class="tbl-register__menu">
               <button class="tbl-register__item" type="button" data-register-source="bigquery"
