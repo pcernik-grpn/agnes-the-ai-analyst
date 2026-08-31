@@ -312,10 +312,15 @@ def _count_tools_from_events(events: list[dict]) -> dict:
 
     ``tool_errors`` counts distinct failed calls (by ``tool_use_id``), the
     same one-error-per-call correlation the processor applies.
+
+    ``mcp_calls`` is the MCP slice of ``tool_calls`` (a breakdown, not a
+    sibling) — on an MCP-heavy session it explains at a glance why the
+    total is what it is.
     """
     tool_calls = sum(1 for e in events if e["kind"] == "tool_use")
+    mcp_calls = sum(1 for e in events if e["kind"] == "tool_use" and str(e.get("tool_name") or "").startswith("mcp__"))
     error_ids = {e.get("tool_use_id") for e in events if e["kind"] == "tool_result" and e.get("is_error")}
-    return {"tool_calls": tool_calls, "tool_errors": len(error_ids)}
+    return {"tool_calls": tool_calls, "tool_errors": len(error_ids), "mcp_calls": mcp_calls}
 
 
 @router.get("/{username}/{session_file}/download")

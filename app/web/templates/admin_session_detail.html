@@ -34,7 +34,11 @@
 .td-role-chip.tool_result  { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
 .td-role-chip.tool_result.is-error { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
 .td-event.is-error { border-color: var(--ds-accent-danger-line); box-shadow: 0 0 0 2px var(--ds-accent-danger-bg); }
-.td-ts { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 11px; }
+.td-ts { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 11px;
+  color: inherit; text-decoration: none; }
+.td-ts:hover { text-decoration: underline; }
+.td-duration { font-variant-numeric: tabular-nums; font-size: 11px;
+  color: var(--text-secondary, #6b7280); white-space: nowrap; }
 .td-tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px; color: var(--text-primary, #111827); font-weight: 500; }
 .td-event-body { padding: 12px 14px; }
@@ -131,8 +135,12 @@
       : '<div><b>Tokens:</b> —</div>';
     const calls = counts ? counts.tool_calls : (s ? s.tool_calls : null);
     const errs = counts ? counts.tool_errors : (s ? s.tool_errors : null);
+    // The MCP slice explains an MCP-heavy total at a glance; omitted at 0.
+    const mcpNote = counts && counts.mcp_calls
+      ? ' <span title="MCP tool calls, included in the total">(' + escapeHtml(String(counts.mcp_calls)) + ' MCP)</span>'
+      : '';
     const countsHtml =
-      '<div><b>Tool calls:</b> ' + escapeHtml(String(calls ?? '—')) + '</div>' +
+      '<div><b>Tool calls:</b> ' + escapeHtml(String(calls ?? '—')) + mcpNote + '</div>' +
       '<div><b>Errors:</b> ' + escapeHtml(String(errs ?? '—')) + '</div>';
     if (!s || !Object.keys(s).length) {
       metaRoot.innerHTML = countsHtml + tokensHtml +
@@ -144,13 +152,30 @@
       '<div><b>Active:</b> ' + escapeHtml(fmtDuration(s.active_seconds)) + '</div>' +
       countsHtml +
       '<div><b>Model:</b> ' + escapeHtml(s.primary_model || '—') + '</div>' +
-      tokensHtml;
+      tokensHtml +
+      activityLinkHtml(s);
+  }
+
+  function activityLinkHtml(s) {
+    // Cross-trail pivot: the same person's audit/sync/llm timeline around
+    // this session. Needs the summary's resolved users.id — absent for
+    // orphaned users or a not-yet-processed file, and the link with it.
+    if (!s || !s.user_id || !s.started_at) return '';
+    const started = new Date(s.started_at).getTime();
+    if (isNaN(started)) return '';
+    const minutesBack = (Date.now() - started) / 60000;
+    // Snap to the activity page's own window options so its range dropdown
+    // stays in sync with what the link asked for.
+    const windowMin = [60, 360, 1440, 10080, 43200].find(w => w >= minutesBack + 5) || 43200;
+    const href = '/admin/activity?user_id=' + encodeURIComponent(s.user_id) + '&window=' + windowMin;
+    return '<div><a class="td-activity-link" href="' + escapeHtml(href) + '">Activity timeline ↗</a></div>';
   }
 
   function renderEvent(ev, idx) {
     const el = document.createElement('div');
     el.className = 'td-event';
     el.dataset.idx = idx;
+    el.id = 'ev-' + idx;
     if (ev.kind === 'tool_result' && ev.is_error) el.classList.add('is-error');
     if ((ev.kind === 'tool_use' || ev.kind === 'tool_result') && ev.tool_use_id) {
       // Pairing hooks: wirePairs() links each call to its result by this id.
@@ -178,7 +203,10 @@
       '<div class="td-event-head">' +
         '<span class="td-role-chip ' + chipClass + '">' + escapeHtml(chipLabel) + '</span>' +
         headRight +
-        '<span class="td-ts">' + escapeHtml(fmtTime(ev.ts)) + '</span>' +
+        // The timestamp doubles as the card's permalink (#ev-N), so "look
+        // at event 42 in this session" is a shareable URL.
+        '<a class="td-ts" href="#ev-' + idx + '" title="Link to this event">' +
+          escapeHtml(fmtTime(ev.ts) || '#') + '</a>' +
       '</div>' +
       '<div class="td-event-body" id="td-body-' + idx + '"></div>';
 
@@ -235,14 +263,34 @@
     );
   }
 
+  function fmtCallDuration(ms) {
+    const s = ms / 1000;
+    if (s < 10) return s.toFixed(1) + 's';
+    if (s < 120) return Math.round(s) + 's';
+    return Math.round(s / 60) + 'm';
+  }
+
   // Tie inputs to outputs: for every tool_use_id with both a call and a
   // result card, put a jump link in each header that scrolls to (and
   // flashes) the counterpart — several calls to the same tool in one turn
   // stay distinguishable because the pairing key is the id, not the name.
-  function wirePairs() {
+  // The same pairing yields the call's measured duration (result ts − call
+  // ts), shown on the call card. Exported chat sessions stamp one time on
+  // the whole turn, so their delta is 0 and no duration renders — omitted,
+  // not "0.0s": that zero would read as a measurement.
+  function wirePairs(events) {
     const uses = {}, results = {};
     eventsRoot.querySelectorAll('.td-event[data-tuid]').forEach(el => {
       (el.dataset.kind === 'tool_use' ? uses : results)[el.dataset.tuid] = el;
+    });
+    const useTs = {}, resTs = {};
+    (events || []).forEach(ev => {
+      if (!ev.tool_use_id || !ev.ts) return;
+      const t = new Date(ev.ts).getTime();
+      if (isNaN(t)) return;
+      if (ev.kind === 'tool_use') useTs[ev.tool_use_id] = t;
+      // First result wins — a duplicate result echo must not stretch the duration.
+      else if (ev.kind === 'tool_result' && !(ev.tool_use_id in resTs)) resTs[ev.tool_use_id] = t;
     });
     const addJump = (from, to, label, title) => {
       const btn = document.createElement('button');
@@ -256,6 +304,14 @@
     Object.keys(uses).forEach(tuid => {
       const res = results[tuid];
       if (!res) return;
+      const delta = resTs[tuid] - useTs[tuid];
+      if (delta > 0) {
+        const dur = document.createElement('span');
+        dur.className = 'td-duration';
+        dur.title = 'Time between this call and its result';
+        dur.textContent = fmtCallDuration(delta);
+        uses[tuid].querySelector('.td-event-head').insertBefore(dur, uses[tuid].querySelector('.td-ts'));
+      }
       addJump(uses[tuid], res, 'result ↓', 'Jump to this call’s output');
       addJump(res, uses[tuid], 'call ↑', 'Jump to the input that produced this output');
     });
@@ -273,7 +329,17 @@
         eventsRoot.appendChild(renderEvent(ev, i));
         if (ev.kind === 'tool_result' && ev.is_error) errorCount++;
       });
-      wirePairs();
+      wirePairs(events);
+      // Deep link: /admin/sessions/…#ev-12 scrolls to (and flashes) that
+      // card once the transcript has rendered — and again on every in-page
+      // permalink click, so the hash link behaves like the jump buttons.
+      const followHash = () => {
+        if (!/^#ev-\d+$/.test(location.hash)) return;
+        const target = document.getElementById(location.hash.slice(1));
+        if (target) flashCard(target);
+      };
+      followHash();
+      window.addEventListener('hashchange', followHash);
       if (errorCount > 0) {
         nextErrBtn.hidden = false;
         nextErrBtn.textContent = '↡ Next error (' + errorCount + ')';

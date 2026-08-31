@@ -715,6 +715,9 @@ class UsagePgRepository:
             "output_tokens",
             "cache_read_tokens",
             "cache_creation_tokens",
+            # Resolved users.id (v45) — mirrors the DuckDB sibling: the
+            # transcript viewer links into /admin/activity?user_id=….
+            "user_id",
         )
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -722,7 +725,7 @@ class UsagePgRepository:
                     "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
                     "user_messages, assistant_messages, tool_calls, tool_errors, "
                     "primary_model, input_tokens, output_tokens, cache_read_tokens, "
-                    "cache_creation_tokens FROM usage_session_summary WHERE session_file = :sf"
+                    "cache_creation_tokens, user_id FROM usage_session_summary WHERE session_file = :sf"
                 ),
                 {"sf": session_file},
             ).fetchone()

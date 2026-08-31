@@ -118,7 +118,8 @@ class TestTranscriptCounts:
         )
         assert resp.status_code == 200, resp.text
         counts = resp.json().get("counts")
-        assert counts == {"tool_calls": 2, "tool_errors": 1}
+        # mcp_calls is the MCP slice of tool_calls (breakdown, not sibling).
+        assert counts == {"tool_calls": 2, "tool_errors": 1, "mcp_calls": 1}
 
     def test_counts_present_even_without_summary_row(self, client, tmp_path):
         """The counts come from the file, not the UsageProcessor — a fresh
@@ -186,7 +187,22 @@ class TestDetailPagePairsCallsWithResults:
         assert "renderMeta(d.summary, d.tokens, d.counts)" in template, (
             "the detail page must pass the transcript payload's exact counts into the meta renderer"
         )
-        assert "wirePairs()" in template, "the detail page must wire call↔result jump links after rendering"
+        assert "wirePairs(events)" in template, "the detail page must wire call↔result jump links after rendering"
         assert "data-tuid" in template or "dataset.tuid" in template, (
             "cards must be keyed by tool_use_id so pairing survives several calls to the same tool"
+        )
+
+    def test_template_renders_durations_permalinks_and_activity_link(self):
+        """The debug-tool extras: measured per-call duration (omitted when
+        the JSONL can't measure it), #ev-N permalinks on every card, the MCP
+        slice of the call count, and the pivot into /admin/activity."""
+        template = Path("app/web/templates/admin_session_detail.html").read_text(encoding="utf-8")
+        assert "td-duration" in template, "paired calls must show the measured call→result duration"
+        assert "delta > 0" in template, "an unmeasurable duration must be omitted, never rendered as a zero"
+        assert "#ev-" in template and "hashchange" in template, (
+            "event cards must be deep-linkable (#ev-N) on load and on in-page clicks"
+        )
+        assert "MCP)" in template, "the Tool calls line must break out the MCP slice when present"
+        assert "/admin/activity?user_id=" in template, (
+            "the header must link into the activity timeline for the session's user"
         )

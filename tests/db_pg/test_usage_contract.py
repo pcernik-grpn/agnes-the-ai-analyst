@@ -392,6 +392,7 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
         repo,
         session_file="tk/s1.jsonl",
         username="tok",
+        user_id="user-42",
         started_at=now,
         input_tokens=100,
         output_tokens=200,
@@ -405,6 +406,9 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
     assert row["output_tokens"] == 200
     assert row["cache_read_tokens"] == 300
     assert row["cache_creation_tokens"] == 400
+    # The transcript viewer's activity-timeline link needs the resolved
+    # users.id — same widened-projection seam as the token counters above.
+    assert row["user_id"] == "user-42"
 
 
 def test_sessions_listing_carries_the_token_counters_on_both_backends(usage_repo):
@@ -1190,14 +1194,20 @@ def test_upsert_summary_uploaded_at_first_arrival_wins(usage_repo):
     repo.upsert_summary(dict(base), processor_version=1)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     first = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert first is not None
     repo.upsert_summary(dict(base), processor_version=2)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     second = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert second == first
@@ -1251,8 +1261,11 @@ def _seed_query_audit(repo, backend, conn, rows):
     if backend == "duckdb":
         for r in rows:
             conn.execute(
-                stmt.replace(":id", "?").replace(":ts", "?").replace(":action", "?")
-                    .replace(":resource", "?").replace(":result", "?"),
+                stmt.replace(":id", "?")
+                .replace(":ts", "?")
+                .replace(":action", "?")
+                .replace(":resource", "?")
+                .replace(":result", "?"),
                 [r["id"], r["ts"], r["action"], r["resource"], r["result"]],
             )
     else:

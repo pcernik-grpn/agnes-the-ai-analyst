@@ -686,12 +686,16 @@ class UsageRepository:
             "output_tokens",
             "cache_read_tokens",
             "cache_creation_tokens",
+            # Resolved users.id (v45) — lets the transcript viewer link into
+            # /admin/activity?user_id=… for the same person. NULL for
+            # orphaned/deleted users; the UI omits the link then.
+            "user_id",
         )
         row = self.conn.execute(
             "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
             "user_messages, assistant_messages, tool_calls, tool_errors, "
             "primary_model, input_tokens, output_tokens, cache_read_tokens, "
-            "cache_creation_tokens FROM usage_session_summary WHERE session_file = ?",
+            "cache_creation_tokens, user_id FROM usage_session_summary WHERE session_file = ?",
             [session_file],
         ).fetchone()
         if row is None:
