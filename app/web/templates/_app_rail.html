@@ -79,9 +79,17 @@
    on /library watched it collapse the moment they opened a builder — a chrome
    change nobody asked for, mid-task. They keep the app rail, like /skills and
    /agents which do exactly the same job from a non-admin path. #}
-{% set _builder_page = _path.endswith('/new') and (
+{# Two shapes, because the builders do not share a URL shape: the source and
+   package builders are the `/new` form of a collection route, while the apps
+   builder IS its route (/admin/linked-apps — `/admin/linked-apps/new` only
+   302s onto it). Keying the whole test on `/new` silently left the third
+   builder out, so opening it from the Library collapsed the rail and moved
+   the caller onto the admin-scoped remembered width — the exact chrome change
+   this exemption exists to prevent. #}
+{% set _builder_page = (_path.endswith('/new') and (
      _path.startswith('/admin/mcp-sources')
-     or _path.startswith('/admin/data-packages')) %}
+     or _path.startswith('/admin/data-packages'))
+   ) or _path.startswith('/admin/linked-apps') %}
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
 <nav class="rail{% if _admin_page %} rail-icon-mode{% endif %}" aria-label="Primary"
      data-rail-context="{{ 'admin' if _admin_page else 'app' }}">
