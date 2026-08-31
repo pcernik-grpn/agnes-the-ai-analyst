@@ -89,6 +89,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from connectors.sharepoint import graph_client
+from connectors.sharepoint.acl_sync import active_zone_rows
 from connectors.sharepoint.graph_client import GRAPH_BASE, SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 
@@ -941,19 +942,53 @@ async def _drive_targets(transport: GraphTransport, scope: Dict[str, Any]) -> Li
     ]
 
 
-async def _excluded_path_prefixes(transport: GraphTransport, scope: Dict[str, Any]) -> List[str]:
-    """Drive-relative path prefixes this scope must NOT crawl.
+@dataclass(frozen=True)
+class _ExclusionIndex:
+    """One scope's ``excluded_subtrees`` entries, split by the TWO different
+    match rules a ``kind`` demands (2026-08-31 sweep v2 / TCRD-284):
 
-    ``sharepoint-subtree-sweep`` records broken-inheritance roots as
-    ``{item_id, path}`` where ``path`` is rooted at the scope's wizard
-    breadcrumb — not comparable with a crawler row's drive-relative path. So
-    each root is resolved ONCE against Graph to its own drive-relative path,
-    and containment is then an exact path-prefix test rather than a guess
-    about delta ordering.
+    * ``kind=="folder"`` (or a legacy entry with no ``kind`` at all — the
+      exclusion semantics every entry had before kinds existed) excludes
+      everything AT OR UNDER its path — component-safe prefix, same rule
+      :func:`_under_prefix` already applied.
+    * ``kind=="file"`` excludes EXACTLY that one item — matched by
+      drive-relative path AND by its stable id, never as a prefix, so a
+      sibling whose name merely starts with the excluded file's name is
+      never swept up with it (the bug a bare prefix test would have had).
 
-    Fail-closed: a root that cannot be resolved raises, and the caller skips
-    the whole scope. Crawling a scope whose exclusions could not be applied
-    would ingest exactly the content an admin excluded.
+    Empty by default — a scope with nothing excluded, or
+    ``include_excluded_subtrees``, gets one with no members and every match
+    below is trivially false.
+    """
+
+    folder_prefixes: Tuple[str, ...] = ()
+    file_paths: "frozenset[str]" = frozenset()
+    file_ids: "frozenset[str]" = frozenset()
+
+
+def _excluded_file(path: str, stable_id: str, index: _ExclusionIndex) -> bool:
+    """Whether one crawled item is a ``kind=="file"`` exclusion — checked by
+    stable id (the entry's own ``item_id``, the identifier this crawler
+    already keys everything on) OR by exact drive-relative path, per the
+    module's matching semantics. Never a prefix test: that is
+    :func:`_under_prefix`'s job, reserved for folder-kind entries."""
+    return stable_id in index.file_ids or (bool(path) and path in index.file_paths)
+
+
+async def _excluded_path_prefixes(transport: GraphTransport, scope: Dict[str, Any]) -> _ExclusionIndex:
+    """This scope's exclusions, resolved to drive-relative paths and split
+    into folder-prefix vs. file-exact matches (see :class:`_ExclusionIndex`).
+
+    Fast path (TCRD-284): an entry already carrying ``rel_path`` — every
+    entry the sweep has written since the rel-path/kind fields shipped — is
+    used AS-IS, no Graph call. A legacy entry (pre those fields, no
+    ``rel_path``) falls back to resolving its ``item_id`` against Graph
+    exactly as before, and is treated as a folder prefix (it predates
+    ``kind`` too).
+
+    Fail-closed: a legacy entry whose Graph resolution fails raises, and the
+    caller skips the whole scope. Crawling a scope whose exclusions could not
+    be applied would ingest exactly the content an admin excluded.
 
     A scope carrying ``include_excluded_subtrees`` is exempt — the admin
     decided that audience may see the content — matching the same override
@@ -961,26 +996,45 @@ async def _excluded_path_prefixes(transport: GraphTransport, scope: Dict[str, An
     ``should_not`` per-subtree override).
     """
     if scope.get("include_excluded_subtrees"):
-        return []
+        return _ExclusionIndex()
     excluded = scope.get("excluded_subtrees")
     if not isinstance(excluded, list) or not excluded:
-        return []
+        return _ExclusionIndex()
     drive_id = scope.get("drive_id")
-    prefixes: List[str] = []
+
+    folder_prefixes: List[str] = []
+    file_paths: set = set()
+    file_ids: set = set()
+
     for entry in excluded:
         if not isinstance(entry, dict) or not entry.get("item_id"):
             continue
-        if not drive_id:
-            raise CrawlError(
-                f"scope {scope.get('source_scope_id')!r} has excluded subtrees but no drive_id — "
-                "cannot resolve them to paths, refusing to crawl it"
-            )
         item_id = str(entry["item_id"])
-        body = await transport.get_json(
-            f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}?$select=id,name,parentReference"
-        )
-        prefixes.append(_drive_relative_path(body.get("parentReference") or {}, str(body.get("name") or "")))
-    return [p for p in prefixes if p]
+        rel_path = entry.get("rel_path")
+
+        if not rel_path:
+            if not drive_id:
+                raise CrawlError(
+                    f"scope {scope.get('source_scope_id')!r} has excluded subtrees but no drive_id — "
+                    "cannot resolve them to paths, refusing to crawl it"
+                )
+            body = await transport.get_json(
+                f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}?$select=id,name,parentReference"
+            )
+            rel_path = _drive_relative_path(body.get("parentReference") or {}, str(body.get("name") or ""))
+        rel_path = str(rel_path)
+        if not rel_path:
+            continue
+
+        if entry.get("kind") == "file":
+            file_paths.add(rel_path)
+            file_ids.add(f"graph:{item_id}")
+        else:
+            folder_prefixes.append(rel_path)
+
+    return _ExclusionIndex(
+        folder_prefixes=tuple(folder_prefixes), file_paths=frozenset(file_paths), file_ids=frozenset(file_ids)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1005,6 +1059,40 @@ def _under_prefix(path: str, prefixes: Sequence[str]) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
 
 
+def _zone_routes_for_scope(connection: Dict[str, Any], source_scope_id: str) -> Dict[str, List[Tuple[str, str]]]:
+    """This scope's ACTIVE permission zones (2026-08-31 plan, Task 3/4;
+    TCRD-284 wires them into the builtin crawler's own routing), grouped by
+    drive and sorted DEEPEST-``rel_path``-first — so :func:`_route_collection`
+    can return the first match and get "nested zones: deepest wins" for
+    free. A dissolved zone is never in here (:func:`active_zone_rows`
+    already filtered it out), so its content falls straight through to the
+    scope's own collection — the exact re-homing-on-dissolve behavior the
+    sweep's own retroactive cleanup (``acl_sync._cleanup_connection_content``)
+    already assumes.
+
+    Keyed by ``zone["drive_id"]``, not the scope row's own (frequently
+    absent, and meaningless for a site scope that fans out to many drives):
+    a zone always carries the same drive id its root folder lives on
+    (``acl_sync._reconcile_zones`` copies it straight from the parent scope
+    at zone-creation time) — the same drive a :class:`DriveTarget` crawls —
+    so matching on ``target.drive_id`` at lookup time is the correct join
+    key regardless of the scope's own kind.
+    """
+    by_drive: Dict[str, List[Tuple[str, str]]] = {}
+    for zone in active_zone_rows(connection):
+        if zone.get("parent_scope_id") != source_scope_id:
+            continue
+        drive_id = zone.get("drive_id")
+        rel_path = zone.get("rel_path")
+        collection_id = zone.get("collection_id")
+        if not drive_id or not rel_path or not collection_id:
+            continue
+        by_drive.setdefault(str(drive_id), []).append((str(rel_path), str(collection_id)))
+    for routes in by_drive.values():
+        routes.sort(key=lambda pair: -len(pair[0]))
+    return by_drive
+
+
 @dataclass
 class _ScopeContext:
     """Everything the per-item pipeline needs about the scope it is in."""
@@ -1012,7 +1100,37 @@ class _ScopeContext:
     source_scope_id: str
     collection_id: str
     anonymize: bool
-    excluded_prefixes: List[str]
+    exclusions: _ExclusionIndex
+    zone_routes_by_drive: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+
+    def candidate_collection_ids(self, drive_id: str) -> List[str]:
+        """This scope's own collection, then every zone collection this
+        drive routes to (deepest first) — the set a DELETED item (which
+        carries no ``parentReference`` to route by path) might have been
+        ingested into, so a deletion can find it wherever it actually
+        landed."""
+        ids = [self.collection_id]
+        ids.extend(collection_id for _prefix, collection_id in self.zone_routes_by_drive.get(drive_id, ()))
+        return ids
+
+
+def _route_collection(path: str, drive_id: str, ctx: _ScopeContext) -> str:
+    """The collection one crawled file lands in (TCRD-284): the DEEPEST
+    active permission zone whose ``rel_path`` contains ``path``
+    (component-safe — ``path == prefix or path.startswith(prefix + "/")``),
+    else the scope's own collection. ``ctx.zone_routes_by_drive`` is
+    pre-sorted deepest-prefix-first, so the first match wins.
+
+    Agreement with :mod:`connectors.sharepoint.ingest_gate` is load-bearing,
+    not incidental: that module refuses, server-side, any document whose
+    path falls under an ACTIVE zone but landed in a DIFFERENT collection
+    than that zone's own (``source_acl_zone_mismatch``) — this function is
+    what keeps a correctly-routed crawl from EVER tripping it.
+    """
+    for prefix, collection_id in ctx.zone_routes_by_drive.get(drive_id, ()):
+        if path == prefix or path.startswith(prefix + "/"):
+            return collection_id
+    return ctx.collection_id
 
 
 class _Ingestor:
@@ -1136,17 +1254,24 @@ async def _process_item(
     ctags: Dict[str, Any] = state["ctags"]
 
     if item.get("deleted"):
-        if ingestor.delete(ctx.collection_id, stable_id):
-            stats.deleted += 1
+        for candidate in ctx.candidate_collection_ids(target.drive_id):
+            if ingestor.delete(candidate, stable_id):
+                stats.deleted += 1
+                break
         ctags.pop(stable_id, None)
         return
     if "file" not in item or _should_skip_name(name):
         return
 
     path = _drive_relative_path(item.get("parentReference") or {}, name)
-    if ctx.excluded_prefixes and _under_prefix(path, ctx.excluded_prefixes):
+    if _excluded_file(path, stable_id, ctx.exclusions):
         stats.excluded_subtree_skips += 1
         return
+    if ctx.exclusions.folder_prefixes and _under_prefix(path, ctx.exclusions.folder_prefixes):
+        stats.excluded_subtree_skips += 1
+        return
+
+    collection_id = _route_collection(path, target.drive_id, ctx)
 
     ctag = item.get("cTag") or item.get("eTag")
     if ctag and ctags.get(stable_id) == ctag:
@@ -1211,7 +1336,7 @@ async def _process_item(
 
     try:
         _file_id, was_new = ingestor.ingest(
-            collection_id=ctx.collection_id,
+            collection_id=collection_id,
             stable_id=stable_id,
             path=path,
             filename=f"{Path(name).stem or name}.md",
@@ -1518,7 +1643,7 @@ async def _run_crawl_async(
             source_scope_id = str(scope.get("source_scope_id"))
             try:
                 targets = await _drive_targets(transport, scope)
-                excluded_prefixes = await _excluded_path_prefixes(transport, scope)
+                exclusions = await _excluded_path_prefixes(transport, scope)
             except (CrawlError, SharePointGraphError) as exc:
                 # One scope's misconfiguration (or one site's outage) must not
                 # cost the connection's other scopes their pass — the same
@@ -1531,7 +1656,8 @@ async def _run_crawl_async(
                 source_scope_id=source_scope_id,
                 collection_id=str(scope["collection_id"]),
                 anonymize=bool(scope.get("anonymize")),
-                excluded_prefixes=excluded_prefixes,
+                exclusions=exclusions,
+                zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
             )
             stats.scopes += 1
             for target in targets:

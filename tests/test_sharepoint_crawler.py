@@ -91,12 +91,15 @@ class AnonymizeResult:
         self.replaced = replaced
 
 
-def _connection(scopes: List[Dict[str, Any]], connection_id: str = "conn1") -> Dict[str, Any]:
-    return {
-        "id": connection_id,
-        "source_type": "sharepoint",
-        "config": {"tenant_id": "t1", "client_id": "c1", "scopes": scopes},
-    }
+def _connection(
+    scopes: List[Dict[str, Any]],
+    connection_id: str = "conn1",
+    zones: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {"tenant_id": "t1", "client_id": "c1", "scopes": scopes}
+    if zones:
+        config["acl_zones"] = zones
+    return {"id": connection_id, "source_type": "sharepoint", "config": config}
 
 
 def _drive_scope(**overrides: Any) -> Dict[str, Any]:
@@ -108,6 +111,24 @@ def _drive_scope(**overrides: Any) -> Dict[str, Any]:
     }
     scope.update(overrides)
     return scope
+
+
+def _zone(**overrides: Any) -> Dict[str, Any]:
+    """A ``config["acl_zones"]`` row — see ``connectors.sharepoint.acl_sync
+    .zone_rows``'s own docstring for the full shape."""
+    zone = {
+        "zone_item_id": "zone1",
+        "parent_scope_id": "b!drive1",
+        "drive_id": "b!drive1",
+        "name": "Zone",
+        "display_path": "Corp / Documents / Zone",
+        "rel_path": "Zone",
+        "collection_id": "zonecol1",
+        "detected_at": "2026-08-31T00:00:00+00:00",
+        "status": "active",
+    }
+    zone.update(overrides)
+    return zone
 
 
 def _file_item(
@@ -872,6 +893,213 @@ class TestScopes:
 
         assert report["scopes"] == 1
         assert list(_state(crawl_env)["delta_links"]) == ["b!drive2"]
+
+
+# --------------------------------------------------------------------------
+# Permission-zone routing (TCRD-284)
+# --------------------------------------------------------------------------
+
+
+class TestZoneRouting:
+    def test_file_under_active_zone_lands_in_zone_collection_sibling_outside_in_scope_collection(
+        self, crawl_env, monkeypatch
+    ):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("in-zone", name="secret.docx", parent_path="/drives/b!drive1/root:/Reports/Private"),
+                        _file_item(
+                            "out-zone", name="public.docx", ctag="c2", parent_path="/drives/b!drive1/root:/Reports"
+                        ),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")
+        zone = _zone(rel_path="Reports/Private", collection_id="zonecol1")
+        _run(_connection([scope], zones=[zone]), monkeypatch)
+
+        by_stable = {row["stable_id"]: row["collection_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert by_stable == {"graph:in-zone": "zonecol1", "graph:out-zone": "col1"}
+
+    def test_nested_zones_deepest_prefix_wins(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("deep", name="foo.docx", parent_path="/drives/b!drive1/root:/Team/Sub"),
+                        _file_item("shallow", name="bar.docx", ctag="c2", parent_path="/drives/b!drive1/root:/Team"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")
+        zones = [
+            _zone(zone_item_id="zoneA", rel_path="Team", collection_id="zoneA_col"),
+            _zone(zone_item_id="zoneB", rel_path="Team/Sub", collection_id="zoneB_col"),
+        ]
+        _run(_connection([scope], zones=zones), monkeypatch)
+
+        by_stable = {row["stable_id"]: row["collection_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert by_stable == {"graph:deep": "zoneB_col", "graph:shallow": "zoneA_col"}
+
+    def test_dissolved_zone_is_ignored_content_falls_back_to_the_scope_collection(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item("archived", name="old.docx", parent_path="/drives/b!drive1/root:/Archive")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")
+        zone = _zone(rel_path="Archive", collection_id="zonecol_dissolved", status="dissolved")
+        _run(_connection([scope], zones=[zone]), monkeypatch)
+
+        assert FakeIngestor.instances[-1].ingested[0]["collection_id"] == "col1"
+
+
+# --------------------------------------------------------------------------
+# File-kind exclusions (TCRD-284): exact match, never a subtree prefix
+# --------------------------------------------------------------------------
+
+
+class TestFileKindExclusion:
+    def test_kind_file_exclusion_skips_exactly_that_file_not_a_similarly_named_sibling(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("FILEX", name="secret.docx", parent_path="/drives/b!drive1/root:/Reports"),
+                        _file_item(
+                            "sibling",
+                            name="secret.docx-backup",
+                            ctag="c2",
+                            parent_path="/drives/b!drive1/root:/Reports",
+                        ),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(
+            drive_id="b!drive1",
+            excluded_subtrees=[
+                {
+                    "item_id": "FILEX",
+                    "path": "Corp/Documents/Reports/secret.docx",
+                    "rel_path": "Reports/secret.docx",
+                    "kind": "file",
+                    "detected_at": "2026-08-31T00:00:00+00:00",
+                }
+            ],
+        )
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["excluded_subtree_skips"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:sibling"]
+
+
+# --------------------------------------------------------------------------
+# Exclusion rel_path fast path (TCRD-284)
+# --------------------------------------------------------------------------
+
+
+class TestExclusionFastPath:
+    def test_legacy_entry_without_rel_path_still_resolves_via_graph(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "/items/EXCL" in url and "/delta" not in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "EXCL",
+                        "name": "Private",
+                        "parentReference": {"path": "/drives/b!drive1/root:/Reports"},
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("inside", name="secret.docx", parent_path="/drives/b!drive1/root:/Reports/Private"),
+                        _file_item(
+                            "outside", name="public.docx", ctag="c2", parent_path="/drives/b!drive1/root:/Reports"
+                        ),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        scope = _drive_scope(
+            drive_id="b!drive1", excluded_subtrees=[{"item_id": "EXCL", "path": "Corp/Documents/Reports/Private"}]
+        )
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["excluded_subtree_skips"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:outside"]
+        assert any("/items/EXCL" in url and "/delta" not in url for url in seen)
+
+    def test_entries_carrying_rel_path_cause_zero_graph_resolution_calls(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "$select=id%2Cname%2CparentReference" in url or "$select=id,name,parentReference" in url:
+                raise AssertionError(f"unexpected Graph item-resolution call for a rel_path-carrying entry: {url}")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("inside", name="secret.docx", parent_path="/drives/b!drive1/root:/Reports/Private"),
+                        _file_item(
+                            "outside", name="public.docx", ctag="c2", parent_path="/drives/b!drive1/root:/Reports"
+                        ),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        scope = _drive_scope(
+            drive_id="b!drive1",
+            excluded_subtrees=[
+                {
+                    "item_id": "EXCL",
+                    "path": "x",
+                    "rel_path": "Reports/Private",
+                    "kind": "folder",
+                    "detected_at": "2026-08-31T00:00:00+00:00",
+                }
+            ],
+        )
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["excluded_subtree_skips"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:outside"]
+        assert not any("/items/EXCL?" in url for url in seen)
 
 
 # --------------------------------------------------------------------------
