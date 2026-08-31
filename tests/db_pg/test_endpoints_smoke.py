@@ -2985,8 +2985,17 @@ KNOWN_UNTESTED = {
     # path reuses create_single_file_artefact — both already parity-proven);
     # behaviour (ownership 404s, traversal/symlink containment, download
     # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    # The preview pair joins them on the same grounds: `…/preview` reads the
+    # caller's own session file and describes it, `…/raw` streams the closed
+    # image/PDF allowlist inline for the modal to draw — same ownership and
+    # containment path, no repo method of their own. Behaviour (deck
+    # extraction, the 415 on active content, the inline headers) covered in
+    # tests/test_chat_session_files.py and tests/test_chat_kai_engine_files.py
+    # for both the host and engine sandboxes.
     "GET /api/chat/sessions/{chat_id}/files",
     "GET /api/chat/sessions/{chat_id}/files/download",
+    "GET /api/chat/sessions/{chat_id}/files/preview",
+    "GET /api/chat/sessions/{chat_id}/files/raw",
     "POST /api/chat/sessions/{chat_id}/files/save-artefact",
     "POST /api/chat/sessions/{chat_id}/ticket",
     "POST /api/chat/{session_id}/fork",

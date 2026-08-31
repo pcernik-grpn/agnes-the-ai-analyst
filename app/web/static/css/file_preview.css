@@ -136,6 +136,52 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Deck preview (kind: "slides"). A .pptx has no browser renderer, so the
+   modal draws the deck's text as cards — one per slide, in deck order, so a
+   reader can scan what the agent actually built. Structural only; the card
+   is the same surface/border pair every other panel uses. */
+.fp-slides {
+  display: grid;
+  gap: 12px;
+}
+.fp-slide {
+  padding: 14px 16px;
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border-light);
+  border-radius: 10px;
+}
+.fp-slide__num {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ds-text-muted);
+}
+.fp-slide__title {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.35;
+  color: var(--ds-text-primary);
+}
+.fp-slide__lines {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ds-text-secondary);
+}
+.fp-slide__lines li + li {
+  margin-top: 3px;
+}
+.fp-slide__empty {
+  margin: 0;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--ds-text-muted);
+}
+
 .fp-msg {
   display: grid;
   place-items: center;

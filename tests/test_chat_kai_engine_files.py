@@ -427,3 +427,96 @@ async def test_mid_stream_cap_abort_closes_the_engine_connection(monkeypatch: py
         async for _ in iterator:
             pass
     assert handle._client.is_closed
+
+
+# ---------------------------------------------------------------------------
+# Preview / raw over the engine sandbox
+#
+# The default provider IS kai-agent, so a preview that only worked on the host
+# branch would be a preview no production instance ever renders.
+# ---------------------------------------------------------------------------
+
+
+def _deck_bytes() -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "ppt/slides/slide1.xml",
+            '<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a">'
+            "<a:p><a:r><a:t>Rapid vs Full</a:t></a:r></a:p>"
+            "<a:p><a:r><a:t>Side-by-side comparison</a:t></a:r></a:p></p:sld>",
+        )
+    return buf.getvalue()
+
+
+def test_preview_reads_a_deck_out_of_the_engine_sandbox(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    client = _make_client(data_dir, monkeypatch, _download_handler({"outputs/deck.pptx": _deck_bytes()}))
+    body = client.get(
+        f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "outputs/deck.pptx"}
+    ).json()
+    assert body["kind"] == "slides"
+    assert body["slides"][0]["title"] == "Rapid vs Full"
+    assert body["slides"][0]["lines"] == ["Side-by-side comparison"]
+
+
+def test_preview_over_the_engine_declines_a_file_past_the_glance_ceiling(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    """`fetch_engine_file_bytes` raises past its cap; the preview turns that
+    into "download it", never a 5xx — the row's download button still works."""
+    import app.api.chat_session_files as mod
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"x",
+            headers={"content-length": str(mod._PREVIEW_MAX_BYTES + 1)},
+        )
+
+    client = _make_client(data_dir, monkeypatch, handler)
+    body = client.get(f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "big.md"}).json()
+    assert body["kind"] == "none"
+    assert "download" in body["reason"].lower()
+
+
+def test_preview_does_not_call_the_engine_for_an_image(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    """An image is drawn by the browser from …/raw, so describing it must
+    cost no engine round-trip and no JWT mint."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("engine must not be called to describe an image")
+
+    client = _make_client(data_dir, monkeypatch, handler)
+    body = client.get(f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "chart.png"}).json()
+    assert body["kind"] == "image"
+    assert minted["args"] == []
+
+
+def test_raw_streams_engine_bytes_inline_with_the_pinned_media_type(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    client = _make_client(data_dir, monkeypatch, _download_handler({"chart.png": b"\x89PNG\r\n\x1a\n"}))
+    resp = client.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"})
+    assert resp.status_code == 200
+    # The engine's handler claims text/html; the map wins, as on download.
+    assert resp.headers["content-type"] == "image/png"
+    assert resp.headers["content-disposition"].startswith("inline")
+    assert resp.headers["x-frame-options"] == "SAMEORIGIN"
+
+
+def test_raw_over_the_engine_refuses_active_content_before_any_call(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, minted: dict
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("engine must not be called for a non-viewable type")
+
+    client = _make_client(data_dir, monkeypatch, handler)
+    assert client.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "page.html"}).status_code == 415
+    assert minted["args"] == []
