@@ -98,9 +98,13 @@ OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 #: cases that have earned it, which is how an operator ends up re-running a
 #: four-hour crawl out of doubt.
 #:
-#: ``"throttled"`` is not yet emitted by the crawl (a 429-budget abort still
-#: records ``"error"``); it is listed ahead of that so the value needs no
-#: change here on the day it lands. An unknown reason claims nothing.
+#: The crawl's own vocabulary is ``"timeout"`` | ``"throttled"`` | ``"error"``
+#: | ``None``, classified in one place on its side (``_STOP_REASONS`` /
+#: ``_stop_reason()``): the named values are exactly the stops that leave
+#: consistent state on disk. ``"error"`` is deliberately absent from the set
+#: below, and an unknown reason claims nothing — a new stop has to be
+#: vouched for here explicitly before this surface will promise anything
+#: about it.
 RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled"})
 
 

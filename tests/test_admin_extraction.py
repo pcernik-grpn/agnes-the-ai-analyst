@@ -415,10 +415,11 @@ class TestRunProjection:
         out = _run_out({"id": "er_1", "status": "interrupted", "report": {}})
         assert out["resumable"] is True
 
-    def test_a_throttle_abort_is_resumable_the_day_the_crawl_emits_it(self):
-        """`"throttled"` is not emitted yet (a 429-budget abort still records
-        `"error"`), but the vocabulary is honored ahead of it so the reason
-        needs no change here on the day it lands."""
+    def test_a_throttle_abort_is_resumable(self):
+        """A 429-budget abort stops at the same consistent point a timeout
+        does — `_process_item` re-raises it rather than absorbing it as a
+        per-file fault — so the persisted cTags describe exactly what was
+        ingested and the next run picks up from there."""
         from app.api.admin_extraction import RESUMABLE_STOP_REASONS, _run_out
 
         assert "throttled" in RESUMABLE_STOP_REASONS

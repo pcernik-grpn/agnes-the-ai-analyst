@@ -56,6 +56,8 @@ _SIGNATURES = (
     "function _extDot(outcome) {",
     "function _extRenderCrawlCell(connId, status) {",
     "function _extRunLine(run) {",
+    "const EXT_STOP_REASON_TEXT = {",
+    "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
@@ -384,7 +386,7 @@ class TestRunsDrawer:
             "total": 1,
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
-        assert "stopped early — timeout" in html
+        assert "stopped early — the run hit its time ceiling" in html
         # The reason line and the resume line are INDEPENDENT: this fixture
         # pins a server that did not vouch for resumability, and the drawer
         # must then stay silent about it even though the reason is one that
@@ -410,7 +412,7 @@ class TestRunsDrawer:
             "total": 1,
         }
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
-        assert "stopped early — timeout" in html
+        assert "stopped early — the run hit its time ceiling" in html
         assert "the next run resumes from where it stopped" in html
 
     def test_a_crash_never_gets_the_resume_reassurance(self):
@@ -432,6 +434,50 @@ class TestRunsDrawer:
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
         assert "the next run resumes" not in html
         assert "graph exploded" in html
+
+    def test_a_throttle_stop_explains_itself_and_is_resumable(self):
+        """A 429-budget abort leaves consistent state, so it earns the resume
+        line — and it says WHAT ran out, not the slug "throttled"."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_th",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 900.0,
+                    "files_done": 512,
+                    "http_429": 120,
+                    "throttle_wait_s": 900.0,
+                    "interrupted_reason": "throttled",
+                    "resumable": True,
+                    "error": "GraphThrottled: 429 budget exhausted",
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "throttling budget was exhausted" in html
+        assert "the next run resumes from where it stopped" in html
+
+    def test_an_unknown_stop_reason_is_shown_verbatim_never_hidden(self):
+        """A slug we do not recognize is still information — collapsing it
+        into a generic phrase would be worse than not explaining it."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_u",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "files_done": 1,
+                    "interrupted_reason": "quota_exhausted",
+                    "resumable": False,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        assert "quota_exhausted" in html
+        assert "the next run resumes" not in html
 
     def test_a_run_with_no_recorded_reason_says_nothing_about_one(self):
         runs = {
