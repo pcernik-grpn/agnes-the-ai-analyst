@@ -28,11 +28,15 @@ def test_every_connector_adapter_is_mirrored_in_the_coverage_map():
     else new has to be added to the map — or added to this exemption with a
     reason, deliberately.
     """
-    from src.semantic.adapters import _REGISTRY
+    from src.semantic.adapters import adapter_names
     from src.semantic.coverage import SEMANTIC_ADAPTER_BY_SOURCE_TYPE
 
+    # `adapter_names()`, not `_REGISTRY`: the built-ins are a NAME table now
+    # and their modules load on first use, so `_REGISTRY` holds only whatever
+    # this process happens to have asked for. Names are what this guard is
+    # about anyway.
     not_connection_backed = {"native"}
-    registered = set(_REGISTRY) - not_connection_backed
+    registered = set(adapter_names()) - not_connection_backed
     mapped = set(SEMANTIC_ADAPTER_BY_SOURCE_TYPE.values())
 
     assert registered - mapped == set(), (
