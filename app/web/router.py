@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Optional
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -11051,6 +11051,7 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     """
     from src.rbac import get_accessible_tables
     from src.marketplace_filter import resolve_allowed_plugins
+    from app.api.marketplace import _curated_stack_sets
 
     by_source: dict[str, int] = {}
     try:
@@ -11070,6 +11071,22 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
 
     try:
         plugins = resolve_allowed_plugins(conn, user)
+        # Grant-only is only ELIGIBILITY (issue #1913): resolve_allowed_plugins
+        # answers "did some group's admin make this plugin reachable", not
+        # "is this plugin actually in the caller's served set". The sandbox
+        # only ever installs `resolve_user_marketplace`'s effective stack --
+        # admin-granted plugins narrowed to `subscriptions ∪ required-tier
+        # grants` -- so a plugin an admin merely made available, that this
+        # caller never subscribed to, was never loaded into their session and
+        # this panel must not claim otherwise. `_curated_stack_sets` is the
+        # exact same union `resolve_user_marketplace` filters the admin set
+        # through (and what the Library derives its own "in stack" state
+        # from, per its own docstring) -- reusing it here is what keeps this
+        # panel from drifting from the sandbox's real content a second time.
+        # Two more fixed-cardinality reads, no loop over `plugins`: still
+        # single-pass, same as the tables branch above.
+        in_stack, _required = _curated_stack_sets(conn, user["id"])
+        plugins = [p for p in plugins if (p["marketplace_id"], p["original_name"]) in in_stack]
         # Keep only the fields the template renders to keep the embedded
         # JSON small; ``plugin_dir`` is a Path which doesn't survive
         # ``tojson``, ``raw`` is upstream marketplace.json and can be MB.
