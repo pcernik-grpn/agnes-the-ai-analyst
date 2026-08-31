@@ -1887,10 +1887,11 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        (rail closing) uses `--rail-peek-text-out` with no delay, matching the
        "content releases, then the column closes" sequence.
 
-       On an ADMIN page the modifier is not emitted at all (_app_rail.html): the
-       lists are not rendered there, so there is nothing for this row to hand off
-       to, and folding it away on peek would leave an admin with no path to
-       /chats — the bug that put this row here to begin with.
+       This holds on an ADMIN page too, where the rail starts collapsed: the
+       lists render there as well now (#1898 item 6), so the row has something to
+       hand off to at every width. While they did not, the modifier was withheld
+       there on purpose — folding this row away on peek would have left an admin
+       with no path to /chats, the bug that put the row here to begin with.
 
        The FOLDED default is not here — it is outside this media query, up with
        the other `.rail-i` rules, because it has to hold below 1025px too. Down

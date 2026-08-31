@@ -1381,8 +1381,10 @@ class TestRailChatsDestination:
         away again (`.rail-i--collapsed-only`) the moment the rail opens, so the
         two are never on screen together.
 
-    On an ADMIN page the lists are not rendered at all, so the row keeps its
-    place at every width — there is nothing there for it to hand off to.
+    That holds on an ADMIN page too (#1898 item 6): the lists render there as
+    well, so the row folds on peek exactly as it does anywhere else. While they
+    did not, the row kept its place at every width — there was nothing for it to
+    hand off to.
 
     The icon rule is asserted directly, because the next text-only row would
     reintroduce the same bug in a different place."""
@@ -1470,20 +1472,34 @@ class TestRailChatsDestination:
         assert "height: 0" in peek
         assert "visibility: hidden" in peek
 
-    def test_admin_pages_get_the_destination_but_not_the_lists(self, web_client, admin_cookie, monkeypatch):
-        """The one place the rail's item set differs by context, and it differs in
-        the safe direction: the Chats row (icon, survives collapse) is on every
-        page; the text-only lists are only where they can be seen.
+    def test_an_admin_page_holds_the_same_conversation_zone_as_an_app_page(self, web_client, admin_cookie, monkeypatch):
+        """One region, one presentation, on every page (#1898 item 6).
 
-        Per PAGE, collapsed and expanded still hold the same set of destinations —
-        that is the invariant. Two pages differing is a full repaint, not a shift."""
+        The lists used to be withheld from /admin, which is what made the rail
+        read as two different sidebars: Library and Agents showed the
+        conversation list, and navigating to Admin replaced it with a single
+        icon row. It also cost the peek its point — hover-expanding the rail on
+        an admin page revealed a void where the lists belong.
+
+        Both forms are in the markup on both pages now; which one is on screen is
+        the rail's WIDTH, decided by CSS, not the section you are in. The Chats
+        row therefore carries the same fold modifier here as anywhere else."""
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         self._enable_chat(web_client, monkeypatch)
-        rail = self._rail(web_client, admin_cookie, "/admin/users")
-        assert 'id="nav-chats"' in rail, "an admin must be able to reach their chats"
-        assert 'id="new-chat"' in rail
-        assert 'class="rail-history"' not in rail
-        assert 'id="rail-pinned"' not in rail
+        admin_rail = self._rail(web_client, admin_cookie, "/admin/users")
+        app_rail = self._rail(web_client, admin_cookie, "/library")
+        for rail in (admin_rail, app_rail):
+            assert 'id="nav-chats"' in rail, "an admin must be able to reach their chats"
+            assert 'id="new-chat"' in rail
+            assert 'class="rail-history"' in rail
+            assert 'id="rail-pinned"' in rail
+            assert 'id="chat-list"' in rail
+            assert '<a class="rail-history-all" href="/chats">View all chats</a>' in rail
+            # The stand-in folds on peek HERE too, now that there is something
+            # for it to hand off to. Withholding the modifier on admin pages was
+            # correct only while the lists were absent.
+            row = rail.split('id="nav-chats"', 1)[0]
+            assert "rail-i--collapsed-only" in row.rsplit("<a ", 1)[1]
 
     def test_the_analyst_onboarding_card_is_not_on_admin_pages(self, web_client, admin_cookie, monkeypatch):
         """It measures the ANALYST's journey — take Agnes to your tools, ask your
