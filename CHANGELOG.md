@@ -12,7 +12,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **`agnes admin connection secret --from-file`** reads the vault secret from a file (`-` = stdin) — a SharePoint combined cert+key PEM could not travel through the single-line hidden prompt, leaving a raw API call as the only way to store one. The file path rides argv; the secret value still never does.
+
 ### Changed
+
+- **Storing a SharePoint connection credential now validates the PEM up front.** `PUT /api/admin/source-connections/{id}/secret` used to accept any string for a SharePoint connection and fail hours later as an opaque provider auth error on the first Graph call; it now answers a typed 400 (`sharepoint_pem_invalid`) naming exactly which half is missing — the material must be the certificate and its unencrypted private key concatenated in one PEM.
+- **The connection `token_env` allowlist error now names the real mistake.** The config-embedded fields (`cert_private_key_env`, `private_key_env`, …) are reported under their own name instead of `token_env`, a cloud secret-manager secret NAME pasted where an env-var name belongs gets told that Agnes reads only its own process environment and pointed at the vault upload, and PEM content pasted into the name field is called out without echoing the material back.
 
 ### Fixed
 
