@@ -31212,7 +31212,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
       "get": {
-        "description": "Producer handoff (spec \u00a713.2 / item 3): the corpus map the external\ncrawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in\nthe producer resolver's OWN shape \u2014 ``\"<site display name>\"`` or\n``\"<site display name>/<drive-relative folder path>\"`` \u2014 built by the\nsame shared translation the in-Agnes ``corpus-extraction`` job handler\nuses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff\n(``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot\ndrift. The earlier flat ``{source_scope_id: collection_id}`` shape was\nunusable for routing: the resolver matches keys against crawler rows'\nsite/path components, which a Graph scope id never equals.\n\n``409 corpus_map_ambiguous`` when the confirmed scopes cannot form an\nunambiguous map (e.g. a site scope plus a drive scope of the same\nsite) \u2014 never a best-guess map.\n\nDeliberately does NOT carry ``anonymize`` \u2014 a producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).\n\nTHIS is the primary callback the corpus-extraction producer itself\ncalls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may\ncall it too (see ``require_admin_or_producer_connection``) \u2014\nself-audited here (``sharepoint_connection.corpus_map_read``,\n``client_kind=\"producer\"``) for the same reason ``list_scopes`` above\nself-audits its own producer branch.",
+        "description": "Producer handoff (spec \u00a713.2 / item 3): the corpus map the external\ncrawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in\nthe producer resolver's OWN shape \u2014 ``\"<site display name>\"`` or\n``\"<site display name>/<drive-relative folder path>\"`` \u2014 built by the\nsame shared translation the in-Agnes ``corpus-extraction`` job handler\nuses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff\n(``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot\ndrift. The earlier flat ``{source_scope_id: collection_id}`` shape was\nunusable for routing: the resolver matches keys against crawler rows'\nsite/path components, which a Graph scope id never equals.\n\nEvery ACTIVE permission zone (2026-08-31 plan, Task 3/7 \u2014\n``connectors/sharepoint/acl_sync.py``'s ``config[\"acl_zones\"]``) folds in\nas an ADDITIONAL, NESTED key under its parent scope's own key (a zone's\n``display_path`` always extends its parent's) \u2014 see\n``connectors/sharepoint/corpus_map.py``'s module docstring for why the\nproducer's resolver MUST match these longest-prefix-first, and why a\nresolver that gets that wrong still fails closed rather than leaking\nzone content (the ingest gate, 2026-08-31 plan, Task 5). A DISSOLVED\nzone is never mapped \u2014 its content re-homes to the parent scope.\n\n``409 corpus_map_ambiguous`` when the confirmed scopes/zones cannot form\nan unambiguous map (e.g. a site scope plus a drive scope of the same\nsite) \u2014 never a best-guess map.\n\nDeliberately does NOT carry ``anonymize`` \u2014 a producer that needs to\nknow WHICH scopes to anonymize reads ``GET .../scopes`` instead (each\nrow already carries ``anonymize``); Agnes's own ``corpus-extraction``\njob handler does the equivalent lookup internally\n(``app/worker/kinds.py::_anonymize_marked_scope_map``).\n\nTHIS is the primary callback the corpus-extraction producer itself\ncalls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may\ncall it too (see ``require_admin_or_producer_connection``) \u2014\nself-audited here (``sharepoint_connection.corpus_map_read``,\n``client_kind=\"producer\"``) for the same reason ``list_scopes`` above\nself-audits its own producer branch.",
         "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
         "parameters": [
           {
@@ -31338,7 +31338,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/scopes": {
       "delete": {
-        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).",
+        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).\n\nIts ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that\ncollection do NOT survive, though (2026-08-31 plan, Task 8): with the\nscope row gone, the sync never reconciles that collection again, so a\nsentinel-owned grant left behind would dangle forever \u2014 indistinguishable\nfrom a deliberate, still-maintained grant to anyone reading ``/admin/\naccess``. Same removal loop :func:`confirm_scope` uses for its own\n``mirrored`` -> ``manual`` transition; an admin-assigned grant on the\nsame collection is untouched either way.",
         "operationId": "remove_scope_api_admin_sharepoint_connections__connection_id__scopes_delete",
         "parameters": [
           {
@@ -31403,7 +31403,7 @@
         ]
       },
       "get": {
-        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants.\n\nAlso the corpus-extraction producer's own callback read (TCRD-...):\na ``ProducerPrincipal`` scoped to THIS connection may call this too\n(see ``require_admin_or_producer_connection``) \u2014 self-audited here\n(``sharepoint_connection.scopes_read``, ``client_kind=\"producer\"``)\nsince a restricted principal's identity is never stashed onto\n``request.state.user``, so the generic audit-fallback middleware would\notherwise see no attributable caller and write nothing at all.",
+        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants, plus this\nconnection's permission zones (2026-08-31 plan, Task 3/8 \u2014 ``\"zones\"``,\nACTIVE and DISSOLVED alike so the wizard can show a zone's history\nrather than have it vanish the moment it dissolves; see :func:`_zone_out`\nfor the exact projection).\n\nAlso the corpus-extraction producer's own callback read (TCRD-...):\na ``ProducerPrincipal`` scoped to THIS connection may call this too\n(see ``require_admin_or_producer_connection``) \u2014 self-audited here\n(``sharepoint_connection.scopes_read``, ``client_kind=\"producer\"``)\nsince a restricted principal's identity is never stashed onto\n``request.state.user``, so the generic audit-fallback middleware would\notherwise see no attributable caller and write nothing at all.",
         "operationId": "list_scopes_api_admin_sharepoint_connections__connection_id__scopes_get",
         "parameters": [
           {
@@ -31530,6 +31530,69 @@
           }
         },
         "summary": "Confirm Scope",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": {
+      "post": {
+        "description": "Admin-triggered one-off run of the ``sharepoint-subtree-sweep`` job\nfor this connection (2026-08-31 plan, Task 8's \"re-check subtrees now\")\n\u2014 enqueues ``connectors.sharepoint.acl_sync.run_subtree_sweep`` (via\n``app/worker/kinds.py::_run_sharepoint_subtree_sweep``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_acl_sync`. The explicit-connection payload also bypasses\nthe job's own per-connection ``acl_sync.sweep_interval_days`` due-guard\n(:func:`connectors.sharepoint.acl_sync._sweep_due`), so this always\ntriggers a real sweep, never a same-day no-op.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. Then\nrefuses cleanly with ``409 feature_disabled`` when ``acl_mirroring\n.enabled`` is off \u2014 same reasoning as :func:`trigger_acl_sync`: the job\nhandler itself would just no-op, but a manual trigger should tell the\nadmin why nothing happened rather than return a 202 for a run that will\ndo nothing.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_sweep_idempotency_key`) \u2014 a second trigger while one is already\nqueued/running for this connection gets ``409 sweep_already_running``\ninstead of a second job.",
+        "operationId": "trigger_subtree_sweep_api_admin_sharepoint_connections__connection_id__subtree_sweep_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Subtree Sweep",
         "tags": [
           "admin"
         ]

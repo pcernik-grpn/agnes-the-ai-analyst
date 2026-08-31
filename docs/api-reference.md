@@ -1204,6 +1204,7 @@ for a DIFFERENT connection 403s.
 - /api/admin/sharepoint/connections/{connection_id}/webhook
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
+- /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1262,16 +1263,26 @@ collection), and optionally applies group grants (ordinary `resource_grants`
 rows on the collection — never duplicated onto the scope row itself). The
 response's `no_group_warning` flags a collection with no granted group
 ("indexed but invisible"). `DELETE` (`?source_scope_id=`) unselects a scope —
-an explicit exclusion — without touching its already-created collection.
+an explicit exclusion — without touching its already-created collection, but
+DOES delete any `sharepoint-acl-sync`-owned (sentinel-assigned) grants on
+that collection (2026-08-31 plan, Task 8) — with the scope row gone, the
+sync never reconciles that collection again, so a leftover sentinel grant
+would otherwise dangle forever; an admin-assigned grant on the same
+collection is untouched. `GET …/scopes` additionally returns `"zones"` — this
+connection's permission zones (Task 3/8, both `active` and `dissolved`), each
+`{zone_item_id, display_path, collection_id, status, detected_at}`.
 
 `access_mode: "manual"|"mirrored"` (2026-08-30 plan, Task 5) opts a scope into
 the `sharepoint-acl-sync` job's group/grant reconciliation; `mirrored`
 requires `drive_id` (`400 missing_drive_id` otherwise). The response also
-carries the `sharepoint-subtree-sweep` job's own findings (Task 7):
-`excluded_subtree_count` and `excluded_subtrees` (`[{item_id, path}]`) — the
-broken-inheritance folders that job excluded from the crawl by default
-(spec §3(b)). `include_excluded_subtrees: true` on `POST` asks to "include
-anyway" a detected subtree — refused with `409
+carries the `sharepoint-subtree-sweep` job's own findings: `excluded_subtree_count`
+and `excluded_file_count` (Task 7 / Task 8's file-count split) plus
+`excluded_subtrees` (`[{item_id, path, rel_path, kind}]`, `kind` one of
+`"folder"`/`"file"`, absent on a pre-sweep-v2 legacy entry which reads as
+`"folder"`) — the broken-inheritance folders/files that job excluded from the
+crawl by default (spec §3(b); sweep v2, 2026-08-31 plan Task 3, added file
+probing and `rel_path`). `include_excluded_subtrees: true` on `POST` asks to
+"include anyway" a detected subtree — refused with `409
 must_not_forbids_subtree_override` under the `must_not` guarantee mode
 (`acl_sync.guarantee_mode`, default), accepted and audited
 (`sharepoint_acl.subtree_override`) under `should_not`.
@@ -1283,9 +1294,28 @@ must_not_forbids_subtree_override` under the `must_not` guarantee mode
 acl_sync_already_running` when one is already queued/running for this
 connection.
 
-`GET …/corpus-map` is the producer handoff: the flat `{source_scope_id:
-collection_id}` mapping `ship_to_agnes.py --corpus-map` consumes until
-crawling moves inside Agnes.
+`POST …/subtree-sweep` (2026-08-31 plan, Task 8) is the admin "re-check
+subtrees now" trigger for the `sharepoint-subtree-sweep` job — identical
+mechanics to `POST …/acl-sync` above (same enqueue/flag-gate/dedup shape,
+`202 {"job_id", "status"}`, `409 feature_disabled`, `409
+sweep_already_running`), except the explicit-connection payload also bypasses
+the job's own per-connection due-guard (`acl_sync.sweep_interval_days`), so
+this always triggers a real sweep rather than a same-day no-op.
+
+`GET …/corpus-map` is the producer handoff: `{corpus_for()-key:
+collection_id}` in the producer resolver's own shape — `"<site display
+name>"` or `"<site display name>/<drive-relative folder path>"` — that
+`ship_to_agnes.py --corpus-map` consumes until crawling moves inside Agnes.
+Every ACTIVE permission zone (2026-08-31 plan, Task 3/7) folds in as an
+ADDITIONAL, NESTED key under its parent scope's own key (a zone's
+`display_path` always extends its parent's, e.g. parent `"Site/Team"`, zone
+`"Site/Team/Legal"`) — the producer's resolver MUST match these
+longest-prefix-first; a resolver that gets that wrong still fails closed via
+the server-side ingest gate (Task 5) rather than leaking zone content to the
+wider parent collection. A dissolved zone is never mapped. The exclusion
+handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
+job, not this endpoint) may now also contain unique-permission FILE item
+ids, riding the same per-scope item-id list as folder exclusions.
 
 `GET …/certificate` returns read-only certificate metadata — the thumbprint
 the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`

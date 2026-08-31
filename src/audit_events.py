@@ -1242,6 +1242,15 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "Already-ingested content removed because its source subtree/file lost inheritance or a permission zone dissolved.",
     ),
+    # -- 2026-08-31 plan, Task 8: admin surface for the subtree sweep — the
+    # "re-check subtrees now" trigger, mirroring sync_triggered's own
+    # "handler writes nothing itself; fallback middleware emits this"
+    # posture (src/audit_posture.py).
+    "sharepoint_acl.sweep_triggered": AuditEvent(
+        "sharepoint_acl.sweep_triggered",
+        "mutation",
+        "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
+    ),
 }
 
 
