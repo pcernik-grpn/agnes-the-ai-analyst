@@ -162,10 +162,10 @@ class TestServerOnlyCatalog:
 
     def test_internal_table_fetch_via_does_not_claim_already_local(self, reload_db):
         """#898: internal tables (agnes_audit & co.) live in the server state
-        backend and have no local view until the usage export lands in the
-        pull manifest — "already local" misroutes a fresh workspace into a
-        failing local query. The hint must point at the auto-routing
-        `agnes query` instead."""
+        backend and are never synced locally (`agnes pull` skips them and the
+        sync API refuses to sign their parquet URLs) — "already local" would
+        misroute any workspace into a failing local query. The hint must say
+        server-side only and point at the auto-routing `agnes query`."""
         from app.api import v2_catalog
         from src.repositories.table_registry import TableRegistryRepository
 
@@ -185,6 +185,10 @@ class TestServerOnlyCatalog:
             row = next(t for t in data["tables"] if t["id"] == "agnes_audit")
             assert "already local" not in row["fetch_via"], row["fetch_via"]
             assert "agnes query" in row["fetch_via"]
+            # There is no local-distribution path for internal tables — the
+            # hint must not promise one (`agnes pull` skips them).
+            assert "server-side only" in row["fetch_via"], row["fetch_via"]
+            assert "agnes pull" not in row["fetch_via"], row["fetch_via"]
         finally:
             conn.close()
             v2_catalog._table_rows_cache.clear()

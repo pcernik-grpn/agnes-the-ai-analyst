@@ -538,6 +538,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **The catalog's `fetch_via` hint for internal tables promised a local path that does not exist.** `query_mode='internal'` rows (`agnes_sessions`/`agnes_telemetry`/`agnes_audit`) claimed they become queryable locally "after the usage export + `agnes pull`" — no such export exists, and both `agnes pull` and the signed-URL sync API refuse internal tables. The hint now says server-side only.
 - A chat turn ended by the idle watchdog now persists its prompt-cache tokens like any other turn. The partial-save path carried only `tokens_in`/`tokens_out`, so it under-counted both the measured cost and the daily budget for precisely the turns most likely to be expensive.
 
 - `agnes catalog --refresh` no longer describes the server's catalog cache as a client-side one.

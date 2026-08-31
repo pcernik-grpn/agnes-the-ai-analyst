@@ -108,12 +108,13 @@ def _fetch_hint(table_id: str, source_type: str, server_only: bool = False, quer
         # tables. Snapshot-create is BigQuery-only, hence the separate hint.
         return "remote — no local copy; query via `agnes query --remote`"
     if source_type == "internal":
-        # Internal tables live in the server state backend and reach the
-        # analyst laptop only after the scheduled usage export lands in the
-        # pull manifest — on a fresh workspace there is NO local view yet, so
-        # "already local" would misroute a client straight into a failing
-        # local query (#898). `agnes query` auto-routes server-side either way.
-        return "query via `agnes query` (auto-routes server-side; local after the usage export + `agnes pull`)"
+        # Internal tables live in the server state backend and are never
+        # distributed to analyst laptops: `agnes pull` skips them and the
+        # sync API refuses to sign parquet URLs for them, so there is NO
+        # local view — "already local" would misroute a client straight
+        # into a failing local query (#898). `agnes query` auto-routes
+        # server-side.
+        return "server-side only — query via `agnes query` (auto-routes to the server)"
     return "already local — query directly via `agnes query`"
 
 
