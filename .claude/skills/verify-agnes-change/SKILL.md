@@ -89,7 +89,7 @@ two-line fix into a two-hour merge.
   a quarter of the suite's runtime — it says so and degrades to `fast` rather
   than quietly expanding to 24 000 tests. `python3 scripts/dev/impacted_tests.py --json`
   shows the selection and the reason without running anything.
-- **`--lane fast`** (~3 min, ~13 000 tests) is everything under the ~150 ms floor
+- **`--lane fast`** (2:57 for 12 989 tests; 1:59 with `AGNES_TEST_MAX_WORKERS=10`) is everything under the ~150 ms floor
   a test pays the moment it builds a `system.duckdb`, **plus every test with no
   recorded duration** — so the test you just wrote is always in the lane, even
   if it is slow.

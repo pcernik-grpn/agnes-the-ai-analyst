@@ -11,7 +11,7 @@ too. Full design: `docs/superpowers/specs/2026-06-05-agnes-dev-agent-kit-design.
 3. Keep changes vendor-agnostic — this is the public OSS distribution. No
    customer-specific deployments, project IDs, internal hostnames, or
    cross-references to private repos in code, config, comments, docs, or commits.
-4. Run the **fast lane** before pushing (~3 min): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
+4. Run the **fast lane** before pushing (2:57): `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`. The full suite runs in CI on the push — do not run it locally as a matter of routine.
 5. Add a `## [Unreleased]` CHANGELOG bullet for any user-visible behavior change.
 
 ## Testing conventions
@@ -64,15 +64,16 @@ how to treat WARN findings, when to add a new check) is
 ### Test lanes — what to run locally, and what CI runs
 
 **The full suite is CI's job, not yours.** It is ~24 000 tests: 12 parallel jobs
-of ~15 minutes each in CI, and 12+ minutes locally. Running it before every push
-— then again after each review round — is where a two-line fix turns into a
-two-hour merge, and it buys nothing CI is not about to compute anyway.
+of ~15 minutes each in CI, and 10:28 locally. Running it before every push — then
+again after each review round — is where a two-line fix turns into a two-hour
+merge, and it buys nothing CI is not about to compute anyway. The pre-push gate
+goes from 12:25 to 2:57 measured on the same machine.
 
 | Lane | Command | What it is |
 |---|---|---|
 | `impacted` | `pytest tests/ connectors/ --lane impacted -n auto -q` | Only the test files this branch's diff plausibly touches. Falls back to `fast` — never to the full suite — when the diff is too broad to target (a merge magnet like `src/db.py`, or a match set covering >25% of the suite's runtime). Inspect the selection with `python3 scripts/dev/impacted_tests.py --json`. |
-| `fast` | `pytest tests/ connectors/ --lane fast -n auto -q` | ~13 000 tests, ~3 min. Every test whose recorded runtime sits under the ~150 ms floor a test pays the moment it builds a `system.duckdb` — i.e. the half of the suite that is pure unit work — **plus every test with no recorded duration**, so a test you just wrote is always in. |
-| full | `pytest tests/ connectors/ -n auto -q` | ~12 min. CI runs this on every push. Locally: when CI is red and the failure will not reproduce under a narrower lane, or when you touched a merge magnet and want the answer before the round trip. |
+| `fast` | `pytest tests/ connectors/ --lane fast -n auto -q` | 12 989 tests, **2:57** (1:59 with `AGNES_TEST_MAX_WORKERS=10` on a 14-core machine — the default cap of 6 is tuned for the full suite's memory profile, and the fast lane is cheaper per worker). Every test whose recorded runtime sits under the ~150 ms floor a test pays the moment it builds a `system.duckdb` — i.e. the half of the suite that is pure unit work — **plus every test with no recorded duration**, so a test you just wrote is always in. |
+| full | `pytest tests/ connectors/ -n auto -q` | 24 231 tests, **10:28**. CI runs this on every push. Locally: when CI is red and the failure will not reproduce under a narrower lane, or when you touched a merge magnet and want the answer before the round trip. |
 
 Both lanes print which lane ran in the pytest header and a kept/deselected line
 in the summary, so a green run can never be mistaken for a full one. Machinery:

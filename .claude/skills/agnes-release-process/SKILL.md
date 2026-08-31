@@ -127,7 +127,7 @@ live in `docs/RELEASING.md`.
 ## Tests before push
 
 Run `.venv/bin/pytest tests/ connectors/ --lane fast --tb=short -n auto -q`
-(~3 min) before every push, after `--lane impacted` for what the diff touches.
+(2:57) before every push, after `--lane impacted` for what the diff touches.
 CI runs the full suite on the push — running it locally too is what makes a
 merge cycle take hours. Failures in code you touched: fix before pushing.
 Failures unrelated: confirm they reproduce on a clean branch, note in the PR

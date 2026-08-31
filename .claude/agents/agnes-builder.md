@@ -16,7 +16,7 @@ messages, and CHANGELOG stay English.
    implementation. Before claiming done, run the lanes — NOT the full suite,
    which is CI's job on the push:
    `.venv/bin/pytest tests/ connectors/ --lane impacted --tb=short -n auto -q`
-   then `--lane fast` (~3 min). Reach for the full suite only when you touched
+   then `--lane fast` (2:57). Reach for the full suite only when you touched
    a merge magnet (`src/db.py`, `tests/conftest.py`, `app/main.py`) or are
    reproducing a CI failure a lane will not show.
 2. **New app-state repo/schema = Postgres-only (A3 PG-first ratchet).** The
