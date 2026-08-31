@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **The extraction worker lane's concurrency is now configurable (Stage 1 of Agnes-owned extraction parallelism).** `extraction.concurrency` (`instance.yaml`, default 1) / `AGNES_EXTRACTION_CONCURRENCY` lets several `corpus-extraction` jobs for DIFFERENT connections run at once instead of the previous hardcoded one-at-a-time lane; per-connection idempotency at enqueue time still prevents two jobs for the SAME connection from ever coexisting. Resolved once at worker start (a config change needs a worker restart), clamped to `[1, 8]`, invalid values fall back to 1 with a logged warning rather than crashing the worker. Heavy/light lanes are unaffected.
+
 ### Changed
 
 - **The extraction lane's Terraform flag alone now activates it end to end.** `extraction_worker_enabled = true` used to still need a manual, per-VM edit of `/data/state/instance.yaml` (an `extraction:` block with `enabled: true` + `producer.command`/`.module`) because that file is applier-owned and the module cannot render it. `app/worker/kinds.py::_extraction_producer_argv()` now honors `AGNES_EXTRACTION_PRODUCER_COMMAND` / `AGNES_EXTRACTION_PRODUCER_MODULE` env overrides (env wins over `instance.yaml`, same posture as `app/coordination/factory.py`), and the `customer-instance` module writes `AGNES_EXTRACTION_ENABLED=1` + `AGNES_EXTRACTION_PRODUCER_COMMAND` into `/opt/agnes/.env` whenever `extraction_worker_enabled` is set — a new module-level `extraction_producer_command` variable (default `python /opt/producer/agnes_lane.py`) supplies the value. `AGNES_EXTRACTION_ENABLED` was already honored everywhere `extraction.enabled` is read.

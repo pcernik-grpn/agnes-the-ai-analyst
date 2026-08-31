@@ -664,6 +664,26 @@ and explicit-secrets prerequisites above remain yours to satisfy — on a
 DuckDB app-state instance the app still refuses to boot, naming the
 missing piece.
 
+**Scaling the extraction lane.** `extraction.concurrency` (`instance.yaml`)
+/ `AGNES_EXTRACTION_CONCURRENCY` (env, takes precedence) sizes how many
+`corpus-extraction` jobs run at once — default 1, clamped to `[1, 8]`,
+resolved once when the worker process starts (a change needs a worker
+restart, there is no live-reload). This is parallelism ACROSS connections,
+not within one: the per-connection idempotency key still guarantees at
+most one in-flight job per connection, so raising `concurrency` only lets
+*different* connections extract concurrently — it does not shard one large
+connection into parallel chunks (that is a separate, unimplemented
+direction; see the design note in the PR that introduced this setting).
+Each slot is a full producer subprocess (its own crawl workers plus an LLM
+pass), so this is memory/CPU math, not a free lunch: the
+`extraction-worker` compose service's default 4g/2cpu
+(`AGNES_EXTRACTION_WORKER_MEM_LIMIT`/`AGNES_EXTRACTION_WORKER_CPUS`) is
+sized for exactly ONE concurrent producer run. `concurrency: 3` on a
+producer that peaks around 1.2 GiB/run wants roughly `AGNES_EXTRACTION_
+WORKER_MEM_LIMIT=6g` (headroom over the naive 3.6 GiB, not just the raw
+multiple) and `AGNES_EXTRACTION_WORKER_CPUS` raised to match — measure your
+own producer's footprint rather than assuming this example holds.
+
 ### Coordination backend
 
 `coordination.backend` (`instance.yaml`) / `AGNES_COORDINATION_BACKEND`
