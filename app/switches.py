@@ -730,6 +730,71 @@ SWITCHES: tuple[Switch, ...] = (
             "New feature — off by default."
         ),
     ),
+    Switch(
+        name="acl_mirroring",
+        config_keys=("acl_mirroring", "enabled"),
+        env_var="AGNES_ACL_MIRRORING_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope "
+            "access_mode='mirrored', and the admin sync-now endpoint. OFF by default — "
+            "turning it on changes nothing until a scope opts into mirroring."
+        ),
+    ),
+    Switch(
+        name="acl_guarantee_mode",
+        config_keys=("acl_sync", "guarantee_mode"),
+        env_var="AGNES_ACL_GUARANTEE_MODE",
+        kind="select",
+        options=("must_not", "should_not"),
+        default="must_not",
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Cross-audience-leak posture (design Q7). must_not = fail closed: "
+            "broken-inheritance subtrees are always excluded, mirrored grants are "
+            "suspended past acl_sync.max_stale_hours, and untagged claims in an "
+            "audience-tiered scope are admin-only. should_not = best effort: advisory "
+            "overrides allowed, stale grants persist with warnings, untagged claims "
+            "stay unrestricted within their collection."
+        ),
+    ),
+    Switch(
+        name="acl_max_stale_hours",
+        config_keys=("acl_sync", "max_stale_hours"),
+        env_var="AGNES_ACL_MAX_STALE_HOURS",
+        kind="int",
+        default=72,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "must_not mode only: hours a failed ACL sync may leave mirrored grants "
+            "standing before they are suspended (deleted until the next successful "
+            "sync rewrites them)."
+        ),
+    ),
+    Switch(
+        name="acl_sweep_interval_days",
+        config_keys=("acl_sync", "sweep_interval_days"),
+        env_var="AGNES_ACL_SWEEP_INTERVAL_DAYS",
+        kind="int",
+        default=7,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "Days between full sharepoint-subtree-sweep passes (broken-inheritance "
+            "folder detection, spec §3(b)) for one connection's mirrored scopes. The "
+            "scheduler row itself already fires weekly (native cron); this is a "
+            "per-connection self-guard against a restart-refire, not the primary cadence."
+        ),
+    ),
 )
 
 _BY_NAME: dict[str, Switch] = {s.name: s for s in SWITCHES}

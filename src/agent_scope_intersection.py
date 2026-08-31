@@ -601,6 +601,62 @@ def writer_can_access_item(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Audience-class pin (2026-08-30 sharepoint-acl-mirroring plan, Task 9; spec
+# §4.2, §7 step 6): an AgentPrincipal's per-tiered-collection audience-class
+# selector defaults to the LEAST-privileged class, but an agent's scope
+# declaration may pin a more-privileged one. The pin is not a data-authority
+# item (it never widens which collections/tables the agent can reach — see
+# ``DATA_AUTHORITY_ITEM_TYPES`` above, which this deliberately does not
+# join): it only selects, WITHIN a collection the agent can already read,
+# which audience-tagged claim variant it sees
+# (``src.audience_classes.audience_classes_for_caller`` is the sole reader).
+#
+# Stored as an ordinary ``agent_scope`` row — no schema change: the existing
+# composite key ``(agent_id, item_type, item_id)`` already lets one agent
+# carry many independent pins, one per collection, by encoding both the
+# collection id and the class name into ``item_id``.
+# ---------------------------------------------------------------------------
+
+#: item_type for a per-collection audience-class pin row. Never added to
+#: ``DATA_AUTHORITY_ITEM_TYPES``/``MODE_TO_RESOURCE_TYPE``/
+#: ``TABLES_MODE_EXTRA_TYPES`` — none of the axes those constants drive
+#: should ever filter, expand, or gate on this item_type.
+AUDIENCE_CLASS_PIN_ITEM_TYPE = "audience_class_pin"
+
+
+def audience_class_pins(agent_id: str) -> dict[str, str]:
+    """``{collection_id: class_name}`` pins this agent's scope declares.
+
+    Reads ``agent_scope`` rows of item_type :data:`AUDIENCE_CLASS_PIN_ITEM_TYPE`
+    straight through the repo factory (``agents_repo().get_scope``) — the
+    write path (``app/api/agents_admin.py::set_agent_scope``) is the only
+    writer and already validates each pin against ``src.audience_classes.
+    audience_class_map()`` before persisting, so a row read back here is
+    normally well-formed. This reader still degrades gracefully rather than
+    raising on a malformed ``item_id`` (missing ``':'``, or an empty
+    collection/class half), since a corrupt declaration must never turn a
+    resolution-time read into a 500 — it is simply dropped. A duplicate
+    collection_id across stored rows (should not happen — the write path
+    keeps at most one pin per collection) keeps the LAST row seen, for a
+    deterministic tie-break rather than an arbitrary one.
+    """
+    from src.repositories import agents_repo
+
+    if not agent_id:
+        return {}
+    pins: dict[str, str] = {}
+    for row in agents_repo().get_scope(agent_id):
+        if row.get("item_type") != AUDIENCE_CLASS_PIN_ITEM_TYPE:
+            continue
+        item_id = row.get("item_id") or ""
+        collection_id, sep, class_name = item_id.partition(":")
+        if not sep or not collection_id or not class_name:
+            continue
+        pins[collection_id] = class_name
+    return pins
+
+
 def first_inaccessible_data_item(
     writer_user_id: str,
     items: Iterable[Tuple[str, str]],

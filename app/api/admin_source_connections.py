@@ -68,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -301,10 +302,20 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
     return token or None
 
 
-def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
+def _reject_disallowed_token_env(token_env: Optional[str], field: str = "token_env") -> None:
     """Reject a secret-ref env name that isn't on the config-secret allowlist
     (409-style 400). None/empty is allowed — vault-secret connections don't use
     token_env. Called on create/update so a bad name never lands in the row.
+    ``field`` names the request field in the error — the config-embedded
+    variants (``cert_private_key_env``, ``private_key_env``, …) were previously
+    all reported as ``token_env``, a field their wizards don't even show.
+
+    Two mistakes admins actually make get targeted messages instead of the
+    generic allowlist remedies: pasting a cloud secret-manager secret NAME
+    where an env-var name belongs (Agnes reads only its own process
+    environment, never a cloud secret store), and pasting the PEM CONTENT
+    into the name field. Both point at the vault upload, the path that works
+    without any deployment change.
 
     The write-time gate is the config-resolution UNION (attach names plus
     config-only names like the SharePoint certificate env) — the hard
@@ -315,17 +326,42 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
         return
     from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_config_secret_env_allowed(token_env):
+    if is_config_secret_env_allowed(token_env):
+        return
+    vault_hint = (
+        "store the credential itself in the connection vault instead: the connection's "
+        "credential field in the admin UI, PUT .../secret, or "
+        "`agnes admin connection secret <id> --from-file <path>`"
+    )
+    if token_env.lstrip().startswith("-----BEGIN"):
+        # Never echo the value back — it is credential material.
         raise HTTPException(
             status_code=400,
             detail=(
-                f"token_env {token_env!r} is not allowlisted. Use a data-source "
-                "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
-                "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
-                "remote-attach token_env), or store the token in the vault via "
-                "PUT .../secret instead."
+                f"{field} holds PEM content, but this field takes the NAME of a server "
+                f"environment variable — {vault_hint}."
             ),
         )
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{field} {token_env!r} looks like a secret manager or vault secret name, "
+                "not an environment variable of the server process — Agnes does not read "
+                f"cloud secret stores. Either {vault_hint}, or have the deployment inject "
+                "the value under an env var and allowlist that name (AGNES_CONFIG_SECRET_ENVS)."
+            ),
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{field} {token_env!r} is not allowlisted. Use a data-source "
+            "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
+            "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
+            "remote-attach token_env), or store the token in the vault via "
+            "PUT .../secret instead."
+        ),
+    )
 
 
 #: Secret-ref NAME fields a connection's ``config`` can carry, per source_type.
@@ -370,7 +406,7 @@ def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict
         value = cfg.get(field)
         if value is not None and not isinstance(value, str):
             continue  # malformed, not a security concern here; the spec validator's problem
-        _reject_disallowed_token_env(value)
+        _reject_disallowed_token_env(value, field=field)
 
 
 #: Source types whose connection identity D2.3 relocated onto this row (off
@@ -871,7 +907,14 @@ async def update_connection(
     ``extraction: null``) in the request still clears it deliberately. The
     full set of keys is ``app.api.admin_sharepoint.
     SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``, ratcheted by
-    ``tests/test_sharepoint_config_carry_forward_ratchet.py``.
+    ``tests/test_sharepoint_config_carry_forward_ratchet.py``. Two more keys
+    — ``config.acl_sync_last_run``/``config.acl_sync_last_success_at``,
+    written by the ``sharepoint-acl-sync`` WORKER JOB rather than an
+    ``admin_sharepoint.py`` endpoint (``connectors.sharepoint.acl_sync
+    .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) — get the same carry-forward
+    treatment just below, kept as a separate hand-maintained list because
+    that ratchet's static scan is deliberately scoped to one file and
+    cannot see a different module's writes.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -968,6 +1011,32 @@ async def update_connection(
                 for _sp_key in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS:
                     if _sp_key not in config and old_config.get(_sp_key) is not None:
                         config = {**config, _sp_key: old_config[_sp_key]}
+
+                # The `sharepoint-acl-sync` WORKER JOB (2026-08-30 plan, Task
+                # 4/5) writes its own two config keys
+                # (`acl_sync_last_run`/`acl_sync_last_success_at`,
+                # `connectors/sharepoint/acl_sync.py::_sync_connection`) —
+                # from a background job, never from an
+                # `app/api/admin_sharepoint.py` endpoint. That is why they are
+                # NOT part of `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS` above:
+                # `tests/test_sharepoint_config_carry_forward_ratchet.py`
+                # statically scans ONLY `admin_sharepoint.py`'s own writers
+                # (its own module docstring states the one-file scope), so
+                # listing a key written from a different module there would
+                # fail that ratchet the other way ("declared but no writer
+                # found"). Same erasure risk as `scopes`/`extraction` above —
+                # an ordinary edit through this wholesale-`config`-replacing
+                # endpoint would otherwise silently drop the connection's last
+                # ACL-sync run/success timestamp — carried forward here by
+                # hand instead, imported from the module that actually owns
+                # them (`connectors.sharepoint.acl_sync
+                # .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS`) so the two lists
+                # never drift out of sync with each other.
+                from connectors.sharepoint.acl_sync import ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _acl_key in ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _acl_key not in config and old_config.get(_acl_key) is not None:
+                        config = {**config, _acl_key: old_config[_acl_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`
@@ -1272,6 +1341,17 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                     status = 400 if is_upstream_client_error(exc) else 502
                     raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
                 _reject_project_mismatch(row, info, what="storage token")
+        elif row.get("source_type") == "sharepoint":
+            # Fail fast on unusable certificate material. Without this, any
+            # string stored fine and surfaced hours later as an opaque
+            # provider auth error on the first Graph call — the least
+            # discoverable part of the whole flow is that the credential is
+            # the certificate AND its private key concatenated in one PEM.
+            from connectors.sharepoint.graph_client import validate_certificate_material
+
+            reason = validate_certificate_material(value)
+            if reason:
+                raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
         key = connection_id
 
     try:
