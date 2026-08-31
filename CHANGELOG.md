@@ -1275,6 +1275,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   directions — every name the help advertises is registered, and every
   registered adapter is advertised — so registering a new adapter cannot leave
   the help behind again.
+- **The semantic model detail page no longer offers a "Detach to edit"
+  button that dead-ends in a 501 on a DuckDB-backed instance.** Detaching an
+  imported model is Postgres-only (A3 ratchet); the toolbar on
+  `/semantic-layer/{slug}` now hides the button and shows an explanatory
+  note instead when the active backend is DuckDB, following the
+  `/admin/ontology` precedent. Also: the MCP query advisory's `detection`
+  disclosure (the "this is a heuristic, not proof" note) no longer gets
+  silently dropped when the advisory itself is shortened to fit the output
+  cap — only dropped when the whole advisory is dropped for being too large.
 - **The static `get_system_db()` guard now actually covers the named-agent
   semantic-layer section.** `app/chat/agent_profile.py`'s
   `_semantic_layer_section` opens a DuckDB connection but was missing from

@@ -672,6 +672,43 @@ class TestModelDetail:
         assert 'data-state-kind="empty"' in r.text
         assert 'data-state-kind="nothing_found"' not in r.text
 
+    def test_detach_button_hidden_with_explanatory_note_on_duckdb_backend(self, seeded_app, monkeypatch):
+        """On a DuckDB-backed instance, `detach_semantic_model` raises
+        `RequiresPostgresBackend` (a 501) -- the toolbar must not offer a
+        control that dead-ends there. `seeded_app` runs on DuckDB by
+        default (no monkeypatch needed to prove the DuckDB-backend case)."""
+        import src.repositories as repos
+
+        monkeypatch.setattr(repos, "use_pg", lambda: False)
+        _seed_model(id="manual/_/imp", slug="imp_retail", source="keboola_metastore")
+        r = seeded_app["client"].get("/semantic-layer/imp_retail", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert 'id="slb-detach-btn"' not in r.text
+        assert "requires the Postgres app-state backend" in r.text
+
+    def test_detach_button_shown_on_pg_backend(self, seeded_app, monkeypatch):
+        """Simulate the PG-backend render without a live Postgres: seed and
+        resolve the row on the (default, DuckDB) test backend, then swap in
+        a lookup that returns that row untouched while `use_pg()` reports
+        True -- isolating the template decision from the actual repo
+        backend selection (which forcing `use_pg()` globally would otherwise
+        route through a real Postgres connection for auth too, per
+        `app.auth.pat_resolver.resolve_token_to_user` -> `users_repo()`)."""
+        import app.web.router as web_router
+        import src.repositories as repos
+        from app.auth.dependencies import get_current_user
+
+        row = _seed_model(id="manual/_/imp2", slug="imp_retail2", source="keboola_metastore")
+        admin_user = {"id": "admin1", "email": "admin@test.com", "is_admin": True}
+        client = seeded_app["client"]
+        client.app.dependency_overrides[get_current_user] = lambda: admin_user
+        monkeypatch.setattr(web_router, "_readable_model_by_slug", lambda slug, user, conn: row)
+        monkeypatch.setattr(repos, "use_pg", lambda: True)
+        r = client.get("/semantic-layer/imp_retail2")
+        assert r.status_code == 200, r.text
+        assert 'id="slb-detach-btn"' in r.text
+        assert "requires the Postgres app-state backend" not in r.text
+
 
 class TestObjectDetail:
     def test_dataset_object_renders_fields_table_and_all_five_ai_groups(self, seeded_app):
@@ -1313,7 +1350,7 @@ class TestFlatProjectionTabsFold:
         """The memo from #1850: the model cards, the browse gate and the
         per-metric document links are three answers off ONE
         ``_can_read_model`` sweep, not three."""
-        import app.api.semantic_models as semantic_models
+        from app.api import semantic_models
 
         _seed_model()
         _seed_document("finance", _document_json("finance"))
