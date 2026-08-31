@@ -160,7 +160,7 @@ class TestDetailPageRendersTokens:
         from pathlib import Path
 
         template = Path("app/web/templates/admin_session_detail.html").read_text(encoding="utf-8")
-        assert "renderMeta(d.summary, d.tokens)" in template, (
+        assert "renderMeta(d.summary, d.tokens, d.counts)" in template, (
             "the detail page must pass the transcript payload's token summary into the meta renderer"
         )
         assert "fmtTokens" in template, "the token line must render, not just receive, the summary"

@@ -170,11 +170,23 @@ def messages_to_turns(chat_id: str, messages: list[ChatMessage]) -> list[dict]:
             message: dict[str, Any] = {"role": "assistant", "content": blocks}
             if m.model:
                 message["model"] = m.model
-            if m.tokens_in or m.tokens_out:
+            if m.tokens_in or m.tokens_out or m.cache_read_tokens or m.cache_creation_tokens:
                 message["usage"] = {
                     "input_tokens": m.tokens_in or 0,
                     "output_tokens": m.tokens_out or 0,
                 }
+                # Prompt-cache halves ride along when recorded (Postgres
+                # app-state; the frozen DuckDB backend has no column and
+                # leaves them None) — without them the transcript viewer's
+                # token line under-reports a cache-heavy chat session by
+                # exactly the dominant term. Keys match the Anthropic usage
+                # shape every downstream reader already parses; omitted
+                # (not zeroed) when unrecorded, so "unknown" stays distinct
+                # from "measured zero".
+                if m.cache_read_tokens is not None:
+                    message["usage"]["cache_read_input_tokens"] = m.cache_read_tokens
+                if m.cache_creation_tokens is not None:
+                    message["usage"]["cache_creation_input_tokens"] = m.cache_creation_tokens
             turns.append(
                 {
                     "type": "assistant",

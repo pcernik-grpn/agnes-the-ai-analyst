@@ -659,7 +659,10 @@ docstring):
 - **Token-derived caps are not metered.** The engine's stream carries no
   usage numbers, so `chat.daily_anthropic_spend_usd` and
   `chat.max_session_tokens` never trip on engine sessions, and the admin
-  spend view reads zero for them. Message-rate (`rate_messages_per_hour`)
+  spend view reads zero for them. For the same reason an engine session's
+  exported transcript at `/admin/sessions` shows **Model: — / Tokens: —**:
+  the model and usage are unknown to Agnes, and the viewer renders that as
+  a dash rather than a made-up zero. Message-rate (`rate_messages_per_hour`)
   and per-user concurrency caps still apply. Cost control belongs on the
   engine's own limits and the LLM broker.
 - **Agent profiles and memories DO reach the engine; co-drive workspaces do

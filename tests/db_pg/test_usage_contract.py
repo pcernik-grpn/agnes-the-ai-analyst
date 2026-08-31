@@ -406,6 +406,7 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
         repo,
         session_file="tk/s1.jsonl",
         username="tok",
+        user_id="user-42",
         started_at=now,
         input_tokens=100,
         output_tokens=200,
@@ -419,6 +420,9 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
     assert row["output_tokens"] == 200
     assert row["cache_read_tokens"] == 300
     assert row["cache_creation_tokens"] == 400
+    # The transcript viewer's activity-timeline link needs the resolved
+    # users.id — same widened-projection seam as the token counters above.
+    assert row["user_id"] == "user-42"
 
 
 def test_tool_call_totals_include_mcp_and_subagent_on_both_backends(usage_repo):
