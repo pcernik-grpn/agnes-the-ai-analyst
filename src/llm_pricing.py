@@ -25,12 +25,24 @@ multiplier for every call it makes today — revisit this if an explicit
 Rates are per million tokens, Anthropic first-party API (which also covers
 Microsoft Foundry). Bedrock and Vertex are partner-operated with their own
 price lists, so a Vertex-routed instance's absolute USD figures are an
-approximation — the relative shape (cached vs uncached) still holds.
+approximation — the relative shape (cached vs uncached) still holds. Such an
+instance (or one running a model newer than its Agnes release) can state its
+own rates in the ``pricing:`` block of instance.yaml; see
+:func:`price_for_model` for the lookup order and
+``config/instance.yaml.example`` for the operator-facing documentation.
+
+Nothing here is persisted. Cost is computed from stored token counts at
+read time, on purpose: prices change, and a stored cost silently becomes a
+number nobody can reproduce.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 #: Prompt-cache multipliers, relative to a model's own input rate. Uniform
 #: across the model family, which is why they are defaults on ModelPrice
@@ -47,13 +59,24 @@ class ModelPrice:
     output_per_mtok: float
     cache_write_multiplier: float = CACHE_WRITE_MULTIPLIER
     cache_read_multiplier: float = CACHE_READ_MULTIPLIER
+    #: Absolute USD/MTok cache rates, used INSTEAD of the multipliers above
+    #: when set. Only operator config sets these: an instance.yaml
+    #: `pricing:` entry states cache rates absolutely (that is how a
+    #: provider's price list reads), while the in-code table derives them
+    #: from each model's own input rate.
+    cache_write_override: float | None = None
+    cache_read_override: float | None = None
 
     @property
     def cache_write_per_mtok(self) -> float:
+        if self.cache_write_override is not None:
+            return self.cache_write_override
         return self.input_per_mtok * self.cache_write_multiplier
 
     @property
     def cache_read_per_mtok(self) -> float:
+        if self.cache_read_override is not None:
+            return self.cache_read_override
         return self.input_per_mtok * self.cache_read_multiplier
 
 
@@ -85,9 +108,27 @@ PRICES: dict[str, ModelPrice] = {
 DEFAULT_PRICE = PRICES["claude-opus-5"]
 
 
-def resolve_price(model: str | None) -> ModelPrice:
-    """Rates for ``model`` — exact match, else longest known prefix, else
-    :data:`DEFAULT_PRICE`.
+def _pricing_config() -> dict[str, Any]:
+    """The instance's ``pricing:`` block, or ``{}`` when it has none.
+
+    Read through the shared loader on every call rather than cached here:
+    the loader already caches, and an /admin/server-config edit has to reach
+    the next cost computation without a restart. Never raises — a config
+    file mid-rewrite must not take the chat spend guardrail down with it.
+    """
+    try:
+        from app.instance_config import get_value
+
+        cfg = get_value("pricing", default=None)
+    except Exception:  # pragma: no cover - defensive, config layer unavailable
+        logger.debug("pricing config unreadable; using in-code prices", exc_info=True)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _table_price(key: str) -> ModelPrice | None:
+    """In-code rates for a normalized model id — exact, else longest known
+    prefix, else ``None``.
 
     Prefix matching is what keeps a dated snapshot id
     (``claude-opus-4-5@20251101``, ``claude-sonnet-5-20260101``) priced as
@@ -95,23 +136,107 @@ def resolve_price(model: str | None) -> ModelPrice:
     ``claude-opus-4-8`` cannot be captured by a shorter ``claude-opus-4``
     style key if one is ever added.
     """
-    if not model:
-        return DEFAULT_PRICE
-    key = model.strip().lower()
+    if not key:
+        return None
     exact = PRICES.get(key)
     if exact is not None:
         return exact
     # Vertex spells a dated snapshot `model@date`; strip the platform
     # prefix Bedrock adds (`anthropic.claude-opus-5`) before matching.
-    key = key.removeprefix("anthropic.")
+    stripped = key.removeprefix("anthropic.")
     for known in sorted(PRICES, key=len, reverse=True):
-        if key.startswith(known):
+        if stripped.startswith(known):
             return PRICES[known]
+    return None
+
+
+def _configured_entry(models: Any, key: str) -> Any:
+    """The operator's entry for ``key`` — exact, else longest matching
+    prefix, mirroring :func:`_table_price` so a configured family covers its
+    dated variants exactly like an in-code one does."""
+    if not isinstance(models, dict) or not key:
+        return None
+    normalized = {str(k).strip().lower(): v for k, v in models.items()}
+    if key in normalized:
+        return normalized[key]
+    stripped = key.removeprefix("anthropic.")
+    for known in sorted(normalized, key=len, reverse=True):
+        if known and stripped.startswith(known):
+            return normalized[known]
+    return None
+
+
+def _price_from_entry(entry: Any, base: ModelPrice | None) -> ModelPrice | None:
+    """Build rates from one operator entry, or ``None`` if it is unusable.
+
+    An entry states USD per million tokens and overrides only the keys it
+    names: correcting an output rate must not silently zero the input one.
+    Unstated cache rates keep the standard multipliers applied to the
+    EFFECTIVE input rate, so ``{input: 10}`` alone still prices a cached
+    read at a tenth of the rate the operator just set.
+    """
+    if not isinstance(entry, dict):
+        if entry is not None:
+            logger.warning("pricing config entry is not a mapping; ignoring it")
+        return None
+    fallback = base if base is not None else ModelPrice(0.0, 0.0)
+    try:
+        input_per_mtok = float(entry["input"]) if "input" in entry else fallback.input_per_mtok
+        output_per_mtok = float(entry["output"]) if "output" in entry else fallback.output_per_mtok
+        cache_read = float(entry["cache_read"]) if "cache_read" in entry else None
+        cache_write = float(entry["cache_write"]) if "cache_write" in entry else None
+    except (TypeError, ValueError):
+        logger.warning("pricing config entry has non-numeric rates; ignoring it: %r", entry)
+        return None
+    return ModelPrice(
+        input_per_mtok,
+        output_per_mtok,
+        cache_read_override=cache_read,
+        cache_write_override=cache_write,
+    )
+
+
+def price_for_model(model: str | None) -> ModelPrice:
+    """Rates for ``model``.
+
+    Lookup order — operator config first, so an instance running a model
+    Agnes has no rate for (or on a partner-operated price list) can state
+    its own numbers without a release:
+
+    1. exact ``pricing.models`` entry
+    2. longest-prefix ``pricing.models`` entry
+    3. exact in-code :data:`PRICES` entry
+    4. longest-prefix in-code entry
+    5. ``pricing.default``
+    6. :data:`DEFAULT_PRICE`
+
+    Step 6 is deliberately the conservative in-code tier rather than a
+    zero-cost price: these rates back the chat daily spend cap, which prices
+    an unattributed day at ``model=None``. "Free" is not a safe reading of
+    "unknown" — an operator who wants it says so in ``pricing.default``.
+    """
+    key = (model or "").strip().lower()
+    cfg = _pricing_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    base = _table_price(key)
+    configured = _price_from_entry(_configured_entry(cfg.get("models"), key), base)
+    if configured is not None:
+        return configured
+    if base is not None:
+        return base
+    default = _price_from_entry(cfg.get("default"), None)
+    if default is not None:
+        return default
     return DEFAULT_PRICE
 
 
+#: Historical name, kept because existing callers (``app/api/admin_usage.py``)
+#: import it. It is the same function, never a second config-blind lookup.
+resolve_price = price_for_model
+
+
 def cost_usd(
-    *,
     model: str | None,
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -124,7 +249,7 @@ def cost_usd(
     field of the same name — cached tokens are reported separately and
     priced separately here, never double-counted.
     """
-    p = resolve_price(model)
+    p = price_for_model(model)
     return (
         input_tokens * p.input_per_mtok
         + output_tokens * p.output_per_mtok

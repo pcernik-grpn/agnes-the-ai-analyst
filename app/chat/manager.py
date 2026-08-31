@@ -4524,7 +4524,8 @@ async def enforce_sender_limits(
     """
     # Enforce daily Anthropic spend cap — see daily_token_totals.
     tokens_in, tokens_out = daily_token_totals(repo, sender)
-    # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
+    # `model=None` resolves to the operator's `pricing.default` if instance.yaml
+    # states one, else llm_pricing.DEFAULT_PRICE — the most
     # expensive general-purpose tier. Deliberate: the day's spend arrives here
     # as a two-bucket token counter with no model attached (a session's model
     # is whatever the sandbox's CLI resolved, recorded per message, and one

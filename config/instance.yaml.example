@@ -1002,6 +1002,42 @@ materialize:
 #   # Default 6.
 #   rolling_snapshot_interval_hours: 6
 
+# --- Model prices (optional) ---
+# What a token costs, in USD per million tokens ("USD per MTok"). Agnes
+# ships list prices for the current Claude models in src/llm_pricing.py and
+# needs nothing here; state a rate only when yours differ — a model newer
+# than this release, a partner-operated endpoint (Bedrock/Vertex run their
+# own price lists), or a negotiated rate.
+#
+# Cost is always COMPUTED at read time from stored token counts, never
+# persisted, so a correction here re-prices every existing dashboard figure
+# on the next page load. It also feeds chat.daily_anthropic_spend_usd, so a
+# wrong rate moves the spend cap.
+#
+# Keys match the model id by exact match, else longest prefix, so one entry
+# covers a family's dated snapshots (`claude-opus-5` prices
+# `claude-opus-5-20260201` too). Unstated rates keep their in-code value;
+# unstated cache rates stay at the standard multipliers of the input rate
+# (a cached read 0.1x, a cache write 1.25x).
+#
+# pricing:
+#   models:
+#     claude-opus-5:
+#       input: 5.0                  # USD per million uncached input tokens
+#       output: 25.0                # USD per million output tokens
+#       cache_read: 0.5             # USD per million tokens read from cache
+#       cache_write: 6.25           # USD per million tokens written to cache
+#     my-fine-tune:
+#       input: 1.5
+#       output: 7.5
+#   # Rate for a model with no entry above and none in-code. Without it, an
+#   # unknown model is priced at the most expensive general-purpose tier —
+#   # deliberate, so a spend cap that has to guess errs toward stopping
+#   # sooner. Set this to zeros to make unknown models cost nothing instead.
+#   default:
+#     input: 5.0
+#     output: 25.0
+
 # --- Cloud-hosted Claude Code (optional) ---
 # Cloud-hosted Claude Code (web /chat + Slack adapter). Off by default;
 # turn on per-instance once the chosen provider's backing exists and
