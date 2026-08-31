@@ -828,16 +828,22 @@ def _invoke_keboola_extractor_subprocess(
     TOKEN`` — see ``_resolve_keboola_credentials``). Mutates
     ``collected_errors`` / ``synced_table_names`` in place.
 
-    ``merge=False`` (the first credential group of a pass) keeps the
-    historical semantics: ``extractor.run()`` rebuilds ``extract.duckdb``
-    from scratch, which is also the implicit prune for deleted/renamed
-    registry rows. ``merge=True`` (every LATER group of the same pass)
-    makes ``run()`` seed its temp build from the current extract and
-    replace only its own tables — without it, each group's atomic
-    tmp-then-move swap clobbered the previous group's output and only the
-    LAST connection's tables survived the pass (every earlier group's
-    ``_meta`` rows and views vanished from analytics at the next
-    orchestrator rebuild).
+    ``merge=False`` keeps the historical semantics: ``extractor.run()``
+    rebuilds ``extract.duckdb`` from scratch, which is also the implicit
+    prune for deleted/renamed registry rows. ``merge=True`` makes ``run()``
+    seed its temp build from the current extract and replace only its own
+    tables. ``_run_sync`` reserves ``merge=False`` for the first credential
+    group of a pass that covers the WHOLE Keboola local surface
+    (``_covers_every_local_row``); every later group, and every group of a
+    scoped pass, merges. Both halves of that are load-bearing:
+
+    * across credential groups — without merge, each group's atomic
+      tmp-then-move swap clobbered the previous group's output and only the
+      LAST connection's tables survived the pass;
+    * across a scoped pass — without merge, a ``tables=[...]`` trigger or a
+      cadence-filtered tick rebuilt the extract from its own subset and
+      deleted the ``_meta`` rows + inner views of every sibling, whose
+      master views then 400 on read until the next full sweep.
 
     Extracted out of ``_run_sync`` (#B2) so the per-``connection_id`` group
     dispatch there can call this once per credential group instead of
@@ -1117,6 +1123,71 @@ sys.exit(compute_exit_code(result, len(configs)))
                     synced_table_names.add(_name)
 
 
+def _registry_row_key(row: dict) -> str:
+    """Stable identity for a ``table_registry`` row.
+
+    ``id`` is the primary key and what ``POST /api/sync/trigger`` bodies carry,
+    so it is the identity that matters when asking "does this pass cover every
+    row of the source?". ``name`` is the fallback for a row shape that predates
+    id-keying (auto-discovered rows where ``id != name``), and only ever used
+    when ``id`` is absent — never as a second key for the same row, which would
+    make a set comparison against it under-count.
+    """
+    return str(row.get("id") or row.get("name") or "")
+
+
+def _is_keboola_row(row: dict) -> bool:
+    """Is this registry row owned by the Keboola connector?
+
+    A missing / empty ``source_type`` reads as Keboola: Keboola was the only
+    connector when the column was added, so legacy rows predate it. Both the
+    "which rows may reach the Keboola extractor" filter and the prune-coverage
+    surface go through here, so they cannot disagree about a legacy row —
+    counting it on one side only would let a pass omitting it still read as
+    covering the surface, and the prune would delete it.
+    """
+    return (row.get("source_type") or "keboola") == "keboola"
+
+
+def _keboola_extract_surface(registry_rows: list) -> list:
+    """The Keboola rows whose ``_meta`` entry and inner view live in
+    ``extracts/keboola/extract.duckdb`` because ``extractor.run()`` put them
+    there — i.e. everything the from-scratch rebuild would drop.
+
+    ``local`` and ``remote`` both qualify: ``run()`` writes a parquet-backed
+    view for the first and a ``kbc``-extension view plus the ``_remote_attach``
+    row for the second, and a rebuild takes out either. ``materialized`` rows
+    do not: ``run()`` skips them, their ``_meta`` row comes from
+    ``_persist_materialized_inner_view``, and the orchestrator's
+    filesystem-fallback recreates their master view from the parquet when the
+    row goes missing — the one query_mode with a recovery path.
+    """
+    return [r for r in registry_rows if _is_keboola_row(r) and (r.get("query_mode") or "local") in ("local", "remote")]
+
+
+def _pass_covers_surface(table_configs: list, surface_rows: list) -> bool:
+    """Does this pass carry every row in ``surface_rows``?
+
+    ``connectors.keboola.extractor.run(merge=False)`` rebuilds the source's
+    ``extract.duckdb`` from scratch, which is what makes deleted / renamed
+    registry rows disappear — and what makes a SCOPED pass destructive, since
+    every row it does not carry loses its ``_meta`` entry and inner view too.
+    So the prune is gated on this predicate rather than on which code path
+    produced ``table_configs``: whatever narrowed the pass (a ``tables=[...]``
+    trigger body, a ``sync_schedule`` cadence filter, a future filter nobody
+    has written yet), a pass that cannot account for the whole surface merges
+    instead.
+
+    Returns False for an empty surface: there is nothing to prune, and the
+    extract may still hold ``_meta`` rows a materialize pass registered, which
+    are worth keeping.
+    """
+    surface = {_registry_row_key(r) for r in surface_rows}
+    if not surface:
+        return False
+    return surface <= {_registry_row_key(tc) for tc in table_configs}
+
+
 def _run_sync(
     tables: Optional[List[str]] = None,
     source_type_filter: Optional[str] = None,
@@ -1256,14 +1327,28 @@ def _run_sync(
         # though the registry is populated. (Devin BUG_0001 on ebb8cc9;
         # #1253 hardened the `tables` branch the same way.)
         repo = table_registry_repo()
-        registry_has_tables = bool(repo.list_all())
+        registry_rows = repo.list_all()
+        registry_has_tables = bool(registry_rows)
         if tables:
             # Manual operator override — bypass schedule filter entirely
             # so an admin saying "sync these specific tables now" wins.
             all_configs = [repo.get(t) for t in tables]
             table_configs = [c for c in all_configs if c is not None]
         else:
-            table_configs = repo.list_local(effective_source_type) if effective_source_type else repo.list_local()
+            # Scope by the EXPLICIT `?source=` filter only — not by
+            # `effective_source_type`, which folds in the instance's
+            # `data_source.type`. That knob names the instance's primary
+            # connector; it is not a statement about what the registry holds.
+            # A deployment provisioned as one kind and later given tables from
+            # another — say a CSV/local instance whose registry has since
+            # acquired Keboola local rows behind a named source_connection —
+            # selected `list_local("local")` == [] on every cadence tick, so
+            # its Keboola tables were never re-extracted and only an explicit
+            # `?source=keboola` trigger ever refreshed them. The materialized
+            # pass below already passes `source_type=source_type_filter` — a
+            # bare sweep materializes every source's rows — so this is the two
+            # halves of one pass agreeing, not a new policy.
+            table_configs = repo.list_local(source_type_filter) if source_type_filter else repo.list_local()
             # Without this filter, every scheduler tick would re-sync
             # every table regardless of its sync_schedule cadence,
             # making the field a no-op at trigger time. Tables with
@@ -1323,7 +1408,18 @@ def _run_sync(
         # `?source=bigquery` trigger would rewrite the Keboola extract.duckdb
         # via the subprocess and the rebuild would not be isolated.
         keboola_extract_in_scope = source_type_filter in (None, "keboola")
-        run_extractor_subprocess = bool(table_configs) and keboola_extract_in_scope
+        # The subprocess runs `connectors.keboola.extractor`, which knows only
+        # how to extract Keboola rows, so hand it only those. A bare sweep now
+        # spans every source (above), and `tables=[...]` can name any row at
+        # all, so without this filter a pass could carry a foreign local row
+        # into the Keboola extractor — and, worse, spawn the extractor for a
+        # pass with no Keboola rows in it, whose rebuild would empty
+        # extracts/keboola/extract.duckdb outright.
+        keboola_configs = [tc for tc in table_configs if _is_keboola_row(tc)]
+        run_extractor_subprocess = bool(keboola_configs) and keboola_extract_in_scope
+        # Independent of the Keboola predicate — see the custom-connector block
+        # below for why.
+        run_custom_connectors = bool(table_configs)
         if not run_extractor_subprocess:
             logger.info(
                 "No local-mode tables to sync for source_type=%s "
@@ -1351,13 +1447,13 @@ def _run_sync(
             # pair belongs to a DIFFERENT project, and using it would
             # silently extract the wrong data rather than fail loudly.
             _by_connection: dict = {}
-            for _tc in table_configs:
+            for _tc in keboola_configs:
                 _by_connection.setdefault(_tc.get("connection_id"), []).append(_tc)
 
             # Every group writes the SAME extracts/keboola/extract.duckdb,
             # and extractor.run()'s default mode rebuilds it from scratch
             # (temp build + atomic move). So: the FIRST invocation of the
-            # pass runs fresh — keeping the whole-pass implicit-prune
+            # pass may run fresh — keeping the whole-pass implicit-prune
             # semantics — and every later group passes merge=True so it
             # adds its own tables to the file instead of clobbering the
             # previous group's. Order the global (None) group first: with
@@ -1365,6 +1461,39 @@ def _run_sync(
             # alias is first-writer-wins and must stay with the global
             # stack, whose token_env is the one the orchestrator can
             # resolve at re-ATTACH time.
+            #
+            # "May", because the implicit prune is only CORRECT for a pass that
+            # accounts for the whole surface the rebuild would drop. A scoped
+            # pass — `tables=[...]` from POST /api/sync/trigger, or a schedule
+            # filter that left only some rows due — rebuilds the file from just
+            # its own tables, so every other table's `_meta` row and inner view
+            # is deleted and the orchestrator then drops their master views.
+            # Reads against them 400 with "Table with name X does not exist"
+            # until the next full sweep, and nothing recovers them in between:
+            # the orchestrator's filesystem-fallback only revives
+            # `query_mode='materialized'` rows, never `local` or `remote` ones,
+            # even though a local row's parquet is still on disk. A single
+            # re-sync of one table is enough to take down every other table of
+            # the source, which is how this was found.
+            #
+            # So prove coverage before pruning, and merge when it cannot be
+            # proven. On a source carrying `remote` rows that means the prune
+            # effectively stops firing: a bare sweep selects local rows only
+            # (`list_local`), so it never accounts for the remote half of the
+            # surface. That is the intended trade — deleted / renamed rows
+            # keeping their views until something covers the whole surface
+            # beats a scoped sync deleting live tables.
+            _keboola_surface = _keboola_extract_surface(registry_rows)
+            _covers_keboola_surface = _pass_covers_surface(keboola_configs, _keboola_surface)
+            if not _covers_keboola_surface:
+                logger.info(
+                    "Keboola extract: pass carries %d of the %d local/remote rows the extract "
+                    "owns — merging into the existing extract.duckdb instead of rebuilding it, "
+                    "so the rows it does not carry keep their master views.",
+                    len(keboola_configs),
+                    len(_keboola_surface),
+                )
+
             _first_group = True
             for _conn_id in sorted(_by_connection, key=lambda c: (c is not None, c or "")):
                 _group_configs = _by_connection[_conn_id]
@@ -1374,7 +1503,7 @@ def _run_sync(
                         env,
                         collected_errors,
                         synced_table_names,
-                        merge=not _first_group,
+                        merge=not (_first_group and _covers_keboola_surface),
                     )
                     _first_group = False
                     continue
@@ -1396,13 +1525,19 @@ def _run_sync(
                     _group_env,
                     collected_errors,
                     synced_table_names,
-                    merge=not _first_group,
+                    merge=not (_first_group and _covers_keboola_surface),
                 )
                 _first_group = False
 
-            # Run custom connectors (Tier A: local mount) — only when there
-            # were local-mode tables to drive the extractor. Custom connectors
-            # currently piggyback on the same env as the Keboola extractor.
+        # Run custom connectors (Tier A: local mount) — only when there were
+        # local-mode tables to drive the extractor. Custom connectors currently
+        # piggyback on the same env as the Keboola extractor.
+        #
+        # Gated on the pass having ANY local row, not on the Keboola predicate:
+        # a deployment whose only local rows come from a mounted custom
+        # connector has no Keboola rows at all, so hanging this off
+        # `run_extractor_subprocess` would stop its connectors running.
+        if run_custom_connectors:
             connectors_dir = Path(
                 os.environ.get("CONNECTORS_DIR", str(Path(__file__).parent.parent.parent / "connectors" / "custom"))
             )
