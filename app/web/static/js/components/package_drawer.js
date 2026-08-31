@@ -308,8 +308,38 @@
         renderPickerRows();
       }
     });
+    els.picker.addEventListener('click', function (e) {
+      if (!st) return;
+      var facet = e.target.closest('[data-facet]');
+      if (facet) {
+        var key = facet.getAttribute('data-facet');
+        var val = facet.getAttribute('data-value');
+        var list = pickerFacets[key] || [];
+        var at = list.indexOf(val);
+        if (at === -1) list.push(val); else list.splice(at, 1);
+        pickerFacets[key] = list;
+        renderPickerFiltered();
+        return;
+      }
+      if (e.target.closest('[data-unpackaged]')) {
+        pickerUnpackagedOnly = !pickerUnpackagedOnly;
+        renderPickerFiltered();
+        return;
+      }
+      if (e.target.closest('[data-picker-clear]')) {
+        resetPickerFilters();
+        renderPickerFiltered();
+        return;
+      }
+    });
     els.picker.addEventListener('change', function (e) {
       if (!st) return;
+      var sortSel = e.target.closest('[data-picker-sort]');
+      if (sortSel) {
+        pickerSort = sortSel.value;
+        renderPickerRows();   // order only — the strip is unchanged
+        return;
+      }
       var box = e.target.closest('input[type="checkbox"]');
       if (!box) return;
       var id = box.getAttribute('data-table-id');
@@ -414,6 +444,7 @@
     st.registry.forEach(function (t) {
       if (q && (t.id + ' ' + (t.name || '') + ' ' + (t.bucket || '') + ' ' + (t.project || ''))
                  .toLowerCase().indexOf(q) === -1) return;
+      if (!matchesFilters(t)) return;
       var pk = t.project || 'Other';
       if (!byProject[pk]) {
         byProject[pk] = { key: pk, label: pk, buckets: {}, order: [] };
@@ -428,11 +459,7 @@
     });
     projects.forEach(function (p) {
       p.order.sort();
-      p.order.forEach(function (bk) {
-        p.buckets[bk].tables.sort(function (a, b) {
-          return String(a.name || a.id).localeCompare(String(b.name || b.id));
-        });
-      });
+      p.order.forEach(function (bk) { sortTables(p.buckets[bk].tables); });
     });
     projects.sort(function (a, b) { return a.label.localeCompare(b.label); });
     return projects;
@@ -450,6 +477,93 @@
 
   /* Panel state: only what is in the package. */
   var pickerQuery = '', pickerOpen = false;
+
+  /* Picker state beyond the search box.
+
+     A substring match is not a way to work three hundred registered tables.
+     These four controls came from the add-tables drawer on the package's own
+     page, which was retired when writing a package moved to one surface — the
+     drawer's picker was the better one, so it moved here rather than dying
+     with it. What an admin actually slices by:
+
+       · SOURCE and QUERY MODE — "the Keboola tables", "the live-query ones".
+         The tree's top level is the PROJECT (a source connection), so "every
+         BigQuery table across three projects" is not expressible by browsing.
+       · IN NO PACKAGE — the pile the product cares about most: a table in no
+         package reaches nobody. Server flag (`packaged` on the registry
+         response), because membership spans every OTHER package.
+       · SORT — within each bucket. The tree's grouping is the structure; this
+         is the order inside it, and "least recently synced first" is how you
+         find the rows that are quietly stale.
+
+     All four narrow what the tree SHOWS. A selection survives them (the box
+     stays ticked on a row that is filtered away), which is what makes
+     "Keboola, tick four, then BigQuery, tick two" add six. */
+  var pickerFacets = { source_type: [], query_mode: [] };
+  var pickerUnpackagedOnly = false;
+  var pickerSort = 'name_asc';
+
+  function facetsActive() {
+    return pickerFacets.source_type.length + pickerFacets.query_mode.length +
+      (pickerUnpackagedOnly ? 1 : 0);
+  }
+
+  function resetPickerFilters() {
+    pickerFacets = { source_type: [], query_mode: [] };
+    pickerUnpackagedOnly = false;
+    pickerSort = 'name_asc';
+  }
+
+  /* The vocabularies, built from the registry itself so a filter can never
+     offer a value that matches nothing. Counted over EVERY row, not the
+     filtered set: a count that shrinks as you tick it tells you nothing about
+     what ticking the next one would do. */
+  function facetOptions(key) {
+    var counts = {};
+    (st ? st.registry : []).forEach(function (t) {
+      var v = t[key] || '';
+      if (v) counts[v] = (counts[v] || 0) + 1;
+    });
+    return Object.keys(counts).sort().map(function (v) {
+      return { value: v, n: counts[v] };
+    });
+  }
+
+  function matchesFilters(t) {
+    if (pickerUnpackagedOnly && t.packaged) return false;
+    var src = pickerFacets.source_type;
+    if (src.length && src.indexOf(t.source_type || '') === -1) return false;
+    var mode = pickerFacets.query_mode;
+    if (mode.length && mode.indexOf(t.query_mode || '') === -1) return false;
+    return true;
+  }
+
+  var SORTS = [
+    { value: 'name_asc', label: 'Name A–Z' },
+    { value: 'name_desc', label: 'Name Z–A' },
+    { value: 'synced_asc', label: 'Least recently synced' },
+    { value: 'synced_desc', label: 'Recently synced' },
+    { value: 'rows_desc', label: 'Most rows first' },
+  ];
+
+  function sortTables(rows) {
+    function name(t) { return String(t.name || t.id).toLowerCase(); }
+    // `last_sync` is an ISO string, so it compares lexicographically without
+    // a parse. A never-synced row has none — and it sorts FIRST under
+    // "least recently synced", because "never" is the extreme case of stale,
+    // not a missing value to tuck away at the end.
+    function synced(t) { return t.last_sync || ''; }
+    rows.sort(function (a, b) {
+      switch (pickerSort) {
+        case 'name_desc': return name(b).localeCompare(name(a));
+        case 'synced_asc': return synced(a).localeCompare(synced(b)) || name(a).localeCompare(name(b));
+        case 'synced_desc': return synced(b).localeCompare(synced(a)) || name(a).localeCompare(name(b));
+        case 'rows_desc': return (Number(b.rows) || 0) - (Number(a.rows) || 0) || name(a).localeCompare(name(b));
+        default: return name(a).localeCompare(name(b));
+      }
+    });
+    return rows;
+  }
 
   function selectedTables() {
     if (!st) return [];
@@ -590,6 +704,58 @@
     return html;
   }
 
+  /* The controls strip, in the product's own filter vocabulary (`.fbar-*`,
+     css/filter_toolbar.css — every consumer of this component already links
+     it). Pressed-state toggles rather than a filter MENU: there are two
+     vocabularies and both are short, and a menu one level deep is a filter
+     you set once and abandon. */
+  function pickerControlsHtml() {
+    function toggles(key, label) {
+      var opts = facetOptions(key);
+      if (opts.length < 2) return '';   // one value filters nothing
+      var chosen = pickerFacets[key];
+      // The label is not decoration: `internal` is a value of BOTH
+      // vocabularies (a source_type and a query_mode) and the strip put the
+      // two identical-looking chips one line apart, each meaning something
+      // else. A group is unreadable without saying what it is a group OF.
+      return '<span class="pdw-pickctl__grp" role="group" aria-label="Filter by ' + esc(label) + '">' +
+        '<span class="pdw-pickctl__k">' + esc(label) + '</span>' +
+        opts.map(function (o) {
+          var on = chosen.indexOf(o.value) !== -1;
+          // ONE class attribute — `is-active` is what filter_toolbar.css
+          // paints, `aria-pressed` is what a screen reader reads, and both
+          // have to agree.
+          return '<button type="button" class="fbar-toggle' + (on ? ' is-active' : '') + '"' +
+            ' data-facet="' + esc(key) + '" data-value="' + esc(o.value) + '"' +
+            ' aria-pressed="' + (on ? 'true' : 'false') + '">' +
+            '<span>' + esc(o.value) + '</span>' +
+            '<span class="fbar-toggle__n">' + o.n + '</span></button>';
+        }).join('') + '</span>';
+    }
+    var unpackagedN = (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+    // Offered only when it narrows something: on a fresh instance every row is
+    // unpackaged, and a filter that hides nothing is a control that lies.
+    var unpackaged = (unpackagedN && unpackagedN < (st ? st.registry.length : 0))
+      ? '<button type="button" class="fbar-toggle' + (pickerUnpackagedOnly ? ' is-active' : '') + '"' +
+        ' data-unpackaged="1" aria-pressed="' + (pickerUnpackagedOnly ? 'true' : 'false') + '"' +
+        ' aria-label="In no package — tables no analyst can pull yet">' +
+        '<span>In no package</span><span class="fbar-toggle__n">' + unpackagedN + '</span></button>'
+      : '';
+    var sort = '<span class="fbar-select pdw-pickctl__sort">' +
+      '<select data-picker-sort aria-label="Sort tables">' +
+      SORTS.map(function (o) {
+        return '<option value="' + esc(o.value) + '"' +
+          (pickerSort === o.value ? ' selected' : '') + '>' + esc(o.label) + '</option>';
+      }).join('') + '</select></span>';
+    var clear = facetsActive()
+      ? '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear filters</button>'
+      : '';
+    var body = toggles('source_type', 'source') + toggles('query_mode', 'query mode') +
+      unpackaged + sort + clear;
+    if (!body) return '';
+    return '<div class="pdw-pickctl">' + body + '</div>';
+  }
+
   function pickerHtml() {
     if (!pickerOpen) return '';
     var shown = 0, total = 0;
@@ -606,6 +772,7 @@
       shown: shown,
       total: total,
       rows: pickerRowsHtml(),
+      controls: pickerControlsHtml(),
       foot: 'Not here? Register it in <a href="/admin/tables">Tables</a> first.',
     });
   }
@@ -618,6 +785,20 @@
     els.picker.querySelectorAll('[data-indeterminate]').forEach(function (b) {
       b.indeterminate = true;
     });
+  }
+
+  /* Rows, count AND the controls strip — a facet click changes the pressed
+     state and whether "Clear filters" exists. Separate from
+     `renderPickerRows` because the search box must keep its focus and caret,
+     and this never touches it. */
+  function renderPickerFiltered() {
+    renderPickerRows();
+    if (!els || !els.picker) return;
+    var strip = els.picker.querySelector('.pdw-pickctl');
+    if (!strip) return;
+    var next = pickerControlsHtml();
+    if (!next) { strip.remove(); return; }
+    strip.outerHTML = next;
   }
 
   /* Rows + count only, so the search box keeps its focus and caret. */
@@ -638,6 +819,9 @@
   function openPicker() {
     pickerOpen = true;
     pickerQuery = '';
+    // Same reasoning as the query: a second open must not inherit the last
+    // visit's narrowing, which would hide rows for a reason nobody remembers.
+    resetPickerFilters();
     renderPicker();
     var box = els.picker.querySelector('[data-ag-search="pdw-tables"]');
     if (box) box.focus();
@@ -691,6 +875,13 @@
           id: t.id, name: t.name || t.id, bucket: t.bucket || '',
           source_type: t.source_type || '', query_mode: t.query_mode || '',
           server_only: !!t.server_only,
+          // What the picker's filter strip slices by. `packaged` spans every
+          // OTHER package, so it can only come from the server; `last_sync`
+          // is left as the ISO string the API sends, which sorts
+          // lexicographically without a parse.
+          packaged: !!t.packaged,
+          rows: Number(t.rows) || 0,
+          last_sync: t.last_sync || '',
           // Project = the source connection this table came through. Tables
           // with no connection (internal, and the derived sources) fall back
           // to the source's own name, which is the truthful grouping for them.
@@ -705,8 +896,12 @@
       var known = new Set(st.registry.map(function (t) { return t.id; }));
       members.forEach(function (id) {
         if (!known.has(id)) {
+          // In THIS package by definition, so `packaged` is true — otherwise
+          // the "in no package" filter would offer to hide a row that is a
+          // member of the thing you are editing.
           st.registry.push({ id: id, name: id, bucket: 'Ungrouped', source_type: '',
-                             query_mode: '', server_only: false, project: 'Other' });
+                             query_mode: '', server_only: false, project: 'Other',
+                             packaged: true, rows: 0, last_sync: '' });
         }
       });
       renderTables();

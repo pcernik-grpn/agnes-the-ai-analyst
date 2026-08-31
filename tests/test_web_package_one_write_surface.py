@@ -26,6 +26,9 @@ it. What this suite pins:
   * the drawer survives for exactly one case: mid-sentence on /admin/tables,
     assigning a table to a package that does not exist yet, where losing the
     page you are on is the whole cost;
+  * the retired add-tables drawer's PICKER controls moved into the builder
+    rather than dying with it — the consolidation must not cost the better
+    picker;
   * the controls the shared field rules do not cover stay dressed in the
     shared sheet, not re-invented per page.
 """
@@ -364,4 +367,78 @@ class TestTheTableListFollowsTheSourceStructure:
         src = COMPONENT.read_text()
         assert "SOURCE_LABELS" in src
         assert "'/api/admin/source-connections'" in src, "project names come from the connections"
+
+class TestThePickerKeptWhatTheRetiredDrawerHad:
+    """The add-tables drawer this change deleted had the better picker.
+
+    It filtered ~500 registered tables by source, by query mode and by "in no
+    package yet", and sorted them five ways; the builder's picker had a search
+    box and a project › bucket tree. Consolidating onto one write surface must
+    not quietly cost the controls that made composing a large package
+    possible, so they moved into the builder.
+    """
+
+    def test_the_picker_filters_by_source_and_by_query_mode(self) -> None:
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "pickerFacets" in src
+        assert "'source_type'" in src and "'query_mode'" in src
+        # Multi-select: "the Keboola tables AND the BigQuery ones" is one
+        # question, not two visits.
+        assert "matchesFilters" in src
+        assert "list.splice(at, 1)" in src, "a chosen facet must be un-choosable"
+
+    def test_a_facet_group_says_what_it_is_a_group_of(self) -> None:
+        """`internal` is a value of BOTH vocabularies — a source_type and a
+        query_mode — so an unlabelled strip renders the same chip twice, a line
+        apart, meaning two different things."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "pdw-pickctl__k" in src
+        css = (STATIC / "css" / "package_drawer.css").read_text(encoding="utf-8")
+        assert ".pdw-pickctl__k" in css
+
+    def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
+        """Membership spans every OTHER package, so the client cannot derive
+        it — and a filter that silently believes everything is unpackaged is
+        worse than no filter."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "packaged: !!t.packaged" in src
+        assert "pickerUnpackagedOnly" in src
+
+    def test_the_registry_endpoint_supplies_that_flag(self, seeded_app) -> None:
+        c = seeded_app["client"]
+        body = c.get("/api/admin/registry", headers=_auth(seeded_app["admin_token"])).json()
+        for row in body["tables"]:
+            assert "packaged" in row, f"{row['id']} carries no packaged flag"
+            assert isinstance(row["packaged"], bool)
+
+    def test_a_member_of_this_package_is_never_offered_as_unpackaged(self) -> None:
+        """A table the registry no longer lists is still shown (a row you
+        cannot see is a row you cannot remove) — and it is in THIS package by
+        definition, so the fallback row must not claim otherwise."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        fallback = src[src.index("st.registry.push({") : src.index("st.registry.push({") + 400]
+        assert "packaged: true" in fallback
+
+    def test_the_toggle_is_offered_only_when_it_narrows_something(self) -> None:
+        """On a fresh instance every row is unpackaged, and a control that
+        hides nothing is a control that lies."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "unpackagedN < (st ? st.registry.length : 0)" in src
+
+    def test_the_sorts_came_across_including_the_stale_first_one(self) -> None:
+        src = COMPONENT.read_text(encoding="utf-8")
+        for value in ("name_asc", "name_desc", "synced_asc", "synced_desc", "rows_desc"):
+            assert f"'{value}'" in src, value
+
+    def test_a_second_open_starts_unfiltered(self) -> None:
+        """Same reasoning the query already followed: inheriting the last
+        visit's narrowing hides rows for a reason nobody remembers."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        opener = src[src.index("function openPicker()") : src.index("function closePicker()")]
+        assert "resetPickerFilters()" in opener
+
+    def test_the_strip_is_an_opt_in_slot_on_the_shared_shell(self) -> None:
+        """Every other builder's picker must render exactly as before."""
+        shell = (STATIC / "js" / "components" / "builder_shell.js").read_text(encoding="utf-8")
+        assert "(o.controls || '')" in shell, "the slot must be optional, not required"
 
