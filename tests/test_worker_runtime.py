@@ -193,6 +193,72 @@ class TestSelectedLanes:
 
 
 # ---------------------------------------------------------------------------
+# _extraction_concurrency() / extraction.concurrency + AGNES_EXTRACTION_CONCURRENCY
+# ---------------------------------------------------------------------------
+
+
+class TestExtractionConcurrency:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("AGNES_EXTRACTION_CONCURRENCY", raising=False)
+
+    def test_default_is_one(self):
+        from app.worker.runtime import _extraction_concurrency
+
+        assert _extraction_concurrency() == 1
+
+    def test_yaml_value_used_when_env_unset(self, monkeypatch):
+        import app.instance_config as instance_config
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setattr(
+            instance_config,
+            "get_value",
+            lambda *keys, default=None: 4 if keys == ("extraction", "concurrency") else default,
+        )
+        assert _extraction_concurrency() == 4
+
+    def test_env_overrides_yaml(self, monkeypatch):
+        import app.instance_config as instance_config
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "2")
+        monkeypatch.setattr(instance_config, "get_value", lambda *keys, default=None: 7)
+        assert _extraction_concurrency() == 2
+
+    def test_value_above_max_is_clamped_and_warns(self, monkeypatch, caplog):
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "20")
+        with caplog.at_level("WARNING"):
+            assert _extraction_concurrency() == 8
+        assert "clamp" in caplog.text.lower()
+
+    def test_zero_is_clamped_to_min_and_warns(self, monkeypatch, caplog):
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "0")
+        with caplog.at_level("WARNING"):
+            assert _extraction_concurrency() == 1
+
+    def test_negative_is_clamped_to_min(self, monkeypatch):
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "-5")
+        assert _extraction_concurrency() == 1
+
+    def test_non_integer_value_falls_back_to_default_one_and_warns(self, monkeypatch, caplog):
+        """Never crash the worker on a typo'd value — an unparseable
+        setting logs a warning and behaves as if unset."""
+        from app.worker.runtime import _extraction_concurrency
+
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "not-a-number")
+        with caplog.at_level("WARNING"):
+            assert _extraction_concurrency() == 1
+        assert "invalid" in caplog.text.lower()
+
+
+# ---------------------------------------------------------------------------
 # worker_loop
 # ---------------------------------------------------------------------------
 
@@ -237,6 +303,20 @@ def test_worker_loop_spawns_all_three_lanes_when_selected(worker_db, monkeypatch
     assert sum(n.startswith("worker-heavy-") for n in names) == 1
     assert sum(n.startswith("worker-light-") for n in names) == 2
     assert sum(n.startswith("worker-extraction-") for n in names) == 1
+
+
+def test_worker_loop_spawns_configured_extraction_slot_count(worker_db, monkeypatch):
+    """``AGNES_EXTRACTION_CONCURRENCY`` sizes the extraction lane's own slot
+    count (resolved once at worker start) — heavy/light stay untouched."""
+    monkeypatch.setenv("AGNES_WORKER_LANES", "heavy,light,extraction")
+    monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "3")
+    from app.worker.runtime import worker_loop
+
+    names = asyncio.run(_lane_task_names(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.2))
+
+    assert sum(n.startswith("worker-heavy-") for n in names) == 1
+    assert sum(n.startswith("worker-light-") for n in names) == 2
+    assert sum(n.startswith("worker-extraction-") for n in names) == 3
 
 
 def test_worker_loop_invalid_lane_raises_before_spawning_anything(worker_db, monkeypatch):
@@ -301,6 +381,63 @@ def test_heavy_lane_serializes_while_light_lane_proceeds_concurrently(worker_db)
 
     done_heavy = repo.list(kind="heavy_test", status="done")
     assert len(done_heavy) == 2
+
+
+def test_extraction_lane_runs_two_connections_concurrently_and_dedups_same_connection(worker_db, monkeypatch):
+    """Two extraction slots (``AGNES_EXTRACTION_CONCURRENCY=2``) claim two
+    DIFFERENT queued jobs (different connections) concurrently and both
+    complete — this is the parallelism this task adds.
+
+    Regression pin (unchanged behavior, asserted explicitly per the task):
+    a second enqueue for the SAME connection's idempotency key dedups onto
+    the already-queued job instead of creating a second row — per-connection
+    idempotency at enqueue time is unaffected by lane concurrency > 1.
+    """
+    monkeypatch.setenv("AGNES_WORKER_LANES", "extraction")
+    monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "2")
+    from app.worker.registry import EXTRACTION_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    lock = threading.Lock()
+    state = {"n": 0, "peak": 0}
+    intervals: list[tuple[float, float]] = []
+
+    def handler(payload: dict) -> None:
+        start = time.monotonic()
+        with lock:
+            state["n"] += 1
+            state["peak"] = max(state["peak"], state["n"])
+        time.sleep(0.4)
+        with lock:
+            state["n"] -= 1
+        intervals.append((start, time.monotonic()))
+
+    register_kind(JobKind(name="extraction_test", handler=handler, lane=EXTRACTION_LANE, lease_seconds=30))
+
+    repo = jobs_repo()
+    job_a = repo.enqueue("extraction_test", {"connection_id": "conn-a"}, idempotency_key="corpus-extraction:conn-a")
+    job_b = repo.enqueue("extraction_test", {"connection_id": "conn-b"}, idempotency_key="corpus-extraction:conn-b")
+    assert job_a["id"] != job_b["id"]
+
+    # A second trigger for connection A while its job is still queued:
+    # dedup, never a second row — the mechanism this task must not touch.
+    dedup = repo.enqueue("extraction_test", {"connection_id": "conn-a"}, idempotency_key="corpus-extraction:conn-a")
+    assert dedup["deduped"] is True
+    assert dedup["id"] == job_a["id"]
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 1.3))
+
+    assert state["peak"] == 2, (
+        f"expected the two different-connection jobs to run concurrently across the two extraction "
+        f"slots, got peak concurrency {state['peak']}"
+    )
+    assert len(intervals) == 2, f"expected both distinct-connection jobs to complete, got {intervals}"
+
+    all_extraction_jobs = repo.list(kind="extraction_test")
+    assert len(all_extraction_jobs) == 2, "the dedup enqueue must not have created a third row for connection A"
+    done = [j for j in all_extraction_jobs if j["status"] == "done"]
+    assert len(done) == 2
 
 
 def test_handler_exception_fails_job_with_retry(worker_db):

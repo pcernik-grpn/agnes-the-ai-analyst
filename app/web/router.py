@@ -8464,6 +8464,15 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         "schedule": None,
         "last_run_at": None,
         "next_run_at": None,
+        # Honest-UI gate: the SAME two gates the manual trigger (`POST
+        # .../extract`) and the scheduled sweep (`POST .../extraction/
+        # run-due`) check BEFORE enqueueing — see `_extraction_readiness`
+        # below. Computed here so the card can disable the "Run extraction
+        # now" button instead of letting the click land a 409 the server
+        # already knows about. Defaults closed (not ready, no reason) if
+        # the block below never runs.
+        "extraction_ready": False,
+        "extraction_unready_reason": None,
     }
     try:
         from app.instance_config import feature_enabled, get_value
@@ -8480,6 +8489,16 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         if schedule_cfg:
             next_run = next_due_at(schedule_cfg, last_run_at)
             in_agnes_schedule["next_run_at"] = next_run.isoformat() if next_run else None
+
+        # `extraction_unready_reason` carries the SAME slug the 409 body's
+        # `error` key uses (`extraction_disabled` /
+        # `extraction_producer_not_configured`) — the frontend maps it to a
+        # human sentence, same pattern as the rejection-reason badges below.
+        from app.api.admin_sharepoint import _extraction_readiness
+
+        usable, error = _extraction_readiness()
+        in_agnes_schedule["extraction_ready"] = usable
+        in_agnes_schedule["extraction_unready_reason"] = None if usable else (error or {}).get("error")
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 

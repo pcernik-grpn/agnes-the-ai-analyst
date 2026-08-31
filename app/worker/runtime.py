@@ -5,11 +5,27 @@ Up to three independent lanes share one asyncio loop:
 
 - **heavy** — concurrency 1 (one slot/task)
 - **light** — concurrency 2 (two slots/tasks)
-- **extraction** — concurrency 1 (one slot/task; spec §7.5 / §16 step 7 of
+- **extraction** — concurrency **configurable**, default 1 (see
+  :func:`_extraction_concurrency`; spec §7.5 / §16 step 7 of
   docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md —
   document extraction gets its OWN lane rather than sharing HEAVY, because a
   corpus re-extraction sitting in HEAVY's concurrency-1 slot would block
   every table sync for its whole duration)
+
+Stage 1 of Agnes-owned extraction parallelism (the design note in the PR
+that added this): before this, the ONLY parallelism in a `corpus-extraction`
+run lived inside the external producer's own `--workers` flag — this lane
+was hardcoded to one slot, so multiple SharePoint connections extracted
+strictly one-at-a-time even though each is an independent producer
+subprocess with no shared state. `extraction.concurrency` /
+`AGNES_EXTRACTION_CONCURRENCY` (see :func:`_extraction_concurrency`) lets
+several `corpus-extraction` jobs for DIFFERENT connections run at once —
+the per-connection idempotency key (`app.api.admin_sharepoint
+._extraction_idempotency_key`) still prevents two jobs for the SAME
+connection from ever coexisting, unaffected by this change (see the
+same-connection-dedup regression test in `tests/test_worker_runtime.py`).
+Sharding ONE connection into per-scope jobs is explicitly NOT this change —
+see the design note in the PR body that introduced `extraction.concurrency`.
 
 **Which lanes THIS process spawns slots for** is controlled by the
 ``AGNES_WORKER_LANES`` env var (comma-separated lane names — see
@@ -138,11 +154,31 @@ logger = logging.getLogger(__name__)
 
 _HEAVY_CONCURRENCY = 1
 _LIGHT_CONCURRENCY = 2
-#: Extraction lane concurrency (spec §7.5 / §16 step 7) — deliberately 1,
-#: same ceiling as HEAVY: extraction is exactly the kind of long-running,
-#: resource-heavy work HEAVY's concurrency-1 slot already protects against
-#: piling up, just on a lane of its own so it can't block table syncs.
+#: Extraction lane concurrency (spec §7.5 / §16 step 7) fallback — this
+#: constant is used only as the STATIC placeholder in `_LANE_CONCURRENCY`
+#: below (kept for the `selected_lanes()` valid-token check); the actual
+#: slot count `worker_loop` spawns comes from `_extraction_concurrency()`,
+#: resolved once at worker start. See that function's docstring.
 _EXTRACTION_CONCURRENCY = 1
+
+#: Default extraction lane slot count when `extraction.concurrency` /
+#: `AGNES_EXTRACTION_CONCURRENCY` is unset or invalid — same value as the
+#: pre-configurable behavior, so an instance that never touches either knob
+#: is byte-for-byte unaffected.
+_DEFAULT_EXTRACTION_CONCURRENCY = 1
+
+#: Clamp bounds for `extraction.concurrency` / `AGNES_EXTRACTION_CONCURRENCY`
+#: (Stage 1 of Agnes-owned extraction parallelism — see module docstring).
+#: Each slot spawns a FULL producer subprocess (its own crawl workers plus
+#: an LLM pass), sized for the `extraction-worker` compose service's default
+#: 4g/2cpu envelope which assumes exactly ONE concurrent producer run —
+#: raising this without also raising `AGNES_EXTRACTION_WORKER_MEM_LIMIT`/
+#: `AGNES_EXTRACTION_WORKER_CPUS` on that service risks OOM/CPU starvation
+#: under the resulting concurrent producer load. 8 is a sanity ceiling, not
+#: a tuned number — an operator sizing for more should raise the compose
+#: limits well before approaching it.
+_MIN_EXTRACTION_CONCURRENCY = 1
+_MAX_EXTRACTION_CONCURRENCY = 8
 
 #: Every lane this build knows about, in spawn order — the valid-token set
 #: ``selected_lanes()`` checks an ``AGNES_WORKER_LANES`` token against.
@@ -231,6 +267,54 @@ def selected_lanes() -> tuple[str, ...]:
             seen.add(t)
             result.append(t)
     return tuple(result)
+
+
+def _extraction_concurrency() -> int:
+    """Effective EXTRACTION lane slot count — ``AGNES_EXTRACTION_CONCURRENCY``
+    (env) overrides ``extraction.concurrency`` (instance.yaml), same
+    env-over-yaml posture as ``app.coordination.factory.resolve_backend_name``
+    (env var checked first via ``os.environ.get`` and short-circuiting the
+    yaml lookup entirely when set).
+
+    Only called from :func:`worker_loop`, once, before any lane slot task is
+    spawned — the resolved value is baked into that single ``worker_loop``
+    call's slot count for its whole lifetime. Changing either knob therefore
+    requires restarting the worker process (same as ``AGNES_WORKER_LANES``);
+    there is no live-reload path for lane sizing.
+
+    Never raises: an unset/empty value falls back to
+    :data:`_DEFAULT_EXTRACTION_CONCURRENCY` (1) silently, a non-integer
+    value falls back to the same default WITH a logged warning (never
+    crashes the worker on a typo'd setting), and an in-range-but-out-of-
+    bounds integer is clamped to
+    :data:`_MIN_EXTRACTION_CONCURRENCY`/:data:`_MAX_EXTRACTION_CONCURRENCY`
+    (1..8) with a logged warning rather than rejected outright.
+    """
+    from app.instance_config import get_value
+
+    raw = os.environ.get("AGNES_EXTRACTION_CONCURRENCY")
+    if raw is None:
+        raw = get_value("extraction", "concurrency", default=_DEFAULT_EXTRACTION_CONCURRENCY)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "worker: invalid extraction.concurrency/AGNES_EXTRACTION_CONCURRENCY=%r, using default %d",
+            raw,
+            _DEFAULT_EXTRACTION_CONCURRENCY,
+        )
+        return _DEFAULT_EXTRACTION_CONCURRENCY
+    if value < _MIN_EXTRACTION_CONCURRENCY or value > _MAX_EXTRACTION_CONCURRENCY:
+        clamped = max(_MIN_EXTRACTION_CONCURRENCY, min(value, _MAX_EXTRACTION_CONCURRENCY))
+        logger.warning(
+            "worker: extraction.concurrency/AGNES_EXTRACTION_CONCURRENCY=%d out of range [%d, %d], clamping to %d",
+            value,
+            _MIN_EXTRACTION_CONCURRENCY,
+            _MAX_EXTRACTION_CONCURRENCY,
+            clamped,
+        )
+        return clamped
+    return value
 
 
 def _drain_timeout_s() -> float:
@@ -749,7 +833,12 @@ async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
     Starts the reaper task, then — for every lane :func:`selected_lanes`
     returns (default: heavy + light only, extraction is opt-in; see the
     module docstring and ``AGNES_WORKER_LANES``) — that lane's own
-    concurrency worth of slots, and waits on all of them. Cancelling the
+    concurrency worth of slots, and waits on all of them. HEAVY and LIGHT's
+    slot counts are the static :data:`_LANE_CONCURRENCY` values; EXTRACTION's
+    is resolved fresh HERE, once, via :func:`_extraction_concurrency` —
+    baked into this call's slot count for its whole lifetime (see that
+    function's docstring for why changing the underlying config needs a
+    worker restart). Cancelling the
     enclosing task (the ``canary_loop`` task-create/cancel pattern in
     ``app/main.py``'s lifespan) cancels every child task too —
     ``asyncio.gather`` propagates cancellation of its own awaiter to every
@@ -761,6 +850,10 @@ async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
     anything if ``AGNES_WORKER_LANES`` names an unknown lane.
     """
     lanes = selected_lanes()
+    # EXTRACTION_LANE resolved fresh, not the static _EXTRACTION_CONCURRENCY
+    # placeholder — see _extraction_concurrency()'s docstring. HEAVY/LIGHT
+    # are untouched (Stage 1 scope — see module docstring).
+    lane_concurrency = {**_LANE_CONCURRENCY, EXTRACTION_LANE: _extraction_concurrency()}
     in_flight: dict[str, _InFlightJob] = {}
     tasks = [asyncio.create_task(_reap_loop(poll_interval_s), name="worker-reaper")]
     # Best-effort PG LISTEN loop that wakes idle lane slots on a fresh
@@ -770,7 +863,7 @@ async def worker_loop(*, worker_id: str, poll_interval_s: float = 5.0) -> None:
     for lane in lanes:
         tasks += [
             asyncio.create_task(_lane_slot(lane, worker_id, poll_interval_s, in_flight), name=f"worker-{lane}-{i}")
-            for i in range(_LANE_CONCURRENCY[lane])
+            for i in range(lane_concurrency[lane])
         ]
     try:
         await asyncio.gather(*tasks)
