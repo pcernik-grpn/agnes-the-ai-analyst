@@ -98,11 +98,30 @@ class TestEveryStripUsesIt:
         [
             ("_admin_tabs.html", "tab-strip__item tab-flow__item"),
             ("admin_access.html", 'class="tab-strip ax-by"'),
-            ("library.html", "fbar-seg tab-strip lib-tabs"),
+            ("library.html", 'class="tab-strip lib-tabs"'),
         ],
     )
     def test_the_strip_carries_the_shared_classes(self, template, marker):
         assert marker in (TEMPLATES / template).read_text()
+
+    def test_the_library_container_is_not_also_the_pill_control(self):
+        """`.fbar-seg` on the CONTAINER is the pill segmented control's own
+        chrome — grey fill, 1px border, 10px radius, 3px padding
+        (filter_toolbar.css) — and `.tab-strip` cannot undo it: two of those
+        tie on specificity and lose on source order (library.html links
+        filter_toolbar.css from `head_extra`, after components.css), and
+        `border-radius` the strip never sets at all.
+
+        Carrying both classes therefore rendered both looks at once: a
+        bordered grey box with underlined tabs sitting inside it. This is the
+        regression the marker above cannot catch on its own — "tab-strip
+        lib-tabs" is a substring of "fbar-seg tab-strip lib-tabs", so the
+        buggy combination passes it."""
+        src = (TEMPLATES / "library.html").read_text()
+        tag = src.split('id="lib-tabs"', 1)[0].rsplit("<div", 1)[1]
+        assert "fbar-seg" not in tag, (
+            f"the library tab container carries the pill control's chrome again: <div{tag}"
+        )
 
     def test_the_library_keeps_its_engine_hook(self):
         """`.fbar-seg__btn` is how filter_toolbar.js finds these buttons. The
