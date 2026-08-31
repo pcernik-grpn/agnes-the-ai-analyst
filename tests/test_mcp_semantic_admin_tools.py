@@ -169,24 +169,40 @@ class TestDetachReattachTools:
         assert "/api/admin/semantic-models/retail/reattach" in post.call_args[0][0]
         assert post.call_args[1]["json"] == {"confirm_reattach": True}
 
-    @pytest.mark.parametrize("tool_name,arg", [("semantic_model_detach", True), ("semantic_model_reattach", True)])
-    def test_a_duckdb_instance_gets_the_typed_501_not_a_crash(self, tool_name, arg):
+    @pytest.mark.parametrize("tool_name", ["semantic_model_detach", "semantic_model_reattach"])
+    def test_a_duckdb_instance_gets_the_typed_501_not_a_crash(self, tool_name):
         """Both endpoints are Postgres-only (A3 ratchet) and answer a typed
-        `501 requires_postgres_backend` on the frozen DuckDB app-state
-        backend. The tool must pass that through as an error naming the
-        reason, so the model can say why — not swallow it, and not fail on
-        something else first."""
+        `501` on the frozen DuckDB app-state backend. The tool must pass that
+        through as an error the model can explain — not swallow it, and not
+        fail on something else first.
+
+        The mocked body is the REAL one `app/main.py`'s handler emits, built
+        from the real exception rather than hand-written: `detail` is prose
+        and `error`/`feature` are its SIBLINGS, so a test that nested them
+        under `detail` would assert against a response shape that never
+        occurs — and would hide that `_raise_for_status_with_detail` forwards
+        `detail` only. What actually reaches the model is the prose, which is
+        why the assertions are on the prose.
+        """
+        from src.repository_errors import RequiresPostgresBackend
+
         mod = _mod()
-        body = {"error": "requires_postgres_backend", "feature": "semantic_model_detach"}
+        exc_obj = RequiresPostgresBackend(tool_name)
+        body = {
+            "detail": str(exc_obj),
+            "error": "requires_postgres_backend",
+            "feature": exc_obj.feature,
+        }
         with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
             tv.get.return_value = "tok"
-            MC.return_value.__aenter__.return_value.post = AsyncMock(
-                return_value=_mock_resp({"detail": body}, status=501)
-            )
+            MC.return_value.__aenter__.return_value.post = AsyncMock(return_value=_mock_resp(body, status=501))
             with pytest.raises(httpx.HTTPStatusError) as exc:
-                _run(getattr(mod, tool_name)("retail", arg))
+                _run(getattr(mod, tool_name)("retail", True))
 
-        assert "requires_postgres_backend" in str(exc.value)
+        message = str(exc.value)
+        assert "501" in message
+        assert "Postgres app-state backend" in message, "the reason must survive into the tool error"
+        assert tool_name in message, "the model must be able to name the feature that refused"
 
 
 class TestPackageLinkTools:

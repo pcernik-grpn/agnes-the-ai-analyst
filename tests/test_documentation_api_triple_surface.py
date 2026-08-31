@@ -162,11 +162,26 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Where documents are synced FROM (#1707). These three families were
     # _EXEMPT with the reason "no MCP analogue by design"; the owner reversed
     # that — neither standing exemption covers them, and an admin PAT is what
-    # gates the tools exactly as it gates the endpoints. One cohort row per
-    # PATH, so the MCP column names one tool per path and the siblings
-    # (`semantic_source_add` on the POST, `semantic_model_reattach`) are
-    # asserted in FOUNDATION_TOOL_NAMES by tests/test_mcp_tool_parity.py —
-    # the same shape as the /api/admin/semantic-layer/mutes rows above.
+    # gates the tools exactly as it gates the endpoints.
+    #
+    # The old exemption's SECOND argument was not hand-waving and is not
+    # dropped here: "a tool that can point this server at an arbitrary git
+    # remote and trigger a fetch is a credential/config surface, not a read
+    # tool". That was true, and it was true of REST and the CLI too — the
+    # same two calls exfiltrated a server env var through git's credential
+    # helper long before an MCP tool existed. It is answered at the
+    # transport, where every caller passes: `src.semantic.transports.
+    # validate_git_config` gates the URL scheme, the credential env var
+    # (`is_semantic_git_token_env_allowed`) and the repository host
+    # (`is_semantic_git_host_allowed`) before any egress, and the write
+    # endpoints repeat it so an admin is refused at POST. See
+    # tests/test_semantic_git_source_egress.py.
+    #
+    # One cohort row per PATH, so the MCP column names one tool per path and
+    # the siblings (`semantic_source_add` on the POST,
+    # `semantic_model_reattach`) are asserted in FOUNDATION_TOOL_NAMES by
+    # tests/test_mcp_tool_parity.py — the same shape as the
+    # /api/admin/semantic-layer/mutes rows above.
     "/api/admin/semantic-sources": ("admin semantic source list", "semantic_source_list"),
     "/api/admin/semantic-sources/{source_id}": ("admin semantic source rm", "semantic_source_remove"),
     "/api/admin/semantic-sources/{source_id}/sync": ("admin semantic source sync", "semantic_source_sync"),

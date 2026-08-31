@@ -132,6 +132,26 @@ def test_studio_off_states_the_count_without_a_link_that_redirects_home(seeded_a
     assert "studio.enabled" in _sentence(strip)
 
 
+def test_the_count_is_capped_rather_than_loading_the_whole_queue(seeded_app, monkeypatch):
+    """A badge is not worth loading an unbounded result set. Past the cap the
+    strip says "99+" and the repository is never asked for more than one row
+    beyond it."""
+    import app.web.router as router_mod
+
+    asked_for: list[int] = []
+
+    class _Fake:
+        def list(self, *, status, domain, created_by, limit):
+            asked_for.append(limit)
+            return [{"id": f"asug_{i}"} for i in range(limit)]
+
+    monkeypatch.setattr("src.repositories.authoring_suggestions_repo", lambda: _Fake())
+    strip = _strip(_tables_html(seeded_app))
+
+    assert asked_for == [router_mod._DRAFT_BADGE_CAP + 1], "the badge must cap its own query"
+    assert f"{router_mod._DRAFT_BADGE_CAP}+ tables await approval of a suggested model" in _sentence(strip)
+
+
 def test_an_unreadable_queue_never_breaks_the_page(seeded_app, monkeypatch):
     """A strip is not worth a 500. If the suggestions store cannot be read,
     /admin/tables still renders — without it."""

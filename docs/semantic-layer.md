@@ -89,6 +89,31 @@ than it sounds: an empty document list legitimately means "upstream deleted
 everything", which prunes. A failed clone must never be able to present itself
 as an empty source, so the error is recorded on the source row and re-raised.
 
+### What a git source is allowed to reach
+
+`repo_url` and `token_env` are admin-writable, the clone reads that env var,
+and git's credential helper is scoped to whatever host the URL names — so
+unguarded, the pair is a way to post a server secret to an arbitrary host.
+Three checks run before any egress, in `src/semantic/transports.py`
+(`validate_git_config`) and again at `POST`/`PUT /api/admin/semantic-sources`
+so an admin is refused at write time rather than in a sync error a week later:
+
+| Check | Default | Operator control |
+|---|---|---|
+| URL scheme is `https`, `ssh`, `git+ssh` or `git@host:org/repo` | enforced | not configurable — `ext::` runs a command, `file://` reads the server's disk |
+| `token_env` is a known git-credential name | `AGNES_SEMANTIC_GIT_TOKEN`, `GIT_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN` | `AGNES_SEMANTIC_GIT_TOKEN_ENVS` (CSV; **replaces** the default set) |
+| Repository host is pinned | unpinned, with a warning logged whenever a credential is used | `AGNES_SEMANTIC_GIT_HOST_ALLOWLIST` (CSV of `host[:port]`) |
+
+Both allowlists are siblings of the connector-ATTACH ones in
+`src/orchestrator_security.py` and deliberately do **not** share membership
+with them: a Keboola storage token or a Databricks PAT is never a git
+credential, and an operator's ATTACH host pin is about DuckDB endpoints, not
+git remotes. Names belonging to another boundary are subtracted out even if an
+override lists them.
+
+A public repository with no `token_env` needs no configuration — the common
+case still works out of the box.
+
 ### Scheduled refresh
 
 Every registered source — regardless of kind — is also synced automatically by
@@ -876,8 +901,14 @@ Two details worth knowing before an agent calls them:
   since) instead of acting. Both are Postgres-only and answer
   `501 requires_postgres_backend` on the frozen DuckDB app-state backend.
 - Everything that writes is annotated non-read-only, so cloud chat's approval
-  gate raises a card before it runs; removing a source, detaching and
-  re-attaching are additionally flagged destructive.
+  gate raises a card before it runs. Removing a source, detaching, re-attaching
+  AND `semantic_source_sync` are additionally flagged destructive — a sync
+  prunes, so an upstream that dropped a document takes the model and its
+  package links with it, and no annotation should imply otherwise just because
+  the action is routine.
+- `semantic_source_add` cannot point the server at an arbitrary host with an
+  arbitrary credential: see "What a git source is allowed to reach" above. The
+  guardrail is in the transport, so it holds for the REST and CLI paths too.
 
 ### Renamed in this release
 

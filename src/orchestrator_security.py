@@ -342,6 +342,154 @@ def is_attach_host_allowed(url: str) -> bool:
     return host in allow or bare in allow
 
 
+# ── Semantic-layer git sources ───────────────────────────────────────────
+#
+# A THIRD consumer class, and deliberately its own pair of allowlists.
+#
+# A `kind='git'` semantic source carries an admin-writable `config.repo_url`
+# and `config.token_env`; `src/semantic/transports.py` reads that env var and
+# hands the value to `src.marketplace._run_git`, whose credential helper is
+# scoped to whatever host the URL names. Unguarded, two API calls (create a
+# source pointing at an attacker host with `token_env=<any server secret>`,
+# then sync it) exfiltrate that secret — the same shape as the connector
+# `_remote_attach` hole F10/F11 closed, through a different door. The eight
+# MCP tools added in #1707 put that door within reach of an agent, which is
+# what made it urgent, but the hole was reachable over REST and the CLI all
+# along and the fix belongs at the transport, not at any one caller.
+#
+# Why NOT reuse `_ATTACH_HOST_ALLOWLIST_ENV` / `_DEFAULT_TOKEN_ENVS`: this
+# module's central discipline is that consumer classes never share membership
+# by accident (see `_CONFIG_SECRET_ONLY_ENVS`, `_PRODUCER_KEY_ENVS`). An
+# operator's ATTACH allowlist means "DuckDB endpoints a connector may ship a
+# token to"; folding git remotes into it would silently authorize clones to
+# those hosts AND break every git source on an instance that pinned them. A
+# Keboola storage token or a Databricks PAT is likewise never a git
+# credential, so the ATTACH token set is subtracted out below rather than
+# reused.
+_SEMANTIC_GIT_HOST_ALLOWLIST_ENV = "AGNES_SEMANTIC_GIT_HOST_ALLOWLIST"
+
+#: Env vars whose value may be handed to git as a clone credential. Unlike
+#: the host allowlist, this one is default-CLOSED: naming which secret may be
+#: read costs an operator one env var, and defaulting it open is exactly the
+#: finding. Conventional git-credential names only — anything else is a
+#: deployment's own and goes in the override.
+#:
+#: Operators REPLACE this set via AGNES_SEMANTIC_GIT_TOKEN_ENVS (same
+#: semantics as every other override here — it does not add).
+_DEFAULT_SEMANTIC_GIT_TOKEN_ENVS: frozenset[str] = frozenset(
+    {
+        "AGNES_SEMANTIC_GIT_TOKEN",
+        "GIT_TOKEN",
+        "GITHUB_TOKEN",
+        "GITLAB_TOKEN",
+        "BITBUCKET_TOKEN",
+    }
+)
+
+#: URL schemes a semantic git source may name. `ext::` is the reason this is
+#: an allowlist and not a denylist: git's ext transport runs its argument as a
+#: shell command, so `repo_url` would be remote code execution rather than
+#: mere egress. `file://` is refused too — a clone of a local path reads the
+#: server's own filesystem into a document set.
+_SEMANTIC_GIT_SCHEMES: frozenset[str] = frozenset({"https", "ssh", "git+ssh"})
+
+
+def semantic_git_host_allowlist_configured() -> bool:
+    """True iff an operator has pinned the hosts semantic git sources may reach."""
+    return bool(_parse_csv_env(_SEMANTIC_GIT_HOST_ALLOWLIST_ENV))
+
+
+def is_semantic_git_host_allowed(url: str) -> bool:
+    """Return True if a semantic source may clone — with a credential — from ``url``.
+
+    Sibling of :func:`is_attach_host_allowed`, same mechanism and same
+    default-open-with-a-warning contract (an instance that has configured
+    nothing keeps working, and the caller logs that it is unpinned), against
+    its own env var. Fail-closed on an unparseable host once an allowlist IS
+    set, for the same reason: we cannot prove the credential is going
+    somewhere approved.
+    """
+    allow = {h.lower() for h in _parse_csv_env(_SEMANTIC_GIT_HOST_ALLOWLIST_ENV)}
+    if not allow:
+        return True
+    host = _url_host(url)
+    if not host:
+        return False
+    bare = host.split(":", 1)[0]
+    return host in allow or bare in allow
+
+
+def get_allowed_semantic_git_token_envs() -> set[str]:
+    """Return the effective semantic-git credential env allowlist.
+
+    Override AGNES_SEMANTIC_GIT_TOKEN_ENVS *replaces*
+    :data:`_DEFAULT_SEMANTIC_GIT_TOKEN_ENVS`. Every other boundary's names are
+    always subtracted back out, override included: an ATTACH data-source
+    token, a config-resolution-only secret and the anonymization producer key
+    are none of them git credentials, and letting one through here would
+    rebuild the cross-class exfiltration path the splits exist to prevent.
+    """
+    override = _parse_csv_env("AGNES_SEMANTIC_GIT_TOKEN_ENVS")
+    base = override if override else set(_DEFAULT_SEMANTIC_GIT_TOKEN_ENVS)
+    other_boundaries = set(_DEFAULT_TOKEN_ENVS) | _CONFIG_SECRET_ONLY_ENVS | _PRODUCER_KEY_ENVS
+    blocked = base & other_boundaries
+    if blocked:
+        logger.warning(
+            "semantic git: ignoring name(s) %s from the effective credential allowlist — "
+            "these belong to another consumer class (connector ATTACH token, config-resolution "
+            "secret, or the anonymization producer key) and are never a git credential",
+            sorted(blocked),
+        )
+    return base - other_boundaries
+
+
+def is_semantic_git_token_env_allowed(name: str) -> bool:
+    """Return True if ``name`` may be read and handed to git as a credential.
+
+    Same two checks as :func:`is_token_env_allowed` — structural regex, then
+    membership — against :func:`get_allowed_semantic_git_token_envs`.
+    """
+    if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+        return False
+    return name in get_allowed_semantic_git_token_envs()
+
+
+def semantic_git_scheme_refusal(url: str) -> str:
+    """Why ``url`` is not a usable semantic-source repository URL, or "".
+
+    Separate from the host allowlist because it is not operator-configurable:
+    no deployment has a legitimate `ext::`-transport semantic source, and that
+    scheme is command execution rather than a fetch.
+    """
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or not url.strip():
+        return "config.repo_url is required for a git semantic source"
+    raw = url.strip()
+    try:
+        scheme = urlparse(raw).scheme.lower()
+    except Exception:  # noqa: BLE001 — an unparseable URL is a refusal, not a crash
+        return f"config.repo_url {raw!r} is not a parseable URL"
+    if not scheme:
+        # `git@host:org/repo` — scp-like syntax, no scheme, and git treats it
+        # as SSH. Accepted, but only in that exact shape; anything else with
+        # no scheme is a local path.
+        if re.match(r"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:", raw):
+            return ""
+        return (
+            f"config.repo_url {raw!r} names no URL scheme — a semantic git source must be "
+            f"one of: {', '.join(sorted(_SEMANTIC_GIT_SCHEMES))} (or git@host:org/repo)"
+        )
+    if scheme not in _SEMANTIC_GIT_SCHEMES:
+        return (
+            f"config.repo_url scheme {scheme!r} is not allowed for a semantic git source "
+            f"(allowed: {', '.join(sorted(_SEMANTIC_GIT_SCHEMES))}). Schemes like 'ext' run a "
+            "command rather than fetching a repository, and 'file' would read the server's "
+            "own filesystem."
+        )
+    return ""
+
+
 def escape_sql_string_literal(value: str) -> str:
     """Double single-quotes for safe use inside DuckDB single-quoted literals.
 

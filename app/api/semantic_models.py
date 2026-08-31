@@ -250,6 +250,26 @@ def _assert_no_provenance_override(config: dict | None) -> None:
         )
 
 
+def _assert_git_config_is_safe(kind: str, config: dict | None) -> None:
+    """Refuse a git source whose config would leak a secret or run a command.
+
+    The transport enforces this too (``src.semantic.transports.
+    validate_git_config``), which is what covers a row written by any other
+    path. Repeating it here is not redundancy for its own sake: without it an
+    admin learns their ``token_env`` is not allowed at the first scheduled
+    sync, in a `last_sync_error` string, instead of in the response to the
+    call that got it wrong.
+    """
+    if (kind or "").strip() != "git" or config is None:
+        return
+    from src.semantic.transports import validate_git_config
+
+    try:
+        validate_git_config(config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
 def _assert_known_adapter(name: str) -> None:
     """Refuse an adapter name nothing is registered under.
 
@@ -257,12 +277,18 @@ def _assert_known_adapter(name: str) -> None:
     the "registered but never runs" state the connector validators already
     exist to prevent. `UnknownAdapter` already names what IS available.
     """
-    from src.semantic.adapters import UnknownAdapter, get_adapter
+    from src.semantic.adapters import adapter_names
 
-    try:
-        get_adapter(name)
-    except UnknownAdapter as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
+    # Names, not `get_adapter()`: resolving the adapter imports its connector
+    # module, so validating "is this a real name" would fail an instance that
+    # simply does not ship that connector's dependencies — and would make a
+    # POST pay four connector imports to check a string.
+    known = adapter_names()
+    if name not in known:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown semantic adapter {name!r}; available: {', '.join(known)}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1138,7 @@ async def create_semantic_source(body: SemanticSourceCreate, user: dict = Depend
         )
     _assert_known_adapter(body.adapter)
     _assert_no_provenance_override(body.config)
+    _assert_git_config_is_safe(body.kind, body.config)
     from uuid import uuid4
 
     source_id = f"ss_{uuid4().hex[:12]}"
@@ -1143,7 +1170,8 @@ async def get_semantic_source(source_id: str, user: dict = Depends(require_admin
 @router.put("/api/admin/semantic-sources/{source_id}")
 async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, user: dict = Depends(require_admin)):
     repo = semantic_source_repo()
-    if repo.get(source_id) is None:
+    existing = repo.get(source_id)
+    if existing is None:
         raise HTTPException(status_code=404, detail=f"Semantic source '{source_id}' not found")
     fields = body.model_dump(exclude_unset=True)
     if not fields:
@@ -1151,6 +1179,8 @@ async def update_semantic_source(source_id: str, body: SemanticSourceUpdate, use
     if fields.get("adapter") is not None:
         _assert_known_adapter(fields["adapter"])
     _assert_no_provenance_override(fields.get("config"))
+    if fields.get("config") is not None:
+        _assert_git_config_is_safe(existing.get("kind") or "", fields["config"])
     return _annotated([repo.update(source_id, **fields)])[0]
 
 

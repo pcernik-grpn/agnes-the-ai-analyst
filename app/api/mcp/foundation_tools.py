@@ -2188,11 +2188,15 @@ def register_foundation_tools(
             kind: ``git`` (clone a repository), ``upload`` (documents carried
                 in ``config.documents``), or ``connection`` (read an existing
                 connected system through its adapter).
-            adapter: Which reader turns the upstream into Ossie documents —
-                ``native`` for documents that already are Ossie (git/upload),
-                otherwise the connector's own (``keboola_metastore``,
-                ``snowflake_semantic``, ``databricks_metric_views``). An
-                unknown name is refused with the registered list.
+            adapter: Which reader turns the upstream into Ossie documents.
+                ``native`` is for documents that already ARE Ossie
+                (git/upload); a connection source uses its connector's own.
+                An unknown name is refused with the full list of registered
+                adapters, generated from the registry itself — which is why
+                this docstring does not restate it: the hand-written copy in
+                the CLI's `--adapter` help had already drifted to a name that
+                did not exist, and a second copy here would be the same bug
+                waiting to happen.
             config: Kind-specific settings — git: ``repo_url`` (+ optional
                 ``ref``, ``glob``, ``token_env``); upload: ``documents``;
                 connection: ``connection_id``. Provenance keys are refused:
@@ -2253,17 +2257,25 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return {"sources": r.json()}
+            return ensure_output_size(
+                {"sources": r.json()},
+                "semantic_source_list",
+                hint="an `upload` source carries its whole documents in `config`; "
+                "read one source at a time through the REST API, or narrow with `enabled_only`",
+            )
 
-    @tool(read_only=False, destructive=False)
+    @tool(read_only=False, destructive=True)
     async def semantic_source_sync(source_id: str) -> dict:
         """Fetch one semantic source now, instead of waiting for the sweep (admin only).
 
-        Imports what the source currently holds and prunes, WITHIN that
-        source's own provenance, the models it no longer sends — it never
-        touches another source's models or a hand-authored one. A model that
-        was detached keeps its local edits; sync records drift instead of
-        overwriting it.
+        Imports what the source currently holds and PRUNES, within that
+        source's own provenance, the models it no longer sends — deleting
+        them and their Data Package links. That is why this is flagged
+        destructive despite being routine: an upstream that has dropped a
+        document (or a misconfigured scope that can no longer see it) takes
+        the model with it, and nothing here can put it back. It never touches
+        another source's models or a hand-authored one, and a detached model
+        keeps its local edits — sync records drift instead of overwriting it.
 
         Additive to the schedule, not a substitute: the report it returns
         (imported / updated / pruned / failed, with per-document errors) is
