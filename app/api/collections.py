@@ -6,11 +6,11 @@ Endpoints:
   GET    /api/collections                         auth (RBAC-filtered list)
   GET    /api/collections/{collection_id}         require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}         owner or admin
-  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access(
-                                                  "{collection_id}") — also accepts a
-                                                  ProducerPrincipal scoped to this collection
-                                                  (the corpus-extraction producer's own upload
-                                                  callback, app.auth.producer_token)
+  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access("{collection_id}")
+                                                  — also accepts a ProducerPrincipal scoped to
+                                                  this collection (the corpus-extraction
+                                                  producer's own upload callback,
+                                                  app.auth.producer_token)
   GET    /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}/files/{file_id}
                                                   require_collection_access("{collection_id}")
