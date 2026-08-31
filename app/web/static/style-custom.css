@@ -263,6 +263,38 @@ body {
 .container--wide   { max-width: var(--width-wide); }     /* 1400px — admin index lists, marketplace grids */
 .container--full   { max-width: none; padding-left: var(--space-4); padding-right: var(--space-4); }
 
+/* ── A content page as a white SHEET ──────────────────────────────────────
+   `.idx` below (index pages) and `.container--full` in admin_page.css (every
+   admin page) both paint their shell `--ds-surface`, and both say why in their
+   own comments: a page left on the app background reads as a different product
+   from the one it was reached from. Content pages on base_page.html /
+   base_ds.html had no way to say the same thing, which is how the semantic
+   layer and the metrics list ended up as the grey stop in a white app — you
+   reach them from the Library's Definitions block, and the canvas changes
+   colour on the way (#1898).
+
+   Opt in per page: `{% block body_attrs %}class="page-sheet"{% endblock %}`.
+
+   FULL BLEED, on the body rather than on `.container`: the container is padded
+   and max-width'd, so painting that would leave grey gutters beside a white
+   column — an oversized card, not a page. This is the same choice `.idx`
+   documents ("no grey gutters beside the centred header either").
+
+   `body.detail-page` is in the same rule rather than opting in template by
+   template: the nine detail pages (data package, table, recipe, plugin,
+   marketplace item, data app, collection, file, memory domain) already carry
+   that class for their footer treatment, so it is the marker for this family
+   and one selector keeps all nine from drifting apart. Cards-on-grey was their
+   look, and cards on a sheet is the look every index page they are reached from
+   already has — the cards keep their own borders either way.
+
+   `html body.…` carries the extra element on purpose: the rule these have to
+   beat is `[data-theme="paper"] body` in paper-skin.css (the sheet that paints
+   the grey), which ties on specificity, and sheet order is not a thing a page
+   should have to reason about. */
+html body.page-sheet,
+html body.detail-page { background: var(--ds-surface); }
+
 /* Index / resource-list page layout (#896 prototype) — used via
    base_index.html by My Stack, Catalog, and similar list pages. The
    header zone (title + description + actions + search + tabs) and the
@@ -4908,9 +4940,11 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
    drawn around them.
 
    This is the treatment /library, /agents and /chats already run by hand
-   (`.lib-head`, `.ag-head`, `.ch-head` — 24px title, 15px secondary lede
-   capped at 68ch), lifted onto the shared primitive so a page can opt in
-   with one variable (`page_hero_plain`) instead of a fourth private copy.
+   (`.lib-head`, `.ag-head`, `.ch-head` — a 22–24px title over a muted
+   lede capped at 68ch), lifted onto the shared primitive so a page can
+   opt in with one variable (`page_hero_plain`) instead of a fourth
+   private copy. The lede's own type scale is shared too — see
+   `.page-lede` below, which those three heads now ride as well.
 
    Use it where the page is a WORKSPACE the reader stays in — a list they
    filter, a table they act on, a two-pane editor. A gradient (or, under
@@ -4934,12 +4968,59 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
        edge. */
     padding: 0 0 22px;
 }
-.page-header--plain .page-header__title { font-size: 24px; }
+
+/* ── The page title ───────────────────────────────────────────────────
+   The other half of the head, on the same terms as `.page-lede` below:
+   one size, named once, for the `<h1>` a page puts above its lede.
+
+   22px — the /library size, the smaller of the two that were in the
+   tree. It is chosen as a PAIR with the 13px lede rather than on its
+   own: /library sized both together and the result is the head the rest
+   of the app is being matched to. 24px was the majority (the plain
+   header and every hand-built head but one) and is a one-line change
+   here if that ever reverses.
+
+   Only `margin` and `font-size` — weight, tracking and colour stay with
+   the theme's own `h1` rule, the same division the plain variant above
+   keeps. Layout a particular head needs (a flex row for a badge beside
+   the name, `overflow-wrap` for a name that can be one long token)
+   stays page-local: it is that page's anatomy, not the type scale. */
+.page-title,
+.page-header--plain .page-header__title {
+    margin: 0;
+    font-size: 22px;
+    line-height: 1.2;
+}
+
+/* ── The page lede ────────────────────────────────────────────────────
+   ONE type scale for the sentence under a page title, wherever that
+   sentence is written: the shared header's `page_hero_subtitle` on a
+   plain-variant page, or a hand-built head's own `<p>`.
+
+   It is the /library scale — 13px, muted, capped at 68ch — because a
+   lede is orientation the reader needs once and then scrolls past on
+   every later visit, and at body size it competed with the rows the
+   page exists to show. It used to be three sizes: 15px `--ds-text-
+   secondary` here, 15px in `.ag-head`/`.ch-head`, and — on any page
+   that wrote a bare `<p class="lede">` with no rule behind it —
+   whatever the UA gave a paragraph, which was the largest of the
+   three.
+
+   `.page-lede` is the one name — deliberately NOT an alias on the bare
+   `.lede` the hand-built heads used to carry, because /home writes that
+   same class for its marketing hero and would have been dragged down to
+   13px muted with them. A page head opts in by name; nothing opts in by
+   accident.
+
+   No `font-weight`/`font-family` here — a lede inherits the body's, so
+   a mid-page section lede that reaches for this class (e.g.
+   /marketplace/guide) keeps whatever its section gives it. */
+.page-lede,
 .page-header--plain .page-header__subtitle {
-    margin: 8px 0 0;
-    font-size: 15px;
-    line-height: 1.5;
-    color: var(--ds-text-secondary);
+    margin: 4px 0 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--ds-text-muted);
     max-width: 68ch;
 }
 .page-header--plain .page-header__eyebrow { color: var(--ds-text-muted); }
@@ -5541,6 +5622,44 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
 
 .ds-table--zebra tbody tr:nth-child(even) td {
     background: var(--ds-surface-dim);
+}
+
+/* `.data-table-wrap` — the wrapper ten admin pages put around a `.data-table`
+   (semantic sources, users, sync, marketplaces, mcp_sources,
+   knowledge_digests, linked_apps, initial_workspace, data_apps, tables) so a
+   wide/many-column table scrolls horizontally instead of taking the whole
+   page with it. No CSS rule ever backed the class (#1707 A6), so the
+   overflow silently landed on the page instead of the table.
+   `admin_tables.html` is the odd one out: its wrap holds a JS-hydrated
+   layout host (`#adminTablesLayoutRows`), not a literal `<table
+   class="data-table">` markup — the hydrator injects one once
+   `/api/admin/registry` resolves. It still gets `overflow-x: auto` for
+   free from this same rule once that happens.
+
+   Decision (PR #1823 review): overflow-x: auto makes overflow-y compute to
+   auto too, which turns the wrap into a NEW scrolling ancestor closer than
+   the viewport — so `.data-table thead th`'s `position: sticky` (below)
+   would silently re-target that ancestor instead. The wrap is never given a
+   height cap, so it never actually scrolls vertically, meaning the header
+   would stop sticking at all instead of degrading gracefully, and the same
+   ancestor change is what triggers the well-known "rounded corners vanish
+   under a stuck thead" clipping bug the `.cloud-chat-table-wrap` recipe in
+   chat.css works around for its own tables. Rather than adopt that recipe's
+   border-transfer here too (all ten pages would need touching, and
+   `admin_tables.html`'s wrap would gain a border around its
+   `#adminTablesLayoutRows` "Loading tables…" placeholder even before a
+   real table exists inside it — a visual change out of scope for this
+   fix), sticky is disabled outright for any thead wrapped in
+   `.data-table-wrap`: an unambiguous "off" instead of a silently
+   non-functional "on". A bounded,
+   internally-scrolling table with real in-wrap sticky is a legitimate
+   follow-up for a page that wants it, not a rule that belongs on every
+   consumer of this class today. */
+.data-table-wrap {
+    overflow-x: auto;
+}
+.data-table-wrap thead th {
+    position: static;
 }
 
 /* ─── Badges — accent vocabulary ──────────────────────────────────────

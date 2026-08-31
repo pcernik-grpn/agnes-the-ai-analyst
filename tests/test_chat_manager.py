@@ -1027,6 +1027,73 @@ def test_midturn_sink_gets_buffered_frames_replayed(manager: ChatManager):
     asyncio.run(_run())
 
 
+def test_assistant_frame_cache_tokens_are_persisted(manager: ChatManager):
+    """A turn's prompt-cache figures must survive the frame -> row hop.
+
+    `tokens_in` counts UNCACHED input only, so without these two columns a
+    long session's real context volume — the term that dominates its cost —
+    is unrecoverable after the fact and can only be modelled.
+    """
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_fake_live_with_fake_handle(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+
+        with patch.object(manager._repo, "append_message", wraps=manager._repo.append_message) as spy:
+            pump_task = asyncio.create_task(manager._pump_subprocess_to_ws(live))
+            live.handle.emit(
+                {
+                    "type": "assistant_message",
+                    "content": "Hi",
+                    "tokens_in": 11,
+                    "tokens_out": 22,
+                    "cache_read_tokens": 3333,
+                    "cache_creation_tokens": 44,
+                    "model": "claude-sonnet-5",
+                }
+            )
+            await _wait_until(lambda: not live.turn_in_flight)
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+
+        assistant = [c for c in spy.call_args_list if c.kwargs.get("role") == "assistant"]
+        assert assistant, "the assistant turn was never persisted"
+        assert assistant[-1].kwargs["cache_read_tokens"] == 3333
+        assert assistant[-1].kwargs["cache_creation_tokens"] == 44
+
+    asyncio.run(_run())
+
+
+def test_daily_counter_charges_cache_writes_but_not_cache_reads(manager: ChatManager):
+    """`input + output + cache_creation`, cache reads excluded — the same
+    definition the agent `token_budget_monthly` path already used
+    (`llm_usage.usage_breakdown_for_month`). A cache WRITE is real input the
+    model was billed a premium for; a cached READ is heavily discounted and
+    stays informational on every budget surface.
+    """
+
+    async def _run():
+        manager._record_daily_tokens("u@x", 1000, 2000, 500)
+        assert manager._daily_token_totals("u@x") == (1500, 2000)
+
+    asyncio.run(_run())
+
+
+def test_record_daily_tokens_keeps_its_three_argument_form(manager: ChatManager):
+    """Back-compat: the cache term is optional, so existing callers (and the
+    api-role thin producer) are unaffected."""
+
+    async def _run():
+        manager._record_daily_tokens("u@x", 10, 20)
+        assert manager._daily_token_totals("u@x") == (10, 20)
+
+    asyncio.run(_run())
+
+
 def test_turn_buffer_cleared_after_assistant_message(manager: ChatManager):
     """After a full turn completes (assistant_message frame), a newly added
     sink must NOT receive any token replay."""

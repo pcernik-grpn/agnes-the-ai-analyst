@@ -434,6 +434,14 @@ _NON_SQL_QUOTED_FAMILIES: list[tuple[str, str]] = [
         r"require_collection_access\(",
         'FastAPI path-template argument — the COLLECTION-scoped wrapper of require_resource_access, same "{collection_id}" placeholder',
     ),
+    (
+        r"require_admin_or_producer_connection\(",
+        'FastAPI path-template argument — the admin-or-producer wrapper of require_resource_access, same "{connection_id}" placeholder',
+    ),
+    (
+        r"require_collection_write_or_producer_access\(",
+        'FastAPI path-template argument — the upload-only admin-or-producer wrapper of require_collection_access, same "{collection_id}" placeholder',
+    ),
     (r'(?i)content-disposition|filename="\{', "HTTP header: quotes are RFC 6266 filename syntax"),
     (r"(?i)etag", "HTTP entity tag: quotes are part of the ETag grammar (RFC 7232)"),
     (r'"\{\}"', "empty JSON object as a literal default / json.loads fallback"),

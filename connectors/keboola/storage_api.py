@@ -31,6 +31,7 @@ Storage API reference:
 
 from __future__ import annotations
 
+import csv
 import gzip
 import logging
 import os
@@ -54,6 +55,8 @@ except ImportError:  # pragma: no cover - boto3 is a declared dependency
     S3SigV4Auth = None  # type: ignore[assignment]
     AWSRequest = None  # type: ignore[assignment]
     Credentials = None  # type: ignore[assignment]
+
+from src.parquet_publish import atomic_publish
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +288,146 @@ def _slice_sort_key(url: str) -> list:
     return [int(chunk) if chunk.isdigit() else chunk for chunk in _DIGIT_RUN_RE.split(path)]
 
 
+# Column name used when an export is legitimately empty but the declared
+# schema could not be read. Matches the placeholder the Keboola extractor
+# already writes for an empty single-file export, so the two empty paths
+# produce the same shape.
+EMPTY_EXPORT_PLACEHOLDER_COLUMN = "_empty"
+
+
+def _coerce_rows_count(raw: Any) -> Optional[int]:
+    """Normalize a table detail's `rowsCount` to an int, or ``None``.
+
+    ``None`` means *unknown*, never *zero* — the whole point of the
+    empty-manifest branch is that the two must not be conflated. Storage API
+    reports the field as a JSON number, but a numeric string is accepted too
+    (older stacks serialize counts that way). Anything else — absent, null,
+    a bool, a non-numeric string, a negative sentinel — is unknown.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float):
+        return int(raw) if raw >= 0 and float(raw).is_integer() else None
+    # `isdecimal()`, not `isdigit()`: superscripts, circled digits and
+    # vulgar fractions all answer True to `isdigit()` while `int()` raises on
+    # them, which would turn a defensive coercer into a source of bare
+    # ValueErrors. A leading `-` fails `isdecimal()` and so reads as unknown,
+    # which is what a negative sentinel should mean here anyway.
+    if isinstance(raw, str) and raw.strip().isdecimal():
+        return int(raw.strip())
+    return None
+
+
+def check_empty_sliced_manifest(
+    manifest: Any,
+    *,
+    table_id: Optional[str],
+    rows_count: Optional[int],
+    filtered: bool,
+) -> None:
+    """Decide whether an entries-less sliced-export manifest is legitimate.
+
+    Returns normally when the empty result is real; raises
+    ``StorageApiError`` when it is (or may be) a lost export. This is the
+    single home of the rule — THREE sliced-manifest consumers call it:
+    ``KeboolaStorageClient._download_sliced`` (CSV),
+    ``KeboolaStorageClient.download_file_slices`` (parquet), and
+    ``KeboolaClient._export_table_with_filters`` (the legacy client, which
+    has its own HTTP plumbing). Mirroring it into any of them instead of
+    calling it is how the three drift apart.
+
+    ``filtered`` must be True when the export carried a ROW-reducing
+    parameter (``whereFilters`` / ``changedSince`` / ``changedUntil`` /
+    ``limit``). ``rowsCount`` on the table detail is a WHOLE-TABLE count, so
+    it cannot arbitrate a filtered result: a filter matching nothing on a
+    table of millions is a correct empty export, and reading the table count
+    there would assert data loss on a correct result. A ``columns``
+    projection is deliberately NOT such a parameter — it narrows columns,
+    never rows, so it leaves the count able to arbitrate.
+
+    ``rows_count`` is the already-coerced count (``_coerce_rows_count``);
+    ``None`` means unknown, which is an error, never an empty table.
+    """
+    if filtered:
+        logger.info(
+            "Filtered sliced export for %s returned no slices — treating as a "
+            "legitimate zero-match (the table's whole-table rowsCount cannot "
+            "arbitrate a filtered result).",
+            table_id,
+        )
+        return
+    if rows_count is None:
+        raise StorageApiError(
+            f"sliced manifest had no entries and upstream rowsCount is "
+            f"unavailable for {table_id!r} — cannot tell an empty table from a "
+            f"lost export: {str(manifest)[:200]}",
+            body=manifest,
+        )
+    if rows_count > 0:
+        raise StorageApiError(
+            f"upstream table {table_id} claims {rows_count} rows but the sliced "
+            f"export returned no slices: {str(manifest)[:200]}",
+            body=manifest,
+        )
+    logger.info(
+        "Sliced export for %s returned no slices and upstream reports 0 rows — an empty table, not a failed export.",
+        table_id,
+    )
+
+
+def _write_empty_csv_export(dest_path: Path, columns: List[str]) -> None:
+    """Write the CSV a zero-row sliced export would have produced.
+
+    Storage API puts the header in slice 0 and the data rows in slices
+    0..n, so "header, no data rows" is exactly the empty table's export —
+    not a special case downstream. The RFC-4180 dialect matches the one the
+    extractor pins on the read side (`quote='"', escape='"'`), so DuckDB
+    recovers the declared column names with zero rows.
+
+    With no declared columns to write, an empty file is left instead; the
+    extractor's existing "export returned no data" branch then emits its
+    placeholder parquet, which is the pre-fix behaviour for that case.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not columns:
+        dest_path.write_bytes(b"")
+        return
+    with open(dest_path, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh, quoting=csv.QUOTE_MINIMAL).writerow(columns)
+
+
+def _write_empty_parquet_export(dest_path: Path, columns: List[str]) -> None:
+    """Write a zero-row parquet carrying ``columns`` as VARCHAR.
+
+    All-VARCHAR is not a shortcut: Storage API's Snowflake UNLOAD serves
+    every column of a *non-empty* parquet export as VARCHAR too, and the
+    extractor retypes afterwards from Keboola's column metadata. Emitting
+    the same shape keeps the empty export on the identical downstream path.
+
+    The file must carry real columns — a view over a column-less parquet
+    does not resolve — hence the placeholder fallback when the declared
+    schema is unavailable.
+
+    Published through `src.parquet_publish.atomic_publish` like every other
+    parquet writer in `connectors/` — temp path, ``chmod 0644``,
+    ``os.replace``. The destination this writer is handed today is a
+    per-call staging dir rather than a served path, but the protocol is not
+    the caller's to opt out of: `dest_path` is an argument, so what it points
+    at is the next caller's choice, and a reader (the orchestrator's MD5
+    sweep, a master view's glob) must never be able to observe a prefix.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    names = list(columns) or [EMPTY_EXPORT_PLACEHOLDER_COLUMN]
+    schema = pa.schema([pa.field(name, pa.string()) for name in names])
+    # `atomic_publish` mkdirs `dest_path.parent` itself.
+    with atomic_publish(dest_path) as tmp:
+        pq.write_table(schema.empty_table(), tmp)
+
+
 @dataclass
 class ExportFilter:
     """Structured Keboola Storage API filter spec.
@@ -337,6 +480,19 @@ class ExportFilter:
             limit=data.get("limit"),
             file_type=ft,
         )
+
+    def is_row_filtered(self) -> bool:
+        """True when this export narrows the ROWS Storage API materializes.
+
+        Only these four do: `whereFilters`, `changedSince`, `changedUntil`,
+        `limit`. `columns` is a projection — it narrows the columns and never
+        the rows — and `file_type` only picks a format. The distinction
+        matters for an empty sliced export: a row-filtered one may legitimately
+        match nothing on a table with rows, while a columns-only one that
+        returns nothing on a non-empty table is data loss (see
+        `check_empty_sliced_manifest`).
+        """
+        return bool(self.where_filters or self.changed_since or self.changed_until or self.limit is not None)
 
     def to_export_params(self) -> dict:
         """Serialize for POST body of `/tables/{id}/export-async`.
@@ -625,7 +781,14 @@ class KeboolaStorageClient:
         manifest JSON listing the per-slice signed URLs."""
         return self._get(f"/files/{file_id}", params={"federationToken": 1})
 
-    def download_file(self, file_info: dict, dest_path: Path) -> Path:
+    def download_file(
+        self,
+        file_info: dict,
+        dest_path: Path,
+        *,
+        table_id: Optional[str] = None,
+        export_filter: Optional[ExportFilter] = None,
+    ) -> Path:
         """Download a Storage API file (single or sliced) to `dest_path`.
 
         Backend variants:
@@ -681,6 +844,8 @@ class KeboolaStorageClient:
                 gcs_token=gcs_token,
                 abs_credentials=abs_credentials,
                 s3_context=self._s3_context(file_info),
+                table_id=table_id,
+                export_filter=export_filter,
             )
         else:
             self._download_single(url, dest_path, gunzip_on_read=is_gzipped)
@@ -985,6 +1150,71 @@ class KeboolaStorageClient:
         """
         return ".gz" in slice_url.split("?")[0].rsplit("/", 1)[-1]
 
+    # ---- empty sliced exports --------------------------------------------
+    #
+    # A sliced-export manifest listing zero entries is ambiguous on the wire:
+    # it is what a table with no rows upstream produces, and also what a
+    # broken export produces. Treating both as a failure made an empty table
+    # (a form-fields table with no attachments, say) permanently red and
+    # indistinguishable from lost data. The table detail's `rowsCount` —
+    # which Storage API guarantees on success, see `get_table_info` —
+    # separates the two. Both sliced entry points route through the single
+    # decision below; neither may re-derive the rule.
+
+    def _resolve_empty_sliced_manifest(
+        self,
+        manifest: Any,
+        *,
+        table_id: Optional[str],
+        export_filter: Optional[ExportFilter],
+        what: str,
+    ) -> List[str]:
+        """Fetch what the shared decision needs, apply it, and return the
+        columns the empty artifact must carry.
+
+        The rule itself lives in :func:`check_empty_sliced_manifest` — this
+        only supplies the table detail (for ``rowsCount`` and the declared
+        columns) and translates the verdict into a column list. Raises when
+        the empty manifest is (or may be) a lost export.
+
+        Under a ``columns`` projection the empty artifact carries the
+        REQUESTED columns, not every declared one: a non-empty projected
+        export carries only those, and the empty one must match or the
+        artifact's shape would depend on whether the table happened to have
+        rows. ``what`` names the artifact for the log line.
+        """
+        detail: Optional[dict] = None
+        if table_id:
+            try:
+                detail = self.get_table_info(table_id)
+            except Exception as exc:
+                logger.warning(
+                    "Sliced export for %s returned no slices and the table detail "
+                    "lookup failed (%s); rowsCount and the declared schema are both "
+                    "unavailable.",
+                    table_id,
+                    exc,
+                )
+                detail = None
+
+        check_empty_sliced_manifest(
+            manifest,
+            table_id=table_id,
+            rows_count=_coerce_rows_count(detail.get("rowsCount") if detail else None),
+            filtered=bool(export_filter and export_filter.is_row_filtered()),
+        )
+
+        requested = list(export_filter.columns) if export_filter and export_filter.columns else []
+        declared = [str(c) for c in ((detail or {}).get("columns") or []) if c is not None]
+        columns = requested or declared
+        logger.info(
+            "Writing an empty %s for %s with the declared schema (%d columns).",
+            what,
+            table_id,
+            len(columns),
+        )
+        return columns
+
     def _download_sliced(
         self,
         manifest_url: str,
@@ -993,6 +1223,8 @@ class KeboolaStorageClient:
         gcs_token: Optional[str] = None,
         abs_credentials: Optional[dict] = None,
         s3_context: Optional[dict] = None,
+        table_id: Optional[str] = None,
+        export_filter: Optional[ExportFilter] = None,
     ) -> None:
         """Sliced exports: the file detail's `url` points at a JSON manifest
         whose `entries[].url` lists per-slice locations. Download each slice
@@ -1007,16 +1239,26 @@ class KeboolaStorageClient:
         - `gs://<bucket>/<key>` (GCP) — requires `gcs_token` (OAuth bearer
           shipped in the file_detail's `gcsCredentials.access_token`).
           Mapped to `https://storage.googleapis.com/storage/v1/b/<bucket>/o/<encoded_key>?alt=media`.
+
+        ``table_id`` lets an entries-less manifest be told apart from a lost
+        export via the table detail's ``rowsCount``, and ``export_filter``
+        says whether that count can arbitrate at all — see
+        ``check_empty_sliced_manifest``. Without ``table_id`` the pre-fix
+        behaviour (always an error) stands.
         """
         m = self.session.get(manifest_url, timeout=_DEFAULT_SLICE_DOWNLOAD_TIMEOUT_SEC)
         m.raise_for_status()
         manifest = m.json()
         entries = manifest.get("entries") or []
         if not entries:
-            raise StorageApiError(
-                f"sliced manifest had no entries: {str(manifest)[:200]}",
-                body=manifest,
+            columns = self._resolve_empty_sliced_manifest(
+                manifest,
+                table_id=table_id,
+                export_filter=export_filter,
+                what="CSV export",
             )
+            _write_empty_csv_export(dest_path, columns)
+            return
         sorted_entries = sorted(entries, key=lambda e: _slice_sort_key(e.get("url") or ""))
         if sorted_entries != entries:
             logger.warning(
@@ -1117,7 +1359,14 @@ class KeboolaStorageClient:
             "file_type": f.file_type,
         }
 
-    def download_file_slices(self, file_info: dict, dest_dir: Path) -> List[Path]:
+    def download_file_slices(
+        self,
+        file_info: dict,
+        dest_dir: Path,
+        *,
+        table_id: Optional[str] = None,
+        export_filter: Optional[ExportFilter] = None,
+    ) -> List[Path]:
         """Download a sliced Storage API export as separate per-slice
         files into ``dest_dir``. Returns the slice paths in manifest
         order. Use when the slices must be processed individually
@@ -1125,6 +1374,15 @@ class KeboolaStorageClient:
         own footer; concatenation would invalidate it). For CSV where
         concat-with-header-only-on-first-slice is the right thing,
         ``download_file`` is the correct entry point.
+
+        A table that is empty upstream — or a row-filtered export that
+        matched nothing — comes back as an entries-less manifest. Given
+        ``table_id`` and ``export_filter`` (see
+        ``check_empty_sliced_manifest`` for how the two decide) that yields a
+        single synthetic slice: a real, zero-row parquet carrying the
+        declared columns, which merges through the caller's
+        ``read_parquet([...])`` unchanged. The return value is therefore "the
+        slices to merge", not strictly "the slices the manifest listed".
         """
         url = file_info.get("url")
         if not url:
@@ -1143,10 +1401,15 @@ class KeboolaStorageClient:
         manifest = m.json()
         entries = manifest.get("entries") or []
         if not entries:
-            raise StorageApiError(
-                f"sliced manifest had no entries: {str(manifest)[:200]}",
-                body=manifest,
+            columns = self._resolve_empty_sliced_manifest(
+                manifest,
+                table_id=table_id,
+                export_filter=export_filter,
+                what="parquet export",
             )
+            empty_slice = dest_dir / "slice-00000"
+            _write_empty_parquet_export(empty_slice, columns)
+            return [empty_slice]
         dest_dir.mkdir(parents=True, exist_ok=True)
         slice_paths: List[Path] = []
         for i, entry in enumerate(entries):
@@ -1216,7 +1479,7 @@ class KeboolaStorageClient:
                 f"DuckDB COPY (concat would corrupt parquet footers)",
                 body=file_info,
             )
-        self.download_file(file_info, dest_path)
+        self.download_file(file_info, dest_path, table_id=table_id, export_filter=export_filter)
         size = dest_path.stat().st_size if dest_path.exists() else 0
         return {
             "job_id": prep["job_id"],

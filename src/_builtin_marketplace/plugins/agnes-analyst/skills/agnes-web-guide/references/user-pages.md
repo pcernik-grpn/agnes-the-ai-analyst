@@ -36,8 +36,10 @@ user sees there, and when to send them.
 - `/semantic-layer` — the semantic models: datasets, fields, relationships,
   metrics, glossary. Each model opens at `/semantic-layer/{slug}` and each
   object at `/semantic-layer/{slug}/{object_id}`.
-- `/catalog/semantics` — browse the catalog's metric definitions and
-  glossary terms in one place. "What is our canonical MRR?" → here (or
+  Two more tabs on the same page list every metric and glossary term
+  registered here, document-backed or not:
+  `/semantic-layer?tab=all_metrics` and `/semantic-layer?tab=all_glossary`.
+  "What is our canonical MRR?" → the All metrics tab (or
   `agnes catalog --metrics` in chat).
 
 ## Skills, plugins & the store

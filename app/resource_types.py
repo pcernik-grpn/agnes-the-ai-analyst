@@ -26,9 +26,10 @@ value verbatim.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, List
+from typing import Any
 
 
 class ResourceType(StrEnum):
@@ -119,7 +120,7 @@ Block = dict[str, Any]
 # (which honors ``use_pg()``), NOT a raw system-DB connection. Passing a
 # DuckDB connection here was the backend-split bug (#518) — on a Postgres
 # instance it read the stale, frozen DuckDB system file.
-ListBlocksFn = Callable[[], List[Block]]
+ListBlocksFn = Callable[[], list[Block]]
 
 # The /admin/access projection must list EVERY grantable resource — an admin
 # can't grant access to something the page doesn't render. The repo ``list()``
@@ -169,7 +170,7 @@ class ResourceTypeSpec:
 # ---------------------------------------------------------------------------
 
 
-def _marketplace_plugin_blocks() -> List[Block]:
+def _marketplace_plugin_blocks() -> list[Block]:
     """Project marketplace_registry + marketplace_plugins into the
     hierarchical (block → items) shape the admin UI renders.
 
@@ -224,7 +225,7 @@ def _marketplace_plugin_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _table_blocks() -> List[Block]:
+def _table_blocks() -> list[Block]:
     """Project table_registry into the (block → items) shape the admin UI
     renders.
 
@@ -277,7 +278,7 @@ def _table_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _data_package_blocks() -> List[Block]:
+def _data_package_blocks() -> list[Block]:
     """Project ``data_packages`` into the (block → items) shape rendered by
     the admin /access page.
 
@@ -325,13 +326,13 @@ def _data_package_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _semantic_model_blocks() -> List[Block]:
+def _semantic_model_blocks() -> list[Block]:
     """Project ``semantic_models`` into the (block → items) shape rendered
     by the admin /access page. ``resource_id`` is ``semantic_models.id``.
 
     This registers ``SEMANTIC_MODEL`` as a directly grantable resource type,
     following the ``DATA_PACKAGE`` entry above, and the export/search RBAC
-    gate reads it: ``_can_access_semantic_model``
+    gate reads it: ``_can_read_model``
     (``app/api/semantic_models.py``) checks a direct
     ``resource_grants(SEMANTIC_MODEL, ...)`` row first and falls back to the
     linked-package grant via ``list_packages_for_model`` — the same way
@@ -371,7 +372,7 @@ def _semantic_model_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _data_app_blocks() -> List[Block]:
+def _data_app_blocks() -> list[Block]:
     """Project ``data_apps`` into grant-picker blocks (resource_id = slug)."""
     from src.repositories import data_apps_repo
 
@@ -407,7 +408,7 @@ def _data_app_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _memory_domain_blocks() -> List[Block]:
+def _memory_domain_blocks() -> list[Block]:
     """Project ``memory_domains`` rows into the (block → items) shape the
     admin /access page renders.
 
@@ -447,7 +448,7 @@ def _memory_domain_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _memory_item_blocks() -> List[Block]:
+def _memory_item_blocks() -> list[Block]:
     """Project ``knowledge_items`` into the (block → items) shape for the
     rare per-item grant override.
 
@@ -491,7 +492,7 @@ def _memory_item_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _recipe_blocks() -> List[Block]:
+def _recipe_blocks() -> list[Block]:
     """Project ``recipes`` rows into the (block → items) shape rendered by
     the admin /access page.
 
@@ -532,7 +533,7 @@ def _recipe_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _chat_blocks() -> List[Block]:
+def _chat_blocks() -> list[Block]:
     """Singleton feature resource: one grantable item gating the whole
     cloud-chat surface (web ``/chat`` + the Slack DM bot).
 
@@ -561,7 +562,7 @@ def _chat_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _slack_channel_blocks() -> List[Block]:
+def _slack_channel_blocks() -> list[Block]:
     """Project the per-channel mention allowlist.
 
     There is **no domain table** — the ``resource_grants`` rows themselves are
@@ -605,7 +606,7 @@ def _slack_channel_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _corpus_file_blocks() -> List[Block]:
+def _corpus_file_blocks() -> list[Block]:
     """Project ``corpus_files`` into the (block → items) shape the admin
     /access page renders — one block per parent collection.
 
@@ -617,7 +618,7 @@ def _corpus_file_blocks() -> List[Block]:
     """
     from src.repositories import corpus_files_repo, file_corpora_repo
 
-    blocks: List[Block] = []
+    blocks: list[Block] = []
     cf_repo = corpus_files_repo()
     for col in file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT):
         try:
@@ -644,7 +645,7 @@ def _corpus_file_blocks() -> List[Block]:
     return blocks
 
 
-def _agent_blocks() -> List[Block]:
+def _agent_blocks() -> list[Block]:
     """Project ``agents`` into the (block → items) shape rendered by the
     admin /access page.
 
@@ -677,7 +678,7 @@ def _agent_blocks() -> List[Block]:
     ]
 
 
-def _store_entity_blocks() -> List[Block]:
+def _store_entity_blocks() -> list[Block]:
     """Project ``store_entities`` into the (block → items) shape rendered by
     the admin /access page.
 
@@ -721,7 +722,7 @@ def _store_entity_blocks() -> List[Block]:
     return [blocks[k] for k in ("skill", "agent", "plugin") if k in blocks]
 
 
-def _collection_blocks() -> List[Block]:
+def _collection_blocks() -> list[Block]:
     """Project ``file_corpora`` into the (block → items) shape rendered by
     the admin /access page.
 
@@ -768,7 +769,7 @@ def _collection_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _knowledge_digest_blocks() -> List[Block]:
+def _knowledge_digest_blocks() -> list[Block]:
     """Project ``knowledge_digests`` into the (block → items) shape rendered
     by the admin /access page.
 
@@ -805,7 +806,7 @@ def _knowledge_digest_blocks() -> List[Block]:
 # ---------------------------------------------------------------------------
 
 
-def _mcp_source_blocks() -> List[Block]:
+def _mcp_source_blocks() -> list[Block]:
     """Project ``mcp_sources`` into the (block -> items) shape rendered by
     the admin /access page.
 

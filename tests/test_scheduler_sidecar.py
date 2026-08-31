@@ -220,6 +220,20 @@ def test_build_jobs_includes_run_due_endpoint():
     assert method == "POST"
 
 
+def test_build_jobs_includes_semantic_auto_draft_sweep():
+    """semantic-phase5 wave 2: the sweep row must POST every 55 minutes to
+    the sweep endpoint, direct-synchronous shape (5-tuple, no enqueue body)."""
+    from services.scheduler.__main__ import build_jobs
+
+    target = next(j for j in build_jobs() if j[0] == "semantic-auto-draft-sweep")
+    assert len(target) == 5
+    name, schedule, endpoint, method, timeout_sec = target
+    assert schedule == "every 55m"
+    assert endpoint == "/api/admin/semantic-auto-draft-sweep"
+    assert method == "POST"
+    assert timeout_sec == 60
+
+
 @pytest.mark.parametrize(
     "seconds,expected",
     [
@@ -449,24 +463,54 @@ def test_is_valid_schedule_rejects_bad(bad):
     assert is_valid_schedule(bad) is False
 
 
-def test_build_jobs_includes_keboola_semantic_layer_refresh_default(monkeypatch):
-    monkeypatch.delenv("SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL", raising=False)
+@pytest.mark.parametrize(
+    "retired",
+    ["keboola-semantic-layer-refresh", "databricks-semantic-layer-refresh"],
+)
+def test_build_jobs_no_longer_schedules_the_per_connector_semantic_refreshes(retired):
+    """#1707 Block 3 step 4: both per-connector semantic refreshes were
+    retired in favour of the ONE generic sweep below. Scheduling either
+    beside it would import the same upstream twice — the duplicate the
+    migration is sequenced to avoid."""
     from services.scheduler.__main__ import build_jobs
 
-    target = next(j for j in build_jobs() if j[0] == "keboola-semantic-layer-refresh")
+    assert retired not in {j[0] for j in build_jobs()}
+
+
+@pytest.mark.parametrize(
+    "retired_env",
+    [
+        "SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL",
+        "SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL",
+    ],
+)
+def test_retired_semantic_interval_envs_are_gone(retired_env):
+    from services.scheduler.__main__ import _DEFAULTS
+
+    assert retired_env not in _DEFAULTS
+
+
+def test_build_jobs_includes_semantic_sources_refresh_default(monkeypatch):
+    """Block 3 of #1707 — the ONE scheduled refresh over registered
+    `semantic_sources`, and since step 4 the only one: it replaced the
+    per-connector Keboola/Databricks jobs."""
+    monkeypatch.delenv("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL", raising=False)
+    from services.scheduler.__main__ import build_jobs
+
+    target = next(j for j in build_jobs() if j[0] == "semantic-sources-refresh")
     _, schedule, endpoint, method, timeout = target
     assert schedule == "every 6h"
-    assert endpoint == "/api/admin/run-keboola-semantic-layer-refresh"
+    assert endpoint == "/api/admin/run-semantic-sources-refresh"
     assert method == "POST"
     assert timeout == 900
 
 
-def test_build_jobs_honors_keboola_semantic_layer_refresh_env_override(monkeypatch):
-    monkeypatch.setenv("SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL", "3600")  # 1h
+def test_build_jobs_honors_semantic_sources_refresh_env_override(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL", "3600")  # 1h
     from services.scheduler.__main__ import build_jobs
 
     jobs = {name: schedule for name, schedule, *_ in build_jobs()}
-    assert jobs["keboola-semantic-layer-refresh"] == "every 1h"
+    assert jobs["semantic-sources-refresh"] == "every 1h"
 
 
 # ---------------------------------------------------------------------------
@@ -655,10 +699,7 @@ class TestUnmigratedRowsUnchanged:
         "store-reap-stuck-reviews": ("/api/admin/run-reap-stuck-reviews", "POST"),
         "store-lint-audit": ("/api/admin/store/lint-audit", "POST"),
         "bq-metadata-refresh": ("/api/admin/run-bq-metadata-refresh", "POST"),
-        "keboola-semantic-layer-refresh": (
-            "/api/admin/run-keboola-semantic-layer-refresh",
-            "POST",
-        ),
+        "semantic-sources-refresh": ("/api/admin/run-semantic-sources-refresh", "POST"),
         "usage-prune": ("/api/admin/usage/prune", "POST"),
         "jira-sla-poll": ("/api/admin/run-jira-sla-poll", "POST"),
         "jira-consistency-check": ("/api/admin/run-jira-consistency-check", "POST"),

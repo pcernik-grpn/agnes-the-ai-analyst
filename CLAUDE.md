@@ -125,6 +125,20 @@ a SQL statement obey a document's constraints and dialects);
 `src/semantic/document_validation.py` is a **document** validator (does a
 document conform to the schema). Different concerns, adjacent names.
 
+Completeness and trust are a separate, cross-source concern layered on top:
+`src/semantic/coverage.py` scores every connected data source across six
+domains (semantic model, metrics, glossary, skill, agent, knowledge base —
+`compute_cross_domain_coverage`) and rolls up sync failures, disconnected
+models, invalid documents, and static document-quality checks into one health
+report (`compute_semantic_layer_health`), both served at `/admin/
+semantic-layer`. Keboola's own binding-coverage engine
+(`connectors/keboola/semantic_layer.py::compute_semantic_coverage`) is one
+provider *inside* the cross-domain report, not a competitor. An admin can mute
+a known finding (`semantic_health_mutes` — always with who/when/why, never
+silently) and anyone can flag a wrong answer (`semantic_feedback`,
+MCP `flag_semantic_issue`). All three new tables are Postgres-only (see
+"Dual-backend discipline" below).
+
 ### Agent profiles & agent-as-API
 
 Named, scoped agents layered over a user's own stack — CRUD/scope/PAT issuance
@@ -445,6 +459,22 @@ HTML dashboard pages use the design-system **page shell** (#367/#482): `{% exten
 - **BigQuery**: `connectors/bigquery/extractor.py` uses the DuckDB BQ extension (remote-only, no download).
 - **Jira**: `connectors/jira/webhook.py` → `incremental_transform.py` → `extract_init.py` updates `_meta`.
 - **Databricks**: `connectors/databricks/extractor.py` materializes registered SQL on a SQL warehouse (Statement Execution API → Arrow → parquet, no SDK); `remote.py` ships an analyst's statement to the warehouse per query for `query_mode='remote'` rows; `attach.py` + `extract_init.py` optionally ATTACH Unity Catalog into DuckDB (`uc_catalog`/`delta`, opt-in, experimental) so remote rows can be JOINed locally; `semantic_layer.py` mirrors Unity Catalog metric views into `metric_definitions` (`source='databricks_semantic_layer'`, scoped prune per workspace).
+
+### LLM cost accounting (`src/llm_pricing.py`)
+One model-aware, cache-aware price table is the only place token counts
+become USD — input, output, cache read (0.1x input) and cache write (1.25x
+input), resolved by exact id then longest known prefix, with an unknown
+model priced at the most expensive general-purpose tier (a guardrail that
+must guess should guess in the direction that stops sooner). Two budget
+surfaces share ONE definition of a chargeable token via `budget_tokens()`:
+`input + output + cache_creation`, cache reads excluded. The chat path
+records all four kinds per message (`chat_messages.cache_read_tokens` /
+`cache_creation_tokens`, PG-only, migration `0092`), which is what makes
+`GET /api/admin/telemetry/chat-cost` (`agnes admin usage chat-cost`) a
+measurement rather than a model — see
+[`docs/observability.md`](docs/observability.md) → *Chat cost*. The daily
+spend cap remains deliberately coarser (a two-bucket counter with no model
+attached) and says so.
 
 ### Config Loading
 1. `config/loader.py` loads `instance.yaml`.

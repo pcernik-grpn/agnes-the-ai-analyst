@@ -89,21 +89,66 @@ def test_two_documents_in_one_import_keep_both_their_metrics(system_db):
     assert names >= {"revenue", "cost"}
 
 
-def test_duplicate_model_name_in_one_import_is_reported_not_silently_collapsed(system_db):
-    """Two documents declaring the same model name collapse onto one row.
+def test_duplicate_model_names_in_one_import_are_disambiguated_not_dropped(system_db):
+    """Two documents declaring the same model name must BOTH be stored.
 
-    The row id derives from the slug, so the later document overwrites the
-    earlier one. Before this was handled the report claimed two models written
-    while a single row existed — silent loss, and in a git-backed source it
-    takes only a copied file.
+    The row id derives from the slug, so without disambiguation the later
+    document overwrites the earlier one. Treating the second as `invalid`
+    (the first fix) traded silent overwrite for silent loss of a different
+    kind: the document was never stored, the run was permanently `partial`
+    (which narrows every subsequent prune), and a previously-stored
+    `slug-<id>` row was deleted by `delete_missing`. The composer this
+    pipeline replaced disambiguated instead — `slug-<stable id>` — and so
+    does this.
     """
     report = import_documents(SOURCE, [_doc("retail", "revenue"), _doc("retail", "other")])
 
-    rows = semantic_model_repo().list_all()
-    assert len(rows) == 1
-    assert report.models_written == len(rows)
-    assert len(report.invalid) == 1
-    assert "duplicate model name" in report.invalid[0]["errors"][0]
+    slugs = sorted(r["slug"] for r in semantic_model_repo().list_all())
+    assert len(slugs) == 2, slugs
+    assert slugs[0] == "retail"  # first occurrence keeps the clean slug
+    assert slugs[1].startswith("retail-")
+    assert report.models_written == 2
+    assert report.invalid == []
+
+
+def test_a_disambiguated_duplicate_survives_the_next_sync(system_db):
+    """The suffix is derived from the model, not from arrival order, so the
+    same batch re-imported is a no-op — not a prune-and-recreate."""
+    documents = [_doc("retail", "revenue"), _doc("retail", "other")]
+    import_documents(SOURCE, documents)
+    before = {r["slug"] for r in semantic_model_repo().list_all()}
+
+    report = import_documents(SOURCE, documents)
+
+    assert report.models_pruned == []
+    assert report.models_unchanged == 2
+    assert {r["slug"] for r in semantic_model_repo().list_all()} == before
+
+
+def test_a_duplicate_name_with_a_stable_upstream_id_is_keyed_on_that_id(system_db):
+    """A connector-composed document carries the upstream object's own id
+    (`custom_extensions[AGNES].metastore_id`) — the same key the projection
+    scopes its row ids on. Disambiguating on it keeps the stored document and
+    its projection talking about the same model."""
+    import json
+
+    def _doc_with_id(model_id):
+        return (
+            "version: '0.2.0.dev0'\n"
+            "semantic_model:\n"
+            "  - name: retail\n"
+            "    custom_extensions:\n"
+            "      - vendor_name: AGNES\n"
+            f"        data: '{json.dumps({'metastore_id': model_id})}'\n"
+            "    datasets:\n"
+            "      - name: orders\n"
+            "        source: db.public.orders\n"
+        )
+
+    import_documents(SOURCE, [_doc_with_id("m-1"), _doc_with_id("m-2")])
+
+    slugs = sorted(r["slug"] for r in semantic_model_repo().list_all())
+    assert slugs == ["retail", "retail-m-2"]
 
 
 def test_null_source_ref_does_not_read_across_other_refs(system_db):

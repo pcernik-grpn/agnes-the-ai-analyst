@@ -1,39 +1,255 @@
-"""`agnes semantic-model` — non-admin, read-tier commands over the semantic
-layer: validate a query before running it, and the agent read-parity tools
-`context` / `schema` (parity spec §4/§5).
+"""`agnes semantic-model` — the semantic layer for anyone signed in.
 
-CLI counterpart to ``POST /api/semantic-models/validate-query`` + the MCP
-``validate_semantic_query`` foundation tool, and to
-``GET /api/semantic-models/context`` / ``GET /api/semantic-models/schema`` +
-the MCP ``get_semantic_context`` / ``get_semantic_schema`` foundation tools —
-same request/response shape across all three surfaces. Not to be confused
-with ``agnes admin semantic-model validate``, which schema-checks a
-*document* locally against the vendored Ossie spec; every command here reads
-against whatever valid semantic models the caller can already read (mirrors
-the non-admin ``/api/semantic-models/search`` + ``export`` RBAC tier — a Data
-Package or direct model grant, not admin-only).
+Everything here is reachable without admin: find a model (`search`), read its
+metadata (`show`) or its document (`export`), check a document (`validate`) or
+a query (`validate-query`) before either reaches the server, look objects up
+(`context`), read the schema they must conform to (`schema`), propose a change
+(`apply`), and report an answer that looked wrong (`feedback submit`).
+
+RBAC is per-model, not per-command: `search`/`show`/`export`/`context`/
+`validate-query` read whatever `status='valid'` models the caller can already
+reach (a Data Package grant or a direct model grant). `validate` and `schema`
+need nothing at all — `validate` never contacts a server.
+
+Two commands are easy to confuse, so both helps say so:
+
+  * ``validate <file>``  — is this DOCUMENT well-formed? Offline, no token.
+  * ``validate-query <sql>`` — does this QUERY obey the models I can read?
+
+The admin half — importing, deleting, sources, coverage, health, mutes, and
+the feedback QUEUE (``feedback list``/``resolve``) — is ``agnes admin
+semantic`` (:mod:`cli.commands.admin_semantic`). The admin-only commands that
+used to live in THIS group (``coverage``, ``health``, ``mute``, ``mutes``,
+``unmute``, ``feedback list``, ``feedback resolve``) survive here for one
+release as hidden aliases; they were always admin-gated on the API side, so
+their home was simply wrong.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional
 
 import typer
 
 from cli.client import api_get, api_post
+from cli.commands import admin_semantic as _admin
+from cli.deprecation import deprecated_alias, deprecation_notice
 
-semantic_model_app = typer.Typer(help="Read the semantic layer: validate queries, browse context, inspect schema")
+semantic_model_app = typer.Typer(
+    help="The semantic layer: find models, read their documents, validate queries, propose changes"
+)
 
 _SEMANTIC_TYPES = ("dataset", "metric", "relationship")
+
+_SEARCH_PATH = "/api/semantic-models/search"
+# The public search endpoint caps `limit` server-side; `show` resolves a slug
+# through it, so it asks for the ceiling rather than a page it might miss on.
+_SEARCH_LIMIT_MAX = 100
+
+# Feedback (F4.5) — "that answer looked wrong". `submit` is open to any
+# signed-in caller and lives here, beside the analysis that produced the bad
+# number: a report must be fileable from every surface (UI, chat, MCP, CLI),
+# not only the ones an admin uses. `list`/`resolve` call `require_admin`
+# endpoints and therefore live in `agnes admin semantic feedback` — placement
+# follows authority, the same rule that moved `coverage`/`health`/`mute*` out
+# of this group. Both survive here as hidden aliases for one release.
+feedback_app = typer.Typer(
+    help="Report an answer that looked wrong or unsupported (the queue is `agnes admin semantic feedback`)"
+)
+semantic_model_app.add_typer(feedback_app, name="feedback")
+
+_FEEDBACK_SUBMIT_PATH = "/api/semantic-feedback"
+
+
+def _fail(resp) -> None:
+    try:
+        detail = resp.json().get("detail")
+    except Exception:
+        detail = None
+    typer.echo(f"Error ({resp.status_code}): {detail or resp.text}", err=True)
+    raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Find and read — `search` / `show` / `export`
+# ---------------------------------------------------------------------------
+
+
+@semantic_model_app.command("search")
+def search(
+    term: str = typer.Argument(..., help="Substring to look for in a model's slug, name or description"),
+    limit: int = typer.Option(
+        10, "--limit", min=1, max=_SEARCH_LIMIT_MAX, help=f"Max models to return (server cap: {_SEARCH_LIMIT_MAX})"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Find semantic models you can read, by substring.
+
+    Case-insensitive match over slug/name/description, filtered to the models
+    your grants actually reach (admins see everything). Reads
+    `GET /api/semantic-models/search` — the same endpoint the MCP
+    `semantic_model_search` tool uses.
+
+    There is no local/server scope to choose: a semantic model is server
+    state, and a laptop holds only the rendered read-only cache `agnes pull`
+    writes under `<workspace>/semantic/`. The admin listing that also shows
+    drafts and invalid documents is `agnes admin semantic list`.
+    """
+    resp = api_get(_SEARCH_PATH, params={"q": term, "limit": limit})
+    if resp.status_code != 200:
+        _fail(resp)
+
+    body = resp.json()
+    models = body.get("models") or []
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+
+    if not models:
+        typer.echo(f"No semantic model you can read matches {term!r}.")
+        typer.echo("  Browse what is modelled instead: agnes semantic-model context dataset")
+        typer.echo("  Ask an admin to grant you the Data Package a model is linked to, or to import one.")
+        return
+
+    typer.echo(f"{len(models)} semantic model(s) matching {term!r}:")
+    for row in models:
+        summary = row.get("description") or row.get("name") or ""
+        typer.echo(f"  {(row.get('slug') or '?'):<24} {(row.get('source') or '?'):<10} {summary}")
+    if len(models) >= limit:
+        # Command-UX standard: a partial result never passes for a whole one.
+        typer.echo(f"  … this is the first {limit} — raise --limit or narrow the term")
+    typer.echo("  Read one: agnes semantic-model show <slug> / agnes semantic-model export <slug>")
+
+
+@semantic_model_app.command("show")
+def show(
+    slug: str = typer.Argument(..., help="Model slug (or id) from `agnes semantic-model search`"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """One model's metadata — provenance, status, content hash.
+
+    Resolved through the same public search endpoint `search` uses, so it
+    needs no admin endpoint and shows exactly the models you may read. The
+    document body itself is `agnes semantic-model export <slug>`; the
+    admin view that also reaches drafts and invalid documents is
+    `agnes admin semantic show <id|slug>`.
+    """
+    resp = api_get(_SEARCH_PATH, params={"q": slug, "limit": _SEARCH_LIMIT_MAX})
+    if resp.status_code != 200:
+        _fail(resp)
+
+    needle = slug.casefold()
+    models = resp.json().get("models") or []
+    row = next(
+        (
+            m
+            for m in models
+            if str(m.get("slug") or "").casefold() == needle or str(m.get("id") or "").casefold() == needle
+        ),
+        None,
+    )
+    if row is None:
+        typer.echo(f"No semantic model {slug!r} you can read.", err=True)
+        if len(models) >= _SEARCH_LIMIT_MAX:
+            # The lookup rides a capped substring search, so "not found" and
+            # "past the cap" are not the same thing and must not read the same.
+            typer.echo(
+                f"  {len(models)} models contain that text — the server caps this search at "
+                f"{_SEARCH_LIMIT_MAX}, so an exact match may be past the cap. Narrow it:",
+                err=True,
+            )
+        typer.echo(f"  agnes semantic-model search {slug}", err=True)
+        raise typer.Exit(1)
+
+    if as_json:
+        typer.echo(json.dumps(row, indent=2, default=str))
+        return
+
+    typer.echo(f"ID:           {row.get('id')}")
+    typer.echo(f"Slug:         {row.get('slug')}")
+    typer.echo(f"Name:         {row.get('name')}")
+    typer.echo(f"Description:  {row.get('description') or '(none)'}")
+    typer.echo(f"Source:       {row.get('source')} (source_ref={row.get('source_ref')})")
+    typer.echo(f"Status:       {row.get('status')}")
+    typer.echo(f"Spec version: {row.get('spec_version')}")
+    typer.echo(f"Content hash: {row.get('content_hash')}")
+    typer.echo(f"  Read the document: agnes semantic-model export {row.get('slug')}")
+
+
+@semantic_model_app.command("export")
+def export_model(
+    slug: str = typer.Argument(..., help="Model slug"),
+    output: str | None = typer.Option(None, "--output", "-o", help="Write to this file instead of stdout"),
+):
+    """Print one model's stored document, byte for byte.
+
+    Comments and key order survive — the server never re-serializes it. Reads
+    the public, resource-gated `GET /api/semantic-models/{slug}.yaml`, so this
+    is not an admin operation: anyone who may read the model may read its
+    document. Round-trip for an edit: export, change, then
+    `agnes semantic-model apply --expect-hash <content_hash>`.
+    """
+    resp = api_get(f"/api/semantic-models/{slug}.yaml")
+    if resp.status_code == 404:
+        typer.echo(f"Semantic model not found: {slug}", err=True)
+        typer.echo(f"  Look for it: agnes semantic-model search {slug}", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 403:
+        typer.echo(f"Access denied: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo("  Ask an admin to link the model to a Data Package you are granted.", err=True)
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        _fail(resp)
+    text = resp.text
+    if output:
+        Path(output).write_text(text)
+        typer.echo(f"Wrote {output}")
+        return
+    typer.echo(text, nl=not text.endswith("\n"))
+
+
+# ---------------------------------------------------------------------------
+# Check before you commit — `validate` (document) / `validate-query` (SQL)
+# ---------------------------------------------------------------------------
+
+
+@semantic_model_app.command("validate")
+def validate_document(
+    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
+):
+    """Schema-check a local DOCUMENT against the vendored semantic-model schema.
+
+    Runs entirely offline: no server, no token, no admin. An author fixing a
+    document should not need a reachable instance to iterate — which is why
+    this is not an admin command.
+
+    NOT `validate-query`: that one checks a SQL statement against the models
+    you can read, and needs a server. This one only asks whether a file is a
+    well-formed semantic-model document.
+    """
+    p = Path(path)
+    if not p.exists():
+        typer.echo(f"Path not found: {path}", err=True)
+        raise typer.Exit(1)
+
+    from src.semantic.document_validation import validate_document as _validate
+
+    result = _validate(p.read_text())
+    if result.ok:
+        typer.echo(f"OK — spec version {result.spec_version}")
+        return
+    typer.echo("Invalid document:", err=True)
+    for e in result.errors:
+        typer.echo(f"  {e}", err=True)
+    raise typer.Exit(1)
 
 
 @semantic_model_app.command("apply")
 def apply(
     path: str = typer.Argument(..., help="Path to a semantic-model document (YAML)"),
-    description: Optional[str] = typer.Option(None, "--description", help="Listing description for the model"),
-    expect_hash: Optional[str] = typer.Option(
+    description: str | None = typer.Option(None, "--description", help="Listing description for the model"),
+    expect_hash: str | None = typer.Option(
         None,
         "--expect-hash",
         help="For edits: the content_hash the edit was based on — a mismatch refuses instead of overwriting.",
@@ -46,7 +262,7 @@ def apply(
     ``Applied`` (the model is live); everyone else gets ``Submitted for
     review`` (an admin approves or rejects it — the model is NOT live until
     then). Offline pre-check without a server or token:
-    `agnes admin semantic-model validate <file>`.
+    `agnes semantic-model validate <file>`.
     """
     p = Path(path)
     if not p.exists():
@@ -67,7 +283,7 @@ def apply(
             detail = resp.text
         typer.echo(f"Failed: {detail}", err=True)
         if isinstance(detail, dict) and detail.get("code") == "invalid_document":
-            typer.echo("  Pre-check locally: agnes admin semantic-model validate <file>", err=True)
+            typer.echo("  Pre-check locally: agnes semantic-model validate <file>", err=True)
         raise typer.Exit(1)
 
     body = resp.json()
@@ -87,7 +303,7 @@ def apply(
 @semantic_model_app.command("validate-query")
 def validate_query(
     sql: str = typer.Argument(..., help="SQL statement to validate"),
-    expect: Optional[str] = typer.Option(
+    expect: str | None = typer.Option(
         None,
         "--expect",
         help='JSON list of expected objects, e.g. \'[{"type":"metric","name":"mrr"}]\'',
@@ -95,7 +311,7 @@ def validate_query(
     target_engine: str = typer.Option("duckdb", "--target-engine", help="Engine the query will run on"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """Validate SQL against the semantic layer: constraint violations,
+    """Validate a SQL QUERY against the semantic layer: constraint violations,
     dialect fit, and (optionally) which expected datasets/metrics/
     relationships the query hits.
 
@@ -104,6 +320,9 @@ def validate_query(
     docstring). Reads every `status='valid'` semantic model you can access;
     if none exist (or none are accessible to you), prints a "no semantic
     model" notice instead of a misleading all-clear.
+
+    NOT `semantic-model validate`: that one schema-checks a DOCUMENT file
+    offline. This one needs a server and checks a statement.
     """
     payload: dict = {"sql": sql, "target_engine": target_engine}
     if expect:
@@ -115,12 +334,7 @@ def validate_query(
 
     resp = api_post("/api/semantic-models/validate-query", json=payload)
     if resp.status_code != 200:
-        try:
-            detail = resp.json().get("detail")
-        except Exception:
-            detail = None
-        typer.echo(f"Error ({resp.status_code}): {detail or resp.text}", err=True)
-        raise typer.Exit(1)
+        _fail(resp)
 
     body = resp.json()
     if as_json:
@@ -133,6 +347,14 @@ def validate_query(
 
     status = "VALID" if body.get("valid") else "INVALID"
     typer.echo(f"{status} — {body.get('summary', '')}")
+    # The datasets/metrics named above (and in `--json`) are a best-effort
+    # text match, not SQL parsing -- printed unconditionally as its own line
+    # so it can never be missed the way a trailing clause in `summary` could
+    # be (issue #1707, finding A18). Falls back to the generic wording
+    # against an older server that doesn't send `detection` yet.
+    typer.echo(
+        body.get("detection") or "Note: detected datasets/metrics are a best-effort text match, not SQL parsing."
+    )
 
     if body.get("violations"):
         typer.echo("Violations:")
@@ -148,34 +370,38 @@ def validate_query(
         typer.echo(f"Warning: {body['mixed_dialect_warning']}")
 
     if not body.get("locally_executable", True):
-        typer.echo("Warning: one or more used metrics are not locally executable on the target engine.")
+        # Name the offenders when the API provides them (sl/b2-consumption-loop
+        # extends validate-query with `not_executable_metrics`); fall back to the
+        # generic wording against a server without that field, so this file works
+        # in either merge order.
+        offenders = ", ".join(str(m) for m in (body.get("not_executable_metrics") or []))
+        subject = offenders if offenders else "one or more used metrics"
+        typer.echo(f"Warning: {subject} — not locally executable on the target engine.")
 
-    if "missing_expected_objects" in body and body["missing_expected_objects"]:
+    if body.get("missing_expected_objects"):
         typer.echo("Missing expected objects:")
         for obj in body["missing_expected_objects"]:
             typer.echo(f"  {obj.get('type')}: {obj.get('name')}")
-    if "unexpected_detected_objects" in body and body["unexpected_detected_objects"]:
+    if body.get("unexpected_detected_objects"):
         typer.echo("Unexpected detected objects:")
         for obj in body["unexpected_detected_objects"]:
             typer.echo(f"  {obj.get('type')}: {obj.get('name')}")
 
 
-def _fail(resp) -> None:
-    try:
-        detail = resp.json().get("detail")
-    except Exception:
-        detail = None
-    typer.echo(f"Error ({resp.status_code}): {detail or resp.text}", err=True)
-    raise typer.Exit(1)
+# ---------------------------------------------------------------------------
+# Agent read-parity — `context` / `schema`
+# ---------------------------------------------------------------------------
 
 
 @semantic_model_app.command("context")
 def context(
-    semantic_type: str = typer.Argument(..., help=f"One of: {', '.join(_SEMANTIC_TYPES)}"),
-    id: Optional[List[str]] = typer.Option(  # noqa: A002 - CLI flag name, not shadowing intentionally
+    semantic_type: list[str] = typer.Argument(
+        ..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)} — several types cost one round trip, not N."
+    ),
+    id: list[str] | None = typer.Option(
         None, "--id", help="Specific object id/name — repeatable. Omit for every object of this type (compact)."
     ),
-    model: Optional[List[str]] = typer.Option(
+    model: list[str] | None = typer.Option(
         None,
         "--model",
         help="Restrict to this model id, slug, or name (the `[model]` label shown in output) — "
@@ -186,12 +412,18 @@ def context(
 ):
     """Look up datasets/metrics/relationships from your accessible semantic models.
 
-    Omitting `--id` returns every object of `semantic_type` COMPACTLY (name +
-    a short summary); passing one or more `--id` returns the FULL attributes
-    of just those objects. Mirrors `GET /api/semantic-models/context` and the
-    MCP `get_semantic_context` foundation tool.
+    Omitting `--id` returns every object of the requested type(s) COMPACTLY
+    (name + a short summary); passing one or more `--id` returns the FULL
+    attributes of just those objects. Mirrors
+    `GET /api/semantic-models/context` and the MCP `get_semantic_context`
+    foundation tool.
+
+    Batch: `context dataset metric relationship` reads the whole layer in one
+    round trip, and `context metric --id a --id b --id c` reads three metrics
+    in full in one — prefer both over a call per object, which multiplies both
+    round trips and the context every later turn carries.
     """
-    selections = [{"semantic_type": semantic_type, "ids": id or None}]
+    selections = [{"semantic_type": t, "ids": id or None} for t in semantic_type]
     params: dict = {"selections": json.dumps(selections)}
     if model:
         params["model_ids"] = model
@@ -246,7 +478,7 @@ def context(
 
 @semantic_model_app.command("schema")
 def schema(
-    semantic_type: List[str] = typer.Argument(..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)}"),
+    semantic_type: list[str] = typer.Argument(..., help=f"One or more of: {', '.join(_SEMANTIC_TYPES)}"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
     """Show the vendored Apache Ossie JSON Schema for one or more object types.
@@ -271,3 +503,145 @@ def schema(
         def_name = ref.get("$ref", "").rsplit("/", 1)[-1]
         typer.echo(f"=== {type_name} ({def_name}) ===")
         typer.echo(json.dumps(body["$defs"].get(def_name, {}), indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Feedback (F4.5) — `agnes semantic-model feedback …`
+# ---------------------------------------------------------------------------
+
+
+def _fail_needs_postgres(resp, what: str) -> None:
+    """Turn the PG-only 501 into the one sentence that names the fix.
+
+    Feedback lives in a Postgres-only table (A3 PG-first ratchet), so an
+    instance still on the frozen DuckDB app-state backend cannot store a
+    report at all. Printing the raw 501 body would leave the reader guessing
+    that their question was malformed.
+    """
+    if resp.status_code != 501:
+        return
+    typer.echo(
+        f"{what} needs the Postgres app-state backend — this instance still runs the frozen "
+        "DuckDB backend. Migrate it (see docs/migrations.md) to use the feedback queue.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+@feedback_app.command("submit")
+def feedback_submit(
+    question: str = typer.Argument(..., help="The question whose answer looked wrong, as it was asked"),
+    sql: str | None = typer.Option(None, "--sql", help="The SQL that produced the suspect answer, if there was one"),
+    metric: str | None = typer.Option(None, "--metric", help="Metric id the answer relied on (e.g. revenue/mrr)"),
+    comment: str | None = typer.Option(None, "--comment", help="What looks wrong about it"),
+    model_hash: str | None = typer.Option(
+        None,
+        "--model-hash",
+        help="content_hash of the semantic model that produced the answer — pins the report to a document "
+        "version, so a later rewrite does not make it look like a complaint about the current text. For "
+        "scripted callers that know it (`agnes semantic-model show <slug> --json` reports it).",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Report that an answer looked wrong or unsupported (anyone signed in).
+
+    Not an admin command: the person who ran the analysis is the one who sees
+    the bad number. Only the question is required — a concept nobody ever
+    defined has no SQL and no metric to name, and that is exactly the case
+    most worth reporting.
+
+    Mirrors `POST /api/semantic-feedback` and the MCP `flag_semantic_issue`
+    tool.
+    """
+    payload = {
+        "question": question,
+        "sql": sql,
+        "metric_id": metric,
+        "comment": comment,
+        "model_content_hash": model_hash,
+    }
+    resp = api_post(_FEEDBACK_SUBMIT_PATH, json={k: v for k, v in payload.items() if v is not None})
+    _fail_needs_postgres(resp, "Filing feedback")
+    if resp.status_code not in (200, 201):
+        _fail(resp)
+
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2, default=str))
+        return
+    typer.echo(f"Filed: {body.get('id')} ({body.get('status', 'open')})")
+    typer.echo("  An admin sees it at /admin/semantic-layer?tab=feedback")
+    typer.echo("  or with: agnes admin semantic feedback list")
+
+
+# ---------------------------------------------------------------------------
+# Deprecated aliases — the admin-gated commands that used to live here
+#
+# `coverage`, `health`, `mute`, `mutes`, `unmute` and the two admin halves of
+# `feedback` all call `require_admin` endpoints; sitting in the any-user group
+# advertised authority the caller did not have. They moved to `agnes admin
+# semantic …` and survive here, hidden, for one release. Each delegates to the
+# SAME function the new path runs, so an alias cannot drift from what it
+# replaces.
+# ---------------------------------------------------------------------------
+
+for _name, _fn in (
+    ("list", _admin.feedback_list),
+    ("resolve", _admin.feedback_resolve),
+):
+    deprecated_alias(
+        feedback_app,
+        name=_name,
+        old=f"semantic-model feedback {_name}",
+        new=f"admin semantic feedback {_name}",
+        fn=_fn,
+    )
+
+for _name, _fn in (
+    ("health", _admin.health),
+    ("mute", _admin.mute),
+    ("mutes", _admin.mutes),
+    ("unmute", _admin.unmute),
+):
+    deprecated_alias(
+        semantic_model_app,
+        name=_name,
+        old=f"semantic-model {_name}",
+        new=f"admin semantic {_name}",
+        fn=_fn,
+    )
+
+# `coverage` is a group, so its notice rides the group callback: Click runs a
+# group callback before the subcommand, which covers the bare invocation and
+# `tables`/`show`/`tag`/`untag` alike with one line.
+_coverage_alias_app = typer.Typer(
+    help="(deprecated alias of `agnes admin semantic coverage`)",
+    invoke_without_command=True,
+)
+semantic_model_app.add_typer(_coverage_alias_app, name="coverage", hidden=True)
+
+
+@_coverage_alias_app.callback(invoke_without_command=True)
+def _coverage_alias(
+    ctx: typer.Context,
+    source: str | None = typer.Option(
+        None, "--source", help="Only this source connection id (`__local__` for tables with no connection)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """(deprecated alias of `agnes admin semantic coverage`)"""
+    sub = ctx.invoked_subcommand
+    suffix = f" {sub}" if sub else ""
+    deprecation_notice(f"semantic-model coverage{suffix}", f"admin semantic coverage{suffix}")
+    if sub is not None:
+        return
+    _admin.coverage_show(source=source, as_json=as_json)
+
+
+for _name, _fn in (
+    ("show", _admin.coverage_show),
+    ("tables", _admin.coverage_tables),
+    ("tag", _admin.coverage_tag),
+    ("untag", _admin.coverage_untag),
+):
+    _coverage_alias_app.command(_name, hidden=True)(_fn)

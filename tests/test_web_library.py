@@ -73,7 +73,7 @@ def test_library_has_no_agent_affordance(seeded_app):
 def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
     """Put a metric and/or a glossary term into the semantic layer.
 
-    The Definitions footer only renders when at least one side is populated, so
+    The Definitions strip only renders when at least one side is populated, so
     a test that wants it has to say so — which is the point of the guard.
     """
     from src.repositories import glossary_repo, metric_repo
@@ -91,17 +91,21 @@ def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
         glossary_repo().create(id=f"g{i}", term=f"Term {i}", definition="What it means here.")
 
 
-def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
-    """The semantic layer closes the page; it is NOT part of the inventory.
+def test_library_shows_definitions_on_the_semantic_models_band(seeded_app):
+    """The metric and glossary registries are a DESTINATION, not inventory.
 
-    It shipped briefly as a "Definitions" band holding two rows, and that was
-    wrong: metrics and glossary terms are the one thing here nobody owns,
-    shares, installs, drops or edits, so as rows they had to blank all four of
-    the table's columns at once (Owner / Sharing / Stack / Actions). Four
-    special-cased columns is the list saying the object is not one of its rows.
-    A data package looks similar but differs where it counts — access to it
-    varies per caller, which is what makes it "what I have"; everyone has the
-    whole glossary.
+    Two things were conflated here and the split is the whole point. A metric
+    or a glossary term is the one thing on this page nobody owns, shares,
+    installs, drops or edits, so as a row it would blank all four of the
+    table's columns at once (Owner / Sharing / Access / Actions) — and four
+    special-cased columns is the list saying the object is not one of its
+    rows. It therefore stays a pair of LINKS.
+
+    Where those links live did change (#1707 N3): they used to close the page
+    as a footer aside below an unbounded list, i.e. after every row. They now
+    ride the band of the Library's own "Semantic models" section, which holds
+    the stored documents those registries are projected from — documents that
+    answer all four columns honestly and ARE rows.
     """
     _seed_definitions(metrics=2, terms=3)
     c = seeded_app["client"]
@@ -110,17 +114,19 @@ def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
     assert 'id="lib-defs"' in r.text
     assert "2 metrics" in r.text
     assert "3 glossary terms" in r.text
-    assert 'href="/catalog/semantics#metrics"' in r.text
-    assert 'href="/catalog/semantics#glossary"' in r.text
-    # Not inventory: no band, no row, no kind.
+    # Into the folded tabs (#1707 N5), never the retired flat page.
+    assert 'href="/semantic-layer?tab=all_metrics"' in r.text
+    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    assert "/catalog/semantics" not in r.text
+    # Still not inventory: the definitions themselves are no row and no kind.
     assert 'data-lib-sec="definitions"' not in r.text
     assert 'data-kind="definitions"' not in r.text
     # And not the retired header link either.
     assert "lib-browse-semantics" not in r.text
 
 
-def test_library_definitions_footer_carries_its_contents_for_search(seeded_app):
-    """The footer is searchable BY TERM, not just by the word "definitions".
+def test_library_definitions_carry_their_contents_for_search(seeded_app):
+    """The block is searchable BY TERM, not just by the word "definitions".
 
     Someone types "MRR" or "active account" — the term they half-remember —
     the list comes back empty, and the footer is the one thing on the page
@@ -156,7 +162,7 @@ def test_library_definitions_footer_carries_its_contents_for_search(seeded_app):
     assert "paid" not in index
 
 
-def test_library_definitions_footer_counts_are_singular_for_one(seeded_app):
+def test_library_definitions_counts_are_singular_for_one(seeded_app):
     """ "1 metric", not "1 metrics" — the count is read as a sentence."""
     _seed_definitions(metrics=1, terms=1)
     c = seeded_app["client"]
@@ -167,8 +173,8 @@ def test_library_definitions_footer_counts_are_singular_for_one(seeded_app):
     assert "1 glossary terms" not in r.text
 
 
-def test_library_hides_definitions_footer_when_semantic_layer_is_empty(seeded_app):
-    """No metrics AND no glossary -> no footer.
+def test_library_hides_definitions_when_semantic_layer_is_empty(seeded_app):
+    """No metrics AND no glossary -> no block.
 
     A block advertising "0 metrics · 0 glossary terms" describes the instance's
     setup, not its content, and reads as a broken feature rather than an
@@ -181,7 +187,7 @@ def test_library_hides_definitions_footer_when_semantic_layer_is_empty(seeded_ap
     assert "/catalog/semantics" not in r.text
 
 
-def test_library_shows_definitions_footer_when_only_one_side_is_populated(seeded_app):
+def test_library_shows_definitions_when_only_one_side_is_populated(seeded_app):
     """Metrics but no glossary still renders it — "0 glossary terms" is a true
     and useful statement about a semantic layer that exists."""
     _seed_definitions(metrics=1, terms=0)
@@ -192,10 +198,10 @@ def test_library_shows_definitions_footer_when_only_one_side_is_populated(seeded
     assert "0 glossary terms" in r.text
 
 
-def test_library_definitions_footer_is_labeled_in_plain_words(seeded_app):
+def test_library_definitions_are_labeled_in_plain_words(seeded_app):
     """ "Definitions", never "Semantic layer" — that name belongs to
     /admin/semantic-layer, where the reader operates the sync rather than
-    looking a term up. Scoped to the footer because an admin's nav dropdown
+    looking a term up. Scoped to the block because an admin's nav dropdown
     carries the admin link on every page, and that one is correct."""
     _seed_definitions()
     c = seeded_app["client"]
@@ -204,6 +210,86 @@ def test_library_definitions_footer_is_labeled_in_plain_words(seeded_app):
     block = r.text.split('id="lib-defs"', 1)[1].split("</aside>", 1)[0]
     assert "Definitions" in block
     assert "Semantic layer" not in block
+
+
+def test_library_definitions_are_not_at_the_tail_of_an_unbounded_list(seeded_app):
+    """#1898 item 1 / #1707 N3 — the block is reachable on ARRIVAL, at any length.
+
+    It used to close the page, under the item list, on the (correct) reasoning
+    that the organization's vocabulary is not one of the list's rows. The cost
+    was discoverability: past a handful of items it was below the fold on every
+    visit, so the surface positioned as the curated single source of truth was
+    the one thing nobody could find.
+
+    The fix is the Semantic models section's FIXED slot in `_SECTION_ORDER`
+    (directly under Data packages), not a strip pinned above the tabs — so what
+    is asserted is the property both approaches were after: the definitions
+    precede the unbounded artefact sections rather than trailing them. Position
+    is asserted rather than mere presence, because presence is exactly what the
+    old bug had.
+    """
+    _seed_definitions()
+    for i in range(6):
+        _create(seeded_app, f"Filler {i}")
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    body = r.text
+    defs_at = body.index('id="lib-defs"')
+    # The sections that grow without bound are the ones it must not sit behind:
+    # a reader who has to scroll past every file, app and memory domain to find
+    # the vocabulary is back to the footer this replaced.
+    for later in ("files", "data_app", "memory_domain"):
+        marker = f'data-lib-sec="{later}"'
+        if marker in body:
+            assert defs_at < body.index(marker), (
+                f"Definitions must precede the unbounded {later} section, "
+                "or it is a footer again under a different name"
+            )
+    # Still not inventory, and still not a notice — its own shape on the band.
+    assert 'data-lib-sec="definitions"' not in body
+    assert 'data-kind="definitions"' not in body
+
+
+def test_library_filter_is_disabled_when_there_is_nothing_to_filter(seeded_app):
+    """#1898 item 4 — an empty popover is worse than no popover.
+
+    Every facet is conditional (a category with fewer than two values does not
+    render), so on a fresh instance the menu came out holding nothing but its own
+    Clear and Done buttons. "No dead filters" has to cover the Filter button
+    itself: with no facets it is visibly unavailable, says why, and the menu is
+    not built at all rather than built empty.
+    """
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    btn = r.text.split('id="lib-filter-btn"', 1)[1].split(">", 1)[0]
+    assert "disabled" in btn
+    assert 'aria-disabled="true"' in btn
+    assert "title=" in btn, "an unavailable control has to say why"
+    # No popover, so there is no empty one to open.
+    assert 'id="lib-filter-menu"' not in r.text
+    assert "data-fbar-done" not in r.text
+
+
+def test_library_filter_is_live_once_a_facet_exists(seeded_app):
+    """The mirror image, so the disable can never become permanent: two owners is
+    two values of one category, which is a real filter, so the control opens a
+    menu with that category in it."""
+    cid = _create(seeded_app, "Two formats")["id"]
+    assert _upload(seeded_app, cid, "a.csv", b"x,y\n1,2\n", "text/csv").status_code in (200, 201)
+    assert _upload(seeded_app, cid, "b.md", b"# note\n", "text/markdown").status_code in (200, 201)
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    btn = r.text.split('id="lib-filter-btn"', 1)[1].split(">", 1)[0]
+    assert "disabled" not in btn
+    assert 'aria-haspopup="true"' in btn
+    assert 'id="lib-filter-menu"' in r.text
+    assert "data-fbar-done" in r.text
+    # …and the menu is not the empty shell the disabled case exists to prevent.
+    menu = r.text.split('id="lib-filter-menu"', 1)[1].split("</div>", 1)[0]
+    assert "fbar-cat" in r.text.split('id="lib-filter-menu"', 1)[1][:4000] or "fbar-menu__opt" in menu
 
 
 def test_library_detail_renders_for_admin(seeded_app):

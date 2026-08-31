@@ -12,7 +12,6 @@ from cli.commands.admin_autodoc import autodoc_tables
 from cli.commands.admin_config import admin_config_app
 from cli.commands.admin_connection import admin_connection_app
 from cli.commands.admin_data_package import admin_data_package_app
-from cli.commands.admin_data_semantics import admin_data_semantics_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
 from cli.commands.admin_jobs import admin_jobs_app
@@ -21,6 +20,7 @@ from cli.commands.admin_mcp import mcp_app as admin_mcp_app
 from cli.commands.admin_memory_domain import admin_memory_domain_app
 from cli.commands.admin_metrics import admin_metrics_app
 from cli.commands.admin_news import admin_news_app
+from cli.commands.admin_semantic import admin_semantic_app
 from cli.commands.admin_semantic_layer import admin_semantic_layer_app
 from cli.commands.admin_semantic_model import admin_semantic_model_app
 from cli.commands.admin_semantic_source import admin_semantic_source_app
@@ -55,9 +55,6 @@ admin_app.add_typer(memory_admin_app, name="memory")
 admin_app.add_typer(admin_usage_app, name="telemetry", help="Telemetry export and admin queries")
 admin_app.add_typer(admin_usage_app, name="usage", help="(deprecated alias of `telemetry`)")
 admin_app.add_typer(admin_data_package_app, name="data-package", help="Data Package CRUD (v49)")
-admin_app.add_typer(
-    admin_data_semantics_app, name="data-semantics", help="Generate the workspace data-semantics pack (#469)"
-)
 admin_app.add_typer(admin_memory_domain_app, name="memory-domain", help="Memory Domain CRUD (v49)")
 admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRUD (K4)")
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
@@ -69,11 +66,16 @@ admin_app.add_typer(
     admin_marketplace_app, name="marketplace", help="Curated marketplace ops (list / sync / disable-plugin)"
 )
 admin_app.add_typer(admin_mcp_app, name="mcp", help="Universal MCP source + tool admin")
-admin_app.add_typer(admin_semantic_layer_app, name="semantic-layer", help="Keboola semantic-layer import status")
+# One semantic-layer admin group (#1707 Block 6). The three it replaced were
+# split by which endpoint family they called, which is not something a reader
+# can guess; they stay registered HIDDEN for one release so no existing
+# invocation breaks, each printing the new path on stderr before delegating.
 admin_app.add_typer(
-    admin_semantic_model_app, name="semantic-model", help="Semantic-model CRUD (semantic model documents)"
+    admin_semantic_app, name="semantic", help="The semantic layer: documents, their sources, and its health"
 )
-admin_app.add_typer(admin_semantic_source_app, name="semantic-source", help="Semantic-source sync configuration")
+admin_app.add_typer(admin_semantic_layer_app, name="semantic-layer", hidden=True)
+admin_app.add_typer(admin_semantic_model_app, name="semantic-model", hidden=True)
+admin_app.add_typer(admin_semantic_source_app, name="semantic-source", hidden=True)
 admin_app.add_typer(
     admin_connection_app, name="connection", help="Named source-connection CRUD (multi-project Keboola)"
 )
@@ -89,7 +91,7 @@ admin_app.command("autodoc-tables")(autodoc_tables)
 
 # Table access policies (design doc §13.2, plan Task 16) — a narrow,
 # purpose-specific nested group, mirroring `data-package` / `memory-domain` /
-# `connection` / `mcp` / `semantic-layer` above. NOT the generic `agnes admin
+# `connection` / `mcp` / `semantic` above. NOT the generic `agnes admin
 # table` catch-all the design doc explicitly rejects hanging noun-verb
 # commands off of. Attach/replace/clear stays flat on `update-table --policy`
 # (mirrors `--query`); this group is read-only inspection — the stored policy
@@ -277,6 +279,14 @@ def register_table(
         "--dry-run",
         help="Run validation + (BQ) source-side check without writing to the registry",
     ),
+    connection_id: str = typer.Option(
+        None,
+        "--connection-id",
+        help=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type."
+        ),
+    ),
 ):
     """Register a single table.
 
@@ -378,6 +388,8 @@ def register_table(
         payload["source_query"] = source_query
     if sync_schedule:
         payload["sync_schedule"] = sync_schedule
+    if connection_id is not None:
+        payload["connection_id"] = connection_id
 
     # v26 sync-strategy support fields. Always send sync_strategy (it has a
     # default). Send the rest only when the operator set them — empty/None
@@ -789,6 +801,14 @@ def update_table(
             "grant analysts access to the table."
         ),
     ),
+    connection_id: str = typer.Option(
+        None,
+        "--connection-id",
+        help=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type."
+        ),
+    ),
 ):
     """Update a registered table.
 
@@ -853,13 +873,15 @@ def update_table(
         payload["access_policy_note"] = policy_note
     if policy_mapping is not None:
         payload["policy_mapping"] = policy_mapping
+    if connection_id is not None:
+        payload["connection_id"] = connection_id
 
     if not payload:
         typer.echo(
             "No fields supplied. Pass at least one of --name, --bucket, "
             "--source-table, --query-mode, --query, --description, "
             "--sync-schedule, --source-type, --server-only, --policy, "
-            "--policy-note, --policy-mapping.",
+            "--policy-note, --policy-mapping, --connection-id.",
             err=True,
         )
         raise typer.Exit(2)

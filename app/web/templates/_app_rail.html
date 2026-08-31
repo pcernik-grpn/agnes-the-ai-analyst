@@ -79,9 +79,17 @@
    on /library watched it collapse the moment they opened a builder — a chrome
    change nobody asked for, mid-task. They keep the app rail, like /skills and
    /agents which do exactly the same job from a non-admin path. #}
-{% set _builder_page = _path.endswith('/new') and (
+{# Two shapes, because the builders do not share a URL shape: the source and
+   package builders are the `/new` form of a collection route, while the apps
+   builder IS its route (/admin/linked-apps — `/admin/linked-apps/new` only
+   302s onto it). Keying the whole test on `/new` silently left the third
+   builder out, so opening it from the Library collapsed the rail and moved
+   the caller onto the admin-scoped remembered width — the exact chrome change
+   this exemption exists to prevent. #}
+{% set _builder_page = (_path.endswith('/new') and (
      _path.startswith('/admin/mcp-sources')
-     or _path.startswith('/admin/data-packages')) %}
+     or _path.startswith('/admin/data-packages'))
+   ) or _path.startswith('/admin/linked-apps') %}
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
 <nav class="rail{% if _admin_page %} rail-icon-mode{% endif %}" aria-label="Primary"
      data-rail-context="{{ 'admin' if _admin_page else 'app' }}">
@@ -121,7 +129,33 @@
        derivation. #}
     <div class="rail-logo-row">
         <a class="rail-logo" href="{{ home_route or '/dashboard' }}" aria-label="Home">
-            {% if config.LOGO_SVG %}{{ config.LOGO_SVG | safe }}{% else %}
+            {# A custom lockup is ONE element, and the collapsed strip is 40px
+               wide — so the wordmark used to be clipped mid-glyph there (#1898
+               item 5: half of a tenant's wordmark, reading as a rendering bug).
+               The built-in brand never had the problem because it is already two
+               elements: an orb that fits the strip plus a `.rail-logo-txt` span
+               the collapse hides.
+
+               A custom lockup now gets the same two-part treatment. The lockup
+               itself rides `.rail-logo-full` (hidden in the strip, exactly as
+               the wordmark span is), and `.rail-logo-mark` is what the strip
+               shows in its place: the operator's own monogram
+               (`instance.logo_mark_svg`) if they have one, otherwise the brand's
+               initial — a derived mark is not as good as a drawn one, but it is
+               a whole character rather than a cropped word.
+
+               Both are always in the DOM and rail.css cross-fades them, so the
+               swap costs no layout: the mark is absolutely positioned in the
+               logo's own box, which is why nothing here moves when the rail
+               opens (see the `.rail-logo-mark` block in rail.css). #}
+            {% if config.LOGO_SVG %}
+            <span class="rail-logo-full">{{ config.LOGO_SVG | safe }}</span>
+            <span class="rail-logo-mark" aria-hidden="true">
+                {%- if config.LOGO_MARK_SVG %}{{ config.LOGO_MARK_SVG | safe }}
+                {%- else %}<span class="rail-logo-mono">{{ (instance_brand or config.INSTANCE_NAME or 'Agnes') | trim | first | upper }}</span>
+                {%- endif %}
+            </span>
+            {% else %}
             {{ agnes_orb.orb(css_class='rail-orb', size=30) }}
             <span class="rail-logo-txt">{{ instance_brand or config.INSTANCE_NAME or 'Agnes' }}</span>
             {% endif %}
@@ -164,11 +198,12 @@
     <div class="rail-collapsible" id="rail-collapsible">
 
     {% set _home = home_route or '/dashboard' %}
-    {# /catalog/semantics counts as Library here: under the rail the Library's
-       Definitions block is the only way in, and the page carries no rail entry
-       of its own — leaving it unhighlighted made the whole chrome read as
-       "nowhere", which is the same strand this rail already avoids for the
-       surfaces it retired. #}
+    {# The semantic layer counts as Library here: under the rail the Library's
+       Semantic models section is the only way in, and those pages carry no
+       rail entry of their own — leaving them unhighlighted made the whole
+       chrome read as "nowhere", which is the same strand this rail already
+       avoids for the surfaces it retired. `/catalog/semantics` is kept in the
+       list for the 308's brief hop; `/semantic-layer` is where it lands. #}
     {# Every entity detail page the Library links out to also counts: without
        these the rail highlighted NOTHING on /catalog/p/*, /memory/d/*,
        /apps/detail/* and /marketplace/* — the most-visited detail surfaces
@@ -176,6 +211,7 @@
        reached from the Library and return to it. #}
     {% set _on_library = _path.startswith('/library') or _path == '/artefacts'
                          or _path.startswith('/catalog')
+                         or _path.startswith('/semantic-layer')
                          or _path.startswith('/memory/d')
                          or _path.startswith('/apps/detail')
                          or _path.startswith('/marketplace') %}
@@ -291,42 +327,44 @@
            set. Not a second plus (New chat owns that) and not two bubbles,
            which reads as "several people" rather than "your own history".
 
-           On an ADMIN page the modifier is withheld, so the row simply stays:
-           the conversation region is not rendered there at all, so folding this
-           away on peek would leave an admin with no path to /chats — the bug
-           that put a destination row here in the first place.
+           This holds on an ADMIN page too, now that the conversation region
+           renders there as well: the row stands in the 56px strip an admin page
+           starts in, and hands off to the real lists the moment that strip is
+           peeked or pinned open. The modifier used to be withheld there —
+           correctly, while the lists were absent, because folding the row away
+           on peek would have left an admin with no path to /chats at all.
 
            `.on` on /chats and nowhere else: /chat's pre-conversation state
            belongs to New chat above, and an open conversation is marked in the
            list below. #}
-        <a class="rail-i{% if not _admin_page %} rail-i--collapsed-only{% endif %} {% if _path.startswith('/chats') %}on{% endif %}"
+        <a class="rail-i rail-i--collapsed-only {% if _path.startswith('/chats') %}on{% endif %}"
            id="nav-chats" href="/chats">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 12a8 8 0 0 1-11.6 7.1L4 20l.9-4.4A8 8 0 1 1 20 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
             <span class="rail-i-label">Chats</span>
         </a>
     </div>
 
-    {# NOT rendered on an admin page — the one place in this partial where the
-       item set differs by context, and the difference is deliberate.
+    {# Rendered on EVERY rail page, admin included (#1898 item 6). It used to be
+       withheld from /admin, and that is what made one region read as two
+       different sidebars: Library and Agents showed the conversation list, and
+       navigating to Admin replaced it with a single icon row.
 
-       This region is pure text: two section labels and a list of conversation
-       titles, with no icon form. So it cannot survive the collapse the rail
-       performs by default on /admin, and every attempt to make it survive has
-       been a worse trade. It was omitted from admin pages once already, on the
-       rule that icon mode's item set must be identical collapsed and
-       hover-expanded (a block that materializes on hover shifts every row below
-       it), then restored so that hover-expanding the rail on an admin page could
-       reach back into your work — which is the gesture's whole purpose, and
-       which it could not serve while collapsed anyway. The Chats row above
-       serves it in one click, from either width, and it does so on the page
-       where a caller with no conversations yet is not offered an empty list.
+       The region is pure text — two lists of conversation titles — so it has no
+       icon form and cannot be drawn in the 56px strip an admin page starts
+       collapsed in. That is what the Chats row above is for, and it is the whole
+       answer at that width. The thing the omission also cost, and the reason it
+       is gone: peeking the rail open on an admin page then revealed a void where
+       the lists belong, so the one gesture for reaching back into your work
+       reached nothing. Peeked or pinned open, an admin page is now the standard
+       rail, conversations included.
 
-       The invariant that actually matters is per PAGE: on any single page,
-       collapsed and expanded hold the same set of destinations. Two pages
-       differing is a full repaint nobody perceives as a shift. So: app pages get
-       the lists, admin pages get the Chats row that leads to them, and neither
-       page has content that vanishes when the rail narrows. #}
-    {% if not _admin_page %}
+       Nothing shifts as a result. `.rail-history` is hidden by `visibility`
+       while collapsed (rail.css), not by `display`, so the region holds its box
+       at both widths and the bottom zone — Library, Agents, Admin, the setup
+       card, the profile — sits exactly where it sat before the pointer arrived.
+       The per-PAGE invariant it was written to protect therefore still holds,
+       and now it holds by the same mechanism on every page rather than by an
+       exception on one. #}
     {# Conversations — the caller's chats in TWO sections, Pinned above Recent,
        with the door to the rest at their foot. The rail is a WORKING SET, not
        the whole history: what you have pinned, the handful you touched most
@@ -464,7 +502,6 @@
             <a class="rail-history-all" href="/chats">View all chats</a>
         </div>
     </section>
-    {% endif %}{# /not _admin_page — the conversation lists #}
     {% endif %}{# /can_chat — end of zone 1 #}
 
     {# ── Zone 2 (bottom): browse destinations, then Admin behind a divider ──
@@ -660,6 +697,33 @@
     {% set _setup_chain = admin_setup_rail() if session.user.is_admin and dev_preview != 'member' else None %}
     {% if _setup_chain and not _setup_chain.complete %}
     {% set _pct = (_setup_chain.done / _setup_chain.total * 94.248) if _setup_chain.total else 0 %}
+    {# Skipped-state suppression, BEFORE the card paints ──────────────────
+       The analyst card retires itself by landing its steps, so the server
+       already knows to stop rendering it. This chain cannot work that way:
+       its six steps are readings of INSTANCE state (is a source connected,
+       is every table in a package…), so "skip" cannot mean "mark them done"
+       — that would be a checklist lying about the instance — and there is
+       no per-user preference table to write a dismissal into either (the
+       journey repo is a fixed column per analyst milestone, and the DuckDB
+       app-state ladder is frozen, so a seventh column is not available).
+
+       So the dismissal is a per-BROWSER preference in localStorage, the
+       same shelf the rail's other soft UI state uses (collapse, the nudge
+       dismissal in chat_onboarding.js). It costs nothing on the server and
+       nothing is lost if it is cleared — the chain simply comes back, which
+       is the honest failure direction for "you hid a setup checklist".
+
+       Synchronous and inline, immediately before the card, on purpose: a
+       `defer`red script would hide the card only AFTER first paint, so
+       every page load would flash the thing the admin has already
+       dismissed. rail.css hides `.rail-setupchain` off this attribute. #}
+    <script>
+      try {
+        if (localStorage.getItem("agnes.setupchain.skipped") === "1") {
+          document.documentElement.setAttribute("data-setupchain-skipped", "1");
+        }
+      } catch (e) { /* private mode — render the chain, which is the default */ }
+    </script>
     <div class="rail-getstarted rail-setupchain" id="railSetupChain">
         <button type="button" class="rail-i rail-getstarted-btn"
                 id="rail-setupchain-toggle"
@@ -683,6 +747,28 @@
         </button>
         <div class="rail-getstarted-panel" id="rail-setupchain-panel"
              role="region" aria-label="Set up {{ instance_brand_short or 'Agnes' }}">
+          {# The collapse chevron, top right, matching the analyst panel's ──────
+             The panel closed four ways already — a second click on the launcher,
+             click-away, Escape, mouse-leave — and advertised none of them, so
+             the card read as something that opens and then stays. The chevron
+             is the affordance for "this can be put away".
+
+             A head row of its own rather than a head with a title in it: the
+             launcher directly above already says "Continue setup — 3 of 6 steps
+             complete", and repeating that inside the panel it opened would be
+             the same sentence twice, 4px apart. The analyst panel has a title
+             because chat_onboarding.js builds it for two mount contexts, only
+             one of which has a launcher to read it off.
+
+             `.cloud-chat-journey-iconbtn` is the analyst panel's own icon
+             button, so the two chevrons are one object — and rail.css's comment
+             on its touch-target cap already anticipated "whatever lands beside
+             it next", which is that panel's chevron. No handler here:
+             rail_popover.js listens for the attribute on the document. #}
+          <div class="rail-setupchain-head">
+            <button type="button" class="cloud-chat-journey-iconbtn" data-rail-popover-collapse
+                    title="Collapse" aria-label="Collapse setup checklist">&#8964;</button>
+          </div>
           <ul class="rail-setupchain-list">
             {% for st in _setup_chain.steps %}
             {# A step whose own check RAISED is neither done nor safe to call
@@ -698,6 +784,27 @@
             </li>
             {% endfor %}
           </ul>
+          {# The quiet way out, in the same slot and the same class the analyst
+             card's "Skip onboarding" uses (`.cloud-chat-journey-finish`, styled
+             for the rail in rail.css) — reusing the component rather than
+             copying its ruleset is what keeps the two cards' footers identical
+             as either one changes.
+
+             "Skip setup", matching the analyst card's "Skip onboarding",
+             because it is the same outcome and the same gesture: the card goes
+             away for good, recoverable only from the profile menu. It read
+             "Hide this checklist" first, on the argument that nothing is truly
+             skipped — the work the chain names still has to happen — but that
+             reasoning describes the INSTANCE, and the button acts on the CARD.
+             To a reader, "hide" promises the collapse that the chevron above
+             now actually provides, so the two words have to be different
+             things: chevron collapses, this skips.
+
+             `data-setupchain-skip` is the JS seam; with rail_setupchain.js
+             absent this is inert rather than broken, the same contract the
+             profile menu's restart entry keeps. #}
+          <button type="button" class="cloud-chat-journey-finish"
+                  data-setupchain-skip>Skip setup</button>
         </div>
     </div>
     {% endif %}
@@ -736,12 +843,31 @@
        /api/chat/journey resolves, so without the resolved brand reaching the
        script a rebranded instance would show its own name for one frame and
        then have "Agnes" written over it. See `brandShort()` there. #}
-    {# The analyst row. `admin_setup` (defined only on /chat, only for an
-       admin) still stands it down there; on every other page the chain row
-       above has already taken the slot, so this renders for a member always,
-       and for an admin once their chain is done. #}
-    {% if not (admin_setup and not admin_setup.complete) and not (_setup_chain and not _setup_chain.complete) %}
+    {# The analyst row. For a member it is simply the row.
+       For an admin whose chain is unfinished it is the OTHER card in a
+       one-card slot, and which of the two shows is the admin's choice ──────
+       The slot has always held exactly one journey, and rightly: two progress
+       rings with different numerators, side by side, is the bug this
+       switching was introduced to fix. But "one card" was implemented as
+       "the other card is not rendered at all", which quietly made the profile
+       menu's "Start over onboarding" a dead control for exactly the callers
+       who had a chain — it reset the journey server-side and there was no card
+       in the document for the result to appear in.
+
+       So both cards now render for such an admin and the stored dismissal
+       decides which is VISIBLE: chain by default, this row once they have
+       hidden the chain. `data-chain-alternate` is what marks this row as the
+       standby one (rail.css hides it until the flag is set); without the
+       attribute — a member, or an admin whose chain is done — the row is the
+       slot's only occupant and nothing hides it.
+
+       `admin_setup` (defined only on /chat, only for an admin) is still
+       honoured for the same reason it was added, and it resolves to the same
+       standby treatment rather than to absence. #}
+    {% set _chain_alternate = (_setup_chain and not _setup_chain.complete)
+                              or (admin_setup and not admin_setup.complete) %}
     <div class="rail-getstarted" id="railGetStarted"
+         {% if _chain_alternate %}data-chain-alternate{% endif %}
          data-brand-short="{{ instance_brand_short or 'Agnes' }}">
         <button type="button" class="rail-i rail-getstarted-btn"
                 id="rail-getstarted-toggle"
@@ -788,7 +914,6 @@
             <div id="chat-journey" class="cloud-chat-journey" hidden></div>
         </div>
     </div>
-    {% endif %}{# admin-setup-pending gate #}
     {% endif %}
 
         {# User row + pop-up menu — same ids/classes as the header's user
@@ -892,9 +1017,31 @@
                 <div class="app-user-menu-sep" role="separator"></div>
                 <a class="app-user-menu-item {% if _path == '/how-it-works' %}is-active{% endif %}"
                    role="menuitem" href="/how-it-works">How {{ instance_brand_short }} works</a>
-                {% if can_chat %}
+                {# `not _admin_page` as well as `can_chat`, matching the card
+                   this re-arms: the analyst row is deliberately absent on admin
+                   pages ("no amount of styling makes a half-finished analyst
+                   checklist relevant there") and chat_onboarding.js, which owns
+                   the click, is not loaded there either. So on /admin the entry
+                   was a menu item that reset journey state and showed nothing —
+                   the same dead control the switch above fixes everywhere else,
+                   and here the honest fix is not to offer it. It returns on any
+                   app page. #}
+                {% if can_chat and not _admin_page %}
                 <button type="button" class="app-user-menu-item app-user-menu-btn"
                         role="menuitem" id="rail-restart-onboarding">Start over onboarding</button>
+                {% endif %}
+                {# The admin chain's way back, for the same reason its neighbour
+                   above exists: the card's own "Skip setup" button goes with the
+                   card, so once hidden the menu is the only route to it.
+
+                   Rendered under the SAME gate as the card (an admin whose chain
+                   is unfinished) and hidden by rail.css until the dismissal is
+                   actually stored — an entry offering to bring back a checklist
+                   that is already on screen names no action. rail_setupchain.js
+                   owns the attribute both states read. #}
+                {% if _setup_chain and not _setup_chain.complete %}
+                <button type="button" class="app-user-menu-item app-user-menu-btn rail-restart-setupchain"
+                        role="menuitem" id="rail-restart-setupchain">Show setup checklist</button>
                 {% endif %}
 
                 <div class="app-user-menu-sep" role="separator"></div>
@@ -919,21 +1066,29 @@
 <script src="{{ static_url('js/rail_toggle.js') }}" defer></script>
 {# Fills the Pinned + Chats lists on every page EXCEPT /chat (where chat.js owns
    the rows), and owns the two sections' collapse state + counts on ALL rail
-   pages, /chat included — AND the onboarding card's popover open/click/Escape
-   wiring (see the "Onboarding card popover" block in rail_history.js), which
-   still applies on an admin page even though the conversation list itself
-   does not render there. Self-guards on body.chat-page-body, so loading it
-   globally is safe. Only needed when the caller can chat. #}
+   pages, /chat and /admin included — AND the onboarding card's popover
+   open/click/Escape wiring (see the "Onboarding card popover" block in
+   rail_history.js). Self-guards on body.chat-page-body, so loading it globally
+   is safe. Only needed when the caller can chat. #}
 {# window.chatRowMenu — the shared "⋮" row menu (Pin/Unpin · Rename · Delete)
    both history renderers use. Must be defined before a row is BUILT, not before
    this file's scripts parse: rows are built after an async sessions fetch, so
    `defer` is enough regardless of tag order. Self-guards against the duplicate
-   load on a rail /chat page (chat.html loads it too). Skipped on an admin
-   page — there are no conversation rows there for it to menu. #}
+   load on a rail /chat page (chat.html loads it too). Loaded on an admin page
+   too, now that the conversation region renders there: those are the standard
+   rail's rows, so they get the standard rail's per-row menu rather than a
+   degraded copy. #}
+{# The rail's two launcher cards — the analyst onboarding card and the admin
+   setup chain — share one popover behaviour (click to pin, outside-click and
+   Escape to close, hover suppression while deliberately closed). It used to be
+   inline in rail_history.js, bound by id to the analyst card, which is how the
+   chain came to be previewable on hover and never openable or collapsible.
+   Loaded before BOTH consumers; all three are `defer`red, so they run in
+   document order. Unconditional, because either card can render without the
+   other: the chain shows for an admin whose setup is unfinished even when
+   `can_chat` is false and rail_history.js never loads. #}
+<script src="{{ static_url('js/rail_popover.js') }}" defer></script>
 {% if can_chat %}
-{# Loaded on admin pages too, now that the conversation region renders there:
-   the rows are the standard rail's rows, so they get the standard rail's
-   per-row "⋮" menu rather than a degraded copy. #}
 <script src="{{ static_url('js/components/chat_row_menu.js') }}" defer></script>
 <script src="{{ static_url('js/rail_history.js') }}" defer></script>
 {% endif %}
@@ -951,5 +1106,14 @@
       .catch(() => { /* onboarding is soft state — never block the page */ });
   }
 </script>
+{% endif %}
+{# Skip / restore for the admin setup chain. Gated on the CHAIN, not on
+   `can_chat` or `not _admin_page` like the module above: the chain is the one
+   card that renders on admin pages, and its two controls (the panel's own
+   button and the profile menu's entry) are exactly where an admin is when they
+   want them. Same gate as the card, so the pair never loads without its
+   markup. #}
+{% if _setup_chain and not _setup_chain.complete %}
+<script src="{{ static_url('js/rail_setupchain.js') }}" defer></script>
 {% endif %}
 {% endif %}

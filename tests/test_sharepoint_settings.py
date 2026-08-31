@@ -233,3 +233,106 @@ def test_vault_set_date_lookup_failure_degrades_to_none(monkeypatch):
 
     assert settings.credential_source == "vault"
     assert settings.credential_set_at is None
+
+
+class TestBase64EnvTransport:
+    """A multiline PEM cannot ride /opt/agnes/.env as-is, so the infra
+    module's `runtime_secret_env_multiline` delivers it base64-encoded in a
+    single line; the env path decodes it. PEM always contains `-----BEGIN`,
+    base64 text never does (no hyphen in its alphabet), so the decode cannot
+    misfire on a raw PEM."""
+
+    def test_base64_encoded_env_value_is_decoded(self, no_vault, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(PEM_FROM_ENV.encode()).decode()
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, encoded)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == PEM_FROM_ENV
+
+    def test_raw_pem_env_value_stays_verbatim(self, no_vault, monkeypatch):
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, PEM_FROM_ENV)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == PEM_FROM_ENV
+
+    def test_non_pem_non_base64_value_is_left_alone(self, no_vault, monkeypatch):
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, "not base64!! and not pem")
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == "not base64!! and not pem"
+
+    def test_base64_of_non_pem_text_is_not_decoded(self, no_vault, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(b"just some opaque token").decode()
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, encoded)
+        settings = resolve_sharepoint_settings(_row(cert_private_key_env=SHAREPOINT_CERT_PRIVATE_KEY_ENV))
+        assert settings.private_key == encoded
+
+    def test_vault_value_is_never_decoded(self, monkeypatch):
+        import base64
+
+        encoded = base64.b64encode(PEM_FROM_VAULT.encode()).decode()
+        monkeypatch.setattr(
+            "connectors.sharepoint.settings._vault_secret", lambda connection_id: encoded, raising=False
+        )
+        settings = resolve_sharepoint_settings(_row())
+        assert settings.private_key == encoded
+
+
+class TestClientSecretAuth:
+    """`config.auth_method = "client_secret"` — Entra's plain client-secret
+    client-credentials flow as an alternative to the certificate. The secret
+    rides the same two transports as the certificate: the connection's vault
+    slot first, then a named env var (default SHAREPOINT_CLIENT_SECRET,
+    override via `config.client_secret_env`, allowlist-gated)."""
+
+    def _row(self, **config_overrides):
+        return _row(auth_method="client_secret", **config_overrides)
+
+    def test_vault_value_becomes_the_client_secret(self, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.sharepoint.settings._vault_secret", lambda connection_id: "app-secret-123", raising=False
+        )
+        settings = resolve_sharepoint_settings(self._row())
+        assert settings.auth_method == "client_secret"
+        assert settings.client_secret == "app-secret-123"
+        assert settings.private_key == ""
+        assert settings.credential_source == "vault"
+
+    def test_env_fallback_uses_the_default_name(self, no_vault, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CLIENT_SECRET", "env-secret-456")
+        settings = resolve_sharepoint_settings(self._row())
+        assert settings.client_secret == "env-secret-456"
+        assert settings.credential_source == "env"
+        assert settings.credential_env == "SHAREPOINT_CLIENT_SECRET"
+
+    def test_env_fallback_honors_a_custom_allowlisted_name(self, no_vault, monkeypatch):
+        monkeypatch.setenv("AGNES_CONFIG_SECRET_ENVS", "MY_SP_SECRET")
+        monkeypatch.setenv("MY_SP_SECRET", "custom-secret")
+        settings = resolve_sharepoint_settings(self._row(client_secret_env="MY_SP_SECRET"))
+        assert settings.client_secret == "custom-secret"
+        assert settings.credential_env == "MY_SP_SECRET"
+
+    def test_an_unrelated_env_name_is_refused_not_read(self, no_vault, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-never")
+        with pytest.raises(SharePointSettingsError):
+            resolve_sharepoint_settings(self._row(client_secret_env="ANTHROPIC_API_KEY"))
+
+    def test_secret_is_never_base64_pem_decoded(self, no_vault, monkeypatch):
+        import base64 as _b64
+
+        opaque = _b64.b64encode(b"random secret bytes").decode()
+        monkeypatch.setenv("SHAREPOINT_CLIENT_SECRET", opaque)
+        settings = resolve_sharepoint_settings(self._row())
+        assert settings.client_secret == opaque
+
+    def test_certificate_stays_the_default_method(self, no_vault, monkeypatch):
+        monkeypatch.setenv(SHAREPOINT_CERT_PRIVATE_KEY_ENV, PEM_FROM_ENV)
+        settings = resolve_sharepoint_settings(_row())
+        assert settings.auth_method == "certificate"
+        assert settings.client_secret == ""
+
+    def test_unknown_auth_method_is_a_typed_error(self, no_vault):
+        with pytest.raises(SharePointSettingsError) as excinfo:
+            resolve_sharepoint_settings(_row(auth_method="managed_identity"))
+        assert "auth_method" in str(excinfo.value)

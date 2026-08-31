@@ -183,3 +183,116 @@ def test_corpus_ids_are_deduplicated_and_sorted_on_write(pg_engine, monkeypatch)
     run_id = _create(repo, corpus_ids=["col_b", "col_a", "col_b"])
     row = repo.get(run_id)
     assert row["corpus_ids"] == ["col_a", "col_b"]
+
+
+# ---------------------------------------------------------------------------
+# llm_usage — cost-visibility tally (unlike `anonymization`, genuinely
+# NULLABLE: a run that never reported usage stays `None`, never `{}`).
+# ---------------------------------------------------------------------------
+
+
+def test_llm_usage_defaults_to_null_not_empty_dict(pg_engine, monkeypatch):
+    """A producer build that doesn't send `llm_usage` at all — the stored
+    column must round-trip as `None`, distinguishing "no figure available"
+    from "reported zero usage"."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo)
+    row = repo.get(run_id)
+    assert row["llm_usage"] is None
+
+
+def test_llm_usage_round_trips(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    usage = {
+        "input_tokens": 1200,
+        "output_tokens": 340,
+        "cache_read_input_tokens": 900,
+        "cache_creation_input_tokens": 50,
+        "models": ["claude-sonnet-4"],
+        "documents": 3,
+        "wall_seconds": 12.5,
+    }
+    run_id = _create(repo, llm_usage=usage)
+    row = repo.get(run_id)
+    assert row["llm_usage"] == usage
+
+    listed = repo.list_recent(limit=10)
+    assert listed[0]["llm_usage"] == usage
+
+
+def test_llm_usage_rollup_is_empty_when_no_runs_report_usage(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(repo)
+    rollup = repo.llm_usage_rollup()
+    assert rollup["runs_with_usage"] == 0
+    assert rollup["input_tokens"] == 0
+    assert rollup["estimated_cost_usd"] is None
+    assert rollup["priced_runs"] == 0
+    assert rollup["models"] == []
+
+
+def test_llm_usage_rollup_sums_across_multiple_runs(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(
+        repo,
+        llm_usage={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 100,
+            "cache_creation_input_tokens": 10,
+            "models": ["claude-sonnet-4"],
+            "documents": 2,
+            "wall_seconds": 5.0,
+        },
+    )
+    _create(
+        repo,
+        llm_usage={
+            "input_tokens": 2000,
+            "output_tokens": 300,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 0,
+            "models": ["claude-sonnet-4"],
+            "documents": 4,
+            "wall_seconds": 7.5,
+        },
+    )
+    # A run with no usage reported at all must not perturb the rollup.
+    _create(repo)
+
+    rollup = repo.llm_usage_rollup()
+    assert rollup["runs_with_usage"] == 2
+    assert rollup["input_tokens"] == 3000
+    assert rollup["output_tokens"] == 500
+    assert rollup["cache_read_input_tokens"] == 150
+    assert rollup["cache_creation_input_tokens"] == 10
+    assert rollup["documents"] == 6
+    assert rollup["wall_seconds"] == 12.5
+    assert rollup["models"] == ["claude-sonnet-4"]
+    # Both runs name exactly one known model, so both are priced.
+    assert rollup["priced_runs"] == 2
+    assert rollup["estimated_cost_usd"] is not None
+    assert rollup["estimated_cost_usd"] > 0
+
+
+def test_llm_usage_rollup_leaves_unpriceable_runs_out_of_the_cost_estimate():
+    from src.repositories.facts_ingest_runs_pg import _price_run_usd
+
+    # No model named at all — cannot honestly attribute a rate.
+    assert _price_run_usd({"input_tokens": 100}) is None
+    # More than one model — no per-model breakdown to split tokens by.
+    assert _price_run_usd({"input_tokens": 100, "models": ["claude-sonnet-4", "gpt-4o"]}) is None
+    # A model absent from the rate card.
+    assert _price_run_usd({"input_tokens": 100, "models": ["some-unknown-model-9000"]}) is None
+
+
+def test_llm_usage_rollup_mixed_priced_and_unpriced_runs_reports_partial_coverage(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(repo, llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["claude-sonnet-4"]})
+    _create(repo, llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["some-unknown-model-9000"]})
+
+    rollup = repo.llm_usage_rollup()
+    assert rollup["runs_with_usage"] == 2
+    assert rollup["priced_runs"] == 1
+    assert rollup["estimated_cost_usd"] is not None
+    assert sorted(rollup["models"]) == ["claude-sonnet-4", "some-unknown-model-9000"]

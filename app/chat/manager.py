@@ -33,6 +33,7 @@ from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
 from app.coordination.factory import coordination
 from app.coordination.leases import default_holder_id
+from src.llm_pricing import cost_usd
 from src.repositories import agents_repo, llm_usage_repo, ticket_repo, usage_repo, users_repo
 
 logger = logging.getLogger(__name__)
@@ -82,9 +83,11 @@ def get_current_chat_loop() -> Optional[asyncio.AbstractEventLoop]:
     return _current_loop
 
 
-# Sonnet pricing constants (USD per million tokens)
-_PRICE_IN_PER_MTOK = 3.0
-_PRICE_OUT_PER_MTOK = 15.0
+# Pricing lives in src/llm_pricing.py — model-aware and cache-aware. It
+# replaced two constants hardcoded to Sonnet 4.6's $3/$15, which mispriced
+# every other model this instance can be pinned to (a `claude-sonnet-5`
+# instance over-estimated spend by 50%, an Opus one under-estimated it by
+# ~3x) and had no rate at all for cached tokens.
 
 # Coordination-backend TTLs for the shared rate-limit/quota counters
 # (wave-2C task 4 — see _msg_window_key / _daily_token_keys). Both simply
@@ -598,7 +601,13 @@ class ChatManager:
         """
         return daily_token_totals(self._repo, user_email)
 
-    def _record_daily_tokens(self, user_email: str, tokens_in: Optional[int], tokens_out: Optional[int]) -> None:
+    def _record_daily_tokens(
+        self,
+        user_email: str,
+        tokens_in: Optional[int],
+        tokens_out: Optional[int],
+        cache_creation_tokens: Optional[int] = None,
+    ) -> None:
         """Add one completed turn's token delta to `user_email`'s running
         daily counters (see ``_daily_token_totals``).
 
@@ -610,7 +619,13 @@ class ChatManager:
         place; co-session per-sender attribution for the ASSISTANT's own
         token spend was never implemented pre-this-task either).
         """
-        tin = tokens_in or 0
+        # A cache WRITE is real input the model was billed ~1.25x for, so it
+        # belongs in the in-total; a cache READ does not (heavily discounted,
+        # excluded from every budget surface — see llm_pricing.budget_tokens).
+        # `daily_anthropic_tokens`, which re-seeds this counter after a
+        # restart, folds the same term in: the two definitions must match or
+        # a re-seed would move the user's remaining budget.
+        tin = (tokens_in or 0) + (cache_creation_tokens or 0)
         tout = tokens_out or 0
         if not tin and not tout:
             return
@@ -1077,7 +1092,7 @@ class ChatManager:
             dynamic_prof = None
             if agent_row:
                 try:
-                    dynamic_prof = agent_profile.build_profile(agent_row)
+                    dynamic_prof = agent_profile.build_profile(agent_row, user_email=session.user_email)
                 except Exception:
                     logger.exception(
                         "agent profile build failed for agent_id=%s — falling back to static/default profile",
@@ -2329,11 +2344,18 @@ class ChatManager:
                     parts=frame.get("parts"),
                     tokens_in=frame.get("tokens_in"),
                     tokens_out=frame.get("tokens_out"),
+                    cache_read_tokens=frame.get("cache_read_tokens"),
+                    cache_creation_tokens=frame.get("cache_creation_tokens"),
                     model=frame.get("model"),
                 )
                 # Feed the turn's token delta into the shared daily-spend
                 # counters _daily_token_totals checks in send_user_message.
-                self._record_daily_tokens(live.user_email, frame.get("tokens_in"), frame.get("tokens_out"))
+                self._record_daily_tokens(
+                    live.user_email,
+                    frame.get("tokens_in"),
+                    frame.get("tokens_out"),
+                    frame.get("cache_creation_tokens"),
+                )
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
                 # Auto-title: the first assistant_message in a session
@@ -4502,7 +4524,25 @@ async def enforce_sender_limits(
     """
     # Enforce daily Anthropic spend cap — see daily_token_totals.
     tokens_in, tokens_out = daily_token_totals(repo, sender)
-    spent_usd = tokens_in * _PRICE_IN_PER_MTOK / 1_000_000 + tokens_out * _PRICE_OUT_PER_MTOK / 1_000_000
+    # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
+    # expensive general-purpose tier. Deliberate: the day's spend arrives here
+    # as a two-bucket token counter with no model attached (a session's model
+    # is whatever the sandbox's CLI resolved, recorded per message, and one
+    # day can mix several), so a cap that must guess guesses in the direction
+    # that stops sooner. It previously guessed Sonnet 4.6's $3/$15 and let an
+    # Opus-running instance spend ~3x its configured cap. Exact, per-model
+    # cost is the measured readout's job (`cost_breakdown` + this module),
+    # not this guardrail's.
+    #
+    # `tokens_in` already carries the day's cache-write tokens (see
+    # ChatManager._record_daily_tokens), priced here at the plain input rate
+    # rather than 1.25x: the counter keeps one in-bucket, so the small
+    # under-price is stated rather than hidden.
+    spent_usd = cost_usd(
+        model=None,
+        input_tokens=tokens_in,
+        output_tokens=tokens_out,
+    )
     if spent_usd >= config.daily_anthropic_spend_usd:
         if on_limit is not None:
             await on_limit(

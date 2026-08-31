@@ -27,6 +27,13 @@ from pathlib import Path
 RAIL_CSS = Path("app/web/static/css/rail.css")
 CHAT_CSS = Path("app/web/static/css/chat.css")
 RAIL_HISTORY_JS = Path("app/web/static/js/rail_history.js")
+# The popover's open/close behaviour used to live inline in rail_history.js,
+# bound by id to the analyst onboarding card. It moved here when the admin setup
+# chain — the rail's SECOND `.rail-getstarted` card, with its own ids — turned
+# out to be getting none of it: previewable on hover, never openable, pinned or
+# collapsible. Defect 1 below is unchanged and still guarded; only the file that
+# owns it moved, and both cards now call it.
+RAIL_POPOVER_JS = Path("app/web/static/js/rail_popover.js")
 ONBOARDING_JS = Path("app/web/static/js/chat_onboarding.js")
 RAIL_TEMPLATE = Path("app/web/templates/_app_rail.html")
 
@@ -37,6 +44,10 @@ def _rail_css() -> str:
 
 def _chat_css() -> str:
     return CHAT_CSS.read_text(encoding="utf-8")
+
+
+def _rail_popover_js() -> str:
+    return RAIL_POPOVER_JS.read_text(encoding="utf-8")
 
 
 def _rail_history_js() -> str:
@@ -79,8 +90,13 @@ def test_close_paths_set_is_closed():
     click, Escape, and the "×" in chat_onboarding.js) must add `.is-closed`,
     not just remove `.is-open` — removing `.is-open` alone is what the hover
     rule silently defeated."""
-    rail_js = _rail_history_js()
-    assert 'gsWrap.classList.toggle("is-closed", !open)' in rail_js
+    popover_js = _rail_popover_js()
+    assert 'wrap.classList.toggle("is-closed", !open)' in popover_js
+    # …and both launcher cards reach that path rather than rolling their own.
+    assert "railPopover.wire" in _rail_history_js()
+    assert "railPopover.wire" in Path("app/web/static/js/rail_setupchain.js").read_text(
+        encoding="utf-8"
+    )
 
     onboarding_js = _onboarding_js()
     assert 'wrap.classList.add("is-closed")' in onboarding_js
@@ -89,8 +105,8 @@ def test_close_paths_set_is_closed():
 def test_mouseleave_lifts_the_close_suppression():
     """`.is-closed` must not permanently disable hover-to-preview — only
     suppress the same hover session that was just explicitly closed."""
-    js = _rail_history_js()
-    assert 'gsWrap.addEventListener("mouseleave"' in js
+    js = _rail_popover_js()
+    assert 'wrap.addEventListener("mouseleave"' in js
     assert 'classList.remove("is-closed")' in js
 
 

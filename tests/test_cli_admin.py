@@ -152,6 +152,66 @@ class TestRegisterTable:
         assert result.exit_code == 0
         assert "Already exists" in result.output
 
+    def test_register_table_connection_id_in_payload(self):
+        """--connection-id lands in the POST payload (used to pin Snowflake
+        and other source-type registrations to a named connection)."""
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["path"] = path
+            captured["json"] = kwargs.get("json")
+            return _resp(201, {"id": "orders", "name": "orders"})
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "register-table",
+                    "orders",
+                    "--source-type",
+                    "snowflake",
+                    "--bucket",
+                    "public",
+                    "--source-table",
+                    "orders",
+                    "--query-mode",
+                    "remote",
+                    "--connection-id",
+                    "conn-sf-1",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["path"] == "/api/admin/register-table"
+        assert captured["json"]["connection_id"] == "conn-sf-1"
+
+    def test_register_table_omits_connection_id_when_not_passed(self):
+        """No regression: omitting --connection-id keeps sending the same
+        payload as before this flag existed."""
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _resp(201, {"id": "orders", "name": "orders"})
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "register-table",
+                    "orders",
+                    "--source-type",
+                    "keboola",
+                    "--bucket",
+                    "in.c-crm",
+                    "--query-mode",
+                    "local",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "connection_id" not in captured["json"]
+
     def test_register_table_failure(self):
         with patch("cli.commands.admin.api_post", return_value=_resp(500, {"detail": "error"})):
             result = runner.invoke(app, ["admin", "register-table", "bad_table"])
@@ -355,6 +415,23 @@ class TestUpdateTable:
             result = runner.invoke(app, ["admin", "update-table", "rev", "--query", f"@{sql_file}"])
         assert result.exit_code == 0, result.output
         assert captured["json"]["source_query"] == "SELECT * FROM orders"
+
+    def test_update_connection_id_in_payload(self):
+        """--connection-id lets an admin fix an existing NULL connection_id
+        row without delete + recreate (acceptance criterion for the
+        Snowflake connection_id fix)."""
+        captured = {}
+
+        def fake_put(path, **kwargs):
+            captured["path"] = path
+            captured["json"] = kwargs.get("json")
+            return _resp(200, {"id": "orders", "updated": ["connection_id"]})
+
+        with patch("cli.commands.admin.api_put", side_effect=fake_put):
+            result = runner.invoke(app, ["admin", "update-table", "orders", "--connection-id", "conn-sf-1"])
+        assert result.exit_code == 0, result.output
+        assert captured["path"] == "/api/admin/registry/orders"
+        assert captured["json"] == {"connection_id": "conn-sf-1"}
 
     def test_update_no_fields_supplied_errors(self):
         result = runner.invoke(app, ["admin", "update-table", "orders"])

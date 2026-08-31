@@ -512,6 +512,7 @@ from app.api.admin_mcp import router as admin_mcp_router
 from app.api.admin_contributed_skills import router as admin_contributed_skills_router
 from app.api.admin_datasource_secrets import router as admin_datasource_secrets_router
 from app.api.admin_sharepoint import router as admin_sharepoint_router
+from app.api.sharepoint_webhooks import router as sharepoint_webhooks_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
@@ -579,7 +580,9 @@ from app.auth.mcp_oauth import make_consent_routes as _make_mcp_consent_routes
 from app.api.cache_warmup import router as cache_warmup_router
 from app.api.bq_metadata_refresh import router as bq_metadata_refresh_router
 from app.api.keboola_semantic_layer_refresh import router as keboola_semantic_layer_refresh_router
-from app.api.databricks_semantic_layer_refresh import router as databricks_semantic_layer_refresh_router
+from app.api.semantic_sources_refresh import router as semantic_sources_refresh_router
+from app.api.semantic_layer_coverage import router as semantic_layer_coverage_router
+from app.api.semantic_feedback import router as semantic_feedback_router
 from app.api.activity import router as activity_router
 from app.api.observability import router as observability_router
 from app.api.admin_user_sessions import router as admin_user_sessions_router
@@ -2949,6 +2952,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sso_router)
     app.include_router(source_connections_admin_router)
     app.include_router(admin_sharepoint_router)
+    app.include_router(sharepoint_webhooks_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)
@@ -3052,8 +3056,22 @@ def create_app() -> FastAPI:
 
     app.include_router(cache_warmup_router)
     app.include_router(bq_metadata_refresh_router)
+    # Keboola semantic-layer COVERAGE (+ the login-triggered background sync
+    # this module still owns). Its scheduled-refresh endpoint is gone —
+    # #1707 Block 3 step 4 moved that trigger onto the generic sweep below.
     app.include_router(keboola_semantic_layer_refresh_router)
-    app.include_router(databricks_semantic_layer_refresh_router)
+    # Cross-source, cross-domain coverage (F4.1). Registered next to — not
+    # instead of — the Keboola-only coverage router above: that one is a
+    # provider inside this one's report.
+    app.include_router(semantic_layer_coverage_router)
+    # Feedback (F4.5) — its own router because its RBAC shape differs: submit
+    # is open to any signed-in caller, only the queue and resolve are admin.
+    app.include_router(semantic_feedback_router)
+    # Block 3 of #1707: the ONE scheduled refresh over registered
+    # `semantic_sources` (git/upload/connection kinds). The Keboola and
+    # Databricks refresh endpoints it replaced are gone; their sources are
+    # auto-migrated onto this sweep (src/semantic/legacy_migration.py).
+    app.include_router(semantic_sources_refresh_router)
     app.include_router(activity_router)
     app.include_router(observability_router)
     app.include_router(admin_user_sessions_router)
@@ -3474,6 +3492,11 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health",
         "/api/health/detailed",
         "/api/version",
+        # Microsoft Graph change-notification receiver — Graph is the only
+        # caller, gated by extraction_webhook.enabled (404 when off), never
+        # a session/PAT (see app/api/sharepoint_webhooks.py). It can never
+        # answer 401/403.
+        "/api/webhooks/sharepoint/{connection_id}",
     }
 )
 

@@ -2167,3 +2167,66 @@ class TestAutoShareAdminUploads:
         # _everyone_grant_exists reads through the repository classes
         # directly, so the factory monkeypatch does not blind this assert.
         assert not self._everyone_grant_exists(body["id"])
+
+
+class TestProducerUploadAccess:
+    """A corpus-extraction producer's own scoped callback credential
+    (`ProducerPrincipal`, `app.auth.producer_token`) may upload into a
+    collection listed in its own `collection_ids` claim — every OTHER
+    collection route (list/delete/reingest/preview/raw) still 403s it,
+    since only `upload_files` uses `require_collection_write_or_producer_
+    access` instead of the plain `require_collection_access`."""
+
+    def _create_collection(self, seeded_app, name: str) -> str:
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"]))
+        assert cr.status_code == 201, cr.text
+        return cr.json()["id"]
+
+    def _producer_token(self, collection_ids) -> str:
+        from app.auth.producer_token import mint_producer_token
+
+        return mint_producer_token(connection_id="conn1", collection_ids=list(collection_ids), ttl_seconds=3600)
+
+    def test_producer_uploads_into_its_own_scoped_collection(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_collection(seeded_app, "Producer Scoped Upload")
+        token = self._producer_token([corpus_id])
+
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("notes.txt", io.BytesIO(b"hello world"), "text/plain")},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+
+    def test_producer_upload_to_undeclared_collection_is_403(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_collection(seeded_app, "Producer Undeclared")
+        # Token scoped to a DIFFERENT collection only.
+        token = self._producer_token(["some-other-collection"])
+
+        resp = c.post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("notes.txt", io.BytesIO(b"hello world"), "text/plain")},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 403
+
+    def test_producer_cannot_list_files_of_its_own_scoped_collection(self, seeded_app):
+        """Scope is upload-only — GET .../files stays on the plain
+        `require_collection_access`, which never accepts a producer."""
+        c = seeded_app["client"]
+        corpus_id = self._create_collection(seeded_app, "Producer Read Denied")
+        token = self._producer_token([corpus_id])
+
+        resp = c.get(f"/api/collections/{corpus_id}/files", headers=_auth(token))
+        assert resp.status_code == 403
+
+    def test_producer_cannot_read_the_collection_itself(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._create_collection(seeded_app, "Producer Detail Denied")
+        token = self._producer_token([corpus_id])
+
+        resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(token))
+        assert resp.status_code == 403

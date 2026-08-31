@@ -27,7 +27,8 @@
   var GROUPS_API = '/api/admin/groups';
 
   var mount = null;
-  var sources = [];          // [{id, name, url, listerToolId}] — only ones that list apps
+  var sources = [];          // [{id, name, url, listerToolId}] — the choosable ones
+  var otherSources = [];     // connected, but exposing no tool that can list apps
   var sourcesErr = null;
   var loading = true;
   var picked = null;         // the chosen source row
@@ -58,9 +59,17 @@
     });
   }
 
-  /* Only sources that actually expose a lister tool. A server with no such
-     tool cannot answer "what apps do you have", and offering it here would be
-     a row whose only outcome is a failure two clicks later. */
+  /* Only a source exposing a lister tool is CHOOSABLE — a server with no such
+     tool cannot answer "what apps do you have", and offering it as a pick would
+     be a row whose only outcome is a failure two clicks later.
+
+     But it is still LISTED. Dropping it from the response entirely made the
+     empty state ambiguous in the one way that matters: "no connected server
+     lists apps" read identically whether nothing was connected at all or five
+     servers were connected and none of them could list, and those want
+     opposite next moves (connect one vs. add a tool to one you have). Keeping
+     both lists lets the section show what is connected and say which half of
+     it is usable. */
   function loadSources() {
     return api(SOURCES_API)
       .then(function (body) {
@@ -71,17 +80,23 @@
               var lister = (full.tools || []).filter(function (t) {
                 return window.LinkedAppsPanel.isLister(t.original_name || t.exposed_name);
               })[0];
-              if (!lister) return null;
               return {
                 id: String(full.id), name: String(full.name || full.id),
                 url: String(full.url || full.command || ''),
-                listerToolId: String(lister.tool_id),
+                listerToolId: lister ? String(lister.tool_id) : '',
               };
             })
+            // A source whose detail call failed is dropped, as before: nothing
+            // can be said about whether it lists apps, so it is neither
+            // choosable nor honestly listable as "cannot".
             .catch(function () { return null; });
         }));
       })
-      .then(function (rows) { sources = rows.filter(Boolean); })
+      .then(function (rows) {
+        var all = rows.filter(Boolean);
+        sources = all.filter(function (s) { return s.listerToolId; });
+        otherSources = all.filter(function (s) { return !s.listerToolId; });
+      })
       .catch(function (e) { sourcesErr = (e && e.message) || 'Could not read the connected servers.'; })
       .then(function () { loading = false; render(); });
   }
@@ -112,7 +127,28 @@
     return panel;
   }
 
+  /* A re-click CLEARS the pick. It was set-only, on a control that is the same
+     `.ag-tglbtn` as the panel's own `✓ On` / `Off` rows two sections down and
+     wears the same `on` state — so it read as a toggle and behaved as a latch,
+     and a caller who chose the wrong server had no way back to "none chosen".
+     Still single-select: choosing a DIFFERENT server switches, as before.
+
+     Clearing resets the panel — `setSource(null, …)` drops the app list, the
+     per-app choices and any error. That is exactly what SWITCHING servers
+     already did silently, and it is the only coherent option: an app list
+     belongs to the server it was read from, so keeping one after the pick is
+     gone would leave a list on screen that nothing accounts for. Re-choosing
+     the server reads it again. Every downstream reader already handles the
+     no-source state — the panel renders its idle prompt, its "Read the app
+     list" button disables, and `publishBlocker()` returns to "Choose a server
+     first." — so nothing else needs a branch for it. */
   function pickSource(id) {
+    if (picked && picked.id === id) {
+      picked = null;
+      thePanel().setSource(null, null);
+      render();
+      return;
+    }
     var row = sources.filter(function (s) { return s.id === id; })[0];
     if (!row) return;
     picked = row;
@@ -122,19 +158,51 @@
 
   /* ── Sections ───────────────────────────────────────────────────────── */
 
+  /* Connecting a server is the one action here that LEAVES the page, so the
+     section says so before the click rather than letting the caller discover
+     it. Both endings are real and neither is a dead end: the source builder
+     carries this same apps panel, so the errand can finish there, or the
+     caller can return and find the new server in the list. */
+  function connectRow() {
+    return '<a class="ag-addrow" href="/admin/mcp-sources/new">+ Connect another server</a>' +
+      '<p class="ag-note">This opens the source builder, so you will leave this page. You can publish ' +
+      'the new server\'s apps there — it carries this same panel — or come back here afterwards and ' +
+      'pick it from the list.</p>';
+  }
+
+  /* Connected servers that cannot list apps, shown rather than hidden: the
+     reader's question is "where is my server?", and the answer is the row plus
+     the reason, not its absence. Inert by construction — no `data-la-src`, so
+     the click handler has nothing to match. */
+  function offRowsHtml() {
+    if (!otherSources.length) return '';
+    return '<div class="ag-rows">' + otherSources.map(function (s) {
+      return '<div class="ag-row ag-row--off">' +
+        '<div class="ag-row-body"><div class="ag-row-name">' + esc(s.name) +
+          '<span class="ag-row-meta">cannot list apps</span></div>' +
+          (s.url ? '<div class="ag-row-desc">' + esc(s.url) + '</div>' : '') + '</div>' +
+        '<button type="button" class="ag-tglbtn" disabled>Choose</button>' +
+      '</div>';
+    }).join('') + '</div>';
+  }
+
   function sourcesBody() {
     if (loading) return '<p class="ag-note">Reading the connected servers…</p>';
     if (sourcesErr) return '<div class="ag-note ag-note--err">' + esc(sourcesErr) + '</div>';
-    var connect = '<a class="ag-addrow" href="/admin/mcp-sources/new">+ Connect another server</a>';
     if (!sources.length) {
-      /* Not a dead end: the thing you need is one click away, and the builder
-         it opens carries this same panel, so the errand finishes there. */
-      return '<div class="ag-slot">' +
-          '<p class="ag-slot-head">No connected server lists apps.</p>' +
-          '<p class="ag-slot-body">Apps are catalogued from a tool server that can list them. Connect one ' +
-          'and its apps can be published from the same page that registers it, or come back here ' +
-          'afterwards.</p>' +
-        '</div>' + connect;
+      /* Two different empty states, because they have two different fixes.
+         Something IS connected → the gap is a lister tool on a server you
+         already have, and the rows below name which ones. Nothing is → the
+         gap is a server. */
+      var slot = otherSources.length
+        ? '<p class="ag-slot-head">None of your connected servers can list apps.</p>' +
+          '<p class="ag-slot-body">A server has to expose a tool that lists apps before its apps can be ' +
+          'catalogued here. These are connected, but none of them do — add a lister tool to one of them, ' +
+          'or connect a server that has one.</p>'
+        : '<p class="ag-slot-head">No server is connected yet.</p>' +
+          '<p class="ag-slot-body">Apps are catalogued from a connected tool server that can list ' +
+          'them.</p>';
+      return '<div class="ag-slot">' + slot + '</div>' + offRowsHtml() + connectRow();
     }
     var rows = sources.map(function (s) {
       var on = picked && picked.id === s.id;
@@ -145,7 +213,106 @@
           (on ? '✓ Chosen' : 'Choose') + '</button>' +
       '</div>';
     }).join('');
-    return '<div class="ag-rows">' + rows + '</div>' + connect;
+    return '<div class="ag-rows">' + rows + '</div>' + offRowsHtml() + connectRow();
+  }
+
+  /* ── The Library preview — the shell's LEFT pane ──────────────────────
+     Both other callers of `BuilderShell.workspace()` put an assistant
+     transcript here (mcp_builder, package_drawer). This page has no assistant
+     and should not grow one: every step is a pick from a short enumerated
+     list, so there is nothing to draft, and an assistant would make the page
+     depend on an LLM credential it does not need. So the pane held three
+     paragraphs of static prose — in a 50%-width column sized for a chat, in
+     `.ag-cfg-blurb`, which is a 12.5px CENTRED CAPTION component. Half an
+     empty screen, set as a caption.
+
+     What earns the space is the one thing the configuration cannot show: what
+     the primary button will DO. These are the rows that will appear in the
+     Library, for the groups granted, updating as apps and groups are toggled.
+
+     Strictly read-only — no `data-*` hook the page's click handler could
+     match. Every control stays in the configuration on the right, so there is
+     exactly one place to change any given thing.
+
+     Names and descriptions come from an external tool server, so they are
+     escaped here like everywhere else that renders them. */
+
+  var APP_GLYPH =
+    '<svg class="la-prev-glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+      '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke="currentColor" stroke-width="1.6"/>' +
+      '<path d="M3.5 9h17" stroke="currentColor" stroke-width="1.6"/>' +
+      '<circle cx="6.6" cy="6.8" r="0.9" fill="currentColor"/></svg>';
+
+  function previewNothing(head, body) {
+    return '<div class="la-prev-body la-prev-body--empty"><div class="la-prev-empty">' +
+        '<svg class="la-prev-empty-glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+          '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke="currentColor" stroke-width="1.6"/>' +
+          '<path d="M3.5 9h17" stroke="currentColor" stroke-width="1.6"/>' +
+          '<circle cx="6.6" cy="6.8" r="0.9" fill="currentColor"/></svg>' +
+        '<p class="la-prev-empty-head">' + esc(head) + '</p>' +
+        '<p class="la-prev-empty-body">' + esc(body) + '</p>' +
+      '</div></div>';
+  }
+
+  /* Who will see them. Rendered inside the preview because "published to
+     nobody" is the outcome most worth seeing before you commit it — the
+     configuration says `nobody` in a summary line, which is easy to read past. */
+  function previewAudience() {
+    if (!chosenGroups.length) {
+      return '<div class="la-prev-lbl"><span>Visible to</span></div>' +
+        '<p class="la-prev-none">Nobody yet — they would be catalogued and invisible. Grant a group ' +
+        'in step 3.</p>';
+    }
+    return '<div class="la-prev-lbl"><span>Visible to</span></div>' +
+      '<div class="la-prev-pills">' + chosenGroups.map(function (g) {
+        return '<span class="ag-instack">' + esc(g.name) + '</span>';
+      }).join('') + '</div>';
+  }
+
+  function previewBody() {
+    if (!picked) {
+      return previewNothing('Nothing to show yet',
+        'Choose a server and read its app list. What you leave on will appear here, exactly as the ' +
+        'groups you grant will find it in their Library.');
+    }
+    var progress = thePanel().state();
+    if (progress.fetching) return previewNothing('Reading…', 'Asking ' + picked.name + ' what apps it has.');
+    if (progress.err) {
+      /* The panel already shows the error, with the retry next to it. Saying it
+         twice in two panes would read as two failures. */
+      return previewNothing('Nothing to show yet',
+        'The app list could not be read — step 2 has the details.');
+    }
+    if (!progress.fetched) {
+      return previewNothing('Not read yet',
+        'Read ' + picked.name + '’s app list in step 2. What you leave on will appear here.');
+    }
+    if (!progress.total) {
+      return previewNothing('That server lists no apps',
+        picked.name + ' answered, but with nothing in it. There is nothing to publish from here.');
+    }
+    var apps = thePanel().chosen();
+    if (!apps.length) {
+      return previewNothing('Every app is switched off',
+        'All ' + progress.total + ' of them. Leave at least one on in step 2 — otherwise publishing ' +
+        'catalogues nothing.');
+    }
+    var rows = apps.map(function (a) {
+      return '<div class="ag-row la-prev-row">' + APP_GLYPH +
+        '<div class="ag-row-body">' +
+          '<div class="ag-row-name">' + esc(a.name) + '<span class="ag-row-meta">Data app</span></div>' +
+          (a.description ? '<div class="ag-row-desc">' + esc(a.description) + '</div>' : '') +
+        '</div>' +
+      '</div>';
+    }).join('');
+    return '<div class="la-prev-body">' +
+        '<div class="la-prev-lbl"><span>Apps</span>' +
+          '<span class="ag-row-meta">' + apps.length + ' of ' + progress.total + ' on</span></div>' +
+        '<div class="ag-rows">' + rows + '</div>' +
+        previewAudience() +
+        '<p class="ag-note">Agnes catalogues where each app lives and who may open it. It does not ' +
+        'host the app or proxy traffic to it.</p>' +
+      '</div>';
   }
 
   function accessBody() {
@@ -233,8 +400,43 @@
 
   /* ── Render ─────────────────────────────────────────────────────────── */
 
+  /* Every interaction in the configuration repaints the WHOLE mount, which
+     destroys the scrolling column and rebuilds it at offset 0 — so choosing a
+     group in section 3 threw the reader back up to section 1, and picking the
+     second of a long list of groups reset the picker's own scroll each time.
+     The offsets are read before the write and re-applied after it.
+
+     FOUR of them, because which element scrolls depends on the viewport and on
+     what is open: `.ag-cfg-body` is the configuration column (builder.css),
+     `.la-prev-body` the Library preview in the left pane, `.ag-pick-rows` the
+     picker modal's list, and below the two-pane breakpoint the layout hands
+     scrolling back to the PAGE (`body.ag-building .idx` goes
+     `overflow: visible`), where the same repaint loses `window.scrollY`
+     instead. Restoring an offset the element held a moment ago is always
+     right; `scrollTop` clamps itself when the new content is shorter.
+
+     Add a scroller to this page → add it here, or it silently jumps. */
+  var SCROLLERS = ['.ag-cfg-body', '.la-prev-body', '.ag-pick-rows'];
+
+  function scrollState() {
+    var tops = SCROLLERS.map(function (sel) {
+      var el = mount.querySelector(sel);
+      return el ? el.scrollTop : 0;
+    });
+    return { tops: tops, win: window.scrollY };
+  }
+
+  function restoreScroll(was) {
+    SCROLLERS.forEach(function (sel, i) {
+      var el = mount.querySelector(sel);
+      if (el && was.tops[i]) el.scrollTop = was.tops[i];
+    });
+    if (was.win) window.scrollTo(0, was.win);
+  }
+
   function render() {
     if (!mount) return;
+    var was = scrollState();
     var sec = window.BuilderShell.section;
     mount.innerHTML =
       window.BuilderShell.head({
@@ -246,13 +448,12 @@
       }) +
       (publishErr ? '<div class="ag-note ag-note--err">' + esc(publishErr) + '</div>' : '') +
       window.BuilderShell.workspace({
-        left: '<div class="ag-cfg-blurb">' +
-            '<p>An app hosted somewhere else — a dashboard, a small tool — is catalogued here so it appears ' +
-            'in the Library beside everything else, for the groups you choose. Agnes does not host it or ' +
-            'proxy it; it records where it lives and who may see it.</p>' +
-            '<p>The list comes from a connected tool server. Publishing apps while you connect one is the ' +
-            'same three steps, in the builder that registers it.</p>' +
-          '</div>',
+        /* Mirrors the configuration pane's own header component, so the two
+           columns start on the same line — which is most of what stops the
+           left one reading as leftover space. */
+        left: '<div class="ag-cfg-head"><div class="ag-cfg-head-main">' +
+            '<h3>In the Library</h3><p>what the groups you chose will see</p>' +
+          '</div></div>' + previewBody(),
         cfgTitle: 'Configuration',
         cfgSub: 'which server, which apps, and who gets them',
         cfgBodyId: 'la-steps',
@@ -281,6 +482,7 @@
       }) +
       '<div id="la-picker">' + pickerHtml() + '</div>';
     document.body.classList.add('ag-building');
+    restoreScroll(was);
   }
 
   function wire() {

@@ -64,7 +64,7 @@ usage_*, etc.). "Analytics" = parquet views and the connector
 | `cli/commands/admin_ask.py` | NL telemetry query | cli-glue | none (HTTP) | — | keep-as-is |
 | `cli/commands/admin_autodoc.py` | LLM-generate table descriptions | cli-glue | none — uses `profile_repo`, `table_registry_repo` | table_registry, profile_results | easy |
 | `cli/commands/admin_data_package.py` | CRUD over Data Packages (v49) | cli-glue | none (HTTP) | — (via API) | keep-as-is |
-| `cli/commands/admin_data_semantics.py` | scaffold workspace data-semantics pack | cli-glue | none — calls 5 repos directly | bq_metadata_cache, column_metadata, data_packages, metric_definitions, table_registry | easy |
+| ~~`cli/commands/admin_data_semantics.py`~~ | scaffold workspace data-semantics pack | — | — | — | **deleted** (#1707 Block 6: pre-Ossie scaffolder, nothing read its output) |
 | `cli/commands/admin_mcp.py` | Universal MCP source + tool admin | cli-glue | none (HTTP) | — | keep-as-is |
 | `cli/commands/admin_memory_domain.py` | CRUD over Memory Domains | cli-glue | none (HTTP) | — | keep-as-is |
 | `cli/commands/admin_metrics.py` | import/export/validate metric YAML ↔ DB | cli-glue | none — uses `src.repositories` | metric_definitions | easy |

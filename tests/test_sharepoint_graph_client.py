@@ -248,6 +248,63 @@ class TestListItemChildren:
             asyncio.run(gc.list_item_children("tok", "drv1", "missing"))
 
 
+class TestGetSiteByPath:
+    """`get_site_by_path` — the discovery-free, `Sites.Selected`-compatible
+    way to reach one site: Graph's by-path addressing
+    (``/sites/{hostname}:/{server-relative-path}``) works on a granted site
+    even when ``/sites`` enumeration is 403-forbidden."""
+
+    def test_resolves_site_by_hostname_and_path(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200,
+                json={
+                    "id": "contoso.sharepoint.com,abc,def",
+                    "displayName": "Project Hub",
+                    "webUrl": "https://contoso.sharepoint.com/sites/ProjectHub",
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        site = asyncio.run(gc.get_site_by_path("tok", "contoso.sharepoint.com", "sites/ProjectHub"))
+        assert site == {
+            "id": "contoso.sharepoint.com,abc,def",
+            "name": "Project Hub",
+            "web_url": "https://contoso.sharepoint.com/sites/ProjectHub",
+        }
+
+    def test_empty_path_addresses_the_root_site(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com"
+            return httpx.Response(200, json={"id": "root-id", "displayName": "Home", "webUrl": "https://x/"})
+
+        _install_transport(monkeypatch, handler)
+        site = asyncio.run(gc.get_site_by_path("tok", "contoso.sharepoint.com", ""))
+        assert site["id"] == "root-id"
+
+    def test_path_segments_are_url_quoted(self, monkeypatch):
+        """A segment is percent-encoded on the wire — nothing an admin pastes
+        can splice extra path components or query syntax into the Graph URL."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert b"/sites/contoso.sharepoint.com:/sites/Team%20Site" in request.url.raw_path
+            return httpx.Response(200, json={"id": "s2", "displayName": "Team Site", "webUrl": "https://x/ts"})
+
+        _install_transport(monkeypatch, handler)
+        site = asyncio.run(gc.get_site_by_path("tok", "contoso.sharepoint.com", "sites/Team Site"))
+        assert site["id"] == "s2"
+
+    def test_non_200_error_carries_the_status_code(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        _install_transport(monkeypatch, handler)
+        with pytest.raises(gc.SharePointGraphError) as exc_info:
+            asyncio.run(gc.get_site_by_path("tok", "contoso.sharepoint.com", "sites/NotGranted"))
+        assert exc_info.value.status_code == 403
+
+
 class TestBuildFolderMatcher:
     def test_prefix_mode_is_case_insensitive(self):
         matcher = gc.build_folder_matcher("con", "prefix")
@@ -809,3 +866,29 @@ class TestCertificateMetadata:
         serialized = json.dumps(result)
         assert "PRIVATE KEY" not in serialized
         assert "BEGIN CERTIFICATE" not in serialized  # no raw PEM at all — only derived fields
+
+
+class TestGetAppTokenClientSecret:
+    """`get_app_token(..., client_secret=...)` — Entra's plain client-secret
+    client-credentials flow. No JWT assertion is built or sent; the secret
+    travels in the form body of the same token endpoint."""
+
+    def test_posts_client_secret_and_no_assertion(self, monkeypatch):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = request.content.decode()
+            return httpx.Response(200, json={"access_token": "graph-token-secret", "expires_in": 3600})
+
+        _install_transport(monkeypatch, handler)
+        token = asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret="s3cr3t"))
+        assert token == "graph-token-secret"
+        assert seen["path"].endswith("/oauth2/v2.0/token")
+        assert "client_secret=s3cr3t" in seen["body"]
+        assert "client_assertion" not in seen["body"]
+
+    def test_no_credential_at_all_is_a_typed_error(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"access_token": "x"}))
+        with pytest.raises(gc.SharePointGraphError):
+            asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret=""))

@@ -53,8 +53,15 @@ than a description.
 `references/payloads.md` is the interchange format reference — the exact
 shape of a `dataset`, `metric`, `relationship`, and the Agnes-specific
 constraint extension, with a worked example of each. Read it before hand-
-authoring a document (`agnes admin semantic-model import <file>`) or editing
-one you exported (`agnes admin semantic-model export <slug>`).
+authoring a document or editing one you exported:
+
+```
+agnes semantic-model export <slug> -o model.yaml   # any user with access
+agnes semantic-model apply model.yaml              # any user: applied if you
+                                                   # are an admin, otherwise
+                                                   # queued for review
+agnes admin semantic import model.yaml             # admin: direct import
+```
 
 ## Validate before you save anything
 
@@ -62,7 +69,7 @@ Agnes never stores a half-valid document. Validate locally — no server, no
 token — before importing:
 
 ```
-agnes admin semantic-model validate <path-to-document.yaml>
+agnes semantic-model validate <path-to-document.yaml>
 ```
 
 This runs the same central `validate()` the server runs on import/edit
@@ -92,11 +99,16 @@ registry.
 
 ## Scope note (read/author, not a bundled write tool)
 
-This skill's actions ride the existing surfaces: `agnes admin semantic-model
-import/export/validate` (document-level CRUD) and `agnes semantic-model
-context/schema/validate-query` (read-parity tools, any authenticated
-caller with access to the model). There is no bundled script here that
-mutates a document for you — validation is always a call to the central
-`validate()` via the CLI above, never a local re-implementation, so a
-document you hand-author is checked against the exact same rules the server
-enforces.
+This skill's actions ride the existing surfaces, all of them in the any-user
+`agnes semantic-model` group: `search`/`show`/`export` to find and read a
+document, `validate` to schema-check one offline, `context`/`schema`/
+`validate-query` (the read-parity tools), and **`apply`** — the write path,
+which is not admin-only: an admin's document goes live, anyone else's is
+queued for admin moderation and the command says which happened. Only
+`agnes admin semantic import` (direct import, bypassing moderation) and the
+rest of `agnes admin semantic …` need an admin.
+
+There is no bundled script here that mutates a document for you — validation
+is always a call to the central `validate()` via the CLI above, never a local
+re-implementation, so a document you hand-author is checked against the exact
+same rules the server enforces.

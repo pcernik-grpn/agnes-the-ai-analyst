@@ -18,7 +18,7 @@ Two stages:
 
 Used by `app/api/marketplace.py` to pre-render `description` and
 `sample_interaction.assistant` from `marketplace-metadata.json` before the
-HTML lands in `PluginDetailResponse`, and by the `/catalog/semantics` metric
+HTML lands in `PluginDetailResponse`, and by the flat metric registry's
 rows (`html_source=True` there). The template injects with `{{ x | safe }}`
 trusting the stored value — no second-pass sanitization on render.
 """

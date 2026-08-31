@@ -11,10 +11,58 @@ Git credentials are NOT handled here. ``src.marketplace._run_git`` already
 supplies a PAT through a host-scoped credential helper in the environment,
 never on argv, and redacts it out of error text; this module reuses it rather
 than growing a second, subtly different implementation of the same rule.
+
+Provenance override (``config.provenance``)
+-------------------------------------------
+A source normally publishes under ``source='ossie_<kind>'`` /
+``source_ref=<source id>``: the registered source id IS the prune boundary,
+so two sources can never delete each other's models. A source migrated off a
+legacy, connector-owned scheduled refresh (#1707 Block 3 step 3 — Keboola's
+Metastore sync) may carry ``config.provenance = {"source": ...,
+"source_ref": ...}`` to keep stamping the label that path already used.
+
+Why, precisely: ``semantic_models``, ``metric_definitions``, ``glossary_terms``
+and ``column_metadata`` rows are OWNED by their ``(source, source_ref)`` pair.
+Every prune in this pipeline is scoped to that pair, every projected row id is
+derived from it (``src.semantic.projection._scoped_id``), and the projector
+even dispatches its table binding on it (``source == 'keboola_metastore'``
+resolves a Keboola tableId through the registry). Importing the same upstream
+under a *new* label would therefore neither update nor prune the existing rows
+— it would write a second, parallel set beside them and leave the originals
+orphaned forever, exactly the silent duplication the migration sequencing
+exists to avoid. Continuity of the prune scope is the whole point.
+
+The override is restricted three ways, because ``config`` reaches the
+database from more than one writer and a claim is a licence to DELETE:
+
+1. the LABEL must be one of :data:`_LEGACY_PROVENANCE_ADAPTERS` — one entry
+   per legacy writer whose scheduled trigger moved onto the generic sweep;
+2. the source must RUN that label's adapter — an ``upload``/``native`` source
+   has no upstream a legacy label could describe, so it may never carry one;
+3. the ``source_ref`` must be one the row can justify from its OWN config —
+   its ``connection_id``, or (for the legacy env-credential row) the pair
+   that path has ever stamped. The label alone is not the boundary: the ref
+   is what selects whose rows a prune reaches, so checking only the label
+   would let any source name connection A's ref and wipe A's models,
+   metrics, glossary terms and column descriptions on its next sync.
+
+``POST``/``PUT /api/admin/semantic-sources`` refuses ``config.provenance``
+outright (``app/api/semantic_models.py``), so today the only writer is the
+auto-migration itself, through the repository. These checks are the second
+half of that story rather than a duplicate of it: they hold for a row written
+by any future path, and they are what makes the CRUD refusal a defence in
+depth instead of the only wall.
+
+``config.safe_prune`` is the second knob the same migration needs: the
+full-wipe guard the Keboola sync has always passed to ``project_document``
+(an upstream that answers 200 with nothing usable must not delete an
+installation's whole metric registry in one pass). Off by default, because a
+git source emptying a model IS a real delete signal.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -26,7 +74,175 @@ from src.repositories import semantic_source_repo
 from src.semantic.adapters import get_adapter
 from src.semantic.importer import ImportReport, import_documents
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_GLOB = "**/*.yaml"
+
+#: Provenance labels a source may claim through ``config.provenance``, mapped
+#: to the adapter a claiming source MUST run — one entry per legacy writer
+#: whose scheduled trigger moved onto the generic sweep. See the module
+#: docstring for why this is an allowlist and not a free field.
+_LEGACY_PROVENANCE_ADAPTERS = {"keboola_metastore": "keboola_metastore"}
+
+
+def resolve_provenance(source: Dict[str, Any]) -> tuple[str, Optional[str]]:
+    """The ``(source, source_ref)`` this source's rows are written and pruned
+    under — its own id unless ``config.provenance`` claims a legacy label.
+
+    Raises ``ValueError`` for a malformed or non-allowlisted override rather
+    than falling back to the generic label: a source that asked to own one
+    scope and silently wrote into another is the failure mode this whole
+    mechanism exists to prevent, and ``import_source`` records the error on
+    the row instead of importing anything.
+    """
+    source_id = source["id"]
+    default = (f"ossie_{source.get('kind')}", source_id)
+
+    override = (source.get("config") or {}).get("provenance")
+    if override is None:
+        return default
+    if not isinstance(override, dict):
+        raise ValueError(
+            f"semantic source {source_id!r}: config.provenance must be an object, "
+            f"got {type(override).__name__}"
+        )
+
+    label = override.get("source")
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError(f"semantic source {source_id!r}: config.provenance.source must be a non-empty string")
+    label = label.strip()
+    if label not in _LEGACY_PROVENANCE_ADAPTERS:
+        raise ValueError(
+            f"semantic source {source_id!r}: config.provenance.source {label!r} is not a migrated legacy "
+            f"provenance label (allowed: {', '.join(sorted(_LEGACY_PROVENANCE_ADAPTERS))}). A source may not "
+            "claim another writer's prune scope."
+        )
+
+    required_adapter = _LEGACY_PROVENANCE_ADAPTERS[label]
+    adapter = (source.get("adapter") or "").strip()
+    if adapter != required_adapter:
+        raise ValueError(
+            f"semantic source {source_id!r}: config.provenance.source {label!r} may only be claimed by a "
+            f"source running the {required_adapter!r} adapter, not {adapter or 'native'!r}. A source that "
+            "does not read that upstream cannot own — or prune — the rows it writes."
+        )
+
+    # An explicit `"source_ref": null` is meaningful — it is what the legacy
+    # Keboola env-credential path stamps — so "absent" and "present but None"
+    # must not collapse into the same branch.
+    if "source_ref" in override:
+        ref = override["source_ref"]
+        if ref is not None and not isinstance(ref, str):
+            raise ValueError(f"semantic source {source_id!r}: config.provenance.source_ref must be a string or null")
+    else:
+        ref = source_id
+    _assert_ref_is_the_sources_own(source_id=source_id, label=label, config=source.get("config") or {}, ref=ref)
+    return label, ref
+
+
+def _assert_ref_is_the_sources_own(*, source_id: str, label: str, config: Dict[str, Any], ref: Optional[str]) -> None:
+    """Refuse a ``source_ref`` this row cannot justify from its own config.
+
+    Connector knowledge in an otherwise generic module, deliberately and
+    minimally: the label allowlist above already names one connector, and the
+    question "is this ref yours?" can only be answered by the writer that owns
+    the scope. Imported lazily, like every other connector reach-in on this
+    path (``src/semantic/legacy_migration.py`` does the same).
+    """
+    if label != "keboola_metastore":  # pragma: no cover - the mapping above is the gate
+        raise ValueError(f"semantic source {source_id!r}: no ownership rule for provenance label {label!r}")
+
+    connection_id = str(config.get("connection_id") or "").strip()
+    if connection_id:
+        if ref != connection_id:
+            raise ValueError(
+                f"semantic source {source_id!r}: config.provenance.source_ref {ref!r} is not this source's "
+                f"own connection ({connection_id!r}). A source may only own — and prune — the scope of the "
+                "connection it reads."
+            )
+        return
+
+    if config.get("legacy_credentials"):
+        # The env-credential path stamps NULL, or the default connection's id
+        # when the credentials actually resolved from that connection; both,
+        # and nothing else, are its own scope.
+        from connectors.keboola.semantic_layer import legacy_credentials_prune_scope
+
+        allowed = legacy_credentials_prune_scope()
+        if ref not in allowed:
+            raise ValueError(
+                f"semantic source {source_id!r}: config.provenance.source_ref {ref!r} is outside the legacy "
+                "Keboola credential path's own scope (null, or the default connection's id)."
+            )
+        return
+
+    raise ValueError(
+        f"semantic source {source_id!r}: a source claiming the {label!r} provenance must pin the connection "
+        "it reads (config.connection_id) or declare config.legacy_credentials."
+    )
+
+
+def validate_git_config(config: Dict[str, Any]) -> None:
+    """Refuse a git source config that would leak a secret — or run a command.
+
+    Three checks, all on admin-writable input, all BEFORE any network call:
+
+    1. ``repo_url`` names an allowed scheme. ``ext::`` runs its argument as a
+       shell command and ``file://`` reads the server's own disk, so the
+       scheme list is an allowlist and is not operator-configurable.
+    2. ``token_env`` is on the semantic-git credential allowlist. The clone
+       reads that env var and hands its value to git, so an unrestricted name
+       makes any server secret readable — ``ANTHROPIC_API_KEY`` as much as a
+       PAT.
+    3. The repository host is allowlisted, when an operator has pinned one.
+       ``src.marketplace._credential_args`` scopes the credential helper to
+       whatever host the URL names, so host and token together are the
+       exfiltration primitive: either gate alone leaves half of it open.
+
+    Raises ``ValueError`` with a message an admin can act on. Called from the
+    transport (so it holds for a row written by any path, including one that
+    predates this check) and from ``POST``/``PUT /api/admin/semantic-sources``
+    (so the admin learns at write time rather than at first sync).
+    """
+    from src.orchestrator_security import (
+        get_allowed_semantic_git_token_envs,
+        is_semantic_git_host_allowed,
+        is_semantic_git_token_env_allowed,
+        semantic_git_host_allowlist_configured,
+        semantic_git_scheme_refusal,
+    )
+
+    repo_url = str(config.get("repo_url") or "").strip()
+    refusal = semantic_git_scheme_refusal(repo_url)
+    if refusal:
+        raise ValueError(refusal)
+
+    token_env = str(config.get("token_env") or "").strip()
+    if token_env and not is_semantic_git_token_env_allowed(token_env):
+        raise ValueError(
+            f"config.token_env {token_env!r} is not an allowed semantic-source git credential. "
+            f"Allowed: {', '.join(sorted(get_allowed_semantic_git_token_envs())) or '(none)'}. "
+            "Add a deployment-specific name to AGNES_SEMANTIC_GIT_TOKEN_ENVS (it REPLACES the "
+            "default set). Names that belong to another trust boundary — a connector ATTACH "
+            "token, a config-resolution secret, the anonymization key — are never accepted here."
+        )
+
+    if not is_semantic_git_host_allowed(repo_url):
+        from src.marketplace import _strip_userinfo
+
+        raise ValueError(
+            f"config.repo_url host is not in AGNES_SEMANTIC_GIT_HOST_ALLOWLIST "
+            f"({_strip_userinfo(repo_url)}) — a semantic source may only clone from a pinned host."
+        )
+
+    if token_env and not semantic_git_host_allowlist_configured():
+        # Default-open, exactly like the ATTACH host gate — but never silent.
+        logger.warning(
+            "semantic git source carries a credential (token_env=%s) with no "
+            "AGNES_SEMANTIC_GIT_HOST_ALLOWLIST configured: the token will be offered to whatever "
+            "host config.repo_url names. Pin the hosts you clone from.",
+            token_env,
+        )
 
 
 def _clone(*, repo_url: str, ref: Optional[str], token_env: Optional[str], dest: Path) -> Path:
@@ -73,9 +289,11 @@ def load_documents(source: Dict[str, Any]) -> List[str]:
     if kind == "upload":
         payload: Dict[str, Any] = {"documents": list(config.get("documents") or [])}
     elif kind == "git":
+        # Before the temp dir, before the clone, before any egress: the
+        # config is admin-writable and reaches here from REST, the CLI, the
+        # MCP tools and any row already in the database.
+        validate_git_config(config)
         repo_url = (config.get("repo_url") or "").strip()
-        if not repo_url:
-            raise ValueError("git semantic source requires config.repo_url")
         with tempfile.TemporaryDirectory(prefix="agnes-semantic-") as tmp:
             root = _clone(
                 repo_url=repo_url,
@@ -100,19 +318,26 @@ def import_source(source_id: str) -> ImportReport:
     source = repo.get(source_id)
     if source is None:
         raise LookupError(
-            f"semantic source {source_id!r} not found — list them with `agnes admin semantic-source list`"
+            f"semantic source {source_id!r} not found — list them with `agnes admin semantic source list`"
         )
 
     try:
+        # Resolved BEFORE the fetch: a source whose provenance override is
+        # malformed must fail without making an upstream call, and certainly
+        # without importing anything under the wrong scope.
+        src_name, src_ref = resolve_provenance(source)
         documents = load_documents(source)
         report = import_documents(
             {
                 **source,
                 # Provenance: the registered source id is the prune boundary, so
                 # two git sources can never delete each other's models even when
-                # they carry the same model names.
-                "source": f"ossie_{source.get('kind')}",
-                "source_ref": source_id,
+                # they carry the same model names. A migrated legacy source
+                # overrides it to keep owning the rows it already wrote — see
+                # the module docstring.
+                "source": src_name,
+                "source_ref": src_ref,
+                "safe_prune": bool((source.get("config") or {}).get("safe_prune")),
             },
             documents,
         )

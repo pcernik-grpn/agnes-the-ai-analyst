@@ -32,8 +32,7 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # implementation) — list them here (route -> one-line reason) instead of
 # letting the sweep flag them. `assert_pg_only_exemptions_fail_clean` below
 # still requires each one to fail CLEAN (a typed 501) on DuckDB, not crash or
-# merely return some unrelated 4xx. Empty until the first PG-only route ships
-# (Track C); the mechanism itself is proven in
+# merely return some unrelated 4xx. The mechanism itself is proven in
 # `tests/db_pg/test_pg_only_route_exemption_mechanism.py`.
 #
 # The fact graph over Collections read surface (build order steps 2+3) has
@@ -58,6 +57,17 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # from `facts_repo()` (see src/repositories/facts_ingest_runs_pg.py) so it
 # needs its own exemption entry even though the reason reads similarly.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "GET /api/admin/semantic-model/coverage": (
+        "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
+    ),
+    "GET /api/admin/semantic-feedback": "the feedback queue reads `semantic_feedback`, a PG-only table (F4.5)",
+    "GET /api/admin/semantic-layer/mutes": (
+        "the muted-check list reads `semantic_health_mutes`, a PG-only table (F4.3)"
+    ),
+    "GET /api/admin/semantic-layer/health": (
+        "the health roll-up resolves `semantic_health_mutes` (the mute overlay) as a "
+        "gate dependency before any other check runs, a PG-only table (F4.2)"
+    ),
     "GET /api/facts/corrections": (
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
@@ -122,6 +132,11 @@ def test_get_status_is_identical_across_backends(tmp_path, monkeypatch, pg_engin
 
     duck_client, duck_token = build_seeded_client("duckdb", tmp_path / "duck", monkeypatch, pg_engine)
     duck = collect_statuses(duck_client, duck_token, methods={"GET"}, skip_substr=_SKIP_SUBSTR)
+    # Must run here, before `build_seeded_client("pg", ...)` below repoints
+    # AGNES_DB_URL — the repo factory reads the backend live on every call,
+    # so re-querying `duck_client` after that point would silently exercise
+    # Postgres repos through DuckDB-configured routes.
+    assert_pg_only_exemptions_fail_clean(duck_client, duck_token, _PG_ONLY_ROUTE_EXEMPTIONS)
 
     # The fail-clean check MUST run before the pg client is built:
     # build_seeded_client("pg", ...) sets AGNES_DB_URL, and use_pg() reads it

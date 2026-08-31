@@ -146,6 +146,15 @@ def _assert_promises_provenance(md: str) -> None:
         re.IGNORECASE,
     ), "the rule needs the hard edge, not just the happy path"
     assert "metric" in md.lower(), "a canonical metric must be citable alongside the table"
+    assert re.search(
+        r"cannot fill (in )?the `?sources`? block.{0,120}say so",
+        md,
+        re.IGNORECASE | re.DOTALL,
+    ), (
+        "the silent failure has to be closed too: an answer that simply omits the block "
+        "is indistinguishable from one that forgot it, so the prompt must require the "
+        "agent to admit an unfillable block in the answer text"
+    )
 
 
 def test_the_workspace_prompt_makes_the_promise_true():

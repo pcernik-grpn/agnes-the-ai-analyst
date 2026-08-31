@@ -92,7 +92,7 @@ locals {
   kai_agent_secrets = local.kai_agent_any_enabled ? setsubtract(toset(compact([
     var.kai_agent_jwt_secret,
     var.kai_agent_e2b_key_secret,
-  ])), setunion(toset(keys(var.runtime_secret_env)), toset(var.runtime_secrets))) : toset([])
+  ])), setunion(toset(keys(var.runtime_secret_env)), toset(keys(var.runtime_secret_env_multiline)), toset(var.runtime_secrets))) : toset([])
 
   # --- Vendor-neutral per-instance branding -> /data/state/instance.yaml ---
   # The startup script seeds instance.yaml on FIRST boot only (it never clobbers
@@ -309,6 +309,19 @@ resource "google_secret_manager_secret_iam_member" "vm_runtime" {
 # per entry to /opt/agnes/.env.
 resource "google_secret_manager_secret_iam_member" "vm_runtime_env" {
   for_each  = var.runtime_secret_env
+  project   = var.gcp_project_id
+  secret_id = each.key
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.vm.email}"
+}
+
+# Same grant for the multiline map (base64 transport — see the variable's
+# description). A secret name also present in runtime_secret_env is skipped:
+# declaring the identical (project, secret, role, member) binding twice
+# errors the apply with "already exists" — the documented duplicate-binding
+# trap.
+resource "google_secret_manager_secret_iam_member" "vm_runtime_env_multiline" {
+  for_each  = { for k, v in var.runtime_secret_env_multiline : k => v if !contains(keys(var.runtime_secret_env), k) }
   project   = var.gcp_project_id
   secret_id = each.key
   role      = "roles/secretmanager.secretAccessor"
@@ -600,6 +613,7 @@ resource "google_compute_instance" "vm" {
     oauth_client_id_secret_name     = try(local.per_vm_oauth[each.value.name].id, "")
     oauth_client_secret_secret_name = try(local.per_vm_oauth[each.value.name].secret, "")
     runtime_secret_env              = var.runtime_secret_env
+    runtime_secret_env_multiline    = var.runtime_secret_env_multiline
     # home_route / studio_enabled are likewise NOT forwarded as separate
     # template vars (D1, 2026-08) — see the theme/experience note above; both
     # ride instance_branding_b64 now.
@@ -627,6 +641,7 @@ resource "google_compute_instance" "vm" {
     extraction_worker_image      = var.extraction_worker_image
     extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
     extraction_worker_cpus       = each.value.extraction_worker_cpus
+    extraction_producer_command  = var.extraction_producer_command
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [

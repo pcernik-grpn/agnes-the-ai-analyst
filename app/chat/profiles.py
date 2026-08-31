@@ -303,6 +303,14 @@ _SEMANTIC_MODEL_BUILDER = ChatProfile(
         "and endpoints.\n"
     ),
     skill_name="agnes-semantic-authoring",
+    # Canonical sibling: `.claude/skills/semantic-layer-building/` is the
+    # repo-side skill covering the same ground for a Claude Code session
+    # (modeling rules, payload shapes, the maintenance loop). This inline
+    # body is a deliberately much shorter chat-sandbox copy — the sandbox has
+    # no marketplace checkout to load the other one from, and loading one from
+    # the other would couple the chat runtime to a dev-time directory. Keep
+    # the two in sync BY HAND when a command path or an endpoint changes;
+    # they are the only two places that teach this surface to an agent.
     skill_body=(
         "---\n"
         "name: agnes-semantic-authoring\n"
@@ -342,8 +350,14 @@ _SEMANTIC_MODEL_BUILDER = ChatProfile(
         "mismatch 409s (`stale_document`) instead of overwriting.\n"
         "- A slug owned by an imported source (git/metastore sync) 409s "
         "(`source_owned`) — that model is edited at its source, not here.\n"
-        "- Offline pre-check: `agnes admin semantic-model validate <file>` "
-        "(no server, no token).\n"
+        "- Offline pre-check: `agnes semantic-model validate <file>` (no "
+        "server, no token, no admin). NOT `validate-query`, which checks a "
+        "SQL statement against the models you can read.\n"
+        "- Find and read what already exists: `agnes semantic-model search "
+        "<term>`, `agnes semantic-model show <slug>`, `agnes semantic-model "
+        "export <slug>`. All three are any-user commands; the admin group "
+        "`agnes admin semantic …` is only for importing, deleting, sources, "
+        "coverage, health and mutes.\n"
     ),
 )
 

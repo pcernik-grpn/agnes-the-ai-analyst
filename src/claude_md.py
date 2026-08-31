@@ -10,8 +10,13 @@ Available placeholders: instance.{name,subtitle}, server.{url,hostname},
 sync_interval, data_source.{type,source_types}, tables (list of
 {name,description,query_mode,source_type}), metrics.{count,categories},
 semantic_layer.has_models (True iff the calling user can read >=1 valid
-semantic model), facts.enabled (True iff the `facts` feature switch is on
-for this instance), marketplaces (RBAC-filtered list),
+semantic model), semantic_layer.models (list of {slug,name,description,instructions}
+for every model the user can read — the one-line catalog; `instructions`
+is the author's own `ai_context.instructions`, truncated),
+semantic_layer.cache_ttl_hours (the TTL `agnes pull` stamps into every
+rendered `semantic/<slug>/…` cache file's header,
+src/semantic/cache_render.py), facts.enabled (True iff the `facts` feature
+switch is on for this instance), marketplaces (RBAC-filtered list),
 user.{id,email,name,is_admin,groups}, now, today, chat_icons (inline icon
 names the chat UI renders — see src/chat_icons.py).
 
@@ -146,15 +151,62 @@ def _metrics_summary(conn: duckdb.DuckDBPyConnection | None, *, user: dict) -> d
     }
 
 
-def _has_semantic_layer(conn: duckdb.DuckDBPyConnection | None, *, user: dict[str, Any]) -> bool:
-    """True iff the calling user can read at least one ``status='valid'``
-    semantic model — same RBAC tier as ``GET /api/semantic-models/search``
-    (``app/api/semantic_models.py::_can_read_model``: admin, a grant on the
-    model itself, or a grant on a Data Package it's linked to).
+# `ai_context.instructions` is authored prose of unbounded length, and this
+# file is read on every session start — a model author's essay must not become
+# the prompt. Long enough for a real rule ("always filter orders by tenant_id;
+# refunds are excluded"), short enough that ten models stay affordable.
+_MODEL_INSTRUCTIONS_MAX_CHARS = 300
 
-    Gates the "Semantic layer" CLAUDE.md section: a user with zero
-    accessible models gets no section telling them to prefer a layer they
-    cannot actually read.
+
+def _model_instructions(document_json: Any) -> str:
+    """The model author's own ``ai_context.instructions``, truncated to
+    ``_MODEL_INSTRUCTIONS_MAX_CHARS``.
+
+    Reads the document's TOP-LEVEL model ``ai_context`` — the Ossie schema
+    allows either a bare string or an object with ``instructions``, and both
+    forms are the same authored steering (same reading as
+    ``src/semantic_context.py::_summary``). Per-dataset and per-metric
+    ``ai_context`` is deliberately NOT gathered here: it belongs to the
+    object, reaches the agent through the rendered `semantic/<slug>/` cache
+    and ``get_semantic_context``, and would flood this file.
+
+    A row holding several models (legal, though rare) contributes the first
+    one that declares instructions — an arbitrary pick would be worse than a
+    deterministic one, and the full text is one `agnes semantic-model
+    context` call away either way.
+    """
+    if not isinstance(document_json, dict):
+        return ""
+    for model in document_json.get("semantic_model") or []:
+        if not isinstance(model, dict):
+            continue
+        ai_context = model.get("ai_context")
+        if isinstance(ai_context, dict):
+            ai_context = ai_context.get("instructions")
+        if not isinstance(ai_context, str) or not ai_context.strip():
+            continue
+        text = " ".join(ai_context.split())
+        if len(text) > _MODEL_INSTRUCTIONS_MAX_CHARS:
+            return text[: _MODEL_INSTRUCTIONS_MAX_CHARS - 1].rstrip() + "…"
+        return text
+    return ""
+
+
+def _semantic_layer_models(conn: duckdb.DuckDBPyConnection | None, *, user: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every ``status='valid'`` semantic model the calling user can read,
+    as ``{"slug", "name", "description", "instructions"}`` — same RBAC tier
+    as ``GET /api/semantic-models/search`` (``app/api/semantic_models.py::
+    _can_read_model``: admin, a grant on the model itself, or a grant on a
+    Data Package it's linked to).
+
+    Feeds both the "Semantic layer" section's gate (``semantic_layer
+    .has_models``, unchanged since it's now ``bool(models)``) and its
+    one-line model catalog (Fáze 1 physical-distribution plan, item 4) — a
+    user with zero accessible models gets neither.
+
+    ``instructions`` is the author's own ``ai_context.instructions``: the one
+    field a model declares *for the agent*, which until now reached no agent
+    surface at all. Empty string when the model declares none.
     """
     from app.api.semantic_models import _can_read_model
     from src.repositories import semantic_model_repo
@@ -170,12 +222,18 @@ def _has_semantic_layer(conn: duckdb.DuckDBPyConnection | None, *, user: dict[st
         # callee's annotation has not caught up, and it is reached only inside
         # the guard above, which degrades to "no section" — so widening
         # `app/api/semantic_models._can_read_model` is left to whoever owns it.
-        return any(
-            row.get("status") == "valid" and _can_read_model(user, row, conn)  # type: ignore[arg-type]
+        return [
+            {
+                "slug": row.get("slug"),
+                "name": row.get("name"),
+                "description": row.get("description") or "",
+                "instructions": _model_instructions(row.get("document_json")),
+            }
             for row in rows
-        )
+            if row.get("status") == "valid" and _can_read_model(user, row, conn)  # type: ignore[arg-type]
+        ]
     except _missing_table_excs():
-        return False
+        return []
 
 
 def _facts_enabled() -> bool:
@@ -242,7 +300,7 @@ def _marketplaces_for_user(conn: duckdb.DuckDBPyConnection | None, user: dict[st
 def build_claude_md_context(
     # Accepts ``None`` for the same reason ``render_claude_md`` does. It DOES
     # pass the conn on (``_list_tables``, ``_metrics_summary``,
-    # ``_has_semantic_layer``, ``_marketplaces_for_user``) — an earlier version
+    # ``_semantic_layer_models``, ``_marketplaces_for_user``) — an earlier version
     # of this comment claimed otherwise, from a grep whose range collapsed on
     # its own end pattern. What is true is that every one of those tolerates
     # ``None`` and falls through to the repository factory
@@ -272,9 +330,12 @@ def build_claude_md_context(
     for the former; template sections that need to say something different
     for a laptop workspace branch on this flag.
     """
+    from src.semantic.cache_render import DEFAULT_TTL_SECONDS
+
     now = datetime.now(UTC) if now is None else now
     parsed = urlparse(server_url)
     tables = _list_tables(conn, user=user)
+    semantic_models = _semantic_layer_models(conn, user=user)
     return {
         "instance": {
             "name": get_instance_name(),
@@ -295,7 +356,17 @@ def build_claude_md_context(
         },
         "tables": tables,
         "metrics": _metrics_summary(conn, user=user),
-        "semantic_layer": {"has_models": _has_semantic_layer(conn, user=user)},
+        "semantic_layer": {
+            "has_models": bool(semantic_models),
+            "models": semantic_models,
+            # Fáze 1 physical-distribution cache: `agnes pull` writes each
+            # accessible model to `semantic/<slug>/` and stamps this same
+            # TTL into every rendered file's header
+            # (`src/semantic/cache_render.py`, `app/api/semantic_models.py
+            # ::semantic_models_bundle`) — single source of truth so the
+            # prose here can never drift from what the CLI actually writes.
+            "cache_ttl_hours": DEFAULT_TTL_SECONDS // 3600,
+        },
         "facts": {"enabled": _facts_enabled()},
         "marketplaces": _marketplaces_for_user(conn, user),
         "user": {

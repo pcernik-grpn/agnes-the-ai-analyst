@@ -37,7 +37,7 @@ cadence, so it doesn't appear in `build_jobs()`.
 | `store-reap-stuck-reviews` | `POST /api/admin/run-reap-stuck-reviews` | stays-HTTP | One indexed SELECT + a handful of small UPDATEs; sub-second reaper. |
 | `store-lint-audit` | `POST /api/admin/store/lint-audit` | stays-HTTP | Fingerprint-gated (zero-cost when nothing changed) weekly audit; not yet migrated. |
 | `bq-metadata-refresh` | `POST /api/admin/run-bq-metadata-refresh` | stays-HTTP | Long interval (4h default), not cadence-sensitive; not yet migrated. |
-| `keboola-semantic-layer-refresh` | `POST /api/admin/run-keboola-semantic-layer-refresh` | stays-HTTP | Long interval (6h default), low request volume; not yet migrated. |
+| `semantic-sources-refresh` | `POST /api/admin/run-semantic-sources-refresh` | stays-HTTP | Long interval (6h default), low request volume; not yet migrated. Replaced the per-connector `keboola-semantic-layer-refresh` / `databricks-semantic-layer-refresh` rows (#1707 Block 3). |
 | `usage-prune` | `POST /api/admin/usage/prune` | stays-HTTP | Daily retention prune, short-circuits when disabled; not yet migrated. |
 | `jira-sla-poll` | `POST /api/admin/run-jira-sla-poll` | stays-HTTP | Short-circuits when Jira isn't configured; not yet migrated. |
 | `jira-consistency-check` | `POST /api/admin/run-jira-consistency-check` | stays-HTTP | Short-circuits when Jira isn't configured; not yet migrated. |

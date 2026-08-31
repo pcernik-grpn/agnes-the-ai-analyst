@@ -30,6 +30,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 import jwt as pyjwt
@@ -247,19 +248,35 @@ def certificate_metadata(private_key_pem: str) -> Dict[str, Any]:
     }
 
 
-async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str) -> str:
-    """Fetch an app-only Graph access token via the certificate-credential
-    flow. Raises :class:`SharePointGraphError` on any non-200 response or a
+async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str, *, client_secret: str = "") -> str:
+    """Fetch an app-only Graph access token — the certificate-credential
+    flow by default, or Entra's plain client-secret flow when
+    ``client_secret`` is provided (``auth_method="client_secret"``
+    connections; ``private_key_pem`` is empty there and never touched).
+    Raises :class:`SharePointGraphError` on any non-200 response or a
     response with no ``access_token`` — never returns a falsy token."""
-    assertion = build_client_assertion(tenant_id, client_id, private_key_pem)
     url = f"{LOGIN_BASE}/{tenant_id}/oauth2/v2.0/token"
-    data = {
-        "client_id": client_id,
-        "scope": "https://graph.microsoft.com/.default",
-        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        "client_assertion": assertion,
-        "grant_type": "client_credentials",
-    }
+    if client_secret:
+        data = {
+            "client_id": client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        }
+    elif private_key_pem:
+        assertion = build_client_assertion(tenant_id, client_id, private_key_pem)
+        data = {
+            "client_id": client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": assertion,
+            "grant_type": "client_credentials",
+        }
+    else:
+        raise SharePointGraphError(
+            "no credential to authenticate with — the connection resolved neither certificate material "
+            "nor a client secret"
+        )
     async with _http_client() as client:
         resp = await client.post(url, data=data, timeout=_TOKEN_TIMEOUT_S)
     if resp.status_code != 200:
@@ -311,6 +328,35 @@ async def list_sites(access_token: str) -> List[Dict[str, Any]]:
         }
         for site in body.get("value", [])
     ]
+
+
+async def get_site_by_path(access_token: str, hostname: str, server_relative_path: str) -> Dict[str, Any]:
+    """One site, addressed by hostname + server-relative path — Graph's
+    by-path form ``/sites/{hostname}:/{path}`` (bare ``/sites/{hostname}``
+    for the tenant root site when ``server_relative_path`` is empty).
+
+    This is the discovery-free complement to :func:`list_sites`: an app
+    registration holding only ``Sites.Selected`` is 403-forbidden from ANY
+    site enumeration by design, but may read a granted site it can name.
+    Same normalized shape as one :func:`list_sites` item, so callers can
+    splice the result straight into a sites-level browse listing.
+
+    Each path segment is percent-encoded before it reaches the Graph URL —
+    the path originates from an admin-pasted URL, and quoting is what makes
+    it structurally inert here regardless of what the caller validated
+    (security playbook: never build a request path from an unchecked value).
+    """
+    segments = [seg for seg in server_relative_path.split("/") if seg]
+    if segments:
+        path = f"/sites/{hostname}:/" + "/".join(quote(seg, safe="") for seg in segments)
+    else:
+        path = f"/sites/{hostname}"
+    body = await _graph_get(access_token, path, params={"$select": "id,name,displayName,webUrl"})
+    return {
+        "id": body["id"],
+        "name": body.get("displayName") or body.get("name") or body["id"],
+        "web_url": body.get("webUrl"),
+    }
 
 
 async def list_drives(access_token: str, site_id: str) -> List[Dict[str, Any]]:

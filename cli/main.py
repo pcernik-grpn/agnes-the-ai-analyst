@@ -345,6 +345,14 @@ app.add_typer(store_app, name="store")
 app.add_typer(my_stack_app, name="my-stack")
 app.add_typer(marketplace_app, name="marketplace")
 app.add_typer(stack_app, name="stack")
+# Visible: `connect` / `disconnect` / `my-secret` are supported user commands
+# (docs/api-reference.md), and the server itself prints `agnes mcp my-secret
+# set <source-id>` as the remedy for a missing credential — hiding the group
+# would hide that remedy. What #1707 Block 6 retired is only the SERVER
+# invocation: bare `agnes mcp` (and the hidden `agnes mcp serve`) starts the
+# stdio MCP server, which is now INTERNAL — the hosted chat sandbox spawns it
+# per session (app/chat/runner.py) and `agnes global enable` wires it into
+# Claude Code's user scope. Both keep working; only the advertising stops.
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(docs_app, name="docs")
 app.add_typer(collections_app, name="collections")

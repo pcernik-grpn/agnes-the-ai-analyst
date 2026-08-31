@@ -1,15 +1,29 @@
-"""Keboola semantic layer refresh — owner of the sync_semantic_layer() call path.
+"""Keboola semantic layer — the login-triggered sync + the coverage report.
 
-POST /api/admin/run-keboola-semantic-layer-refresh — called by the
-scheduler container (auth: shared scheduler token resolves to a synthetic
-admin user, same mechanism as app/api/bq_metadata_refresh.py) on the
-SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL cadence. Also callable by
-a real admin on demand.
+This module used to own ``POST /api/admin/run-keboola-semantic-layer-refresh``
+and its scheduler cadence. Both are gone (#1707 Block 3 step 4): the ONE
+scheduled semantic refresh is now the generic sweep over ``semantic_sources``
+(``app/api/semantic_sources_refresh.py``), which auto-registers one source per
+Keboola connection holding a master token and imports it under the SAME
+``(source='keboola_metastore', source_ref=<connection id>)`` provenance this
+connector has always stamped — see ``src/semantic/legacy_migration.py``.
 
-Single-flight guarded (mirrors app/api/bq_metadata_refresh.py): a second
-concurrent call while a sync is in flight gets 409 already_running instead
-of racing a second Metastore fetch + upsert/prune pass against the same
-metric_definitions rows.
+What stayed here, because neither is a scheduled trigger:
+
+* :func:`run_semantic_layer_refresh_background` — the Keboola multi-project
+  login flow provisions master tokens and wants the metrics live without
+  waiting for the next sweep. It runs ``sync_semantic_layer()``, i.e. the same
+  adapter + central projector under the same provenance, so it can never
+  duplicate what the sweep writes.
+* ``GET /api/admin/semantic-layer/coverage`` — a read-only report.
+
+Single-flight guarded, and guarded against the SWEEP as well as against
+itself: the background sync claims ``KEBOOLA_SEMANTIC_REFRESH``
+(``src/semantic/refresh_guard.py``) before it starts, and the sweep claims the
+same slot while importing a ``keboola_metastore``-adapter source. Two logins
+landing together, or a login landing inside a sweep, therefore skip instead of
+racing a second Metastore fetch + upsert/prune pass against the same rows —
+which two locks in two modules could not prevent.
 """
 
 from __future__ import annotations
@@ -20,27 +34,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 
 from app.auth.access import require_admin
-from connectors.keboola.semantic_layer import (
-    MasterTokenRequiredError,
-    sync_semantic_layer,
-)
-from src.audit_helpers import log_safe
+from connectors.keboola.semantic_layer import sync_semantic_layer
+from src.semantic.refresh_guard import KEBOOLA_SEMANTIC_REFRESH
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-_refresh_lock = asyncio.Lock()
-# Claimed SYNCHRONOUSLY (no await between check and set) before either caller
-# touches the lock. `_refresh_lock.locked()` alone leaves the skip decision
-# and the acquisition as two steps; the uncontended asyncio.Lock.acquire fast
-# path happens not to yield between them on CPython, but that is an
-# implementation detail, and a second caller passing the check would QUEUE a
-# full duplicate sync instead of skipping (Devin Review on PR #1328). The
-# flag flip is atomic on the single event loop by construction.
-_refresh_claimed = False
 # In-flight tracking (`run_id`/`started_at`, cleared once a run finishes) plus
 # the LAST COMPLETED run's summary (`last_completed_at`/`last_status`/
 # `last_result`), so an admin who hasn't synced yet — or whose last sync
@@ -57,39 +58,18 @@ _refresh_state: dict[str, Any] = {
 
 
 def get_last_refresh_summary() -> dict[str, Any]:
-    """Read accessor for the admin UI — the last completed run's summary,
-    without reaching into the module-private `_refresh_state` dict directly."""
+    """The last completed LOGIN-TRIGGERED sync's summary, without reaching
+    into the module-private `_refresh_state` dict directly.
+
+    The /admin/semantic-layer status strip reads the generic sweep's summary
+    (``app.api.semantic_sources_refresh.get_last_refresh_summary``) since the
+    scheduled trigger moved there — this one covers the background path that
+    stayed behind."""
     return {
         "last_completed_at": _refresh_state.get("last_completed_at"),
         "last_status": _refresh_state.get("last_status"),
         "last_result": _refresh_state.get("last_result"),
     }
-
-
-# Error codes `sync_semantic_layer` attaches to a returned {"status": "error"}
-# and the HTTP status each deserves. Anything unmapped (including a missing
-# code, e.g. an older caller) stays 502, so the fallback is the historical
-# behavior rather than a silently-wrong 400.
-_ERROR_CODE_STATUS = {
-    "credentials_not_configured": 400,
-    "upstream_client_error": 400,
-    # The connection's master token opens a different project than the one it
-    # is bound to — a mis-paste to correct, not an outage.
-    "project_mismatch": 400,
-    # The stored token is no longer a master token. The single-source paths
-    # reach this endpoint as a raised MasterTokenRequiredError and answer 400;
-    # the multi-source loop captures it per connection, so it needs the code
-    # to answer the same.
-    "master_token_required": 400,
-    "upstream_error": 502,
-}
-
-
-def _status_for_error_code(code: Any) -> int:
-    """HTTP status for a sync error code — 400 when the admin can fix it
-    (nothing configured, Keboola refused the token), 502 when the upstream is
-    genuinely unreachable or broken."""
-    return _ERROR_CODE_STATUS.get(code, 502) if isinstance(code, str) else 502
 
 
 def _record_completion(status: str, result: Any) -> None:
@@ -99,138 +79,50 @@ def _record_completion(status: str, result: Any) -> None:
 
 
 async def run_semantic_layer_refresh_background(*, trigger: str) -> None:
-    """Fire the same guarded sync the admin endpoint owns, for background
-    callers (the Keboola multi-project login provisions master tokens and
-    wants the metrics live without an admin click). Shares the single-flight
-    lock and the status dict, so the admin UI shows these runs too. Skips
-    silently when a run is already in flight — the next login or the
-    scheduler catches up — and never raises. The skip decision and the slot
-    acquisition are one atomic step (see ``_refresh_claimed``)."""
-    global _refresh_claimed
-    if _refresh_claimed or _refresh_lock.locked():
-        logger.info("keboola semantic layer refresh (%s): already running, skipped", trigger)
-        return
-    _refresh_claimed = True
-    try:
-        async with _refresh_lock:
-            run_id = uuid.uuid4().hex[:8]
-            _refresh_state["run_id"] = run_id
-            _refresh_state["started_at"] = datetime.now(timezone.utc).isoformat()
-            try:
-                result = await asyncio.to_thread(sync_semantic_layer)
-            except Exception as e:  # noqa: BLE001 — background: record, never raise
-                _record_completion("error", str(e))
-                logger.warning("keboola semantic layer refresh (%s) failed: %s", trigger, e)
-                return
-            finally:
-                _refresh_state["run_id"] = None
-                _refresh_state["started_at"] = None
-            if result.get("status") == "error":
-                _record_completion("error", result.get("error", "Keboola semantic layer sync failed"))
-                logger.warning(
-                    "keboola semantic layer refresh (%s) reported an error: %s", trigger, result.get("error")
-                )
-                return
-            _record_completion("ok", result)
-            logger.info(
-                "keboola semantic layer refresh (%s): run_id=%s created_or_updated=%s pruned=%s sources=%s",
-                trigger,
-                run_id,
-                result.get("created_or_updated"),
-                result.get("pruned"),
-                len(result.get("sources") or []),
-            )
-    finally:
-        _refresh_claimed = False
+    """Fire the guarded Keboola sync for background callers (the multi-project
+    login provisions master tokens and wants the metrics live without an admin
+    click). Skips silently when the shared slot is taken — by another login OR
+    by the scheduled sweep importing the same rows — and never raises; the
+    next login or the next sweep catches up.
 
-
-@router.post("/api/admin/run-keboola-semantic-layer-refresh")
-async def run_keboola_semantic_layer_refresh(
-    user: dict = Depends(require_admin),
-):
-    """Sync the configured Keboola project's semantic layer into
-    metric_definitions. See connectors/keboola/semantic_layer.py for the
-    mapping/prune logic.
-
-    409 if a sync is already in flight. 400 when the sync fails for a reason
-    the admin controls — no Keboola credentials configured, or a token the
-    Storage/Metastore API refuses (4xx). 502 only when the upstream is
-    unreachable or answers 5xx.
+    The claim is one atomic, non-blocking step (``SingleFlight.try_claim``):
+    a check followed by a separate acquisition would let a second caller pass
+    the check and then QUEUE a full duplicate sync instead of skipping (Devin
+    Review on PR #1328).
     """
-    global _refresh_claimed
-    if _refresh_claimed or _refresh_lock.locked():
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "reason": "already_running",
-                "run_id": _refresh_state.get("run_id"),
-                "started_at": _refresh_state.get("started_at"),
-                "hint": "A refresh is already in flight; this caller is a no-op.",
-            },
+    with KEBOOLA_SEMANTIC_REFRESH.try_claim(f"login:{trigger}") as claimed:
+        if not claimed:
+            logger.info(
+                "keboola semantic layer refresh (%s): already running (%s), skipped",
+                trigger,
+                KEBOOLA_SEMANTIC_REFRESH.holder,
+            )
+            return
+        run_id = uuid.uuid4().hex[:8]
+        _refresh_state["run_id"] = run_id
+        _refresh_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            result = await asyncio.to_thread(sync_semantic_layer)
+        except Exception as e:  # noqa: BLE001 — background: record, never raise
+            _record_completion("error", str(e))
+            logger.warning("keboola semantic layer refresh (%s) failed: %s", trigger, e)
+            return
+        finally:
+            _refresh_state["run_id"] = None
+            _refresh_state["started_at"] = None
+        if result.get("status") == "error":
+            _record_completion("error", result.get("error", "Keboola semantic layer sync failed"))
+            logger.warning("keboola semantic layer refresh (%s) reported an error: %s", trigger, result.get("error"))
+            return
+        _record_completion("ok", result)
+        logger.info(
+            "keboola semantic layer refresh (%s): run_id=%s created_or_updated=%s pruned=%s sources=%s",
+            trigger,
+            run_id,
+            result.get("created_or_updated"),
+            result.get("pruned"),
+            len(result.get("sources") or []),
         )
-
-    _refresh_claimed = True
-    try:
-        async with _refresh_lock:
-            run_id = uuid.uuid4().hex[:8]
-            started_at = datetime.now(timezone.utc).isoformat()
-            _refresh_state["run_id"] = run_id
-            _refresh_state["started_at"] = started_at
-            try:
-                result = await asyncio.to_thread(sync_semantic_layer)
-            except MasterTokenRequiredError as e:
-                _record_completion("error", str(e))
-                raise HTTPException(status_code=400, detail=str(e))
-            except Exception as e:
-                _record_completion("error", str(e))
-                raise
-            else:
-                # sync_semantic_layer() reports config/upstream failures (missing
-                # credentials, Storage/Metastore API errors) as a returned
-                # {"status": "error"} dict rather than an exception — those must
-                # be recorded and surfaced the same way as the exception paths
-                # above, or the admin UI shows a false "OK" after a failed sync.
-                if result.get("status") == "error":
-                    message = result.get("error", "Keboola semantic layer sync failed")
-                    _record_completion("error", message)
-                    # Only a real upstream failure is a Bad Gateway. "Nothing is
-                    # configured yet" and "Keboola refused this token" are the
-                    # admin's to fix, and answering 502 for them reads as an Agnes
-                    # outage — the exact misdiagnosis this endpoint kept causing.
-                    raise HTTPException(status_code=_status_for_error_code(result.get("code")), detail=message)
-                _record_completion("ok", result)
-            finally:
-                _refresh_state["run_id"] = None
-                _refresh_state["started_at"] = None
-    finally:
-        _refresh_claimed = False
-
-    logger.info(
-        "keboola semantic layer refresh: run_id=%s status=%s created_or_updated=%s "
-        "pruned=%s skipped_unresolved_table=%s skipped_foreign_alias=%s "
-        "skipped_embedded_comment=%s sources=%s",
-        run_id,
-        result.get("status"),
-        result.get("created_or_updated"),
-        result.get("pruned"),
-        result.get("skipped_unresolved_table"),
-        result.get("skipped_foreign_alias"),
-        result.get("skipped_embedded_comment"),
-        len(result.get("sources") or []),
-    )
-    log_safe(
-        user_id=user.get("id"),
-        action="run_keboola_semantic_layer_refresh",
-        resource="job:keboola-semantic-layer-refresh",
-        params={
-            "run_id": run_id,
-            "status": result.get("status"),
-            "created_or_updated": result.get("created_or_updated"),
-            "pruned": result.get("pruned"),
-            "sources": len(result.get("sources") or []),
-        },
-    )
-    return {**result, "run_id": run_id, "started_at": started_at}
 
 
 @router.get("/api/admin/semantic-layer/coverage")

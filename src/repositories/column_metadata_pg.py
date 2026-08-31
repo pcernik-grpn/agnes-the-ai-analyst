@@ -28,6 +28,7 @@ class ColumnMetadataPgRepository(ColumnMetadataImportMixin):
         description: Optional[str] = None,
         confidence: str = "manual",
         source: str = "manual",
+        source_ref: Optional[str] = None,
     ) -> dict:
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:
@@ -35,19 +36,20 @@ class ColumnMetadataPgRepository(ColumnMetadataImportMixin):
                 sa.text(
                     """INSERT INTO column_metadata
                        (table_id, column_name, basetype, description,
-                        confidence, source, updated_at)
-                       VALUES (:t, :c, :bt, :desc, :conf, :src, :now)
+                        confidence, source, source_ref, updated_at)
+                       VALUES (:t, :c, :bt, :desc, :conf, :src, :src_ref, :now)
                        ON CONFLICT (table_id, column_name) DO UPDATE SET
                          basetype = EXCLUDED.basetype,
                          description = EXCLUDED.description,
                          confidence = EXCLUDED.confidence,
                          source = EXCLUDED.source,
+                         source_ref = EXCLUDED.source_ref,
                          updated_at = EXCLUDED.updated_at"""
                 ),
                 {
                     "t": table_id, "c": column_name, "bt": basetype,
                     "desc": description, "conf": confidence, "src": source,
-                    "now": now,
+                    "src_ref": source_ref, "now": now,
                 },
             )
         return self.get(table_id, column_name)  # type: ignore[return-value]
@@ -69,6 +71,15 @@ class ColumnMetadataPgRepository(ColumnMetadataImportMixin):
                     "SELECT * FROM column_metadata WHERE table_id = :t ORDER BY column_name"
                 ),
                 {"t": table_id},
+            ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Mirrors ``ColumnMetadataRepository.list_all`` — every row, across
+        every table, for orphan detection (Block 5 of #1707)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT * FROM column_metadata ORDER BY table_id, column_name")
             ).mappings().all()
         return [dict(r) for r in rows]
 

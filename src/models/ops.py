@@ -78,6 +78,9 @@ class TableRegistry(Base):
     access_policy_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     access_policy_updated_by: Mapped[str | None] = mapped_column(String, nullable=True)
     policy_mapping: Mapped[bool] = mapped_column(Boolean, server_default=text("FALSE"), nullable=False)
+    # v125: dedup bookkeeping for wave 2's headless semantic-model
+    # auto-drafting session. NULL = no draft pending for this table.
+    semantic_draft_pending_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_table_registry_source_type", "source_type"),

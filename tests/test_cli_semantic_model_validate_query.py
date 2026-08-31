@@ -1,9 +1,10 @@
 """CLI tests for `agnes semantic-model validate-query` (query-validation
 engine wiring, parity spec §5).
 
-Not to be confused with `tests/test_cli_semantic_model.py`, which covers the
-admin document CRUD + schema-validate surface (`agnes admin semantic-model
-...`) — this is the non-admin query validator.
+Not to be confused with its sibling `agnes semantic-model validate`, which
+schema-checks a DOCUMENT file offline — covered, along with the admin document
+CRUD surface (`agnes admin semantic …`), in `tests/test_cli_semantic_model.py`
+and `tests/test_cli_semantic_consolidation.py`. This is the query validator.
 """
 
 from __future__ import annotations
@@ -46,6 +47,10 @@ _VALID_RESULT = {
     "mixed_dialect_warning": None,
     "locally_executable": True,
     "summary": "Query references 1 dataset(s) and 1 metric(s) from the semantic layer; no constraint violations detected.",
+    "detection": (
+        "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+        "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+    ),
 }
 
 
@@ -63,6 +68,25 @@ class TestValidateQuery:
             result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT 1", "--json"])
         assert result.exit_code == 0
         assert json.loads(result.stdout) == _VALID_RESULT
+
+    def test_non_json_output_carries_the_detection_caveat(self):
+        """Issue #1707 finding A18: the dataset/metric list printed above this
+        line is a best-effort text match, not a confirmed fact -- the human
+        (non-`--json`) output must say so unmissably, not bury it in
+        `summary` or omit it."""
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, _VALID_RESULT)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT SUM(revenue) FROM orders"])
+        assert result.exit_code == 0
+        assert "best-effort text match" in result.output.lower()
+
+    def test_non_json_output_falls_back_when_server_omits_detection(self):
+        """An older server without the `detection` field must still get a
+        caveat -- never silently drop it just because the key is absent."""
+        body = {k: v for k, v in _VALID_RESULT.items() if k != "detection"}
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT SUM(revenue) FROM orders"])
+        assert result.exit_code == 0
+        assert "best-effort text match" in result.output.lower()
 
     def test_error_violation_prints_invalid_and_reason(self):
         body = {
@@ -112,6 +136,22 @@ class TestValidateQuery:
             result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT mrr FROM orders"])
         assert result.exit_code == 0
         assert "not locally executable" in result.output.lower()
+
+    def test_locally_executable_false_names_the_offending_metrics(self):
+        """A vague "one or more used metrics" leaves the analyst to work out
+        which one. The server now returns the names, so print them."""
+        body = {
+            **_VALID_RESULT,
+            "used_metrics": ["revenue", "mrr"],
+            "locally_executable": False,
+            "not_executable_metrics": ["mrr"],
+        }
+        with patch("cli.commands.semantic_model.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["semantic-model", "validate-query", "SELECT revenue, mrr FROM orders"])
+        assert result.exit_code == 0
+        warning = next(line for line in result.output.splitlines() if "not locally executable" in line.lower())
+        assert "mrr" in warning
+        assert "revenue" not in warning, warning
 
     def test_no_semantic_model_prints_message_without_failing(self):
         body = {

@@ -39,7 +39,7 @@ import duckdb
 from fastapi import Depends, HTTPException, Request, status
 
 from app.auth.dependencies import _get_db, get_current_user
-from app.auth.session_principal import PRINCIPAL_TYPES, Principal
+from app.auth.session_principal import AgentPrincipal, PRINCIPAL_TYPES, Principal, SessionPrincipal
 from app.resource_types import ResourceType
 from src.db import SYSTEM_ADMIN_GROUP
 
@@ -462,7 +462,18 @@ def can_access_session(
     Must NOT call is_user_admin / can_access (PR checklist item) — both a
     ``SessionPrincipal``'s and an ``AgentPrincipal``'s ``intersection`` were
     already built without the admin short-circuit, so consulting either here
-    would re-introduce god-mode through the back door."""
+    would re-introduce god-mode through the back door.
+
+    A ``ProducerPrincipal`` (or any future ``Principal`` outside this pair)
+    has no ``intersection`` at all — its authority is enforced elsewhere
+    (see ``app.auth.producer_token``'s module docstring) via a small,
+    explicit, per-endpoint scope check, never this generic grant-table
+    primitive. Fail closed here rather than raise ``AttributeError`` — this
+    is what makes ``require_resource_access``/``require_collection_access``
+    403 such a principal cleanly on every route that doesn't know it
+    exists, instead of 500ing."""
+    if not isinstance(principal, (SessionPrincipal, AgentPrincipal)):
+        return False
     return resource_id in principal.intersection.get(resource_type, frozenset())
 
 
@@ -539,6 +550,106 @@ def require_admin(
     return user
 
 
+def require_admin_or_producer(
+    user=Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Like :func:`require_admin`, but ALSO accepts a ``ProducerPrincipal``
+    — the corpus-extraction producer's own ingest/corrections callback
+    credential (see ``app.auth.producer_token``). Used by
+    ``POST /api/facts/ingest`` and ``GET /api/facts/corrections``, neither
+    of which has a single path-scoped resource id to check up front the
+    way ``require_admin_or_producer_connection`` / ``require_collection_
+    write_or_producer_access`` below do — each of those two routes applies
+    its own body-level (ingest) or documented (corrections) scope handling
+    instead.
+    """
+    from app.auth.session_principal import ProducerPrincipal
+
+    if isinstance(user, ProducerPrincipal):
+        return user
+    return require_admin(user=user, conn=conn)
+
+
+def require_admin_or_producer_connection(path_template: str):
+    """Dependency factory: admin (see :func:`require_admin`) OR a
+    ``ProducerPrincipal`` whose own ``connection_id`` matches the path's
+    resolved connection id — the corpus-map / scopes handoff a
+    corpus-extraction producer calls back into (see
+    ``app.auth.producer_token``). A producer token minted for a DIFFERENT
+    connection, or any other non-admin credential, 403s.
+    """
+
+    def dep(
+        request: Request,
+        user=Depends(get_current_user),
+        conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    ):
+        from app.auth.session_principal import ProducerPrincipal
+
+        if isinstance(user, ProducerPrincipal):
+            try:
+                resource_id = path_template.format(**request.path_params)
+            except KeyError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        f"require_admin_or_producer_connection: path_template {path_template!r} "
+                        f"references missing path_param {e}"
+                    ),
+                )
+            if resource_id != user.connection_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="producer_wrong_connection",
+                )
+            return user
+        return require_admin(user=user, conn=conn)
+
+    return dep
+
+
+def require_collection_write_or_producer_access(path_template: str):
+    """Dependency factory mirroring :func:`require_collection_access`, but
+    ALSO accepting a ``ProducerPrincipal`` scoped to this collection (the
+    corpus-extraction producer's upload callback — see
+    ``app.auth.producer_token``). Used ONLY by
+    ``POST /api/collections/{collection_id}/files`` — every OTHER
+    collection route keeps ``require_collection_access`` unchanged, so a
+    producer token that authenticates here still 403s on
+    read/delete/reingest/preview/raw for the SAME collection.
+    """
+    base_dep = require_collection_access(path_template)
+
+    def dep(
+        request: Request,
+        user=Depends(get_current_user),
+        conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    ):
+        from app.auth.session_principal import ProducerPrincipal
+
+        if isinstance(user, ProducerPrincipal):
+            try:
+                resource_id = path_template.format(**request.path_params)
+            except KeyError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        f"require_collection_write_or_producer_access: path_template {path_template!r} "
+                        f"references missing path_param {e}"
+                    ),
+                )
+            if resource_id not in user.collection_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied to collection {resource_id!r}",
+                )
+            return user
+        return base_dep(request=request, user=user, conn=conn)
+
+    return dep
+
+
 def require_agent_profiles_enabled() -> None:
     """Dependency: 403 the whole request when the instance-level Agent
     profiles toggle is off.
@@ -586,6 +697,31 @@ def require_facts_enabled() -> None:
 
     if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="facts_disabled")
+
+
+def require_extraction_webhook_enabled() -> None:
+    """Dependency: 404 the whole request when ``extraction_webhook.enabled``
+    is off.
+
+    Mounted as a router-level ``dependencies=[...]`` entry on
+    ``app/api/sharepoint_webhooks.py``'s router — same "close the whole
+    surface" posture as :func:`require_facts_enabled`, `404` rather than
+    `403`: a caller (Microsoft Graph) that never had a route to discover
+    should see "not found", not "forbidden". This is the ONLY gate on that
+    router — it carries no session/PAT auth (Graph is the caller; its own
+    ``clientState`` is verified inside the handler body, never a
+    ``Depends`` chain).
+
+    ``extraction_webhook`` is its OWN top-level config section, deliberately
+    NOT nested under ``extraction`` — see the ``Switch`` entry's own comment
+    in ``app/switches.py`` for why (mixing this always-editable switch into
+    the locked ``extraction`` section would trip
+    ``test_no_section_mixes_editable_and_locked_switches``).
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("extraction_webhook", "enabled", env_var="AGNES_EXTRACTION_WEBHOOK_ENABLED", default=False):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction_webhook_disabled")
 
 
 def access_denied_detail(resource_type: ResourceType, resource_id: str) -> str:

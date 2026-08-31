@@ -94,6 +94,46 @@ class SemanticModelsRepository:
         )
         return self.get(id)  # type: ignore[return-value]
 
+    def update_document(
+        self,
+        model_id: str,
+        *,
+        name: str,
+        description,
+        document: str,
+        document_json,
+        spec_version: str,
+        content_hash: str,
+        status: str = "valid",
+        validation_errors=None,
+        validated_at,
+    ) -> Dict[str, Any]:
+        """Rewrite an existing row's mutable fields in place — a plain
+        UPDATE, not ``upsert``'s DELETE+INSERT. Preserves everything
+        ``upsert`` has no parameter for: ``id``/``source``/``source_ref``
+        (provenance) and, on Postgres, ``sync_mode``/detach-tracking. Used
+        by ``apply_manual_model`` and ``update_semantic_model`` when editing
+        an already-detached model (F3), so the edit doesn't silently reset
+        it to ``sync_mode='synced'``."""
+        self.conn.execute(
+            "UPDATE semantic_models SET name = ?, description = ?, document = ?, document_json = ?, "
+            "spec_version = ?, content_hash = ?, status = ?, validation_errors = ?, validated_at = ?, "
+            "updated_at = current_timestamp WHERE id = ?",
+            [
+                name,
+                description,
+                document,
+                json.dumps(document_json) if document_json is not None else None,
+                spec_version,
+                content_hash,
+                status,
+                json.dumps(validation_errors) if validation_errors is not None else None,
+                validated_at,
+                model_id,
+            ],
+        )
+        return self.get(model_id)  # type: ignore[return-value]
+
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(f"SELECT {self._SELECT} FROM semantic_models WHERE id = ?", [model_id]).fetchone()
         return self._decode(row)
@@ -119,6 +159,52 @@ class SemanticModelsRepository:
         sql += " ORDER BY name"
         return [self._decode(r) for r in self.conn.execute(sql, params).fetchall()]
 
+    def count_valid(self) -> int:
+        """How many rows are usable as a semantic model — ``status='valid'``
+        with a parsed ``document_json``.
+
+        The cheap existence gate for the hot path: ``POST /api/query`` asks
+        "does this instance have a semantic layer at all?" on every single
+        statement, and ``list_all()`` would drag every row's ``document`` +
+        ``document_json`` across for an answer that is one integer.
+
+        Deliberately a *superset* of what ``_accessible_valid_documents``
+        will actually load — an empty-object ``document_json`` counts here
+        and yields nothing there. Over-counting only costs the load that
+        then returns nothing; under-counting would switch the advisory off
+        silently, which is why the predicate is not narrowed further.
+        """
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_models WHERE status = 'valid' AND document_json IS NOT NULL"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def counts_by_provenance(self) -> Dict[tuple[str, Optional[str]], int]:
+        """How many rows each ``(source, source_ref)`` owns, in one query.
+
+        "Owns" means exactly one thing: the row is stamped with that
+        provenance. It is deliberately NOT "a sync of this source would
+        delete this many" — the prune is narrower than ownership on both
+        counts (Postgres excludes ``sync_mode='detached'`` rows, and a
+        ``safe_prune`` source skips the prune entirely when a run yields no
+        valid document), so equating the two would overstate what a sync can
+        reach. This is the read-time answer to "did this source import
+        anything", which no column on ``semantic_sources`` records (that
+        table is a frozen pre-A3 pair; see issue #1707).
+
+        Every row under the provenance counts, valid or invalid: an invalid
+        document is still something this source brought in, and whether it
+        parses is what ``invalid_models`` in the health report is for.
+
+        Grouped rather than one COUNT per source: the caller has a list of
+        sources and would otherwise issue N queries to render one page.
+        A scope with no rows is simply absent from the mapping.
+        """
+        rows = self.conn.execute(
+            "SELECT source, source_ref, COUNT(*) FROM semantic_models GROUP BY source, source_ref"
+        ).fetchall()
+        return {(r[0], r[1]): int(r[2]) for r in rows}
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         self.conn.execute("DELETE FROM data_package_semantic_models WHERE model_id = ?", [model_id])
@@ -136,6 +222,48 @@ class SemanticModelsRepository:
         for model_id in ids:
             self.delete(model_id)
         return ids
+
+    def detach(self, model_id: str, *, by: str, base_hash: str) -> Dict[str, Any]:
+        """F3 detach is Postgres-only (A3 ratchet — migrations/versions/
+        0090_semantic_models_detach.py has no DuckDB counterpart); this
+        DuckDB repo gains no capability that depends on it."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def reattach(self, model_id: str) -> Dict[str, Any]:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def update_source_content_hash(self, model_id: str, content_hash: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def mark_source_missing(self, model_id: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def clear_source_missing(self, model_id: str) -> None:
+        """Postgres-only sibling of :meth:`detach` — see that docstring."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
+
+    def list_detached_with_health_state(self) -> List[Dict[str, Any]]:
+        """Postgres-only sibling of :meth:`detach` — see that docstring.
+
+        The query it mirrors reads ``sync_mode``/``source_missing_since``/
+        ``source_content_hash``, none of which exist on this backend, so an
+        empty list would be a lie rather than a fail-clean answer."""
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("semantic_model_detach")
 
     def link_package(self, package_id: str, model_id: str) -> None:
         self.conn.execute(

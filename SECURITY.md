@@ -145,7 +145,11 @@ ALL`, `no-new-privileges`, resource limits, no Docker socket inside —
 `app/chat/docker_provider.py`); under the default `kai-agent` provider, the
 embedded engine's own remote execution sandbox. The in-sandbox
 `pre_tool_use.py` hook is **advisory only** (fail-open, Bash-only, agent-
-rewritable); the enforcing egress layers sit outside the sandbox's reach —
+rewritable). Under the `docker` provider its `ask` and `deny` verdicts are at
+least acted on — the runner re-runs it from an SDK `PreToolUse` hook and
+suspends the call for a human decision, and the same gate confirms mutating
+MCP tool calls (see "The agent's tool calls are confirmed, with limits") — but
+the enforcing egress layers sit outside the sandbox's reach —
 the docker provider's `chat.docker_egress_mode` (`none` joins an internal
 network with no route off the host; `allowlist` adds the egress-proxy
 sidecar, whose compose-owned `EGRESS_ALLOW_HOSTS` is the enforcing copy) and,
@@ -213,18 +217,36 @@ Combined with the next item, a successful injection can use the agent's tools wi
 the session's authority. It cannot exceed that authority — the server re-derives
 it — but within it, it acts as the user.
 
-### The agent runs without per-tool approval
+### The agent's tool calls are confirmed, with limits
 
 Inside the sandbox the agent runs with `permission_mode="bypassPermissions"` and
-the full tool set (`app/chat/runner.py`). There is no human-in-the-loop approval
-for individual tool calls, no command policy, and no allow/deny tool list. The
-only in-turn limits are a per-turn tool-call budget and an idle watchdog.
+the full tool set (`app/chat/runner.py`). A subset of its calls does take a
+human-in-the-loop confirmation: under the `docker` provider an in-process
+`PreToolUse` gate suspends the call and raises an approval card for a Bash
+command the workspace hook flags `ask` (recursive deletes, force pushes,
+`agnes admin …` and `agnes app …` mutations) and for any MCP tool not on the
+runner's read-only allowlist; under the `kai-agent` provider the engine raises
+its own approval events onto the same card. Everything else runs unasked, and
+there is still no allow/deny tool list. The other in-turn limits are a per-turn
+tool-call budget and an idle watchdog.
 
-**The sandbox is the boundary.** The bundled workspace `PreToolUse` hook blocks
-some destructive and enumerating commands, but it is advisory: it is fail-open by
-construction, it only inspects Bash, and it is a file inside the workspace the
-agent could modify. Treat it as defense-in-depth, never as a control. The VM-level
-egress deny-list survives its removal.
+Three scoping caveats, all deliberate:
+
+- **The gate is only as armed as the SDK allows.** Where the installed
+  `claude-agent-sdk` supports no `PreToolUse` hook at all, nothing is
+  registered and every tool call — Bash and MCP — runs unasked; the runner logs
+  it loudly. Where the SDK's `HookMatcher` takes no `timeout`, the gate cannot
+  block safely and instead DENIES what it would have asked about.
+- **It gates tool calls, not outcomes.** The same mutation reached another way
+  — `curl` at the in-sandbox relay with the session's scoped ticket — never
+  passes the gate. The server's own RBAC still applies; the confirmation does
+  not.
+- **The bundled workspace `PreToolUse` hook is advisory.** It is fail-open by
+  construction, it only inspects Bash, and it is a file inside the workspace the
+  agent could modify. Treat it as defense-in-depth, never as a control.
+
+**The sandbox is the boundary.** The VM-level egress deny-list survives the
+hook's removal.
 
 ### Admin is god-mode
 

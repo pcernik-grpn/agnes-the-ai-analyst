@@ -334,11 +334,21 @@ class TestCheckDialects:
 
     def test_no_used_metrics_means_no_dialects_and_locally_executable(self):
         result = check_dialects(_fixture_document(), [], target_engine="duckdb")
-        assert result == {"sql_dialects": [], "mixed_dialect_warning": None, "locally_executable": True}
+        assert result == {
+            "sql_dialects": [],
+            "mixed_dialect_warning": None,
+            "locally_executable": True,
+            "not_executable_metrics": [],
+        }
 
     def test_no_model_document_defaults_safe(self):
         result = check_dialects({}, ["revenue"], target_engine="duckdb")
-        assert result == {"sql_dialects": [], "mixed_dialect_warning": None, "locally_executable": True}
+        assert result == {
+            "sql_dialects": [],
+            "mixed_dialect_warning": None,
+            "locally_executable": True,
+            "not_executable_metrics": [],
+        }
 
     def test_ansi_only_metric_is_executable_on_any_target_engine(self):
         # Devin Review on PR #1319: ANSI_SQL is the universally accepted
@@ -398,6 +408,35 @@ class TestCheckDialects:
         result = check_dialects(document, ["revenue", "orders_count"], target_engine="duckdb")
         assert result["mixed_dialect_warning"] is None
 
+    def test_not_executable_metrics_names_only_the_offenders(self):
+        """`locally_executable` is one bool for the whole statement, so a
+        caller that wants to say WHICH metric is unusable had to name every
+        used metric — turning one bad metric into a warning against all of
+        them. The names come back alongside the bool."""
+        result = check_dialects(_fixture_document(), ["revenue", "customer_lifetime_value"], target_engine="duckdb")
+        assert result["locally_executable"] is False
+        assert result["not_executable_metrics"] == ["customer_lifetime_value"]
+
+    def test_not_executable_metrics_is_empty_when_everything_composes(self):
+        result = check_dialects(_fixture_document(), ["revenue"], target_engine="duckdb")
+        assert result["locally_executable"] is True
+        assert result["not_executable_metrics"] == []
+
+    def test_a_metric_whose_dialect_entries_carry_no_body_is_named_too(self):
+        """The label-only case (PR #1327) sets `locally_executable` False from
+        a second loop — it must contribute its name like any other offender,
+        and must not stop at the first one."""
+        document = {
+            "metrics": [
+                {"name": "revenue", "expression": {"dialects": [{"dialect": "DUCKDB", "expression": "  "}]}},
+                {"name": "orders_count", "expression": {"dialects": [{"dialect": "DUCKDB"}]}},
+                {"name": "clean", "expression": {"dialects": [{"dialect": "DUCKDB", "expression": "COUNT(*)"}]}},
+            ]
+        }
+        result = check_dialects(document, ["revenue", "orders_count", "clean"], target_engine="duckdb")
+        assert result["locally_executable"] is False
+        assert result["not_executable_metrics"] == ["revenue", "orders_count"]
+
     def test_case_variant_dialect_labels_count_as_one_dialect(self):
         # Devin Review on PR #1319: labels come from untrusted imported text --
         # "DUCKDB" and "duckdb" are one dialect, in the list and in the warning.
@@ -439,6 +478,18 @@ class TestValidateQuery:
         assert result["sql_dialects"] == ["SNOWFLAKE"]
         # Advisory only -- a dialect trap never flips validity by itself.
         assert result["valid"] is True
+
+    def test_not_executable_metrics_unions_across_documents(self):
+        """The per-document offender lists become one de-duplicated union, in
+        first-seen order, like every other list this function composes."""
+        sql = "SELECT revenue, customer_lifetime_value FROM orders JOIN customers ON 1=1"
+        result = validate_query(sql, [_fixture_document(), _fixture_document()], target_engine="duckdb")
+        assert result["locally_executable"] is False
+        assert result["not_executable_metrics"] == ["customer_lifetime_value"]
+
+    def test_not_executable_metrics_is_empty_on_a_clean_query(self):
+        result = validate_query("SELECT SUM(amount) AS revenue FROM orders", [_fixture_document()])
+        assert result["not_executable_metrics"] == []
 
     def test_dialect_mix_warning_surfaces_in_summary(self):
         sql = (

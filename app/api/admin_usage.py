@@ -15,10 +15,10 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
-from typing import Literal, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.auth.access import require_admin
@@ -31,6 +31,7 @@ from connectors.llm.exceptions import (
     LLMTimeoutError,
 )
 from connectors.llm.factory import create_vertex_extractor, vertex_config_or_none
+from src.llm_pricing import cost_usd, resolve_price
 from src.repositories import (
     audit_repo,
     usage_repo,
@@ -442,3 +443,137 @@ def prune_usage(
         logger.exception("audit_log write failed for usage.prune; continuing")
 
     return {"status": "ok", "retention_days": retention, "deleted": deleted, "remaining": after}
+
+
+_CHAT_COST_WINDOWS = {"1d": 1, "7d": 7, "30d": 30, "all": 0}
+
+
+@router.get("/chat-cost")
+def chat_cost(
+    request: Request,
+    window: str = Query("7d", description="1d|7d|30d|all"),
+    user: Optional[str] = Query(None, description="Restrict to one session owner's email."),
+    limit: int = Query(50, ge=1, le=500, description="Max (session, model) rows."),
+    admin: dict = Depends(require_admin),
+):
+    """Measured cost of chat sessions, split by cached vs uncached tokens.
+
+    The point of this route is that it MEASURES rather than models. A cost
+    comparison between two agent workflows (say, one that loads business
+    definitions from a governed semantic layer once per session against one
+    that carries them by hand) turns almost entirely on how a re-read of a
+    large cached prefix is priced: at the full input rate it dominates the
+    bill, at the real cached rate (~0.1x) it nearly vanishes. Both figures
+    come from ``chat_messages`` here, per model, so nobody has to guess.
+
+    ``cache_accounting`` per row, and ``notes`` overall, say out loud when a
+    zero is not a measurement: rows written before migration 0092 carry no
+    cache figures at all, and a "0 cached tokens" that means "unrecorded" is
+    exactly the mistake this route exists to stop.
+    """
+    if window not in _CHAT_COST_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"window must be one of {sorted(_CHAT_COST_WINDOWS)}")
+    days = _CHAT_COST_WINDOWS[window]
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+
+    repo = getattr(request.app.state, "chat_repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="chat_unavailable: this instance has no chat repository")
+
+    # RequiresPostgresBackend deliberately surfaces: app/main.py turns it into
+    # a typed 501 (the prompt-cache columns are Postgres-only under A3), which
+    # is the honest answer here — never cache-blind zeros.
+    rows = repo.cost_breakdown(since=since, user_email=user, limit=limit)
+
+    sessions: list[dict[str, Any]] = []
+    totals: dict[str, Any] = {
+        "messages": 0,
+        "cache_recorded_messages": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    for r in rows:
+        row_cost = cost_usd(
+            model=r.get("model"),
+            input_tokens=int(r.get("tokens_in") or 0),
+            output_tokens=int(r.get("tokens_out") or 0),
+            cache_read_tokens=int(r.get("cache_read_tokens") or 0),
+            cache_creation_tokens=int(r.get("cache_creation_tokens") or 0),
+        )
+        messages = int(r.get("messages") or 0)
+        recorded = int(r.get("cache_recorded_messages") or 0)
+        if recorded == 0:
+            accounting = "unavailable"
+        elif recorded < messages:
+            accounting = "partial"
+        else:
+            accounting = "recorded"
+        price = resolve_price(r.get("model"))
+        sessions.append(
+            {
+                "session_id": r.get("session_id"),
+                "user_email": r.get("user_email"),
+                "model": r.get("model"),
+                "priced_as": {
+                    "input_per_mtok": price.input_per_mtok,
+                    "output_per_mtok": price.output_per_mtok,
+                    "cache_read_per_mtok": round(price.cache_read_per_mtok, 6),
+                    "cache_write_per_mtok": round(price.cache_write_per_mtok, 6),
+                },
+                "messages": messages,
+                "cache_recorded_messages": recorded,
+                "cache_accounting": accounting,
+                "input_tokens": int(r.get("tokens_in") or 0),
+                "output_tokens": int(r.get("tokens_out") or 0),
+                "cache_read_tokens": int(r.get("cache_read_tokens") or 0),
+                "cache_creation_tokens": int(r.get("cache_creation_tokens") or 0),
+                "cost_usd": round(row_cost, 6),
+                "last_message_at": r.get("last_message_at"),
+            }
+        )
+        totals["messages"] += messages
+        totals["cache_recorded_messages"] += recorded
+        totals["input_tokens"] += int(r.get("tokens_in") or 0)
+        totals["output_tokens"] += int(r.get("tokens_out") or 0)
+        totals["cache_read_tokens"] += int(r.get("cache_read_tokens") or 0)
+        totals["cache_creation_tokens"] += int(r.get("cache_creation_tokens") or 0)
+        totals["cost_usd"] += row_cost
+
+    totals["cost_usd"] = round(totals["cost_usd"], 6)
+    read_input = totals["input_tokens"] + totals["cache_read_tokens"] + totals["cache_creation_tokens"]
+    # Share of everything the model READ this window that came from cache.
+    # A high share is the signal that a per-turn context re-read is cheap —
+    # the term a hand-built cost model is most likely to price at 10x.
+    totals["cached_input_share"] = round(totals["cache_read_tokens"] / read_input, 4) if read_input else None
+
+    notes = []
+    if totals["messages"] and totals["cache_recorded_messages"] < totals["messages"]:
+        notes.append(
+            f"{totals['messages'] - totals['cache_recorded_messages']} of {totals['messages']} assistant "
+            "messages carry no prompt-cache figures (written before migration 0092). Their cached tokens "
+            "are unknown, NOT zero, so cost_usd for those rows is a floor rather than a measurement."
+        )
+    if not rows:
+        notes.append("No assistant messages in this window.")
+
+    try:
+        audit_repo().log(
+            user_id=admin.get("id"),
+            action="usage.chat_cost",
+            params={"window": window, "user": user, "row_count": len(sessions)},
+            result="success",
+            client_kind="web",
+        )
+    except Exception:
+        logger.exception("audit_log write failed for usage.chat_cost; continuing")
+
+    return {
+        "window": window,
+        "since": since,
+        "totals": totals,
+        "sessions": sessions,
+        "notes": notes,
+    }

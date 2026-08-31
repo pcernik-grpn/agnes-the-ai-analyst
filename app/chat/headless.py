@@ -156,6 +156,7 @@ async def run_one_shot(
     prompt: str,
     timeout_s: int,
     owner_user_id: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a FRESH session, send ``prompt``, and wait up to
     ``timeout_s`` seconds for the turn to complete.
@@ -174,11 +175,25 @@ async def run_one_shot(
     triggers an artifact harvest (V1b Task 5, C4) scoped to that owner.
     Callers that don't pass it simply get no harvest, same as before this
     parameter existed.
+
+    ``profile`` (optional, keyword-only) — a registered chat profile slug
+    (``app.chat.profiles``) to spawn the session with, for callers with no
+    ``agent_id`` of their own (e.g. the semantic-layer auto-draft sweep,
+    which authenticates as a system identity rather than a named agent).
+    ``None`` (the default, every pre-existing caller) leaves session
+    spawning exactly as before.
+
+    ``surface`` is always ``Surface.API`` here, never a caller-supplied
+    parameter — every headless one-shot run is unattended by construction,
+    and ``Surface.API`` is what makes ``ChatManager._resolve_if_unattended``
+    resolve a question/approval instantly instead of waiting out the full
+    approval timeout.
     """
     session = await manager.create_session(
         user_email=user_email,
         surface=Surface.API,
         agent_id=agent_id,
+        profile=profile,
     )
     chat_id = session.id
     sink = HeadlessSink()

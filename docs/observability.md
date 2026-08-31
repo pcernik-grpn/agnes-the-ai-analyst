@@ -63,6 +63,50 @@ nothing until an admin opts in. See `src/audit_retention.py` for the
 dispatcher and `config/instance.yaml.example` for the full `retention:`
 block.
 
+## Chat cost — measured, not modelled
+
+```bash
+agnes admin usage chat-cost                      # last 7 days
+agnes admin usage chat-cost --window 30d --json
+agnes admin usage chat-cost --user someone@example.com
+```
+
+Mirrors `GET /api/admin/telemetry/chat-cost` (admin-only). One row per
+`(session, model)` with uncached input, output, cache reads and cache writes
+reported **separately**, priced by `src/llm_pricing.py` at the rates of the
+model that session actually ran on.
+
+Why it is split that way: prompt caching is the largest single lever on the
+cost of a long agent session. A cached read costs ~0.1x the input rate and a
+cache write ~1.25x, so a workload built around one large stable prefix and
+many short turns — which is what every agent surface here is — is cheap in
+reality and looks expensive in any cost model that charges those re-reads at
+the full input rate. That error is roughly 10x on the dominant term, which is
+more than enough to reverse a conclusion. Read the numbers instead:
+`cached_input_share` says how much of everything the model read came from
+cache.
+
+Two honesty markers, both load-bearing:
+
+- **`cache_accounting`** per row is `recorded`, `partial`, or `unavailable`.
+  Rows written before the prompt-cache columns existed carry no figures at
+  all; their cached tokens are *unknown*, not zero, and their `cost_usd` is
+  a floor. A cache-blind zero read as a measurement is exactly the mistake
+  this endpoint exists to prevent.
+- **`priced_as`** per row states the four rates used, so any figure here can
+  be re-derived rather than taken on trust.
+
+The prompt-cache columns are Postgres-only (`migrations/versions/0092_*`, A3
+freeze), so on the frozen DuckDB app-state backend this route answers a typed
+`501 requires_postgres_backend` rather than serving zeros.
+
+Note the separate, deliberately coarser surface: the daily spend cap
+(`chat.daily_anthropic_spend_usd`) prices the day's tokens at the most
+expensive general-purpose tier because it reads a two-bucket counter with no
+model attached — a guardrail that must guess should guess in the direction
+that stops sooner. It is a soft guardrail, not a billing ledger; this
+endpoint is the ledger.
+
 ## Audit log volume — how much does audit logging cost you
 
 The audit-coverage work (wave 1 + wave 2 of the audit-full-coverage plan)

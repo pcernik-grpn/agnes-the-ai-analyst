@@ -232,6 +232,68 @@ def test_ingest_omitted_anonymization_is_fine_pre_pg(facts_client):
 
 
 # ---------------------------------------------------------------------------
+# `llm_usage` block on POST /api/facts/ingest (cost-visibility) — additive,
+# optional, strictly typed (same posture as `anonymization` above), validated
+# BEFORE the PG-only repo call, so a malformed block 422s cleanly even on the
+# DuckDB backend.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_malformed_llm_usage_negative_token_count_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"input_tokens": -5}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_malformed_llm_usage_wall_seconds_wrong_type_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"wall_seconds": "not-a-number"}},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_malformed_llm_usage_models_wrong_type_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"llm_usage": {"models": "claude-sonnet-4"}},  # must be a list, not a bare string
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 422
+
+
+def test_ingest_omitted_llm_usage_is_fine_pre_pg(facts_client):
+    """No `llm_usage` key at all — the field is optional; the request still
+    validates and only fails past the gate at the PG-only repo call, same as
+    every other bare ingest request against the DuckDB backend."""
+    r = facts_client["client"].post("/api/facts/ingest", json={}, headers=_auth(facts_client["admin_token"]))
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_well_formed_llm_usage_is_fine_pre_pg(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "llm_usage": {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_read_input_tokens": 50,
+                "cache_creation_input_tokens": 5,
+                "models": ["claude-sonnet-4"],
+                "documents": 3,
+                "wall_seconds": 4.2,
+            }
+        },
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text  # cleared validation; fails clean past it, same as every other body
+
+
+# ---------------------------------------------------------------------------
 # anonymize-fail-closed gate: refuse a batch that carries claims for a
 # corpus whose SharePoint scope is anonymize-marked unless the batch's own
 # `anonymization` block declares it. Runs BEFORE the PG-only `facts_repo()`
@@ -332,3 +394,212 @@ def test_ingest_lookup_failure_refuses_never_falls_through_to_accept(facts_clien
     )
     assert r.status_code == 503, r.text
     assert r.json()["detail"]["reason"] == "anonymization_check_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Producer-scoped callback credential (`app.auth.producer_token`) — the
+# corpus-extraction producer's own narrow credential now accepted here
+# alongside admin/scheduler (replaces forwarding the scheduler shared
+# secret, see app/worker/kinds.py::_agnes_producer_callback_env). `/ingest`
+# additionally scope-checks every document's `corpus_id` against the
+# token's own `collection_ids`; `/corrections` is accepted unfiltered (see
+# `list_corrections`'s own docstring for why a cheap filter isn't possible
+# yet).
+# ---------------------------------------------------------------------------
+
+
+def _producer_token(collection_ids=(), connection_id="conn1") -> str:
+    from app.auth.producer_token import mint_producer_token
+
+    return mint_producer_token(connection_id=connection_id, collection_ids=list(collection_ids), ttl_seconds=3600)
+
+
+def test_ingest_producer_token_passes_the_gate_then_501s_on_duckdb(facts_client):
+    """Proven the same way the scheduler-token test above is: NOT
+    401/403 — the DuckDB-backed `facts_repo()` 501 is what's left past
+    the gate."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_a", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_ingest_rejects_a_document_outside_the_producer_tokens_scope(facts_client):
+    """Authorization-level gate (TCRD-...): a producer scoped to col_a must
+    never write into col_b just because it can reach this endpoint at
+    all — itemized 403, independent of the anonymize gate above."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_b", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "producer_corpus_out_of_scope"
+    assert detail["corpus_ids"] == ["col_b"]
+
+
+def test_ingest_rejects_a_mixed_batch_itemizing_only_the_out_of_scope_ids(facts_client):
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [
+                {"doc_id": "d1", "corpus_id": "col_a", "path": "f1.md"},
+                {"doc_id": "d2", "corpus_id": "col_b", "path": "f2.md"},
+                {"doc_id": "d3", "corpus_id": "col_c", "path": "f3.md"},
+            ]
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert sorted(r.json()["detail"]["corpus_ids"]) == ["col_b", "col_c"]
+
+
+def test_ingest_rejects_a_producer_batch_that_declares_no_corpus(facts_client):
+    """The `documents[]`-only scope check is bypassable on its own.
+
+    `FactsPgRepository.ingest_batch`'s doc_id ladder falls back to an
+    UNRESTRICTED, instance-wide scan (`_resolve_doc` tier 3b) precisely when
+    `documents[]` declared no `(doc_id, corpus_id)` pair — the documented
+    "documents may be omitted when every doc_id already resolves" replay flow
+    (spec §7.2). So a producer scoped to col_a could send `documents: []` plus
+    node evidence naming a doc_id that lives in col_b, and its claims would
+    anchor onto col_b's file. Nothing in the batch carries a `corpus_id` for
+    the per-document check to look at, so it passes.
+
+    403 rather than the 501 that means "past the gate" — which is what this
+    same request returned before the fix.
+    """
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d_in_col_b", "quote": "q"}]}],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["reason"] == "producer_batch_declares_no_corpus"
+
+
+def test_ingest_rejects_a_producer_full_documents_replace_with_no_corpus(facts_client):
+    """`full_documents` is replace mode — it DELETES the listed documents'
+    existing claims — and it is a bare list of doc_ids with no corpus_id
+    anywhere, so the same undeclared-corpus batch is a cross-collection
+    DELETE, not just a write."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [], "full_documents": ["d_in_col_b"]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["reason"] == "producer_batch_declares_no_corpus"
+
+
+def test_ingest_allows_a_producer_batch_that_declares_an_in_scope_corpus(facts_client):
+    """Declaring one in-scope `(doc_id, corpus_id)` pair is enough: from then
+    on `declared_corpus_ids` is a subset of the token's own scope (the
+    per-document check has already refused any other corpus_id), so tiers 1-3a
+    cannot resolve outside it and the batch proceeds — 501, i.e. past the
+    gate, not 403."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [{"doc_id": "d1", "corpus_id": "col_a", "path": "f.md"}],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d1", "quote": "q"}]}],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_undeclared_corpus_replay_still_works_for_an_admin(facts_client):
+    """The documents-omitted replay flow is the repository's documented
+    behaviour and dozens of existing callers depend on it. The new refusal is
+    scoped to a ProducerPrincipal only — an admin sending the same shape is
+    unaffected (501 past the gate, never 403)."""
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d_anywhere", "quote": "q"}]}],
+        },
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_producer_batch_with_no_doc_ids_at_all_is_not_refused(facts_client):
+    """Nothing to resolve, nothing to escape: a batch that references no
+    doc_id anywhere cannot reach the unrestricted scan, so the new gate must
+    not fire on it (over-refusing would break a legitimate empty/no-op call)."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [], "nodes": [{"id": "n1", "type": "client"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code != 403, r.text
+
+
+def test_ingest_producer_scope_gate_is_a_noop_for_admin(facts_client):
+    """An admin (or the scheduler token) has no `collection_ids` claim to
+    check against — unaffected by the new gate, unchanged 501 past it."""
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_anything", "path": "f.md"}]},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_corrections_get_accepts_a_producer_token(facts_client):
+    """No collection_ids scoping possible for this route today (documented
+    TODO on `list_corrections`) — accepted, then 501s on DuckDB exactly
+    like the scheduler-token/admin cases."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].get("/api/facts/corrections", headers=_auth(token))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_correction_write_routes_still_reject_a_producer_token(facts_client):
+    """The producer's scoped credential is off-surface for the
+    corrections WRITE routes entirely (not on `_PRODUCER_ALLOWED_SURFACE`
+    at all) — refused before this router's own `require_admin` gate ever
+    runs."""
+    token = _producer_token(["col_a"])
+    put = facts_client["client"].put(
+        "/api/facts/corrections/fact/f_x", json={"verdict": "wrong", "reason": "x"}, headers=_auth(token)
+    )
+    assert put.status_code == 403
+    delete = facts_client["client"].delete("/api/facts/corrections/fact/f_x", headers=_auth(token))
+    assert delete.status_code == 403
+
+
+def test_ingest_runs_still_rejects_a_producer_token(facts_client):
+    """`GET /api/facts/ingest-runs` is not one of the producer's five
+    allowed endpoints — off-surface 403, even though it sits on the same
+    `require_admin` family as `/ingest`."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].get("/api/facts/ingest-runs", headers=_auth(token))
+    assert r.status_code == 403
+
+
+def test_read_surface_still_rejects_a_producer_token(facts_client):
+    """The generic `Depends(get_current_user)` read routes (search/
+    neighbors/claims/facets) have no further gate of their own — exactly
+    the over-wide surface the fixed allowlist in
+    `app.auth.producer_token` exists to close."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post("/api/facts/search", json={"type": "client"}, headers=_auth(token))
+    assert r.status_code == 403

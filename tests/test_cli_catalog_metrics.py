@@ -39,14 +39,36 @@ def test_catalog_show_without_metrics_implies_metrics(monkeypatch):
     calls: list = []
     monkeypatch.setattr(
         catalog_mod,
-        "_show_one_metric",
-        lambda metric_id, as_json: calls.append((metric_id, as_json)),
+        "_show_metrics",
+        lambda metric_ids, as_json: calls.append((metric_ids, as_json)),
     )
 
     runner = CliRunner()
     result = runner.invoke(catalog_app, ["--show", "revenue/mrr"])
     assert result.exit_code == 0, result.output
-    assert calls == [("revenue/mrr", False)]
+    assert calls == [(["revenue/mrr"], False)]
+
+
+def test_catalog_show_is_repeatable_and_batches_into_one_call(monkeypatch):
+    """Several `--show` ids reach the detail path in ONE call.
+
+    The point of the flag being repeatable: an agent reading twenty metric
+    definitions should spend one command and leave one tool result in its
+    context, not twenty of each.
+    """
+    import cli.commands.catalog as catalog_mod
+
+    calls: list = []
+    monkeypatch.setattr(
+        catalog_mod,
+        "_show_metrics",
+        lambda metric_ids, as_json: calls.append((metric_ids, as_json)),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(catalog_app, ["--show", "revenue/mrr", "--show", "revenue/net", "--show", "orders/aov"])
+    assert result.exit_code == 0, result.output
+    assert calls == [(["revenue/mrr", "revenue/net", "orders/aov"], False)]
 
 
 # ---------------------------------------------------------------------------

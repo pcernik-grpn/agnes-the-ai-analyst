@@ -92,6 +92,16 @@ _KNOB_CATALOGUE: list[dict[str, Any]] = [
         "default": "",
     },
     {
+        # Only consulted when `instance_logo_svg` is set: with no custom lockup
+        # the rail's collapsed strip renders the built-in orb, which is already
+        # a mark. Unset with a lockup set = a derived initial (rail.css).
+        "key": "instance_logo_mark_svg",
+        "resolver": "get_instance_logo_mark_svg",
+        "env_var": "AGNES_INSTANCE_LOGO_MARK_SVG",
+        "yaml_path": "instance.logo_mark_svg",
+        "default": "",
+    },
+    {
         # Unset resolves the built-in `img/agnes-orb.png` through `static_url()`,
         # so the value is the SERVED url (`/static/img/agnes-orb.png`) carrying a
         # `?v=<mtime>` cache-buster. The default is declared as that url without

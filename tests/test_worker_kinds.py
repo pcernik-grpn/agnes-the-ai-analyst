@@ -241,7 +241,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({})
@@ -257,7 +259,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({"tables": ["orders"], "source": "keboola"})
@@ -277,7 +281,10 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: False)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: False,
+        )
 
         with pytest.raises(RuntimeError):
             JOB_KINDS["data-refresh"].handler({})
@@ -291,9 +298,59 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: run_sync_result)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: run_sync_result,
+        )
 
         JOB_KINDS["data-refresh"].handler({})  # must not raise
+
+    def test_returns_result_sink_populated_by_run_sync(self, monkeypatch):
+        """#1620: the handler's return value is what `app/worker/runtime.py`
+        passes to `JobsRepository.complete(..., result=...)` — it must be
+        the exact dict `_run_sync` filled via `result_sink`, not `None`,
+        so a job that "succeeded" but silently skipped every table (the
+        reported bug) is diagnosable via `GET /api/jobs/{id}`."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        fake_summary = {
+            "materialized": {"materialized": [], "skipped": [{"table": "t1", "reason": "due_check"}], "errors": []},
+            "errors": [],
+            "synced_tables": [],
+        }
+
+        def _fake_run_sync(tables=None, source_type_filter=None, result_sink=None):
+            if result_sink is not None:
+                result_sink.update(fake_summary)
+            return True
+
+        monkeypatch.setattr("app.api.sync._run_sync", _fake_run_sync)
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result == fake_summary
+
+    def test_returns_none_when_run_sync_is_a_noop(self, monkeypatch):
+        """`_run_sync` returning `None` (lock-contention no-op) never
+        populates `result_sink` — the handler must return `None`, not an
+        empty dict, so `complete()`'s `result is not None` branch (which
+        writes `payload_json["result"]`) is skipped for a call that did
+        nothing."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: None,
+        )
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result is None
 
 
 class TestMarketplacesSyncHandler:
@@ -606,7 +663,9 @@ class TestCorpusExtractionHandler:
         with pytest.raises(RuntimeError, match="certificate not configured"):
             handler({"connection_id": "conn1"})
 
-    def _stub_connection_and_settings(self, monkeypatch, *, private_key="super-secret-pem-material", config=None):
+    def _stub_connection_and_settings(
+        self, monkeypatch, *, private_key="super-secret-pem-material", config=None, **settings_overrides
+    ):
         # Default config carries ONE confirmed scope: since the corpus-map
         # handoff, a scope-less connection with no payload corpus_id refuses
         # to run (see test_no_scopes_and_no_corpus_id_refuses) — tests that
@@ -638,6 +697,7 @@ class TestCorpusExtractionHandler:
             client_id="client-1",
             private_key=private_key,
             credential_source="vault",
+            **settings_overrides,
         )
         monkeypatch.setattr("connectors.sharepoint.settings.resolve_sharepoint_settings", lambda conn: fake_settings)
         return fake_settings
@@ -677,6 +737,36 @@ class TestCorpusExtractionHandler:
         assert call["env"]["AGNES_SHAREPOINT_CLIENT_ID"] == "client-1"
         assert call["env"]["AGNES_SHAREPOINT_PRIVATE_KEY"] == "super-secret-pem-material"
         assert call["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "corpus-9"
+
+    def test_client_secret_connection_forwards_the_secret_not_a_key(self, monkeypatch):
+        """`auth_method="client_secret"` connections hand the producer
+        AGNES_SHAREPOINT_CLIENT_SECRET (+ the method marker) and no empty
+        AGNES_SHAREPOINT_PRIVATE_KEY placeholder."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(
+            monkeypatch, private_key="", auth_method="client_secret", client_secret="app-secret-value"
+        )
+
+        calls = []
+
+        class _FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, env=None, timeout=None, **kwargs):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeCompleted()
+
+        monkeypatch.setattr("app.worker.kinds.subprocess.run", _fake_run)
+        handler = self._register()
+        handler({"connection_id": "conn1", "corpus_id": "corpus-9"})
+
+        env = calls[0]["env"]
+        assert "app-secret-value" not in " ".join(calls[0]["argv"])
+        assert env["AGNES_SHAREPOINT_CLIENT_SECRET"] == "app-secret-value"
+        assert env["AGNES_SHAREPOINT_AUTH_METHOD"] == "client_secret"
+        assert "AGNES_SHAREPOINT_PRIVATE_KEY" not in env
 
     def test_child_env_does_not_forward_instance_secrets(self, monkeypatch):
         """The producer is an EXTERNAL, admin-configurable binary — it must
@@ -1197,14 +1287,14 @@ class TestCorpusExtractionHandler:
         assert "THE-ONLY-PART-THAT-MATTERS" in tails[0]
         assert "A" * 100 not in tails[0], "the whole 5 KB was logged, not a 32-byte tail"
 
-    # -- producer callback credential (TCRD-226) -----------------------------
+    # -- producer callback credential ----------------------------------------
     # The producer calls back into Agnes's own REST API (corpus-map, scopes,
-    # POST /api/facts/ingest) to do its actual work — until this wiring it had
-    # no credential to do so at all. The scheduler shared-secret token is the
-    # natural fit (the only existing credential class a headless subprocess
-    # can already present); see the module docstring for the honest over-grant
-    # note (it resolves to a synthetic Admin-group user, far more than the
-    # producer actually needs).
+    # the collections upload, POST /api/facts/ingest, GET
+    # /api/facts/corrections) to do its actual work. AGNES_API_TOKEN is a
+    # short-lived, PRODUCER-SCOPED JWT minted fresh for this run (see
+    # app.auth.producer_token) — this REPLACES the earlier design that
+    # forwarded the scheduler shared secret here (a genuine over-grant: that
+    # secret resolves to a synthetic Admin-group user).
 
     def _run_capturing_env(self, monkeypatch):
         calls = []
@@ -1233,24 +1323,39 @@ class TestCorpusExtractionHandler:
 
         assert calls[0]["env"]["AGNES_API_URL"] == "https://agnes.example.com"
 
-    def test_agnes_api_token_forwarded_when_scheduler_secret_configured(self, monkeypatch):
+    def test_agnes_api_token_is_always_a_producer_jwt_never_the_scheduler_secret(self, monkeypatch):
+        """AGNES_API_TOKEN must be present and be a producer-typed JWT
+        regardless of whether SCHEDULER_API_TOKEN happens to be configured
+        — the two credentials are unrelated now. Regression guard for the
+        exact bug this change fixes: the child env used to carry the raw
+        scheduler secret verbatim."""
+        from app.auth.jwt import verify_token
+
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
-        monkeypatch.setenv("SCHEDULER_API_TOKEN", "s" * 40)
+        secret = "s" * 40
+        monkeypatch.setenv("SCHEDULER_API_TOKEN", secret)
         self._stub_connection_and_settings(monkeypatch)
         calls = self._run_capturing_env(monkeypatch)
         handler = self._register()
 
         handler({"connection_id": "conn1"})
 
-        env = calls[0]["env"]
-        assert env["AGNES_API_TOKEN"] == "s" * 40
+        token = calls[0]["env"]["AGNES_API_TOKEN"]
+        assert token != secret
+        payload = verify_token(token)
+        assert payload is not None
+        assert payload["typ"] == "producer"
+        assert payload["connection_id"] == "conn1"
         # Never on argv — same F7 rule as every other secret this handler
         # resolves.
-        assert "s" * 40 not in " ".join(calls[0]["argv"])
+        assert token not in " ".join(calls[0]["argv"])
 
-    def test_agnes_api_token_absent_when_no_scheduler_secret_configured(self, monkeypatch):
-        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) →
-        no token to forward — never a placeholder/empty credential."""
+    def test_agnes_api_token_present_even_with_no_scheduler_secret_configured(self, monkeypatch):
+        """No scheduler shared secret configured (e.g. LOCAL_DEV_MODE) used
+        to mean no callback token at all — now it makes no difference,
+        since the producer JWT is minted independently."""
+        from app.auth.jwt import verify_token
+
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
         monkeypatch.delenv("SCHEDULER_API_TOKEN", raising=False)
         self._stub_connection_and_settings(monkeypatch)
@@ -1259,7 +1364,102 @@ class TestCorpusExtractionHandler:
 
         handler({"connection_id": "conn1"})
 
-        assert "AGNES_API_TOKEN" not in calls[0]["env"]
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload is not None
+        assert payload["typ"] == "producer"
+
+    def test_agnes_api_token_collection_ids_match_the_confirmed_scopes(self, monkeypatch):
+        """`collection_ids` claim is the SAME source `GET .../corpus-map`
+        reads — every confirmed scope's `collection_id`, sorted."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "instance-hmac-secret")
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._ANON_CONFIG)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_anon_1", "col_plain_1"]
+
+    def test_no_scopes_and_no_corpus_id_is_refused_before_any_token_is_minted(self, monkeypatch):
+        """The scenario this test used to describe — no confirmed scopes, no
+        payload `corpus_id`, token minted with `collection_ids: []` — is not a
+        run the handler performs at all: nothing says which collection the
+        documents go to, so it refuses up front rather than spending a producer
+        run on it. Asserted here so the refusal, not an empty credential, is
+        what this case is pinned to."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="no confirmed scopes"):
+            handler({"connection_id": "conn1"})
+        assert calls == [], "the producer must not be run at all"
+
+    def test_agnes_api_token_covers_the_payloads_explicit_corpus_id(self, monkeypatch):
+        """A run with no confirmed scopes is supported as long as the payload
+        names a `corpus_id` — the handler forwards it as
+        `AGNES_EXTRACTION_CORPUS_ID`. The credential has to cover it, or the
+        producer would be 403'd by `POST /api/collections/{id}/files` and by
+        `/api/facts/ingest`'s corpus check on the one collection it was told to
+        fill. Scoping the token to the confirmed scopes alone (what it did
+        before) set that run up to fail."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "col_explicit"})
+
+        assert calls[0]["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "col_explicit"
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_explicit"]
+
+    def test_agnes_api_token_unions_the_corpus_id_with_the_confirmed_scopes(self, monkeypatch):
+        """Same hole with scopes present: a payload naming a collection outside
+        them must widen the claim, not be silently left out of it. The union is
+        deduplicated and sorted, so naming a collection already in scope adds
+        nothing."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "col_outside"})
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default", "col_outside"]
+
+        # naming a collection already in scope adds nothing
+        handler({"connection_id": "conn1", "corpus_id": "col_default"})
+        payload = verify_token(calls[1]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default"]
+
+    def test_agnes_api_token_expiry_tracks_timeout_plus_grace(self, monkeypatch):
+        from app.auth.jwt import verify_token
+        from app.worker.kinds import _PRODUCER_TOKEN_GRACE_SECONDS
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        # self._ENABLED_CONFIG sets timeout_s=60. `iat`/`exp` are minted from
+        # two separate `datetime.now()` calls a few microseconds apart, so
+        # assert within a tight tolerance rather than exact equality — a
+        # sub-second-boundary flake is possible but not the thing this test
+        # means to pin.
+        assert abs((payload["exp"] - payload["iat"]) - (60 + _PRODUCER_TOKEN_GRACE_SECONDS)) <= 1
 
     def test_agnes_api_token_never_logged(self, monkeypatch, caplog):
         import logging
@@ -1267,12 +1467,14 @@ class TestCorpusExtractionHandler:
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
         monkeypatch.setenv("SCHEDULER_API_TOKEN", "t" * 40)
         self._stub_connection_and_settings(monkeypatch)
-        self._run_capturing_env(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
         handler = self._register()
 
         with caplog.at_level(logging.DEBUG):
             handler({"connection_id": "conn1"})
 
+        token = calls[0]["env"]["AGNES_API_TOKEN"]
+        assert token not in caplog.text
         assert "t" * 40 not in caplog.text
 
     # -- loopback callback URL guard (role-split worker, no SERVER_URL) -----
@@ -1435,6 +1637,82 @@ class TestCorpusExtractionHandler:
         handler({"connection_id": "conn1"})
 
         assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
+
+
+class TestExtractionProducerArgvEnvOverride:
+    """``AGNES_EXTRACTION_PRODUCER_COMMAND`` / ``AGNES_EXTRACTION_PRODUCER_MODULE``
+    (deploy-time knobs so a Terraform module can activate the extraction
+    lane's producer without an applier-owned edit of ``instance.yaml`` on
+    the VM) — env wins over instance.yaml, per field, mirroring
+    ``app/coordination/factory.py``'s env-overrides-yaml posture."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
+
+    def test_command_env_wins_over_yaml_command(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"command": "python -m yaml_producer"}}}),
+        )
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "/opt/producer/agnes_lane.py"]
+
+    def test_command_env_is_shlex_split(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py --flag 'a b'")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == [
+            "python",
+            "/opt/producer/agnes_lane.py",
+            "--flag",
+            "a b",
+        ]
+
+    def test_module_env_wins_over_yaml_module(self, monkeypatch):
+        import sys
+
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"module": "yaml_producer.run"}}}),
+        )
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "env_producer.run")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == [sys.executable, "-m", "env_producer.run"]
+
+    def test_command_env_wins_over_module_env(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_MODULE", "env_producer.run")
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "/opt/producer/agnes_lane.py"]
+
+    def test_no_env_falls_back_to_yaml(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"extraction": {"producer": {"command": "python -m yaml_producer"}}}),
+        )
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() == ["python", "-m", "yaml_producer"]
+
+    def test_neither_env_nor_yaml_returns_none(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+
+        from app.worker.kinds import _extraction_producer_argv
+
+        assert _extraction_producer_argv() is None
 
 
 class TestJiraWebhookEnqueues:

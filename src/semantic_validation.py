@@ -31,7 +31,7 @@ Expected document shape (fields this module reads; anything else is ignored)::
             {"name": str, "from": <dataset name>, "to": <dataset name>, ...},
             ...
         ],
-        "glossary": [{"term": str, "definition": str, "seeAlso": [...]}, ...],
+        "glossary": [{"term": str, "definition": str, "see_also": [...]}, ...],
         "custom_extensions": [{"vendor_name": str, "data": "<json string>"}, ...],
     }
 
@@ -95,6 +95,17 @@ _STATICALLY_CHECKABLE_CONSTRAINT_TYPES = frozenset({"required_filter"})
 # (Devin Review on PR #1319). ``check_dialects`` unions it into every
 # target's usable set.
 _UNIVERSAL_DIALECT = "ansi_sql"
+
+# Disclosure of the LIMITATIONS above, carried in the wire result so every
+# surface that wraps ``validate_query`` (the REST endpoint, the ``/api/query``
+# soft-enforce advisory, the CLI, MCP) says the same thing rather than each
+# inventing -- or omitting -- its own caveat. Issue #1707 finding A18: the
+# REST endpoint used to ship ``used_datasets``/``used_metrics`` with no such
+# disclosure at all, so a heuristic name-match read as a confirmed fact.
+DETECTION_NOTE_LONG = (
+    "Datasets and metrics were detected by a best-effort text match on their declared names, not by parsing "
+    "the SQL — a column or alias that shares a name matches too. Treat this as a prompt to check, not a proof."
+)
 
 
 def _normalize_for_presence(text: str) -> str:
@@ -405,10 +416,14 @@ def _canonical_dialect(dialect: str) -> str:
     return dialect.strip().lower()
 
 
-def _used_metric_dialects(document: dict[str, Any], used_metrics: list[str]) -> list[list[str]]:
-    """Per *used* metric in ``document``, the dialect labels it declares
-    (raw display form; an entry may be empty for a metric with no
+def _used_metric_dialect_pairs(document: dict[str, Any], used_metrics: list[str]) -> list[tuple[str, list[str]]]:
+    """Per *used* metric in ``document``, ``(declared name, dialect labels)``
+    (raw display form; the label list may be empty for a metric with no
     expressions).
+
+    The name is carried alongside the labels so a caller can say WHICH metric
+    is unexecutable instead of naming every metric the statement touched --
+    the bool alone cannot distinguish them.
 
     The name join is casefolded on both sides, like every other name
     comparison in this module: ``check_dialects`` is public API and its
@@ -418,14 +433,20 @@ def _used_metric_dialects(document: dict[str, Any], used_metrics: list[str]) -> 
     round 6).
     """
     used = {str(m).casefold() for m in (used_metrics or [])}
-    per_metric: list[list[str]] = []
+    pairs: list[tuple[str, list[str]]] = []
     for metric in document.get("metrics") or []:
         if not isinstance(metric, dict) or not metric.get("name"):
             continue
         if str(metric["name"]).casefold() not in used:
             continue
-        per_metric.append(_declared_dialects(metric))
-    return per_metric
+        pairs.append((str(metric["name"]), _declared_dialects(metric)))
+    return pairs
+
+
+def _used_metric_dialects(document: dict[str, Any], used_metrics: list[str]) -> list[list[str]]:
+    """The labels-only projection of ``_used_metric_dialect_pairs`` -- what
+    ``_mixed_dialect_warning`` consumes."""
+    return [dialects for _name, dialects in _used_metric_dialect_pairs(document, used_metrics)]
 
 
 def _declares_unusable_expression(metric: dict[str, Any]) -> bool:
@@ -491,40 +512,54 @@ def check_dialects(
     also when it declares ``dialects[]`` entries of which none carries an
     expression body (nothing composes anywhere). A metric with no expression
     block at all is not flagged here -- nothing to conflict with.
+
+    ``not_executable_metrics`` names the metrics that drove
+    ``locally_executable`` to ``False``, in declaration order. A single bool
+    forces a caller who wants to warn about it to name EVERY used metric --
+    turning one unusable metric into an accusation against all of them --
+    so the names travel with the flag. Empty whenever
+    ``locally_executable`` is ``True``.
     """
     document = document if isinstance(document, dict) else {}
     target = (target_engine or "duckdb").strip().lower()
     usable = frozenset({target, _UNIVERSAL_DIALECT})
 
-    per_metric = _used_metric_dialects(document, used_metrics)
+    pairs = _used_metric_dialect_pairs(document, used_metrics)
+    per_metric = [dialects for _name, dialects in pairs]
 
     declared: list[str] = []
     seen: set[str] = set()
-    locally_executable = True
-    for metric_dialects in per_metric:
+    not_executable: list[str] = []
+    for name, metric_dialects in pairs:
         for dialect in metric_dialects:
             key = _canonical_dialect(dialect)
             if key not in seen:
                 seen.add(key)
                 declared.append(dialect)
         if metric_dialects and not any(_canonical_dialect(d) in usable for d in metric_dialects):
-            locally_executable = False
+            not_executable.append(name)
 
     # A used metric that declares dialect entries none of which carry a body
     # composes nowhere; it reaches this point with an EMPTY dialect list, so
-    # the loop above cannot see it (Devin Review on PR #1327).
+    # the loop above cannot see it (Devin Review on PR #1327). Every such
+    # metric is collected, not just the first: the loop no longer only flips
+    # a bool, it builds the offender list the caller names out loud.
     used = {str(m).casefold() for m in (used_metrics or [])}
     for metric in document.get("metrics") or []:
         if not isinstance(metric, dict) or not metric.get("name"):
             continue
-        if str(metric["name"]).casefold() in used and _declares_unusable_expression(metric):
-            locally_executable = False
-            break
+        if (
+            str(metric["name"]).casefold() in used
+            and _declares_unusable_expression(metric)
+            and str(metric["name"]) not in not_executable
+        ):
+            not_executable.append(str(metric["name"]))
 
     return {
         "sql_dialects": declared,
         "mixed_dialect_warning": _mixed_dialect_warning(declared, per_metric),
-        "locally_executable": locally_executable,
+        "locally_executable": not not_executable,
+        "not_executable_metrics": not_executable,
     }
 
 
@@ -655,6 +690,7 @@ def validate_query(
     seen_dialects: set[str] = set()
     metric_dialect_lists: list[list[str]] = []
     locally_executable = True
+    not_executable_metrics: list[str] = []
     violations: list[dict[str, Any]] = []
     post_execution_checks: list[dict[str, Any]] = []
 
@@ -686,6 +722,12 @@ def validate_query(
                 declared_dialects.append(dialect)
         if not dialect_info["locally_executable"]:
             locally_executable = False
+        # Union across documents, de-duplicated in first-seen order like every
+        # other list here. Same-named metrics in two documents are one name to
+        # the caller, who is going to print it.
+        for name in dialect_info.get("not_executable_metrics") or []:
+            if name not in not_executable_metrics:
+                not_executable_metrics.append(name)
         metric_dialect_lists.extend(_used_metric_dialects(document, detected["used_metrics"]))
 
         document_violations, document_checks = evaluate_constraints(
@@ -718,7 +760,19 @@ def validate_query(
         # should not have to parse prose (Devin Review on PR #1319, round 3).
         "mixed_dialect_warning": mixed_dialect_warning,
         "locally_executable": locally_executable,
+        # Which used metrics drove ``locally_executable`` to False -- so a
+        # consumer warns about those, not about every metric the statement
+        # happened to mention. Empty when ``locally_executable`` is True.
+        "not_executable_metrics": not_executable_metrics,
         "summary": summary,
+        # Issue #1707 finding A18: every caller of this function ships
+        # ``used_datasets``/``used_metrics`` as if they were confirmed facts;
+        # without this, a heuristic hit (e.g. a WHERE clause on a column named
+        # ``status`` matching a dataset that merely shares the word) reads as
+        # a proven touch. Set here, once, so it travels with the result
+        # regardless of which surface (REST endpoint, ``/api/query`` advisory,
+        # CLI, MCP) forwards it.
+        "detection": DETECTION_NOTE_LONG,
     }
 
     if expected is not None:
@@ -734,6 +788,7 @@ def validate_query(
 
 __all__ = [
     "AGNES_VENDOR_NAME",
+    "DETECTION_NOTE_LONG",
     "check_dialects",
     "detect_used_objects",
     "evaluate_constraints",

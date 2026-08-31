@@ -105,6 +105,35 @@ For `source_type=keboola` / `source_type=jira` (local), use **DuckDB SQL** in yo
 | Throwaway exploration with raw BQ syntax | `agnes query --remote "SELECT … FROM <registered_id>"` — direct `bq."<dataset>"."<table>"` paths are now registry-gated (403 `bq_path_not_registered` if not registered). Register first or use the catalog id. |
 | Cross-table JOIN with both remote | Use `agnes snapshot create` for one side + `agnes query --remote` for the other; full cross-remote JOIN needs design (see #101) |
 
+## Business meaning: read the definitions once, in batches
+
+Before computing any business metric, read its canonical definition rather
+than deriving one from column names:
+
+```bash
+agnes catalog --metrics                                    # what is defined
+agnes catalog --metrics --show revenue/net --show orders/aov  # several, one call
+agnes semantic-model context dataset metric relationship   # the whole layer, compact, one call
+agnes semantic-model context metric --id net_revenue --id aov  # full detail, batched
+agnes glossary search "<term>"                             # what a business term means here
+agnes semantic-model validate-query "<SQL>"                # check BEFORE running
+```
+
+Three rules, in cost order:
+
+1. **Batch.** Every one of those flags is repeatable. Twenty single-id
+   lookups cost twenty round trips and leave twenty payloads in the
+   conversation, which every later turn then carries — for the same answer
+   one call would have given.
+2. **Don't re-read.** A definition you looked up earlier in the session is
+   still valid. Re-fetching it adds cost and nothing else.
+3. **Validate, don't hope.** `validate-query` catches a constraint violation
+   (an excluded order state, a wrong grain) and a dialect mismatch before
+   the query hands you a confidently wrong number.
+
+Never invent metric SQL. A term the layer does not define is something to
+say plainly, not something to guess.
+
 ## When the table you need isn't in `agnes catalog`
 
 The catalog reads from `system.duckdb::table_registry` — entries land there only via admin registration, not auto-discovery. If `agnes catalog` doesn't show what the user is asking about:
@@ -121,3 +150,4 @@ The catalog reads from `system.duckdb::table_registry` — entries land there on
 4. **Snapshot name**: descriptive (`cz_recent`), reuse across questions
 5. **Query**: `agnes query` against snapshot; DuckDB SQL syntax
 6. **Cleanup**: `agnes snapshot drop` when done; `agnes disk-info` to check size
+7. **Business metrics**: canonical definition first, batched in one call, validated before running — never invented

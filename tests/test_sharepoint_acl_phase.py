@@ -110,7 +110,7 @@ def _make_user(user_id: str, email: str) -> dict:
     return {"id": user_id, "email": email}
 
 
-async def _fake_get_app_token(tenant_id, client_id, private_key):
+async def _fake_get_app_token(tenant_id, client_id, private_key, *, client_secret=""):
     return "fake-token"
 
 

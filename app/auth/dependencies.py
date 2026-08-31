@@ -47,6 +47,23 @@ _AUTH_DETAIL_BY_REASON = {
     "session_revoked": "Session revoked — please sign in again",
 }
 
+
+def auth_detail_for_reason(reason: str | None) -> str:
+    """Human 401 ``detail`` for a ``pat_resolver.ResolutionReason``.
+
+    The public accessor for the vocabulary above, so a non-REST surface that
+    rejects a credential can say the same thing the REST surface says instead
+    of inventing a second wording. Used by the MCP SSE transport's
+    ``_AuthMiddleware`` (``app/api/mcp_http.py``), which used to collapse every
+    rejection — and its own internal errors — into one fixed
+    "Not authenticated".
+
+    An unknown or absent reason falls back to the deliberately vague "Invalid
+    or expired token".
+    """
+    return _AUTH_DETAIL_BY_REASON.get(reason or "", "Invalid or expired token")
+
+
 # X-StorageApi-Token header rejections → 401 detail. Reasons come from
 # app.auth.keboola_header.resolve_header_user.
 _KEBOOLA_HEADER_DETAIL = {
@@ -346,6 +363,22 @@ def get_current_user(
             detail="Scheduler user not provisioned",
         )
 
+    # Producer-scoped callback credential (corpus-extraction): resolves to
+    # a RESTRICTED ProducerPrincipal, never a real user. Checked before
+    # pat_resolver for the same reason as the scheduler check above — this
+    # typ has no `sub` naming a real user row. May raise 403 itself (see
+    # docstring) when the token is genuinely a producer JWT but this
+    # request is off its fixed allowed surface — that must not fall
+    # through to pat_resolver's 401 chain.
+    from app.auth.producer_token import resolve_producer_principal
+
+    producer_principal = resolve_producer_principal(token, request)
+    if producer_principal is not None:
+        from src.audit_context import set_client_kind
+
+        set_client_kind("producer")
+        return producer_principal
+
     from app.auth.pat_resolver import resolve_token_to_user
     from app.auth.session_principal import PRINCIPAL_TYPES
 
@@ -375,7 +408,7 @@ def get_current_user(
         return _stash_user(request, user)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail=_AUTH_DETAIL_BY_REASON.get(reason, "Invalid or expired token"),
+        detail=auth_detail_for_reason(reason),
     )
 
 

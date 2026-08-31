@@ -1977,6 +1977,174 @@ def test_http_anonymization_block_persists_into_the_run_report(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# `llm_usage` — cost-visibility block (producer-reported), same treatment as
+# `anonymization` above: rides into the persisted run report only, never the
+# direct ingest response, plus a cumulative `llm_usage_totals` rollup on
+# `GET /api/facts/ingest-runs`.
+# ---------------------------------------------------------------------------
+
+
+def test_http_llm_usage_persists_into_the_run_report(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "LLM Usage E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    llm_usage = {
+        "input_tokens": 1500,
+        "output_tokens": 300,
+        "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 10,
+        "models": ["claude-sonnet-4"],
+        "documents": 1,
+        "wall_seconds": 3.4,
+    }
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-llm", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-llm",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-llm", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+        "llm_usage": llm_usage,
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.status_code == 200, ingest_resp.text
+    # The direct response is still the plain run report — llm_usage is NOT
+    # echoed there, only persisted (same treatment `anonymization` gets).
+    assert "llm_usage" not in ingest_resp.json()
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    body = runs_resp.json()
+    run = body["runs"][0]
+    assert run["llm_usage"] == llm_usage
+
+    totals = body["llm_usage_totals"]
+    assert totals["runs_with_usage"] == 1
+    assert totals["input_tokens"] == 1500
+    assert totals["output_tokens"] == 300
+    assert totals["cache_read_input_tokens"] == 200
+    assert totals["cache_creation_input_tokens"] == 10
+    assert totals["documents"] == 1
+    assert totals["wall_seconds"] == 3.4
+    assert totals["models"] == ["claude-sonnet-4"]
+    assert totals["priced_runs"] == 1
+    assert totals["estimated_cost_usd"] is not None
+
+
+def test_http_llm_usage_omitted_defaults_to_null_in_the_run_report(tmp_path, monkeypatch, pg_engine):
+    """No `llm_usage` block sent — the run report's field stays `None`
+    (never a fabricated `{}`), and the rollup does not count this run."""
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "LLM Usage Omitted E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    ingest_body = {
+        "documents": [{"doc_id": "producer-doc-no-llm", "corpus_id": corpus_id, "path": "acme.md"}],
+        "nodes": [
+            {
+                "id": "engagement:acme-rollout-no-llm",
+                "type": "engagement",
+                "attrs": {"sponsor": "Alice Adams"},
+                "evidence": [{"doc_id": "producer-doc-no-llm", "quote": "Acme Rollout is sponsored by Alice Adams."}],
+            }
+        ],
+    }
+    ingest_resp = client.post("/api/facts/ingest", json=ingest_body, headers=headers)
+    assert ingest_resp.status_code == 200, ingest_resp.text
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    body = runs_resp.json()
+    run = body["runs"][0]
+    assert run["llm_usage"] is None
+    assert body["llm_usage_totals"]["runs_with_usage"] == 0
+    assert body["llm_usage_totals"]["estimated_cost_usd"] is None
+
+
+def test_http_llm_usage_totals_sum_across_two_ingest_runs(tmp_path, monkeypatch, pg_engine):
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+
+    created = client.post("/api/collections", json={"name": "LLM Usage Sum E2E"}, headers=headers)
+    assert created.status_code == 201, created.text
+    corpus_id = created.json()["id"]
+
+    content = b"Acme Rollout is sponsored by Alice Adams. Beta Corp is a vendor."
+    up = client.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
+        data={"paths": ["acme.md"]},
+        headers=headers,
+    )
+    assert up.status_code == 201, up.text
+
+    def _ingest(doc_id, node_id, quote, usage):
+        return client.post(
+            "/api/facts/ingest",
+            json={
+                "documents": [{"doc_id": doc_id, "corpus_id": corpus_id, "path": "acme.md"}],
+                "nodes": [
+                    {"id": node_id, "type": "engagement", "attrs": {}, "evidence": [{"doc_id": doc_id, "quote": quote}]}
+                ],
+                "llm_usage": usage,
+            },
+            headers=headers,
+        )
+
+    r1 = _ingest(
+        "producer-doc-sum-1",
+        "engagement:acme-sum",
+        "Acme Rollout is sponsored by Alice Adams.",
+        {"input_tokens": 1000, "output_tokens": 100, "models": ["claude-sonnet-4"]},
+    )
+    assert r1.status_code == 200, r1.text
+    r2 = _ingest(
+        "producer-doc-sum-2",
+        "engagement:beta-sum",
+        "Beta Corp is a vendor.",
+        {"input_tokens": 2000, "output_tokens": 400, "models": ["claude-sonnet-4"]},
+    )
+    assert r2.status_code == 200, r2.text
+
+    runs_resp = client.get("/api/facts/ingest-runs", headers=headers)
+    assert runs_resp.status_code == 200, runs_resp.text
+    totals = runs_resp.json()["llm_usage_totals"]
+    assert totals["runs_with_usage"] == 2
+    assert totals["input_tokens"] == 3000
+    assert totals["output_tokens"] == 500
+    assert totals["priced_runs"] == 2
+    assert totals["estimated_cost_usd"] is not None
+
+
+# ---------------------------------------------------------------------------
 # anonymize-fail-closed gate — end-to-end proof over a real Postgres backend
 # that a refused batch writes nothing at all (not merely that the HTTP
 # response says 403; tests/test_api_facts_ingest.py already proves the gate

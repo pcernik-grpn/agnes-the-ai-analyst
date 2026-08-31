@@ -393,8 +393,20 @@ class KeboolaMetastoreAdapter:
     """Fetches a Keboola project's Metastore and composes one Ossie document
     per ``semantic-model``.
 
-    ``config`` is ``{"url", "token"}`` — the same connection shape
-    ``sync_semantic_layer`` already resolves per configured Keboola project.
+    ``config`` carries either the credentials directly (``{"url", "token"}``
+    — what ``sync_semantic_layer`` passes for the Keboola-login-triggered
+    sync) or, for a registered ``semantic_sources`` row, only SCOPE:
+    ``{"connection_id": ...}`` or ``{"legacy_credentials": true}``, resolved
+    per sync by ``connectors.keboola.semantic_layer
+    .resolve_semantic_source_credentials``. A stored source row must never
+    become a second place a Storage token is kept, which is the same rule the
+    Snowflake and Databricks adapters follow.
+
+    Resolving from scope also runs the preflight the legacy sync ran before
+    touching a row — master-token check and project-binding check — so a
+    misconfigured connection fails the sync instead of importing another
+    project's semantic layer under this one's provenance.
+
     This adapter owns its own Metastore fetch (a fresh ``MetastoreClient``,
     independent of any fetch ``connectors/keboola/semantic_layer.py`` has
     already done for the flat-table sync) so it stays a self-contained
@@ -416,7 +428,17 @@ class KeboolaMetastoreAdapter:
         url = config.get("url")
         token = config.get("token")
         if not url or not token:
-            raise ValueError("KeboolaMetastoreAdapter requires config['url'] and config['token']")
+            if not (config.get("connection_id") or config.get("legacy_credentials")):
+                raise ValueError(
+                    "KeboolaMetastoreAdapter requires config['url'] + config['token'], or a registered "
+                    "source's scope (config['connection_id'] or config['legacy_credentials'])"
+                )
+            # Local import for the same reason as MetastoreClient above, and
+            # because connectors.keboola.semantic_layer imports this module's
+            # adapter in turn.
+            from connectors.keboola.semantic_layer import resolve_semantic_source_credentials
+
+            url, token = resolve_semantic_source_credentials(config)
 
         metastore = MetastoreClient(url=url, token=token)
         models = metastore.list_items("semantic-model")

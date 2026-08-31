@@ -2,7 +2,7 @@
 // every page EXCEPT /chat.
 //
 // The rail (html[data-ui-layout="rail"]) renders the chat list
-// (_app_rail.html → .rail-history) on every page EXCEPT an /admin one, directly
+// (_app_rail.html → .rail-history) on every rail page, /admin included, directly
 // under the New chat + Chats rows. On /chat, chat.js owns that same
 // <ul id="chat-list"> — it renders live, highlights the active row, and handles
 // open/delete in place — so this script MUST stay out of its way there. On every
@@ -78,57 +78,26 @@
   }
 
   // ---- Onboarding card popover ("Set up Agnes") -----------------------
-  // Reveals on hover via CSS, but ALSO opens on click and stays pinned (the
-  // `.is-open` class forces it visible) so click users aren't left with a
-  // dead button. Outside-click / Escape closes it. chat_onboarding.js fills
-  // #chat-journey inside it — and hides the whole row once every step is done.
-  // Wired before the /chat bail so it works there too.
+  // Reveals on hover via CSS, but ALSO opens on click and stays pinned, with
+  // outside-click / Escape to close. Wired before the /chat bail so it works
+  // there too. chat_onboarding.js fills #chat-journey inside the panel — and
+  // hides the whole row once every step is done.
+  //
+  // The behaviour itself lives in rail_popover.js because the rail has TWO of
+  // these cards: this one and the admin setup chain, which reuses
+  // `.rail-getstarted` for its look but carries its own ids and so was getting
+  // none of this. See the note there.
   const gsToggle = document.getElementById("rail-getstarted-toggle");
   const gsWrap = document.getElementById("railGetStarted");
-  if (gsToggle && gsWrap) {
-    const setOpen = (open) => {
+  if (window.railPopover) {
+    window.railPopover.wire(gsWrap, gsToggle, () => {
       // Ask the checklist to re-read /api/chat/journey before it comes into
       // view. Steps complete from real activity now (adding to your stack from
       // the Library marks its milestone server-side), so the copy this panel
       // loaded at page load can already be out of date by the time it is
       // opened — and a checklist showing a step you just finished as pending is
       // the single fastest way to make onboarding feel broken.
-      if (open) document.dispatchEvent(new CustomEvent("agnes:journey-refresh"));
-      gsWrap.classList.toggle("is-open", open);
-      // `.is-closed` (rail.css) is the only thing that can override the
-      // panel's CSS :hover / :focus-within reveal rules — closing here
-      // otherwise has no visible effect while the cursor is still over the
-      // launcher (exactly when a click-to-close fires) or while the toggle
-      // itself holds focus (it's a descendant of .rail-getstarted, so
-      // :focus-within stays true after Escape moves focus there below).
-      gsWrap.classList.toggle("is-closed", !open);
-      gsToggle.setAttribute("aria-expanded", open ? "true" : "false");
-    };
-    gsToggle.addEventListener("click", (e) => {
-      e.stopPropagation();
-      setOpen(!gsWrap.classList.contains("is-open"));
-    });
-    document.addEventListener("click", (e) => {
-      if (gsWrap.classList.contains("is-open") && !gsWrap.contains(e.target)) setOpen(false);
-    });
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && gsWrap.classList.contains("is-open")) {
-        setOpen(false);
-        gsToggle.focus();
-      }
-    });
-    // Once the cursor genuinely leaves the launcher, lift the suppression so
-    // a later hover can preview the panel again — `.is-closed` is meant to
-    // block the SAME hover session from immediately reopening what was just
-    // closed, not to disable hover-to-preview permanently.
-    // ...but only once nothing inside the launcher still holds focus. The
-    // toggle keeps DOM focus after a click-to-close, and Escape explicitly
-    // refocuses it, so lifting `.is-closed` while `:focus-within` is still
-    // true would let the CSS reveal reopen the panel the instant the cursor
-    // leaves. Guarding on activeElement keeps hover-to-preview working while
-    // fixing the toggle-click / Escape close paths.
-    gsWrap.addEventListener("mouseleave", () => {
-      if (!gsWrap.contains(document.activeElement)) gsWrap.classList.remove("is-closed");
+      document.dispatchEvent(new CustomEvent("agnes:journey-refresh"));
     });
   }
 

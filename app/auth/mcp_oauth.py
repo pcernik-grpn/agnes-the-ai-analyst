@@ -158,6 +158,95 @@ _WRITE_CAPABILITY = (
 _RBAC_CAPABILITY = "Never do more than your own Agnes permissions allow"
 
 
+# ---------------------------------------------------------------------------
+# Plain-PAT credential on the Streamable-HTTP transport
+# ---------------------------------------------------------------------------
+
+# ``client_id`` stamped on an AccessToken synthesized from an Agnes PAT. A PAT
+# has no OAuth client behind it, but the SDK's AccessToken requires the field.
+# The literal is deliberately not a UUID: RFC 7591 registration assigns
+# ``str(uuid4())`` (the SDK's RegistrationHandler), so no registered client can
+# ever carry this id — which is what keeps /revoke inert for a PAT, since the
+# revocation handler only revokes when the loaded token's ``client_id`` equals
+# the id of the client that authenticated the revoke request.
+AGNES_PAT_CLIENT_ID = "agnes-pat"
+
+# The coarse scope the streamable transport requires of every credential
+# (``required_scopes=["read"]`` in app/api/mcp_streamable.py). A PAT carries no
+# OAuth scopes of its own; its real authority is the caller's RBAC, applied per
+# self-call exactly as on every other Agnes surface.
+_PAT_SCOPES = ("read",)
+
+
+def _access_token_from_pat(token: str) -> AccessToken | None:
+    """Accept a plain Agnes PAT as a streamable-transport credential, or None.
+
+    Why this exists: ``/api/mcp`` (SSE) authenticates with a PAT while
+    ``/api/mcp/http`` (streamable) accepted only OAuth tokens, so one
+    documented credential worked on one transport and returned ``401
+    invalid_token`` on the other. OAuth stays exactly as it was — it is what
+    remote connectors (claude.ai, Cursor, VS Code) discover and use, and it is
+    still tried first.
+
+    Deliberately narrow: ONLY a ``typ="pat"`` credential. Two consequences,
+    both load-bearing rather than incidental:
+
+    - An OAuth access token is itself a signed Agnes session JWT. A fallback
+      that accepted any token ``resolve_token_to_user`` likes would keep
+      honouring one after RFC 7009 revocation for the rest of its 8-hour TTL,
+      silently undoing revocation. ``typ`` excludes it by construction.
+    - A browser session cookie value is a session JWT too. The widening is
+      about honouring the PAT contract, not about handing the connector
+      surface to every credential that can authenticate a web page.
+
+    Everything else the resolver enforces still applies unchanged — revoked /
+    expired / unknown / hash-mismatched PATs, deactivated accounts, and the
+    ``credential_surface`` narrowing.
+
+    An agent PAT (``typ="agent_pat"``) is refused by the ``typ`` check below,
+    which is the ACTIVE gate: it fires first, so such a token never reaches
+    ``resolve_token_to_user`` from here at all. The resolver's own surface
+    allowlist (``_AGENT_PAT_ALLOWED_PREFIXES``, which cannot match because
+    this call passes no ``Request``) is a latent second line that would catch
+    it if the ``typ`` gate below were ever widened — depth, not the reason it
+    is refused today.
+
+    Exceptions are NOT swallowed: a resolver that raises means Agnes is
+    broken, and the caller gets a 500 from the ASGI stack rather than a 401
+    telling them to rotate a working credential (the same distinction the SSE
+    middleware now draws).
+    """
+    from app.auth.jwt import verify_token
+
+    payload = verify_token(token)
+    # THE gate. Widening this set is a security decision, not a cleanup: it is
+    # what keeps agent PATs, session JWTs and OAuth access tokens off this
+    # transport (see the docstring). tests/test_mcp_transport_auth_parity.py
+    # ratchets each of those refusals.
+    if not payload or payload.get("typ") != "pat":
+        return None
+
+    from app.auth.pat_resolver import resolve_token_to_user
+    from app.auth.session_principal import PRINCIPAL_TYPES
+
+    # No ``conn``: resolve_token_to_user routes through the repository factory
+    # and ignores it, so passing None keeps the system DuckDB unopened on a
+    # Postgres instance (forbidden invariant) — same call shape as
+    # ``_get_session_user`` above.
+    user, _reason = resolve_token_to_user(None, token)
+    if user is None or isinstance(user, PRINCIPAL_TYPES) or not isinstance(user, dict):
+        return None
+
+    exp = payload.get("exp")
+    return AccessToken(
+        token=token,
+        client_id=AGNES_PAT_CLIENT_ID,
+        scopes=list(_PAT_SCOPES),
+        expires_at=int(exp) if exp is not None else None,
+        subject=str(user.get("id") or "") or None,
+    )
+
+
 class AgnesMCPOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
     """Agnes implementation of the MCP SDK OAuth provider protocol.
 
@@ -482,10 +571,30 @@ class AgnesMCPOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, 
     # ------------------------------------------------------------------
 
     async def load_access_token(self, token: str) -> AccessToken | None:
+        """Verify a bearer token for the Streamable-HTTP transport.
+
+        This is the whole body of the SDK's ``ProviderTokenVerifier``, i.e.
+        the streamable transport's accept/reject decision. Two credentials
+        pass it: an OAuth access token this provider issued (below), and — as
+        a strict fallback — a plain Agnes PAT (``_access_token_from_pat``).
+
+        Order matters. The OAuth store is authoritative and consulted first,
+        so an issued token's revocation and expiry are decided there and only
+        there; the fallback then runs on tokens the store does not know, and
+        by construction (``typ="pat"``) can never pick up an OAuth token the
+        store just refused.
+        """
         from src.repositories import oauth_clients_repo
 
         row = oauth_clients_repo().get_access_token(token)
-        if row is None or row.get("revoked_at") is not None:
+        if row is None:
+            # Not a token this server issued — it may still be a plain PAT.
+            return _access_token_from_pat(token)
+        if row.get("revoked_at") is not None:
+            # Known AND revoked: refused outright, never handed to the
+            # fallback. The `typ="pat"` check would refuse it there anyway;
+            # this makes the revocation decision single-branch rather than
+            # dependent on a check two modules away.
             return None
         exp = row.get("expires_at")
         if exp is not None and exp < int(time.time()):

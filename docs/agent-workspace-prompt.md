@@ -88,6 +88,8 @@ PUT validation time, so the admin is notified immediately.
 | `metrics.count` | int | Total metric definitions in DB |
 | `metrics.categories` | list[str] | Sorted unique category names |
 | `semantic_layer.has_models` | bool | `True` iff the calling user can read at least one valid semantic model |
+| `semantic_layer.models` | list[dict] | RBAC-filtered `{slug, name, description, instructions}` per readable model. `instructions` is the document's top-level `ai_context.instructions` (the author's own steering, truncated to ~300 chars), empty string when the model declares none |
+| `semantic_layer.cache_ttl_hours` | int | TTL `agnes pull` stamps into every rendered `semantic/<slug>/…` cache file's header |
 | `facts.enabled` | bool | `True` iff the `facts` feature switch is on for this instance. Gates the "Facts — entity and relationship questions" section that steers who/what/relationship/aggregation questions to `fact_search`/`fact_neighbors`/`fact_claims` before SQL or document search |
 | `marketplaces` | list[dict] | RBAC-filtered `{slug, name, plugins:[{name}]}` |
 | `user.id` | string | Analyst user ID |

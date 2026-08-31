@@ -117,20 +117,26 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import unquote, urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin, require_admin_or_producer_connection
+from app.auth.public_url import public_base_url
+from app.auth.session_principal import ProducerPrincipal
 from app.resource_types import ResourceType
+from src.audit_helpers import log_safe
 from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
     certificate_metadata,
     get_app_token,
+    get_site_by_path,
     list_drives,
     list_item_children,
     list_root_children,
@@ -140,8 +146,8 @@ from connectors.sharepoint.graph_client import (
 )
 from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
-from src.audit_helpers import log_safe
 from src.repositories import (
+    corpus_file_events_repo,
     file_corpora_repo,
     resource_grants_repo,
     source_connections_repo,
@@ -228,9 +234,11 @@ class ConfirmScopeBody(BaseModel):
 #: Keys THIS module writes into a SharePoint connection's ``config`` outside
 #: the generic ``PUT /api/admin/source-connections/{id}`` editor's own
 #: request body: the wizard's confirmed-scope rows (``scopes`` —
-#: :func:`confirm_scope` / :func:`remove_scope`) and the in-Agnes extraction
+#: :func:`confirm_scope` / :func:`remove_scope`), the in-Agnes extraction
 #: schedule's own dispatch bookkeeping (``extraction`` —
-#: :func:`_record_extraction_dispatch`, TCRD-226).
+#: :func:`_record_extraction_dispatch`, TCRD-226), and the Graph
+#: change-notification receiver's shared secret (``webhook_secret`` —
+#: :func:`rotate_webhook_secret`).
 #:
 #: A key earns a place here on ONE test: the server writes it into this
 #: connection's ``config`` and the generic connection-editor FORM never
@@ -249,7 +257,9 @@ class ConfirmScopeBody(BaseModel):
 #: change fails a test that names the fix, rather than shipping a silent
 #: erasure the way ``scopes`` (2026-08-29 morning) and ``extraction``
 #: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
-SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction")
+#: ``webhook_secret`` is the third instance of this same class — added
+#: here in the same change that introduces the writer, not after.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret")
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -275,6 +285,62 @@ def _validate_graph_id(value: str, field: str) -> None:
     500 from a Graph call that silently misrouted."""
     if not value or not _GRAPH_ID_RE.match(value):
         raise HTTPException(status_code=422, detail={"error": f"invalid_{field}", "message": f"malformed {field}"})
+
+
+_SITE_URL_MAX_LEN = 2048
+#: RFC-1123-ish: lowercase letters/digits/dots/hyphens, must start with an
+#: alphanumeric and contain a dot. Deliberately NOT pinned to
+#: ``*.sharepoint.com`` — sovereign clouds (`.sharepoint.us`, `.sharepoint.cn`,
+#: …) and vanity domains are legitimate hosts; the Graph base URL is a
+#: constant, so a wrong host can only make Graph itself answer 400/404.
+_SITE_HOSTNAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
+
+
+def _invalid_site_url(reason: str) -> None:
+    raise HTTPException(status_code=422, detail={"error": "invalid_site_url", "message": f"invalid site_url: {reason}"})
+
+
+def _parse_site_url(raw: str) -> Tuple[str, str]:
+    """An admin-pasted SharePoint URL -> ``(hostname, server_relative_path)``
+    for Graph's by-path site addressing.
+
+    Admins paste whatever their browser shows, so a URL deep inside the site
+    (a library page, a document) is trimmed to the site itself when the path
+    starts with a site-collection managed path (``/sites/…``, ``/teams/…``
+    -> first two segments). Any other path shape is kept as given — the
+    tenant root site (empty path) included.
+
+    This is request validation, not transport safety: every segment is
+    ALSO percent-encoded at the Graph client (`get_site_by_path`), so the
+    typed 422s here exist to tell the admin what to fix, not to be the only
+    thing standing between a pasted string and the Graph URL. Rejections are
+    structural (scheme, userinfo/port smuggling, dot-dot or control-character
+    segments), never a guess at which tenants are plausible.
+    """
+    value = (raw or "").strip()
+    if not value:
+        _invalid_site_url("empty")
+    if len(value) > _SITE_URL_MAX_LEN:
+        _invalid_site_url("too long")
+    if "://" not in value:
+        value = "https://" + value
+    parts = urlsplit(value)
+    if parts.scheme != "https":
+        _invalid_site_url("only https:// URLs are accepted")
+    host = parts.netloc.lower()
+    if "@" in host or ":" in host:
+        _invalid_site_url("hostname must not carry credentials or a port")
+    if "." not in host or not _SITE_HOSTNAME_RE.match(host):
+        _invalid_site_url("malformed hostname")
+    segments = [unquote(seg) for seg in parts.path.split("/") if seg]
+    for seg in segments:
+        if seg in (".", "..") or "\\" in seg or any(ord(ch) < 32 for ch in seg):
+            _invalid_site_url("malformed path segment")
+    if segments and segments[0].lower() in ("sites", "teams"):
+        if len(segments) < 2:
+            _invalid_site_url("the URL names a managed path but no site")
+        segments = segments[:2]
+    return host, "/".join(segments)
 
 
 #: A single browse click never fans out into more Graph calls than this many
@@ -332,7 +398,9 @@ async def _resolved_token(row: Dict[str, Any]) -> str:
             detail={"error": "sharepoint_cert_unresolved", "message": str(exc)},
         ) from exc
     try:
-        return await get_app_token(settings.tenant_id, settings.client_id, settings.private_key)
+        return await get_app_token(
+            settings.tenant_id, settings.client_id, settings.private_key, client_secret=settings.client_secret
+        )
     except SharePointGraphError as exc:
         raise HTTPException(
             status_code=502,
@@ -519,6 +587,15 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     BEFORE a job is queued rather than 30 minutes later when a worker claims
     it and the handler raises.
 
+    Both gates already honor a deploy-time env override ahead of
+    ``instance.yaml`` — ``AGNES_EXTRACTION_ENABLED`` (via
+    ``feature_enabled`` below) and ``AGNES_EXTRACTION_PRODUCER_COMMAND`` /
+    ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
+    :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
+    this function and the handler it mirrors see the identical truth
+    regardless of which source (env or yaml) an instance configures
+    through.
+
     Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
     "message": ...})`` naming the exact fix.
     """
@@ -543,7 +620,8 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
             "message": (
                 "No producer configured — set extraction.producer.command or "
                 "extraction.producer.module in instance.yaml (or "
-                "extraction.producer.mode: builtin for the in-process crawler)."
+                "AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE), "
+                "or extraction.producer.mode: builtin for the in-process crawler."
             ),
         }
 
@@ -648,6 +726,7 @@ async def browse_tree(
     site_id: Optional[str] = None,
     drive_id: Optional[str] = None,
     item_id: Optional[str] = None,
+    site_url: Optional[str] = None,
     with_permissions: bool = False,
     _user: dict = Depends(require_admin),
 ):
@@ -660,6 +739,15 @@ async def browse_tree(
     item id, never a path, and is structurally validated before it reaches
     a Graph URL).
 
+    ``site_url`` (exclusive with all three coordinates above) resolves ONE
+    site addressed directly by a pasted URL and returns it as a one-item
+    ``sites`` level. This is the ``Sites.Selected`` escape hatch: that
+    permission 403-forbids every enumeration Graph offers, so the sites
+    level above is unreachable for such an app registration, while a granted
+    site it can NAME stays readable (Graph by-path addressing). A deep URL
+    (a library page, a document) is trimmed to its site when it starts with
+    a site-collection managed path — see :func:`_parse_site_url`.
+
     ``with_permissions=1`` (default off) additionally probes each listed
     FOLDER for ``hasUniqueRoleAssignments`` — an ADVISORY-ONLY signal
     (Decision #2: Agnes never derives or enforces anything from a
@@ -671,6 +759,17 @@ async def browse_tree(
     fails the browse itself — affected folders just come back ``null``
     ("unknown").
     """
+    if site_url is not None and (site_id or drive_id or item_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "site_url_exclusive",
+                "message": "site_url resolves a site on its own — it cannot be combined with site_id/drive_id/item_id",
+            },
+        )
+    site_by_url: Optional[Tuple[str, str]] = None
+    if site_url is not None:
+        site_by_url = _parse_site_url(site_url)  # typed 422 before any token resolution
     if item_id is not None:
         if not drive_id:
             raise HTTPException(status_code=422, detail={"error": "item_id_requires_drive_id"})
@@ -678,6 +777,10 @@ async def browse_tree(
     row = _sharepoint_connection_or_404(connection_id)
     token = await _resolved_token(row)
     try:
+        if site_by_url is not None:
+            hostname, site_path = site_by_url
+            site = await get_site_by_path(token, hostname, site_path)
+            return {"level": "sites", "items": [site]}
         if drive_id:
             items = await (
                 list_item_children(token, drive_id, item_id) if item_id else list_root_children(token, drive_id)
@@ -691,6 +794,33 @@ async def browse_tree(
         items = await list_sites(token)
         return {"level": "sites", "items": items}
     except SharePointGraphError as exc:
+        # A Graph 403 is a PERMISSION verdict on an issued token, never an
+        # outage — classify the two cases this endpoint can make actionable
+        # instead of letting them read as "SharePoint did not answer" (the
+        # generic wrap below, which one real Sites.Selected tenant surfaced
+        # for a working certificate).
+        if exc.status_code == 403 and site_by_url is not None:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_site_not_granted",
+                    "message": (
+                        "Graph refused this site (HTTP 403): the app registration has no grant on it. "
+                        "Grant the app access to this site (Sites.Selected), or check the URL."
+                    ),
+                },
+            ) from exc
+        if exc.status_code == 403 and not site_id and not drive_id:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_discovery_forbidden",
+                    "message": (
+                        "Graph refused to list sites (HTTP 403). An app registration holding only "
+                        "Sites.Selected cannot enumerate sites — add a granted site directly by its URL instead."
+                    ),
+                },
+            ) from exc
         raise HTTPException(
             status_code=502,
             detail={"error": "sharepoint_graph_error", "message": str(exc)},
@@ -811,12 +941,27 @@ async def search_tree(
 @router.get("/connections/{connection_id}/scopes")
 async def list_scopes(
     connection_id: str,
-    _user: dict = Depends(require_admin),
+    user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
     """The wizard's step-2/3 source of truth: every confirmed scope row,
-    enriched with its collection and current group grants."""
+    enriched with its collection and current group grants.
+
+    Also the corpus-extraction producer's own callback read (TCRD-...):
+    a ``ProducerPrincipal`` scoped to THIS connection may call this too
+    (see ``require_admin_or_producer_connection``) — self-audited here
+    (``sharepoint_connection.scopes_read``, ``client_kind="producer"``)
+    since a restricted principal's identity is never stashed onto
+    ``request.state.user``, so the generic audit-fallback middleware would
+    otherwise see no attributable caller and write nothing at all.
+    """
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
+    if isinstance(user, ProducerPrincipal):
+        log_safe(
+            action="sharepoint_connection.scopes_read",
+            resource=connection_id,
+            client_kind="producer",
+        )
     return {"items": [_scope_out(s, declared, row) for s in _scopes(row)]}
 
 
@@ -1054,7 +1199,7 @@ async def remove_scope(
 @router.get("/connections/{connection_id}/corpus-map")
 async def corpus_map(
     connection_id: str,
-    _user: dict = Depends(require_admin),
+    user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
     """Producer handoff (spec §13.2 / item 3): the corpus map the external
     crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
@@ -1075,15 +1220,30 @@ async def corpus_map(
     know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
     row already carries ``anonymize``); Agnes's own ``corpus-extraction``
     job handler does the equivalent lookup internally
-    (``app/worker/kinds.py::_anonymize_marked_scope_map``)."""
+    (``app/worker/kinds.py::_anonymize_marked_scope_map``).
+
+    THIS is the primary callback the corpus-extraction producer itself
+    calls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may
+    call it too (see ``require_admin_or_producer_connection``) —
+    self-audited here (``sharepoint_connection.corpus_map_read``,
+    ``client_kind="producer"``) for the same reason ``list_scopes`` above
+    self-audits its own producer branch.
+    """
     row = _sharepoint_connection_or_404(connection_id)
     try:
-        return producer_corpus_map(_scopes(row))
+        mapping = producer_corpus_map(_scopes(row))
     except CorpusMapError as exc:
         raise HTTPException(
             status_code=409,
             detail={"error": "corpus_map_ambiguous", "message": str(exc)},
         ) from exc
+    if isinstance(user, ProducerPrincipal):
+        log_safe(
+            action="sharepoint_connection.corpus_map_read",
+            resource=connection_id,
+            client_kind="producer",
+        )
+    return mapping
 
 
 @router.get("/connections/{connection_id}/certificate")
@@ -1111,7 +1271,55 @@ async def certificate(
         settings = resolve_sharepoint_settings(row)
     except SharePointSettingsError as exc:
         return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
+    if settings.auth_method == "client_secret":
+        # No certificate exists to describe — a typed absence, same shape as
+        # the unresolved/unparseable cases, never an error.
+        return {"certificate": None, "reason": "client_secret_auth"}
     return certificate_metadata(settings.private_key)
+
+
+@router.post("/connections/{connection_id}/webhook")
+async def rotate_webhook_secret(
+    connection_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """(Re)generate this connection's Graph change-notification receiver
+    secret and return the receiver URL alongside it, so an operator can run
+    the producer's own ``subscriptions.py create --url <webhook_url>``
+    against this connection without hand-assembling either value.
+
+    Always mints a FRESH random secret — there is no "read the current
+    one" verb, matching the outbound-webhook pattern
+    (``app/api/agent_webhooks.py``): a caller who wants to see it again
+    calls this again, which also rotates it, invalidating whatever Graph
+    subscription was signed with the old value (the operator must then
+    re-point the subscription's ``clientState``, or simply create a new
+    subscription — Agnes does not manage Graph subscriptions itself).
+
+    Unlike the outbound-webhook secret, this one is NOT hidden after
+    creation: it lives in this connection's own ``config.webhook_secret``
+    (see ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``), the same trust
+    boundary ``config.tenant_id``/``client_id`` already sit behind, so any
+    admin who can ``GET`` this connection can also read it back later. That
+    is an admin-to-admin visibility question, not a public one — the
+    receiver route (``app/api/sharepoint_webhooks.py``) never returns it and
+    verifies every notification's ``clientState`` against it in constant
+    time.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    secret = secrets.token_hex(32)
+    new_config = {**(row.get("config") or {}), "webhook_secret": secret}
+    source_connections_repo().update(connection_id, config=new_config)
+
+    webhook_url = f"{public_base_url(request=request)}/api/webhooks/sharepoint/{connection_id}"
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.webhook_secret_rotate",
+        resource=f"source_connection:{connection_id}",
+    )
+    logger.info("sharepoint connection %s: webhook secret rotated", connection_id)
+    return {"webhook_url": webhook_url, "secret": secret}
 
 
 @router.post("/connections/{connection_id}/extract", status_code=202)
@@ -1266,3 +1474,131 @@ async def run_due_extraction(
             logger.exception("extraction:run-due — connection %s failed; continuing sweep", row.get("id"))
 
     return {"dispatched": dispatched, "count": len(dispatched)}
+
+
+# ---------------------------------------------------------------------------
+# Observed-changes feed (2026-08-30) — own section, appended at the end of
+# the file on purpose to minimize merge conflicts with the rest of this
+# router (see the module's own maintenance note at the top).
+#
+# "What changed between two timestamps" for a SharePoint connection, derived
+# from the append-only ``corpus_file_events`` log
+# (``src/repositories/corpus_file_events_pg.py``) that ``app/api/
+# collections.py``'s upload/delete handlers already write. See that
+# repository's module docstring for why a plain event log is needed here at
+# all rather than deriving purely from ``corpus_files``' own timestamps: a
+# snapshot table cannot answer "was the last touch an update or a rename"
+# after the fact, and a hard-deleted row leaves nothing to snapshot.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a caller-supplied ``since``/``until`` to an aware UTC
+    datetime — a bare ISO string with no offset parses as naive, and this
+    value is about to be compared against Postgres's own tz-aware
+    ``observed_at`` column (mirrors the idiom in ``app/api/collections.py::
+    _is_stale_processing`` / ``app/auth/pat_resolver.py``)."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+@router.get("/connections/{connection_id}/changes")
+async def connection_changes(
+    connection_id: str,
+    since: Optional[datetime] = Query(default=None, description="Inclusive lower bound on observed_at (ISO 8601)."),
+    until: Optional[datetime] = Query(default=None, description="Inclusive upper bound on observed_at (ISO 8601)."),
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: Optional[str] = Query(default=None, description="Opaque token from a prior page's next_cursor."),
+    _user: dict = Depends(require_admin),
+):
+    """Observed content changes for this connection between ``since`` and
+    ``until`` — "what changed", for a consumer that would otherwise have to
+    diff the whole corpus by hand or re-read everything on every check.
+
+    ``observed_at`` is when AGNES learned of the change (the moment its own
+    upload/delete handler recorded it), never a live query against
+    Microsoft Graph — this endpoint never calls SharePoint. A document
+    edited at the source but not yet re-crawled therefore does NOT appear
+    here; it will, once a future sync uploads the new content and this
+    feed's window covers that upload's ``observed_at``. Both bounds are
+    optional and inclusive; omitting ``since`` reads from the beginning of
+    the log, omitting ``until`` reads to now.
+
+    Each item is ``{change, name, path, collection_id, file_id,
+    source_stable_id, source_modified, observed_at, ingest_run_id}``:
+
+    * ``change`` — ``added`` (new document), ``updated`` (same identity,
+      content/``sha256`` differs), ``renamed`` (same identity and content,
+      ``name``/``path`` differs — detectable ONLY when the upload carried a
+      ``source_stable_id``, since a bare path match has no identity that
+      survives a path change), or ``deleted``.
+    * ``source_modified`` — always ``null`` today: no upload path persists
+      the source's own modified-timestamp yet (see ``document_dates`` in
+      ``app/api/collections.py::upload_files``, accepted but not yet
+      stored). Reserved so a future producer that DOES supply it does not
+      need a contract change.
+    * ``ingest_run_id`` — always ``null`` today: the crawler invokes this
+      connection's upload endpoint out-of-process (spec's producer
+      subprocess), which carries no run identifier through to
+      ``corpus_file_events``. Reserved for the same forward-compatibility
+      reason as ``source_modified``.
+
+    Ordering is ``(observed_at, id)`` ascending — deterministic even when
+    several events share a timestamp, which pagination depends on:
+    ``next_cursor`` (``null`` at the end of the window) resumes strictly
+    after the last item's position. A file that changed more than once in
+    the window appears once per transition, in order — this is an event
+    feed, not a snapshot of current state.
+
+    Scoped to the connection's OWN collections (every ``collection_id`` any
+    of its confirmed scopes maps to, per ``config.scopes`` — see
+    :func:`_scopes`); a connection with no confirmed scopes yet returns an
+    empty page rather than an error. Only top-level file upload/delete via
+    ``/api/collections/{id}/files*`` are tracked — a member added or removed
+    from inside an uploaded zip bundle is not (see
+    ``app/api/collections.py::_purge_children_and_content``).
+
+    Malformed ``cursor`` is a typed **400** (``invalid_cursor``), never a
+    500 from a bad row-value comparison downstream.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    collection_ids = sorted({s["collection_id"] for s in _scopes(row) if s.get("collection_id")})
+
+    since_utc = _ensure_utc(since)
+    until_utc = _ensure_utc(until)
+
+    try:
+        events, next_cursor = corpus_file_events_repo().list_for_corpus_ids(
+            collection_ids,
+            since=since_utc,
+            until=until_utc,
+            limit=limit,
+            cursor=cursor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_cursor", "message": str(exc)}) from exc
+
+    items = [
+        {
+            "change": event["change"],
+            "name": event["name"],
+            "path": event.get("path"),
+            "collection_id": event["corpus_id"],
+            "file_id": event.get("file_id"),
+            "source_stable_id": event.get("source_stable_id"),
+            "source_modified": None,
+            "observed_at": event["observed_at"],
+            "ingest_run_id": None,
+        }
+        for event in events
+    ]
+    return {
+        "connection_id": connection_id,
+        "since": since_utc.isoformat() if since_utc else None,
+        "until": until_utc.isoformat() if until_utc else None,
+        "items": items,
+        "next_cursor": next_cursor,
+    }

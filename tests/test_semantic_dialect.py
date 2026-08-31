@@ -1,4 +1,20 @@
+from src.semantic import document_validation
 from src.semantic.dialect import resolve_expression, resolve_expression_any
+
+
+def test_vendored_schema_does_not_offer_duckdb_as_a_dialect():
+    """Pinning test: the vendored, pinned Ossie schema's Dialect enum has no
+    DUCKDB value today, so a document declaring ``dialect: DUCKDB`` fails
+    validation and is never projected. ``_PREFERRED`` in dialect.py keeps
+    DUCKDB first anyway as cheap forward-compat for when upstream adds it.
+
+    If this test starts failing, the vendored schema gained DUCKDB — that's
+    the moment to consciously re-activate the dormant preference (and update
+    the comments in dialect.py + docs/semantic-layer.md that currently say
+    it's dormant).
+    """
+    dialect_enum = document_validation._SCHEMA["$defs"]["Dialect"]["enum"]
+    assert "DUCKDB" not in dialect_enum
 
 
 def _expr(*pairs):

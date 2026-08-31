@@ -1530,9 +1530,7 @@ def test_v119_db_migrates_to_v120_adds_agent_schedules(tmp_path):
     _ensure_schema(conn)
     assert get_schema_version(conn) == SCHEMA_VERSION
 
-    exists = conn.execute(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_schedules'"
-    ).fetchone()
+    exists = conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_schedules'").fetchone()
     assert exists is not None
 
     conn.execute(

@@ -247,6 +247,31 @@ class TestQueryTool:
         _, payload = m.call_args[0]
         assert payload["limit"] == 50
 
+    def test_the_semantic_advisory_never_fails_a_deliverable_result(self, monkeypatch):
+        """Same guarantee as the HTTP foundation `query` tool, through the same
+        shared helper: an advisory bolted onto a borderline-sized result must
+        give way before the rows do. A transport-specific answer here would
+        mean a query that succeeds over HTTP and errors over stdio."""
+        srv = _import_server()
+        monkeypatch.setenv("AGNES_MCP_MAX_OUTPUT_CHARS", "4000")
+        rows = [[i, "x" * 40] for i in range(60)]
+        payload = {
+            "columns": ["id", "blob"],
+            "rows": rows,
+            "truncated": False,
+            "semantic_validation": {
+                "valid": False,
+                "warnings": [f"w{i} " + "y" * 100 for i in range(40)],
+                "violations": [{"name": f"c{i}", "reason": "z" * 200} for i in range(40)],
+            },
+        }
+        with patch("cli.mcp.server.api_post_json", return_value=payload):
+            result = srv.query("SELECT id, blob FROM t")
+        assert result["rows"] == rows
+        advisory = result.get("semantic_validation")
+        if advisory is not None:
+            assert advisory["truncated"] is True
+
     def test_query_raises_on_server_error(self):
         srv = _import_server()
         from cli.v2_client import V2ClientError

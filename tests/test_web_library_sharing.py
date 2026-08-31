@@ -803,6 +803,11 @@ def test_page_header_carries_the_controls_and_the_bands_own_the_top(seeded_app):
     assert "fbar-dock__veil" not in text
     assert "fbar-dock__card" not in text
 
+    # The dock is gone from THIS page — markup, veil and the card the retired
+    # resize animation observed.
+    assert 'class="fbar-dock"' not in text
+    assert "fbar-dock__veil" not in text
+    assert "fbar-dock__card" not in text
 
 def test_library_title_carries_no_setup_caveat(seeded_app):
     """The caveat never rides the TITLE: no `.pnote` panel under the lede, and no
@@ -826,8 +831,16 @@ def test_library_title_carries_no_setup_caveat(seeded_app):
     # Neither the panel nor the pill that replaced it — markup, CSS and JS.
     assert 'class="pnote"' not in text
     assert "lib-status" not in text
-    # The title stands alone, directly ahead of the lede.
-    assert "<h1>Library</h1>" in text
+    # The title stands alone, directly ahead of the lede: nothing is stapled
+    # INSIDE the h1. Matched with a pattern rather than the literal
+    # `<h1>Library</h1>`, because the heading legitimately carries the shared
+    # `page-title` class now (#1915) — what must stay true is that its content
+    # is the name and nothing else, which is the property the old literal was
+    # really expressing.
+    assert re.search(r"<h1[^>]*>Library</h1>", text), (
+        "the Library h1 must contain the page name alone — a pill or badge "
+        "inside it is what this guards against"
+    )
     # The title stands alone. The prose lede that used to follow it is gone —
     # what it became is the count, and the count belongs on the list.
     assert 'class="lede"' not in text

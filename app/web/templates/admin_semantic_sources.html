@@ -1,0 +1,552 @@
+{% extends "base_admin_page.html" %}
+{% block title %}Semantic sources — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{# Section-level and PLAIN, matching /admin/semantic-layer: the h1 names the
+   section, the tab strip below names the lens. #}
+{% set page_hero_title = "Data" %}
+{% set page_hero_subtitle = "Where semantic-layer documents come from — a git repo, an upload, or a data-source connection's own native models (Keboola Metastore, Snowflake semantic views, Databricks Unity Catalog metric views). Each source can be synced independently; see the imported result at <a href=\"/semantic-layer\">Semantic models</a>." %}
+{% set page_hero_plain = True %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/icon_btn.css') }}">
+<style>
+  .ss-page { font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif); }
+
+  .ss-toolbar {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 16px; margin-bottom: 20px; flex-wrap: wrap;
+  }
+
+  .ss-kind-pill, .ss-status-pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+  }
+  .ss-kind-git        { background: var(--ds-accent-info-bg);    color: var(--ds-accent-info-ink); }
+  .ss-kind-upload      { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+  .ss-kind-connection  { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+
+  .ss-status-ok       { color: var(--ds-accent-success-ink); }
+  .ss-status-error     { color: var(--ds-accent-danger-ink); }
+  .ss-status-none      { color: var(--ds-text-muted); }
+  .ss-status-disabled  { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
+
+  .ss-adapter { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--ds-text-secondary); }
+
+  /* How many models this source OWNS. "Synced ok" only says the fetch
+     worked — a source scoped at an empty upstream stays green forever while
+     importing nothing (#1707), so the count needs its own marker.
+     `-empty` (amber) fires ONLY for a source that synced OK and still owns
+     nothing — the same rule the CLI and the docs state. A never-synced or
+     skipped source owning nothing has simply not run, so it stays neutral.
+     Amber is WARN (attention), never danger: nothing failed either way. */
+  .ss-models {
+    display: inline-block; padding: 2px 8px; border-radius: var(--ds-radius-pill, 999px);
+    font-size: 11px; font-weight: 600; white-space: nowrap;
+  }
+  .ss-models-neutral { background: var(--ds-surface-dim); color: var(--ds-text-secondary); }
+  .ss-models-empty { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .ss-models-unknown { color: var(--ds-text-muted); }
+
+  /* What this source actually SCANNED, beside the sync result. A count of 0
+     cannot separate "there is nothing upstream" from "the role I connect as
+     cannot see it" (finding A17 on #1707) — naming the database/schema/role,
+     project, catalog or repository is what makes the second checkable.
+     Informational: muted, never an accent, because a scope is neither good
+     nor bad news on its own. */
+  .ss-scope { color: var(--ds-text-muted); font-size: 12px; white-space: nowrap; }
+
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: nowrap; }
+
+  .ss-empty, .ss-loading {
+    text-align: center; padding: 48px 16px;
+    color: var(--ds-text-secondary); font-size: 13px;
+  }
+  .ss-empty .big { font-size: 15px; color: var(--ds-text-primary); margin-bottom: 6px; font-weight: 500; }
+
+  /* Modal — same vocabulary as admin_mcp_sources.html */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(15, 23, 42, 0.55);
+    display: none; align-items: center; justify-content: center; z-index: 1000;
+    padding: 16px;
+  }
+  .modal-backdrop.is-open { display: flex; }
+  .modal-card {
+    background: var(--ds-surface); border-radius: 12px;
+    padding: 24px; width: 100%; max-width: 520px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+    max-height: 90vh; overflow-y: auto;
+  }
+  .modal-card h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  .modal-card p.sub { margin: 0 0 18px; font-size: 13px; color: var(--ds-text-secondary); }
+  .modal-card label { display: block; font-size: 12px; font-weight: 500; color: var(--ds-text-secondary); margin: 12px 0 6px; }
+  .modal-card .help { font-size: 11px; color: var(--ds-text-muted); margin-top: 4px; }
+  .modal-card input[type="text"], .modal-card input[type="url"], .modal-card select, .modal-card textarea {
+    width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border);
+    border-radius: 8px; font-size: 13px; box-sizing: border-box;
+    background: var(--ds-surface); color: var(--ds-text-primary);
+    font-family: inherit;
+  }
+  .modal-card textarea { min-height: 100px; resize: vertical; font-family: var(--font-mono, ui-monospace, monospace); }
+  .modal-card input:focus, .modal-card textarea:focus, .modal-card select:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+  .kind-fields { display: none; }
+  .kind-fields.is-active { display: block; }
+
+  /* Toast — same vocabulary as the other admin pages */
+  .toast-stack {
+    position: fixed; bottom: 24px; right: 24px; z-index: 2000;
+    display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+  }
+  .toast {
+    background: var(--ds-text-primary); color: var(--ds-text-inverse); padding: 10px 16px;
+    border-radius: 8px; font-size: 13px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+    opacity: 0; transform: translateY(8px); transition: opacity 0.2s, transform 0.2s;
+    pointer-events: auto; max-width: 380px; white-space: pre-wrap;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.success { background: var(--ds-accent-success-ink); }
+  .toast.error { background: var(--ds-accent-danger-ink); }
+</style>
+{% endblock %}
+
+{% block page %}
+{% include "_admin_tabs.html" %}
+<div class="ss-page">
+  <div class="ss-toolbar">
+    <span></span>
+    {{ ds.button('+ Add source', variant='primary', id='open-create-btn') }}
+  </div>
+
+  <div class="data-table-wrap">
+    <table class="data-table" id="ss-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Kind</th>
+          <th>Adapter</th>
+          <th>Enabled</th>
+          <th>Last sync</th>
+          <th>Models</th>
+          <th class="num">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="ss-tbody"></tbody>
+    </table>
+    <div id="ss-loading" class="ss-loading">Loading semantic sources…</div>
+    <div id="ss-empty" class="ss-empty" style="display:none;">
+      <div class="big">No semantic sources registered</div>
+      <div>Click <strong>Add source</strong> to pull semantic-layer documents from a git repo, an upload, or a data-source connection (Snowflake, Databricks, Keboola).</div>
+    </div>
+  </div>
+</div>
+
+<!-- Create modal -->
+<div class="modal-backdrop" id="create-modal" role="dialog" aria-modal="true" aria-labelledby="create-modal-title">
+  <div class="modal-card">
+    <h3 id="create-modal-title">Add semantic source</h3>
+    <p class="sub">Register where semantic-layer documents come from. After saving, use <strong>Sync</strong> on its row to import.</p>
+
+    <label for="new-name">Name</label>
+    <input id="new-name" type="text" placeholder="e.g. Finance models" required autocomplete="off">
+
+    <label for="new-kind">Kind</label>
+    <select id="new-kind" class="ds-dropdown-native">
+      <option value="git">git — clone a repo, read matching files</option>
+      <option value="upload">upload — paste a document directly</option>
+      <option value="connection">connection — pull from a data-source connection</option>
+    </select>
+    {{ ds.dropdown(
+      id='new-kind-dd', target='new-kind',
+      aria_label='Kind', selected='git',
+      options=[
+        {'value': 'git', 'label': 'git — clone a repo, read matching files'},
+        {'value': 'upload', 'label': 'upload — paste a document directly'},
+        {'value': 'connection', 'label': 'connection — pull from a data-source connection'},
+      ],
+    ) }}
+
+    <div class="kind-fields is-active" data-kind="git">
+      <label for="new-repo-url">Repository URL</label>
+      <input id="new-repo-url" type="url" placeholder="https://example.com/semantics.git" autocomplete="off">
+
+      <label for="new-ref">Ref <span class="optional">(default: main)</span></label>
+      <input id="new-ref" type="text" placeholder="main" autocomplete="off">
+
+      <label for="new-glob">Glob</label>
+      <input id="new-glob" type="text" placeholder="semantic/**/*.yaml" autocomplete="off">
+
+      <label for="new-token-env">Token env var <span class="optional">(optional, private repos)</span></label>
+      <input id="new-token-env" type="text" placeholder="e.g. FINANCE_GIT_TOKEN" autocomplete="off">
+    </div>
+
+    <div class="kind-fields" data-kind="upload">
+      <label for="new-document">Ossie document (YAML)</label>
+      <textarea id="new-document" autocomplete="off" placeholder="version: &quot;0.2.0.dev0&quot;&#10;semantic_model:&#10;  - name: retail&#10;    datasets: [...]"></textarea>
+    </div>
+
+    <div class="kind-fields" data-kind="connection">
+      <label for="new-adapter">Adapter</label>
+      <select id="new-adapter" class="ds-dropdown-native">
+        <option value="snowflake_semantic">snowflake_semantic — Snowflake semantic views (CREATE SEMANTIC VIEW)</option>
+        <option value="databricks_metric_views">databricks_metric_views — Unity Catalog metric views</option>
+        <option value="keboola_metastore">keboola_metastore — Keboola project Metastore</option>
+      </select>
+      {{ ds.dropdown(
+        id='new-adapter-dd', target='new-adapter',
+        aria_label='Adapter', selected='snowflake_semantic',
+        options=[
+          {'value': 'snowflake_semantic', 'label': 'snowflake_semantic — Snowflake semantic views (CREATE SEMANTIC VIEW)'},
+          {'value': 'databricks_metric_views', 'label': 'databricks_metric_views — Unity Catalog metric views'},
+          {'value': 'keboola_metastore', 'label': 'keboola_metastore — Keboola project Metastore'},
+        ],
+      ) }}
+      <div class="help">Reads the instance's already-configured connection for that source type — no separate credentials here.</div>
+    </div>
+
+    <div class="modal-actions">
+      {{ ds.button('Cancel', variant='secondary', attrs='data-close-modal="create-modal"') }}
+      {{ ds.button('Add source', variant='primary', id='confirm-create-btn') }}
+    </div>
+  </div>
+</div>
+
+<!-- Confirm delete modal -->
+<div class="modal-backdrop" id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal-card">
+    <h3 id="confirm-title">Delete semantic source?</h3>
+    <p class="sub" id="confirm-text"></p>
+    <div class="modal-actions">
+      {{ ds.button('Cancel', variant='secondary', attrs='data-close-modal="confirm-modal"') }}
+      {{ ds.button('Delete', variant='danger', id='confirm-ok-btn') }}
+    </div>
+  </div>
+</div>
+
+<div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
+<script>
+const API = "/api/admin/semantic-sources";
+
+function syncDropdown(selectId, value) {
+  const host = document.querySelector(`.ds-dropdown[data-ds-dropdown-target="${selectId}"]`);
+  if (!host) return;
+  const label = host.querySelector(".ds-dropdown-btn-label");
+  host.querySelectorAll('[role="menuitemradio"]').forEach((item) => {
+    const match = item.dataset.value === value;
+    item.classList.toggle("is-selected", match);
+    item.setAttribute("aria-checked", match ? "true" : "false");
+    if (match && label) label.textContent = item.textContent.trim();
+  });
+}
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
+function toast(msg, kind = "") {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = msg;
+  document.getElementById("toast-stack").appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 250); }, 4500);
+}
+
+function openModal(id) {
+  document.getElementById(id).classList.add("is-open");
+  const focusable = document.querySelector(`#${id} input, #${id} button.btn-primary`);
+  focusable && focusable.focus();
+}
+function closeModal(id) { document.getElementById(id).classList.remove("is-open"); }
+document.querySelectorAll("[data-close-modal]").forEach(el =>
+  el.addEventListener("click", () => closeModal(el.dataset.closeModal)));
+document.querySelectorAll(".modal-backdrop").forEach(el => {
+  el.addEventListener("click", e => { if (e.target === el) el.classList.remove("is-open"); });
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.querySelectorAll(".modal-backdrop.is-open").forEach(m => m.classList.remove("is-open"));
+});
+
+function syncKindFields() {
+  const k = document.getElementById("new-kind").value;
+  document.querySelectorAll(".kind-fields").forEach(el => {
+    el.classList.toggle("is-active", el.dataset.kind === k);
+  });
+}
+document.getElementById("new-kind").addEventListener("change", syncKindFields);
+
+let allSources = [];
+let pendingDeleteId = null;
+
+function fmtLastSync(s) {
+  if (!s.last_sync_at) return `<span class="ss-status-none">never synced</span>`;
+  const when = new Date(s.last_sync_at).toLocaleString();
+  if (s.last_sync_status === "error") {
+    return `<span class="ss-status-error" title="${esc(s.last_sync_error || '')}">✗ failed</span> · ${esc(when)}`;
+  }
+  if (s.last_sync_status === "ok") {
+    return `<span class="ss-status-ok">✓ ok</span> · ${esc(when)}`;
+  }
+  if (s.last_sync_status === "skipped") {
+    // The sweep deliberately did not sync this source (today: another source
+    // already imported the same upstream project this run). Muted rather than
+    // red — nothing failed — but the reason has to be reachable, or the row
+    // reads as "synced fine" forever.
+    return `<span class="ss-status-none" title="${esc(s.last_sync_error || '')}">— skipped</span> · ${esc(when)}`;
+  }
+  return esc(when);
+}
+
+function fmtScanScope(s) {
+  // Derived server-side from the source's own config (src/semantic/
+  // scan_scope.py). `null` — no scope could be stated for this source, or a
+  // server too old to send the field — renders nothing at all rather than a
+  // guess: an empty scope line would be a claim of its own.
+  // Tense-neutral on purpose: this cell also renders on a "never synced" row,
+  // where the scope is what the FIRST sync will look at, not what a past one
+  // did — a tooltip saying "last sync" would contradict the row beside it.
+  if (typeof s.scan_scope !== "string" || !s.scan_scope) return "";
+  return ` · <span class="ss-scope" title="What this source's sync looks at.">scanned ${esc(s.scan_scope)}</span>`;
+}
+
+function fmtOwnedModels(s) {
+  const n = s.owned_model_count;
+  if (typeof n !== "number") {
+    // `null` (this source's provenance could not be resolved) or a server too
+    // old to send the field at all — say nothing rather than assert a count
+    // nobody claimed. A confident "0 models" here would be a wrong number.
+    const why = s.owned_model_count === null
+      ? "Cannot determine — this source's provenance could not be resolved. See the server log."
+      : "Not reported by this server.";
+    return `<span class="ss-models-unknown" title="${esc(why)}">—</span>`;
+  }
+  const label = `${n} model${n === 1 ? "" : "s"}`;
+  // Amber ONLY for "synced fine and still owns nothing" — the finding. A
+  // source that has never run (or was skipped) owning nothing has not failed
+  // to import, it has not imported yet.
+  if (n === 0 && s.last_sync_status === "ok") {
+    const why = "Synced, but imported nothing — check this source's scope/config.";
+    return `<span class="ss-models ss-models-empty" title="${esc(why)}">${esc(label)}</span>`;
+  }
+  const title = n === 0 ? ' title="Nothing imported yet."' : "";
+  return `<span class="ss-models ss-models-neutral"${title}>${esc(label)}</span>`;
+}
+
+function renderSources() {
+  const tbody = document.getElementById("ss-tbody");
+  const loading = document.getElementById("ss-loading");
+  const empty = document.getElementById("ss-empty");
+  loading.style.display = "none";
+
+  if (allSources.length === 0) {
+    empty.style.display = "block";
+    tbody.innerHTML = "";
+    return;
+  }
+  empty.style.display = "none";
+
+  tbody.innerHTML = "";
+  for (const s of allSources) {
+    const tr = document.createElement("tr");
+    const enabled = s.enabled !== false;
+    tr.innerHTML = `
+      <td>${esc(s.name || s.id)}</td>
+      <td><span class="ss-kind-pill ss-kind-${esc(s.kind || "git")}">${esc(s.kind || "")}</span></td>
+      <td><span class="ss-adapter">${esc(s.adapter || "native")}</span></td>
+      <td><span class="ss-status-pill ${enabled ? "" : "ss-status-disabled"}">${enabled ? "Enabled" : "Disabled"}</span></td>
+      <td>${fmtLastSync(s)}${fmtScanScope(s)}</td>
+      <td>${fmtOwnedModels(s)}</td>
+      <td>
+        <div class="row-actions">
+          <button class="icon-btn" data-act="sync" data-id="${esc(s.id)}">Sync now</button>
+          <button class="icon-btn" data-act="toggle" data-id="${esc(s.id)}" data-enabled="${enabled}">${enabled ? "Disable" : "Enable"}</button>
+          <button class="icon-btn danger" data-act="delete" data-id="${esc(s.id)}" data-name="${esc(s.name || s.id)}">Delete</button>
+        </div>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+document.getElementById("open-create-btn").addEventListener("click", () => {
+  document.getElementById("new-name").value = "";
+  document.getElementById("new-kind").value = "git";
+  syncDropdown("new-kind", "git");
+  document.getElementById("new-repo-url").value = "";
+  document.getElementById("new-ref").value = "";
+  document.getElementById("new-glob").value = "";
+  document.getElementById("new-token-env").value = "";
+  document.getElementById("new-document").value = "";
+  document.getElementById("new-adapter").value = "snowflake_semantic";
+  syncDropdown("new-adapter", "snowflake_semantic");
+  syncKindFields();
+  openModal("create-modal");
+});
+
+document.getElementById("confirm-create-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("confirm-create-btn");
+  const name = document.getElementById("new-name").value.trim();
+  const kind = document.getElementById("new-kind").value;
+  if (!name) { toast("Name is required", "error"); return; }
+
+  let adapter = "native";
+  let config = {};
+  if (kind === "git") {
+    const repoUrl = document.getElementById("new-repo-url").value.trim();
+    const glob = document.getElementById("new-glob").value.trim();
+    if (!repoUrl) { toast("Repository URL is required for a git source", "error"); return; }
+    if (!glob) { toast("Glob is required for a git source", "error"); return; }
+    config = { repo_url: repoUrl, glob };
+    const ref = document.getElementById("new-ref").value.trim();
+    if (ref) config.ref = ref;
+    const tokenEnv = document.getElementById("new-token-env").value.trim();
+    if (tokenEnv) config.token_env = tokenEnv;
+  } else if (kind === "upload") {
+    const doc = document.getElementById("new-document").value;
+    if (!doc.trim()) { toast("Paste a document for an upload source", "error"); return; }
+    config = { documents: [doc] };
+  } else if (kind === "connection") {
+    adapter = document.getElementById("new-adapter").value;
+  }
+
+  btn.disabled = true;
+  try {
+    const r = await fetch(API, {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, kind, adapter, config, enabled: true }),
+    });
+    if (r.ok) {
+      toast("Semantic source added", "success");
+      closeModal("create-modal");
+      await loadSources();
+    } else {
+      let detail = r.statusText;
+      try { detail = (await r.json()).detail || detail; } catch (_) {}
+      toast("Add failed: " + detail, "error");
+    }
+  } catch (e) {
+    toast("Add failed: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("ss-tbody").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-act]");
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const id = btn.dataset.id;
+
+  if (act === "delete") {
+    pendingDeleteId = id;
+    document.getElementById("confirm-text").textContent =
+      `Remove "${btn.dataset.name}"? Models it previously imported are pruned on the next sync of any source.`;
+    openModal("confirm-modal");
+    return;
+  }
+
+  if (act === "toggle") {
+    const enabled = btn.dataset.enabled === "true";
+    btn.disabled = true;
+    try {
+      const r = await fetch(`${API}/${encodeURIComponent(id)}`, {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      if (r.ok) {
+        toast(enabled ? "Source disabled" : "Source enabled", "success");
+        await loadSources();
+      } else {
+        let detail = r.statusText;
+        try { detail = (await r.json()).detail || detail; } catch (_) {}
+        toast("Update failed: " + detail, "error");
+      }
+    } catch (err) {
+      toast("Update failed: " + err.message, "error");
+    } finally {
+      btn.disabled = false;
+    }
+    return;
+  }
+
+  if (act === "sync") {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "Syncing…";
+    try {
+      const r = await fetch(`${API}/${encodeURIComponent(id)}/sync`, {
+        method: "POST", credentials: "include",
+      });
+      if (r.ok) {
+        const report = await r.json();
+        const invalidCount = (report.invalid || []).length;
+        toast(
+          `Synced — written ${report.models_written ?? 0}, unchanged ${report.models_unchanged ?? 0}` +
+          (invalidCount ? `, ${invalidCount} invalid` : ""),
+          invalidCount ? "error" : "success",
+        );
+        await loadSources();
+      } else {
+        let detail = r.statusText;
+        try { detail = (await r.json()).detail || detail; } catch (_) {}
+        toast("Sync failed: " + detail, "error");
+        await loadSources();
+      }
+    } catch (err) {
+      toast("Sync failed: " + err.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+});
+
+document.getElementById("confirm-ok-btn").addEventListener("click", async () => {
+  if (!pendingDeleteId) return;
+  const btn = document.getElementById("confirm-ok-btn");
+  btn.disabled = true;
+  try {
+    const r = await fetch(`${API}/${encodeURIComponent(pendingDeleteId)}`, {
+      method: "DELETE", credentials: "include",
+    });
+    if (r.ok) {
+      toast("Semantic source deleted", "success");
+      closeModal("confirm-modal");
+      pendingDeleteId = null;
+      await loadSources();
+    } else {
+      let detail = r.statusText;
+      try { detail = (await r.json()).detail || detail; } catch (_) {}
+      toast("Delete failed: " + detail, "error");
+    }
+  } catch (e) {
+    toast("Delete failed: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function loadSources() {
+  document.getElementById("ss-loading").style.display = "block";
+  try {
+    const r = await fetch(API, { credentials: "include" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    allSources = Array.isArray(data) ? data : (Array.isArray(data.sources) ? data.sources : []);
+    renderSources();
+  } catch (e) {
+    document.getElementById("ss-loading").textContent = "Failed to load: " + e.message;
+    toast("Failed to load sources: " + e.message, "error");
+  }
+}
+
+loadSources();
+</script>
+{% endblock %}

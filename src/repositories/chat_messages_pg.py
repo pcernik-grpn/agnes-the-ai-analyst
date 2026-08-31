@@ -54,6 +54,8 @@ class ChatMessagePgRepository:
         parts: Optional[list[dict]] = None,
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
     ) -> ChatMessage:
@@ -64,10 +66,11 @@ class ChatMessagePgRepository:
                 sa.text(
                     "INSERT INTO chat_messages "
                     "(id, session_id, role, content, tool_calls, parts, tokens_in, "
-                    "tokens_out, model, sender_email, created_at) "
+                    "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                    "model, sender_email, created_at) "
                     "VALUES (:id, :session_id, :role, :content, "
                     "CAST(:tool_calls AS JSONB), CAST(:parts AS JSONB), "
-                    ":tokens_in, :tokens_out, "
+                    ":tokens_in, :tokens_out, :cache_read_tokens, :cache_creation_tokens, "
                     ":model, :sender_email, :created_at)"
                 ),
                 {
@@ -79,6 +82,8 @@ class ChatMessagePgRepository:
                     "parts": json.dumps(parts) if parts else None,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
+                    "cache_read_tokens": cache_read_tokens,
+                    "cache_creation_tokens": cache_creation_tokens,
                     "model": model,
                     "sender_email": sender_email,
                     "created_at": now,
@@ -102,6 +107,8 @@ class ChatMessagePgRepository:
             parts=parts,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
             model=model,
             sender_email=sender_email,
             created_at=now,
@@ -117,7 +124,8 @@ class ChatMessagePgRepository:
                 ).scalar()
             sql = (
                 "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
-                "tokens_out, model, sender_email, created_at FROM chat_messages "
+                "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                "model, sender_email, created_at FROM chat_messages "
                 "WHERE session_id = :session_id"
             )
             params: dict = {"session_id": session_id}
@@ -137,6 +145,8 @@ class ChatMessagePgRepository:
                 parts=_decode_json_column(r["parts"]),
                 tokens_in=r["tokens_in"],
                 tokens_out=r["tokens_out"],
+                cache_read_tokens=r["cache_read_tokens"],
+                cache_creation_tokens=r["cache_creation_tokens"],
                 model=r["model"],
                 sender_email=r["sender_email"],
                 created_at=r["created_at"],
@@ -157,7 +167,8 @@ class ChatMessagePgRepository:
                 conn.execute(
                     sa.text(
                         "SELECT id, session_id, role, content, tool_calls, parts, tokens_in, "
-                        "tokens_out, model, sender_email, created_at FROM chat_messages "
+                        "tokens_out, cache_read_tokens, cache_creation_tokens, "
+                        "model, sender_email, created_at FROM chat_messages "
                         "WHERE session_id = :session_id ORDER BY created_at DESC LIMIT :limit"
                     ),
                     {"session_id": session_id, "limit": limit},
@@ -175,6 +186,8 @@ class ChatMessagePgRepository:
                 parts=_decode_json_column(r["parts"]),
                 tokens_in=r["tokens_in"],
                 tokens_out=r["tokens_out"],
+                cache_read_tokens=r["cache_read_tokens"],
+                cache_creation_tokens=r["cache_creation_tokens"],
                 model=r["model"],
                 sender_email=r["sender_email"],
                 created_at=r["created_at"],
@@ -195,11 +208,22 @@ class ChatMessagePgRepository:
         return row[0] if row else None
 
     def session_total_tokens(self, session_id: str) -> int:
+        """Tokens charged against this session's ``max_session_tokens`` cap.
+
+        Counts ``tokens_in + tokens_out + cache_creation_tokens``, the same
+        definition ``src.llm_pricing.budget_tokens`` states and the agent
+        ``token_budget_monthly`` path already used
+        (``llm_usage.usage_breakdown_for_month``): a cache WRITE is real
+        input the model was billed ~1.25x for, so leaving it out let a
+        session that keeps re-warming a large prefix run past its cap.
+        ``cache_read_tokens`` stays excluded on every budget surface —
+        heavily discounted, informational only.
+        """
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
                     "SELECT COALESCE(SUM(COALESCE(tokens_in, 0) + "
-                    "COALESCE(tokens_out, 0)), 0) "
+                    "COALESCE(tokens_out, 0) + COALESCE(cache_creation_tokens, 0)), 0) "
                     "FROM chat_messages WHERE session_id = :id"
                 ),
                 {"id": session_id},
@@ -207,10 +231,21 @@ class ChatMessagePgRepository:
         return int(row or 0)
 
     def daily_anthropic_tokens(self, user_email: str) -> tuple[int, int]:
+        """``(tokens_in, tokens_out)`` for today, the durable source the
+        daily-spend counters re-seed from after a restart.
+
+        ``tokens_in`` folds in ``cache_creation_tokens`` for the reason
+        ``session_total_tokens`` documents — and, critically, so this
+        aggregate agrees with what ``ChatManager._record_daily_tokens``
+        increments the live counter by. The two must define the in-total
+        identically or a counter re-seed would silently move a user's
+        remaining budget.
+        """
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
-                    "SELECT COALESCE(SUM(m.tokens_in), 0), "
+                    "SELECT COALESCE(SUM(COALESCE(m.tokens_in, 0) + "
+                    "COALESCE(m.cache_creation_tokens, 0)), 0), "
                     "COALESCE(SUM(m.tokens_out), 0) "
                     "FROM chat_messages m "
                     "JOIN chat_sessions s ON m.session_id = s.id "
@@ -221,3 +256,60 @@ class ChatMessagePgRepository:
                 {"ue": user_email},
             ).first()
         return int(row[0] or 0), int(row[1] or 0)
+
+    def cost_breakdown(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Per-(session, model) token sums, newest session activity first —
+        the measured input for "what did this workflow actually cost".
+
+        One row per ``(session_id, model)`` pair so a session that switched
+        models is priced per model rather than averaged into one wrong rate.
+        ``cache_recorded_messages`` counts assistant rows that actually
+        carry a cache figure: it is what lets a caller distinguish "this
+        session used no cache" from "this session predates the columns, or
+        ran on the frozen DuckDB backend that has none" — reporting the
+        second as a measured zero is how a cache-blind cost comparison gets
+        published as fact.
+
+        USD is deliberately NOT computed here: pricing belongs to
+        ``src/llm_pricing.py``, which the caller applies per row using that
+        row's own ``model``.
+        """
+        clauses = ["m.role = 'assistant'"]
+        params: dict = {"limit": limit}
+        if since is not None:
+            clauses.append("m.created_at >= :since")
+            params["since"] = since
+        if user_email is not None:
+            clauses.append("s.user_email = :ue")
+            params["ue"] = user_email
+        where = " AND ".join(clauses)
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT m.session_id, s.user_email, m.model, "
+                        "COUNT(*) AS messages, "
+                        "COUNT(m.cache_read_tokens) AS cache_recorded_messages, "
+                        "COALESCE(SUM(m.tokens_in), 0) AS tokens_in, "
+                        "COALESCE(SUM(m.tokens_out), 0) AS tokens_out, "
+                        "COALESCE(SUM(m.cache_read_tokens), 0) AS cache_read_tokens, "
+                        "COALESCE(SUM(m.cache_creation_tokens), 0) AS cache_creation_tokens, "
+                        "MAX(m.created_at) AS last_message_at "
+                        "FROM chat_messages m "
+                        "JOIN chat_sessions s ON m.session_id = s.id "
+                        f"WHERE {where} "
+                        "GROUP BY m.session_id, s.user_email, m.model "
+                        "ORDER BY last_message_at DESC LIMIT :limit"
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]

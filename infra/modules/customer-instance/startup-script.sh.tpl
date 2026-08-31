@@ -573,8 +573,37 @@ GOOGLE_CLIENT_SECRET=$(gcloud secrets versions access latest --secret="$${OAUTH_
 # secretAccessor for each map key. Missing / 403 / empty -> silent fallback to ""
 # so the operator can wire a secret name before the value exists; the app
 # surfaces its own missing-key error at startup (e.g. _chat_anthropic_key_ok).
+#
+# Two hardening steps before a value reaches the .env heredoc below:
+# - A MULTILINE value (a PEM, an SA-key JSON) is refused — blanked with a
+#   warning — because written raw it corrupts every following .env line, and
+#   the `set -a; . .env` this same script runs before `docker compose up`
+#   would execute the value's lines as commands. Multiline secrets belong in
+#   `runtime_secret_env_multiline` (base64 transport, app-side decode).
+# - The surviving single-line value is pre-escaped into *_QUOTED for a
+#   DOUBLE-QUOTED .env line: `\` `"` `$` and backtick each get a backslash.
+#   That is the one escape set BOTH consumers of the line unescape
+#   identically — this script's own bash source and docker compose's dotenv
+#   parser. Unquoted, a value with a space aborted the boot-time source
+#   (the CADDY_TLS trap below), and `$`/backticks were mangled or executed.
+# --- runtime-secret-env-plain begin (rendered + executed by tests/test_infra_runtime_secret_env_hardening.py) ---
 %{ for secret_name, env_name in runtime_secret_env ~}
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null || echo "")
+case "$${${env_name}}" in *$'\n'*)
+    echo "WARNING: secret '${secret_name}' has a multiline value; refusing to write ${env_name} into .env — map it via runtime_secret_env_multiline (base64 transport) instead"
+    ${env_name}=""
+    ;;
+esac
+${env_name}_QUOTED=$(printf '%s' "$${${env_name}}" | sed -e 's/[\\"$`]/\\&/g' || true)
+%{ endfor ~}
+# --- runtime-secret-env-plain end ---
+
+# Multiline secrets (`runtime_secret_env_multiline`, e.g. a SharePoint
+# cert+key PEM): base64-encoded to a single line so the value survives the
+# .env format, the auto-upgrade script's bash source, and compose env_file
+# parsing. The app decodes on read (connectors/sharepoint/settings).
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
+${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null | base64 -w0 || echo "")
 %{ endfor ~}
 
 # AGNES_VERSION, RELEASE_CHANNEL, AGNES_COMMIT_SHA are baked into the image
@@ -1300,6 +1329,9 @@ ACME_EMAIL=$ACME_EMAIL
 GOOGLE_CLIENT_ID=$GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
 %{ for secret_name, env_name in runtime_secret_env ~}
+${env_name}="$${${env_name}_QUOTED}"
+%{ endfor ~}
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
 ${env_name}=$${${env_name}}
 %{ endfor ~}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
@@ -1327,6 +1359,15 @@ AGNES_REDIS_URL=redis://redis:6379/0
 AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
+# The app-side gates for the `corpus-extraction` job kind
+# (app/instance_config.py::feature_enabled, app/worker/kinds.py::
+# _extraction_producer_argv) both check an env override before
+# instance.yaml — the SAME env-overrides-yaml posture as
+# AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
+# what makes this flag alone activate the lane end to end, with no
+# applier-owned instance.yaml edit on the VM's data disk.
+AGNES_EXTRACTION_ENABLED=1
+AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}

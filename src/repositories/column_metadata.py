@@ -20,8 +20,16 @@ class ColumnMetadataRepository(ColumnMetadataImportMixin):
         description: Optional[str] = None,
         confidence: str = "manual",
         source: str = "manual",
+        source_ref: Optional[str] = None,
     ) -> dict:
-        """Insert or update column metadata. Returns the saved record."""
+        """Insert or update column metadata. Returns the saved record.
+
+        ``source_ref`` is accepted for signature parity with the Postgres
+        sibling but not persisted here: the DuckDB app-state schema is
+        frozen (A3 PG-first ratchet, see ``docs/migrations.md`` -> "Adding a
+        PG-only feature") and never gained a ``column_metadata.source_ref``
+        column. The capability lands on Postgres only.
+        """
         now = datetime.now(timezone.utc)
         self.conn.execute(
             """INSERT INTO column_metadata (table_id, column_name, basetype, description, confidence, source, updated_at)
@@ -53,6 +61,21 @@ class ColumnMetadataRepository(ColumnMetadataImportMixin):
             "SELECT * FROM column_metadata WHERE table_id = ? ORDER BY column_name",
             [table_id],
         ).fetchall()
+        if not results:
+            return []
+        columns = [desc[0] for desc in self.conn.description]
+        return [dict(zip(columns, row)) for row in results]
+
+    def list_all(self) -> List[Dict[str, Any]]:
+        """Every column_metadata row, across every table — not scoped to one
+        ``table_id`` like :meth:`list_for_table`.
+
+        Needed to find rows whose ``table_id`` no longer names a live
+        ``table_registry`` row at all (Block 5 of #1707, orphaned-column
+        detection): that question cannot be asked by ``table_id``, since the
+        very id that is missing is what makes the row orphaned.
+        """
+        results = self.conn.execute("SELECT * FROM column_metadata ORDER BY table_id, column_name").fetchall()
         if not results:
             return []
         columns = [desc[0] for desc in self.conn.description]

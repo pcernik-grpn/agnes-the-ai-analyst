@@ -1201,7 +1201,9 @@ def _agent_workspace_members(session: Any) -> Dict[str, bytes]:
             return {}
 
         members: Dict[str, bytes] = {}
-        profile = agent_profile.build_profile(agent, advertise_memory_write=False)
+        profile = agent_profile.build_profile(
+            agent, advertise_memory_write=False, user_email=getattr(session, "user_email", None)
+        )
         if profile is not None:
             members[_WORKSPACE_PROMPT_ARCNAME] = profile.claude_md.encode("utf-8")
             members[f".claude/skills/{profile.skill_name}/SKILL.md"] = profile.skill_body.encode("utf-8")

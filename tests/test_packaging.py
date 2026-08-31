@@ -146,6 +146,78 @@ _SERVER_ONLY_SAMPLE = ("claude-agent-sdk", "fastapi", "sqlalchemy", "psycopg", "
 _CORE_ANCHORS = ("anthropic", "openai", "jsonschema")
 
 
+# Modules an analyst's CLI-wheel install genuinely does not have: they are
+# pulled by `[server]` (or by nothing at all — `requests` is not even declared
+# there; it arrives transitively behind the Keboola connector). Blocking them
+# in a subprocess reproduces that install exactly, which is the only way to
+# catch this class of break from a dev checkout where everything is present.
+_ABSENT_ON_A_CLI_ONLY_INSTALL = ("requests", "fastapi", "sqlalchemy", "psycopg")
+
+_CLI_IMPORT_PROBE = """
+import sys
+from importlib.abc import MetaPathFinder
+
+BLOCKED = {blocked!r}
+
+
+class _Blocker(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        root = name.split(".", 1)[0]
+        if root in BLOCKED:
+            raise ImportError("No module named " + repr(name) + " (absent on a CLI-only install)")
+        return None
+
+
+sys.meta_path.insert(0, _Blocker())
+import cli.main  # noqa: F401
+
+# The command tree must also BUILD, not merely import: Typer resolves every
+# option's metadata when the Click command is assembled, so a lazy-looking
+# import can still fire on first invocation.
+import typer.main
+
+typer.main.get_command(cli.main.app)
+print("ok")
+"""
+
+
+def test_cli_imports_without_the_server_extra():
+    """`agnes` must import with core deps alone — no `[server]`, no `requests`.
+
+    The CLI wheel is `[project.dependencies]` only, so a module-level import
+    anywhere under `cli/` that reaches server-side code breaks EVERY command,
+    including ones with nothing to do with the feature that added it. This
+    fired for real: `cli/commands/admin_semantic.py` imported
+    `src.semantic.adapters` at module scope to build one line of `--adapter`
+    help, and that module eagerly imported all four connector adapters —
+    dragging in `requests` and failing `agnes` at import on an analyst
+    install. The fix (`_BUILTIN_ADAPTERS` as data, implementations imported on
+    demand) is what keeps the generated help AND a clean import; this guard is
+    what stops the next one.
+
+    Run in a subprocess: `cli.main` is already imported by the time most
+    tests run, so an in-process block would prove nothing.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    probe = _CLI_IMPORT_PROBE.format(blocked=set(_ABSENT_ON_A_CLI_ONLY_INSTALL))
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "`agnes` does not import with core dependencies alone — an import under cli/ reaches "
+        f"a server-only module.\\n{result.stderr[-2500:]}"
+    )
+
+
 def test_server_only_deps_are_declared_in_server_extra():
     """Each dependency in the server-only sample must appear in
     [project.optional-dependencies].server."""

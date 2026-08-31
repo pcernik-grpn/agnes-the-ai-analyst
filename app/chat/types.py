@@ -92,6 +92,15 @@ class ChatMessage:
     #: row written before schema v123; `tool_calls` is its positionless
     #: projection and remains the fallback for those.
     parts: Optional[list[dict]] = None
+    #: Prompt-cache halves of the turn's usage, recorded so a session's real
+    #: cost can be MEASURED rather than modelled (src/llm_pricing.py prices
+    #: all four token kinds). `tokens_in` counts UNCACHED input only, so
+    #: without these two a long session's context volume is unknowable after
+    #: the fact. Postgres app-state only — the frozen DuckDB backend has no
+    #: column for them (A3) and leaves them None, which the cost readout
+    #: reports as unavailable rather than as zero.
+    cache_read_tokens: Optional[int] = None
+    cache_creation_tokens: Optional[int] = None
 
 
 @dataclass

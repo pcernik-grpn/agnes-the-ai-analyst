@@ -820,7 +820,19 @@
           var on = btn.getAttribute('data-' + (cfg.segments.name || 'own')) === value
                 || btn.getAttribute('data-own') === value;
           btn.classList.toggle('is-active', on);
-          btn.setAttribute('aria-selected', on ? 'true' : 'false');
+          // The state attribute has to be the one the element's ROLE defines,
+          // and every caller of this engine is a `role="radiogroup"` of
+          // `role="radio"` buttons (library.html, chats.html,
+          // _profile_tokens.html) — where the state is `aria-checked`;
+          // `aria-selected` belongs to tabs and options and means nothing on a
+          // radio. Writing only `aria-selected` left the server-rendered
+          // `aria-checked="true"` on the DEFAULT segment forever, and
+          // components.css styles an active tab off BOTH the class and
+          // `[aria-checked="true"]` — so selecting the second tab lit them both
+          // (#1898 item 2, the half `.tab-strip` alone could not fix). A screen
+          // reader heard the same stale answer.
+          btn.setAttribute(btn.getAttribute('role') === 'radio' ? 'aria-checked' : 'aria-selected',
+                           on ? 'true' : 'false');
         });
       }
       apply();

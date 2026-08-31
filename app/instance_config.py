@@ -1013,6 +1013,32 @@ def get_instance_logo_svg() -> str:
     return (raw or "").strip()
 
 
+def get_instance_logo_mark_svg() -> str:
+    """Raw inline ``<svg>`` for the brand mark shown where a full lockup does
+    not fit — today the rail's 56px collapsed strip (``_app_rail.html``).
+
+    A lockup and a mark are different assets, not one asset at two sizes: a
+    wordmark clipped to 40px is half a word, which is what the collapsed rail
+    used to render for any instance with :func:`get_instance_logo_svg` set.
+    Operators who have a monogram put it here; those who do not get a derived
+    initial in the same slot (see ``.rail-logo-mono`` in ``rail.css``), so the
+    strip never shows a cropped wordmark either way.
+
+    Only consulted when ``logo_svg`` is set — with no custom lockup the rail
+    renders the built-in orb, which is already a mark.
+
+    Resolution: ``AGNES_INSTANCE_LOGO_MARK_SVG`` env >
+    ``instance.logo_mark_svg`` YAML > ``""``. Mirrors
+    :func:`get_instance_logo_svg` exactly, including the trusted-operator
+    contract: the markup is rendered with ``| safe``, so it is instance
+    configuration, never user input.
+    """
+    raw = os.environ.get("AGNES_INSTANCE_LOGO_MARK_SVG")
+    if raw is None:
+        raw = get_value("instance", "logo_mark_svg", default="")
+    return (raw or "").strip()
+
+
 def get_instance_favicon() -> str:
     """Favicon href for ``<link rel="icon">`` — resolved to a value templates
     can drop in directly, unlike :func:`get_instance_logo_svg` (raw markup)

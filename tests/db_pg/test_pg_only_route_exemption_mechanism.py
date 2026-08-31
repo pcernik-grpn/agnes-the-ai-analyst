@@ -12,9 +12,13 @@ either a false-positive failure or a silent blind spot that could hide a real
 ``_parity_sweep_util.diff_statuses(..., exempt=...)`` +
 ``assert_pg_only_exemptions_fail_clean`` are that mechanism. These are unit
 tests against the mechanism itself (the "error path directly", per the A3
-work-package acceptance) — no live route exists yet that uses it (the first
-lands with Track C); the two production sweep files already wire an empty
-exemption dict ready for that.
+work-package acceptance), driven with fakes so they stay independent of
+whichever route is the current example. Live production users: the GET
+sweep's ``_PG_ONLY_ROUTE_EXEMPTIONS`` (``tests/db_pg/
+test_get_status_parity_sweep.py``) lists every read-only F4.x semantic-layer
+route backed by a PG-only table (coverage, health, mutes — F4.1–F4.3); the
+mutation sweep's own list (``tests/db_pg/test_mutation_status_parity_sweep.py``)
+carries ``POST /api/admin/semantic-auto-draft-sweep`` (semantic-phase5 wave 2).
 
 The fail-clean check is intentionally narrow: TYPED 501
 (``body["error"] == "requires_postgres_backend"``), not "any 4xx/501" — a
@@ -199,15 +203,28 @@ def test_sweeps_run_fail_clean_check_before_pg_client_build():
 
 
 def test_post_reload_raise_still_translates_to_typed_501(tmp_path, monkeypatch):
-    """``build_seeded_client`` reloads ``src.repositories``, rebinding
-    ``RequiresPostgresBackend`` to a NEW class object, while ``app.main``
+    """``build_seeded_client`` reloads ``src.repositories``, and ``app.main``
     registered its 501 handler against the class it imported at its own import
-    time — Starlette resolves handlers via the raised exception's MRO, which
-    never contains the pre-reload class, so without the harness re-registration
-    (``_reregister_requires_pg_handler``) the raise would fall through to the
-    catch-all 500. Prove end-to-end that a route raising the CURRENT
-    (post-reload) class on the DuckDB-built client answers the exact typed 501
-    that ``assert_pg_only_exemptions_fail_clean`` demands."""
+    time. Starlette resolves handlers via the raised exception's MRO, so if the
+    reload produced a NEW class object the raise would fall through to the
+    catch-all 500 — the original bug this test was written for.
+
+    Two things now stand between that bug and production, and this test pins
+    both. ``RequiresPostgresBackend`` lives in its own import-free module
+    (``src/repository_errors.py``), which ``importlib.reload(src.repositories)``
+    does not touch — so the identity is STABLE across any number of reloads, in
+    either order — and the harness re-registration
+    (``_reregister_requires_pg_handler``) remains as belt-and-braces. The
+    identity assertion below therefore reads the way it does deliberately: it
+    used to demand that the reload rebind the class (back when the class was
+    defined inside ``src/repositories/__init__.py``, which made rebinding
+    unavoidable), and it now demands the opposite, because the fix was to make
+    rebinding impossible. Flipping it back would silently reintroduce the
+    unhandled 500.
+
+    The end-to-end proof is unchanged: a route raising the current class on the
+    DuckDB-built client answers the exact typed 501 that
+    ``assert_pg_only_exemptions_fail_clean`` demands."""
     import app.main  # bind app.main's class reference BEFORE the reload below  # noqa: F401
 
     from ._parity_sweep_util import build_seeded_client
@@ -217,8 +234,11 @@ def test_post_reload_raise_still_translates_to_typed_501(tmp_path, monkeypatch):
     import src.repositories
 
     exc_cls = src.repositories.RequiresPostgresBackend  # the post-reload class
-    assert exc_cls is not app.main.RequiresPostgresBackend, (
-        "precondition: the reload must have rebound RequiresPostgresBackend, otherwise this test exercises nothing"
+    assert exc_cls is app.main.RequiresPostgresBackend, (
+        "the reload rebound RequiresPostgresBackend — it must be defined in an "
+        "import-free module of its own (src/repository_errors.py) so reloading "
+        "src.repositories cannot produce a second class object that app.main's "
+        "handler no longer matches"
     )
 
     from fastapi import APIRouter
@@ -241,10 +261,10 @@ def test_post_reload_raise_still_translates_to_typed_501(tmp_path, monkeypatch):
 
 
 def test_production_pg_only_exemptions_all_have_reasons():
-    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` are dicts today (empty
-    — no PG-only route exists yet); this guards the shape from the day the
-    first one lands (Track C) so an exemption can never be added without a
-    reason."""
+    """Both sweep files' ``_PG_ONLY_ROUTE_EXEMPTIONS`` must be dicts, and
+    every entry (the mutation sweep now carries one — the semantic-layer
+    auto-draft sweep, semantic-phase5 wave 2) must carry a non-empty
+    reason, so an exemption can never be added silently."""
     import tests.db_pg.test_get_status_parity_sweep as get_sweep
     import tests.db_pg.test_mutation_status_parity_sweep as mutation_sweep
 

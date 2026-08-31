@@ -54,12 +54,14 @@ def ensure_internal_tables_registered() -> None:
                 name=table.display_name,
                 description=table.description,
                 source_type="internal",
-                # `bucket` is the grouping key /catalog uses for accordion
-                # category headers — displayed verbatim, so a more
-                # readable string than the lowercase "agnes" goes
-                # straight onto the page. The three internal tables
-                # land under "Agnes Internal" on Data Packages instead
-                # of the catch-all "default".
+                # `bucket` is a display-only label here, shown verbatim
+                # in admin surfaces (e.g. next to source_type on
+                # /admin/sync), so a more readable string than the
+                # lowercase "agnes" is worth setting. It feeds no
+                # analyst-facing grouping: the synthetic "Agnes
+                # Internal" card on Data Packages was removed in #333,
+                # and internal tables are excluded from all package
+                # surfaces since.
                 bucket="Agnes Internal",
                 source_table=table.source_table,
                 query_mode="internal",

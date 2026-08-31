@@ -66,6 +66,90 @@ def test_semantic_context_and_schema_tools_are_foundation_tools():
         assert name in FOUNDATION_TOOL_NAMES
 
 
+def test_semantic_feedback_tools_are_foundation_tools():
+    """Feedback channel (F4.5) — an agent that cannot ground its answer must be
+    able to say so from the same surface it answers on."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in ("flag_semantic_issue", "semantic_feedback_list", "semantic_feedback_resolve"):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_semantic_mute_tools_are_foundation_tools():
+    """Muting a health check (F4.3). CONTRIBUTING.md's only standing MCP
+    exemptions are credential-provisioning writes and security-posture
+    diagnostics; "low-frequency admin action" is neither, so the pair rides the
+    same three surfaces as everything else on this page."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in ("semantic_mutes_list", "mute_semantic_check", "unmute_semantic_check"):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_mute_semantic_check_is_declared_a_write():
+    """It silences a warning. A read-only hint would let a client auto-approve
+    it — an agent quietly muting the check that names its own gap is precisely
+    the failure this feature is designed against."""
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    for name in ("mute_semantic_check", "unmute_semantic_check"):
+        assert _tools_by_name(mcp_http.mcp)[name].annotations.readOnlyHint is False
+
+
+def test_flag_semantic_issue_is_declared_a_write():
+    """It stores a row. A read-only hint would let a client auto-approve it,
+    which is how a "helpful" agent files reports nobody asked for."""
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    ann = _tools_by_name(mcp_http.mcp)["flag_semantic_issue"].annotations
+    assert ann.readOnlyHint is False
+
+
+def test_semantic_admin_families_are_foundation_tools():
+    """Sources, detach/reattach and package links (#1707).
+
+    REST and CLI carried all three; MCP carried none, and no standing
+    exemption covered them — CONTRIBUTING.md's are credential-provisioning
+    writes and security-posture diagnostics. Configuring where documents come
+    from is admin-gated, not MCP-exempt: the tools mirror the same endpoints,
+    so the same admin PAT is what decides.
+    """
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    for name in (
+        "semantic_source_add",
+        "semantic_source_list",
+        "semantic_source_sync",
+        "semantic_source_remove",
+        "semantic_model_detach",
+        "semantic_model_reattach",
+        "semantic_model_link_package",
+        "semantic_model_unlink_package",
+    ):
+        assert name in FOUNDATION_TOOL_NAMES
+
+
+def test_the_irreversible_semantic_admin_tools_are_declared_destructive():
+    """Removing a source and detaching a model are not "edits".
+
+    A client that auto-approves anything not flagged destructive would let an
+    agent drop a sync source, or take a model off the sync path, without the
+    user being asked. Re-attaching is the same class of act from the other
+    side: it hands the model back to the importer, which overwrites whatever
+    was edited locally at the next run.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from app.api import mcp_http
+
+    tools = _tools_by_name(mcp_http.mcp)
+    for name in ("semantic_source_remove", "semantic_model_detach", "semantic_model_reattach"):
+        ann = tools[name].annotations
+        assert ann.readOnlyHint is False, f"{name} writes state"
+        assert ann.destructiveHint is True, f"{name} must be flagged destructive"
+
+
 def test_activity_tool_is_a_foundation_tool():
     """Unified Activity Center timeline (E3 slice 2) — CLI/REST/web had no
     MCP counterpart before this."""
@@ -127,6 +211,146 @@ def test_stdio_server_exposes_data_app_family():
     from cli.mcp import server as stdio_server
 
     assert set(DATA_APP_TOOL_NAMES) <= _tool_names(stdio_server.mcp)
+
+
+# --- The stdio surface is closed (#1707 Block 6, decision 8) ---------------
+#
+# The stdio server is INTERNAL: the hosted chat sandbox spawns it per session
+# and `agnes global enable` wires it into Claude Code. It is not a supported
+# end-user surface and its tool set does not grow — anything agent-facing that
+# is not filesystem-bound belongs on the HTTP foundation surface, which every
+# transport (SSE, streamable, chat) already shares.
+#
+# This constant is the whole set, written out. A `<=` subset assertion (which
+# is all this file used to have for stdio) cannot notice a tool being ADDED,
+# and an intersection-based comparison cannot notice one being added to a
+# family that is absent from the other side — which is exactly how the
+# semantic-tool question below went unguarded.
+
+STDIO_TOOL_NAMES = frozenset(
+    {
+        # Catalog / data reads
+        "catalog",
+        "schema",
+        "describe",
+        "query",
+        "query_local",
+        "pull",
+        "server_info",
+        "tool_docs",
+        # Knowledge + collections
+        "knowledge_search",
+        "collections_list",
+        "collections_search",
+        "collections_reingest",
+        "collection_get",
+        "collection_file_read",
+        "chat_upload_file",
+        # Data apps: authoring, deploy, and the in-chat preview loop
+        "data_apps_list",
+        "data_app_get",
+        "data_app_create",
+        "data_app_create_draft",
+        "data_app_delete_draft",
+        "data_app_deploy",
+        "data_app_git_credential",
+        "data_app_logs",
+        "data_app_set_description",
+        "agnes_data_app_preview",
+        "agnes_data_app_refresh",
+        "agnes_data_app_close",
+        "agnes_data_app_credentials",
+    }
+)
+
+
+def test_stdio_tool_set_is_exactly_the_documented_set():
+    """Adding or removing an ``agnes mcp`` tool must be a conscious edit.
+
+    Passthrough tools registered dynamically at ``run()`` are deliberately not
+    in scope — this pins the STATIC set the module declares at import time.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from cli.mcp import server as stdio_server
+
+    actual = _tool_names(stdio_server.mcp)
+    assert actual == set(STDIO_TOOL_NAMES), (
+        "the stdio `agnes mcp` tool set changed. It is closed by design "
+        "(#1707 Block 6): put agent-facing tools on the HTTP foundation "
+        "surface (app/api/mcp/foundation_tools.py) instead. If a tool "
+        "genuinely needs a local process, add it to STDIO_TOOL_NAMES here in "
+        f"the same change. added={sorted(actual - set(STDIO_TOOL_NAMES))} "
+        f"removed={sorted(set(STDIO_TOOL_NAMES) - actual)}"
+    )
+
+
+# Every semantic-layer tool, on the surface that is allowed to have them.
+SEMANTIC_TOOL_NAMES = frozenset(
+    {
+        "semantic_model_search",
+        "semantic_model_get",
+        "apply_semantic_model",
+        "validate_semantic_query",
+        "get_semantic_context",
+        "get_semantic_schema",
+        "semantic_model_coverage",
+        "semantic_model_coverage_tag",
+        "semantic_model_coverage_untag",
+        "admin_semantic_coverage",
+        "admin_semantic_layer_coverage",
+        "semantic_layer_health",
+        "semantic_mutes_list",
+        "mute_semantic_check",
+        "unmute_semantic_check",
+        "flag_semantic_issue",
+        "semantic_feedback_list",
+        "semantic_feedback_resolve",
+        # The three admin families that had REST + CLI and no MCP (#1707):
+        # where documents come from, detaching a model from its source, and
+        # which Data Package carries it. Nothing anywhere justified the gap as
+        # an exception, so it was one.
+        "semantic_source_add",
+        "semantic_source_list",
+        "semantic_source_sync",
+        "semantic_source_remove",
+        "semantic_model_detach",
+        "semantic_model_reattach",
+        "semantic_model_link_package",
+        "semantic_model_unlink_package",
+    }
+)
+
+
+def test_the_whole_semantic_family_is_on_the_remote_foundation_surface():
+    """One definition, every HTTP transport — the point of foundation_tools."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    missing = sorted(SEMANTIC_TOOL_NAMES - set(FOUNDATION_TOOL_NAMES))
+    assert not missing, f"semantic tools missing from the foundation surface: {missing}"
+
+
+def test_semantic_tools_are_remote_only_by_design():
+    """No semantic tool may appear on the stdio server. Ever.
+
+    #1707 decision 8: the stdio server is the chat sandbox's internal tool
+    channel, retired as an end-user surface; no semantic tools will be added
+    to it. Every semantic read is RBAC-filtered server-side against the
+    caller's grants, so it has nothing to gain from a local process and one
+    thing to lose — a second, hand-maintained copy of a permission-sensitive
+    tool that no `foundation_tools` change would keep in step.
+
+    This replaces an intersection-based guard that looked like coverage and
+    verified nothing: the stdio and HTTP registries share no semantic tool, so
+    intersecting them produced an empty set to assert over.
+    """
+    pytest.importorskip("mcp", reason="mcp package not installed")
+    from cli.mcp import server as stdio_server
+
+    leaked = sorted(SEMANTIC_TOOL_NAMES & _tool_names(stdio_server.mcp))
+    assert not leaked, (
+        f"semantic tools were added to the stdio `agnes mcp` server: {leaked}. "
+        "They belong on app/api/mcp/foundation_tools.py only (#1707 decision 8)."
+    )
 
 
 # --- Behaviour annotations (CON-1) ---------------------------------------
@@ -209,6 +433,15 @@ _TITLE_VERBS = {
     "open",
     "show",
     "register",
+    # Semantic-layer admin verbs (#1707) — a model leaves and rejoins its
+    # source's sync path, and is linked to the Data Package that carries it.
+    # Named actions, so the derived titles ("Semantic Model Detach") already
+    # say what the call does and need no TITLE_OVERRIDES entry; this list is
+    # the vocabulary, and it was simply missing the words.
+    "detach",
+    "reattach",
+    "link",
+    "unlink",
 }
 
 
@@ -249,6 +482,12 @@ def test_stdio_and_http_agree_on_shared_tool_behaviour():
     `stack_unsubscribe` from being destructive over HTTP and read-only over
     stdio — exactly the drift the name-parity guards above already prevent for
     the tool *list*.
+
+    Scope note: an intersection guard can only speak about tools that exist on
+    BOTH surfaces, which for the semantic family is none of them (they are
+    remote-only by design — see `test_semantic_tools_are_remote_only_by_design`
+    and the exact-set pin `test_stdio_tool_set_is_exactly_the_documented_set`,
+    which is what actually covers additions and removals).
     """
     pytest.importorskip("mcp", reason="mcp package not installed")
     from app.api import mcp_http

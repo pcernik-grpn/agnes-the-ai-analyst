@@ -62,7 +62,7 @@ retired names.
 | "How do I install a skill or plugin?" | `/library` — the row's *Add* pill (the *+ Add* menu is for building/uploading your own) |
 | "How do I change my password?" | user menu → *Change password* (`/auth/password/change`; only with password sign-in enabled) |
 | "How do I write and publish my own skill?" | `/skills` (the Builder), upload at `/store/new` |
-| "What are the canonical metric definitions?" | `/semantic-layer` and `/catalog/semantics` (or `agnes catalog --metrics` here) |
+| "What are the canonical metric definitions?" | `/semantic-layer` — the *All metrics* tab (or `agnes catalog --metrics` here) |
 | "Who can see this table?" (admin) | `/admin/access`, try `/admin/access?lens=simulate` |
 
 ## References

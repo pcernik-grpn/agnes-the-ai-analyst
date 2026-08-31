@@ -91,6 +91,97 @@ def test_build_profile_rails_are_not_added_without_a_persona():
     assert agent_profile.build_profile(_agent_row(system_prompt="")) is None
 
 
+def _seed_retail_model():
+    from src.repositories import semantic_model_repo
+
+    doc = (
+        "version: '0.2.0.dev0'\n"
+        "semantic_model:\n"
+        "  - name: retail\n"
+        "    datasets:\n"
+        "      - name: orders\n"
+        "        source: db.public.orders\n"
+        "        fields: []\n"
+    )
+    semantic_model_repo().upsert(
+        id="manual/_/retail",
+        slug="retail",
+        name="retail",
+        description="Retail sales model.",
+        document=doc,
+        document_json={
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "ai_context": {"instructions": "Always exclude test orders."},
+                    "datasets": [{"name": "orders", "source": "db.public.orders", "fields": []}],
+                }
+            ]
+        },
+        spec_version="0.2.0.dev0",
+        content_hash="h1",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+
+
+def test_build_profile_appends_a_readable_semantic_model_when_user_email_is_given(tmp_path, monkeypatch):
+    """P1-3: a named agent profile REPLACES the workspace CLAUDE.md, so
+    without this it got zero semantic-layer context while the sandbox path
+    (`src/claude_md.py`) always has — asserting `DATA_ACCESS_RAILS in md`
+    alone would not catch this section being silently empty."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from src.db import get_system_db
+    from src.repositories import user_groups_repo, users_repo
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    users_repo().create(id="u1", email="reader@example.com", name="Reader")
+    conn = get_system_db()
+    admin_group = user_groups_repo().get_by_name("Admin")
+    UserGroupMembersRepository(conn).add_member("u1", admin_group["id"], source="test")
+    conn.close()
+
+    _seed_retail_model()
+
+    row = _agent_row(system_prompt="You are a sales assistant.")
+    profile = agent_profile.build_profile(row, user_email="reader@example.com")
+    md = profile.claude_md
+    assert "## Semantic layer" in md
+    assert "retail" in md
+    assert "Always exclude test orders." in md
+
+
+def test_build_profile_omits_semantic_model_the_user_cannot_read(tmp_path, monkeypatch):
+    """P1-3 RBAC: this section reuses ``_can_read_model`` — admin, a grant on
+    the model, or a grant on a linked Data Package — same as
+    ``GET /api/semantic-models/search``. A non-admin user with none of those
+    must see nothing, or the persona would leak a model's existence and its
+    author's ``ai_context.instructions`` to someone `/api/semantic-models`
+    would refuse outright."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    from src.repositories import users_repo
+
+    users_repo().create(id="u2", email="outsider@example.com", name="Outsider")
+    _seed_retail_model()
+
+    row = _agent_row(system_prompt="You are a sales assistant.")
+    profile = agent_profile.build_profile(row, user_email="outsider@example.com")
+    md = profile.claude_md
+    assert "## Semantic layer" not in md
+    assert "retail" not in md
+
+
+def test_build_profile_omits_semantic_layer_section_without_user_email():
+    """Default behavior (no ``user_email``) must stay unchanged — no section,
+    no lookup attempted."""
+    row = _agent_row(system_prompt="You are a sales assistant.")
+    profile = agent_profile.build_profile(row)
+    assert "## Semantic layer" not in profile.claude_md
+
+
 def test_build_profile_appends_facts_rails_when_the_switch_is_on(monkeypatch):
     """A persona REPLACES the workspace CLAUDE.md wholesale, so the
     `facts.enabled`-gated "Facts — entity and relationship questions" section
@@ -126,6 +217,33 @@ def test_build_profile_omits_facts_rails_when_the_switch_is_off(monkeypatch):
     assert "Facts —" not in md
     # The catalog guidance is unaffected by the switch.
     assert agent_profile.DATA_ACCESS_RAILS in md
+
+
+def test_semantic_section_teaches_batched_reading(monkeypatch):
+    """The persona's semantic pointer must carry the ECONOMY rules, not just
+    the existence of the layer.
+
+    An agent that discovers the layer without them issues one lookup per
+    object, and every one of those payloads then sits in the conversation for
+    the rest of the session — the cost of reading a governed layer is decided
+    almost entirely by whether the reads are batched and not repeated.
+    """
+    monkeypatch.setattr(
+        "src.claude_md._semantic_layer_models",
+        lambda conn, user: [{"slug": "retail", "description": "Orders", "instructions": ""}],
+    )
+    monkeypatch.setattr(
+        "src.repositories.users_repo",
+        lambda: type("R", (), {"get_by_email": staticmethod(lambda e: {"id": "u1", "email": e})})(),
+    )
+    section = agent_profile._semantic_layer_section("u@x.com")
+    assert "retail" in section
+    # One call for every type, one call for every id.
+    assert "context dataset metric relationship" in section
+    assert "--id <a> --id <b>" in section
+    # And don't re-read what you already have.
+    assert "already read is still valid" in section
+    assert "validate-query" in section
 
 
 def test_build_profile_skill_body_is_valid_skill_md():

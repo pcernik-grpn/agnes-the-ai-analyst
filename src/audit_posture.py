@@ -148,6 +148,17 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # (Re)generates the Graph change-notification receiver's shared secret.
+    # Handler writes its own row (log_safe), same as scope_confirm above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
+    # -- app.api.sharepoint_webhooks --------------------------------------------
+    # Public, unauthenticated (Graph is the caller) — carries no user
+    # identity, so AuditFallbackMiddleware never fires for it regardless of
+    # this declared action; the entire audit signal is the handler's own
+    # explicit log_safe(user_id=None, ...) calls, exactly like
+    # "POST /webhooks/jira" below. Declared here only to satisfy the
+    # mutating-route posture ratchet.
+    "POST /api/webhooks/sharepoint/{connection_id}": "webhook.sharepoint_received",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger. Handler writes nothing itself; the fallback middleware emits
     # this cataloged action on its behalf (src/audit_events.py CATALOG).
@@ -300,8 +311,6 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/data-packages/{pkg_id}/tables": "data_package.add_table",
     "POST /api/admin/data-packages/{pkg_id}/tools": "data_package.add_tool",
     "PUT /api/admin/data-packages/{pkg_id}": "data_package.update",
-    # -- app.api.databricks_semantic_layer_refresh -----------------------------
-    "POST /api/admin/run-databricks-semantic-layer-refresh": "run_databricks_semantic_layer_refresh",
     # -- app.api.db_state ------------------------------------------------------
     "POST /api/admin/db/cancel/{job_id}": "db_migration.cancel",
     "POST /api/admin/db/migrate": "db_migration.start",
@@ -334,8 +343,6 @@ POSTURE: dict[str, str] = {
     "POST /api/kai/tickets": "kai.tickets_issue",
     # -- app.api.keboola_login_projects ----------------------------------------
     "POST /api/auth/keboola/projects": "keboola.projects_import",
-    # -- app.api.keboola_semantic_layer_refresh --------------------------------
-    "POST /api/admin/run-keboola-semantic-layer-refresh": "run_keboola_semantic_layer_refresh",
     # -- app.api.knowledge_digests ---------------------------------------------
     "DELETE /api/admin/knowledge-digests/{digest_id}": "knowledge_digest.delete",
     "POST /api/admin/knowledge-digests": "knowledge_digest.create",
@@ -454,6 +461,18 @@ POSTURE: dict[str, str] = {
     "POST /api/scripts/run": "script.run",
     "POST /api/scripts/run-due": "script_runner.tick",
     "POST /api/scripts/{script_id}/run": "script.run",
+    # -- app.api.semantic_feedback ---------------------------------------------
+    "POST /api/admin/semantic-feedback/{feedback_id}/resolve": "semantic_feedback.resolved",
+    "POST /api/semantic-feedback": "semantic_feedback.submit",
+    # -- app.api.semantic_layer_coverage ---------------------------------------
+    # The coverage-tag pair writes no row of its own — AuditFallbackMiddleware
+    # emits the action named here on its behalf (this branch declared it
+    # "fallback", a literal Wave 2 — Task 1 retired). The mute pair and the
+    # semantic-model package link/unlink pair below do write their own rows.
+    "DELETE /api/admin/semantic-layer/mutes/{mute_id}": "semantic_health_mute.delete",
+    "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}": "semantic_coverage_tag.delete",
+    "POST /api/admin/semantic-layer/mutes": "semantic_health_mute.create",
+    "POST /api/admin/semantic-model/coverage/tags": "semantic_coverage_tag.create",
     # -- app.api.semantic_models -----------------------------------------------
     "DELETE /api/admin/semantic-models/{model_id:path}": "semantic_model.delete",
     "DELETE /api/admin/semantic-sources/{source_id}": "semantic_source.delete",
@@ -464,6 +483,19 @@ POSTURE: dict[str, str] = {
     "POST /api/semantic-models/validate-query": "semantic_model.validate_query",
     "PUT /api/admin/semantic-models/{model_id:path}": "semantic_model.update",
     "PUT /api/admin/semantic-sources/{source_id}": "semantic_source.update",
+    # Built on `mf/semantic-layer-v0` in parallel with this wave. The
+    # package link/unlink pair, the detach/reattach pair and the sweep each
+    # audit themselves under the cataloged action named here (see
+    # src/audit_events.py) — declaring them is the cross-check.
+    "DELETE /api/admin/semantic-models/{slug}/packages/{package_id}": "semantic_model.unlink_package",
+    "POST /api/admin/semantic-auto-draft-sweep": "semantic_auto_draft_sweep",
+    "POST /api/admin/semantic-models/{model_id:path}/detach": "semantic_model.detach",
+    "POST /api/admin/semantic-models/{model_id:path}/reattach": "semantic_model.reattach",
+    "POST /api/admin/semantic-models/{slug}/packages": "semantic_model.link_package",
+    # -- app.api.semantic_sources_refresh --------------------------------------
+    # `run_` prefix keeps the sweep inside SCHEDULER_ACTION_SQL's liveness
+    # predicate, same as the other scheduler-triggered endpoints above.
+    "POST /api/admin/run-semantic-sources-refresh": "run_semantic_sources_refresh",
     # -- app.api.settings ------------------------------------------------------
     "PUT /api/settings/dataset": "settings.dataset_update",
     # -- app.api.share_requests_admin ------------------------------------------
@@ -632,6 +664,9 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
     "GET /api/admin/server-config": "server_config.read",
     "GET /api/admin/server-config/overlay": "server_config.read",
+    # Same fold the /admin/data-sources template inlines at render time, for
+    # the page's own repaint — no data content, secrets, or other users' data.
+    "GET /api/admin/source-pipelines": "exempt:ui_support",
     "GET /api/admin/store/submissions": "exempt:ui_support",
     "GET /api/admin/store/submissions/{submission_id}": "exempt:ui_support",
     "GET /api/admin/store/submissions/{submission_id}/bundle.zip": "store.submission.bundle_downloaded",
@@ -671,6 +706,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
+    "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
@@ -689,6 +725,9 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin_upgrade_freeze --
     "GET /api/admin/upgrade-freeze": "exempt:ui_support",
     # -- app.api.admin_usage --
+    # Cross-user aggregate read (every session owner's spend), so a real
+    # action rather than exempt:ui_support per the read-posture policy.
+    "GET /api/admin/telemetry/chat-cost": "usage.chat_cost",
     "GET /api/admin/telemetry/export": "usage.export",
     # -- app.api.admin_usage_summary --
     "GET /api/admin/telemetry/facets": "exempt:ui_support",
@@ -932,11 +971,27 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/recipes/{slug}": "exempt:ui_support",
     # -- app.api.scripts --
     "GET /api/scripts": "exempt:ui_support",
+    # -- app.api.semantic_feedback --
+    # The admin queue of "that answer looked wrong" reports. Other people's
+    # submissions, but a moderation QUEUE backing a page, same shape and same
+    # posture as `GET /api/admin/store/submissions` above.
+    "GET /api/admin/semantic-feedback": "exempt:ui_support",
+    # -- app.api.semantic_layer_coverage --
+    "GET /api/admin/semantic-layer/health": "exempt:ui_support",
+    "GET /api/admin/semantic-layer/mutes": "exempt:ui_support",
+    "GET /api/admin/semantic-model/coverage": "exempt:ui_support",
     # -- app.api.semantic_models --
+    "GET /api/admin/semantic-coverage": "exempt:ui_support",
     "GET /api/admin/semantic-models": "exempt:ui_support",
     "GET /api/admin/semantic-models/{model_id:path}": "exempt:ui_support",
     "GET /api/admin/semantic-sources": "exempt:ui_support",
     "GET /api/admin/semantic-sources/{source_id}": "exempt:ui_support",
+    # The `agnes pull` delivery channel for the local semantic cache — a
+    # BUNDLE of every model the caller can read, which is data content
+    # leaving the server. Real action, exactly like its siblings
+    # `memory.bundle_download` and `store.bundle_download`; the handler
+    # writes no row of its own, so the read path emits this one.
+    "GET /api/semantic-models/bundle": "semantic_model.bundle_download",
     "GET /api/semantic-models/context": "exempt:ui_support",
     "GET /api/semantic-models/schema": "exempt:ui_support",
     "GET /api/semantic-models/search": "exempt:ui_support",
@@ -1062,6 +1117,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/prompts": "exempt:ui_support",
     "GET /admin/scheduler-runs": "exempt:ui_support",
     "GET /admin/semantic-layer": "exempt:ui_support",
+    "GET /admin/semantic-sources": "exempt:ui_support",
     "GET /admin/server-config": "exempt:ui_support",
     "GET /admin/sessions": "exempt:ui_support",
     "GET /admin/sessions/{username}/{session_file}": "exempt:ui_support",
@@ -1368,6 +1424,30 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "get_semantic_context": "exempt:ui_support",
     "get_semantic_schema": "exempt:ui_support",
     "apply_semantic_model": "authoring_suggestion.submit",
+    # Built on `mf/semantic-layer-v0` in parallel with this wave (#1707 took
+    # the three admin families that had REST + CLI and no MCP to triple
+    # surface). Each is a thin self-call over the REST endpoint named in
+    # app/api/mcp/foundation_tools.py's comments, so each reuses that route's
+    # exact action / exempt-reason above — no tool mints a posture of its own.
+    "admin_semantic_coverage": "exempt:ui_support",
+    "semantic_model_coverage": "exempt:ui_support",
+    "semantic_model_coverage_tag": "semantic_coverage_tag.create",
+    "semantic_model_coverage_untag": "semantic_coverage_tag.delete",
+    "semantic_mutes_list": "exempt:ui_support",
+    "mute_semantic_check": "semantic_health_mute.create",
+    "unmute_semantic_check": "semantic_health_mute.delete",
+    "semantic_source_add": "semantic_source.create",
+    "semantic_source_list": "exempt:ui_support",
+    "semantic_source_sync": "semantic_source.sync",
+    "semantic_source_remove": "semantic_source.delete",
+    "semantic_model_detach": "semantic_model.detach",
+    "semantic_model_reattach": "semantic_model.reattach",
+    "semantic_model_link_package": "semantic_model.link_package",
+    "semantic_model_unlink_package": "semantic_model.unlink_package",
+    "semantic_layer_health": "exempt:ui_support",
+    "flag_semantic_issue": "semantic_feedback.submit",
+    "semantic_feedback_list": "exempt:ui_support",
+    "semantic_feedback_resolve": "semantic_feedback.resolved",
     "collections_reingest": "collection.file_reingest",
     # In-process facts_repo() calls, no HTTP self-call -- see module note.
     "fact_search": "mcp.tool_call",

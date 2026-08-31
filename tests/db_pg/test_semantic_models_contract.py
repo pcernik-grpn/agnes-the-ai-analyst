@@ -50,19 +50,22 @@ def repo(request, tmp_path, pg_engine, monkeypatch):
         yield r
 
 
-def _upsert(repo, *, id, slug, source="git", source_ref="repo-a"):
+_UNSET = object()
+
+
+def _upsert(repo, *, id, slug, source="git", source_ref="repo-a", status="valid", document_json=_UNSET):
     return repo.upsert(
         id=id,
         slug=slug,
         name=slug.title(),
         description=None,
         document=f"version: '0.2.0.dev0'\nsemantic_model:\n  - name: {slug}\n",
-        document_json={"semantic_model": [{"name": slug}]},
+        document_json={"semantic_model": [{"name": slug}]} if document_json is _UNSET else document_json,
         spec_version="0.2.0.dev0",
         content_hash=f"hash-{slug}",
         source=source,
         source_ref=source_ref,
-        status="valid",
+        status=status,
         validation_errors=None,
         validated_at=None,
     )
@@ -160,6 +163,31 @@ def test_delete_missing_treats_a_null_source_ref_as_its_own_origin(repo):
     assert repo.get("m3") is not None, "a NULL-ref sync must not prune a non-NULL sibling"
 
 
+def test_update_document_rewrites_content_in_place(repo):
+    """F3: a plain UPDATE, not upsert()'s DELETE+INSERT — same id, same
+    source/source_ref (provenance untouched)."""
+    _upsert(repo, id="m1", slug="retail", source="keboola_metastore", source_ref="proj1")
+
+    updated = repo.update_document(
+        "m1",
+        name="Retail",
+        document="version: '0.2.0.dev0'\nsemantic_model:\n  - name: retail\n  - name: extra\n",
+        document_json={"semantic_model": [{"name": "retail"}, {"name": "extra"}]},
+        content_hash="new-hash",
+        description="edited",
+        spec_version="0.2.0.dev0",
+        validated_at=None,
+    )
+
+    assert updated["id"] == "m1"
+    assert updated["content_hash"] == "new-hash"
+    assert updated["description"] == "edited"
+    assert len(updated["document_json"]["semantic_model"]) == 2
+    assert updated["source"] == "keboola_metastore"
+    assert updated["source_ref"] == "proj1"
+    assert repo.get_by_slug("retail")["id"] == "m1", "still the only row at this slug, not a second one"
+
+
 def test_list_all_source_ref_none_means_unfiltered_on_both_engines(repo):
     """`source_ref=None` on list_all means "don't filter", NOT "match NULL".
 
@@ -171,3 +199,82 @@ def test_list_all_source_ref_none_means_unfiltered_on_both_engines(repo):
     _upsert(repo, id="m3", slug="other", source="manual", source_ref="repo-a")
 
     assert {r["id"] for r in repo.list_all(source="manual", source_ref=None)} == {"m1", "m3"}
+
+
+def test_count_valid_is_the_cheap_existence_gate(repo):
+    """`POST /api/query` asks "is there a semantic layer at all?" on EVERY
+    query. That question must cost one COUNT, not a full `list_all()` that
+    drags `document` + `document_json` for every row across the wire.
+
+    It counts exactly the rows `_accessible_valid_documents` can use:
+    `status='valid'` AND a non-NULL `document_json`.
+    """
+    assert repo.count_valid() == 0
+
+    _upsert(repo, id="m1", slug="retail")
+    assert repo.count_valid() == 1
+
+    _upsert(repo, id="m2", slug="broken", status="invalid")
+    assert repo.count_valid() == 1, "a non-valid row is not a usable model"
+
+    _upsert(repo, id="m3", slug="empty", document_json=None)
+    assert repo.count_valid() == 1, "a row with no parsed document has nothing to validate against"
+
+    _upsert(repo, id="m4", slug="finance")
+    assert repo.count_valid() == 2
+
+
+def test_count_valid_agrees_with_list_all_on_both_engines(repo):
+    """The gate must never under-count what the loader would find — that
+    would silently switch the advisory off. Pinned against the loader's own
+    predicate rather than a hand-written number."""
+    _upsert(repo, id="m1", slug="retail")
+    _upsert(repo, id="m2", slug="broken", status="invalid")
+    _upsert(repo, id="m3", slug="empty", document_json=None)
+
+    usable = [r for r in repo.list_all() if r.get("status") == "valid" and r.get("document_json")]
+    assert repo.count_valid() >= len(usable)
+    assert repo.count_valid() == len(usable)
+
+
+def test_counts_by_provenance_groups_every_origin(repo):
+    """The read-time answer to "how many models does this source own".
+
+    Keyed on the same ``(source, source_ref)`` pair ``delete_missing`` prunes
+    on, but deliberately NOT equal to what a prune would delete — the prune is
+    narrower (detached rows on PG, the ``safe_prune`` skip). "Owns" is "is
+    stamped with this provenance", nothing more. One grouped query, not one
+    COUNT per source.
+    """
+    assert repo.counts_by_provenance() == {}
+
+    _upsert(repo, id="m1", slug="retail", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m2", slug="finance", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m3", slug="other", source="ossie_git", source_ref="ss_b")
+
+    counts = repo.counts_by_provenance()
+    assert counts[("ossie_git", "ss_a")] == 2
+    assert counts[("ossie_git", "ss_b")] == 1
+    assert ("ossie_git", "ss_c") not in counts, "a scope with no rows is absent, never a zero row"
+
+
+def test_counts_by_provenance_treats_a_null_source_ref_as_its_own_origin(repo):
+    """Same asymmetry ``delete_missing`` has: NULL is one origin among others,
+    not a wildcard. Both engines must agree on the key it lands under."""
+    _upsert(repo, id="m1", slug="kept", source="keboola_metastore", source_ref=None)
+    _upsert(repo, id="m2", slug="other", source="keboola_metastore", source_ref="conn-a")
+
+    counts = repo.counts_by_provenance()
+    assert counts[("keboola_metastore", None)] == 1
+    assert counts[("keboola_metastore", "conn-a")] == 1
+
+
+def test_counts_by_provenance_counts_invalid_documents_too(repo):
+    """An invalid document is still a row this source wrote and this source's
+    next prune would reach. Excluding it would report "owns 0" for a source
+    that is importing fine and failing validation — two different problems the
+    health report already tells apart (``invalid_models``)."""
+    _upsert(repo, id="m1", slug="retail", source="ossie_git", source_ref="ss_a")
+    _upsert(repo, id="m2", slug="broken", source="ossie_git", source_ref="ss_a", status="invalid")
+
+    assert repo.counts_by_provenance()[("ossie_git", "ss_a")] == 2

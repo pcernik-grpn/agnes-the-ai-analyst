@@ -81,7 +81,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 from app.chat.profiles import ChatProfile
@@ -210,6 +210,90 @@ def _facts_rails_enabled() -> bool:
     return feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
 
 
+def _semantic_layer_section(user_email: str | None) -> str:
+    """The same minimal semantic-layer pointer the sandbox/CLAUDE.md path
+    gets (``src.claude_md``'s "## Semantic layer" section), condensed for a
+    persona: slug + description + the model author's own truncated
+    ``ai_context.instructions``, no full metric/glossary dump — a named
+    agent profile REPLACES the workspace CLAUDE.md the same way a persona
+    replaces it natively (see :data:`DATA_ACCESS_RAILS`), so without this a
+    named agent (persona web chat, Slack, ``agnes chat``, the one-shot agent
+    API) got zero semantic context while the sandbox path always has.
+
+    Empty string — never raises, never appended — when ``user_email`` is
+    unset, the user can't be resolved, no readable model exists, or
+    anything else goes wrong: this is a nice-to-have addition to a persona
+    prompt, not a reason to fail a spawn the user is waiting on.
+
+    Opens its own DuckDB connection when the active backend is DuckDB
+    (Postgres reads need none) — the same ``conn = None if use_pg() else
+    get_system_db()`` pattern ``app/main.py``'s workspace-prompt renderer
+    uses. This module otherwise opens no connection of its own, so this
+    call is why it carries a ``get_system_db()`` grandfather entry in
+    ``tests/test_backend_split_guard.py``.
+    """
+    if not user_email:
+        return ""
+    conn = None
+    try:
+        from src.claude_md import _semantic_layer_models
+        from src.repositories import use_pg, users_repo
+
+        u = users_repo().get_by_email(user_email)
+        if not u:
+            return ""
+        if not use_pg():
+            from src.db import get_system_db
+
+            conn = get_system_db()
+        models = _semantic_layer_models(conn, user=u)
+        if not models:
+            return ""
+        lines = [
+            "\n---\n\n"
+            "## Semantic layer\n\n"
+            "This instance has at least one semantic model you can read — a "
+            "structured document of datasets, metrics, relationships, and "
+            "constraints that is the authoritative source of business "
+            "meaning here. Prefer its definitions over inferring meaning "
+            "from table or column names.\n\n"
+            "Registered models:\n"
+        ]
+        for m in models:
+            line = f"- `{m['slug']}`"
+            if m.get("description"):
+                line += f" — {m['description']}"
+            lines.append(line + "\n")
+            if m.get("instructions"):
+                lines.append(f"  - Model author's note about this data: {m['instructions']}\n")
+        # Discovery guidance is deliberately economy-first. An agent that
+        # finds the layer without it issues one lookup per object, and every
+        # one of those payloads then sits in the conversation for the rest of
+        # the session — reading the layer is cheap, reading it one object at a
+        # time and re-reading it later is not.
+        lines.append(
+            "\nDiscover more in ONE call, then work from what you read:\n"
+            "- `agnes semantic-model context dataset metric relationship` — "
+            "the whole layer, compact (or the MCP `get_semantic_context` tool "
+            "with the same list).\n"
+            "- `agnes semantic-model context metric --id <a> --id <b>` — full "
+            "detail for several objects at once. A call per object multiplies "
+            "both round trips and the context every later turn carries, and a "
+            "definition you have already read is still valid.\n"
+            "- Always check a query against the layer first with `agnes "
+            'semantic-model validate-query "<SQL>"` — it catches a constraint '
+            "violation (an excluded order state, a wrong grain) and a dialect "
+            "mismatch before the query hands you a confidently wrong number.\n"
+        )
+        return "".join(lines)
+    except Exception:
+        logger.exception("semantic layer section unavailable for agent persona (user=%s)", user_email)
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # agents.<field>_mode -> (scope key, agent_scope.item_type)
 _MODE_FIELD_TO_SCOPE = {
     "plugins_mode": ("plugins", "plugin"),
@@ -299,7 +383,9 @@ def _context_skill(agent_row: dict, *, advertise_memory_write: bool = True) -> s
     return "".join(lines)
 
 
-def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Optional[ChatProfile]:
+def build_profile(
+    agent_row: dict, *, advertise_memory_write: bool = True, user_email: str | None = None
+) -> ChatProfile | None:
     """Build a dynamic ``ChatProfile`` from an ``agents`` row.
 
     Returns ``None`` when ``system_prompt`` is empty/whitespace-only — the
@@ -310,18 +396,24 @@ def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Op
 
     The returned ``claude_md`` is the authored persona followed by
     :data:`DATA_ACCESS_RAILS` — see that constant for why a persona must
-    never be able to silently drop the platform's data-access floor — and,
+    never be able to silently drop the platform's data-access floor — then,
     when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
     it (see that constant for why a persona needs its own copy of the
-    fact-tool guidance too). The early return above means this only ever
-    applies where a persona actually replaces the workspace prompt; an agent
-    with no persona keeps the full symlinked rails — including the
-    template's own facts section — and is untouched.
+    fact-tool guidance too), and finally :func:`_semantic_layer_section`.
+    The early return above means this only ever applies where a persona
+    actually replaces the workspace prompt; an agent with no persona keeps
+    the full symlinked rails — including the template's own facts and
+    semantic-layer sections — and is untouched.
 
     ``advertise_memory_write`` is threaded to :func:`_context_skill` — pass
     ``False`` when the profile is materialized for a sandbox with no channel
     to the remember endpoint (the embedded kai-agent engine's workspace
     tarball, ``app/api/kai.py``).
+
+    ``user_email`` threads into :func:`_semantic_layer_section` for the
+    RBAC-filtered model summary — omit it (or pass ``None``) where the
+    caller has no session identity handy; the persona still builds, just
+    without that section, exactly as before this parameter existed.
     """
     system_prompt = (agent_row.get("system_prompt") or "").strip()
     if not system_prompt:
@@ -330,6 +422,7 @@ def build_profile(agent_row: dict, *, advertise_memory_write: bool = True) -> Op
     claude_md = system_prompt + DATA_ACCESS_RAILS
     if _facts_rails_enabled():
         claude_md += FACTS_ACCESS_RAILS
+    claude_md += _semantic_layer_section(user_email)
     return ChatProfile(
         slug=f"agent-{slug}",
         claude_md=claude_md,
@@ -466,7 +559,7 @@ def _memory_date(memory: dict) -> str:
     return text[:10] if text else "unknown-date"
 
 
-def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
+def _rendered_memories_with_count(agent_row: dict) -> tuple[str | None, int]:
     """``(document, count)`` for this agent's in-budget active memories —
     ``(None, 0)`` when there is nothing to write. Shared never-raises core of
     :func:`render_memories` and :func:`materialize_memories`."""
@@ -498,7 +591,7 @@ def _rendered_memories_with_count(agent_row: dict) -> tuple[Optional[str], int]:
         return None, 0
 
 
-def render_memories(agent_row: dict) -> Optional[str]:
+def render_memories(agent_row: dict) -> str | None:
     """Render this agent's in-budget active memories as the ``agent-memory.md``
     document, or ``None`` when there is nothing to write.
 

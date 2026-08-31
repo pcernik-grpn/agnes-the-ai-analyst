@@ -118,7 +118,7 @@ def _last_run(connection_id: str = CONN_ID) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def _fake_get_app_token(tenant_id, client_id, private_key):
+async def _fake_get_app_token(tenant_id, client_id, private_key, *, client_secret=""):
     return "fake-token"
 
 

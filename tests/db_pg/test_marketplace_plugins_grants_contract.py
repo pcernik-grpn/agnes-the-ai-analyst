@@ -375,6 +375,57 @@ class TestIsBuiltin:
         assert row["name"] == "Built-in 3 Updated"
         assert row.get("is_builtin") is True
 
+    def test_re_register_clears_last_error_for_builtin(self, repos):
+        """A stale last_error stamped on a built-in row (e.g. by the old
+        pre-fix sync path that tried to git-clone the builtin:// sentinel)
+        must self-heal the next time the row is re-registered — the only
+        path a built-in row ever gets re-registered through is the boot-time
+        seed, so this is what makes a stuck error recoverable at all."""
+        reg = _make_registry_repo(repos)
+        reg.register(
+            id="builtin-heal",
+            name="Built-in Heal",
+            url="builtin://builtin-heal",
+            is_builtin=True,
+        )
+        reg.update_sync_status("builtin-heal", error="git clone failed: stale fossil")
+        row = reg.get("builtin-heal")
+        assert row is not None
+        assert row["last_error"] == "git clone failed: stale fossil"
+
+        # Re-register, as seed_builtin_marketplace() does on every boot.
+        reg.register(
+            id="builtin-heal",
+            name="Built-in Heal",
+            url="builtin://builtin-heal",
+            is_builtin=True,
+        )
+
+        row = reg.get("builtin-heal")
+        assert row is not None
+        assert row["last_error"] is None, "stale error on a built-in row must clear on re-register"
+
+    def test_re_register_preserves_last_error_for_non_builtin(self, repos):
+        """Regression guard: the self-heal is scoped to is_builtin — an admin
+        edit/PATCH of a normal marketplace must not silently wipe a real
+        last_error off the board."""
+        reg = _make_registry_repo(repos)
+        reg.register(id="normal-heal", name="Normal Heal", url="https://example.test/heal.git")
+        reg.update_sync_status("normal-heal", error="real git clone failure")
+        row = reg.get("normal-heal")
+        assert row is not None
+        assert row["last_error"] == "real git clone failure"
+
+        # Re-register, as an admin edit (PATCH) would.
+        reg.register(id="normal-heal", name="Normal Heal Updated", url="https://example.test/heal.git")
+
+        row = reg.get("normal-heal")
+        assert row is not None
+        assert row["name"] == "Normal Heal Updated"
+        assert row["last_error"] == "real git clone failure", (
+            "re-registering a non-builtin row must not clear a real last_error"
+        )
+
 
 class TestAdminDisabled:
     """Contract tests for marketplace_plugins.admin_disabled and set_admin_disabled."""

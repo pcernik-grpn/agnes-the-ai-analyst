@@ -100,7 +100,12 @@ def _validate_sharepoint(config: Dict[str, Any]) -> Dict[str, Any]:
     client_id = str(config.get("client_id") or "").strip()
     if not client_id:
         raise ValueError("sharepoint connection requires config.client_id")
-    return {**config, "tenant_id": tenant_id, "client_id": client_id}
+    # Mirrors Snowflake's auth_type normalization: default the method, reject
+    # the unknown, so a typo fails at save time rather than at first resolve.
+    auth_method = str(config.get("auth_method") or "certificate").strip() or "certificate"
+    if auth_method not in ("certificate", "client_secret"):
+        raise ValueError(f"auth_method must be 'certificate' or 'client_secret', got: {auth_method!r}")
+    return {**config, "tenant_id": tenant_id, "client_id": client_id, "auth_method": auth_method}
 
 
 _SPECS: Dict[str, ConnectionSpec] = {

@@ -106,6 +106,45 @@ class SemanticModelsPgRepository:
             )
         return self.get(id)  # type: ignore[return-value]
 
+    def update_document(
+        self,
+        model_id: str,
+        *,
+        name: str,
+        description,
+        document: str,
+        document_json,
+        spec_version: str,
+        content_hash: str,
+        status: str = "valid",
+        validation_errors=None,
+        validated_at,
+    ) -> Dict[str, Any]:
+        """Postgres mirror of ``SemanticModelsRepository.update_document``."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE semantic_models SET name = :name, description = :description, "
+                    "document = :document, document_json = CAST(:document_json AS JSONB), "
+                    "spec_version = :spec_version, content_hash = :content_hash, status = :status, "
+                    "validation_errors = CAST(:validation_errors AS JSONB), validated_at = :validated_at, "
+                    "updated_at = current_timestamp WHERE id = :id"
+                ),
+                {
+                    "name": name,
+                    "description": description,
+                    "document": document,
+                    "document_json": _json_param(document_json),
+                    "spec_version": spec_version,
+                    "content_hash": content_hash,
+                    "status": status,
+                    "validation_errors": _json_param(validation_errors),
+                    "validated_at": validated_at,
+                    "id": model_id,
+                },
+            )
+        return self.get(model_id)  # type: ignore[return-value]
+
     def get(self, model_id: str) -> Optional[Dict[str, Any]]:
         with self._engine.connect() as conn:
             row = (
@@ -147,6 +186,24 @@ class SemanticModelsPgRepository:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode_row(dict(r)) for r in rows]
 
+    def count_valid(self) -> int:
+        """Postgres twin of the DuckDB ``count_valid`` — same predicate, same
+        superset-not-subset contract (see the sibling's docstring)."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT COUNT(*) FROM semantic_models WHERE status = 'valid' AND document_json IS NOT NULL")
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def counts_by_provenance(self) -> Dict[tuple[str, Optional[str]], int]:
+        """Postgres twin of the DuckDB ``counts_by_provenance`` — same key,
+        same "absent, never zero" contract (see the sibling's docstring)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT source, source_ref, COUNT(*) FROM semantic_models GROUP BY source, source_ref")
+            ).all()
+        return {(r[0], r[1]): int(r[2]) for r in rows}
+
     def delete(self, model_id: str) -> bool:
         existed = self.get(model_id) is not None
         with self._engine.begin() as conn:
@@ -161,12 +218,17 @@ class SemanticModelsPgRepository:
         return existed
 
     def delete_missing(self, *, source: str, source_ref: Optional[str], keep_slugs: List[str]) -> List[str]:
+        """F3: a detached row never gets pruned here, even if its slug drops
+        out of ``keep_slugs`` — the importer tracks that as "source missing"
+        (``mark_source_missing``) instead of deleting it out from under an
+        admin's edit."""
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
                     "SELECT id FROM semantic_models "
                     "WHERE source = :source AND source_ref IS NOT DISTINCT FROM :source_ref "
-                    "  AND NOT (slug = ANY(CAST(:keep AS TEXT[]))) ORDER BY id"
+                    "  AND NOT (slug = ANY(CAST(:keep AS TEXT[]))) "
+                    "  AND sync_mode != 'detached' ORDER BY id"
                 ),
                 {"source": source, "source_ref": source_ref, "keep": list(keep_slugs)},
             ).all()
@@ -174,6 +236,93 @@ class SemanticModelsPgRepository:
         for model_id in ids:
             self.delete(model_id)
         return ids
+
+    def detach(self, model_id: str, *, by: str, base_hash: str) -> Dict[str, Any]:
+        """F3: flip a source-owned row to ``sync_mode='detached'`` in place
+        (same id, same source/source_ref — provenance is preserved). PG-only
+        (A3 ratchet, migrations/versions/0090_semantic_models_detach.py)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE semantic_models SET sync_mode = 'detached', "
+                    "detached_at = current_timestamp, detached_by = :by, "
+                    "detach_base_hash = :base_hash WHERE id = :id"
+                ),
+                {"by": by, "base_hash": base_hash, "id": model_id},
+            )
+        return self.get(model_id)  # type: ignore[return-value]
+
+    def reattach(self, model_id: str) -> Dict[str, Any]:
+        """F3: return a detached row to ``sync_mode='synced'`` and clear
+        every detach-tracking column. Does not touch ``document``/
+        ``content_hash`` itself — the next importer pass does that."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE semantic_models SET sync_mode = 'synced', "
+                    "detached_at = NULL, detached_by = NULL, detach_base_hash = NULL, "
+                    "source_content_hash = NULL, source_missing_since = NULL WHERE id = :id"
+                ),
+                {"id": model_id},
+            )
+        return self.get(model_id)  # type: ignore[return-value]
+
+    def update_source_content_hash(self, model_id: str, content_hash: str) -> None:
+        """F3: park the latest hash the importer has seen from the source
+        for a detached row, without touching ``document``/``content_hash``
+        (the row's own, possibly locally-edited, content)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE semantic_models SET source_content_hash = :hash WHERE id = :id"),
+                {"hash": content_hash, "id": model_id},
+            )
+
+    def mark_source_missing(self, model_id: str) -> None:
+        """F3: record the first time the source stopped sending this slug
+        while detached. No-op once already set — a later sweep must not
+        keep bumping the timestamp forward."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "UPDATE semantic_models SET source_missing_since = current_timestamp "
+                    "WHERE id = :id AND source_missing_since IS NULL"
+                ),
+                {"id": model_id},
+            )
+
+    def clear_source_missing(self, model_id: str) -> None:
+        """F3: the source started sending this slug again."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE semantic_models SET source_missing_since = NULL WHERE id = :id"),
+                {"id": model_id},
+            )
+
+    def list_detached_with_health_state(self) -> List[Dict[str, Any]]:
+        """F3 prep for F4.2 (health check, not yet on `main` — see phase3.md
+        N6): every detached row, each annotated with a ``health_state`` of
+        ``source_deleted`` (most severe — the source no longer has this
+        slug at all), ``source_changed`` (still there, but different from
+        what was detached), or ``detached_clean`` (unchanged since detach).
+        F4.2's aggregation endpoint is the consumer of this; this method
+        only prepares the query."""
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT *, CASE "
+                        "  WHEN source_missing_since IS NOT NULL THEN 'source_deleted' "
+                        "  WHEN source_content_hash IS NOT NULL AND source_content_hash != detach_base_hash "
+                        "    THEN 'source_changed' "
+                        "  ELSE 'detached_clean' "
+                        "END AS health_state "
+                        "FROM semantic_models WHERE sync_mode = 'detached' ORDER BY detached_at"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [self._decode_row(dict(r)) for r in rows]
 
     def link_package(self, package_id: str, model_id: str) -> None:
         with self._engine.begin() as conn:

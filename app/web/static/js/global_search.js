@@ -9,8 +9,8 @@
    Debounces input, groups results by type (Tables /
    Knowledge / Documents), and links each hit to its detail page:
      - table     -> /catalog/t/<table_id> (falls back to /catalog)
-     - metric    -> /catalog/semantics#metrics   (#1108)
-     - glossary  -> /catalog/semantics#glossary  (#1108)
+     - metric    -> /semantic-layer?tab=all_metrics   (#1108, retargeted #1707)
+     - glossary  -> /semantic-layer?tab=all_glossary  (#1108, retargeted #1707)
      - knowledge -> /corporate-memory
      - chunk     -> /library
    All API-derived strings are set via textContent — never innerHTML — so a
@@ -42,8 +42,12 @@
         if (hit.type === "table") {
             return hit.table_id ? "/catalog/t/" + encodeURIComponent(hit.table_id) : "/catalog";
         }
-        if (hit.type === "metric") return "/catalog/semantics#metrics";
-        if (hit.type === "glossary") return "/catalog/semantics#glossary";
+        // The flat registries are tabs of the model list since #1707 N5. The
+        // TAB rides the query string, not a fragment: a fragment never reaches
+        // the server, so `#metrics` could only ever have been a client-side
+        // hint and the old /catalog/semantics 308 cannot read it.
+        if (hit.type === "metric") return "/semantic-layer?tab=all_metrics";
+        if (hit.type === "glossary") return "/semantic-layer?tab=all_glossary";
         if (hit.type === "knowledge") return "/corporate-memory";
         if (hit.type === "chunk") return "/library";
         return "#";

@@ -429,7 +429,25 @@ function renderJourneyPanel() {
           title="Replay the ${brand} tour" aria-label="Replay the tour">↻</button>
         ${
           inRailPopover
-            ? ""
+            ? // The collapse chevron, LAST in the row so it sits furthest
+              // right — the panel's outermost control, past the one that acts
+              // on the panel's contents. It closes the popover, which the card
+              // already did four ways (second click on the launcher,
+              // click-away, Escape, mouse-leave) and advertised none of; the
+              // chevron is what makes "this can be put away" visible.
+              //
+              // No handler bound here on purpose: rail_popover.js listens for
+              // `[data-rail-popover-collapse]` on the document, because this
+              // innerHTML is rebuilt on every journey update and a per-button
+              // handler would be discarded with it the first time a step
+              // completed.
+              //
+              // Rail only. The inline /chat panel is part of the page rather
+              // than a popover hanging off a launcher, so there is nothing to
+              // collapse there — it keeps the "×" instead, which is a
+              // different action (dismiss for the page load).
+              `<button type="button" class="cloud-chat-journey-iconbtn" data-rail-popover-collapse
+          title="Collapse" aria-label="Collapse onboarding checklist">⌄</button>`
             : `<button type="button" class="cloud-chat-journey-iconbtn" data-journey-close
           title="Close" aria-label="Close onboarding">×</button>`
         }
