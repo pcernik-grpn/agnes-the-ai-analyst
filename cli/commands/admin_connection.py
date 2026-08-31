@@ -15,6 +15,8 @@ Each subcommand maps 1:1 to one HTTP endpoint:
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -122,19 +124,43 @@ def set_secret(
     connection_id: str = typer.Argument(..., help="Connection id"),
     kind: str = typer.Option("storage", "--kind", help="storage | master (master = semantic-layer owner token)"),
     remove: bool = typer.Option(False, "--remove", help="Clear the secret instead of setting it"),
+    from_file: Optional[str] = typer.Option(
+        None,
+        "--from-file",
+        help="Read the secret from this file ('-' = stdin) — for multiline values "
+        "like a SharePoint cert+key PEM that cannot travel through the prompt",
+    ),
 ):
-    """Set or clear a connection's vault secret. The token is read from a
-    hidden prompt — never pass secrets on the command line."""
+    """Set or clear a connection's vault secret. The value is read from a
+    hidden prompt, or — for multiline material like a combined cert+key
+    PEM — from a file via ``--from-file`` (the path is argv, the secret
+    never is)."""
     if kind not in ("storage", "master"):
         typer.echo("Error: --kind must be storage or master", err=True)
         raise typer.Exit(1)
     if remove:
+        if from_file:
+            typer.echo("Error: --remove clears the secret; it cannot be combined with --from-file", err=True)
+            raise typer.Exit(1)
         resp = api_delete(f"/api/admin/source-connections/{connection_id}/secret", params={"kind": kind})
         if resp.status_code not in (200, 204):
             _fail(resp)
         typer.echo(f"Cleared {kind} secret for {connection_id}")
         return
-    token = typer.prompt("Token", hide_input=True)
+    if from_file:
+        if from_file == "-":
+            token = sys.stdin.read().strip()
+        else:
+            try:
+                token = Path(from_file).read_text().strip()
+            except OSError as exc:
+                typer.echo(f"Error: could not read {from_file}: {exc}", err=True)
+                raise typer.Exit(1) from exc
+        if not token:
+            typer.echo(f"Error: {from_file} is empty", err=True)
+            raise typer.Exit(1)
+    else:
+        token = typer.prompt("Token", hide_input=True)
     resp = api_put(f"/api/admin/source-connections/{connection_id}/secret", json={"value": token, "kind": kind})
     if resp.status_code not in (200, 204):
         _fail(resp)

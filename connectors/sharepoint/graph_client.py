@@ -144,6 +144,44 @@ def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str)
     return pyjwt.encode(claims, private_key, algorithm="RS256", headers={"x5t": thumbprint})
 
 
+def validate_certificate_material(pem_text: str) -> Optional[str]:
+    """Why ``pem_text`` cannot serve as SharePoint certificate material, or
+    ``None`` when it can — a parseable ``CERTIFICATE`` block plus a parseable
+    ``PRIVATE KEY`` block, :func:`build_client_assertion`'s exact needs,
+    checked without signing anything.
+
+    The fail-fast seam for the admin PUT that stores the material: garbage
+    used to store fine and surface hours later as an opaque provider auth
+    error on the first Graph call. Never raises, and the reason string never
+    carries key material — the private-key parse failure is deliberately
+    reported without the parser's own message.
+    """
+    blocks = _split_pem_blocks(pem_text or "")
+    cert_pem = blocks.get("CERTIFICATE")
+    key_pem = blocks.get("PRIVATE KEY")
+    if not cert_pem and not key_pem:
+        return "no PEM blocks found — paste the certificate followed by its private key, concatenated in one PEM"
+    if not cert_pem:
+        return (
+            "missing a CERTIFICATE block — the certificate (for the JWT assertion's x5t "
+            "thumbprint) and the private key belong together, concatenated in one PEM"
+        )
+    if not key_pem:
+        return (
+            "missing a PRIVATE KEY block — the private key (to sign the JWT assertion) "
+            "and the certificate belong together, concatenated in one PEM"
+        )
+    try:
+        x509.load_pem_x509_certificate(cert_pem.encode())
+    except Exception as exc:  # noqa: BLE001 — malformed PEM; message names no secret material
+        return f"CERTIFICATE block could not be parsed: {exc}"
+    try:
+        load_pem_private_key(key_pem.encode(), password=None)
+    except Exception:  # noqa: BLE001 — never echo parser detail about key material
+        return "PRIVATE KEY block could not be parsed — an unencrypted PKCS#8 or PKCS#1 key is expected"
+    return None
+
+
 #: A certificate within this many days of ``not_after`` is flagged
 #: ``expiring_soon`` rather than ``ok`` — the admin's early-warning window
 #: for the "certificate expires silently, auth breaks with no warning"

@@ -68,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -301,10 +302,20 @@ def _resolve_token(connection_id: str, row: Dict[str, Any]) -> Optional[str]:
     return token or None
 
 
-def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
+def _reject_disallowed_token_env(token_env: Optional[str], field: str = "token_env") -> None:
     """Reject a secret-ref env name that isn't on the config-secret allowlist
     (409-style 400). None/empty is allowed — vault-secret connections don't use
     token_env. Called on create/update so a bad name never lands in the row.
+    ``field`` names the request field in the error — the config-embedded
+    variants (``cert_private_key_env``, ``private_key_env``, …) were previously
+    all reported as ``token_env``, a field their wizards don't even show.
+
+    Two mistakes admins actually make get targeted messages instead of the
+    generic allowlist remedies: pasting a cloud secret-manager secret NAME
+    where an env-var name belongs (Agnes reads only its own process
+    environment, never a cloud secret store), and pasting the PEM CONTENT
+    into the name field. Both point at the vault upload, the path that works
+    without any deployment change.
 
     The write-time gate is the config-resolution UNION (attach names plus
     config-only names like the SharePoint certificate env) — the hard
@@ -315,17 +326,42 @@ def _reject_disallowed_token_env(token_env: Optional[str]) -> None:
         return
     from src.orchestrator_security import is_config_secret_env_allowed
 
-    if not is_config_secret_env_allowed(token_env):
+    if is_config_secret_env_allowed(token_env):
+        return
+    vault_hint = (
+        "store the credential itself in the connection vault instead: the connection's "
+        "credential field in the admin UI, PUT .../secret, or "
+        "`agnes admin connection secret <id> --from-file <path>`"
+    )
+    if token_env.lstrip().startswith("-----BEGIN"):
+        # Never echo the value back — it is credential material.
         raise HTTPException(
             status_code=400,
             detail=(
-                f"token_env {token_env!r} is not allowlisted. Use a data-source "
-                "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
-                "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
-                "remote-attach token_env), or store the token in the vault via "
-                "PUT .../secret instead."
+                f"{field} holds PEM content, but this field takes the NAME of a server "
+                f"environment variable — {vault_hint}."
             ),
         )
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{field} {token_env!r} looks like a secret manager or vault secret name, "
+                "not an environment variable of the server process — Agnes does not read "
+                f"cloud secret stores. Either {vault_hint}, or have the deployment inject "
+                "the value under an env var and allowlist that name (AGNES_CONFIG_SECRET_ENVS)."
+            ),
+        )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{field} {token_env!r} is not allowlisted. Use a data-source "
+            "credential env var (or add the name to AGNES_CONFIG_SECRET_ENVS, "
+            "or AGNES_REMOTE_ATTACH_TOKEN_ENVS if it must also serve as a "
+            "remote-attach token_env), or store the token in the vault via "
+            "PUT .../secret instead."
+        ),
+    )
 
 
 #: Secret-ref NAME fields a connection's ``config`` can carry, per source_type.
@@ -370,7 +406,7 @@ def _reject_disallowed_config_token_envs(source_type: str, config: Optional[Dict
         value = cfg.get(field)
         if value is not None and not isinstance(value, str):
             continue  # malformed, not a security concern here; the spec validator's problem
-        _reject_disallowed_token_env(value)
+        _reject_disallowed_token_env(value, field=field)
 
 
 #: Source types whose connection identity D2.3 relocated onto this row (off
@@ -1272,6 +1308,17 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                     status = 400 if is_upstream_client_error(exc) else 502
                     raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
                 _reject_project_mismatch(row, info, what="storage token")
+        elif row.get("source_type") == "sharepoint":
+            # Fail fast on unusable certificate material. Without this, any
+            # string stored fine and surfaced hours later as an opaque
+            # provider auth error on the first Graph call — the least
+            # discoverable part of the whole flow is that the credential is
+            # the certificate AND its private key concatenated in one PEM.
+            from connectors.sharepoint.graph_client import validate_certificate_material
+
+            reason = validate_certificate_material(value)
+            if reason:
+                raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
         key = connection_id
 
     try:
