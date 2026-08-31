@@ -29988,6 +29988,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/webhook": {
+      "post": {
+        "description": "(Re)generate this connection's Graph change-notification receiver\nsecret and return the receiver URL alongside it, so an operator can run\nthe producer's own ``subscriptions.py create --url <webhook_url>``\nagainst this connection without hand-assembling either value.\n\nAlways mints a FRESH random secret \u2014 there is no \"read the current\none\" verb, matching the outbound-webhook pattern\n(``app/api/agent_webhooks.py``): a caller who wants to see it again\ncalls this again, which also rotates it, invalidating whatever Graph\nsubscription was signed with the old value (the operator must then\nre-point the subscription's ``clientState``, or simply create a new\nsubscription \u2014 Agnes does not manage Graph subscriptions itself).\n\nUnlike the outbound-webhook secret, this one is NOT hidden after\ncreation: it lives in this connection's own ``config.webhook_secret``\n(see ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``), the same trust\nboundary ``config.tenant_id``/``client_id`` already sit behind, so any\nadmin who can ``GET`` this connection can also read it back later. That\nis an admin-to-admin visibility question, not a public one \u2014 the\nreceiver route (``app/api/sharepoint_webhooks.py``) never returns it and\nverifies every notification's ``clientState`` against it in constant\ntime.",
+        "operationId": "rotate_webhook_secret_api_admin_sharepoint_connections__connection_id__webhook_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate Webhook Secret",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/extraction/run-due": {
       "post": {
         "description": "Scheduler-driven sweep (TCRD-226): fires ``corpus-extraction`` for\nevery SharePoint connection whose extraction cadence\n(``extraction.schedule`` \u2014 a single instance-wide setting in the\n``extraction:`` config block, applied independently to each\nconnection's own ``last_run_at``) says it is due. Same shape as\n``POST /api/v1/agents/run-due`` (walk + per-row due-check + enqueue\ninto an EXISTING job kind) \u2014 no second scheduling mechanism.\nScheduler row: ``extraction-run-due`` in\n``services/scheduler/__main__.py``, registered only when\n``extraction.schedule`` is configured (absent/empty = off, same\ndefault posture as ``extraction.enabled``).\n\nA clean, typed no-op (never an error) when the feature isn't usable \u2014\n``extraction.enabled`` is false, no producer is configured, or no\nschedule is configured \u2014 since this endpoint, once registered, fires\nUNCONDITIONALLY on its own cadence; the JOB HANDLER\n(``_run_corpus_extraction``) raises on the same conditions because a\n``corpus-extraction`` job only ever exists because something explicitly\nenqueued it, but this sweep is what decides whether to enqueue at all.",
@@ -55240,6 +55303,47 @@
         "summary": "Version Info",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/api/webhooks/sharepoint/{connection_id}": {
+      "post": {
+        "description": "Graph validation handshake + change-notification delivery \u2014 see the\nmodule docstring for the full contract. Always ``200``/``202``/``413``;\nnever a status that reveals whether ``connection_id`` names a real\nSharePoint connection or a configured secret.",
+        "operationId": "receive_sharepoint_webhook_api_webhooks_sharepoint__connection_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Receive Sharepoint Webhook",
+        "tags": [
+          "sharepoint-webhooks"
         ]
       }
     },

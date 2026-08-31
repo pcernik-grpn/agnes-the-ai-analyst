@@ -2297,3 +2297,25 @@ class TestSharePointScopesSurviveOrdinaryEdits:
             "last_run_at": "2026-08-29T00:00:00+00:00",
             "last_job_id": "job_1",
         }
+
+    def test_editing_config_without_webhook_secret_preserves_it(self, seeded_app):
+        """``config.webhook_secret`` (the Graph change-notification receiver's
+        shared secret, ``app/api/admin_sharepoint.py::rotate_webhook_secret``)
+        is the THIRD instance of this same shape of server-written
+        bookkeeping — never typed by an admin, never rendered by the
+        generic editor's form. An ordinary edit through this endpoint must
+        not silently reset it, which would invalidate every Graph
+        subscription signed with the old value."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-webhook-secret-preserve")
+
+        rotate = c.post(f"/api/admin/sharepoint/connections/{conn_id}/webhook", headers=_auth(token))
+        secret = rotate.json()["secret"]
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("webhook_secret") == secret

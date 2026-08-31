@@ -100,13 +100,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin
+from app.auth.public_url import public_base_url
 from app.resource_types import ResourceType
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
@@ -121,6 +123,7 @@ from connectors.sharepoint.graph_client import (
     search_folders,
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+from src.audit_helpers import log_safe
 from src.repositories import (
     file_corpora_repo,
     resource_grants_repo,
@@ -160,9 +163,11 @@ class ConfirmScopeBody(BaseModel):
 #: Keys THIS module writes into a SharePoint connection's ``config`` outside
 #: the generic ``PUT /api/admin/source-connections/{id}`` editor's own
 #: request body: the wizard's confirmed-scope rows (``scopes`` —
-#: :func:`confirm_scope` / :func:`remove_scope`) and the in-Agnes extraction
+#: :func:`confirm_scope` / :func:`remove_scope`), the in-Agnes extraction
 #: schedule's own dispatch bookkeeping (``extraction`` —
-#: :func:`_record_extraction_dispatch`, TCRD-226).
+#: :func:`_record_extraction_dispatch`, TCRD-226), and the Graph
+#: change-notification receiver's shared secret (``webhook_secret`` —
+#: :func:`rotate_webhook_secret`).
 #:
 #: A key earns a place here on ONE test: the server writes it into this
 #: connection's ``config`` and the generic connection-editor FORM never
@@ -181,7 +186,9 @@ class ConfirmScopeBody(BaseModel):
 #: change fails a test that names the fix, rather than shipping a silent
 #: erasure the way ``scopes`` (2026-08-29 morning) and ``extraction``
 #: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
-SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction")
+#: ``webhook_secret`` is the third instance of this same class — added
+#: here in the same change that introduces the writer, not after.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret")
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -826,6 +833,50 @@ async def certificate(
     except SharePointSettingsError as exc:
         return {"certificate": None, "reason": f"sharepoint_cert_unresolved: {exc}"}
     return certificate_metadata(settings.private_key)
+
+
+@router.post("/connections/{connection_id}/webhook")
+async def rotate_webhook_secret(
+    connection_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """(Re)generate this connection's Graph change-notification receiver
+    secret and return the receiver URL alongside it, so an operator can run
+    the producer's own ``subscriptions.py create --url <webhook_url>``
+    against this connection without hand-assembling either value.
+
+    Always mints a FRESH random secret — there is no "read the current
+    one" verb, matching the outbound-webhook pattern
+    (``app/api/agent_webhooks.py``): a caller who wants to see it again
+    calls this again, which also rotates it, invalidating whatever Graph
+    subscription was signed with the old value (the operator must then
+    re-point the subscription's ``clientState``, or simply create a new
+    subscription — Agnes does not manage Graph subscriptions itself).
+
+    Unlike the outbound-webhook secret, this one is NOT hidden after
+    creation: it lives in this connection's own ``config.webhook_secret``
+    (see ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``), the same trust
+    boundary ``config.tenant_id``/``client_id`` already sit behind, so any
+    admin who can ``GET`` this connection can also read it back later. That
+    is an admin-to-admin visibility question, not a public one — the
+    receiver route (``app/api/sharepoint_webhooks.py``) never returns it and
+    verifies every notification's ``clientState`` against it in constant
+    time.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    secret = secrets.token_hex(32)
+    new_config = {**(row.get("config") or {}), "webhook_secret": secret}
+    source_connections_repo().update(connection_id, config=new_config)
+
+    webhook_url = f"{public_base_url(request=request)}/api/webhooks/sharepoint/{connection_id}"
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.webhook_secret_rotate",
+        resource=f"source_connection:{connection_id}",
+    )
+    logger.info("sharepoint connection %s: webhook secret rotated", connection_id)
+    return {"webhook_url": webhook_url, "secret": secret}
 
 
 @router.post("/connections/{connection_id}/extract", status_code=202)

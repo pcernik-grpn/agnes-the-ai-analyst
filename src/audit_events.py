@@ -1055,6 +1055,22 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "The scheduler's SharePoint extraction sweep ran.",
     ),
+    # -- SharePoint Graph change-notification receiver -------------------------
+    "sharepoint_connection.webhook_secret_rotate": AuditEvent(
+        "sharepoint_connection.webhook_secret_rotate",
+        "mutation",
+        "An admin (re)generated a SharePoint connection's Graph change-notification webhook secret.",
+    ),
+    "webhook.sharepoint_received": AuditEvent(
+        "webhook.sharepoint_received",
+        "system",
+        "A SharePoint Graph change notification passed clientState verification and enqueued a corpus-extraction run.",
+    ),
+    "webhook.sharepoint_rejected": AuditEvent(
+        "webhook.sharepoint_rejected",
+        "system",
+        "A SharePoint Graph change notification was rejected (clientState did not match the connection's secret).",
+    ),
 }
 
 

@@ -3140,6 +3140,19 @@ KNOWN_UNTESTED = {
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
     "POST /api/admin/sharepoint/extraction/run-due",
+    # Graph change-notification receiver (webhook-triggered extraction) — the
+    # admin secret-rotation endpoint writes only into the EXISTING
+    # `source_connections.config` JSON column (no new schema surface), and
+    # the public receiver route carries no user auth to smoke at all (Graph
+    # is the caller; admission is a per-notification clientState check, not
+    # a Depends chain — see tests/test_route_auth_guard.py's _EXEMPT entry).
+    # Both routes' actual behavior (secret mint/rotate/persist, handshake
+    # echo, clientState verification, dedup + debounce, the feature gate,
+    # the request-size cap) is covered by
+    # tests/test_admin_sharepoint.py::TestWebhookSecretRotation and
+    # tests/test_sharepoint_webhooks.py; not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/webhook",
+    "POST /api/webhooks/sharepoint/{connection_id}",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

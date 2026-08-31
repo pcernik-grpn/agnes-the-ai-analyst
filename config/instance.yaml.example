@@ -1346,6 +1346,26 @@ extraction:
     hmac_key_env: ""
 
 
+# Microsoft Graph change-notification receiver for SharePoint connections —
+# POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
+# drive push near-real-time notifications instead of Agnes waiting for
+# extraction.schedule above. A SEPARATE top-level section from `extraction:`
+# on purpose (see app/switches.py's `extraction_webhook_enabled` entry): that
+# section's own `enabled` flag is deployment-locked (needs a worker lane +
+# producer), while this one is a plain, always-editable route gate.
+#
+# Off by default: the whole route answers 404 when off. Gates the RECEIVER
+# route only — a notification it accepts still needs `extraction.enabled` +
+# a configured producer + a worker polling the `extraction` lane to actually
+# run the resulting `corpus-extraction` job. Agnes never creates, renews, or
+# deletes the Graph subscription itself; an operator runs the producer's own
+# `subscriptions.py create --url <webhook_url>` against the URL + secret
+# `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
+# AGNES_EXTRACTION_WEBHOOK_ENABLED overrides this at the environment level.
+extraction_webhook:
+  enabled: false
+
+
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
 # agents, data packages, connections, and corporate memory).
 #

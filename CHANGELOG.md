@@ -12,6 +12,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **SharePoint changes reach Agnes in near-real-time via a Graph change-notification receiver.** `POST /api/webhooks/sharepoint/{connection_id}` answers the external producer's Graph drive subscription: the validation handshake (echoes `?validationToken=` verbatim) and notification delivery (verifies every notification's `clientState` in constant time against the connection's own secret, `POST /api/admin/sharepoint/connections/{connection_id}/webhook` (re)generates). A verified notification enqueues the existing `corpus-extraction` job with the same idempotency key the manual/scheduled triggers use plus a ~60s debounce, so a burst of notifications for one connection collapses onto a single run instead of waiting for `extraction.schedule`'s clock. Off by default (`extraction_webhook.enabled`) — the whole route 404s when off; Agnes never creates, renews, or deletes the Graph subscription itself.
+
 ### Changed
 
 ### Fixed

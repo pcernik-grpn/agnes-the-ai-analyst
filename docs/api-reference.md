@@ -1175,6 +1175,7 @@ these three routes are the wizard's own steps 2/3.
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
+- /api/admin/sharepoint/connections/{connection_id}/webhook
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1278,6 +1279,52 @@ feature isn't usable or no schedule is configured.
 
 Admin-only wizard bookkeeping with no analyst CLI/MCP analogue; the eventual
 document surface is `agnes facts …`.
+
+**Graph change-notification receiver.** `POST …/webhook` (re)generates this
+connection's Microsoft Graph change-notification shared secret and returns
+`{webhook_url, secret}` — the URL and secret an operator feeds to the
+external producer's own `subscriptions.py create --url <webhook_url>` to
+actually create the Graph drive subscription (Agnes never creates, renews,
+or deletes that subscription itself). Always mints a FRESH secret; there is
+no "read the current one" verb, so a caller who needs it again calls this
+again, which also invalidates whatever subscription was signed with the old
+value. Persisted in `config.webhook_secret` — the same trust boundary
+`config.tenant_id`/`client_id` already sit behind, unlike the outbound
+agent-webhook secret this mirrors, which is shown once and never re-served.
+See `/api/webhooks/sharepoint/{connection_id}` below for the receiver
+itself.
+
+### `/api/webhooks/sharepoint/{connection_id}` — Graph change-notification receiver
+
+Public, unauthenticated (Microsoft Graph is the caller) `POST` route that
+lets a SharePoint drive push near-real-time change notifications instead of
+Agnes waiting for `extraction.schedule`'s clock. Feature-gated by
+`extraction_webhook.enabled` (default off) — the whole route 404s when off,
+same posture as `/api/facts*`.
+
+Two request shapes on the same route, matching Graph's own contract:
+
+- **Validation handshake** — a `?validationToken=` query param is present
+  (sent when a subscription is created/renewed). Echoed back verbatim as
+  `200 text/plain` within Graph's 10-second window; no body read, no
+  connection lookup, no side effects.
+- **Notification delivery** — a JSON body `{"value": [{..., "clientState":
+  "..."}]}`. Every notification's `clientState` is checked in constant time
+  (`hmac.compare_digest`) against the connection's own `config.
+  webhook_secret` (minted by `POST /api/admin/sharepoint/connections/
+  {connection_id}/webhook` above). The response is `202` regardless of
+  whether the connection exists, a secret is configured, or any
+  notification verified — never an oracle. On at least one verified
+  notification, enqueues the SAME `corpus-extraction` job kind the manual
+  admin trigger uses, with the same idempotency key (so a burst of
+  notifications for one connection collapses onto a single run) and a
+  ~60s `run_after` debounce; skipped (still `202`) when `extraction.enabled`
+  or its producer isn't configured, so a webhook burst never queues a job
+  doomed to fail. Hard 1 MiB request-body cap, enforced by streaming rather
+  than buffering first (`413` on overflow).
+
+Admin-only wizard/system-to-system bookkeeping with no analyst CLI/MCP
+analogue — Graph is the only caller.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
