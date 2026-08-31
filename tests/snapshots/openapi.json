@@ -12064,6 +12064,17 @@
             ],
             "title": "Deactivated At"
           },
+          "domain_warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Warning"
+          },
           "email": {
             "title": "Email",
             "type": "string"
