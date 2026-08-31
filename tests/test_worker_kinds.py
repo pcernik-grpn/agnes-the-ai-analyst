@@ -91,6 +91,8 @@ class TestRegisterAllKinds:
         "collections-purge",
         "webhook-deliver",
         "corpus-extraction",
+        "sharepoint-acl-sync",
+        "sharepoint-subtree-sweep",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -123,6 +125,8 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["analytics-rebuild"].lane == HEAVY_LANE
         assert JOB_KINDS["collections-purge"].lane == HEAVY_LANE
         assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
+        assert JOB_KINDS["sharepoint-acl-sync"].lane == LIGHT_LANE
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lane == LIGHT_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a
@@ -134,6 +138,38 @@ class TestRegisterAllKinds:
         register_all_kinds()
 
         assert len(JOB_KINDS) == len(self._ALWAYS_REGISTERED)
+
+    def test_sharepoint_subtree_sweep_no_automatic_retry(self):
+        """Same rationale as corpus-extraction — a failed multi-hour sweep
+        needs an operator to look at it, not an unattended re-run."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].retry_in_seconds is None
+
+    def test_sharepoint_subtree_sweep_lease_env_override(self, monkeypatch):
+        """``_sp_sweep_lease_seconds()`` reads the env fresh on every
+        ``register_all_kinds()`` call — no reload needed, same as every
+        other lease knob in this module."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        monkeypatch.setenv("AGNES_SP_SWEEP_LEASE_S", "600")
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 600
+
+    def test_sharepoint_subtree_sweep_lease_default(self):
+        """Default 4h (14400s) — a full probe pass over a large library is
+        multi-hour (spec §6.2)."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 14400
 
 
 class TestAgentResponseRoleSplitRegistration:
@@ -1320,6 +1356,85 @@ class TestCorpusExtractionHandler:
         handler({"connection_id": "conn1"})
 
         assert calls[0]["env"]["AGNES_API_URL"] == "http://127.0.0.1:8000"
+
+    # -- broken-inheritance subtree exclusion handoff (2026-08-30 plan,
+    # Task 7) --------------------------------------------------------------
+
+    _EXCLUDED_SUBTREE_CONFIG = {
+        "scopes": [
+            {
+                "source_scope_id": "scope-excl-1",
+                "display_path": "Contracts",
+                "collection_id": "col_excl_1",
+                "access_mode": "mirrored",
+                "excluded_subtrees": [
+                    {"item_id": "item-A", "path": "Contracts/A", "detected_at": "2026-08-30T00:00:00+00:00"},
+                    {"item_id": "item-B", "path": "Contracts/B/C", "detected_at": "2026-08-30T00:00:00+00:00"},
+                ],
+            },
+            {
+                "source_scope_id": "scope-plain-1",
+                "display_path": "Public docs",
+                "collection_id": "col_plain_1",
+                "access_mode": "mirrored",
+            },
+        ]
+    }
+
+    def test_excluded_subtrees_land_in_child_env_as_json(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config=self._EXCLUDED_SUBTREE_CONFIG)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        env = calls[0]["env"]
+        assert json.loads(env["AGNES_SP_EXCLUDED_SUBTREE_IDS"]) == {"scope-excl-1": ["item-A", "item-B"]}
+        # The unaffected scope contributes nothing to the map.
+        assert "scope-plain-1" not in json.loads(env["AGNES_SP_EXCLUDED_SUBTREE_IDS"])
+
+    def test_no_excluded_subtrees_omits_the_var(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        plain_config = {
+            "scopes": [
+                {
+                    "source_scope_id": "scope-plain-1",
+                    "display_path": "Public docs",
+                    "collection_id": "col_plain_1",
+                    "access_mode": "mirrored",
+                }
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=plain_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
+
+    def test_include_excluded_subtrees_override_omits_that_scope_from_the_map(self, monkeypatch):
+        """`should_not`'s per-subtree "include anyway" override
+        (``app/api/admin_sharepoint.py``'s ``include_excluded_subtrees``) —
+        the crawler must NOT be told to skip a subtree the admin explicitly
+        chose to include."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        overridden_config = {
+            "scopes": [
+                {
+                    **self._EXCLUDED_SUBTREE_CONFIG["scopes"][0],
+                    "include_excluded_subtrees": True,
+                },
+            ]
+        }
+        self._stub_connection_and_settings(monkeypatch, config=overridden_config)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert "AGNES_SP_EXCLUDED_SUBTREE_IDS" not in calls[0]["env"]
 
 
 class TestJiraWebhookEnqueues:

@@ -177,6 +177,24 @@ class ScopeItem(BaseModel):
 
 class SetScopeRequest(BaseModel):
     items: List[ScopeItem] = []
+    # Per-collection audience-class pin (2026-08-30 sharepoint-acl-mirroring
+    # plan, Task 9; spec §4.2, §7 step 6) — ``{collection_id: class_name}``.
+    # Every entry is validated against ``src.audience_classes.
+    # audience_class_map()`` (the collection must be TIERED, the class name
+    # must be one of ITS configured classes) before being persisted as
+    # ``agent_scope`` rows (see ``src.agent_scope_intersection.
+    # AUDIENCE_CLASS_PIN_ITEM_TYPE``). ``None`` (omitted) leaves any
+    # previously-stored pins untouched; ``{}`` explicitly clears them — the
+    # SAME omitted-vs-empty convention Task 8's ``ConfirmScopeBody.
+    # audience_classes`` already established for the sibling wizard field,
+    # for the same reason: a scope PUT that says nothing about audience
+    # tiers must not silently wipe a configured pin. The pin never widens
+    # what the agent may reach (enforced in :func:`src.audience_classes.
+    # audience_classes_for_caller`, not here) — it only selects, within a
+    # tiered collection the agent can already read, which audience-tagged
+    # variant it sees, and even then only when the agent's OWNER currently
+    # holds that class or better (checked live at resolution time).
+    audience_class: Optional[Dict[str, str]] = None
 
 
 class CreateAgentTokenRequest(BaseModel):
@@ -814,9 +832,56 @@ async def set_agent_scope(
                 f"slack channel '{item_id}' is already bound to {who} — unbind it there first (one agent per channel)",
             )
 
+    # Audience-class pin (2026-08-30 sharepoint-acl-mirroring plan, Task 9;
+    # spec §4.2, §7 step 6) — stored as ordinary `agent_scope` rows (see
+    # `src.agent_scope_intersection.AUDIENCE_CLASS_PIN_ITEM_TYPE`), so they
+    # have to be folded into the SAME `set_scope` call: it replaces the
+    # whole row set for this agent, and unlike the plain scope `items`
+    # above (this endpoint's own job is to set them wholesale), the pin
+    # follows `ConfirmScopeBody.audience_classes`'s omitted-vs-empty
+    # convention — `None` preserves whatever was already stored.
+    from src.agent_scope_intersection import AUDIENCE_CLASS_PIN_ITEM_TYPE
+
+    audience_class_out: Dict[str, str] = {}
+    if payload.audience_class is None:
+        for row in agents_repo().get_scope(agent_id):
+            if row.get("item_type") != AUDIENCE_CLASS_PIN_ITEM_TYPE:
+                continue
+            item_id = row.get("item_id") or ""
+            collection_id, sep, class_name = item_id.partition(":")
+            if sep and collection_id and class_name:
+                audience_class_out[collection_id] = class_name
+    else:
+        from src.audience_classes import audience_class_map
+
+        class_map = audience_class_map()
+        for collection_id, class_name in payload.audience_class.items():
+            classes = class_map.get(collection_id)
+            if not classes:
+                raise _err(
+                    400,
+                    "invalid_audience_class_collection",
+                    f"'{collection_id}' is not a tiered SharePoint-mirrored collection",
+                )
+            if class_name not in {name for name, _ in classes}:
+                raise _err(
+                    400,
+                    "invalid_audience_class_name",
+                    f"'{class_name}' is not a configured audience class for collection '{collection_id}'",
+                )
+            audience_class_out[collection_id] = class_name
+
+    items.extend(
+        (AUDIENCE_CLASS_PIN_ITEM_TYPE, f"{collection_id}:{class_name}")
+        for collection_id, class_name in audience_class_out.items()
+    )
+
     agents_repo().set_scope(agent_id, items, granted_by=user["id"])
     _audit(user["id"], "agent.scope.set", agent_id, {"count": len(items)})
-    return {"items": [{"item_type": t, "item_id": i} for t, i in items]}
+    return {
+        "items": [{"item_type": t, "item_id": i} for t, i in items if t != AUDIENCE_CLASS_PIN_ITEM_TYPE],
+        "audience_class": audience_class_out,
+    }
 
 
 @router.post("/{agent_id}/tokens")

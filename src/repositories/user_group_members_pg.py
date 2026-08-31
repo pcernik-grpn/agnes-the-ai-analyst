@@ -138,6 +138,26 @@ class UserGroupMembersPgRepository:
                     {"u": user_id, "g": group_id, "s": source, "b": added_by},
                 )
 
+    def replace_group_members_for_source(self, group_id: str, user_ids: List[str], source: str, added_by: str) -> None:
+        """Authoritative refresh of this GROUP's ``source``-tagged membership —
+        mirrors the DuckDB sibling's ``replace_group_members_for_source``
+        (the group-oriented transpose of ``replace_synced_groups``)."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("DELETE FROM user_group_members WHERE group_id = :g AND source = :s"),
+                {"g": group_id, "s": source},
+            )
+            for user_id in user_ids:
+                conn.execute(
+                    sa.text(
+                        """INSERT INTO user_group_members
+                           (user_id, group_id, source, added_by)
+                           VALUES (:u, :g, :s, :b)
+                           ON CONFLICT (user_id, group_id) DO NOTHING"""
+                    ),
+                    {"u": user_id, "g": group_id, "s": source, "b": added_by},
+                )
+
     def replace_google_sync_groups(
         self,
         user_id: str,

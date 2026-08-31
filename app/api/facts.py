@@ -53,6 +53,7 @@ cookie session:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -379,22 +380,47 @@ def _refuse_undeclared_anonymize_marked_corpora(body: "FactsIngestRequest") -> N
 class FactsIngestRequest(BaseModel):
     """Wire format accepted verbatim (spec §7.0/§7.2) — ``documents`` are the
     crawler's ``make_row`` rows each EXTENDED with ``corpus_id``; ``nodes``/
-    ``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote}]}``.
-    Deliberately plain ``Dict[str, Any]`` items rather than a strict nested
-    schema — the producer contract explicitly tolerates unknown fields
-    (underscore-prefixed crawler internals are stripped server-side, not
-    rejected), so a rigid Pydantic model would reject valid producer input
-    on every crawler-side field addition.
+    ``edges`` carry ``{id/src+type+dst, attrs, evidence: [{doc_id, quote,
+    audience?}]}``. Deliberately plain ``Dict[str, Any]`` items rather than a
+    strict nested schema — the producer contract explicitly tolerates
+    unknown fields (underscore-prefixed crawler internals are stripped
+    server-side, not rejected), so a rigid Pydantic model would reject valid
+    producer input on every crawler-side field addition.
 
-    ``anonymization`` is the one exception: a small, OPTIONAL, strictly
-    typed block (spec §9.2) — malformed input there is a real protocol
-    error (422), not tolerated crawler noise."""
+    ``anonymization`` is one exception: a small, OPTIONAL, strictly typed
+    block (spec §9.2) — malformed input there is a real protocol error
+    (422), not tolerated crawler noise. ``evidence[].audience`` (Task 10,
+    spec §4.2) is the other: an OPTIONAL index-time variant tag, format-
+    checked against ``_AUDIENCE_PATTERN`` by :func:`_validate_evidence_audience`
+    before this batch ever reaches :meth:`FactsPgRepository.ingest_batch`."""
 
     documents: List[Dict[str, Any]] = Field(default_factory=list)
     full_documents: List[str] = Field(default_factory=list)
     nodes: List[Dict[str, Any]] = Field(default_factory=list)
     edges: List[Dict[str, Any]] = Field(default_factory=list)
     anonymization: Optional[FactsIngestAnonymizationReport] = None
+
+
+_AUDIENCE_PATTERN = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _validate_evidence_audience(body: "FactsIngestRequest") -> None:
+    """Refuse the WHOLE batch (422, nothing written) if any ``nodes``/
+    ``edges`` evidence item's ``audience`` fails ``_AUDIENCE_PATTERN``
+    (Task 10, 2026-08-30 sharepoint-acl-mirroring plan; spec §4.2) — a
+    protocol error, same posture as a malformed ``anonymization`` block,
+    checked BEFORE any DB lookup so a producer typo never partially writes.
+    An absent/``None`` ``audience`` is untagged (today's behavior) and never
+    itemized here."""
+    invalid: List[Dict[str, Any]] = []
+    for kind, rows in (("nodes", body.nodes), ("edges", body.edges)):
+        for row_idx, row in enumerate(rows):
+            for ev_idx, ev in enumerate(row.get("evidence") or []):
+                audience = ev.get("audience")
+                if audience is not None and not _AUDIENCE_PATTERN.match(str(audience)):
+                    invalid.append({"row": f"{kind}[{row_idx}].evidence[{ev_idx}]", "audience": audience})
+    if invalid:
+        raise HTTPException(status_code=422, detail={"reason": "invalid_audience", "items": invalid})
 
 
 @router.post("/ingest")
@@ -473,7 +499,11 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     itself refused (``503`` ``anonymization_check_unavailable``) rather
     than treated as "nothing is marked" — see
     :func:`_refuse_undeclared_anonymize_marked_corpora`.
+
+    ``evidence[].audience`` (Task 10, spec §4.2) is format-validated FIRST,
+    before either gate below — see :func:`_validate_evidence_audience`.
     """
+    _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
     try:
         report = facts_repo().ingest_batch(

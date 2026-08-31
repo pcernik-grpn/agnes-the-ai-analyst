@@ -148,6 +148,10 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
+    # trigger. Handler writes nothing itself; the fallback middleware emits
+    # this cataloged action on its behalf (src/audit_events.py CATALOG).
+    "POST /api/admin/sharepoint/connections/{connection_id}/acl-sync": "sharepoint_acl.sync_triggered",
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
@@ -1322,6 +1326,15 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
+    # Both of these ALSO write their own more-specific rows internally
+    # (connectors/sharepoint/acl_sync.py -- e.g. sharepoint_acl.sync_completed/
+    # sync_failed for the sync job; the sweep job persists state without a
+    # log_safe call of its own) -- per the "Names a more specific action"
+    # bullet above, the generic `job.run` row still fires too (no dedup
+    # across these three transports), so `job.run` remains the correct
+    # declaration here.
+    "sharepoint-acl-sync": "job.run",
+    "sharepoint-subtree-sweep": "job.run",
     # Conditionally registered (only on a process hosting a live ChatManager
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.

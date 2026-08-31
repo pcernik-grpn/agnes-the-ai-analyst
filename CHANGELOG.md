@@ -21,6 +21,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 - **`agnes admin connection secret --from-file`** reads the vault secret from a file (`-` = stdin) — a SharePoint combined cert+key PEM could not travel through the single-line hidden prompt, leaving a raw API call as the only way to store one. The file path rides argv; the secret value still never does.
 
+- SharePoint ACL mirroring (all slices, behind `acl_mirroring.enabled`, default off): per-scope mirrored grants via a third source-segregated sync writer, broken-inheritance subtree exclusion sweep, per-scope audience classes with index-time claim variants, and a guarantee-mode switch (`must_not`/`should_not`) deciding the fail-closed posture.
+
 ### Changed
 - The marketplace item page no longer jumps when its content arrives.
 - Grid cover cards now ship a responsive srcset, so phones download a 480-px WebP instead of the full upload; page heroes fetch the 480-px variant directly (their fixed tile size never benefits from a larger one).
