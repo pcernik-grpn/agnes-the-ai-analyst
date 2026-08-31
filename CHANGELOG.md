@@ -14,6 +14,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Changed
 
+- **The corpus-extraction producer no longer runs under the scheduler's admin token.** `app/worker/kinds.py`'s `corpus-extraction` job handler mints a short-lived, producer-scoped JWT (`app.auth.producer_token`) naming only the connection and its own confirmed scope collections, instead of forwarding `SCHEDULER_API_TOKEN` (which resolved to a synthetic Admin-group user — a genuine over-grant this closes). The token resolves to a restricted `ProducerPrincipal`, accepted only on `GET .../corpus-map`, `GET .../scopes` (own connection only), `POST /api/collections/{id}/files` (own collections only), `POST /api/facts/ingest` (per-document corpus scope check, `403 producer_corpus_out_of_scope` when violated), and `GET /api/facts/corrections` — every other endpoint 403s it. `SCHEDULER_API_TOKEN` no longer needs to be configured for extraction to work.
+
 ### Fixed
 
 ### Removed

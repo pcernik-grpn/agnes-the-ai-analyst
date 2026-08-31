@@ -332,3 +332,122 @@ def test_ingest_lookup_failure_refuses_never_falls_through_to_accept(facts_clien
     )
     assert r.status_code == 503, r.text
     assert r.json()["detail"]["reason"] == "anonymization_check_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Producer-scoped callback credential (`app.auth.producer_token`) — the
+# corpus-extraction producer's own narrow credential now accepted here
+# alongside admin/scheduler (replaces forwarding the scheduler shared
+# secret, see app/worker/kinds.py::_agnes_producer_callback_env). `/ingest`
+# additionally scope-checks every document's `corpus_id` against the
+# token's own `collection_ids`; `/corrections` is accepted unfiltered (see
+# `list_corrections`'s own docstring for why a cheap filter isn't possible
+# yet).
+# ---------------------------------------------------------------------------
+
+
+def _producer_token(collection_ids=(), connection_id="conn1") -> str:
+    from app.auth.producer_token import mint_producer_token
+
+    return mint_producer_token(connection_id=connection_id, collection_ids=list(collection_ids), ttl_seconds=3600)
+
+
+def test_ingest_producer_token_passes_the_gate_then_501s_on_duckdb(facts_client):
+    """Proven the same way the scheduler-token test above is: NOT
+    401/403 — the DuckDB-backed `facts_repo()` 501 is what's left past
+    the gate."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_a", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_ingest_rejects_a_document_outside_the_producer_tokens_scope(facts_client):
+    """Authorization-level gate (TCRD-...): a producer scoped to col_a must
+    never write into col_b just because it can reach this endpoint at
+    all — itemized 403, independent of the anonymize gate above."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_b", "path": "f.md"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "producer_corpus_out_of_scope"
+    assert detail["corpus_ids"] == ["col_b"]
+
+
+def test_ingest_rejects_a_mixed_batch_itemizing_only_the_out_of_scope_ids(facts_client):
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [
+                {"doc_id": "d1", "corpus_id": "col_a", "path": "f1.md"},
+                {"doc_id": "d2", "corpus_id": "col_b", "path": "f2.md"},
+                {"doc_id": "d3", "corpus_id": "col_c", "path": "f3.md"},
+            ]
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert sorted(r.json()["detail"]["corpus_ids"]) == ["col_b", "col_c"]
+
+
+def test_ingest_producer_scope_gate_is_a_noop_for_admin(facts_client):
+    """An admin (or the scheduler token) has no `collection_ids` claim to
+    check against — unaffected by the new gate, unchanged 501 past it."""
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [{"doc_id": "d1", "corpus_id": "col_anything", "path": "f.md"}]},
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_corrections_get_accepts_a_producer_token(facts_client):
+    """No collection_ids scoping possible for this route today (documented
+    TODO on `list_corrections`) — accepted, then 501s on DuckDB exactly
+    like the scheduler-token/admin cases."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].get("/api/facts/corrections", headers=_auth(token))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_correction_write_routes_still_reject_a_producer_token(facts_client):
+    """The producer's scoped credential is off-surface for the
+    corrections WRITE routes entirely (not on `_PRODUCER_ALLOWED_SURFACE`
+    at all) — refused before this router's own `require_admin` gate ever
+    runs."""
+    token = _producer_token(["col_a"])
+    put = facts_client["client"].put(
+        "/api/facts/corrections/fact/f_x", json={"verdict": "wrong", "reason": "x"}, headers=_auth(token)
+    )
+    assert put.status_code == 403
+    delete = facts_client["client"].delete("/api/facts/corrections/fact/f_x", headers=_auth(token))
+    assert delete.status_code == 403
+
+
+def test_ingest_runs_still_rejects_a_producer_token(facts_client):
+    """`GET /api/facts/ingest-runs` is not one of the producer's five
+    allowed endpoints — off-surface 403, even though it sits on the same
+    `require_admin` family as `/ingest`."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].get("/api/facts/ingest-runs", headers=_auth(token))
+    assert r.status_code == 403
+
+
+def test_read_surface_still_rejects_a_producer_token(facts_client):
+    """The generic `Depends(get_current_user)` read routes (search/
+    neighbors/claims/facets) have no further gate of their own — exactly
+    the over-wide surface the fixed allowlist in
+    `app.auth.producer_token` exists to close."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post("/api/facts/search", json={"type": "client"}, headers=_auth(token))
+    assert r.status_code == 403
