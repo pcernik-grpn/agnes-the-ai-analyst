@@ -399,6 +399,96 @@ def test_ingest_rejects_a_mixed_batch_itemizing_only_the_out_of_scope_ids(facts_
     assert sorted(r.json()["detail"]["corpus_ids"]) == ["col_b", "col_c"]
 
 
+def test_ingest_rejects_a_producer_batch_that_declares_no_corpus(facts_client):
+    """The `documents[]`-only scope check is bypassable on its own.
+
+    `FactsPgRepository.ingest_batch`'s doc_id ladder falls back to an
+    UNRESTRICTED, instance-wide scan (`_resolve_doc` tier 3b) precisely when
+    `documents[]` declared no `(doc_id, corpus_id)` pair — the documented
+    "documents may be omitted when every doc_id already resolves" replay flow
+    (spec §7.2). So a producer scoped to col_a could send `documents: []` plus
+    node evidence naming a doc_id that lives in col_b, and its claims would
+    anchor onto col_b's file. Nothing in the batch carries a `corpus_id` for
+    the per-document check to look at, so it passes.
+
+    403 rather than the 501 that means "past the gate" — which is what this
+    same request returned before the fix.
+    """
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d_in_col_b", "quote": "q"}]}],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["reason"] == "producer_batch_declares_no_corpus"
+
+
+def test_ingest_rejects_a_producer_full_documents_replace_with_no_corpus(facts_client):
+    """`full_documents` is replace mode — it DELETES the listed documents'
+    existing claims — and it is a bare list of doc_ids with no corpus_id
+    anywhere, so the same undeclared-corpus batch is a cross-collection
+    DELETE, not just a write."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [], "full_documents": ["d_in_col_b"]},
+        headers=_auth(token),
+    )
+    assert r.status_code == 403, r.text
+    assert r.json()["detail"]["reason"] == "producer_batch_declares_no_corpus"
+
+
+def test_ingest_allows_a_producer_batch_that_declares_an_in_scope_corpus(facts_client):
+    """Declaring one in-scope `(doc_id, corpus_id)` pair is enough: from then
+    on `declared_corpus_ids` is a subset of the token's own scope (the
+    per-document check has already refused any other corpus_id), so tiers 1-3a
+    cannot resolve outside it and the batch proceeds — 501, i.e. past the
+    gate, not 403."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [{"doc_id": "d1", "corpus_id": "col_a", "path": "f.md"}],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d1", "quote": "q"}]}],
+        },
+        headers=_auth(token),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_undeclared_corpus_replay_still_works_for_an_admin(facts_client):
+    """The documents-omitted replay flow is the repository's documented
+    behaviour and dozens of existing callers depend on it. The new refusal is
+    scoped to a ProducerPrincipal only — an admin sending the same shape is
+    unaffected (501 past the gate, never 403)."""
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={
+            "documents": [],
+            "nodes": [{"id": "n1", "type": "client", "evidence": [{"doc_id": "d_anywhere", "quote": "q"}]}],
+        },
+        headers=_auth(facts_client["admin_token"]),
+    )
+    assert r.status_code == 501, r.text
+
+
+def test_ingest_producer_batch_with_no_doc_ids_at_all_is_not_refused(facts_client):
+    """Nothing to resolve, nothing to escape: a batch that references no
+    doc_id anywhere cannot reach the unrestricted scan, so the new gate must
+    not fire on it (over-refusing would break a legitimate empty/no-op call)."""
+    token = _producer_token(["col_a"])
+    r = facts_client["client"].post(
+        "/api/facts/ingest",
+        json={"documents": [], "nodes": [{"id": "n1", "type": "client"}]},
+        headers=_auth(token),
+    )
+    assert r.status_code != 403, r.text
+
+
 def test_ingest_producer_scope_gate_is_a_noop_for_admin(facts_client):
     """An admin (or the scheduler token) has no `collection_ids` claim to
     check against — unaffected by the new gate, unchanged 501 past it."""

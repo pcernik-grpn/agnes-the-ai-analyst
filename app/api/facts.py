@@ -382,6 +382,33 @@ def _refuse_undeclared_anonymize_marked_corpora(body: "FactsIngestRequest") -> N
         )
 
 
+def _batch_references_a_doc_id(body: "FactsIngestRequest") -> bool:
+    """True if anything in this batch would make ``ingest_batch`` resolve a
+    ``doc_id`` — a ``full_documents`` entry (replace mode: it DELETES that
+    document's existing claims) or any node/edge evidence naming one.
+
+    Tolerant of shape, like the rest of this endpoint: ``nodes``/``edges``
+    are deliberately ``Dict[str, Any]`` so an unknown producer-side field
+    is not a 422, which means ``evidence`` may be absent or not a list and
+    an element may not be a dict. Anything unreadable counts as "no doc_id
+    here" rather than raising — the repository is the layer that rejects a
+    malformed batch, and this helper only decides whether the scope gate
+    above has to fire.
+    """
+    if body.full_documents:
+        return True
+    for item in (*body.nodes, *body.edges):
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for ev in evidence:
+            if isinstance(ev, dict) and ev.get("doc_id"):
+                return True
+    return False
+
+
 def _refuse_producer_out_of_scope_documents(body: "FactsIngestRequest", user: Any) -> None:
     """Authorization-level gate for a ``ProducerPrincipal`` caller: every
     ``documents[]`` row's ``corpus_id`` must be one of the token's own
@@ -419,6 +446,43 @@ def _refuse_producer_out_of_scope_documents(body: "FactsIngestRequest", user: An
                 "message": (
                     "this producer credential is scoped to a different set of collections; these "
                     "documents' corpus_id are outside its scope"
+                ),
+            },
+        )
+
+    # …and the batch must DECLARE a corpus whenever anything in it needs a
+    # doc_id resolved. Without this the check above is bypassable outright:
+    # `FactsPgRepository.ingest_batch`'s doc_id ladder falls back to an
+    # UNRESTRICTED, instance-wide scan (`_resolve_doc` tier 3b) precisely
+    # when `documents[]` declared no `(doc_id, corpus_id)` pair at all —
+    # the documented "documents may be omitted when every doc_id already
+    # resolves" replay flow (spec §7.2). A producer scoped to collections
+    # A/B could therefore POST `documents: []` plus `nodes`/`edges` whose
+    # evidence names a doc_id living in collection C, and its claims would
+    # anchor onto C's file — or pass that doc_id in `full_documents` and
+    # DELETE C's existing claims for it (replace mode). Neither row carries
+    # a `corpus_id` for the loop above to inspect, so both slip through.
+    #
+    # Refused only for a ProducerPrincipal: tier 3b stays exactly as it was
+    # for an admin or the scheduler token, which is what the replay flow's
+    # existing callers use and what its docstring says depends on it. A
+    # producer that declares at least one `documents[]` pair keeps every
+    # tier, because `declared_corpus_ids` is then a subset of the token's
+    # own scope (the loop above has already refused any other corpus_id) and
+    # resolution cannot leave it.
+    declares_corpus = any(d.get("doc_id") and d.get("corpus_id") for d in body.documents)
+    if declares_corpus:
+        return
+    if _batch_references_a_doc_id(body):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "producer_batch_declares_no_corpus",
+                "message": (
+                    "a producer credential must declare each document's corpus_id in "
+                    "documents[]; a batch that references doc_ids without declaring any "
+                    "corpus would resolve them across every collection, escaping this "
+                    "credential's scope"
                 ),
             },
         )
@@ -555,9 +619,15 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     REJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,
     itemizing the offending corpus ids), an authorization boundary
     independent of the ``ambiguous_cross_collection_doc_id`` data-integrity
-    rule above. See :func:`_refuse_producer_out_of_scope_documents`. A
-    human admin (or the scheduler token) has no such claim and is
-    unaffected.
+    rule above — AND, because the repository's doc_id ladder falls back to
+    an unrestricted instance-wide scan exactly when ``documents[]`` declared
+    no corpus at all, a producer batch that references any doc_id (node/edge
+    evidence, or ``full_documents``' replace-mode delete list) without
+    declaring one is refused whole (``403``
+    ``producer_batch_declares_no_corpus``). See
+    :func:`_refuse_producer_out_of_scope_documents`. A human admin (or the
+    scheduler token) has no such claim, keeps the documented
+    documents-omitted replay flow, and is unaffected by either half.
     ``evidence[].audience`` (Task 10, spec §4.2) is format-validated FIRST,
     before either gate below — see :func:`_validate_evidence_audience`.
     """

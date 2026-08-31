@@ -1448,7 +1448,7 @@ def _confirmed_scope_collection_ids(connection: dict) -> list[str]:
 _PRODUCER_TOKEN_GRACE_SECONDS = 15 * 60
 
 
-def _agnes_producer_callback_env(connection: dict, timeout_s: int) -> dict[str, str]:
+def _agnes_producer_callback_env(connection: dict, timeout_s: int, corpus_id: str | None = None) -> dict[str, str]:
     """The credential the producer subprocess needs to call BACK into
     Agnes's own REST API (TCRD-226) — ``GET .../corpus-map``,
     ``GET .../scopes``, the collections upload, ``POST /api/facts/ingest``,
@@ -1523,9 +1523,26 @@ def _agnes_producer_callback_env(connection: dict, timeout_s: int) -> dict[str, 
 
     from app.auth.producer_token import mint_producer_token
 
+    # `collection_ids` is this connection's confirmed scope collections UNION
+    # the run's explicit `corpus_id`. The union is load-bearing, not
+    # belt-and-braces: `_run_corpus_extraction` supports a run with NO
+    # confirmed scopes as long as the payload names a `corpus_id` — that is
+    # exactly what its "no confirmed scopes and the payload carries no
+    # corpus_id" refusal permits by omission — and it forwards that id to the
+    # producer as AGNES_EXTRACTION_CORPUS_ID. Scoping the token to the
+    # confirmed scopes alone hands such a run a credential that 403s on the
+    # very collection it was told to fill: POST /api/collections/{id}/files and
+    # /api/facts/ingest's corpus check both test membership of this claim. Same
+    # when scopes exist but the payload names a different collection. The
+    # widening is bounded by what an admin already decided — a payload
+    # `corpus_id` only ever arrives from POST .../extract or the scheduled
+    # sweep.
+    scoped = list(_confirmed_scope_collection_ids(connection))
+    if corpus_id and str(corpus_id) not in scoped:
+        scoped.append(str(corpus_id))
     env["AGNES_API_TOKEN"] = mint_producer_token(
         connection_id=connection["id"],
-        collection_ids=_confirmed_scope_collection_ids(connection),
+        collection_ids=scoped,
         ttl_seconds=timeout_s + _PRODUCER_TOKEN_GRACE_SECONDS,
     )
     return env
@@ -1719,7 +1736,7 @@ def _run_corpus_extraction(payload: dict) -> dict:
     # and the over-grant it replaces. `timeout_s` is resolved first so the
     # token's `exp` can be sized off it.
     timeout_s = _extraction_timeout_seconds()
-    child_env.update(_agnes_producer_callback_env(connection, timeout_s))
+    child_env.update(_agnes_producer_callback_env(connection, timeout_s, corpus_id))
 
     logger.info(
         "corpus-extraction: invoking producer for connection %s (corpus=%s, timeout=%ds)",

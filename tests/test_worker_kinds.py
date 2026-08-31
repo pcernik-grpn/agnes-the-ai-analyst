@@ -1294,16 +1294,30 @@ class TestCorpusExtractionHandler:
         payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
         assert payload["collection_ids"] == ["col_anon_1", "col_plain_1"]
 
-    def test_agnes_api_token_collection_ids_empty_when_no_scopes_confirmed(self, monkeypatch):
-        """A connection with no confirmed scopes mints a token naming NO
-        collections — so the producer can reach `.../corpus-map` and
-        `.../scopes` for its own connection but cannot upload anywhere.
+    def test_no_scopes_and_no_corpus_id_is_refused_before_any_token_is_minted(self, monkeypatch):
+        """The scenario this test used to describe — no confirmed scopes, no
+        payload `corpus_id`, token minted with `collection_ids: []` — is not a
+        run the handler performs at all: nothing says which collection the
+        documents go to, so it refuses up front rather than spending a producer
+        run on it. Asserted here so the refusal, not an empty credential, is
+        what this case is pinned to."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch, config={})
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
 
-        Reached via an explicit `corpus_id` payload: a run with neither
-        confirmed scopes NOR a `corpus_id` is refused outright before the
-        mint (nothing would say where documents go), so that is the only
-        remaining path on which a scopeless connection spawns a producer.
-        """
+        with pytest.raises(RuntimeError, match="no confirmed scopes"):
+            handler({"connection_id": "conn1"})
+        assert calls == [], "the producer must not be run at all"
+
+    def test_agnes_api_token_covers_the_payloads_explicit_corpus_id(self, monkeypatch):
+        """A run with no confirmed scopes is supported as long as the payload
+        names a `corpus_id` — the handler forwards it as
+        `AGNES_EXTRACTION_CORPUS_ID`. The credential has to cover it, or the
+        producer would be 403'd by `POST /api/collections/{id}/files` and by
+        `/api/facts/ingest`'s corpus check on the one collection it was told to
+        fill. Scoping the token to the confirmed scopes alone (what it did
+        before) set that run up to fail."""
         from app.auth.jwt import verify_token
 
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
@@ -1313,8 +1327,30 @@ class TestCorpusExtractionHandler:
 
         handler({"connection_id": "conn1", "corpus_id": "col_explicit"})
 
+        assert calls[0]["env"]["AGNES_EXTRACTION_CORPUS_ID"] == "col_explicit"
         payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
-        assert payload["collection_ids"] == []
+        assert payload["collection_ids"] == ["col_explicit"]
+
+    def test_agnes_api_token_unions_the_corpus_id_with_the_confirmed_scopes(self, monkeypatch):
+        """Same hole with scopes present: a payload naming a collection outside
+        them must widen the claim, not be silently left out of it. The union is
+        deduplicated and sorted, so naming a collection already in scope adds
+        nothing."""
+        from app.auth.jwt import verify_token
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_connection_and_settings(monkeypatch)
+        calls = self._run_capturing_env(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "corpus_id": "col_outside"})
+        payload = verify_token(calls[0]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default", "col_outside"]
+
+        # naming a collection already in scope adds nothing
+        handler({"connection_id": "conn1", "corpus_id": "col_default"})
+        payload = verify_token(calls[1]["env"]["AGNES_API_TOKEN"])
+        assert payload["collection_ids"] == ["col_default"]
 
     def test_agnes_api_token_expiry_tracks_timeout_plus_grace(self, monkeypatch):
         from app.auth.jwt import verify_token
