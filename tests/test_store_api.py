@@ -2533,3 +2533,101 @@ class TestCreateFromMarkdown:
         _, cookies = _create_user(web_client, "ivan@x.com")
         r = self._publish(web_client, cookies, type="agent", skill_md="too short")
         assert r.status_code == 422, r.text
+
+
+class TestEditFromMarkdown:
+    """Reading a published document back, and writing a new one over it.
+
+    The builder authors markdown; the only edit surface (``/marketplace/flea/
+    {id}/edit``) edits metadata and takes a replacement ``.zip``. So the one
+    thing the builder wrote was the one thing no surface could change, and an
+    author who wanted to fix a sentence in their own skill had to reconstruct
+    a bundle by hand. These two endpoints are the missing halves.
+    """
+
+    def _publish(self, client, cookies, **overrides):
+        payload = {
+            "name": "editable-skill",
+            "description": _OK_DESC,
+            "skill_md": _OK_BODY,
+        }
+        payload.update(overrides)
+        r = client.post("/api/store/entities/from-markdown", json=payload, cookies=cookies)
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def test_reading_it_back_returns_what_was_published(self, web_client):
+        _, cookies = _create_user(web_client, "mona@x.com")
+        created = self._publish(web_client, cookies)
+        r = web_client.get(f"/api/store/entities/{created['id']}/markdown", cookies=cookies)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["type"] == "skill"
+        assert body["name"] == "editable-skill"
+        # The published document, frontmatter and all — this is what the
+        # builder reopens, so it has to be the real bytes on disk.
+        assert _OK_BODY.split("\n")[0][:40] in body["skill_md"]
+        assert body["editable"] is True
+
+    def test_a_stranger_is_not_told_it_exists(self, web_client):
+        _, owner_cookies = _create_user(web_client, "nora@x.com")
+        created = self._publish(web_client, owner_cookies)
+        _, other = _create_user(web_client, "otto@x.com")
+        r = web_client.get(f"/api/store/entities/{created['id']}/markdown", cookies=other)
+        # 404, not 403 — the same no-leak refusal _enforce_visibility makes.
+        assert r.status_code == 404
+        assert r.json()["detail"] == "entity_not_found"
+
+    def test_editing_replaces_the_document(self, web_client, tmp_path):
+        _, cookies = _create_user(web_client, "pete@x.com")
+        created = self._publish(web_client, cookies)
+        revised = _OK_BODY + "\n\nOne more paragraph the author added afterwards.\n"
+        r = web_client.put(
+            f"/api/store/entities/{created['id']}/from-markdown",
+            json={"name": "editable-skill", "description": _OK_DESC, "skill_md": revised},
+            cookies=cookies,
+        )
+        assert r.status_code == 200, r.text
+        back = web_client.get(f"/api/store/entities/{created['id']}/markdown", cookies=cookies)
+        assert "One more paragraph" in back.json()["skill_md"]
+
+    def test_editing_runs_the_same_guardrails_as_publishing(self, web_client):
+        """The point of delegating instead of writing files directly: a body
+        that could not be published cannot be edited in either."""
+        _, cookies = _create_user(web_client, "rita@x.com")
+        created = self._publish(web_client, cookies)
+        r = web_client.put(
+            f"/api/store/entities/{created['id']}/from-markdown",
+            json={"name": "editable-skill", "skill_md": "too short"},
+            cookies=cookies,
+        )
+        assert r.status_code == 422, r.text
+
+    def test_a_bad_name_is_refused_before_anything_is_written(self, web_client):
+        _, cookies = _create_user(web_client, "sara@x.com")
+        created = self._publish(web_client, cookies)
+        r = web_client.put(
+            f"/api/store/entities/{created['id']}/from-markdown",
+            json={"name": "Bad Name!", "skill_md": _OK_BODY},
+            cookies=cookies,
+        )
+        assert r.status_code == 400
+        assert r.json()["detail"] == "invalid_name_format"
+
+    def test_a_stranger_cannot_edit_it(self, web_client):
+        _, owner_cookies = _create_user(web_client, "tina@x.com")
+        created = self._publish(web_client, owner_cookies)
+        _, other = _create_user(web_client, "umar@x.com")
+        r = web_client.put(
+            f"/api/store/entities/{created['id']}/from-markdown",
+            json={"name": "editable-skill", "skill_md": _OK_BODY},
+            cookies=other,
+        )
+        assert r.status_code == 404
+
+    def test_both_halves_require_auth(self, web_client):
+        assert web_client.get("/api/store/entities/nope/markdown").status_code in (401, 403)
+        assert web_client.put(
+            "/api/store/entities/nope/from-markdown",
+            json={"name": "x", "skill_md": "y"},
+        ).status_code in (401, 403)

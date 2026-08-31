@@ -117,6 +117,10 @@ class TestFeatureFlagsRegistry:
             "facts_visibility_mode",
             "extraction",
             "extraction_webhook_enabled",
+            "acl_mirroring",
+            "acl_guarantee_mode",
+            "acl_max_stale_hours",
+            "acl_sweep_interval_days",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -327,6 +331,10 @@ class TestServerConfigFeatureFlagsInventory:
             "facts_visibility_mode",
             "extraction",
             "extraction_webhook_enabled",
+            "acl_mirroring",
+            "acl_guarantee_mode",
+            "acl_max_stale_hours",
+            "acl_sweep_interval_days",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

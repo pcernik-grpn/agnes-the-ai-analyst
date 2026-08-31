@@ -176,10 +176,28 @@ answers *which packages contain this table, and who gets those packages*.
 
 The control is not access — the grant already gave access. It decides whether
 the resource is permanent and always downloaded, or whether the user chooses to
-keep a local copy. So it takes the words the user will read in the Library:
-**Required by your admin** and **Available — the user chooses a local copy**.
-Not Optional / Automatic, which names neither state and matches nothing the user
-sees.
+keep a local copy. So it takes the words the user will read in the Library.
+
+> **Reversed 2026-08-30.** This section originally chose **Required by your
+> admin** / **Available — the user chooses a local copy**, rejecting Optional /
+> Automatic as naming "neither state and matching nothing the user sees". The
+> pair is now **Automatic / Optional**. The rule did not change — the Library's
+> words still win — but the Library's words moved underneath it. The vocabulary
+> pass that same week replaced *In stack* / *Add to stack* with **Keep a local
+> copy**, so "Required by your admin" is no longer the sentence the tier
+> mirrors, and the argument for *Required* went with it. What remained was
+> *Available*'s own flaw, which the original decision did not weigh: **both
+> tiers are available**. Both are granted, both are reachable, both are
+> queryable the moment the grant exists — that is the premise this very section
+> establishes two paragraphs up. Offering *Available* as the opposite of
+> *Required* therefore draws a distinction the system does not make, and a
+> member reading it concludes the other tier is not available, which is false.
+> *Optional* is a true opposite of *Automatic* and describes the one thing that
+> actually differs: who decides about the local copy.
+>
+> The wire values `available` / `required` are untouched, as before. Enforced
+> by `tests/test_access_vocabulary.py` and `tests/test_vocabulary_contract.py`;
+> the words themselves live in `app/web/vocabulary.py`. See TCRD-208.
 
 It also applies to fewer rows than the matrix implies: packages, memory and
 plugins only. On everything else the tier column should not exist.
@@ -259,6 +277,9 @@ decides, and *Simulate* is where an admin would check it.
   `available`/`required` in the API and docs, **Optional / Automatic** in the
   admin UI, **Required by your admin** / **Keep a local copy** in the Library
   redesign. The redesign's words are the ones a user reads, so they win.
+  **Settled 2026-08-30 as Automatic / Optional** — see the reversal note in
+  section 2 for why the first answer (Required / Available) did not survive
+  the Library's own rewording.
 - **`docs/RBAC.md`** — auto-membership described as opt-in; default-on since
   Wave 0.
 

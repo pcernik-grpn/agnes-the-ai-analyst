@@ -2319,3 +2319,38 @@ class TestSharePointScopesSurviveOrdinaryEdits:
         )
         assert r.status_code == 200, r.text
         assert r.json()["config"].get("webhook_secret") == secret
+
+    def test_editing_config_without_acl_sync_last_run_preserves_it(self, seeded_app):
+        """``config.acl_sync_last_run``/``config.acl_sync_last_success_at``
+        (2026-08-30 plan, Task 4/5 — ``connectors/sharepoint/acl_sync.py::
+        _sync_connection``) are the SAME shape of server-written bookkeeping
+        as ``scopes``/``extraction`` above, written by the ``sharepoint-acl-
+        sync`` WORKER JOB rather than an admin_sharepoint.py endpoint — so
+        they are NOT part of ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`` (see
+        that tuple's docstring) but must be carried forward by the SAME
+        "explicit wins" contract, or an ordinary edit through this endpoint
+        would silently drop the connection's last ACL-sync run."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-acl-sync-preserve")
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["acl_sync_last_run"] = {"at": "2026-08-30T00:00:00+00:00", "ok": True, "matched": 3, "unmatched": 1}
+        config["acl_sync_last_success_at"] = "2026-08-30T00:00:00+00:00"
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("acl_sync_last_run") == {
+            "at": "2026-08-30T00:00:00+00:00",
+            "ok": True,
+            "matched": 3,
+            "unmatched": 1,
+        }
+        assert r.json()["config"].get("acl_sync_last_success_at") == "2026-08-30T00:00:00+00:00"

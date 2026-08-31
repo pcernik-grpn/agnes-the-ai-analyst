@@ -589,6 +589,8 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "access_policies": "live",  # matches its switch
     "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
     "extraction_webhook": "live",  # matches its switch — no other known key under this section
+    "acl_mirroring": "live",  # matches its switch — no other known key under this section
+    "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -824,6 +826,42 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "all_evidence: visible only if ALL of its claims are readable — hides "
                 "strictly more within one grant snapshot. Facts and edges use the same "
                 "rule."
+            ),
+        },
+    },
+    "acl_mirroring": {
+        "enabled": {
+            "kind": "bool",
+            "default": _flag_default("acl_mirroring", "enabled", False),
+            "hint": (
+                "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope "
+                "access_mode='mirrored', and the admin sync-now endpoint. OFF by "
+                "default — turning it on changes nothing until a scope opts into "
+                "mirroring."
+            ),
+        },
+    },
+    "acl_sync": {
+        "guarantee_mode": {
+            "kind": "select",
+            "options": ["must_not", "should_not"],
+            "default": _switch_default_path(("acl_sync", "guarantee_mode"), "must_not"),
+            "hint": (
+                "Cross-audience-leak posture (design Q7). must_not (default): fail "
+                "closed — broken-inheritance subtrees always excluded, mirrored "
+                "grants suspended past max_stale_hours, untagged claims in an "
+                "audience-tiered scope admin-only. should_not: best effort — "
+                "advisory overrides allowed, stale grants persist with warnings, "
+                "untagged claims stay unrestricted within their collection."
+            ),
+        },
+        "max_stale_hours": {
+            "kind": "int",
+            "default": _switch_default_path(("acl_sync", "max_stale_hours"), 72),
+            "hint": (
+                "must_not mode only: hours a failed ACL sync may leave mirrored "
+                "grants standing before they are suspended (deleted until the next "
+                "successful sync rewrites them)."
             ),
         },
     },

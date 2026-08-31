@@ -281,27 +281,6 @@
     });
   }
 
-  // ---- Dock geometry ---------------------------------------------------
-  // The Filter menu opens UPWARD from a button in a bottom-anchored card, so its
-  // offset has to clear the chips row above that button — otherwise it opens
-  // straight into the very state it is about to change. The row's height is not
-  // knowable in CSS (it wraps), so publish it as a custom property whenever it
-  // appears, disappears or rewraps; 0 while there are no chips.
-  function syncDockChips() {
-    // Published on the FRAME, not the card: the menus inside the card inherit it
-    // either way, but the frosted veil is the card's SIBLING and sizes its band
-    // off this value, so a property set on the card would never reach it.
-    var frame = document.querySelector(".fbar-dock");
-    var chips = document.getElementById("ch-chips");
-    if (!frame) return;
-    var h = chips && !chips.hidden ? chips.getBoundingClientRect().height : 0;
-    frame.style.setProperty("--fbar-dock-chips", h ? Math.round(h) + 10 + "px" : "0px");
-  }
-  if (typeof ResizeObserver === "function") {
-    var chipsEl = document.getElementById("ch-chips");
-    if (chipsEl) new ResizeObserver(syncDockChips).observe(chipsEl);
-  }
-
   // ---- Segment badge counts -------------------------------------------
   // The UNFILTERED tally per segment, matching how the Filter menu's category
   // options count. Recomputed from the rows' own bucket sets after any action, so
@@ -664,7 +643,6 @@
         // survive invisibly (see syncSelection).
         syncSelection();
         syncFilterView();
-        syncDockChips();
       },
     });
   }
@@ -672,5 +650,4 @@
   updateSegmentCounts();
   syncSelection();
   syncFilterView();
-  syncDockChips();
 })();

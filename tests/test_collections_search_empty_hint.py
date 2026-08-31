@@ -152,7 +152,8 @@ class TestCombinedKnowledgeSearchCarriesTheSameHint:
         assert "searched_tables" in body
         hint = body.get("hint", "")
         assert hint, "the docstring promises a hint; the response must carry one"
-        assert "DO have access" in hint
+        assert "NOT evidence that access is missing" in hint
+        assert "DO have access" not in hint  # must not over-claim the other way
         for caveat in ("file names are searched", "whole word", "wildcard"):
             assert caveat in hint.lower(), f"hint does not name: {caveat}"
 
@@ -187,7 +188,8 @@ class TestABlankCollectionFilterIsNotAFilter:
 
         assert body["searched_collections"] >= 1, "a blank filter narrowed the search to nothing"
         assert "no collections are shared with you" not in body.get("hint", "").lower()
-        assert "DO have access" in body["hint"]
+        assert "NOT evidence that access is missing" in body["hint"]
+        assert "DO have access" not in body["hint"]
 
     def test_a_real_corpus_id_still_narrows(self, seeded_app):
         """The filter must keep working — this is not "ignore corpus_id"."""
@@ -216,7 +218,9 @@ class TestTheCombinedHintCountsEverySearchedLeg:
             "/api/knowledge/search", params={"q": "nosuchwordanywhere"}, headers=_auth(tok)
         )
         assert r.status_code == 200, r.text
-        assert "DO have access" in r.json().get("hint", "")
+        hint = r.json().get("hint", "")
+        assert "NOT evidence that access is missing" in hint
+        assert "DO have access" not in hint
 
     def test_the_empty_branch_reads_correctly_for_an_admin_too(self):
         """An admin's counts ARE the whole instance, so the empty branch can
@@ -255,9 +259,60 @@ class TestTheCombinedHintCountsEverySearchedLeg:
         assert "knowledge" not in inspect.signature(mod._empty_combined_hint).parameters, (
             "the hint judges access from a term that is true for nearly every account"
         )
-        assert "DO have access" not in mod._empty_combined_hint(0, 0, 0)
+        assert "NOT evidence that access is missing" not in mod._empty_combined_hint(0, 0, 0)
 
     def test_a_caller_with_any_countable_source_is_a_wording_miss(self):
         from app.api.knowledge_search import _empty_combined_hint
 
-        assert "DO have access" in _empty_combined_hint(0, 3, 0)
+        assert "NOT evidence that access is missing" in _empty_combined_hint(0, 3, 0)
+
+
+class TestTheHintDoesNotOverClaimAccess:
+    """The mirror of this file's founding incident, found in a later audit.
+
+    The original bug: an agent read an empty result as "I don't have access to
+    your files" when it plainly did, so the hint began asserting the caller DID
+    have access. That fixed the observed case and introduced its opposite —
+    the sentence was emitted unconditionally, so a member searching for a term
+    that names a real resource nobody had shared with them was told, in the one
+    place the product volunteers an opinion about access, that access was not
+    the problem. The chat agent repeats it.
+
+    Both readings have to be wrong-proof. The endpoint cannot see the
+    un-granted set, so it must not describe it in either direction: it states
+    the scope it searched (the count, which is what separates "no access" from
+    "no match" — see this file's module docstring) and says an empty result is
+    not evidence of missing access, without claiming the caller can reach the
+    thing they asked for.
+    """
+
+    def test_it_never_asserts_the_caller_has_access_to_the_query(self):
+        from app.api.knowledge_search import _empty_combined_hint
+
+        for args in [(0, 0, 0), (1, 0, 0), (0, 3, 0), (2, 5, 1)]:
+            hint = _empty_combined_hint(*args)
+            assert "DO have access" not in hint, args
+            assert "not an access problem" not in hint, args
+
+    def test_it_still_denies_the_no_access_inference_when_something_is_reachable(self):
+        """The founding incident: the agent must not conclude it is locked out."""
+        from app.api.knowledge_search import _empty_combined_hint
+
+        hint = _empty_combined_hint(1, 0, 0)
+        assert "NOT evidence that access is missing" in hint
+
+    def test_it_still_names_what_was_searched(self):
+        """The count is the fact that separates the two readings."""
+        from app.api.knowledge_search import _empty_combined_hint
+
+        assert "1 collection(s)" in _empty_combined_hint(1, 2, 0)
+        assert "2 table(s)" in _empty_combined_hint(1, 2, 0)
+
+    def test_the_nothing_reachable_branch_is_unchanged(self):
+        """A caller with nothing shared is a genuine access story, and that
+        branch was always correct — it must not inherit the wording language."""
+        from app.api.knowledge_search import _empty_combined_hint
+
+        hint = _empty_combined_hint(0, 0, 0)
+        assert "reachable from this account" in hint
+        assert "not about your wording" in hint

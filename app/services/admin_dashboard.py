@@ -148,13 +148,74 @@ def resolve_needs_fixing(*, force: bool = False) -> list[ResolvedSignal]:
         return _cache_value
 
 
+#: The setup chain is INSTANCE state, not per-user — every admin sees the same
+#: six steps at the same progress — so one memo serves them all. It exists
+#: because the chain moved from one page (`/chat`) to the rail, which renders
+#: on every page: six areas of repo reads per request, on every request, is a
+#: sitewide latency regression that would later be blamed on templates.
+_SETUP_RAIL_TTL_SECONDS = 30
+_setup_rail_lock = threading.Lock()
+_setup_rail_value: Optional[dict] = None
+_setup_rail_at: float = 0.0
+
+
+def resolve_setup_rail(*, force: bool = False) -> Optional[dict]:
+    """The chain as the rail needs it, memoised for `_SETUP_RAIL_TTL_SECONDS`.
+
+    Returns ``{"done", "total", "complete", "steps": [{label, done, failed,
+    href}]}`` or None when the whole build raised — the rail then renders the
+    analyst card exactly as it did before, which is the honest fallback for
+    "we could not check" and never a chain claiming zero progress.
+
+    A step whose own area raised is carried through as ``failed`` rather than
+    dropped or counted done: the reader needs to see that the check itself is
+    broken, not a chain that looks healthy because a read failed.
+    """
+    global _setup_rail_value, _setup_rail_at
+    now = time.monotonic()
+    with _setup_rail_lock:
+        if not force and _setup_rail_value is not None and (now - _setup_rail_at) < _SETUP_RAIL_TTL_SECONDS:
+            return _setup_rail_value
+        try:
+            setup = (resolve_journey() or {}).get("setup") or {}
+            if not setup.get("total"):
+                _setup_rail_value, _setup_rail_at = None, time.monotonic()
+                return None
+            _setup_rail_value = {
+                "done": setup.get("done_count") or 0,
+                "total": setup["total"],
+                "complete": bool(setup.get("complete")),
+                "steps": [
+                    {
+                        # `done_cta` is the verb for a finished step ("Add
+                        # another source"); the rail lists what the chain IS,
+                        # so it always shows the step's own name.
+                        "label": st.get("cta") or st.get("key") or "",
+                        "done": bool(st.get("done")),
+                        "failed": bool(st.get("failed")),
+                        "href": st.get("href") or "/admin",
+                    }
+                    for st in (setup.get("steps") or [])
+                ],
+            }
+            _setup_rail_at = time.monotonic()
+            return _setup_rail_value
+        except Exception:
+            logger.exception("setup rail: chain resolution failed")
+            _setup_rail_value, _setup_rail_at = None, time.monotonic()
+            return None
+
+
 def invalidate_cache() -> None:
     """Drop the Zone-2 cache. Used by tests, which must not inherit a rollup
     computed against a previous fixture's data."""
-    global _cache_value, _cache_at
+    global _cache_value, _cache_at, _setup_rail_value, _setup_rail_at
     with _cache_lock:
         _cache_value = None
         _cache_at = 0.0
+    with _setup_rail_lock:
+        _setup_rail_value = None
+        _setup_rail_at = 0.0
 
 
 def signal_keys() -> list[str]:
@@ -223,6 +284,7 @@ def _plural(n: int, one: str, many: str) -> str:
 def _area_data() -> dict:
     """Sources, registered tables, packages, and the tables that reach nobody."""
     from src.repositories import (
+        connection_secrets_repo,
         data_packages_repo,
         source_connections_repo,
         table_registry_repo,
@@ -234,8 +296,31 @@ def _area_data() -> dict:
     packaged: set[str] = set()
     for ids in member_ids.values():
         packaged.update(ids)
+    # A connection with neither a vault secret nor a `token_env` naming one
+    # cannot read a single table. Counting rows called that "connected" — the
+    # chain's first link was the only one with no integrity term, so a failed
+    # token validation still ticked the step and the wizard went on to say
+    # "already connected, no token to paste again".
+    #
+    # `has_secret` is derived exactly as app/api/admin_source_connections.py
+    # derives it for the source card, so the card and the checklist cannot
+    # disagree about whether a connection works. Failing to read the vault is
+    # treated as "cannot prove it works" rather than as healthy: this counter
+    # only ever suppresses a green tick, so erring toward the warning is safe.
+    connections = source_connections_repo().list()
+    secrets = connection_secrets_repo()
+
+    def _can_read(row: dict) -> bool:
+        if (row.get("token_env") or "").strip():
+            return True
+        try:
+            return bool(secrets.has(row["id"]))
+        except Exception:  # noqa: BLE001
+            return False
+
     return {
-        "sources": len(source_connections_repo().list()),
+        "sources": len(connections),
+        "sources_unhealthy": sum(1 for c in connections if not _can_read(c)),
         "tables": len(tables),
         "packages": len(packages_repo.list()),
         "packages_with_tables": sum(1 for ids in member_ids.values() if ids),
@@ -353,7 +438,7 @@ def _step(
         "cta": cta,
         "done_cta": done_cta or cta,
         # …and when the maintenance verb names a DIFFERENT place, the click has
-        # to follow it: "Bundle tables" belongs on the Tables lens, "Manage
+        # to follow it: "Group tables" belongs on the Tables lens, "Manage
         # packages" on the Packages workspace. Sharing one href made the done
         # row's label a promise the click broke — the same defect the verify
         # step had with "Simulate a person".
@@ -370,13 +455,19 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
     unpackaged = d.get("unpackaged", 0)
     uncovered = p.get("uncovered", 0)
     unshared = a.get("unshared", 0)
+    unhealthy_sources = d.get("sources_unhealthy", 0)
 
     steps = [
         _step(
             "connect",
             "Connect a source",
             area=data,
-            done=bool(d.get("sources")) or bool(d.get("tables")),
+            # `done` used to be `sources or tables` — a bare existence check,
+            # and the only link in the chain without an integrity term beside
+            # it. A connection whose token failed validation is a row, so the
+            # step went green while nothing could be read; a hand-registered
+            # table ticked it with no connection at all. Both now fail.
+            done=bool(d.get("sources")) and not d.get("sources_unhealthy"),
             detail=(
                 f"{d.get('sources', 0)} {_plural(d.get('sources', 0), 'source is', 'sources are')} connected."
                 if d.get("sources")
@@ -387,6 +478,22 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
                 "One connection can carry hundreds of tables, and you can add more sources later."
             ),
             facts=[{"n": d.get("sources", 0), "label": _plural(d.get("sources", 0), "source", "sources")}],
+            # The fourth integrity term, beside `unpackaged`, `uncovered` and
+            # `unshared`. Only speaks once a source exists: with none at all
+            # the step is "not started", which is not a fault to report.
+            health=(
+                {
+                    "level": "warn",
+                    "text": (
+                        f"{unhealthy_sources} "
+                        f"{_plural(unhealthy_sources, 'source has', 'sources have')} no credential — "
+                        f"{_plural(unhealthy_sources, 'it', 'they')} cannot read any table"
+                    ),
+                    "href": "/admin/data-sources",
+                }
+                if unhealthy_sources
+                else ({"level": "ok", "text": "Every source has a credential."} if d.get("sources") else None)
+            ),
             href="/admin/data-sources?add=1",
             cta="Connect a source",
             done_cta="Add another source",
@@ -413,7 +520,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
         ),
         _step(
             "package",
-            "Bundle tables into packages",
+            "Group tables into packages",
             area=data,
             done=bool(d.get("packages_with_tables")),
             detail=(
@@ -443,7 +550,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
                 else {"level": "ok", "text": "Every distributable table is in a package."}
             ),
             href="/admin/tables",
-            cta="Bundle tables",
+            cta="Group tables",
             done_cta="Manage packages",
             # Bundling happens on the Tables lens (that is where the tables
             # are); managing the packages themselves is the Packages
@@ -535,7 +642,7 @@ def _build_steps(data: Optional[dict], people: Optional[dict], access: Optional[
     # step whose completion an admin cannot tick by visiting a page — "did my
     # change actually reach anyone?" is the question the product could not
     # answer at all before.
-    chain_ok = all(s["done"] for s in steps) and not (unpackaged or uncovered or unshared)
+    chain_ok = all(s["done"] for s in steps) and not (unhealthy_sources or unpackaged or uncovered or unshared)
     reach = min(p.get("covered", 0), p.get("people", 0))
     steps.append(
         _step(

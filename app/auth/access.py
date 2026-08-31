@@ -351,6 +351,26 @@ def _allowed_ids_for_user(
     return frozenset(r["resource_id"] for r in rows)
 
 
+def granted_store_entity_ids(
+    user_id: str,
+    conn: Optional[duckdb.DuckDBPyConnection] = None,
+) -> frozenset[str]:
+    """Store entities the user's groups have been granted, at any tier.
+
+    A ``store_entity`` grant used to be accepted and mean nothing: the row was
+    written, and the group still got 404 on the item, never saw it in a
+    listing, and was refused an install with ``entity_not_approved``. This is
+    the read side that makes the grant true — private stops meaning "nobody
+    but me" and starts meaning "not everyone".
+
+    Not admin-short-circuited, on purpose: this answers "which hidden entities
+    should be SERVED to this person", and an admin's god-mode belongs at the
+    authorization gate (``can_access``), not in the set of bundles written into
+    their workspace. Same backend-split rule as :func:`_allowed_ids_for_user`.
+    """
+    return _allowed_ids_for_user(user_id, ResourceType.STORE_ENTITY.value, conn=conn)
+
+
 def required_store_entity_ids(
     user_id: str,
     conn: Optional[duckdb.DuckDBPyConnection] = None,

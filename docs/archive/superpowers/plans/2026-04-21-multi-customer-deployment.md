@@ -38,12 +38,12 @@ Tyto kroky vyžadují externí akce (oprávnění, Keboola UI). Musí být hotov
 
 ### Task 0.1: Ověřit přístupová práva
 
-- [ ] **Step 1: Ověřit, že máš `iam.serviceAccountAdmin` na internal-prod**
+- [ ] **Step 1: Ověřit, že máš `iam.serviceAccountAdmin` na <gcp-project>**
 
 ```bash
-gcloud projects get-iam-policy internal-prod --format=json \
+gcloud projects get-iam-policy <gcp-project> --format=json \
   | python3 -c "import json, sys; d=json.load(sys.stdin); \
-      me='zdenek.srotyr@keboola.com'; \
+      me='admin@example.com'; \
       roles=[b['role'] for b in d['bindings'] if any(me in m for m in b.get('members', []))]; \
       print('\n'.join(roles) if roles else 'NO DIRECT ROLES — check org-level or ask Petr (owner)')"
 ```
@@ -54,7 +54,7 @@ Expected: seznam rolí, nebo poznámka "NO DIRECT ROLES".
 
 Poslat mu odkaz na tuhle dokumentaci: https://cloud.google.com/iam/docs/understanding-roles#iam-roles
 
-Napsat Petrovi ve Slacku / emailu: "Potřebuji dočasně roli `iam.serviceAccountAdmin` a `resourcemanager.projectIamAdmin` na projektu `internal-prod` pro vytvoření Agnes deploy SA. Zrušíme, jakmile bude hotovo."
+Napsat Petrovi ve Slacku / emailu: "Potřebuji dočasně roli `iam.serviceAccountAdmin` a `resourcemanager.projectIamAdmin` na projektu `<gcp-project>` pro vytvoření Agnes deploy SA. Zrušíme, jakmile bude hotovo."
 
 - [ ] **Step 3: Ověřit, že image `ghcr.io/keboola/agnes-the-ai-analyst` je public**
 
@@ -72,7 +72,7 @@ Expected: `"public"`. Pokud `"private"`, změnit přes GitHub UI: Keboola org �
 gcloud compute disks snapshot data-analyst \
     --zone=europe-west1-b \
     --snapshot-names=data-analyst-pre-migration-$(date +%Y%m%d) \
-    --project=internal-prod
+    --project=<gcp-project>
 ```
 
 Expected: `Created snapshot data-analyst-pre-migration-YYYYMMDD`.
@@ -80,7 +80,7 @@ Expected: `Created snapshot data-analyst-pre-migration-YYYYMMDD`.
 - [ ] **Step 2: Ověřit snapshot**
 
 ```bash
-gcloud compute snapshots list --project=internal-prod \
+gcloud compute snapshots list --project=<gcp-project> \
     --filter="name~pre-migration" --format="table(name, status, diskSizeGb, creationTimestamp)"
 ```
 
@@ -246,11 +246,11 @@ echo ""
 chmod +x scripts/bootstrap-gcp.sh
 ```
 
-- [ ] **Step 3: Spustit skript na internal-prod**
+- [ ] **Step 3: Spustit skript na <gcp-project>**
 
 ```bash
 cd "/Users/zdeneksrotyr/Library/Mobile Documents/com~apple~CloudDocs/Sources/VsCode/component_factory/tmp_oss"
-./scripts/bootstrap-gcp.sh internal-prod
+./scripts/bootstrap-gcp.sh <gcp-project>
 ```
 
 Expected: na konci výpis "HOTOVO" + instrukce.
@@ -260,8 +260,8 @@ Pokud selže na "Permission denied": viz Task 0.1 step 2 (požádat Petra).
 - [ ] **Step 4: Ověřit SA a bucket**
 
 ```bash
-gcloud iam service-accounts list --project=internal-prod --filter="email~agnes-deploy" --format="value(email)"
-gsutil ls -b gs://agnes-internal-prod-tfstate
+gcloud iam service-accounts list --project=<gcp-project> --filter="email~agnes-deploy" --format="value(email)"
+gsutil ls -b gs://agnes-<gcp-project>-tfstate
 ```
 
 Expected: SA email + bucket URL.
@@ -288,7 +288,7 @@ read -s NEW_TOKEN
 echo -n "$NEW_TOKEN" | gcloud secrets create keboola-storage-token \
     --data-file=- \
     --replication-policy=automatic \
-    --project=internal-prod
+    --project=<gcp-project>
 unset NEW_TOKEN
 ```
 
@@ -300,7 +300,7 @@ Expected: `Created secret [keboola-storage-token]`.
 openssl rand -hex 32 | gcloud secrets create jwt-secret-key \
     --data-file=- \
     --replication-policy=automatic \
-    --project=internal-prod
+    --project=<gcp-project>
 ```
 
 Expected: `Created secret [jwt-secret-key]`.
@@ -308,7 +308,7 @@ Expected: `Created secret [jwt-secret-key]`.
 - [ ] **Step 4: Ověřit secrets**
 
 ```bash
-gcloud secrets list --project=internal-prod --format="table(name, createTime)"
+gcloud secrets list --project=<gcp-project> --format="table(name, createTime)"
 ```
 
 Expected: dva secrets — keboola-storage-token, jwt-secret-key.
@@ -318,9 +318,9 @@ Expected: dva secrets — keboola-storage-token, jwt-secret-key.
 ```bash
 for secret in keboola-storage-token jwt-secret-key; do
     gcloud secrets add-iam-policy-binding "$secret" \
-        --member="serviceAccount:agnes-deploy@internal-prod.iam.gserviceaccount.com" \
+        --member="serviceAccount:agnes-deploy@<gcp-project>.iam.gserviceaccount.com" \
         --role=roles/secretmanager.secretAccessor \
-        --project=internal-prod
+        --project=<gcp-project>
 done
 ```
 
@@ -356,7 +356,7 @@ JWT_KEY=$(gcloud secrets versions access latest --secret=jwt-secret-key 2>&1)
 # Non-secret config (může zůstat v metadatě/startup-scriptu)
 DATA_SOURCE="${DATA_SOURCE:-keboola}"
 KEBOOLA_STACK_URL="${KEBOOLA_STACK_URL:-https://connection.us-east4.gcp.keboola.com/}"
-SEED_ADMIN_EMAIL="${SEED_ADMIN_EMAIL:-zdenek.srotyr@keboola.com}"
+SEED_ADMIN_EMAIL="${SEED_ADMIN_EMAIL:-admin@example.com}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 DATA_DIR="${DATA_DIR:-/data}"
 
@@ -436,7 +436,7 @@ git commit -m "infra: prod compose pulls from GHCR via AGNES_TAG env (default :s
 - [ ] **Step 1: SSH na prod VM a zastavit kontejnery**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'cd /home/deploy/app && docker compose down'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'cd /home/deploy/app && docker compose down'"
 ```
 
 Expected: `Container app-app-1 Stopped`, `Container app-scheduler-1 Stopped`.
@@ -445,7 +445,7 @@ Expected: `Container app-app-1 Stopped`, `Container app-scheduler-1 Stopped`.
 
 ```bash
 # Ověřit aktuální SA
-gcloud compute instances describe data-analyst --zone=europe-west1-b --project=internal-prod \
+gcloud compute instances describe data-analyst --zone=europe-west1-b --project=<gcp-project> \
     --format="value(serviceAccounts[0].email)"
 ```
 
@@ -454,7 +454,7 @@ Pokud výstup `327445566538-compute@developer.gserviceaccount.com` (default SA),
 Přidat mu explicitně secretmanager.secretAccessor (idempotentní):
 
 ```bash
-gcloud projects add-iam-policy-binding internal-prod \
+gcloud projects add-iam-policy-binding <gcp-project> \
     --member="serviceAccount:327445566538-compute@developer.gserviceaccount.com" \
     --role="roles/secretmanager.secretAccessor" \
     --condition=None
@@ -466,13 +466,13 @@ gcloud projects add-iam-policy-binding internal-prod \
 gcloud compute scp \
     "/Users/zdeneksrotyr/Library/Mobile Documents/com~apple~CloudDocs/Sources/VsCode/component_factory/tmp_oss/scripts/fetch-env-from-secrets.sh" \
     data-analyst:/tmp/fetch-env.sh \
-    --zone=europe-west1-b --project=internal-prod
+    --zone=europe-west1-b --project=<gcp-project>
 ```
 
 - [ ] **Step 4: Spustit fetch-env skript pod uživatelem deploy**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo install -m 755 -o deploy -g deploy /tmp/fetch-env.sh /home/deploy/app/fetch-env.sh && sudo -u deploy bash -c 'cd /home/deploy/app && ./fetch-env.sh'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo install -m 755 -o deploy -g deploy /tmp/fetch-env.sh /home/deploy/app/fetch-env.sh && sudo -u deploy bash -c 'cd /home/deploy/app && ./fetch-env.sh'"
 ```
 
 Expected: `Wrote /home/deploy/app/.env (chmod 600)`.
@@ -480,7 +480,7 @@ Expected: `Wrote /home/deploy/app/.env (chmod 600)`.
 - [ ] **Step 5: Zkontrolovat .env na VM (bez vypisování hodnot)**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'ls -la /home/deploy/app/.env && wc -l /home/deploy/app/.env && cut -d= -f1 /home/deploy/app/.env'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'ls -la /home/deploy/app/.env && wc -l /home/deploy/app/.env && cut -d= -f1 /home/deploy/app/.env'"
 ```
 
 Expected: soubor 600 mode, 7 řádků, klíče: JWT_SECRET_KEY, DATA_DIR, DATA_SOURCE, KEBOOLA_STORAGE_TOKEN, KEBOOLA_STACK_URL, SEED_ADMIN_EMAIL, LOG_LEVEL.
@@ -488,13 +488,13 @@ Expected: soubor 600 mode, 7 řádků, klíče: JWT_SECRET_KEY, DATA_DIR, DATA_S
 - [ ] **Step 6: Aktualizovat docker-compose.yml konfiguraci na VM na pulling z GHCR**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'cd /home/deploy/app && git fetch origin feature/v2-fastapi-duckdb-docker-cli && git reset --hard origin/feature/v2-fastapi-duckdb-docker-cli'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'cd /home/deploy/app && git fetch origin feature/v2-fastapi-duckdb-docker-cli && git reset --hard origin/feature/v2-fastapi-duckdb-docker-cli'"
 ```
 
 **Pozor:** VM má starý remote `ZdenekSrotyr/tmp_oss`. Tohle tedy nebude fungovat, pokud se ten repo smazal. Alternativa: nahradit origin remote za keboola/agnes-the-ai-analyst:
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'cd /home/deploy/app && git remote set-url origin https://github.com/keboola/agnes-the-ai-analyst.git && git fetch origin main && git reset --hard origin/main'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'cd /home/deploy/app && git remote set-url origin https://github.com/keboola/agnes-the-ai-analyst.git && git fetch origin main && git reset --hard origin/main'"
 ```
 
 Expected: HEAD is now at `<sha>` `<message>`.
@@ -502,7 +502,7 @@ Expected: HEAD is now at `<sha>` `<message>`.
 - [ ] **Step 7: Pullnout image z GHCR a nastartovat s novým override**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'cd /home/deploy/app && export AGNES_TAG=stable && docker compose -f docker-compose.yml -f docker-compose.prod.yml pull && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'cd /home/deploy/app && export AGNES_TAG=stable && docker compose -f docker-compose.yml -f docker-compose.prod.yml pull && docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d'"
 ```
 
 Expected: `Container app-app-1 Started`, `Container app-scheduler-1 Started`.
@@ -520,7 +520,7 @@ Expected: `"status": "healthy"` nebo `"degraded"` (stale tables jsou OK). Ne `co
 - [ ] **Step 9: Ověřit, že app používá nový image**
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo docker inspect app-app-1 --format '{{.Config.Image}}'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo docker inspect app-app-1 --format '{{.Config.Image}}'"
 ```
 
 Expected: `ghcr.io/keboola/agnes-the-ai-analyst:stable` (ne `app-app`).
@@ -530,7 +530,7 @@ Expected: `ghcr.io/keboola/agnes-the-ai-analyst:stable` (ne `app-app`).
 ```bash
 curl -sS --max-time 5 -X POST http://<redacted-ip>:8000/auth/password/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"zdenek.srotyr@keboola.com","password":"1234"}' 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('OK — role:', d.get('role'))"
+  -d '{"email":"admin@example.com","password":"<password>"}' 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print('OK — role:', d.get('role'))"
 ```
 
 Expected: `OK — role: admin`.
@@ -614,12 +614,12 @@ curl -s --max-time 10 http://<redacted-ip>:8000/api/sync/status 2>&1 | python3 -
 Expected: nějaký valid JSON. Pokud `401 Unauthorized` nebo `Invalid token`, app ještě má cached starý token — restartovat:
 
 ```bash
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo -u deploy bash -c 'cd /home/deploy/app && docker compose restart app'"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo -u deploy bash -c 'cd /home/deploy/app && docker compose restart app'"
 ```
 
 ### Task 1.10: Checkpoint — Fáze 1 hotová
 
-- [ ] **Step 1: Přepnout heslo z `1234` na něco silného**
+- [ ] **Step 1: Přepnout heslo z `<password>` na něco silného**
 
 Přes UI nebo:
 
@@ -627,7 +627,7 @@ Přes UI nebo:
 read -s NEW_PASSWORD
 TOKEN=$(curl -sS -X POST http://<redacted-ip>:8000/auth/password/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"zdenek.srotyr@keboola.com","password":"1234"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+  -d '{"email":"admin@example.com","password":"<password>"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
 # [Volba: použít admin endpoint pro změnu hesla, pokud existuje — jinak přes UI]
 unset NEW_PASSWORD TOKEN
 ```
@@ -638,7 +638,7 @@ Zkontrolovat checklist:
 - [ ] Prod VM `data-analyst` běží z `ghcr.io/...:stable`
 - [ ] Dev VM `data-analyst-dev` běží z `ghcr.io/...:stable`
 - [ ] Secrets v GCP Secret Manageru
-- [ ] Heslo admin usera není `1234`
+- [ ] Heslo admin usera není výchozí
 - [ ] `ZdenekSrotyr/tmp_oss` je smazaný
 - [ ] Starý Keboola token je invalidován
 
@@ -1166,7 +1166,7 @@ terraform {
     google = { source = "hashicorp/google", version = "~> 5.0" }
   }
   backend "gcs" {
-    bucket = "agnes-internal-prod-tfstate"
+    bucket = "agnes-<gcp-project>-tfstate"
     prefix = "keboola"
   }
 }
@@ -1206,8 +1206,8 @@ variable "dev_instances"     { type = any, default = [] }
 EOF
 
 cat > terraform/terraform.tfvars.example <<'EOF'
-gcp_project_id    = "internal-prod"
-seed_admin_email  = "zdenek.srotyr@keboola.com"
+gcp_project_id    = "<gcp-project>"
+seed_admin_email  = "admin@example.com"
 keboola_stack_url = "https://connection.us-east4.gcp.keboola.com/"
 
 prod_instance = {
@@ -1250,7 +1250,7 @@ git push -u origin main
 ```bash
 # Klíč vytvořený v Task 1.2 step 3
 gh secret set GCP_SA_KEY --repo keboola/agnes-infra-keboola \
-    < ../tmp_oss/agnes-deploy-internal-prod-key.json
+    < ../tmp_oss/agnes-deploy-<gcp-project>-key.json
 ```
 
 **Poznámka:** Pokud klíč ne už smazal, re-generate: `gcloud iam service-accounts keys create ...`.
@@ -1280,7 +1280,7 @@ Už máme z Task 0.2. Pokud je snapshot starší než 24 h, udělat nový:
 gcloud compute disks snapshot data-analyst \
     --zone=europe-west1-b \
     --snapshot-names=data-analyst-migration-$(date +%Y%m%d-%H%M) \
-    --project=internal-prod
+    --project=<gcp-project>
 ```
 
 - [ ] **Step 2: Terraform apply — vytvoří nové VMs (`agnes-prod`, `agnes-dev`) vedle starých**
@@ -1307,15 +1307,15 @@ NEW_PROD_IP=$(cd ~/.../agnes-infra-keboola/terraform && terraform output -raw pr
 # (nebo použít oslogin → další prerekvizita)
 
 # Alternativa: udělat z druhé strany — SSH na starou VM, rsync na novou
-gcloud compute ssh data-analyst --zone=europe-west1-b --project=internal-prod --command="sudo docker compose -f /home/deploy/app/docker-compose.yml -f /home/deploy/app/docker-compose.prod.yml down"
+gcloud compute ssh data-analyst --zone=europe-west1-b --project=<gcp-project> --command="sudo docker compose -f /home/deploy/app/docker-compose.yml -f /home/deploy/app/docker-compose.prod.yml down"
 
 # Rsync přes gcloud compute scp recursive (funguje jen z lokálu)
-gcloud compute scp --recurse --zone=europe-west1-b --project=internal-prod \
+gcloud compute scp --recurse --zone=europe-west1-b --project=<gcp-project> \
     data-analyst:/home/deploy/app/data-volume/ \
     agnes-prod:/data/
 
 # Spustit app na nové VM znovu
-gcloud compute ssh agnes-prod --zone=europe-west1-b --project=internal-prod --command="sudo docker compose -f /opt/agnes/docker-compose.yml -f /opt/agnes/docker-compose.prod.yml restart"
+gcloud compute ssh agnes-prod --zone=europe-west1-b --project=<gcp-project> --command="sudo docker compose -f /opt/agnes/docker-compose.yml -f /opt/agnes/docker-compose.prod.yml restart"
 ```
 
 **Alternativně (čistěji):** restore ze snapshotu přes `gcloud compute disks create --source-snapshot`, pak attach místo prázdného data disku.
@@ -1334,7 +1334,7 @@ Expected: healthy / degraded, tables visible.
 ```bash
 curl -sS -X POST "http://$NEW_PROD_IP:8000/auth/password/login" \
   -H "Content-Type: application/json" \
-  -d '{"email":"zdenek.srotyr@keboola.com","password":"<nové silné heslo z Task 1.10>"}' \
+  -d '{"email":"admin@example.com","password":"<nové silné heslo z Task 1.10>"}' \
   | python3 -c "import sys,json;print('OK' if json.load(sys.stdin).get('role')=='admin' else 'FAIL')"
 ```
 
@@ -1347,8 +1347,8 @@ Stejné kroky 1-5.
 - [ ] **Step 7: Vypnout staré VMs (zatím NEmazat — jen stop)**
 
 ```bash
-gcloud compute instances stop data-analyst --zone=europe-west1-b --project=internal-prod
-gcloud compute instances stop data-analyst-dev --zone=europe-west1-b --project=internal-prod
+gcloud compute instances stop data-analyst --zone=europe-west1-b --project=<gcp-project>
+gcloud compute instances stop data-analyst-dev --zone=europe-west1-b --project=<gcp-project>
 ```
 
 - [ ] **Step 8: Ověřit, že nový prod běží minimálně 24 h bez problému**
@@ -1361,13 +1361,13 @@ curl -s "http://$NEW_PROD_IP:8000/api/health" | python3 -m json.tool
 - [ ] **Step 9: Po 24h stability smazat staré VMs + jejich disky + statické IP**
 
 ```bash
-gcloud compute instances delete data-analyst --zone=europe-west1-b --project=internal-prod --quiet
-gcloud compute instances delete data-analyst-dev --zone=europe-west1-b --project=internal-prod --quiet
+gcloud compute instances delete data-analyst --zone=europe-west1-b --project=<gcp-project> --quiet
+gcloud compute instances delete data-analyst-dev --zone=europe-west1-b --project=<gcp-project> --quiet
 
-gcloud compute disks delete data-analyst --zone=europe-west1-b --project=internal-prod --quiet 2>&1 || true
-gcloud compute disks delete data-analyst-dev --zone=europe-west1-b --project=internal-prod --quiet 2>&1 || true
+gcloud compute disks delete data-analyst --zone=europe-west1-b --project=<gcp-project> --quiet 2>&1 || true
+gcloud compute disks delete data-analyst-dev --zone=europe-west1-b --project=<gcp-project> --quiet 2>&1 || true
 
-gcloud compute addresses delete data-analyst-ip --region=europe-west1 --project=internal-prod --quiet 2>&1 || true
+gcloud compute addresses delete data-analyst-ip --region=europe-west1 --project=<gcp-project> --quiet 2>&1 || true
 ```
 
 - [ ] **Step 10: Checkpoint — Fáze 2 hotová**
@@ -1546,7 +1546,7 @@ Expected: `HTTP/2 200` (ne 301, ne TLS error).
 - [ ] **Step 1: SSH na dev VM a ověřit, že watchtower běží**
 
 ```bash
-gcloud compute ssh agnes-dev --zone=europe-west1-b --project=internal-prod --command="sudo docker ps | grep watchtower"
+gcloud compute ssh agnes-dev --zone=europe-west1-b --project=<gcp-project> --command="sudo docker ps | grep watchtower"
 ```
 
 Expected: container `watchtower` STATUS `Up X minutes`.
@@ -1567,7 +1567,7 @@ Počkat ~ 5-10 min (CI build + watchtower poll interval 5 min).
 
 ```bash
 # Kontrola image sha na dev VM
-gcloud compute ssh agnes-dev --zone=europe-west1-b --project=internal-prod \
+gcloud compute ssh agnes-dev --zone=europe-west1-b --project=<gcp-project> \
     --command="sudo docker inspect app-app-1 --format '{{.Image}}' && sudo docker image inspect \$(sudo docker inspect app-app-1 --format '{{.Image}}') --format '{{.Created}}'"
 ```
 
@@ -1588,7 +1588,7 @@ metadata = {
 - [ ] **Step 2: Zkontrolovat, že uživatelé mají `roles/compute.osAdminLogin` na projektu**
 
 ```bash
-gcloud projects get-iam-policy internal-prod \
+gcloud projects get-iam-policy <gcp-project> \
     --flatten="bindings[].members" \
     --filter="bindings.role=roles/compute.osAdminLogin" \
     --format="value(bindings.members)"
@@ -1597,15 +1597,15 @@ gcloud projects get-iam-policy internal-prod \
 Pokud prázdné, přidat:
 
 ```bash
-gcloud projects add-iam-policy-binding internal-prod \
-    --member=user:zdenek.srotyr@keboola.com \
+gcloud projects add-iam-policy-binding <gcp-project> \
+    --member=user:admin@example.com \
     --role=roles/compute.osAdminLogin
 ```
 
 - [ ] **Step 3: Test SSH přes OS Login**
 
 ```bash
-gcloud compute ssh agnes-prod --zone=europe-west1-b --project=internal-prod --command="whoami"
+gcloud compute ssh agnes-prod --zone=europe-west1-b --project=<gcp-project> --command="whoami"
 ```
 
 Expected: username ve formátu `zdenek_srotyr_keboola_com` (OS Login generated).
@@ -1615,7 +1615,7 @@ Expected: username ve formátu `zdenek_srotyr_keboola_com` (OS Login generated).
 - [ ] **Step 1: Ověřit, že VM SA má jen secretmanager.secretAccessor**
 
 ```bash
-gcloud projects get-iam-policy internal-prod \
+gcloud projects get-iam-policy <gcp-project> \
     --flatten="bindings[].members" \
     --filter="bindings.members:agnes-keboola-vm@" \
     --format="value(bindings.role)"
@@ -1806,7 +1806,7 @@ V PR:
 - [ ] **Step 1: Smazat lokální SA key**
 
 ```bash
-rm ~/.../agnes-deploy-internal-prod-key.json
+rm ~/.../agnes-deploy-<gcp-project>-key.json
 ```
 
 - [ ] **Step 2: Na GCP smazat starý klíč (key rotation)**
@@ -1814,8 +1814,8 @@ rm ~/.../agnes-deploy-internal-prod-key.json
 ```bash
 # Seznam klíčů
 gcloud iam service-accounts keys list \
-    --iam-account=agnes-deploy@internal-prod.iam.gserviceaccount.com \
-    --project=internal-prod
+    --iam-account=agnes-deploy@<gcp-project>.iam.gserviceaccount.com \
+    --project=<gcp-project>
 ```
 
 Po ověření, že GH Actions s novým klíčem funguje (po úspěšném prvním apply), smazat starý.

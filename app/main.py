@@ -2861,13 +2861,14 @@ def create_app() -> FastAPI:
     # lazily created by app/api/uploads.py — we mkdir here too so the
     # StaticFiles mount has a real directory on boot even before the first
     # upload (avoids the "directory does not exist" 500 on cold systems).
+    from app.web.cover_files import CoverFiles
     from src.db import _get_data_dir as _ddir_uploads
 
     uploads_dir = _ddir_uploads() / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
     app.mount(
         "/uploads",
-        StaticFiles(directory=str(uploads_dir)),
+        CoverFiles(directory=str(uploads_dir)),
         name="uploads",
     )
 

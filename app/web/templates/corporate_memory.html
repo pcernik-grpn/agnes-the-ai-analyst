@@ -15,7 +15,7 @@
 <div class="stack-hero">
   <div class="eyebrow">Knowledge</div>
   <h1>What does your team already know?</h1>
-  <p class="sub">Everything you've been granted is already in your My Stack tab. Browse here for anything new your admin publishes.</p>
+  <p class="sub">Everything you've been granted is already in Yours. Browse here for anything new your admin publishes.</p>
 
   <div class="stack-hero__search-row">
     <div class="stack-hero__search-wrap">
@@ -81,7 +81,7 @@
              stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M6.429 9.75 2.25 12l4.179 2.25m0-4.5 5.571 3 5.571-3m-11.142 0L2.25 7.5 12 2.25l9.75 5.25-4.179 2.25m0 0L21.75 12l-4.179 2.25m0 0 4.179 2.25L12 21.75 2.25 16.5l4.179-2.25m11.142 0-5.571 3-5.571-3"/>
         </svg>
-        My Stack <span class="count" data-count="my">{{ stack_entries|length }}</span>
+        Yours <span class="count" data-count="my">{{ stack_entries|length }}</span>
       </button>
     </div>
     {# Admin-only right-of-tabs action — parallels /catalog's
@@ -109,14 +109,14 @@
     <div class="stack-curator-block__body">
       Domains bundle related knowledge items (rules, playbooks, decisions) so
       analysts can opt-in to a coherent body of context. Required domains are
-      added to your stack automatically.
+      added for you automatically.
     </div>
   </div>
 
   <div class="stack-filter-row" id="memory-filters">
     <button class="pill is-active" data-filter="all">All</button>
-    <button class="pill" data-filter="required">Required</button>
-    <button class="pill" data-filter="available">Available</button>
+    <button class="pill" data-filter="required">{{ words.tier_automatic }}</button>
+    <button class="pill" data-filter="available">{{ words.tier_optional }}</button>
     {# Label matches the cards: the filter keys off local-copy state, which is
        what `in_stack` means after the auto-membership reshape (#1206). The
        data-filter VALUE stays `in_stack` — JS and card markup key on it. #}
@@ -140,7 +140,7 @@
       <span class="icon">{{ ico.icon('brain', 40) }}</span>
       {% if stack_entries %}
       <h3>You already have everything available</h3>
-      <p>Every Memory Domain you've been granted is already in your <strong>My Stack</strong> tab above — Browse only lists ones you don't have yet. Check back once your admin publishes something new.</p>
+      <p>Every Memory Domain you've been granted is already under <strong>Yours</strong> above — Browse only lists ones you don't have yet. Check back once your admin publishes something new.</p>
       {% elif user.is_admin %}
       <h3>No Memory Domains yet</h3>
       <p>Memory Domains bundle related knowledge items (playbooks, runbooks,
@@ -177,7 +177,7 @@
     </div>
     <div class="stack-empty"{% if stack_entries %} hidden{% endif %}>
       <span class="icon">{{ ico.icon('folder', 40) }}</span>
-      <h3>Your stack is empty</h3>
+      <h3>Nothing here yet</h3>
       {% if entries %}
       <p>Browse the {{ entries|length }} available domain{{ '' if entries|length == 1 else 's' }}
          and click <strong>Download locally</strong>. Required domains will

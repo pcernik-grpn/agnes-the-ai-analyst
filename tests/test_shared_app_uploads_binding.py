@@ -26,7 +26,10 @@ def test_no_seeded_app_test_fetches_from_the_uploads_mount():
         if path.name == Path(__file__).name:
             continue
         src = path.read_text(encoding="utf-8", errors="replace")
-        if "seeded_app" not in src:
+        # Negative lookahead excludes `seeded_app_fresh` -- the sanctioned
+        # alternative this assertion itself recommends below -- so a file
+        # that uses only the fresh fixture doesn't trip its own fix.
+        if not re.search(r"seeded_app(?!_fresh)", src):
             continue
         # A GET/HEAD against the mount, however the client is spelled.
         if re.search(r"""\.(get|head)\(\s*f?["']/uploads/""", src):

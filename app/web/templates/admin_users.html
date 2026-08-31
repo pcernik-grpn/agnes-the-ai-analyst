@@ -1442,6 +1442,12 @@ async function cdwSubmit() {
       toast(`Not added to ${failed.join(", ")} — do it on their page`, "error");
     }
     loadUsers();
+    // An address outside `auth.allowed_domain` cannot sign in with Google,
+    // Microsoft or a magic link. The API allows it (the keboola/password/sso
+    // providers do not check the domain, so it is legitimate on some
+    // instances) but saying nothing is how an admin completes the whole
+    // invite flow for an account that will never authenticate.
+    if (data.domain_warning) toast(data.domain_warning, "error");
     if (data.invite_url) showInviteLink(email, data.invite_url, data.invite_email_sent);
   } finally {
     cdw.next.disabled = false;

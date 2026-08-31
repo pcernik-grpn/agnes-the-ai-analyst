@@ -182,7 +182,15 @@
        per-kind sections below. A cover image, when set, overlays the
        glyph and removes itself on load error to reveal it. #}
     {{ cards.kind_glyph(glyph or kind) }}
-    {% if cover_image_url %}<img src="{{ cover_image_url }}" alt="" onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
+    {# No srcset here: the governing default renders the cover tile at
+       132x74 CSS px (.detail-hero__icon--cover just below), which is
+       396 device px even at DPR 3 — the 480 variant covers that up to
+       DPR 3.6 on its own (the paper theme narrows the tile further, to
+       108x62, static/css/detail-page.css). A srcset with a 600px/320px
+       sizes guess doesn't match the tile's real size and only invites a
+       DPR-3 phone to fetch the 960 for zero visible gain. #}
+    {% if cover_image_url %}<img src="{{ cover_image_url|cover_w(480) }}" alt="" fetchpriority="high" width="480" height="240"
+         onerror="this.parentElement.classList.remove('detail-hero__icon--cover'); this.remove();">{% endif %}
   </div>
   <div class="detail-hero__body">
     <div class="detail-hero__title-row">
@@ -629,6 +637,18 @@
 {%- if edit_in_flight -%}
   {%- set _ = items.append({'label': 'Edit', 'icon': 'edit', 'disabled': True,
       'title': 'Wait for the in-flight review to finish before editing.'}) -%}
+{%- elif entity.type in ('skill', 'agent') -%}
+  {# A skill or agent template was AUTHORED as a document, and the builder is
+     the only surface that can open one: /marketplace/flea/<id>/edit changes
+     the listing around it and takes a replacement .zip, so the body — the one
+     thing the builder wrote — was the one thing nothing could edit. Bundles
+     keep that page, because there is no single document behind them. #}
+  {%- set _ = items.append({'label': 'Edit', 'icon': 'edit',
+      'href': '/skills?edit=' ~ entity.id,
+      'title': 'Open it in the builder — its text, description and category.'}) -%}
+  {%- set _ = items.append({'label': 'Edit listing', 'icon': 'edit',
+      'href': '/marketplace/flea/' ~ entity.id ~ '/edit',
+      'title': 'Cover photo, tagline and demo video — how it looks in the marketplace.'}) -%}
 {%- else -%}
   {%- set _ = items.append({'label': 'Edit', 'icon': 'edit',
       'href': '/marketplace/flea/' ~ entity.id ~ '/edit',

@@ -372,22 +372,22 @@
                   {{ _vis_icon }}{{ c.visibility_label }}{{ _chevron }}
                 </button>
                 {% else %}
-                {# Skills: an approved store entity is already readable by everyone
-                   here, so the badge explains that model instead of offering a
-                   group grant nothing would read. `--fixed` alongside `--editable`
-                   is the point: it opens a dialog (so it keeps the chevron, the
-                   pointer and the button metrics) but that dialog changes nothing,
-                   so it must not wear the blue that now means "changeable".
+                {# An APPROVED store entity is already readable by everyone here,
+                   so the badge explains that model rather than offering a grant
+                   with nothing left to widen. A private one is now genuinely
+                   shareable and takes the `c.shareable` branch above instead.
+                   `--fixed` alongside `--editable` is the point: it opens a
+                   dialog (so it keeps the chevron, the pointer and the button
+                   metrics) but that dialog changes nothing, so it must not wear
+                   the blue that now means "changeable".
 
-                   TODO — make this badge a real control for a PRIVATE store entity
-                   ("share my private skill"). Today an owner has no path from the
-                   Library (or anywhere else) to take their own skill/plugin from
-                   Private to Everyone: `access=private|everyone` is accept-only at
-                   CREATE (`POST /api/store/entities` and the `from-markdown`
-                   sibling) — `PUT /api/store/entities/{id}` edits name, description,
-                   category, title, tagline, bundle and photo, but not access. So the
-                   missing piece is an access-change endpoint, not a control here;
-                   this branch is only where the control would land once one exists.
+                   TODO — what is still missing is the ACCESS TIER, not the
+                   grant: an owner cannot take their own private skill to
+                   Everyone after the fact. `access=private|everyone` is
+                   accept-only at CREATE (`POST /api/store/entities` and the
+                   `from-markdown` sibling) — `PUT /api/store/entities/{id}`
+                   edits name, description, category, title, tagline, bundle and
+                   photo, but not access.
 
                    The design question that endpoint has to answer: private→everyone
                    makes the bundle readable by every authenticated user, so it must
@@ -627,24 +627,11 @@
   .lib-browse__state #lib-chips { margin: 0; }
   /* A chip sits on the same baseline as the count beside it. */
   .library-page .lib-browse__state .fbar-chip { height: 22px; }
-  /* The tab strip closes the header, full width, so it reads as the divider
-     between the page and its list rather than as another control. */
-  /* The content switcher. Underlined rather than pilled, so it reads as a
-     division of the page below it and not as another control in the row above;
-     quieter than the title, louder than the utilities. */
-  .lib-head .lib-tabs {
-    margin: 14px 0 0; border: 0; background: none; padding: 0; gap: 18px;
-    box-shadow: inset 0 -1px 0 var(--ds-border-light);
-  }
-  .lib-head .lib-tabs .fbar-seg__btn {
-    border-radius: 0; border-bottom: 2px solid transparent; height: 32px;
-    padding: 0 0 2px; font-size: 13.5px; gap: 7px;
-  }
-  .lib-head .lib-tabs .fbar-seg__btn.is-active {
-    background: none; box-shadow: none;
-    color: var(--ds-text-primary); border-bottom-color: var(--ds-primary);
-  }
-  .lib-head .lib-tabs .fbar-seg__n { font-size: 11.5px; font-weight: 600; }
+  /* The strip closes the header, full width, so it reads as the divider
+     between the page and its list rather than as another control. Everything
+     about how a tab LOOKS is `.tab-strip`'s, in components.css — this sets
+     only where the strip sits on this page. */
+  .lib-head .lib-tabs { margin: 14px 0 0; }
   /* Chips describe the LIST, so they sit beside it, not up in the header —
      left-aligned on the same edge as the rows, and tight to them. */
   #lib-chips { margin: 0 0 10px; justify-content: flex-start; }
@@ -700,84 +687,11 @@
 
      Everything it opens now opens DOWNWARD, the shared component's default;
      the upward overrides the dock needed are gone with it. */
-  /* ══ Toolbar refinement ═══════════════════════════════════════════════
-     Page-scoped only: `/chats` renders the same `.fbar-*` component and is
-     untouched by every rule below.
-
-     The problem was never the structure, it was that FIVE controls shared one
-     treatment — 38px tall, 1px border, 9px radius, on `--ds-surface`. Search,
-     Filter, the stack toggle, the view switcher and "+ Add" were five equal
-     boxes, so nothing in the row had rank and the row read as leftovers rather
-     than as a system. Search made it worse by being the only flex-grow child
-     (`flex: 1 1 220px`), so on a desktop width it swallowed the free space and
-     became the loudest thing on a page whose subject is a list.
-
-     The fix is rank, not new components:
-       search   — a FIELD, not a button: quiet fill, no resting border, fixed
-                  width, so it reads as somewhere to type;
-       Filter · stack · view — utilities: borderless, muted, tinting only on
-                  hover and when on;
-       + Add    — the only filled control, therefore the only primary.
-     Everything drops 38px → 32px so the controls sit lighter than the rows
-     they act on. */
-  .library-page .fbar { gap: 6px; margin: 0; }
-
-  /* Search stops growing: a fixed, modest field beside the title. */
-  .library-page .fbar__search { flex: 0 1 300px; }
-  .library-page .fbar__search input {
-    height: 32px; font-size: 13px; padding: 0 10px 0 30px;
-    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
-    border-color: transparent;
-  }
-  .library-page .fbar__search input:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
-  .library-page .fbar__search input:focus { background: var(--ds-surface); border-color: var(--ds-primary); }
-  .library-page .fbar__search svg { left: 9px; width: 15px; height: 15px; }
-
-  /* The utility cluster — quiet until used. */
-  .library-page .fbar-filter__btn,
-  .library-page .fbar-toggle {
-    height: 32px; padding: 0 9px; font-size: 12.5px; font-weight: 500;
-    color: var(--ds-text-secondary); background: transparent; border-color: transparent;
-  }
-  .library-page .fbar-filter__btn:hover,
-  .library-page .fbar-toggle:hover {
-    color: var(--ds-text-primary);
-    background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent);
-    border-color: transparent;
-  }
-  /* On = a tint, not an outline. An outline here competed with "+ Add". */
-  .library-page .fbar-filter__btn.is-active,
-  .library-page .fbar-toggle.is-active {
-    color: var(--ds-primary); background: var(--ds-primary-light); border-color: transparent;
-  }
-  .library-page .fbar-filter__btn svg,
-  .library-page .fbar-toggle svg { width: 14px; height: 14px; }
-  /* The stack toggle's number is a hint at what pressing it leaves, not a
-     filter badge — so it stays muted text rather than gaining a pill. */
-  .library-page .fbar-toggle__n { font-weight: 600; }
-  .library-page .fbar-filter__n { min-width: 16px; height: 16px; font-size: 10.5px; }
-
-  /* Sort. It renders only in GRID view (the table sorts from its column
-     headers), and it kept the shared 38px while everything around it had come
-     down to 32 — so switching view made the whole toolbar jump 4px.
-  Sort is the design system's `ds-dropdown` (the native <select> beside it is
-     the accessible source of truth and is visually hidden), so the height that
-     mattered is the BUTTON's, not the select's. `min-width: 180px` went too:
-     "Recently added" does not need a 180px slot in a row of content-sized
-     controls. */
-  .library-page .fbar-select .ds-dropdown-btn {
-    height: 32px; min-width: 0; font-size: 12.5px; padding: 0 8px 0 10px;
-    background: color-mix(in srgb, var(--ds-text-primary) 4%, transparent);
-    border-color: transparent;
-  }
-  .library-page .fbar-select .ds-dropdown-btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); }
-
-  /* View switcher: same weight as its neighbours, no box of its own. */
-  .library-page .fbar-view { border: 0; border-radius: 8px; overflow: hidden; }
-  .library-page .fbar-view__btn { width: 30px; height: 32px; background: transparent; }
-  .library-page .fbar-view__btn + .fbar-view__btn { border-left: 0; }
-  .library-page .fbar-view__btn:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
-  .library-page .fbar-view__btn svg { width: 16px; height: 16px; }
+  /* The row's rank treatment — search as a field, quiet utilities, one filled
+     primary, everything 32px — is `.fbar--ranked` in filter_toolbar.css. It
+     lived here, page-scoped, until /chats moved onto the same layout and would
+     have had to copy it (TCRD-280). Only what is genuinely this page's stays
+     below: where ITS primary sits, and that primary's own height. */
 
   /* A hairline before the primary, so "utilities … then the action" is legible
      without another border per control. */
@@ -880,12 +794,6 @@
      be. */
   @media (max-width: 900px) {
     .library-page .lib-table thead th { position: static; }
-  }
-
-  /* Narrow viewports: the controls drop under the title rather than squeezing
-     search to a slot too small to type in. */
-  @media (max-width: 900px) {
-    .library-page .fbar__search { flex: 1 1 180px; }
   }
 
   /* "+ Add" is content-sized like every other control in the row. */
@@ -2061,7 +1969,13 @@
      it against each row's `data-tab`, hides a section whose rows all fall out
      and rewrites the count. No tab-specific JS. #}
   {% if library_tabs %}
-  <div class="fbar-seg lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
+  {# `.fbar-seg__btn` stays on the buttons: filter_toolbar.js's segment engine
+     binds to that class, and it is a wire hook, not a look. The LOOK comes
+     from `.tab-strip` around them — the same strip People, Access and Data
+     use, defined once in components.css. This block used to re-underline the
+     pill segmented control page-locally, which is how a fourth copy of one
+     component's styling came to exist. #}
+  <div class="fbar-seg tab-strip lib-tabs" id="lib-tabs" role="radiogroup" aria-label="Library section">
     {% for t in library_tabs %}
     <button type="button" class="fbar-seg__btn{% if t.key == library_active_tab %} is-active{% endif %}"
             data-own="{{ t.key }}" role="radio"
@@ -2174,7 +2088,7 @@
      list, and everything here narrows the one they chose. #}
   <div class="lib-browse">
       <div class="lib-head__controls">
-    <div class="fbar" role="group" aria-label="Search, filter and sort library">
+    <div class="fbar fbar--ranked" role="group" aria-label="Search, filter and sort library">
       {# The bar's own `role="search"` landmark. It sits inside a `group` rather
          than fronting one, which is why the landmark rides this box: a search
          field with no landmark of its own is unreachable by landmark navigation. #}
@@ -2273,7 +2187,7 @@
       {% if library_stack_toggle %}
       <button type="button" class="fbar-toggle" id="lib-stack-toggle"
               data-facet-value="in_stack" aria-pressed="false"
-              title="Only what's in your stack — the set your default agent can use">
+              title="Only what your default agent can already use">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 4.9-9 4.9-9-4.9L12 2Z"></path><path d="m3 11.9 9 4.9 9-4.9"></path><path d="m3 16.9 9 4.9 9-4.9"></path></svg>
         Agents use it<span class="fbar-toggle__n" data-stack-count>{{ library_in_stack_count }}</span>
       </button>
@@ -2386,13 +2300,16 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke-linecap="round"/></svg>
               <span>Connect a source<small>Warehouse, BigQuery, Databricks, files</small></span>
             </a>
-            {# An app is a view onto the data rather than something an agent
-               calls, which is why it is added from this half. Opens the existing
-               three-step admin ingest. #}
-            <a class="lib-new__item" href="/admin/linked-apps/new" role="menuitem">
+            {# Two doors to the same room ON PURPOSE, because they are two
+               errands: publishing apps while you connect the server that lists
+               them is the MCP builder's last section, and publishing from a
+               server connected weeks ago starts here. Both drive one panel. #}
+            {% if data_apps_enabled() %}
+            <a class="lib-new__item" href="/admin/linked-apps" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18" /></svg>
-              <span>Link an external app<small>Apps hosted elsewhere, catalogued here</small></span>
+              <span>Publish external apps<small>Apps a connected server lists, catalogued here</small></span>
             </a>
+            {% endif %}{# data apps off → the flow cannot complete, so it is not offered #}
             {% endif %}
             <a class="lib-new__item" href="/skills?type=skill" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8L3.5 9.2l5.9-.9z" stroke-linejoin="round"/></svg>
@@ -2417,7 +2334,7 @@
                that reading wins later, this row moves and nothing else does. #}
             <a class="lib-new__item" href="/admin/mcp-sources/new" role="menuitem">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3v6M5.5 7.5l4 3M18.5 7.5l-4 3M12 21v-6" stroke-linecap="round"/><circle cx="12" cy="12" r="2.5"/></svg>
-              <span>Connect an MCP source<small>Tools an agent can call</small></span>
+              <span>Connect an MCP source<small>Tools an agent can call{% if data_apps_enabled() %}, and any apps it lists{% endif %}</small></span>
             </a>
             {% endif %}
             <div class="lib-new__sep"></div>
@@ -3327,10 +3244,10 @@
         // the caller has. `textContent` of the pill's rest state is exactly
         // what the row shows.
         const rowLabel = (stackEl.querySelector('.lib-stackpill__rest') || stackEl).textContent.trim()
-          || 'In stack';
+          || 'Agents can use this';
         tip(rowLabel, stackEl.dataset.tip || stackEl.title || (locked
-          ? 'In your stack — only an admin can remove it'
-          : 'In your stack'));
+          ? 'Your agents use this — only an admin can remove it'
+          : 'Your agents use this'));
         status.innerHTML = (locked ? LOCK_SVG : CARD_CHECK_SVG) + '<span></span>';
         status.querySelector('span').textContent = rowLabel;
         foot.appendChild(status);
@@ -3339,7 +3256,7 @@
         // explain an absence nobody expected (the table slot is simply
         // empty, and the card mirrors it). Every other slotless kind keeps
         // the explicit status.
-        tip('Not addable', 'This item cannot be added to your stack');
+        tip('Not addable', 'This item cannot be added to your agents');
         status.innerHTML = '<span>Not addable</span>';
         foot.appendChild(status);
       }

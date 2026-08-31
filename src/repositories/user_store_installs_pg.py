@@ -5,7 +5,7 @@ Mirrors ``src/repositories/user_store_installs.py``.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -62,10 +62,24 @@ class UserStoreInstallsPgRepository:
             ).first()
         return row is not None
 
-    def list_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+    def list_for_user(self, user_id: str, granted_ids: Sequence[str] = ()) -> List[Dict[str, Any]]:
         """PG sibling of the DuckDB ``list_for_user`` — see that docstring for
-        which visibility states serve and why a hidden entity serves only to
-        its own author."""
+        which visibility states serve, why a hidden entity serves to its own
+        author, and what ``granted_ids`` is."""
+        granted = [str(g) for g in (granted_ids or [])]
+        params: Dict[str, Any] = {"u": user_id}
+        granted_sql = ""
+        if granted:
+            keys = []
+            for i, gid in enumerate(granted):
+                key = f"g{i}"
+                params[key] = gid
+                keys.append(f":{key}")
+            granted_sql = (
+                " OR (se.visibility_status = 'hidden' AND se.id IN (" + ",".join(keys) + ")"
+                " AND NOT EXISTS (SELECT 1 FROM store_submissions ss2 WHERE ss2.entity_id = se.id"
+                f" AND ss2.status IN ({BLOCKING_SUBMISSION_STATUS_SQL})))"
+            )
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
@@ -92,10 +106,11 @@ class UserStoreInstallsPgRepository:
                                  AND ss.status IN ({BLOCKING_SUBMISSION_STATUS_SQL})
                              )
                            )
+                           {granted_sql}
                          )
                        ORDER BY usi.installed_at DESC, se.id"""
                     ),
-                    {"u": user_id},
+                    params,
                 )
                 .mappings()
                 .all()

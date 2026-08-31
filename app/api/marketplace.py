@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -34,6 +35,7 @@ from app.auth.access import (
     require_resource_access,
 )
 
+from src.images.variants import ALLOWED_WIDTHS, coerce_width, variant_path
 from src.repositories import (
     audit_repo,
     marketplace_plugins_repo,
@@ -650,14 +652,9 @@ def _flea_to_item(
     viewer_id: Optional[str] = None,
     stats: Optional[Dict[str, Dict]] = None,
 ) -> MarketplaceItem:
-    photo_url = (
-        # ``?v=`` cache-busting fingerprint: flea entities have a monotonic
-        # ``version_no`` (schema v37) bumped on every re-upload, so the URL
-        # changes exactly when the underlying bytes change.
-        f"/api/store/entities/{entity['id']}/photo?v={entity.get('version_no', 1)}"
-        if entity.get("photo_path")
-        else None
-    )
+    from app.api.store import entity_cover_url
+
+    photo_url = entity_cover_url(entity)
     # v49 phase-3: invocation is the stored synthetic_name. The column is
     # NOT NULL (phase 1 migration + repo create/update/archive write
     # paths keep it in sync), so reading it directly is safe and a
@@ -1955,12 +1952,9 @@ async def flea_detail(
         entity_id,
     )
 
-    cover_url: Optional[str] = None
-    if entity.get("photo_path"):
-        # ``?v=`` cache-busting fingerprint via ``version_no`` — see
-        # ``app/api/store.py:get_entity_photo`` for the matching
-        # ``Cache-Control: immutable`` header.
-        cover_url = f"/api/store/entities/{entity_id}/photo?v={entity.get('version_no', 1)}"
+    from app.api.store import entity_cover_url
+
+    cover_url = entity_cover_url(entity)
 
     # Strip archive-rename suffix for human display; manifest_name keeps
     # the renamed-on-archive slug since that's what Claude Code resolves.
@@ -3018,6 +3012,9 @@ async def curated_asset(
     marketplace_id: str,
     plugin_name: str,
     path: str,
+    w: str | None = Query(
+        None, description="Serve a resized WebP variant (480 or 960); any other value serves the original"
+    ),
     _user: dict = Depends(get_current_user),
 ):
     """Serve an internal image asset from the cloned marketplace working tree.
@@ -3092,6 +3089,11 @@ async def curated_asset(
             status_code=415,
             detail=f"unsupported_asset_extension: {ext or '(none)'}",
         )
+    width = coerce_width(w)
+    if width in ALLOWED_WIDTHS:
+        variant = await run_in_threadpool(variant_path, safe, width)
+        if variant is not None:
+            return FileResponse(variant, media_type="image/webp", headers=_ASSET_SECURITY_HEADERS)
     return FileResponse(
         safe,
         media_type=_ASSET_CONTENT_TYPE[ext],
@@ -3160,6 +3162,9 @@ async def curated_mirrored(
     marketplace_id: str,
     plugin_name: str,
     key: str,
+    w: str | None = Query(
+        None, description="Serve a resized WebP variant (480 or 960); any other value serves the original"
+    ),
     _user: dict = Depends(get_current_user),
 ):
     """Serve a mirrored external asset from the marketplace cache.
@@ -3197,7 +3202,10 @@ async def curated_mirrored(
     # Cover photos: aggressive cache. URL fingerprint via ``?v=`` from
     # src/marketplace.py sync enrich keeps cache coherent across upstream
     # commits.
-    return FileResponse(
-        safe,
-        headers={"Cache-Control": "public, max-age=2592000, immutable"},
-    )
+    cover_headers = {"Cache-Control": "public, max-age=2592000, immutable"}
+    width = coerce_width(w)
+    if width in ALLOWED_WIDTHS:
+        variant = await run_in_threadpool(variant_path, safe, width)
+        if variant is not None:
+            return FileResponse(variant, media_type="image/webp", headers=cover_headers)
+    return FileResponse(safe, headers=cover_headers)

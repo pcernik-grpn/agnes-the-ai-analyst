@@ -689,6 +689,7 @@ class StoreEntitiesRepository:
         owner_user_id: Optional[str] = None,
         visibility_status: Optional[List[str]] = None,
         include_owner_id: Optional[str] = None,
+        include_ids: Optional[List[str]] = None,
         publisher_kind: Optional[str] = None,
         exclude_owner_user_id: Optional[str] = None,
         verification_state: Optional[List[str]] = None,
@@ -701,6 +702,12 @@ class StoreEntitiesRepository:
         ``visibility_status`` whitelists which guardrail states are visible.
         Non-admin browse passes ``["approved"]``; admin/owner views pass
         ``None`` (no filter) so pending/hidden entries surface in their UIs.
+
+        ``include_ids`` is the same escape hatch for entities the caller's
+        groups were GRANTED: a hidden entity a group holds a ``store_entity``
+        grant for belongs in that group's browse, because private means "not
+        everyone", not "nobody but me". Resolved by the caller — this layer
+        does not read grants.
 
         ``include_owner_id`` is the "show me my own pending stuff too"
         knob: when set alongside a ``visibility_status`` whitelist, the
@@ -760,6 +767,14 @@ class StoreEntitiesRepository:
             params.extend([like, like])
         if visibility_status:
             placeholders = ",".join("?" for _ in visibility_status)
+            granted = [str(g) for g in (include_ids or [])]
+            # Archived is excluded here for the same reason it is for the
+            # owner's own rows below: browse never shows it.
+            granted_sql = (
+                " OR (id IN (" + ",".join("?" for _ in granted) + ") AND visibility_status != 'archived')"
+                if granted
+                else ""
+            )
             if include_owner_id:
                 # Approved (or whatever the whitelist allows) for everyone,
                 # plus the caller's OWN entries that aren't archived.
@@ -771,13 +786,16 @@ class StoreEntitiesRepository:
                 # surface archived for already-installed plugins.
                 clauses.append(
                     f"(visibility_status IN ({placeholders}) "
-                    f"OR (owner_user_id = ? AND visibility_status != 'archived'))"
+                    f"OR (owner_user_id = ? AND visibility_status != 'archived')"
+                    f"{granted_sql})"
                 )
                 params.extend(visibility_status)
                 params.append(include_owner_id)
+                params.extend(granted)
             else:
-                clauses.append(f"visibility_status IN ({placeholders})")
+                clauses.append(f"(visibility_status IN ({placeholders}){granted_sql})")
                 params.extend(visibility_status)
+                params.extend(granted)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         count_row = self.conn.execute(

@@ -14,48 +14,21 @@ def _auth(seeded_app):
     return {"Authorization": f"Bearer {seeded_app['admin_token']}"}
 
 
-class TestMcpSourcesCreateModalDropdowns:
-    def test_native_selects_still_render_for_existing_js_wiring(self, seeded_app):
-        resp = seeded_app["client"].get("/admin/mcp-sources", headers=_auth(seeded_app))
-        assert resp.status_code == 200
-        text = resp.text
-        assert '<select id="new-transport" class="ds-dropdown-native">' in text
-        assert '<select id="new-scope" class="ds-dropdown-native">' in text
-        assert '<select id="new-auth-method" class="ds-dropdown-native">' in text
+class TestMcpSourcesListingHasNoCreateForm:
+    """The create modal these dropdowns dressed is gone.
 
-    def test_custom_dropdown_markup_present_for_each_select(self, seeded_app):
-        resp = seeded_app["client"].get("/admin/mcp-sources", headers=_auth(seeded_app))
-        assert resp.status_code == 200
-        text = resp.text
-        for dd_id, target, values in (
-            ("new-transport-dd", "new-transport", ("stdio", "http", "sse")),
-            ("new-scope-dd", "new-scope", ("shared", "per_user")),
-            ("new-auth-method-dd", "new-auth-method", ("", "bearer", "oauth")),
-        ):
-            assert f'data-ds-dropdown-target="{target}"' in text
-            assert f'id="{dd_id}-btn"' in text
-            assert f'id="{dd_id}-menu"' in text
-            for value in values:
-                assert f'data-value="{value}"' in text
-        assert 'aria-haspopup="menu"' in text
-        assert 'role="menuitemradio"' in text
+    It was the second door to registering a source, and the unguarded one: it
+    posted whatever was typed, with no connection check and no tools, while
+    the builder that refuses an unreachable server was linked from nowhere on
+    this page. The paired `ds.dropdown()` markup went with the form.
+    """
 
-    def test_dropdown_js_module_and_css_are_loaded(self, seeded_app):
+    def test_no_create_selects_remain(self, seeded_app):
         resp = seeded_app["client"].get("/admin/mcp-sources", headers=_auth(seeded_app))
         assert resp.status_code == 200
-        text = resp.text
-        assert "js/components/ds_dropdown.js" in text
-        assert "css/ds_dropdown.css" in text
+        for dead in ('id="new-transport"', 'id="new-scope"', 'id="new-auth-method"', "syncDropdown"):
+            assert dead not in resp.text, f"the create modal is back: {dead}"
 
-    def test_sync_dropdown_helper_wired_into_form_reset(self, seeded_app):
-        """`open-create-btn` resets the form via direct `.value =` assignment
-        on the three selects — a path that bypasses ds_dropdown.js's own
-        selectItem() label update. syncDropdown() must be called for each so
-        the custom dropdown (paper theme) doesn't show a stale label after a
-        previous selection + modal re-open."""
+    def test_the_add_button_opens_the_builder(self, seeded_app):
         resp = seeded_app["client"].get("/admin/mcp-sources", headers=_auth(seeded_app))
-        assert resp.status_code == 200
-        text = resp.text
-        assert 'syncDropdown("new-transport", "stdio");' in text
-        assert 'syncDropdown("new-auth-method", "");' in text
-        assert 'syncDropdown("new-scope", "shared");' in text
+        assert "/admin/mcp-sources/new" in resp.text

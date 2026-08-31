@@ -144,6 +144,44 @@ def build_client_assertion(tenant_id: str, client_id: str, private_key_pem: str)
     return pyjwt.encode(claims, private_key, algorithm="RS256", headers={"x5t": thumbprint})
 
 
+def validate_certificate_material(pem_text: str) -> Optional[str]:
+    """Why ``pem_text`` cannot serve as SharePoint certificate material, or
+    ``None`` when it can — a parseable ``CERTIFICATE`` block plus a parseable
+    ``PRIVATE KEY`` block, :func:`build_client_assertion`'s exact needs,
+    checked without signing anything.
+
+    The fail-fast seam for the admin PUT that stores the material: garbage
+    used to store fine and surface hours later as an opaque provider auth
+    error on the first Graph call. Never raises, and the reason string never
+    carries key material — the private-key parse failure is deliberately
+    reported without the parser's own message.
+    """
+    blocks = _split_pem_blocks(pem_text or "")
+    cert_pem = blocks.get("CERTIFICATE")
+    key_pem = blocks.get("PRIVATE KEY")
+    if not cert_pem and not key_pem:
+        return "no PEM blocks found — paste the certificate followed by its private key, concatenated in one PEM"
+    if not cert_pem:
+        return (
+            "missing a CERTIFICATE block — the certificate (for the JWT assertion's x5t "
+            "thumbprint) and the private key belong together, concatenated in one PEM"
+        )
+    if not key_pem:
+        return (
+            "missing a PRIVATE KEY block — the private key (to sign the JWT assertion) "
+            "and the certificate belong together, concatenated in one PEM"
+        )
+    try:
+        x509.load_pem_x509_certificate(cert_pem.encode())
+    except Exception as exc:  # noqa: BLE001 — malformed PEM; message names no secret material
+        return f"CERTIFICATE block could not be parsed: {exc}"
+    try:
+        load_pem_private_key(key_pem.encode(), password=None)
+    except Exception:  # noqa: BLE001 — never echo parser detail about key material
+        return "PRIVATE KEY block could not be parsed — an unencrypted PKCS#8 or PKCS#1 key is expected"
+    return None
+
+
 #: A certificate within this many days of ``not_after`` is flagged
 #: ``expiring_soon`` rather than ``ok`` — the admin's early-warning window
 #: for the "certificate expires silently, auth breaks with no warning"
@@ -639,3 +677,52 @@ async def probe_unique_permissions(access_token: str, drive_id: str, item_ids: L
                     value = raw
             result[item_id] = value
     return result
+
+
+# ---------------------------------------------------------------------------
+# ACL mirroring readers (design spec 2026-08-28 §6 link 1): unlike the probe
+# above, these two ARE read for enforcement — the ACL sync job (2026-08-30
+# plan, Task 4) classifies their output into Agnes groups/grants. Both page
+# via ``@odata.nextLink``, the standard Graph collection convention.
+# ---------------------------------------------------------------------------
+
+
+async def _graph_get_all_pages(
+    access_token: str, path: str, *, params: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """Collect ``value`` across ``@odata.nextLink`` pages (permissions and
+    transitiveMembers both page; a single-page read costs nothing extra)."""
+    items: List[Dict[str, Any]] = []
+    body = await _graph_get(access_token, path, params=params)
+    while True:
+        items.extend(body.get("value") or [])
+        next_link = body.get("@odata.nextLink")
+        if not next_link:
+            return items
+        # nextLink is absolute and already carries the query string; _graph_get
+        # prepends GRAPH_BASE itself, so strip that same prefix back off.
+        body = await _graph_get(access_token, next_link.split("/v1.0", 1)[-1])
+
+
+async def list_item_permissions(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+    """Raw Graph ``permission`` objects on one drive item (the scope root) —
+    the sync's per-run read of who currently has access. App-only requires
+    ``Sites.FullControl.All`` or a per-site ``Sites.Selected`` full-control
+    role; a Graph failure surfaces as :class:`SharePointGraphError`, never
+    swallowed (the caller marks the run/scope failed and audits it)."""
+    return await _graph_get_all_pages(access_token, f"/drives/{drive_id}/items/{item_id}/permissions")
+
+
+async def list_group_transitive_members(access_token: str, group_id: str) -> List[Dict[str, Any]]:
+    """Transitive USER members of an Entra group — nested groups are
+    flattened by Graph itself; non-user directory objects (nested groups,
+    service principals, ...) are dropped here so callers never have to
+    re-check ``@odata.type``. Requires ``GroupMember.Read.All`` (NOT
+    included in ``Sites.FullControl.All`` — a separate app-registration
+    permission grant)."""
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/groups/{group_id}/transitiveMembers",
+        params={"$select": "id,mail,userPrincipalName", "$top": "999"},
+    )
+    return [r for r in rows if r.get("@odata.type") == "#microsoft.graph.user"]

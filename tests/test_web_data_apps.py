@@ -357,16 +357,24 @@ def test_detail_linked_hides_deploy_shows_override_form(web_env):
     assert "https://example.com/apps/sales" in resp.text
 
 
-def test_admin_linked_apps_wizard_renders_for_admin(web_env):
+def test_admin_linked_apps_page_renders_for_an_admin(web_env):
+    """Publishing apps from an already-connected server is its own errand, and
+    its own page: the MCP builder covers the server being connected NOW, this
+    covers the one connected weeks ago. Both render the same panel."""
     c = web_env["client"]
     resp = c.get("/admin/linked-apps", headers=_auth(web_env["admin_pat"]))
-    assert resp.status_code == 200
-    # Heading matches the sidebar row ("Linked apps"); the page used to open
-    # with the verb ("Link Keboola apps") while the nav named the noun.
-    assert "Linked apps" in resp.text
-    # the three wizard steps are present
-    assert 'id="wiz-step-1"' in resp.text
-    assert 'id="wiz-step-3"' in resp.text
+    assert resp.status_code == 200, resp.text
+    assert 'id="la-view"' in resp.text
+    assert "linked_apps_panel.js" in resp.text, "the page does not load the shared panel"
+
+
+def test_the_old_new_linked_app_path_lands_on_that_page(web_env):
+    """There is no separate create step any more — publishing apps IS picking a
+    connected server and reading its list."""
+    c = web_env["client"]
+    resp = c.get("/admin/linked-apps/new", headers=_auth(web_env["admin_pat"]), follow_redirects=False)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "/admin/linked-apps"
 
 
 def test_admin_linked_apps_wizard_forbidden_for_non_admin(web_env):
@@ -408,14 +416,17 @@ def test_detail_page_404s_soft_deleted_linked_app(web_env):
     assert resp.status_code == 404
 
 
-def test_linked_apps_wizard_calls_real_access_endpoints():
-    """The wizard's group/grant calls must hit the mounted /api/admin router —
-    /api/access/* does not exist and 404s silently in the UI (Devin Review on
-    #1116)."""
-    src = open("app/web/templates/admin_linked_apps.html").read()
-    assert "/api/admin/groups" in src
+def test_app_publishing_calls_real_access_endpoints():
+    """Group/grant calls must hit the mounted /api/admin router — /api/access/*
+    does not exist and 404s silently in the UI (Devin Review on #1116).
+
+    Follows the code: both surfaces that publish apps — the MCP builder's
+    section and /admin/linked-apps — drive one panel, and the panel is where
+    the calls live.
+    """
+    src = open("app/web/static/js/components/linked_apps_panel.js").read()
     assert "/api/admin/grants" in src
     assert "/api/access/" not in src
-    # The wizard is the ONE caller that designates its tool as the data-app
-    # lister — without the flag the server never projects a targeted run.
+    # It is the ONE caller that designates its tool as the data-app lister —
+    # without the flag the server never projects a targeted run.
     assert "lister: true" in src

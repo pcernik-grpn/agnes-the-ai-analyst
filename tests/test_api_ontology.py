@@ -27,7 +27,7 @@ def _auth(app, token_key="admin_token"):
     return {"Authorization": f"Bearer {app[token_key]}"}
 
 
-def _seed_document(seeded_app, *, text="Acme Corp is owned by Kohlberg Capital."):
+def _seed_document(seeded_app, *, text="Acme Corp is owned by Litware Capital."):
     from src.repositories import corpus_chunks_repo, corpus_files_repo, file_corpora_repo
 
     corpus_id = file_corpora_repo().create(name="ontology-src", slug="ontology-src", description=None, created_by="u1")
@@ -171,7 +171,7 @@ def test_dry_run_returns_structured_facts_edges_and_not_captured(ontology_client
                     {
                         "type": "client",
                         "attrs": {"name": "Acme Corp"},
-                        "quote": "Acme Corp is owned by Kohlberg Capital.",
+                        "quote": "Acme Corp is owned by Litware Capital.",
                     }
                 ],
                 "edges": [
@@ -179,7 +179,7 @@ def test_dry_run_returns_structured_facts_edges_and_not_captured(ontology_client
                         "type": "owned_by",
                         "src_type": "client",
                         "dst_type": "sponsor",
-                        "quote": "Acme Corp is owned by Kohlberg Capital.",
+                        "quote": "Acme Corp is owned by Litware Capital.",
                     }
                 ],
                 "not_captured": [{"sentence": "founded in 1990", "reason": "no 'founded_year' attribute"}],
@@ -207,7 +207,7 @@ def test_dry_run_returns_structured_facts_edges_and_not_captured(ontology_client
 
     # The document text reached the model as fenced, labeled untrusted data —
     # not folded into the (admin-authored, trusted) system prompt.
-    assert "Acme Corp is owned by Kohlberg Capital." in captured["prompt"]
+    assert "Acme Corp is owned by Litware Capital." in captured["prompt"]
     assert "UNTRUSTED_SOURCE_DATA" in captured["prompt"]
     assert "client" in captured["system"]
     assert "owned_by" in captured["system"]
