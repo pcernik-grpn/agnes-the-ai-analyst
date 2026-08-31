@@ -15,10 +15,12 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **The nightly `/catalog` smoke asserted a label the Library stopped using.** #1751 renamed the acquisition filter from *"Not in stack yet"* to *"Not added yet"* and `scripts/e2e/smoke_catalog.sh` kept the old needle, so the browser smoke has failed on every run since — the fifth time this script has been red against a stale assertion rather than a regression (#1497, #1506, #1510, #1522 were the same shape). Needle updated. The vocabulary guard added in 0.93 only reads templates, which is why this class of drift still escapes it.
 
 ### Removed
 
 ### Internal
+- **The nightly `docker-e2e` lane is green again.** The wave-2 audit hardening gave `_check_token` a 32-character minimum on the apps-runner shared secret, replacing a plain `!=` compare. `tests/test_chat_docker_provider_daemon.py` had been setting a 17-character fixture token, which the old compare accepted and the floor rejects *before* comparing — so both docker-sandbox tests failed as a flat `401 bad_runner_token` that named neither the length rule nor the fixture. The production floor is correct and unchanged; the fixture token is now long enough to clear it. Only the nightly and `workflow_dispatch` runs see this lane (`docker-e2e` is skipped on pull requests), which is why it went red on `main` without blocking a single PR.
 
 ## [0.94.0] - 2026-08-31
 
@@ -75,8 +77,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The connection `token_env` allowlist error now names the real mistake.** The config-embedded fields (`cert_private_key_env`, `private_key_env`, …) are reported under their own name instead of `token_env`, a cloud secret-manager secret NAME pasted where an env-var name belongs gets told that Agnes reads only its own process environment and pointed at the vault upload, and PEM content pasted into the name field is called out without echoing the material back.
 
 ### Fixed
-
-- **The nightly `/catalog` smoke asserted a label the Library stopped using.** #1751 renamed the acquisition filter from *"Not in stack yet"* to *"Not added yet"* and `scripts/e2e/smoke_catalog.sh` kept the old needle, so the browser smoke has failed on every run since — the fifth time this script has been red against a stale assertion rather than a regression (#1497, #1506, #1510, #1522 were the same shape). Needle updated. The vocabulary guard added in 0.93 only reads templates, which is why this class of drift still escapes it.
 
 - **The Library row now says WHY you have a granted item, and the exists-but-not-shared 403 is one door for every kind rather than a machine string for three of them.** A member's row said what the thing is and that an admin put it there; through WHICH of their groups was nowhere in the product — not on the row, not on the detail page, not in `/me/profile` — and it is the only part of the answer they can act on, since the group is what they ask their admin to change. `StackResolver.granting_groups()` composes the grant rows the resolver already reads (it discarded `group_id` into id sets) with a name lookup, and the membership tooltip gains a clause naming up to three groups; it degrades to the existing sentence rather than taking the row down. Separately, `/catalog/p/{slug}` had a 403 that reads as language and offers a copy-this-to-your-admin action, while `/catalog/t/{id}` and `/memory/d/{slug}` raised a bare `access_denied` and `/apps/{slug}` a bare `forbidden` — the same situation for the reader, printed as a machine token. All four now raise `not_shared:<kind>:<name>` and share the one page, with only the noun moving; `package_not_shared:<name>` stays as an alias so a cached 403 does not regress.
 
