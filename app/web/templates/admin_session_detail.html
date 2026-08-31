@@ -44,6 +44,9 @@
 .td-toggle { display: block; margin-top: 6px; color: var(--ds-primary); font-size: 12px;
   background: none; border: 0; padding: 0; cursor: pointer; }
 .td-toggle:hover { text-decoration: underline; }
+.td-jump { color: var(--ds-primary); font-size: 11px; background: none; border: 0;
+  padding: 0; cursor: pointer; white-space: nowrap; }
+.td-jump:hover { text-decoration: underline; }
 .td-pre { background: var(--border-light, #f3f4f6); border-radius: 6px;
   padding: 10px 12px; margin: 0; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: pre-wrap; word-break: break-word; max-height: 280px; overflow: auto; }
@@ -113,11 +116,12 @@
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
     return String(n);
   }
-  function renderMeta(s, tokens) {
-    // `tokens` is summed server-side from the transcript's own
-    // message.usage blocks (TCRD-222) — exact for the file being viewed,
-    // independent of the UsageProcessor's tick. null = the JSONL predates
-    // the usage field; render an honest dash, never a zero.
+  function renderMeta(s, tokens, counts) {
+    // `tokens` and `counts` are computed server-side from the transcript's
+    // own turns (TCRD-222 pattern) — exact for the file being viewed,
+    // independent of the UsageProcessor's tick (and of pre-v10 summary rows
+    // whose tool_calls excluded MCP/subagent calls). tokens null = the JSONL
+    // carries no usage blocks; render an honest dash, never a zero.
     const tokensHtml = tokens
       ? '<div><b>Tokens:</b> ' + escapeHtml(fmtTokens(tokens.total))
         + ' <span title="input / output / cache read / cache creation">('
@@ -125,16 +129,20 @@
         + escapeHtml(fmtTokens(tokens.output)) + ' out / '
         + escapeHtml(fmtTokens((tokens.cache_read || 0) + (tokens.cache_creation || 0))) + ' cache)</span></div>'
       : '<div><b>Tokens:</b> —</div>';
+    const calls = counts ? counts.tool_calls : (s ? s.tool_calls : null);
+    const errs = counts ? counts.tool_errors : (s ? s.tool_errors : null);
+    const countsHtml =
+      '<div><b>Tool calls:</b> ' + escapeHtml(String(calls ?? '—')) + '</div>' +
+      '<div><b>Errors:</b> ' + escapeHtml(String(errs ?? '—')) + '</div>';
     if (!s || !Object.keys(s).length) {
-      metaRoot.innerHTML = tokensHtml +
+      metaRoot.innerHTML = countsHtml + tokensHtml +
         '<div><i>Summary not extracted yet (UsageProcessor hasn\'t run).</i></div>';
       return;
     }
     metaRoot.innerHTML =
       '<div><b>Started:</b> ' + escapeHtml(s.started_at || '—') + '</div>' +
       '<div><b>Active:</b> ' + escapeHtml(fmtDuration(s.active_seconds)) + '</div>' +
-      '<div><b>Tool calls:</b> ' + escapeHtml(String(s.tool_calls ?? '—')) + '</div>' +
-      '<div><b>Errors:</b> ' + escapeHtml(String(s.tool_errors ?? '—')) + '</div>' +
+      countsHtml +
       '<div><b>Model:</b> ' + escapeHtml(s.primary_model || '—') + '</div>' +
       tokensHtml;
   }
@@ -144,6 +152,11 @@
     el.className = 'td-event';
     el.dataset.idx = idx;
     if (ev.kind === 'tool_result' && ev.is_error) el.classList.add('is-error');
+    if ((ev.kind === 'tool_use' || ev.kind === 'tool_result') && ev.tool_use_id) {
+      // Pairing hooks: wirePairs() links each call to its result by this id.
+      el.dataset.kind = ev.kind;
+      el.dataset.tuid = ev.tool_use_id;
+    }
 
     let chipClass = ev.kind;
     let chipLabel = ev.kind;
@@ -155,6 +168,9 @@
 
     let headRight = '';
     if (ev.kind === 'tool_use' || ev.kind === 'tool_result') {
+      // tool_result events carry the tool_name of the call they answer
+      // (server-resolved via tool_use_id) so the card is labeled by tool,
+      // not by an opaque toolu_… id.
       headRight = '<span class="td-tool-name">' + escapeHtml(ev.tool_name || ev.tool_use_id || '') + '</span>';
     }
 
@@ -208,18 +224,56 @@
     return el;
   }
 
+  function flashCard(el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // Element.animate() keyframes don't resolve CSS custom properties the
+    // way inline styles do — resolve the token to its computed color first.
+    const line = getComputedStyle(el).getPropertyValue('--ds-primary').trim();
+    el.animate(
+      [{ outline: `3px solid ${line}` }, { outline: '3px solid transparent' }],
+      { duration: 1500 }
+    );
+  }
+
+  // Tie inputs to outputs: for every tool_use_id with both a call and a
+  // result card, put a jump link in each header that scrolls to (and
+  // flashes) the counterpart — several calls to the same tool in one turn
+  // stay distinguishable because the pairing key is the id, not the name.
+  function wirePairs() {
+    const uses = {}, results = {};
+    eventsRoot.querySelectorAll('.td-event[data-tuid]').forEach(el => {
+      (el.dataset.kind === 'tool_use' ? uses : results)[el.dataset.tuid] = el;
+    });
+    const addJump = (from, to, label, title) => {
+      const btn = document.createElement('button');
+      btn.className = 'td-jump';
+      btn.type = 'button';
+      btn.textContent = label;
+      btn.title = title;
+      btn.addEventListener('click', () => flashCard(to));
+      from.querySelector('.td-event-head').insertBefore(btn, from.querySelector('.td-ts'));
+    };
+    Object.keys(uses).forEach(tuid => {
+      const res = results[tuid];
+      if (!res) return;
+      addJump(uses[tuid], res, 'result ↓', 'Jump to this call’s output');
+      addJump(res, uses[tuid], 'call ↑', 'Jump to the input that produced this output');
+    });
+  }
+
   fetch('/api/admin/sessions/' + encodeURIComponent(username) + '/' +
         encodeURIComponent(sessionFile) + '/transcript', { credentials: 'same-origin' })
     .then(r => r.json())
     .then(d => {
       loading.remove();
-      renderMeta(d.summary, d.tokens);
+      renderMeta(d.summary, d.tokens, d.counts);
       const events = d.events || [];
       let errorCount = 0;
       events.forEach((ev, i) => {
         eventsRoot.appendChild(renderEvent(ev, i));
         if (ev.kind === 'tool_result' && ev.is_error) errorCount++;
       });
+      wirePairs();
       if (errorCount > 0) {
         nextErrBtn.hidden = false;
         nextErrBtn.textContent = '↡ Next error (' + errorCount + ')';

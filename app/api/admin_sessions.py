@@ -218,7 +218,24 @@ def _render_transcript(turns: list[dict]) -> list[dict]:
       - ``tool_result``  (user-role echo from Claude Code carrying tool output)
     Non-conversational turns (system, summary, file-history-snapshot…) are
     skipped; they're noise for an operator investigating a failure.
+
+    A ``tool_result`` event also carries the ``tool_name`` of the call it
+    answers (resolved via ``tool_use_id``) — the raw block only has the id,
+    and a result card labeled ``toolu_01Xq…`` gives an operator no way to
+    tie the output back to its input.
     """
+    # First pass: tool_use_id → tool name, so result events can be labeled.
+    tool_names: dict[str, str] = {}
+    for turn in turns:
+        if turn.get("type") != "assistant":
+            continue
+        content = (turn.get("message", {}) or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
+                tool_names[block["id"]] = block.get("name") or ""
+
     events: list[dict] = []
     for turn in turns:
         ttype = turn.get("type")
@@ -273,6 +290,7 @@ def _render_transcript(turns: list[dict]) -> list[dict]:
                     {
                         "kind": "tool_result",
                         "tool_use_id": block.get("tool_use_id"),
+                        "tool_name": tool_names.get(block.get("tool_use_id") or "") or None,
                         "is_error": bool(block.get("is_error", False)),
                         "text": _flatten_text_content(block.get("content")),
                         "ts": ts,
@@ -280,6 +298,24 @@ def _render_transcript(turns: list[dict]) -> list[dict]:
                     }
                 )
     return events
+
+
+def _count_tools_from_events(events: list[dict]) -> dict:
+    """Exact tool-call counters for the transcript being viewed.
+
+    The summary row's ``tool_calls`` comes from the UsageProcessor and can
+    lag (fresh upload, pre-v10 semantics that excluded MCP/subagent calls) —
+    a header number that disagrees with the tool cards below it reads as a
+    bug. Same principle as ``_sum_usage_from_turns`` (TCRD-222): compute it
+    inline from the file this request already parsed, so the detail view is
+    exact regardless of the processor's tick.
+
+    ``tool_errors`` counts distinct failed calls (by ``tool_use_id``), the
+    same one-error-per-call correlation the processor applies.
+    """
+    tool_calls = sum(1 for e in events if e["kind"] == "tool_use")
+    error_ids = {e.get("tool_use_id") for e in events if e["kind"] == "tool_result" and e.get("is_error")}
+    return {"tool_calls": tool_calls, "tool_errors": len(error_ids)}
 
 
 @router.get("/{username}/{session_file}/download")
@@ -369,6 +405,7 @@ def transcript(
     turns = parse_jsonl(path)
     events = _render_transcript(turns)
     tokens = _sum_usage_from_turns(turns)
+    counts = _count_tools_from_events(events)
 
     summary_data = usage_repo().get_session_summary(f"{username}/{session_file}")
     summary: dict[str, Any] = {}
@@ -399,5 +436,6 @@ def transcript(
         "session_file": session_file,
         "summary": summary,
         "tokens": tokens,
+        "counts": counts,
         "events": events,
     }
