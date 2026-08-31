@@ -36,14 +36,33 @@ DRIVE_DELTA = f"{GRAPH}/drives/b!drive1/root/delta"
 
 
 class FakeIngestor:
-    """Stands in for ``crawler._Ingestor`` — records what would be written."""
+    """Stands in for ``crawler._Ingestor`` — records what would be written.
+
+    ``delete`` is COLLECTION-scoped, mirroring the real ``_Ingestor.delete``
+    (``corpus_file_sources_repo().resolve(collection_id, stable_id)``): it
+    only succeeds when ``stable_id`` was last ingested into THIS
+    ``collection_id``. A fake that returned ``True`` for any collection would
+    make a zone-routing deletion test vacuous — it would pass even if the
+    crawler tried the wrong collection first.
+
+    ``_collection_of`` (stable_id -> collection_id) is a CLASS-level dict,
+    not per-instance: the crawler makes a fresh ``_Ingestor()`` every run,
+    but the real backing store (``corpus_file_sources_repo()``) persists
+    across runs — a resumed crawl's delete must still find what an earlier
+    run's instance ingested. Reset between tests by :meth:`reset`.
+    """
 
     instances: List["FakeIngestor"] = []
+    _collection_of: Dict[str, str] = {}
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances.clear()
+        cls._collection_of.clear()
 
     def __init__(self) -> None:
         self.ingested: List[Dict[str, Any]] = []
         self.deleted: List[str] = []
-        self.known: Dict[str, str] = {}
         FakeIngestor.instances.append(self)
 
     def ingest(
@@ -66,15 +85,14 @@ class FakeIngestor:
                 "source_sha256": source_sha256,
             }
         )
-        was_new = stable_id not in self.known
-        self.known[stable_id] = f"file-{len(self.known)}"
-        return self.known[stable_id], was_new
+        was_new = stable_id not in FakeIngestor._collection_of
+        FakeIngestor._collection_of[stable_id] = collection_id
+        return f"file-{len(FakeIngestor._collection_of)}", was_new
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
-        if stable_id in self.known:
-            del self.known[stable_id]
-            self.deleted.append(stable_id)
-            return True
+        if FakeIngestor._collection_of.get(stable_id) != collection_id:
+            return False
+        del FakeIngestor._collection_of[stable_id]
         self.deleted.append(stable_id)
         return True
 
@@ -166,7 +184,7 @@ def crawl_env(tmp_path, monkeypatch):
     # covered by its own tests — stubbed here so no crawl test needs a real
     # key pair, and so a settings failure can never masquerade as a crawl bug.
     monkeypatch.setattr(crawler, "resolve_sharepoint_settings", lambda connection: _FakeSettings())
-    FakeIngestor.instances.clear()
+    FakeIngestor.reset()
     yield tmp_path
 
 
@@ -972,6 +990,53 @@ class TestZoneRouting:
         _run(_connection([scope], zones=[zone]), monkeypatch)
 
         assert FakeIngestor.instances[-1].ingested[0]["collection_id"] == "col1"
+
+    def test_deleted_item_in_a_zone_is_removed_from_the_zone_collection(self, crawl_env, monkeypatch):
+        """Companion to ``TestDeltaFlow::
+        test_deleted_item_removes_the_anchored_file_and_its_ctag``, which
+        already pins the NO-zone case. A deleted delta row carries no
+        ``parentReference`` to route by path, so the crawler must try every
+        collection this scope could have routed the file into
+        (``_ScopeContext.candidate_collection_ids``) — a file that landed in
+        a permission zone's OWN collection must still be found and removed
+        from THAT collection, not silently kept because the scope's own
+        collection never had it."""
+        pages = iter(
+            [
+                {
+                    "value": [
+                        _file_item("in-zone", name="secret.docx", parent_path="/drives/b!drive1/root:/Reports/Private")
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+                {
+                    "value": [{"id": "in-zone", "name": "secret.docx", "deleted": {"state": "deleted"}}],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=2",
+                },
+            ]
+        )
+        page_holder = {"page": next(pages)}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json=page_holder["page"])
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")
+        zone = _zone(rel_path="Reports/Private", collection_id="zonecol1")
+        connection = _connection([scope], zones=[zone])
+
+        _run(connection, monkeypatch)
+        first = FakeIngestor.instances[-1]
+        assert first.ingested[0]["collection_id"] == "zonecol1"
+
+        page_holder["page"] = next(pages)
+        report = _run(connection, monkeypatch)
+
+        assert report["deleted"] == 1
+        assert FakeIngestor.instances[-1].deleted == ["graph:in-zone"]
+        assert "graph:in-zone" not in _state(crawl_env)["ctags"]
 
 
 # --------------------------------------------------------------------------
