@@ -388,6 +388,28 @@ def _extraction_schedule() -> Optional[str]:
     return None
 
 
+def _acl_sync_schedule() -> str:
+    """every-Nh row for sharepoint-acl-sync (2026-08-31 plan, Task 2).
+
+    Env > instance.yaml > default 4. Mirrors the ``acl_sync_interval_hours``
+    switch without importing ``app.switches`` — the sidecar reads env +
+    ``get_value`` only (same pattern as :func:`_extraction_schedule` above).
+    Deliberately NOT folded into the smallest-tick ``min()`` in
+    :func:`build_jobs` — hour-grain cadence needs no minute-tick constraint.
+    """
+    from src.scheduler import is_valid_schedule
+
+    from app.instance_config import get_value
+
+    raw = os.environ.get("AGNES_ACL_SYNC_INTERVAL_HOURS") or get_value("acl_sync", "interval_hours", default=4)
+    try:
+        hours = max(1, int(raw))
+    except (TypeError, ValueError):
+        hours = 4
+    schedule = f"every {hours}h"
+    return schedule if is_valid_schedule(schedule) else "every 4h"
+
+
 def _verification_schedule(verify_seconds: int) -> str:
     """Resolve the verification-detector processor's cadence.
 
@@ -704,44 +726,43 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             _ENQUEUE_TIMEOUT_SEC,
             _ENQUEUE_BODIES["ducklake-maintenance"],
         ),
-        # 2026-08-30 plan, Task 4: SharePoint ACL mirroring's nightly sweep
-        # (connectors/sharepoint/acl_sync.py::run_acl_sync). Daily rather
-        # than interval-driven, same reasoning as jira-org-refresh — the
-        # drift window this bounds (spec §5.2/§5.3) is stated in hours, not
-        # minutes. 06:00 UTC is offset from every other daily row above
-        # (marketplaces 03:00, store-blocked-purge 04:00, ducklake-
-        # maintenance 04:30, jira-org-refresh/store-lint-audit 05:00,
-        # audit-prune 05:30, retention-prune 05:45) so none of them fire on
-        # the same tick. The handler no-ops when acl_mirroring.enabled is
-        # false, so this row is harmless on an instance that hasn't turned
-        # the feature on.
+        # 2026-08-31 plan, Task 2: SharePoint ACL mirroring's sync
+        # (connectors/sharepoint/acl_sync.py::run_acl_sync), now hours-scale
+        # rather than a fixed daily row — the source-side revocation window
+        # this bounds (spec §5.2/§5.3, Q7 ratified MUST NOT) is the interval
+        # itself, so a slower default (daily) leaves rights live too long
+        # after they are revoked upstream. `_acl_sync_schedule()` resolves
+        # `every Nh` from the `acl_sync.interval_hours` switch (default 4h;
+        # `AGNES_ACL_SYNC_INTERVAL_HOURS` overrides). The handler no-ops when
+        # acl_mirroring.enabled is false, so this row is harmless on an
+        # instance that hasn't turned the feature on.
         (
             "sharepoint-acl",
-            "daily 06:00",
+            _acl_sync_schedule(),
             "/api/jobs",
             "POST",
             _ENQUEUE_TIMEOUT_SEC,
             _ENQUEUE_BODIES["sharepoint-acl"],
         ),
-        # 2026-08-30 plan, Task 7: broken-inheritance subtree sweep
-        # (connectors/sharepoint/acl_sync.py::run_subtree_sweep). WEEKLY —
-        # native cron, same grammar store-lint-audit already uses for its own
-        # weekly row — rather than daily/nightly: a full probe pass over a
-        # large library is multi-hour (spec §6.2's cost model), so a nightly
-        # cadence would starve the shared per-app-per-tenant Graph throttle
-        # budget the content crawl also depends on. Monday 07:00 UTC — offset
-        # from store-lint-audit's own Monday 05:00 row and from
-        # sharepoint-acl's daily 06:00 row so none of them share a tick. The
-        # handler no-ops when acl_mirroring.enabled is false (same posture as
-        # sharepoint-acl above) and each connection additionally self-guards
-        # against a restart-refire via its own acl_sweep_last_full/
+        # 2026-08-31 plan, Task 2: broken-inheritance subtree sweep
+        # (connectors/sharepoint/acl_sync.py::run_subtree_sweep), moved from
+        # weekly to DAILY — the detection window this bounds (a newly
+        # broken-inheritance subtree going unnoticed) is now hours-scale
+        # policy (MUST NOT posture), so a week-long blind spot was too wide.
+        # 07:00 UTC is offset from every other daily row (marketplaces 03:00,
+        # store-blocked-purge 04:00, ducklake-maintenance 04:30, jira-org-
+        # refresh/store-lint-audit 05:00, audit-prune 05:30, retention-prune
+        # 05:45) so none of them fire on the same tick. The handler no-ops
+        # when acl_mirroring.enabled is false (same posture as sharepoint-acl
+        # above); each connection additionally self-guards against a
+        # restart-refire via its own acl_sweep_last_full/
         # acl_sync.sweep_interval_days check (connectors/sharepoint/
-        # acl_sync.py::_sweep_due) — the same restart-refire risk
-        # store-lint-audit's admin endpoint guards against for its own weekly
-        # row.
+        # acl_sync.py::_sweep_due, default 1 day) — the row firing daily
+        # no longer relies on that self-guard alone to bound the drift
+        # window, but it still prevents a redundant re-sweep within the day.
         (
             "sharepoint-subtree-sweep",
-            "cron 0 7 * * 1",
+            "daily 07:00",
             "/api/jobs",
             "POST",
             _ENQUEUE_TIMEOUT_SEC,
