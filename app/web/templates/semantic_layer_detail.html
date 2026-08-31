@@ -1,6 +1,7 @@
 {% extends "base_page.html" %}
+{% import "macros/_state.html" as state %}
 
-{% block title %}{{ model_name }} — Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <style>
@@ -48,6 +49,11 @@
 }
 .slb-cross-link:hover { text-decoration: underline; }
 
+.slb-pg-note {
+    font-size: 11.5px;
+    color: var(--ds-text-muted);
+}
+
 .slb-rule-code {
     font-family: var(--ds-font-mono, monospace);
     font-size: 12px;
@@ -56,20 +62,75 @@
     border-radius: var(--radius-sm);
     padding: 2px 6px;
 }
+
+.slb-severity-note {
+    margin: var(--space-2) 0 0;
+    font-size: 12px;
+    color: var(--ds-text-secondary);
+}
+
+/* A8 (issue #1707): removable filter chip shown above the table when `q` is
+   active — makes the active filter visible and gives it a single removable
+   affordance (replaces the redundant `Clear` button/search box combo this
+   page used to render alongside it). Product decision (#1707 A8): tabs
+   deliberately drop `q` on click; the chip only shows the active filter,
+   it does not survive a tab switch. Same shape/tokens as the library page's
+   `.fbar-chip` (filter_toolbar.css) — a pill chip with a round "x" — kept
+   page-local rather than pulling in that stylesheet for one chip. */
+.slb-filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 22rem;
+    height: 28px;
+    padding: 0 5px 0 11px;
+    margin: 0 0 var(--space-4);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ds-primary);
+    background: var(--ds-primary-light);
+    border: 1px solid color-mix(in srgb, var(--ds-primary) 30%, transparent);
+    border-radius: var(--ds-radius-pill);
+}
+.slb-filter-chip__label { flex: none; font-weight: 500; color: var(--ds-text-secondary); }
+.slb-filter-chip__value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+}
+.slb-filter-chip__x {
+    display: inline-grid;
+    place-items: center;
+    flex: none;
+    width: 17px;
+    height: 17px;
+    border: none;
+    background: color-mix(in srgb, var(--ds-primary) 14%, transparent);
+    color: var(--ds-primary);
+    border-radius: 50%;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1;
+    text-decoration: none;
+}
+.slb-filter-chip__x:hover { background: var(--ds-primary); color: var(--ds-text-inverse); }
+.slb-filter-chip__x:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
 </style>
 {% endblock %}
 
 {% block page_prehead %}
-<a class="slb-back" href="/semantic-layer">&larr; Semantic layer</a>
+<a class="slb-back" href="/semantic-layer">&larr; Semantic models</a>
 {% endblock %}
 
-{% set page_hero_eyebrow = "Semantic layer" %}
+{% set page_hero_eyebrow = "Semantic models" %}
 {% set page_hero_title = model_name %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = model_description %}
 
 {% block toolbar %}
-<div class="slb-meta">
+<div class="slb-meta" data-csrf="{{ csrf_token }}" data-model-slug="{{ slug }}">
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }}</span>
     {% else %}
@@ -80,6 +141,22 @@
     {% endif %}
     {% if warehouse_only_metric_count %}
     <span class="badge badge--warn">{{ warehouse_only_metric_count }} metric{{ 's' if warehouse_only_metric_count != 1 else '' }} run server-side only (warehouse dialect)</span>
+    {% endif %}
+    {% if sync_mode == 'detached' %}
+    <span class="badge badge--warn">
+        Detached
+        {%- if source_missing_since %} · source no longer has this model
+        {%- elif source_changed_since_detach %} · source changed since detach
+        {%- endif %}
+    </span>
+    <a href="/api/semantic-models/{{ slug }}.yaml" class="slb-cross-link">Export detached version</a>
+    {% if user.is_admin and not source_missing_since %}
+    <button type="button" class="btn btn-secondary btn-sm" id="slb-reattach-btn">Re-attach</button>
+    {% endif %}
+    {% elif is_imported and user.is_admin and pg_backend %}
+    <button type="button" class="btn btn-primary btn-sm" id="slb-detach-btn">Detach to edit</button>
+    {% elif is_imported and user.is_admin %}
+    <span class="slb-pg-note">Editing an imported model requires the Postgres app-state backend</span>
     {% endif %}
 </div>
 {{ ds.tabs(items=tabs, aria_label='Semantic model object types') }}
@@ -101,8 +178,22 @@
     <input type="hidden" name="tab" value="{{ active_tab }}">
     <input type="search" name="q" value="{{ q }}" placeholder="Filter {{ active_tab }}&hellip;" aria-label="Filter {{ active_tab }}">
     <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
-    {% if q %}<a class="btn btn-ghost btn-sm" href="/semantic-layer/{{ slug }}?tab={{ active_tab }}">Clear</a>{% endif %}
 </form>
+
+{% if q %}
+{# A8 (issue #1707): a removable chip showing the active filter above the
+   table. Product decision (#1707 A8): tabs deliberately drop `q` on click;
+   the chip only shows the active filter, it does not survive a tab switch.
+   The "x" links to the same tab WITHOUT `q` — this is now the page's only
+   removable-filter control; the redundant `Clear` link/button that used to
+   sit next to the search box was removed in favor of it. #}
+<div class="slb-filter-chip" data-testid="slb-filter-chip">
+    <span class="slb-filter-chip__label">filter:</span>
+    <span class="slb-filter-chip__value">{{ q }}</span>
+    <a class="slb-filter-chip__x" href="/semantic-layer/{{ slug }}?tab={{ active_tab }}"
+       aria-label="Remove filter &ldquo;{{ q }}&rdquo;">&times;</a>
+</div>
+{% endif %}
 
 {% if active_tab == 'datasets' %}
     {% if datasets %}
@@ -122,8 +213,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.datasets %}
+    {{ state.panel('nothing_found', 'No datasets match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No datasets{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No datasets.') }}
     {% endif %}
 
 {% elif active_tab == 'metrics' %}
@@ -147,15 +240,17 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.metrics %}
+    {{ state.panel('nothing_found', 'No metrics match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No metrics{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No metrics.') }}
     {% endif %}
 
 {% elif active_tab == 'constraints' %}
     {% if constraints %}
     <table class="data-table">
         <thead>
-            <tr><th>Name</th><th>Type</th><th>Rule</th><th>Severity</th><th>Metrics</th></tr>
+            <tr><th>Name</th><th>Type</th><th>Rule</th><th data-tip="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft." aria-label="Error makes validate-query report valid: false; warning is recorded for reference. Neither ever blocks a query — enforcement is soft.">Severity</th><th>Metrics</th></tr>
         </thead>
         <tbody>
             {% for c in constraints %}
@@ -173,8 +268,11 @@
             {% endfor %}
         </tbody>
     </table>
+    <p class="slb-severity-note">Only <code class="slb-rule-code">required_filter</code> constraints are statically checkable today — an error-severity constraint of any other type is advisory only, exactly like a warning, until <code class="slb-rule-code">validate-query</code> gains a checker for it.</p>
+    {% elif q.strip() and counts.constraints %}
+    {{ state.panel('nothing_found', 'No constraints match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No constraints{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No constraints.') }}
     {% endif %}
 
 {% elif active_tab == 'relationships' %}
@@ -194,8 +292,10 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.relationships %}
+    {{ state.panel('nothing_found', 'No relationships match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No relationships{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No relationships.') }}
     {% endif %}
 
 {% elif active_tab == 'glossary' %}
@@ -214,8 +314,72 @@
             {% endfor %}
         </tbody>
     </table>
+    {% elif q.strip() and counts.glossary %}
+    {{ state.panel('nothing_found', 'No glossary terms match “' ~ q ~ '”.') }}
     {% else %}
-    <div class="empty-state"><p class="empty-state__description">No glossary terms{% if q %} match &ldquo;{{ q }}&rdquo;{% endif %}.</p></div>
+    {{ state.panel('empty', 'No glossary terms.') }}
     {% endif %}
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  // F3: detach/re-attach — minimal danger-flow buttons, no new UI layer.
+  // Editing a detached model happens through the existing chat-authoring
+  // /apply path, not here (see phase3.md §3 bod 4).
+  var meta = document.querySelector(".slb-meta");
+  if (!meta) return;
+  var csrf = meta.dataset.csrf || "";
+  var slug = meta.dataset.modelSlug || "";
+
+  function post(path, body) {
+    return fetch(path, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  async function handle(btn, path, body) {
+    btn.disabled = true;
+    try {
+      var r = await post(path, body);
+      var data = {};
+      try { data = await r.json(); } catch (e) { /* non-JSON error body */ }
+      if (!r.ok) {
+        var msg = (data && data.detail && (data.detail.message || data.detail)) || ("Failed: HTTP " + r.status);
+        await alertModal(msg);
+        return;
+      }
+      window.location.reload();
+    } catch (e) {
+      await alertModal("Network error — please try again.");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  var detachBtn = document.getElementById("slb-detach-btn");
+  if (detachBtn) {
+    detachBtn.addEventListener("click", async function () {
+      if (!(await confirmModal("Detach this model? Sync will stop overwriting it until you re-attach."))) return;
+      handle(detachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/detach", {
+        confirm_detach: true,
+      });
+    });
+  }
+
+  var reattachBtn = document.getElementById("slb-reattach-btn");
+  if (reattachBtn) {
+    reattachBtn.addEventListener("click", async function () {
+      if (!(await confirmModal("Re-attach this model? Your local edits will be replaced by the source's version at the next sync."))) return;
+      handle(reattachBtn, "/api/admin/semantic-models/" + encodeURIComponent(slug) + "/reattach", {
+        confirm_reattach: true,
+      });
+    });
+  }
+})();
+</script>
 {% endblock %}

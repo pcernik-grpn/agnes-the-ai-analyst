@@ -350,7 +350,24 @@ EXEMPT: frozenset[str] = frozenset(
         # that SQL or returns a row. ─────────────────────────────────────
         "app/api/metrics.py::list_metrics",
         "app/api/metrics.py::get_metric",
-        "app/web/router.py::catalog_semantics",
+        # The flat metric/glossary projection, now the model list's "All
+        # metrics" / "All glossary" tabs (#1707 N5 folded /catalog/semantics
+        # into /semantic-layer; that route is a 308 and reads nothing).
+        # The gate resolves table IDS and filters metric DEFINITIONS by them;
+        # it never reads a table's rows.
+        "app/web/router.py::semantic_layer_list",
+        # #1707's metric deep link -- returns a URL STRING and nothing else
+        # (`/semantic-layer?tab=all_metrics&q=<metric name>`), never a row, a
+        # column list or even the metric's SQL. Its `get_accessible_tables`
+        # call is the SAME stack gate `semantic_layer_list` right above
+        # applies, run for the same reason and reusing its very helper
+        # (`_first_inaccessible_table`):
+        # to decide whether the metric this link points at would be visible on
+        # that page at all, so the link is never offered into an empty filter.
+        # The resolver has nothing to enforce here -- its four functions each
+        # take a `table_id` and produce a relation/SQL/schema for reading that
+        # table's content, and this node reads no table.
+        "app/web/router.py::_registry_href_for_metric",
         # ── estimate-only: a BQ dry-run byte/row/cost NUMBER, never row
         # content or a column list. select/where/order_by are validated
         # against `build_schema`'s (COVERED) effective schema via

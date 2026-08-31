@@ -1244,6 +1244,8 @@
           <div class="ds-field ds-wsl-opt__field" hidden>
             <label for="ds-new-master">Semantic-layer token <span class="optional">(project owner)</span></label>
             <input type="password" id="ds-new-master" placeholder="paste owner token" autocomplete="off">
+            <div class="field-hint">Keboola calls this the project's <strong>master</strong> token — search your
+               Keboola project for that term if "owner token" turns up nothing.</div>
           </div>
         </div>
         </div>
@@ -1333,9 +1335,23 @@
             <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs in Snowflake) or <strong>materialized</strong>
                (a scheduled copy to parquet). For custom SQL or partitioning, use
                <a href="/admin/tables">Tables → Register new table</a>.</p>
-            <p style="margin-left:0;">Snowflake <strong>semantic views</strong> are not tables. Import their definitions —
-               logical tables, relationships, metrics — on the <a href="/admin/semantic-layer">Semantic layer</a> page.
-               Their metric SQL is Snowflake-flavour, so Agnes reads it but will not run it locally.</p>
+          </div>
+          {# Semantic views (CREATE SEMANTIC VIEW) are not tables and are not
+             picked up by anything above — connecting Snowflake used to leave
+             them undiscoverable short of the CLI. Mirrors Keboola's own
+             semantic-layer opt-in (`ds-new-semantic` above): optional,
+             non-fatal, and reachable again later on its own page if skipped
+             or if it fails. #}
+          <div class="ds-wsl-opt">
+            <label class="ds-wsl-opt__head">
+              <input type="checkbox" id="ds-new-semantic-snowflake">
+              <span>Also sync semantic views (business metrics &amp; glossary)</span>
+            </label>
+            <p>Snowflake <strong>semantic views</strong> (<code>CREATE SEMANTIC VIEW</code>) are not tables — this
+               imports their logical tables, relationships and metrics into {{ instance_brand or 'Agnes' }}'s semantic
+               layer, using this connection's own credentials. Their metric SQL is Snowflake-flavour, so Agnes reads
+               it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync any
+               time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
           </div>
         </div>
 
@@ -1367,6 +1383,18 @@
             <p style="margin-left:0;">Tables you add here can be <strong>live</strong> (remote, every query runs on the SQL warehouse) or <strong>materialized</strong>
                (a scheduled copy to parquet). For custom SQL, partitioning or metric views, use
                <a href="/admin/tables">Tables → Register new table</a> — the full editor (live, materialized, custom SQL with <code>MEASURE()</code>) lives there.</p>
+          </div>
+          {# Mirrors the identical Snowflake opt-in above — see its comment. #}
+          <div class="ds-wsl-opt">
+            <label class="ds-wsl-opt__head">
+              <input type="checkbox" id="ds-new-semantic-databricks">
+              <span>Also sync semantic views (business metrics &amp; glossary)</span>
+            </label>
+            <p>Unity Catalog <strong>metric views</strong> are not ordinary tables — this imports their dimensions
+               and measures into {{ instance_brand or 'Agnes' }}'s semantic layer, using this connection's own
+               credentials. Their measure SQL uses <code>MEASURE()</code>, a Databricks-only aggregate, so Agnes
+               reads it but will not run it locally. <strong>Optional:</strong> skip it and tables still work; sync
+               any time later on the <a href="/admin/semantic-sources">Semantic sources</a> page.</p>
           </div>
         </div>
 
@@ -1806,7 +1834,7 @@ function _masterTokenFactHtml(row) {
   const hasMaster = row.has_master_secret === true;
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Keboola calls this the project MASTER (owner) token. Required only for the semantic layer — metrics and glossary.">Semantic-layer token</span>
+    <span class="ds-src__fact-k" role="note" data-tip="Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary." aria-label="Semantic-layer token. Keboola calls this the project's master (owner) token — required only for the semantic layer's metrics and glossary.">Semantic-layer token</span>
     <span class="ds-src__fact-v"><span class="ds-badge ${hasMaster ? "badge-vault" : "badge-unset"}">${hasMaster ? "set" : "not set"}</span></span>
     <span class="ds-src__fact-a">
       <button type="button" class="btn btn-secondary" onclick="toggleMasterToken('${id}')">${hasMaster ? "Rotate" : "Set token"}</button>
@@ -1828,7 +1856,7 @@ function _masterTokenFactHtml(row) {
    admin can act on: "no tables yet", "never synced", "token not set",
    "0 packages — nobody can pull this". A missing cell (BigQuery has no
    semantic layer) simply is not rendered — the strip is per-connector. */
-const SOURCE_PIPELINES = {{ source_pipelines | tojson }};
+let SOURCE_PIPELINES = {{ source_pipelines | tojson }};
 
 /* Connectors that produce tables but keep no `source_connections` row —
    BigQuery (credentialed once, at instance level), Jira (webhooks), uploaded
@@ -2001,11 +2029,27 @@ function _pipelineStripHtml(row) {
         ? `✓ ${sem.metrics} metric${sem.metrics === 1 ? "" : "s"} · ${sem.terms} term${sem.terms === 1 ? "" : "s"}`
         : "Nothing imported yet";
     const semTone = !sem.token ? "is-warn" : (sem.metrics || sem.terms) ? "is-ok" : "is-warn";
-    cells.push(`
-      <a class="ds-pipe__cell" href="/admin/semantic-layer">
-        <span class="ds-pipe__k">Semantic layer</span>
-        <span class="ds-pipe__v ${semTone}">${semText}</span>
-      </a>`);
+    // "Token not set" cannot be fixed on /admin/semantic-layer — the page
+    // renders fine, it just has no token field; the token is set on this
+    // same card (Actions → Semantic-layer token), so a STORED connection's
+    // cell calls that action directly instead of navigating to a page that
+    // cannot help. A derived card (no stored connection — see `row.derived`
+    // above) carries no such widget at all — `_masterTokenFactHtml` is never
+    // rendered for it — so it keeps the base link; there is nothing on the
+    // card itself to point at instead.
+    if (!sem.token && !row.derived) {
+      cells.push(`
+        <button type="button" class="ds-pipe__cell" onclick="toggleMasterToken('${row.id}')">
+          <span class="ds-pipe__k">Semantic layer health</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </button>`);
+    } else {
+      cells.push(`
+        <a class="ds-pipe__cell" href="/admin/semantic-layer">
+          <span class="ds-pipe__k">Semantic layer health</span>
+          <span class="ds-pipe__v ${semTone}">${semText}</span>
+        </a>`);
+    }
   }
 
   // Feeds — the end of the chain: who actually gets this source's data.
@@ -2629,6 +2673,7 @@ async function importKeboolaConnection(id) {
       // real one it just replaced.
       const idx = DERIVED_SOURCES.findIndex((d) => d.source_type === "keboola");
       if (idx !== -1) DERIVED_SOURCES.splice(idx, 1);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       showToast("Import failed: " + (data.detail || `HTTP ${r.status}`), false);
@@ -2656,6 +2701,90 @@ function renderConnList() {
   list.innerHTML = _connections.map(_connectionCardHtml).join("");
   _fillGrantPickers();
   loadTokenMismatchWarnings();
+}
+
+/* ── Keeping the strip true after a mutation ───────────────────────────────
+   `SOURCE_PIPELINES` is a snapshot of a server-side fold, taken when this
+   HTML was built — but everything on this page happens over fetch. The
+   wizard registers tables, creates packages and writes grants; the cards
+   save tokens and toggle chat tools; none of it touched that snapshot, so a
+   card went on saying "Add the first tables → / Never synced / 0 packages"
+   after two dozen tables had landed, until somebody hard-reloaded.
+
+   `GET /api/admin/source-pipelines` re-reads the same fold. Every handler
+   that mutates anything calls THIS function afterwards — the rule is
+   deliberately blunt ("a mutation re-reads the strip") rather than a
+   per-handler judgment about which cells that particular write can move,
+   because the per-handler judgment is what silently rots.
+
+   Repainted in place, never reloaded: an admin with a card expanded or a
+   browse panel open is mid-task, and a reload throws that away along with
+   their scroll position. A failed refresh keeps the stale strip and says
+   nothing — a card that stops updating is recoverable, one that empties
+   itself is not.
+
+   This carries the STRIP, not the connection rows. A handler that also
+   changed what the row itself says — a stored secret, a cleared project
+   binding, a queued extraction's timestamp, a connection that now exists at
+   all — pairs this with `loadConnections()`, in that order, so the redraw
+   below paints from the fresh dict. */
+let _pipelineRefreshInFlight = null;
+
+async function refreshSourcePipelines() {
+  // One read at a time. A wizard exit calls this from several places within a
+  // tick, and two overlapping reads would resolve last-response-wins — which,
+  // with the older response landing second, is the stale strip this whole
+  // function exists to remove. Everyone waiting gets the same promise.
+  if (_pipelineRefreshInFlight) return _pipelineRefreshInFlight;
+  _pipelineRefreshInFlight = (async () => {
+    try {
+      const r = await fetch("/api/admin/source-pipelines", { credentials: "include" });
+      if (!r.ok) return false;
+      SOURCE_PIPELINES = await r.json();
+      // Inside the try: a repaint that throws must report itself as a failed
+      // refresh, not escape into a caller's `finally` and replace whatever
+      // error that block was already unwinding.
+      _repaintSourceCards();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  })().finally(() => { _pipelineRefreshInFlight = null; });
+  return _pipelineRefreshInFlight;
+}
+
+/* Swap each drawn card's strip and status word for what the fresh dict says,
+   and leave the rest of the card — including whether it is open — exactly as
+   the admin left it. A source the list has not drawn yet (a connection the
+   wizard just created) is skipped here; `loadConnections()` draws it from the
+   same fresh dict. */
+function _repaintSourceCards() {
+  for (const row of _connections) {
+    const card = document.getElementById(`ds-conn-${row.id}`);
+    if (!card) continue;
+    const head = card.querySelector(".ds-src__head");
+
+    const stripHtml = _pipelineStripHtml(row);
+    const strip = card.querySelector(":scope > .ds-pipe");
+    if (strip && stripHtml) strip.outerHTML = stripHtml;
+    else if (strip) strip.remove();
+    else if (stripHtml && head) head.insertAdjacentHTML("afterend", stripHtml);
+
+    if (!head) continue;
+    const health = _sourceHealth(row);
+    const chip = head.querySelector(".ds-src__health");
+    if (chip && health) {
+      chip.className = `ds-src__health ${health.tone}`;
+      chip.textContent = health.label;
+    } else if (chip) {
+      chip.remove();
+    } else if (health) {
+      const acts = head.querySelector(".ds-src__acts");
+      const chipHtml = `<span class="ds-src__health ${health.tone}">${health.label}</span>`;
+      if (acts) acts.insertAdjacentHTML("beforebegin", chipHtml);
+      else head.insertAdjacentHTML("beforeend", chipHtml);
+    }
+  }
 }
 
 // A connection whose storage token and master token resolve to DIFFERENT
@@ -2787,6 +2916,11 @@ async function runSpExtraction(id) {
       resultEl.className = "ds-conn-test-result show ok";
       resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
       showToast("Extraction queued.", true);
+      // The dispatch stamps `config.extraction.last_run_at` on the connection
+      // row, and the body's "In-Agnes extraction" line reads it — so this
+      // needs the rows re-read too, not just the strip.
+      await refreshSourcePipelines();
+      await loadConnections();
     } else {
       const msg = detailMessage(body, "failed to start extraction");
       resultEl.className = "ds-conn-test-result show fail";
@@ -2829,6 +2963,7 @@ async function saveSpCertificate(id) {
       showToast("Certificate updated.", true);
       input.value = "";
       toggleSpCertRow(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2856,6 +2991,9 @@ async function deleteConn(id) {
     if (r.ok || r.status === 204) {
       showToast(`"${name}" deleted.`, true);
       _connections = _connections.filter(c => c.id !== id);
+      // Not only about the card that just went away: with one connection of a
+      // type left, that type's unlinked tables become attributable to it.
+      await refreshSourcePipelines();
       renderConnList();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2875,6 +3013,7 @@ async function setDefaultConn(id) {
     });
     if (r.ok) {
       showToast("Default project updated.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -2915,12 +3054,13 @@ async function saveRotatedToken(id) {
       showToast("Token rotated.", true);
       input.value = "";
       toggleRotate(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
       const msg = r.status === 409
         ? "Server vault key missing — set AGNES_VAULT_KEY first."
-        : "Failed: " + (body.detail || "unknown error");
+        : "Failed: " + detailMessage(body, "unknown error");
       showToast(msg, false);
     }
   } catch (_) {
@@ -2956,12 +3096,13 @@ async function saveMasterToken(id) {
       showToast("Master token saved.", true);
       input.value = "";
       toggleMasterToken(id);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
       const msg = r.status === 409
         ? "Server vault key missing — set AGNES_VAULT_KEY first."
-        : "Failed: " + (body.detail || "unknown error");
+        : "Failed: " + detailMessage(body, "unknown error");
       showToast(msg, false);
     }
   } catch (_) {
@@ -2975,6 +3116,7 @@ async function removeMasterToken(id) {
     const r = await fetch(`${API_CONNECTIONS}/${id}/secret?kind=master`, { method: "DELETE", credentials: "include" });
     if (r.ok || r.status === 204) {
       showToast("Master token removed.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -3003,6 +3145,7 @@ async function unbindProject(id) {
     });
     if (r.ok) {
       showToast("Project binding cleared.", true);
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -3164,6 +3307,7 @@ async function grantChatTools(id, sourceId) {
       const gated = body.admin_only ? ` ${body.admin_only} are mutating and stay locked until opted in per tool (agnes admin mcp tool grant <tool_id> --group <g> --allow-mutating).` : "";
       const off = body.skipped_disabled ? ` ${body.skipped_disabled} disabled tools were skipped.` : "";
       showToast(`Granted ${body.granted} of ${body.total} tools${extra}.${gated}${off}`, true);
+      await refreshSourcePipelines();
     } else {
       showToast("Failed: " + detailMessage(body, `HTTP ${r.status}`), false);
     }
@@ -3201,6 +3345,7 @@ async function toggleChatTools(id, isOn, resync) {
                 + (allAdminOnly ? " All are recorded as mutating (no read-only annotations upstream); mutating tools stay locked for a group until an admin opts each in per tool (allow_mutating on the tool grant)." : "")),
         true,
       );
+      await refreshSourcePipelines();
       await loadConnections();
     } else {
       const body = await r.json().catch(() => ({}));
@@ -3639,6 +3784,9 @@ async function registerSelected(connId, errElId) {
     const done = okCount + alreadyCount;
     showToast(`${done} ready, ${failCount} failed. See per-row status.`, false);
   }
+  // The whole point of the strip: "No tables yet" must stop being the
+  // answer the moment it stops being true.
+  await refreshSourcePipelines();
   return { ok: registered, failed: failCount };
 }
 
@@ -3855,6 +4003,80 @@ function _renderSfCredStatus(host, kind) {
    row's `config` does not carry a custom `private_key_passphrase_env`. */
 const _SF_PASSPHRASE_ENV_DEFAULT = "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE";
 
+/* Shared by the Snowflake and Databricks "also sync semantic views" opt-ins
+   — the same shape as Keboola's own opt-in above, generalized to any
+   connector with a registered `connection`-kind semantic adapter
+   (src/semantic/adapters/__init__.py). Reuses the existing
+   /api/admin/semantic-sources* API — no new endpoint.
+
+   Idempotent: reuses an existing `connection` source for this adapter
+   instead of creating a duplicate one every time the wizard runs (e.g. an
+   admin re-opening it to fix a credential). Returns a short status string;
+   never throws — this must never block the wizard's own connection flow.
+
+   `connectionId` is the row this opt-in was checked on, written to the
+   source's `config.connection_id`. It is NOT a credential — every one of
+   these adapters resolves host/token itself from the connection, which is
+   why an empty config syncs at all — it is the link the cross-domain
+   coverage report scores against: a source recording no connection is
+   credited to nobody (src/semantic/coverage.py::_native_semantic_status),
+   so without it a working semantic layer still reports as missing. */
+async function _connectSemanticSource(adapter, label, connectionId) {
+  try {
+    const listResp = await fetch("/api/admin/semantic-sources", { credentials: "include" });
+    if (!listResp.ok) throw new Error(`HTTP ${listResp.status}`);
+    const existing = (await listResp.json()).find((s) => s.kind === "connection" && s.adapter === adapter);
+
+    let sourceId = existing && existing.id;
+    if (!sourceId) {
+      const config = connectionId ? { connection_id: connectionId } : {};
+      const createResp = await fetch("/api/admin/semantic-sources", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "connection", name: label, adapter, config, enabled: true }),
+      });
+      if (!createResp.ok) {
+        const detail = await createResp.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${createResp.status}`);
+      }
+      sourceId = (await createResp.json()).id;
+    } else if (connectionId && (existing.config || {}).connection_id !== connectionId) {
+      /* A source registered before the wizard wrote the link — or one left
+         pointing at a connection that has since been re-created — repaired
+         in place rather than left syncing into a coverage row that reports
+         it missing. Safe to re-point: this wizard keeps one connection per
+         source_type (see the `_sfConnId` note above), so there is no second
+         connection of this type whose link this could be stealing. Scope
+         keys already on the config (`catalogs`, `database`, …) are kept. */
+      const linkResp = await fetch(`/api/admin/semantic-sources/${encodeURIComponent(sourceId)}`, {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: { ...(existing.config || {}), connection_id: connectionId } }),
+      });
+      if (!linkResp.ok) {
+        const detail = await linkResp.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${linkResp.status}`);
+      }
+    }
+
+    const syncResp = await fetch(`/api/admin/semantic-sources/${encodeURIComponent(sourceId)}/sync`, {
+      method: "POST", credentials: "include",
+    });
+    if (!syncResp.ok) {
+      const detail = await syncResp.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${syncResp.status}`);
+    }
+    const report = await syncResp.json();
+    const invalidCount = (report.invalid || []).length;
+    if (invalidCount) {
+      return { ok: false, message: `Semantic layer: synced with ${invalidCount} document(s) skipped — see Semantic sources.` };
+    }
+    return { ok: true, message: `Semantic layer enabled — ${report.models_written ?? 0} model(s) imported.` };
+  } catch (e) {
+    return { ok: false, message: `Semantic layer sync failed (${e.message || e}) — set it up later on the Semantic sources page.` };
+  }
+}
+
 async function _saveSnowflakeAndContinue() {
   const err = document.getElementById("ds-wizard-error");
   const account = document.getElementById("ds-sf-account").value.trim();
@@ -3940,6 +4162,18 @@ async function _saveSnowflakeAndContinue() {
     _sfConfigLoaded = true;
     _setWizStep(2);
     _renderSfRowsEditor();
+    // Non-fatal, after the step-2 banner has its own text — appended, not
+    // awaited-before-navigation, since a stalled/slow sync must never hold
+    // up table browsing (Devin Review precedent on the identical Keboola
+    // opt-in above).
+    if (document.getElementById("ds-new-semantic-snowflake").checked) {
+      _connectSemanticSource("snowflake_semantic", "Snowflake semantics", _sfConnId).then((result) => {
+        const banner = document.getElementById("ds-wizard-connected-banner");
+        if (banner) {
+          banner.innerHTML += ` <span style="${result.ok ? "" : "color:var(--ds-accent-warn-ink)"}">${_esc(result.message)}</span>`;
+        }
+      });
+    }
   } catch (e) {
     err.textContent = "Could not save Snowflake settings: " + (e.message || e);
     err.style.display = "block";
@@ -4072,6 +4306,26 @@ async function _saveDatabricksAndContinue() {
       _renderDbxCredStatus();
     }
     _dbxConfigLoaded = true;
+    // Unlike Snowflake/Keboola, this flow closes the wizard and navigates
+    // away immediately — there is no banner left to append to, and a
+    // fire-and-forget call here would be cancelled by the navigation before
+    // it completes. Awaited so it actually runs; still non-fatal for the
+    // connection itself (no `throw` — host/warehouse/token are saved either
+    // way), but NOT silent: a failure here used to be discarded and the
+    // navigation ran regardless, so a checked box, no error and no semantic
+    // layer was an indistinguishable outcome from success. This is the only
+    // moment the message has somewhere to land, so on failure the wizard
+    // stays put and says so, with the onward link the navigation would have
+    // taken.
+    if (document.getElementById("ds-new-semantic-databricks").checked) {
+      const result = await _connectSemanticSource("databricks_metric_views", "Databricks semantics", _dbxConnId);
+      if (!result.ok) {
+        err.innerHTML = `<span style="color:var(--ds-accent-warn-ink)">Databricks connection saved. ${_esc(result.message)}</span>` +
+          ` <a href="/admin/tables">Continue to Tables</a>`;
+        err.style.display = "block";
+        return;
+      }
+    }
     closeWizard();
     window.location.href = "/admin/tables";
   } catch (e) {
@@ -4105,6 +4359,8 @@ function openWizard(connector) {
   document.getElementById("ds-new-token").value = "";
   document.getElementById("ds-new-semantic").checked = false;
   document.getElementById("ds-new-master").value = "";
+  document.getElementById("ds-new-semantic-snowflake").checked = false;
+  document.getElementById("ds-new-semantic-databricks").checked = false;
   document.getElementById("ds-sf-account").value = "";
   document.getElementById("ds-sf-user").value = "";
   document.getElementById("ds-sf-auth-type").value = "password";
@@ -4211,9 +4467,16 @@ function openWizard(connector) {
   document.querySelector("#ds-wizard-overlay .ds-drawer__body").scrollTop = 0;
 }
 
-function closeWizard() {
+async function closeWizard() {
   document.getElementById("ds-wizard-overlay").classList.remove("show");
   document.body.style.overflow = "";
+  // The wizard is where a source's whole pipeline gets built — connection,
+  // tables, packages, grants — and every card behind it was drawn before any
+  // of that happened. On EVERY exit, not only the Finish button: a connection
+  // created in step 1 and then dismissed with X/Escape is still a connection,
+  // and it has no card at all until the list is re-read.
+  await refreshSourcePipelines();
+  await loadConnections();
 }
 
 // A connector failure reaches the admin as whatever the upstream API said —
@@ -4392,9 +4655,8 @@ async function connectAndValidate() {
           banner.innerHTML += ` Semantic layer enabled — metrics & glossary will sync.`;
         } else {
           const mb = await mResp.json().catch(() => ({}));
-          const md = mb.detail;
           banner.innerHTML += ` <span style="color:var(--ds-accent-warn-ink)">Semantic-layer token was refused (` +
-            _esc((md && typeof md === "object" ? (md.message || md.error) : md) || `HTTP ${mResp.status}`) +
+            _esc(detailMessage(mb, `HTTP ${mResp.status}`)) +
             `) — tables still work; set it later on this connection's card.</span>`;
         }
       } else {
@@ -4443,13 +4705,11 @@ async function _loadWizardTables(connId) {
   }
 }
 
-function finishWizard() {
-  closeWizard();
+async function finishWizard() {
+  await closeWizard();
   if (_wizardSource === "snowflake") {
     window.location.reload();
-    return;
   }
-  loadConnections();
 }
 
 /* ── Step 2 (BigQuery): manual rows editor ────────────────────────────────
@@ -4546,6 +4806,7 @@ async function _registerBqRows() {
       failed++;
     }
   }
+  await refreshSourcePipelines();
   return { ok: registered, failed };
 }
 
@@ -4883,6 +5144,7 @@ async function _registerSfRows() {
       failed++;
     }
   }
+  await refreshSourcePipelines();
   return { ok: registered, failed };
 }
 
@@ -5111,6 +5373,9 @@ async function _createPackagesAndContinue() {
     await _renderShareStep();
   } finally {
     btn.disabled = false;
+    // In `finally`: a tray that failed halfway still created the packages
+    // before it, and the Feeds cell behind the drawer is stale either way.
+    await refreshSourcePipelines();
   }
 }
 
@@ -5207,6 +5472,9 @@ async function _shareAndFinish() {
     _showDoneSlab();
   } finally {
     btn.disabled = false;
+    // Grants are the end of the chain — "0 packages" becomes "1 package →
+    // 4 people" here, and the card behind the receipt should say so.
+    await refreshSourcePipelines();
   }
 }
 
@@ -5851,9 +6119,16 @@ function _spHighlightShareRow(scopeId) {
   setTimeout(() => row.classList.remove("sp-share-row--highlight"), 2500);
 }
 
-function closeSpWizard() {
+async function closeSpWizard() {
   document.getElementById("sp-wizard-overlay").classList.remove("show");
   document.body.style.overflow = "";
+  // Same contract as the table wizard's own exit: this drawer connects a
+  // source, scopes it and shares it, and every card behind it was drawn
+  // before any of that happened. The rows too — scopes live in the
+  // connection's own `config`, so the card's identity line and its scope
+  // list are as stale as the strip.
+  await refreshSourcePipelines();
+  await loadConnections();
 }
 
 function spGoStep(step) {
@@ -6480,7 +6755,7 @@ document.getElementById("spw-finish-btn").addEventListener("click", () => {
     }
     btn.style.display = "none";
     document.getElementById("spw-done-btn").style.display = "";
-    loadConnections();
+    refreshSourcePipelines().then(loadConnections);
   });
 });
 

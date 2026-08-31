@@ -132,6 +132,64 @@ def test_seed_builtin_marketplace_idempotent(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_seed_builtin_marketplace_clears_stale_last_error(tmp_path, monkeypatch):
+    """A last_error stamped by the old pre-fix sync path (which tried to
+    git-clone the builtin:// sentinel) must self-heal on the next re-seed —
+    there is no other way to clear it: the admin UI hides "Sync now" for
+    is_builtin rows, and sync_one() now refuses built-in rows before ever
+    touching last_error again."""
+    conn = _setup_duckdb_repos(tmp_path)
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
+
+    from src.marketplace import seed_builtin_marketplace, BUILTIN_MARKETPLACE_SLUG
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    seed_builtin_marketplace()
+
+    reg = MarketplaceRegistryRepository(conn)
+    reg.update_sync_status(
+        BUILTIN_MARKETPLACE_SLUG,
+        error="git clone failed: 'remote-builtin' is not a git command",
+    )
+    row = reg.get(BUILTIN_MARKETPLACE_SLUG)
+    assert row["last_error"] is not None, "precondition: error stamped"
+
+    # Simulate a reboot: seed_builtin_marketplace() re-registers the row.
+    seed_builtin_marketplace()
+
+    row = reg.get(BUILTIN_MARKETPLACE_SLUG)
+    assert row["last_error"] is None, "stale error on a built-in row must self-heal on re-seed"
+
+    conn.close()
+
+
+def test_register_does_not_clear_last_error_for_non_builtin(tmp_path, monkeypatch):
+    """Regression guard: the self-heal is scoped to is_builtin. Re-registering
+    (e.g. an admin edit/PATCH) a normal marketplace must leave a real
+    last_error untouched."""
+    conn = _setup_duckdb_repos(tmp_path)
+    from src.repositories.marketplace_registry import MarketplaceRegistryRepository
+
+    reg = MarketplaceRegistryRepository(conn)
+    reg.register(id="normal-heal", name="Normal", url="https://example.test/normal.git")
+    reg.update_sync_status("normal-heal", error="real git clone failure")
+    row = reg.get("normal-heal")
+    assert row["last_error"] == "real git clone failure"
+
+    # Re-register, as an admin edit (PATCH) would.
+    reg.register(id="normal-heal", name="Normal Updated", url="https://example.test/normal.git")
+
+    row = reg.get("normal-heal")
+    assert row["name"] == "Normal Updated"
+    assert row["last_error"] == "real git clone failure", (
+        "re-registering a non-builtin row must not clear a real last_error"
+    )
+
+    conn.close()
+
+
 def test_seed_builtin_marketplace_populates_plugin_cache(tmp_path, monkeypatch):
     """After seeding, marketplace_plugins has rows for the built-in plugins."""
     conn = _setup_duckdb_repos(tmp_path)

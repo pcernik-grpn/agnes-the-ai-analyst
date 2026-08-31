@@ -172,11 +172,12 @@
     <div class="rail-collapsible" id="rail-collapsible">
 
     {% set _home = home_route or '/dashboard' %}
-    {# /catalog/semantics counts as Library here: under the rail the Library's
-       Definitions block is the only way in, and the page carries no rail entry
-       of its own — leaving it unhighlighted made the whole chrome read as
-       "nowhere", which is the same strand this rail already avoids for the
-       surfaces it retired. #}
+    {# The semantic layer counts as Library here: under the rail the Library's
+       Semantic models section is the only way in, and those pages carry no
+       rail entry of their own — leaving them unhighlighted made the whole
+       chrome read as "nowhere", which is the same strand this rail already
+       avoids for the surfaces it retired. `/catalog/semantics` is kept in the
+       list for the 308's brief hop; `/semantic-layer` is where it lands. #}
     {# Every entity detail page the Library links out to also counts: without
        these the rail highlighted NOTHING on /catalog/p/*, /memory/d/*,
        /apps/detail/* and /marketplace/* — the most-visited detail surfaces
@@ -184,6 +185,7 @@
        reached from the Library and return to it. #}
     {% set _on_library = _path.startswith('/library') or _path == '/artefacts'
                          or _path.startswith('/catalog')
+                         or _path.startswith('/semantic-layer')
                          or _path.startswith('/memory/d')
                          or _path.startswith('/apps/detail')
                          or _path.startswith('/marketplace') %}

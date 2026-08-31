@@ -122,7 +122,7 @@ class TestClientOverTheWire:
 
 class TestSemanticLayerOverTheWire:
     def test_metric_views_land_in_metric_definitions(self, warehouse, e2e_env, monkeypatch):
-        from connectors.databricks.semantic_ossie import DatabricksSemanticAdapter
+        from connectors.databricks.semantic_ossie import DatabricksMetricViewAdapter
         from src.repositories import metric_repo
         from src.semantic.importer import import_documents
 
@@ -136,9 +136,9 @@ class TestSemanticLayerOverTheWire:
                 "token": "tok-secret",
             },
         )
-        monkeypatch.setattr(DatabricksSemanticAdapter, "_client", lambda self, settings: _client(warehouse))
+        monkeypatch.setattr(DatabricksMetricViewAdapter, "_client", lambda self, settings: _client(warehouse))
 
-        documents = DatabricksSemanticAdapter().extract({})
+        documents = DatabricksMetricViewAdapter().extract({})
         assert len(documents) == 1
 
         report = import_documents({"source": "ossie_connection", "source_ref": "databricks_default"}, documents)

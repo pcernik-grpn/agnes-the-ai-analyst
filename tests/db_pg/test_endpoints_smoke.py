@@ -1031,6 +1031,76 @@ class TestAdminRegistrySmoke:
 
 
 # ---------------------------------------------------------------------------
+# Admin source pipelines  (the /admin/data-sources card strip, as data)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminSourcePipelinesSmoke:
+    COVERED_ROUTES = {
+        "GET /api/admin/source-pipelines",
+    }
+
+    def test_strip_counts_a_table_against_its_connection(self, seeded_app_both):
+        """The strip is a fold over four different repos — table_registry,
+        sync_state, data_packages and the grant tables — so it is exactly the
+        kind of read that can silently answer "0 tables" on one backend and
+        "1" on the other. Registered through the API, read back through the
+        endpoint, on both.
+        """
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post(
+            "/api/admin/source-connections",
+            json={
+                "name": "Pipelines Smoke",
+                "source_type": "keboola",
+                "config": {"stack_url": "https://connection.example.com"},
+            },
+            headers=h,
+        )
+        assert created.status_code in (200, 201), created.text
+        conn_id = created.json()["id"]
+
+        empty = c.get("/api/admin/source-pipelines", headers=h)
+        assert empty.status_code == 200, empty.text
+        cells = empty.json()[conn_id]
+        # Per-connector shape: Keboola carries the semantic cell, and a fresh
+        # connection reports each stage as the state it is actually in.
+        assert set(cells) == {"tables", "sync", "semantic", "feeds"}
+        assert cells["tables"]["count"] == 0
+        assert cells["feeds"]["packages"] == 0
+
+        registered = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "pipelines_smoke_orders",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+                "connection_id": conn_id,
+            },
+            headers=h,
+        )
+        assert registered.status_code in (200, 201), registered.text
+        table_id = registered.json().get("id") or registered.json().get("table_id")
+
+        after = c.get("/api/admin/source-pipelines", headers=h)
+        assert after.status_code == 200
+        cells = after.json()[conn_id]
+        assert cells["tables"]["count"] == 1
+        assert cells["tables"]["basis"] == "connection"
+
+        c.delete(f"/api/admin/registry/{table_id}", headers=h)
+        c.delete(f"/api/admin/source-connections/{conn_id}", headers=h)
+
+    def test_non_admin_is_refused(self, seeded_app_both):
+        r = seeded_app_both["client"].get("/api/admin/source-pipelines", headers=_analyst_headers(seeded_app_both))
+        assert r.status_code == 403, r.text
+
+
+# ---------------------------------------------------------------------------
 # Admin Doctor  (new-instance deployment gate)
 # ---------------------------------------------------------------------------
 
@@ -2059,6 +2129,40 @@ class TestUpgradeFreezeSmoke:
 # ---------------------------------------------------------------------------
 
 KNOWN_UNTESTED = {
+    # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
+    # admin-gated, behaviorally covered outside this parameter-free smoke
+    # sweep: GET /api/admin/semantic-coverage in tests/test_semantic_coverage.py
+    # (source-agnostic zero-coverage check, RBAC gate); POST /api/admin/
+    # semantic-auto-draft-sweep in tests/test_semantic_autodraft_sweep.py
+    # (admin gate, DuckDB-backend 501 fail-clean per the A3 ratchet) plus
+    # the PG-only sweep-logic tests in tests/db_pg/test_semantic_autodraft_
+    # sweep_pg.py (dedup, batch limit, concurrency-cap degradation).
+    "GET /api/admin/semantic-coverage",
+    "POST /api/admin/semantic-auto-draft-sweep",
+    # Cross-domain semantic-layer coverage/health/mute/feedback (F4.1-4.3,
+    # 4.5) — all admin-gated except the feedback submit, all Postgres-only
+    # (resource_source_tags / semantic_health_mutes / semantic_feedback),
+    # and every mutation needs a body — not parameter-free-GET shaped for
+    # this smoke sweep. Behaviourally covered in dedicated files instead:
+    # tests/test_semantic_model_coverage_endpoint.py (RBAC + DuckDB 501),
+    # tests/db_pg/test_semantic_model_coverage_pg.py (per-domain status
+    # logic, live PG); tests/test_semantic_layer_health_endpoint.py +
+    # tests/db_pg/test_semantic_layer_health_pg.py (roll-up, mute overlay);
+    # tests/test_semantic_health_mutes_endpoint.py +
+    # tests/db_pg/test_semantic_health_mutes_pg.py (scope grammar, 409/404,
+    # expiry); tests/test_semantic_feedback_endpoint.py +
+    # tests/db_pg/test_semantic_feedback_pg.py (open-submit RBAC, guarded
+    # resolve).
+    "GET /api/admin/semantic-model/coverage",
+    "POST /api/admin/semantic-model/coverage/tags",
+    "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}",
+    "GET /api/admin/semantic-layer/health",
+    "GET /api/admin/semantic-layer/mutes",
+    "POST /api/admin/semantic-layer/mutes",
+    "DELETE /api/admin/semantic-layer/mutes/{mute_id}",
+    "POST /api/semantic-feedback",
+    "GET /api/admin/semantic-feedback",
+    "POST /api/admin/semantic-feedback/{feedback_id}/resolve",
     # External SSO login (design 2026-08-28) — PG-only feature covered
     # depth-first in its own harnesses rather than duplicated here:
     # tests/db_pg/test_admin_sso_api.py (admin gate, validation matrix,
@@ -2412,6 +2516,10 @@ KNOWN_UNTESTED = {
     # Admin semantic-layer sources page (multi-project sync) — tested in
     # tests/test_admin_semantic_layer_page.py.
     "GET /admin/semantic-layer",
+    # Admin semantic-sources page — shell over the existing
+    # /api/admin/semantic-sources* REST API; tested in
+    # tests/test_admin_semantic_sources_page.py (render + admin-gate).
+    "GET /admin/semantic-sources",
     # Guided linked-apps admin wizard (v0.77.28) — tested in
     # tests/test_web_data_apps.py (render + admin-gate).
     "GET /admin/linked-apps",
@@ -2817,23 +2925,13 @@ KNOWN_UNTESTED = {
     "POST /api/admin/run-corporate-memory",
     "POST /api/admin/run-jira-consistency-check",
     "POST /api/admin/run-jira-sla-poll",
-    # Keboola semantic layer (Metastore) sync — scheduler-driven admin
-    # maintenance op, mirrors run-bq-metadata-refresh. No dual-backend
-    # contract test needed (no new repo methods/migration). Behaviour
-    # covered in tests/test_keboola_semantic_layer_refresh_endpoint.py.
-    "POST /api/admin/run-keboola-semantic-layer-refresh",
-    # Databricks semantic layer (Unity Catalog metric views) sync — same
-    # shape as the Keboola sibling above: scheduler-driven admin maintenance
-    # op, no new repo methods/migration. Behaviour covered in
-    # tests/test_databricks_semantic_layer_refresh_endpoint.py.
-    # The handler never touches the backend switch itself; the repo calls its
-    # sync drives (metric_repo().create/find_by_name/list/delete, incl. the
-    # source_ref kwarg) are already parity-proven on both backends by
-    # tests/db_pg/test_config_pg.py::test_metric_source_ref_roundtrip and
-    # tests/db_pg/test_ported_methods_contract.py::test_metrics_yaml_reconcile_prunes_on_both_backends
-    # — cited here so this exclusion is self-verifying rather than resting on
-    # "nothing new here".
-    "POST /api/admin/run-databricks-semantic-layer-refresh",
+    # (The per-connector Keboola/Databricks semantic-refresh triggers that
+    # used to be excluded here are gone — #1707 Block 3 step 4. Their
+    # replacement, POST /api/admin/run-semantic-sources-refresh, is
+    # deliberately NOT excluded but COVERED: it is parameter-free and needs no
+    # upstream call for an `upload`-kind source, which makes it exactly the
+    # sweep worth smoking on both backends — see
+    # TestSemanticLayerSmoke.test_scheduled_sweep_syncs_a_registered_source.)
     # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
     # op, mirrors run-corporate-memory. No dual-backend contract test needed
     # (no new repo methods/migration; state.json lives on disk). Behaviour
@@ -3338,19 +3436,79 @@ class TestSemanticLayerSmoke:
         "GET /api/admin/semantic-models/{model_id}",
         "PUT /api/admin/semantic-models/{model_id}",
         "DELETE /api/admin/semantic-models/{model_id}",
+        "POST /api/admin/semantic-models/{model_id}/detach",
+        "POST /api/admin/semantic-models/{model_id}/reattach",
         "GET /api/admin/semantic-sources",
         "POST /api/admin/semantic-sources",
         "GET /api/admin/semantic-sources/{source_id}",
         "PUT /api/admin/semantic-sources/{source_id}",
         "DELETE /api/admin/semantic-sources/{source_id}",
         "POST /api/admin/semantic-sources/{source_id}/sync",
+        "POST /api/admin/run-semantic-sources-refresh",
         "GET /api/semantic-models/search",
         "GET /api/semantic-models/{slug}.yaml",
         "POST /api/semantic-models/validate-query",
         "GET /api/semantic-models/context",
         "GET /api/semantic-models/schema",
+        "GET /api/semantic-models/bundle",
         "POST /api/semantic-models/apply",
+        "POST /api/admin/semantic-models/{slug}/packages",
+        "DELETE /api/admin/semantic-models/{slug}/packages/{package_id}",
     }
+
+    def test_package_link_and_unlink_are_wired_on_both_backends(self, seeded_app_both):
+        from src.repositories import data_packages_repo
+
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post("/api/admin/semantic-models", json={"document": _SEMANTIC_DOC}, headers=h)
+        assert created.status_code == 201
+        slug = created.json()["slug"]
+
+        pkg_id = data_packages_repo().create(
+            name="Smoke Pkg", slug="smoke-pkg", description=None, icon=None, color=None, created_by="test"
+        )
+
+        linked = c.post(
+            f"/api/admin/semantic-models/{slug}/packages",
+            json={"package_id": pkg_id},
+            headers=h,
+        )
+        assert linked.status_code == 200, linked.text
+        assert linked.json()["package_ids"] == [pkg_id]
+
+        unlinked = c.delete(f"/api/admin/semantic-models/{slug}/packages/{pkg_id}", headers=h)
+        assert unlinked.status_code == 200, unlinked.text
+        assert unlinked.json()["package_ids"] == []
+
+    def test_detach_and_reattach_are_wired_on_both_backends(self, seeded_app_both):
+        """F3 detach/re-attach. A hand-authored model is the wrong subject for
+        both (nothing to detach FROM, nothing detached to return), which is
+        exactly what makes it a backend-independent smoke probe: the route is
+        reachable, admin-gated and answers its own typed refusal rather than
+        500ing. On DuckDB the PG-only guard fires first (A3 ratchet), so the
+        refusal is the typed 501 instead."""
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+        backend = seeded_app_both["backend"]
+
+        created = c.post("/api/admin/semantic-models", json={"document": _SEMANTIC_DOC}, headers=h)
+        assert created.status_code == 201
+        model_id = created.json()["id"]
+
+        detach = c.post(f"/api/admin/semantic-models/{model_id}/detach", json={"confirm_detach": True}, headers=h)
+        reattach = c.post(f"/api/admin/semantic-models/{model_id}/reattach", json={"confirm_reattach": True}, headers=h)
+
+        if backend == "duckdb":
+            assert detach.status_code == 501, detach.text
+            assert reattach.status_code == 501, reattach.text
+        else:
+            # `source='manual'` — no source to detach from, and not detached.
+            assert detach.status_code == 400, detach.text
+            assert detach.json()["detail"]["code"] == "not_source_owned"
+            assert reattach.status_code == 409, reattach.text
+            assert reattach.json()["detail"]["code"] == "not_detached"
 
     def test_model_crud_and_export(self, seeded_app_both):
         c = seeded_app_both["client"]
@@ -3402,6 +3560,20 @@ class TestSemanticLayerSmoke:
         )
         assert schema.status_code == 200
         assert "Dataset" in schema.json()["$defs"]
+
+        # The `agnes pull` delivery channel for the local semantic cache:
+        # RBAC-scoped bundle of every accessible status='valid' model.
+        bundle = c.get("/api/semantic-models/bundle", headers=h)
+        assert bundle.status_code == 200
+        body = bundle.json()
+        assert body["ttl_seconds"] > 0
+        assert body["generated_at"]
+        bundled = {m["slug"]: m for m in body["models"]}
+        assert "smoke_model" in bundled
+        # The renderer needs the document and the hash it caches against —
+        # both must actually be carried, not just the row's identity.
+        assert bundled["smoke_model"]["document_json"]
+        assert bundled["smoke_model"]["content_hash"]
 
         assert c.delete(f"/api/admin/semantic-models/{model_id}", headers=h).status_code == 204
 
@@ -3477,4 +3649,35 @@ class TestSemanticLayerSmoke:
         )
 
         assert c.post(f"/api/admin/semantic-sources/{source_id}/sync", headers=h).status_code == 200
+        assert c.delete(f"/api/admin/semantic-sources/{source_id}", headers=h).status_code == 204
+
+    def test_scheduled_sweep_syncs_a_registered_source(self, seeded_app_both):
+        """The ONE scheduled semantic refresh (#1707 Block 3 step 4), which
+        replaced the two per-connector triggers. An `upload`-kind source keeps
+        it network-free, so what this smokes is the part that differs per
+        backend: reading `semantic_sources` and writing `semantic_models`
+        through whichever repo pair is active."""
+        c = seeded_app_both["client"]
+        h = _admin_headers(seeded_app_both)
+
+        created = c.post(
+            "/api/admin/semantic-sources",
+            json={
+                "kind": "upload",
+                "name": "sweep smoke source",
+                "adapter": "native",
+                "config": {"documents": [_SEMANTIC_DOC]},
+            },
+            headers=h,
+        )
+        assert created.status_code == 201
+        source_id = created.json()["id"]
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=h)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["status"] == "ok"
+        assert {"synced", "failed", "skipped_disabled", "sources", "run_id"} <= set(body)
+        assert {s["id"]: s["status"] for s in body["sources"]}[source_id] == "ok"
+
         assert c.delete(f"/api/admin/semantic-sources/{source_id}", headers=h).status_code == 204

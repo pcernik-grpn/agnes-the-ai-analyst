@@ -91,17 +91,21 @@ def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
         glossary_repo().create(id=f"g{i}", term=f"Term {i}", definition="What it means here.")
 
 
-def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
-    """The semantic layer closes the page; it is NOT part of the inventory.
+def test_library_shows_definitions_on_the_semantic_models_band(seeded_app):
+    """The metric and glossary registries are a DESTINATION, not inventory.
 
-    It shipped briefly as a "Definitions" band holding two rows, and that was
-    wrong: metrics and glossary terms are the one thing here nobody owns,
-    shares, installs, drops or edits, so as rows they had to blank all four of
-    the table's columns at once (Owner / Sharing / Stack / Actions). Four
-    special-cased columns is the list saying the object is not one of its rows.
-    A data package looks similar but differs where it counts — access to it
-    varies per caller, which is what makes it "what I have"; everyone has the
-    whole glossary.
+    Two things were conflated here and the split is the whole point. A metric
+    or a glossary term is the one thing on this page nobody owns, shares,
+    installs, drops or edits, so as a row it would blank all four of the
+    table's columns at once (Owner / Sharing / Access / Actions) — and four
+    special-cased columns is the list saying the object is not one of its
+    rows. It therefore stays a pair of LINKS.
+
+    Where those links live did change (#1707 N3): they used to close the page
+    as a footer aside below an unbounded list, i.e. after every row. They now
+    ride the band of the Library's own "Semantic models" section, which holds
+    the stored documents those registries are projected from — documents that
+    answer all four columns honestly and ARE rows.
     """
     _seed_definitions(metrics=2, terms=3)
     c = seeded_app["client"]
@@ -110,9 +114,11 @@ def test_library_shows_definitions_as_a_footer_not_a_row(seeded_app):
     assert 'id="lib-defs"' in r.text
     assert "2 metrics" in r.text
     assert "3 glossary terms" in r.text
-    assert 'href="/catalog/semantics#metrics"' in r.text
-    assert 'href="/catalog/semantics#glossary"' in r.text
-    # Not inventory: no band, no row, no kind.
+    # Into the folded tabs (#1707 N5), never the retired flat page.
+    assert 'href="/semantic-layer?tab=all_metrics"' in r.text
+    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    assert "/catalog/semantics" not in r.text
+    # Still not inventory: the definitions themselves are no row and no kind.
     assert 'data-lib-sec="definitions"' not in r.text
     assert 'data-kind="definitions"' not in r.text
     # And not the retired header link either.

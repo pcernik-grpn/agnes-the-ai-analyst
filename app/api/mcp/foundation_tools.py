@@ -28,7 +28,7 @@ from pydantic import Field
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from src.mcp_tooling import ensure_output_size, progressive_tool
+from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
 
 
 def _raise_for_status_with_detail(r: httpx.Response) -> None:
@@ -76,6 +76,23 @@ def _split_marketplace_id(item_id: str) -> tuple[str, str, str]:
     return "flea", item_id.removeprefix("flea-"), ""
 
 
+# Server-level steering, shown to an MCP client BEFORE it calls anything —
+# the one place to say "look the term up before you compute it". Shared by
+# both transports (SSE `app/api/mcp_http.py`, Streamable-HTTP
+# `app/api/mcp_streamable.py`); they carried byte-identical hand-copies, which
+# is how the 18-of-24 tool drift this module exists to prevent got started.
+# Token-budget sensitive: every client pays for this string on every session.
+SERVER_INSTRUCTIONS = (
+    "Agnes is a self-hosted AI harness for the organization's data, skills, and memory. "
+    "Use `catalog` first to discover available tables, then `schema` to "
+    "understand columns, `describe` for sample rows, and `query` to run SQL. "
+    "For a business term or metric, read its declared definition first — `glossary_search`, "
+    "then `get_semantic_context` — rather than inferring it from table or column names, "
+    "and call `validate_semantic_query` before running SQL that touches modeled data. "
+    "Run `server_info` to check connectivity at the start of a session."
+)
+
+
 FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "server_info",
     "catalog",
@@ -88,7 +105,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # Open semantic-layer contract (Task 12) — read-only search + get over
     # canonical Ossie semantic models. Triple-surface with
     # GET /api/semantic-models/search + GET /api/semantic-models/{slug}.yaml
-    # + `agnes admin semantic-model list/export`.
+    # + `agnes admin semantic list` / `agnes semantic-model export`.
     "semantic_model_search",
     "semantic_model_get",
     # Query-validation engine wiring (wave 3) — validate SQL against the
@@ -164,8 +181,63 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "admin_register_table",
     # Why imported metrics are missing — coverage of each Keboola project's
     # semantic layer against the table registry. Triple-surface with
-    # /api/admin/semantic-layer/coverage + `agnes admin semantic-layer coverage`.
+    # /api/admin/semantic-layer/coverage + `agnes admin semantic keboola-import`.
     "admin_semantic_layer_coverage",
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # which source wrote it. Triple-surface with
+    # /api/admin/semantic-coverage + `agnes admin semantic coverage tables`.
+    "admin_semantic_coverage",
+    # Cross-domain, cross-SOURCE completeness (F4.1) — what each connected
+    # source lacks in semantics/metrics/glossary/skill/agent/knowledge base.
+    # Triple-surface with /api/admin/semantic-model/coverage* + `agnes
+    # admin semantic coverage[ tag| untag]`. The tag/untag pair is NOT
+    # read_only and is deliberately NOT MCP-exempt: CONTRIBUTING.md's only
+    # standing exemptions are credential-provisioning writes and
+    # security-posture diagnostics, and "low-frequency admin action" is
+    # neither.
+    "semantic_model_coverage",
+    "semantic_model_coverage_tag",
+    "semantic_model_coverage_untag",
+    # Muting one of those checks (F4.3) — "I know, it is deliberate". The pair
+    # is NOT read_only and, like tag/untag above, is deliberately not
+    # MCP-exempt. The list rides along on purpose: a mute an agent can create
+    # but never SEE is the anonymous disappearance the feature exists to
+    # prevent.
+    "semantic_mutes_list",
+    "mute_semantic_check",
+    "unmute_semantic_check",
+    # The three admin families that had REST + CLI and no MCP (#1707): where
+    # documents are synced FROM, taking a model off that sync path, and which
+    # Data Package carries it to non-admin readers. Triple-surface with
+    # /api/admin/semantic-sources* + /api/admin/semantic-models/{id}/
+    # {detach,reattach} + /api/admin/semantic-models/{slug}/packages* and
+    # `agnes admin semantic source add|list|sync|rm` / `detach` / `reattach` /
+    # `link-package` / `unlink-package`. Admin-gated, not MCP-exempt — same
+    # reasoning as the tag/untag and mute pairs above.
+    "semantic_source_add",
+    "semantic_source_list",
+    "semantic_source_sync",
+    "semantic_source_remove",
+    "semantic_model_detach",
+    "semantic_model_reattach",
+    "semantic_model_link_package",
+    "semantic_model_unlink_package",
+    # Is the layer trustworthy right now (F4.2) — sync failures, models whose
+    # source is gone, invalid documents, three static document-quality checks,
+    # F4.1's coverage roll-up, and every active mute, in one call. Triple-
+    # surface with GET /api/admin/semantic-layer/health + `agnes admin
+    # semantic health`.
+    "semantic_layer_health",
+    # "That answer looked wrong" (F4.5). `flag_semantic_issue` is the one tool
+    # here an ORDINARY caller may use — the agent that cannot ground its own
+    # answer is the intended reporter, which is why it is not admin-gated and
+    # why the workspace prompt tells the agent to offer filing one. The other
+    # two are the admin side of the same queue; same reasoning as the tag/untag
+    # pair above for why they are not MCP-exempt.
+    "flag_semantic_issue",
+    "semantic_feedback_list",
+    "semantic_feedback_resolve",
     # Maintained digests (K4, #799) — admin CRUD, triple-surface with
     # /api/admin/knowledge-digests* + `agnes admin digest`.
     "admin_knowledge_digests_list",
@@ -371,7 +443,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def catalog() -> dict:
-        """List all tables available to you (RBAC-filtered).
+        """List all tables available to you (RBAC-filtered). Table and column names are not definitions — for what a business term or metric MEANS here, call ``glossary_search`` / ``get_semantic_context`` before writing SQL.
 
         Returns a dict with a ``tables`` list.  Each entry has:
         - ``id``         — use this in schema / describe / query calls
@@ -481,7 +553,7 @@ def register_foundation_tools(
         public). Results are typed ``chunk | knowledge | table | metric | glossary``;
         a ``table`` hit means structured data: pivot to SQL via the ``query``
         tool with the hit's ``table_id`` instead of reading text chunks.
-        A ``metric`` hit links to /catalog/semantics#metrics; a ``glossary``
+        A ``metric`` hit links to /semantic-layer?tab=all_metrics; a ``glossary``
         hit carries the term definition inline.
         The response's ``retrieval`` field labels the chunk engine's mode:
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded
@@ -514,7 +586,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def glossary_search(query: str, k: int = 10) -> dict:
-        """Search Keboola-imported business-term definitions (glossary).
+        """Search business-term definitions (glossary), from any semantic model source.
 
         Relevance-ranked (BM25) search across term + definition, RBAC tier
         matches knowledge_search (any authenticated user). Use this to
@@ -610,7 +682,9 @@ def register_foundation_tools(
         ``used_metrics``, ``matched_relationships``, ``violations``,
         ``post_execution_checks`` (rules that cannot be checked before
         running — never treated as a violation), ``sql_dialects``,
-        ``mixed_dialect_warning``, ``locally_executable``, ``summary``, plus
+        ``mixed_dialect_warning``, ``locally_executable`` +
+        ``not_executable_metrics`` (which used metrics made it false — name
+        those, not every metric you used), ``summary``, plus
         the ``matched_expected_objects``/``missing_expected_objects``/
         ``unexpected_detected_objects`` trio when ``expected`` was passed.
         When you have no accessible ``status='valid'`` semantic model, this
@@ -633,7 +707,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def get_semantic_context(
-        semantic_type: Literal["dataset", "metric", "relationship"],
+        semantic_type: Literal["dataset", "metric", "relationship"] | list[str],
         ids: list[str] | None = None,
         model_ids: list[str] | None = None,
     ) -> dict:
@@ -651,19 +725,45 @@ def register_foundation_tools(
         contributes no objects, silently — not an error. Mirrors
         ``GET /api/semantic-models/context`` and `agnes semantic-model context`.
 
+        BATCH — do this in ONE call, not N:
+
+        - ``semantic_type=["dataset", "metric", "relationship"]`` is the whole
+          layer, compactly, in a single round trip. Make this your first call.
+        - ``semantic_type="metric", ids=["revenue", "aov", "margin", ...]``
+          returns full detail for every id at once. Twenty separate one-id
+          calls cost twenty round trips and leave twenty tool results in
+          context for the same answer.
+
+        And once read, work from what you already have — re-fetching a
+        definition you looked up earlier in the session buys nothing.
+
         Args:
-            semantic_type: ``dataset``, ``metric``, or ``relationship``.
-            ids: Specific object names to fetch in full. Omit (or pass an
-                empty list) for every object of this type, compactly.
+            semantic_type: ``dataset``, ``metric``, ``relationship`` — or a
+                LIST of them to fetch several types in one call.
+            ids: Specific object names to fetch in full — pass them all in
+                one call. Omit (or pass an empty list) for every object of
+                the requested type(s), compactly. With several types, the
+                same id filter applies to each; a type with no match simply
+                contributes nothing.
             model_ids: Restrict to these models by id, slug, or model name
                 (the ``model`` label each returned object carries; matched
                 case-insensitively). Omit for every model you can access.
 
         Returns ``{"results": [{"semantic_type", "mode", "objects": [...]}],
-        "unknown_types": [...]}``. Each object carries ``"model"`` (which
-        semantic model it came from) alongside its own attributes.
+        "unknown_types": [...], "model_hashes": {slug: content_hash}}`` — one
+        ``results`` entry per requested type. Each
+        object carries ``"model"`` (which semantic model it came from)
+        alongside its own attributes. ``model_hashes`` covers every model you
+        can access (not narrowed by ``model_ids``) — use it to check whether
+        a local `semantic/<slug>/…` cache file `agnes pull` wrote (header
+        `content_hash`) is still current once its `ttl_seconds` has elapsed.
         """
-        params: dict[str, Any] = {"selections": json.dumps([{"semantic_type": semantic_type, "ids": ids or None}])}
+        # The wire endpoint has always accepted a LIST of selections; this
+        # tool used to hardcode a one-element list, which is what made a
+        # "what exists here?" bootstrap cost one round trip per type.
+        requested = [semantic_type] if isinstance(semantic_type, str) else list(semantic_type)
+        selections = [{"semantic_type": t, "ids": ids or None} for t in requested]
+        params: dict[str, Any] = {"selections": json.dumps(selections)}
         if model_ids:
             params["model_ids"] = model_ids
         async with httpx.AsyncClient() as c:
@@ -1075,7 +1175,7 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def query(sql: str, limit: int = 1000) -> dict:
-        """Execute a SQL query against Agnes data.
+        """Execute a SQL query against Agnes data. Check SQL that touches modeled data with ``validate_semantic_query`` first; the response may also carry a ``semantic_validation`` field — advisory warnings about the statement, never a block.
 
         For local and materialized tables the query runs against the server-side
         DuckDB view.  For remote (BigQuery) tables it passes through to BigQuery.
@@ -1086,12 +1186,20 @@ def register_foundation_tools(
             limit: Maximum rows to return (default 1000).
 
         Returns ``{"columns": [...], "rows": [[...], ...], "truncated": bool,
-        "row_scope": {"policied_tables": [...], "note": str} | None}``.
+        "row_scope": {"policied_tables": [...], "note": str} | None,
+        "semantic_validation": {...} | None}``.
         ``row_scope`` is present when a table this query touched has an
         access policy applied — the result is YOUR scoped slice, not the
         whole table. When present, state that qualification in your answer;
         never present an aggregate over the result as an organisation-wide
         figure.
+
+        ``semantic_validation`` is present only when the semantic layer has
+        something to say about the statement — an error-severity constraint
+        violation, or a used metric with no expression for the engine that
+        ran it. Enforcement is SOFT: the rows are unaffected and the status
+        is still 200. Its ``warnings`` list is the human-readable form; say
+        the qualification out loud rather than reporting the number alone.
         """
         async with httpx.AsyncClient() as c:
             r = await c.post(
@@ -1101,7 +1209,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return ensure_output_size(r.json(), "query")
+            return ensure_query_output_size(r.json())
 
     @tool(read_only=True)
     async def skills() -> dict:
@@ -1984,7 +2092,7 @@ def register_foundation_tools(
         semantic layer usually describes more than an instance registers.
 
         Mirrors ``GET /api/admin/semantic-layer/coverage`` and
-        ``agnes admin semantic-layer coverage``.
+        ``agnes admin semantic keboola-import``.
 
         Requires an admin PAT.
         """
@@ -1993,6 +2101,659 @@ def register_foundation_tools(
                 f"{base_url}/api/admin/semantic-layer/coverage",
                 headers=headers_fn(),
                 timeout=60,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_semantic_coverage() -> dict:
+        """List registered tables with NO valid semantic model at all (admin only).
+
+        Source-agnostic — unlike ``admin_semantic_layer_coverage`` (Keboola
+        metric importability, predicted live against one project's
+        Metastore), this reads what is already stored in the semantic-model
+        registry regardless of source (Keboola, git, manual, upload,
+        connection) and answers a narrower question: does a registered
+        table appear in ANY valid model's datasets at all.
+
+        Returns ``{"tables": [...]}`` — full table_registry rows. Mirrors
+        ``GET /api/admin/semantic-coverage`` and `agnes admin semantic
+        coverage tables`.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-coverage",
+                headers=headers_fn(),
+                timeout=60,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_model_coverage(source: str = "") -> dict:
+        """What each connected data source still lacks, across every domain (admin only).
+
+        One entry per data source, one status per domain — semantic model,
+        metrics, glossary, skill, agent, knowledge base — as ``ok`` /
+        ``partial`` / ``missing`` / ``not_applicable``, each with a
+        one-sentence ``detail`` and, where a create flow exists, an
+        ``action``. Use it to answer "what is undocumented here" rather than
+        guessing from an empty catalog.
+
+        ``not_applicable`` is NOT a gap: it means the domain cannot be filled
+        for that source type in this build (e.g. no semantic-layer adapter
+        exists for it), so do not report it as work to do.
+
+        Broader than ``admin_semantic_layer_coverage`` above, which covers
+        Keboola's metric binding only — that report is one provider inside
+        this one, and rides along per-source as ``domains.semantic.raw``.
+
+        Args:
+            source: Optional source connection id to narrow to. ``__local__``
+                is the synthetic bucket for registered tables that belong to
+                no connection.
+
+        Mirrors ``GET /api/admin/semantic-model/coverage`` and
+        ``agnes admin semantic coverage``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-model/coverage",
+                params={"source": source} if source else None,
+                headers=headers_fn(),
+                timeout=60,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_tag(resource_type: str, resource_id: str, source_id: str) -> dict:
+        """Record that a skill / agent / knowledge domain is ABOUT a data source (admin only).
+
+        The one input the coverage report cannot derive: skills, agents and
+        memory domains live in their own tables with no notion of a source.
+
+        Args:
+            resource_type: ``marketplace_plugin`` (a skill) | ``agent`` |
+                ``memory_domain`` (a knowledge base).
+            resource_id: The same id format the RBAC grant for that type
+                uses — ``<marketplace_id>/<plugin_name>`` for a plugin, the
+                row id for an agent or memory domain.
+            source_id: The ``source_connections.id`` the resource is about.
+
+        Mirrors ``POST /api/admin/semantic-model/coverage/tags`` and
+        ``agnes admin semantic coverage tag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-model/coverage/tags",
+                json={
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "source_id": source_id,
+                },
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_coverage_untag(tag_id: str) -> dict:
+        """Remove one source tag (admin only).
+
+        Args:
+            tag_id: The tag's id, as carried in
+                ``semantic_model_coverage``'s ``domains.<domain>.raw``.
+
+        Mirrors ``DELETE /api/admin/semantic-model/coverage/tags/{tag_id}``
+        and ``agnes admin semantic coverage untag``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-model/coverage/tags/{tag_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return {"deleted": tag_id}
+
+    @tool(read_only=True)
+    async def semantic_mutes_list(include_expired: bool = False) -> dict:
+        """List the semantic-layer checks an admin has deliberately silenced (admin only).
+
+        Read this before reporting a coverage or health gap as news: a scope
+        listed here is one somebody has already seen, judged expected, and
+        signed for. Each entry carries ``scope``, ``muted_by``, ``muted_at``
+        and (when given) ``reason`` — the reason is usually the answer to "why
+        is this still missing".
+
+        Args:
+            include_expired: Also return mutes whose expiry has passed. They no
+                longer silence anything, but the record of who chose it stands.
+
+        Mirrors ``GET /api/admin/semantic-layer/mutes`` and
+        ``agnes admin semantic mutes``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                params={"include_expired": "true"} if include_expired else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def mute_semantic_check(scope: str, reason: str = "", expires_at: str = "") -> dict:
+        """Silence one semantic-layer check that is known and expected (admin only).
+
+        OFFER this rather than reaching for it: muting is how a real gap stops
+        being reported, and the caller's identity, the time and the reason are
+        stored on the row and shown everywhere the mute appears. Say what you
+        would mute and why, and file it once the user agrees. Never as a way to
+        make a finding you could not explain go away.
+
+        409 if the scope is already muted — read ``semantic_mutes_list`` first;
+        somebody may have signed for it already.
+
+        Args:
+            scope: ``domain:<domain>`` (one domain across every source),
+                ``source:<source_id>`` (one source entirely), or
+                ``source:<source_id>:domain:<domain>`` (a single cell). The
+                domains are the ones ``semantic_model_coverage`` reports;
+                ``__local__`` is the source id of the no-connection bucket.
+            reason: Why the check is expected. Optional at the API and strongly
+                worth filling: it is what the next reader inherits.
+            expires_at: ISO-8601 instant at which the check starts reporting
+                again (e.g. ``2026-10-01T00:00:00Z``). Omit for "until somebody
+                unmutes it". Must be in the future.
+
+        Mirrors ``POST /api/admin/semantic-layer/mutes`` and
+        ``agnes admin semantic mute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        payload = {"scope": scope, "reason": reason or None, "expires_at": expires_at or None}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-layer/mutes",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def unmute_semantic_check(mute_id: str) -> dict:
+        """Let a silenced semantic-layer check report again (admin only).
+
+        Args:
+            mute_id: The mute's id, from ``semantic_mutes_list``.
+
+        Mirrors ``DELETE /api/admin/semantic-layer/mutes/{mute_id}`` and
+        ``agnes admin semantic unmute``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-layer/mutes/{mute_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return {"unmuted": mute_id}
+
+    # ── Where documents come from, and who they reach ────────────────────
+    #
+    # Sources, detach/reattach and the Data Package link pair had REST and
+    # CLI and no MCP tool (#1707). Nothing justified the gap: CONTRIBUTING's
+    # only standing MCP exemptions are credential-provisioning writes and
+    # security-posture diagnostics, and none of these is either. Every one is
+    # a thin wrapper over the endpoint the CLI already calls, so the admin
+    # gate, the validation and the Postgres-only refusals stay in the one
+    # place that owns them.
+
+    @tool(read_only=False)
+    async def semantic_source_add(
+        name: str,
+        kind: str,
+        adapter: str = "native",
+        config: dict | None = None,
+        enabled: bool = True,
+    ) -> dict:
+        """Register a place semantic-model documents are synced FROM (admin only).
+
+        A source is a standing instruction, not a one-off import: once
+        registered it is swept on a schedule, and the models it brings in are
+        owned by it — editing one through the API answers ``409
+        source_owned`` until it is detached. Register one when documents
+        should keep arriving; to load a document once, use
+        ``apply_semantic_model``.
+
+        Args:
+            name: Display name, shown wherever the source appears.
+            kind: ``git`` (clone a repository), ``upload`` (documents carried
+                in ``config.documents``), or ``connection`` (read an existing
+                connected system through its adapter).
+            adapter: Which reader turns the upstream into Ossie documents.
+                ``native`` is for documents that already ARE Ossie
+                (git/upload); a connection source uses its connector's own.
+                An unknown name is refused with the full list of registered
+                adapters, generated from the registry itself — which is why
+                this docstring does not restate it: the hand-written copy in
+                the CLI's `--adapter` help had already drifted to a name that
+                did not exist, and a second copy here would be the same bug
+                waiting to happen.
+            config: Kind-specific settings — git: ``repo_url`` (+ optional
+                ``ref``, ``glob``, ``token_env``); upload: ``documents``;
+                connection: ``connection_id``. Provenance keys are refused:
+                a source may not claim to be another source.
+            enabled: False registers it excluded from sync — both the
+                scheduled sweep and ``semantic_source_sync`` skip it until
+                it is enabled.
+
+        Mirrors ``POST /api/admin/semantic-sources`` and ``agnes admin
+        semantic source add``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-sources",
+                json={
+                    "name": name,
+                    "kind": kind,
+                    "adapter": adapter,
+                    "config": config or {},
+                    "enabled": enabled,
+                },
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_source_list(enabled_only: bool = False) -> dict:
+        """List the registered semantic-model sources and how their last sync went (admin only).
+
+        Read this before concluding a model is missing or stale: each row
+        carries ``last_sync_status``/``last_sync_at``, ``owned_model_count``
+        (did the last sync bring anything back) and ``scan_scope`` (what it
+        actually looked at). ``ok`` with zero owned models and a named scope
+        is the signature of a source whose credentials cannot see the
+        upstream it is pointed at — not of an empty upstream.
+
+        Args:
+            enabled_only: Only sources that participate in sync. Disabled
+                ones are skipped by the sweep, which is usually the answer to
+                "why has nothing arrived".
+
+        Returns ``{"sources": [...]}``.
+
+        Mirrors ``GET /api/admin/semantic-sources`` and ``agnes admin
+        semantic source list``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-sources",
+                params={"enabled_only": "true"} if enabled_only else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return ensure_output_size(
+                {"sources": r.json()},
+                "semantic_source_list",
+                hint="an `upload` source carries its whole documents in `config`; "
+                "read one source at a time through the REST API, or narrow with `enabled_only`",
+            )
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_source_sync(source_id: str) -> dict:
+        """Fetch one semantic source now, instead of waiting for the sweep (admin only).
+
+        Imports what the source currently holds and PRUNES, within that
+        source's own provenance, the models it no longer sends — deleting
+        them and their Data Package links. That is why this is flagged
+        destructive despite being routine: an upstream that has dropped a
+        document (or a misconfigured scope that can no longer see it) takes
+        the model with it, and nothing here can put it back. It never touches
+        another source's models or a hand-authored one, and a detached model
+        keeps its local edits — sync records drift instead of overwriting it.
+
+        Additive to the schedule, not a substitute: the report it returns
+        (imported / updated / pruned / failed, with per-document errors) is
+        the fastest way to see why a source is not producing what was
+        expected. 409 if the source is disabled — that is deliberate
+        exclusion, so enable it first rather than working around it.
+
+        Args:
+            source_id: The source's id, from ``semantic_source_list``.
+
+        Mirrors ``POST /api/admin/semantic-sources/{source_id}/sync`` and
+        ``agnes admin semantic source sync``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-sources/{source_id}/sync",
+                headers=headers_fn(),
+                # A sync clones a repository or queries an upstream system;
+                # the CLI gives it room and so does this.
+                timeout=300,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_source_remove(source_id: str) -> dict:
+        """Stop syncing from a semantic source (admin only).
+
+        Deletes the source ROW. The models it already imported stay — they
+        keep its provenance and simply stop being refreshed, which is what
+        makes them show up as orphaned in ``semantic_layer_health``. Nothing
+        recreates the row: registering it again is a new source, and the
+        first sync re-adopts the models by provenance.
+
+        Prefer disabling it (``enabled: false``) when the intent is "pause
+        this", not "forget where these came from".
+
+        Args:
+            source_id: The source's id, from ``semantic_source_list``.
+
+        Mirrors ``DELETE /api/admin/semantic-sources/{source_id}`` and
+        ``agnes admin semantic source rm``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-sources/{source_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return {"deleted": source_id}
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_model_detach(model_ref: str, confirm_detach: bool) -> dict:
+        """Take a source-owned semantic model off the sync path so it can be edited (admin only).
+
+        The escape hatch out of ``409 source_owned``: the model stays where it
+        is and keeps its provenance, but sync stops overwriting it and starts
+        recording drift instead. From here ``apply_semantic_model`` and the
+        admin edit surfaces work on it — and it stops receiving upstream
+        corrections, which is the cost. ``semantic_model_reattach`` undoes it.
+
+        Args:
+            model_ref: The model's id or slug.
+            confirm_detach: Must be passed explicitly. Ask the user before
+                setting it to True — this is a danger flow, and the endpoint
+                refuses ``confirm_required`` without it rather than the tool
+                deciding on the caller's behalf.
+
+        Mirrors ``POST /api/admin/semantic-models/{model_ref}/detach`` and
+        ``agnes admin semantic detach``.
+
+        Requires an admin PAT, and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{model_ref}/detach",
+                json={"confirm_detach": confirm_detach},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False, destructive=True)
+    async def semantic_model_reattach(model_ref: str, confirm_reattach: bool) -> dict:
+        """Return a detached semantic model to the sync path (admin only).
+
+        The next sync run rewrites the document from the source, DISCARDING
+        every local edit made since it was detached — that is the whole point
+        of re-attaching, and why it is not reversible by re-detaching.
+        Unconfirmed, the endpoint answers a staleness preview instead of
+        acting (when it was detached, whether the source changed since); read
+        that back to the user before confirming.
+
+        Args:
+            model_ref: The model's id or slug.
+            confirm_reattach: Must be passed explicitly. Pass False first to
+                get the preview, then True once the user has agreed to lose
+                the local edits.
+
+        Mirrors ``POST /api/admin/semantic-models/{model_ref}/reattach`` and
+        ``agnes admin semantic reattach``.
+
+        Requires an admin PAT, and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend``).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{model_ref}/reattach",
+                json={"confirm_reattach": confirm_reattach},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_link_package(slug: str, package_id: str) -> dict:
+        """Give a semantic model a Data Package's audience (admin only).
+
+        A model linked to no package is readable by admins only, so this is
+        how a document reaches the analysts who are supposed to use it: it
+        inherits that package's grants for non-admin search and export.
+        Idempotent, and unaffected by ownership — the link lives in a
+        junction table, so a source re-sync cannot revert it.
+
+        Args:
+            slug: The model's slug.
+            package_id: The Data Package to link it to.
+
+        Returns ``{"package_ids": [...]}`` — every package now carrying the
+        model.
+
+        Mirrors ``POST /api/admin/semantic-models/{slug}/packages`` and
+        ``agnes admin semantic link-package``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-models/{slug}/packages",
+                json={"package_id": package_id},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def semantic_model_unlink_package(slug: str, package_id: str) -> dict:
+        """Take a semantic model out of a Data Package's audience (admin only).
+
+        Removes the junction row only — the model itself is untouched and
+        keeps every other package it is linked to. Once it is in none, it is
+        readable by admins only again. Idempotent on a pair that was never
+        linked.
+
+        Args:
+            slug: The model's slug.
+            package_id: The Data Package to unlink it from.
+
+        Returns ``{"package_ids": [...]}`` — the packages still carrying the
+        model.
+
+        Mirrors ``DELETE /api/admin/semantic-models/{slug}/packages/{package_id}``
+        and ``agnes admin semantic unlink-package``.
+
+        Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{base_url}/api/admin/semantic-models/{slug}/packages/{package_id}",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_layer_health() -> dict:
+        """Is the semantic layer trustworthy right now (admin only)?
+
+        Sync failures, models whose source was deleted or renamed away from
+        under them, metric bindings and profiled columns that outlived the
+        table they were bound to, documents that failed schema validation,
+        three static document-quality checks (a metric with no description,
+        one name defined twice with a different formula, a cross-dataset
+        metric with no declared relationship between the datasets it
+        touches), ``semantic_model_coverage``'s missing/partial counts rolled
+        up into one pair of numbers, and every currently active mute — so a
+        finding already silenced by an admin does not get reported as news
+        twice.
+
+        Mirrors ``GET /api/admin/semantic-layer/health`` and ``agnes admin
+        semantic health``.
+
+        Requires an admin PAT and the Postgres app-state backend (a DuckDB
+        instance answers ``501 requires_postgres_backend`` — the mute overlay
+        has no DuckDB implementation, and a health report that silently
+        dropped it would hide exactly what F4.3 exists to keep visible).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-layer/health",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False, idempotent=False)
+    async def flag_semantic_issue(
+        question: str,
+        sql: str | None = None,
+        metric_id: str | None = None,
+        comment: str | None = None,
+    ) -> dict:
+        """Report that an answer looked wrong or could not be supported by the semantic layer.
+
+        Call this when a number cannot be traced to a documented metric, when a
+        metric's definition contradicts what the question asked for, or when a
+        concept in the question is not defined anywhere in the layer. OFFER it
+        to the user first and file it once they agree — never silently, and
+        never instead of answering.
+
+        This is the only write on this surface an ordinary (non-admin) caller
+        may make, deliberately: whoever read the doubtful answer is the one who
+        knows it was doubtful, and that is rarely an admin. An admin then works
+        the queue (``semantic_feedback_list`` / ``semantic_feedback_resolve``).
+
+        Args:
+            question: The question as asked, in the asker's own words — the
+                evidence for what the semantic layer failed to answer.
+            sql: The SQL that produced the suspect answer, if there was any.
+            metric_id: Metric id the answer relied on (e.g. ``revenue/mrr``).
+            comment: What looks wrong about it.
+
+        Mirrors ``POST /api/semantic-feedback`` and
+        ``agnes semantic-model feedback submit``.
+
+        Requires the Postgres app-state backend (a DuckDB instance answers
+        ``501 requires_postgres_backend``).
+        """
+        payload = {"question": question, "sql": sql, "metric_id": metric_id, "comment": comment}
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/semantic-feedback",
+                json={k: v for k, v in payload.items() if v is not None},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def semantic_feedback_list(status: str = "") -> dict:
+        """List reported semantic-layer issues (admin only).
+
+        The queue behind ``flag_semantic_issue`` — what people and agents said
+        looked wrong, newest first, each with who filed it and (once closed)
+        who resolved it and how.
+
+        Args:
+            status: Optional filter — ``open``, ``acknowledged`` or
+                ``resolved``. Omit for every report.
+
+        Mirrors ``GET /api/admin/semantic-feedback`` and
+        ``agnes admin semantic feedback list``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/semantic-feedback",
+                params={"status": status} if status else None,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+        # The queue only grows, and each report carries a question, a comment
+        # and possibly a whole query — so it is one of the few admin lists that
+        # can genuinely outgrow a model's context. Refuse loudly rather than
+        # return a silently truncated queue.
+        return ensure_output_size(
+            r.json(),
+            "semantic_feedback_list",
+            hint="narrow with `status='open'`",
+        )
+
+    @tool(read_only=False)
+    async def semantic_feedback_resolve(feedback_id: str, resolution_note: str = "") -> dict:
+        """Close one reported semantic-layer issue, on the record (admin only).
+
+        Args:
+            feedback_id: The report's id, from ``semantic_feedback_list``.
+            resolution_note: What was done about it — stored on the report, so
+                the next reader of the same question can see the answer.
+
+        Mirrors ``POST /api/admin/semantic-feedback/{id}/resolve`` and
+        ``agnes admin semantic feedback resolve``.
+
+        Requires an admin PAT and the Postgres app-state backend.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/semantic-feedback/{feedback_id}/resolve",
+                json={"resolution_note": resolution_note or None},
+                headers=headers_fn(),
+                timeout=30,
             )
             _raise_for_status_with_detail(r)
             return r.json()
@@ -2832,7 +3593,11 @@ def register_foundation_tools(
         # itself via a same-origin re-fetch of the grant endpoint.
         return {"render": "data_app_preview", "slug": slug, "url": url}
 
-    @tool(read_only=False, idempotent=True)
+    # Read-only, and honestly so — see the note on the stdio twin in
+    # cli/mcp/server.py: both tools return a render directive and make no
+    # server call, and a client that confirms non-read-only calls would put
+    # an approval card in front of every preview refresh.
+    @tool(read_only=True, idempotent=True)
     async def agnes_data_app_refresh(slug: str) -> dict:
         """Force-reload the in-chat preview pane for a hosted data app.
 
@@ -2848,7 +3613,7 @@ def register_foundation_tools(
         """
         return {"render": "data_app_preview_refresh", "slug": slug}
 
-    @tool(read_only=False, destructive=True)
+    @tool(read_only=True, idempotent=True)
     async def agnes_data_app_close(slug: str) -> dict:
         """Tear down the in-chat preview pane for a hosted data app.
 

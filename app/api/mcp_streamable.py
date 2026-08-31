@@ -8,8 +8,8 @@ prefer, protected by native OAuth 2.1 + PKCE.
 The SSE app continues to live at /api/mcp/sse for Cowork back-compat —
 this module does NOT replace it.
 
-Authentication path
--------------------
+Authentication path (primary — OAuth 2.1)
+-----------------------------------------
 1. MCP client discovers  GET /.well-known/oauth-protected-resource
    which points to the authorization server at /api/mcp/http.
 2. Client registers via POST /api/mcp/http/register (RFC 7591).
@@ -20,6 +20,18 @@ Authentication path
 5. All subsequent MCP requests carry  Authorization: Bearer <JWT>.
    The JWT is a standard Agnes session JWT — resolve_token_to_user
    accepts it and all RBAC applies unchanged.
+
+Second accepted credential — a plain Agnes PAT
+----------------------------------------------
+``Authorization: Bearer <PAT>`` also authenticates here, so the credential
+the ``/mcp-connect`` page issues works on BOTH HTTP transports rather than
+only on SSE (where it always did). The check lives in the SDK's verifier
+seam — ``AgnesMCPOAuthProvider.load_access_token`` → ``_access_token_from_
+pat`` in app/auth/mcp_oauth.py — and runs only AFTER the OAuth store misses,
+so OAuth issuance, expiry and RFC 7009 revocation are unaffected. It accepts
+``typ="pat"`` and nothing else; that function documents why the line is drawn
+there (a session JWT, including an OAuth token this server itself minted, must
+not ride in on it).
 
 Tools
 -----
@@ -48,7 +60,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.api.mcp.foundation_tools import register_foundation_tools
+from app.api.mcp.foundation_tools import SERVER_INSTRUCTIONS, register_foundation_tools
 from app.auth.mcp_oauth import AgnesMCPOAuthProvider
 from app.auth.public_url import mcp_issuer_url, pinned_public_base_url, public_base_url
 
@@ -541,12 +553,7 @@ def _make_streamable_app() -> ASGIApp:
 
     mcp = FastMCP(
         "Agnes",
-        instructions=(
-            "Agnes is a self-hosted AI harness for the organization's data, skills, and memory. "
-            "Use `catalog` first to discover available tables, then `schema` to "
-            "understand columns, `describe` for sample rows, and `query` to run SQL. "
-            "Run `server_info` to check connectivity at the start of a session."
-        ),
+        instructions=SERVER_INSTRUCTIONS,
         # DNS-rebinding/Host-header protection is disabled deliberately: this is
         # a REMOTE connector reached through a TLS-terminating reverse proxy on a
         # fixed FQDN (operators set AGNES_BASE_URL to that host), and the proxy

@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HOOK = Path("app/initial_workspace_default/.claude/hooks/pre_tool_use.py")
 
 
@@ -62,6 +64,117 @@ def test_prompts_for_admin_grant():
         }
     )
     assert out.get("permissionDecision") == "ask"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "agnes app create --slug demo --repo x",
+        "agnes app deploy demo --mode dev",
+        "agnes app stop demo",
+        "agnes app delete demo",
+        "agnes app draft create demo",
+        "agnes app draft delete demo demo-draft",
+        "agnes app git-credential demo",
+        "agnes app set-description demo 'new text'",
+    ],
+)
+def test_prompts_for_data_app_mutations(command):
+    """The same mutations the chat approval gate raises a card for over MCP
+    (`data_app_deploy`, `data_app_delete_draft`, …) are one Bash call away
+    through the CLI. Without a matching `ask` here, the gate is a front door
+    with the back door open."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") == "ask", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["agnes app list", "agnes app show demo", "agnes app logs demo", "agnes app open demo"],
+)
+def test_read_only_data_app_commands_run_unasked(command):
+    """Reads must not cost a click — the MCP twins (`data_apps_list`,
+    `data_app_get`, `data_app_logs`) are annotated read-only."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") in (None, "allow"), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Canonical (post-Block-6) spellings.
+        "agnes semantic-model apply model.yaml",
+        "agnes admin semantic import model.yaml",
+        "agnes admin semantic delete acme-model",
+        "agnes admin semantic detach acme-model",
+        "agnes admin semantic reattach acme-model --source src-1",
+        "agnes admin semantic link-package acme-model --package pkg-1",
+        "agnes admin semantic unlink-package acme-model --package pkg-1",
+        "agnes admin semantic source add --kind git --url https://api.github.com/acme/repo.git",
+        "agnes admin semantic source sync src-1",
+        "agnes admin semantic source rm src-1",
+        "agnes admin semantic mute source:src-1",
+        "agnes admin semantic unmute mute-1",
+        "agnes admin semantic coverage tag agent agent-1 --source src-1",
+        "agnes admin semantic coverage untag tag-1",
+        "agnes admin semantic feedback resolve fb-1",
+        # Deprecated one-release aliases — same functions, different spelling.
+        "agnes admin semantic-model import model.yaml",
+        "agnes admin semantic-model detach acme-model",
+        "agnes admin semantic-model reattach acme-model --source src-1",
+        "agnes admin semantic-model link-package acme-model --package pkg-1",
+        "agnes admin semantic-model unlink-package acme-model --package pkg-1",
+        "agnes admin semantic-source add --kind git --url https://api.github.com/acme/repo.git",
+        "agnes admin semantic-source sync src-1",
+        "agnes semantic-model mute source:src-1",
+        "agnes semantic-model unmute mute-1",
+        "agnes semantic-model coverage tag agent agent-1 --source src-1",
+        "agnes semantic-model coverage untag tag-1",
+        "agnes semantic-model feedback resolve fb-1",
+    ],
+)
+def test_prompts_for_semantic_layer_mutations(command):
+    """The same mutations the chat approval gate raises a card for over MCP
+    (`apply_semantic_model`, `mute_semantic_check`, `semantic_model_coverage_tag`,
+    `semantic_feedback_resolve`, …) are one Bash call away through the CLI —
+    including the deprecated one-release aliases, which delegate to the exact
+    same functions. Without a matching `ask` here, an admin-identity chat
+    session can overwrite a live semantic model unconfirmed."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") == "ask", command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "agnes semantic-model search revenue",
+        "agnes semantic-model show acme-model",
+        "agnes semantic-model export acme-model",
+        "agnes semantic-model validate model.yaml",
+        "agnes semantic-model context --semantic-type metric",
+        "agnes semantic-model schema --semantic-type dataset",
+        'agnes semantic-model validate-query "SELECT 1"',
+        "agnes semantic-model feedback submit acme-model 'looks wrong'",
+        "agnes semantic-model health",
+        "agnes semantic-model mutes",
+        "agnes semantic-model feedback list",
+        "agnes admin semantic list",
+        "agnes admin semantic show acme-model",
+        "agnes admin semantic source list",
+        "agnes admin semantic coverage show",
+        "agnes admin semantic coverage tables",
+        "agnes admin semantic keboola-import",
+        "agnes admin semantic health",
+        "agnes admin semantic mutes",
+        "agnes admin semantic feedback list",
+    ],
+)
+def test_read_only_semantic_layer_commands_run_unasked(command):
+    """Reads must not cost a click — the MCP twins (`semantic_model_search`,
+    `semantic_layer_health`, `semantic_mutes_list`, …) are annotated
+    read-only, and `validate`/`export` never left the any-user tier."""
+    rc, out = _run({"tool_name": "Bash", "tool_input": {"command": command}})
+    assert out.get("permissionDecision") in (None, "allow"), command
 
 
 SETTINGS = Path("app/initial_workspace_default/.claude/settings.json")

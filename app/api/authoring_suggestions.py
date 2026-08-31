@@ -60,6 +60,8 @@ from src.repositories import (
     data_packages_repo,
     memory_domains_repo,
 )
+from src.semantic.document_validation import validate_document
+from src.semantic_autodraft import clear_pending_for_document
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +214,40 @@ def _replay_semantic_model(payload: dict, by: str, submitted_by: Optional[str] =
         description=payload.get("description"),
         expected_content_hash=payload.get("expected_content_hash"),
     )
+    # Auto-draft dedup (semantic-phase5 wave 2): a table's
+    # `semantic_draft_pending_at` flag is set the moment its sweep-triggered
+    # session was invoked, regardless of who ultimately proposed the model
+    # that resolves it (the auto-draft session itself, or an unrelated human
+    # submission for the same table). Clearing it here — using the just-
+    # validated `document_json`, not a re-parse of the raw payload — covers
+    # both. Best-effort: a clearing failure must not turn a successful
+    # approve into a 500; the flag simply stays set until an admin clears it
+    # by hand or a later resolution clears it instead.
+    try:
+        clear_pending_for_document(row.get("document_json") or {})
+    except Exception:
+        logger.exception("authoring: failed to clear semantic_draft_pending_at after approving model %s", row.get("id"))
     return row["id"]
+
+
+def _clear_semantic_draft_pending_side_effect(payload: dict, resource_id: Optional[str]) -> None:
+    """Reject-path counterpart to the clearing ``_replay_semantic_model``
+    does on approve — a REJECTED draft must be just as eligible for a fresh
+    sweep as an approved one. Parses the raw ``document`` text (a rejected
+    suggestion was never validated by ``apply_manual_model``, so there is no
+    already-parsed ``document_json`` to reuse) and swallows a parse/resolve
+    failure rather than raise: this is dedup housekeeping, not the reject
+    itself, and must never turn a successful reject into a 500."""
+    del resource_id  # unused — a reject never creates a resource
+    document = payload.get("document")
+    if not document:
+        return
+    try:
+        result = validate_document(document)
+        if result.ok and result.parsed:
+            clear_pending_for_document(result.parsed)
+    except Exception:
+        logger.exception("authoring: failed to clear semantic_draft_pending_at on reject")
 
 
 _SAFE_REPLAY = {
@@ -221,6 +256,17 @@ _SAFE_REPLAY = {
     "mcp": _replay_mcp,
     "marketplace": _replay_marketplace,
     "semantic-layer": _replay_semantic_model,
+}
+
+# Generic per-domain side effect run from `_resolve()` after ANY successful
+# state write (approve or reject alike) — unlike `_SAFE_REPLAY`, which only
+# ever runs on approve. Currently only `_resolve()` itself calls this (i.e.
+# only the reject path today, since `approve_suggestion` below has its own
+# inline flow and handles its domain's side effect directly via
+# `_replay_semantic_model`), but the dict is domain-keyed and reads the
+# resolved row's own payload, so it generalizes to any future call site.
+_SIDE_EFFECTS = {
+    "semantic-layer": _clear_semantic_draft_pending_side_effect,
 }
 
 public_router = APIRouter(prefix="/api/studio", tags=["authoring-suggestions"])
@@ -337,7 +383,8 @@ def _resolve(
     created_resource_id: Optional[str] = None,
 ) -> dict:
     repo = authoring_suggestions_repo()
-    if repo.get(sid) is None:
+    sug = repo.get(sid)
+    if sug is None:
         raise HTTPException(status_code=404, detail={"kind": "not_found"})
     flipped = repo.resolve(
         sid,
@@ -348,6 +395,12 @@ def _resolve(
     )
     if not flipped:
         raise HTTPException(status_code=409, detail={"kind": "already_resolved"})
+    side_effect = _SIDE_EFFECTS.get(sug["domain"])
+    if side_effect is not None:
+        try:
+            side_effect(sug.get("payload") or {}, created_resource_id)
+        except Exception:
+            logger.exception("authoring: domain side effect failed for suggestion %s (domain=%s)", sid, sug["domain"])
     audit_repo().log(
         user_id=admin["id"],
         action=f"authoring_suggestion.{status}",

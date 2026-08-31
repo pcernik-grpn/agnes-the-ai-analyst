@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from src.semantic.projection import project_document
+from src.semantic.projection import project_document, prune_model
 
 
 @pytest.fixture
@@ -289,7 +289,7 @@ def _ext(payload: dict) -> dict:
     return {"vendor_name": _AGNES, "data": json.dumps(payload)}
 
 
-def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
+def _register_table(source_type: str, bucket: str, source_table: str, name: str) -> None:
     from src.db import get_system_db
     from src.repositories.table_registry import TableRegistryRepository
 
@@ -298,13 +298,17 @@ def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
         TableRegistryRepository(conn).register(
             id=name,
             name=name,
-            source_type="keboola",
+            source_type=source_type,
             bucket=bucket,
             source_table=source_table,
             query_mode="local",
         )
     finally:
         conn.close()
+
+
+def _register_keboola_table(bucket: str, source_table: str, name: str) -> None:
+    _register_table("keboola", bucket, source_table, name)
 
 
 def _doc(*, metric_ext=None, dataset_ext=None, model_ext=None, table_id="in.c-shop.orders"):
@@ -393,6 +397,190 @@ class TestTableBinding:
 
         assert [m for m in metric_repo().list() if m.get("source") == "keboola_metastore"] == []
 
+    def test_a_snowflake_shaped_binding_resolves_via_the_generic_path(self, system_db):
+        """A hand-authored/uploaded model's dataset references a
+        Snowflake/Databricks-style 3-segment identifier
+        (`DATABASE.SCHEMA.TABLE`). The Keboola-shaped path (last-dot split)
+        would misparse this as bucket='ESHOP_DEMO.RAW', table='ORDERS' and
+        never match; the generic last-TWO-segments path matches
+        bucket='RAW', table='ORDERS' against the registered row instead."""
+        _register_table("snowflake", "RAW", "ORDERS", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.ORDERS"}, table_id="ESHOP_DEMO.RAW.ORDERS"),
+            source="manual",
+            source_ref=None,
+        )
+
+        row = _only_metric(source="manual", source_ref=None)
+        assert row["table_name"] == "snowflake_orders"
+        assert row["sql"].startswith("SELECT ")
+        assert "SUM(amount)" in row["sql"]
+
+    def test_a_case_mismatched_snowflake_binding_still_resolves(self, system_db):
+        """Snowflake's information-schema identifiers come back UPPERCASE
+        unless the object was created quoted, but a table can be registered
+        with any case an admin chose — the generic path must fold case on
+        both sides rather than require them to already agree."""
+        _register_table("snowflake", "raw", "orders", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.ORDERS"}, table_id="ESHOP_DEMO.RAW.ORDERS"),
+            source="manual",
+            source_ref=None,
+        )
+
+        row = _only_metric(source="manual", source_ref=None)
+        assert row["table_name"] == "snowflake_orders"
+
+    def test_a_keboola_shaped_binding_still_resolves_when_other_tables_are_registered(self, system_db):
+        """Regression guard: registering a non-Keboola table alongside a
+        Keboola one must not change the Keboola path's own resolution."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+        _register_table("snowflake", "RAW", "ORDERS", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "in.c-shop.orders"}),
+            source="keboola_metastore",
+            source_ref="conn-1",
+        )
+
+        row = _only_metric()
+        assert row["table_name"] == "shop_orders"
+
+    def test_a_multi_segment_binding_to_an_unregistered_table_is_skipped(self, system_db):
+        """The "never raises, resolves to None" contract holds for the
+        generic path too: a 3-segment identifier matching nothing in the
+        registry is skipped, not crashed on or bound to the wrong row."""
+        from src.repositories import metric_repo
+
+        project_document(
+            _doc(metric_ext={"dataset": "ESHOP_DEMO.RAW.NOWHERE"}, table_id="ESHOP_DEMO.RAW.NOWHERE"),
+            source="manual",
+            source_ref=None,
+        )
+
+        assert [m for m in metric_repo().list() if m.get("source") == "manual"] == []
+
+
+class TestWarehouseShapedBindings:
+    """Table-driven cover for the two warehouse identifier shapes the generic
+    binder (#1631/#1668) was built for but never pinned as a goal: Snowflake's
+    ``DATABASE.SCHEMA.TABLE`` (emitted UPPERCASE unless the object was created
+    quoted) and Databricks's ``catalog.schema.view`` (emitted lowercase).
+
+    The registered row and the document can disagree in case for the very same
+    table — the admin who ran ``agnes admin register-table --bucket … --source-
+    table …`` typed whatever they typed, and the adapter composes from the
+    account's own information-schema — so every row below is stated as
+    (what was registered) × (what the document says), and both must resolve to
+    the same registry row. A document identifier is matched on its LAST TWO
+    segments, so the leading database/catalog segment is ignored by design:
+    the same table registered once serves a document that names it with or
+    without its catalog.
+    """
+
+    # (case id, registered source_type, registered bucket, registered
+    #  source_table, the identifier the document declares)
+    _BINDS = [
+        # --- Snowflake: UPPERCASE identifiers, 3 segments ------------------
+        ("sf_upper_both_sides", "snowflake", "RAW", "ORDERS", "ESHOP_DEMO.RAW.ORDERS"),
+        ("sf_doc_upper_row_lower", "snowflake", "raw", "orders", "ESHOP_DEMO.RAW.ORDERS"),
+        ("sf_doc_lower_row_upper", "snowflake", "RAW", "ORDERS", "eshop_demo.raw.orders"),
+        ("sf_mixed_case", "snowflake", "Raw", "Orders", "EshopDemo.RAW.orders"),
+        # A 2-segment identifier (no database qualifier) is the same match.
+        ("sf_two_segments", "snowflake", "RAW", "ORDERS", "RAW.ORDERS"),
+        # --- Databricks: lowercase catalog.schema.view --------------------
+        ("dbx_lower_both_sides", "databricks", "sales", "orders_view", "main.sales.orders_view"),
+        ("dbx_doc_mixed_row_lower", "databricks", "sales", "orders_view", "Main.Sales.Orders_View"),
+        ("dbx_doc_lower_row_upper", "databricks", "SALES", "ORDERS_VIEW", "main.sales.orders_view"),
+        ("dbx_two_segments", "databricks", "sales", "orders_view", "sales.orders_view"),
+    ]
+
+    @pytest.mark.parametrize(
+        "source_type,bucket,source_table,identifier",
+        [pytest.param(*case[1:], id=case[0]) for case in _BINDS],
+    )
+    def test_the_metric_binds_to_the_registered_table(
+        self, system_db, source_type, bucket, source_table, identifier
+    ):
+        _register_table(source_type, bucket, source_table, "warehouse_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": identifier}, table_id=identifier),
+            source="ossie_git",
+            source_ref="repo-a",
+        )
+
+        row = _only_metric(source="ossie_git", source_ref="repo-a")
+        assert row["table_name"] == "warehouse_orders"
+        # Bound means RUNNABLE — a composed SELECT, not the bare fragment.
+        assert row["sql"].startswith("SELECT ")
+        assert "SUM(amount)" in row["sql"]
+
+    @pytest.mark.parametrize(
+        "source_type,bucket,source_table,identifier",
+        [pytest.param(*case[1:], id=case[0]) for case in _BINDS],
+    )
+    def test_the_dataset_resolves_to_the_registered_table_id(
+        self, system_db, source_type, bucket, source_table, identifier
+    ):
+        """The same shapes through the OTHER resolver — the one
+        ``column_metadata`` keys on and ``tables_without_semantic_coverage``
+        reads. The two must agree, or a table would count as covered while
+        its metric was skipped (or the reverse)."""
+        from src.semantic.projection import resolve_dataset_table
+
+        _register_table(source_type, bucket, source_table, "warehouse_orders")
+
+        resolved = resolve_dataset_table({"name": "orders", "source": identifier}, "ossie_git")
+
+        assert resolved == "warehouse_orders"
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            pytest.param("ESHOP_DEMO.RAW.GHOSTS", id="sf_unregistered_table"),
+            pytest.param("ESHOP_DEMO.STAGING.ORDERS", id="sf_wrong_schema"),
+            pytest.param("main.sales.ghosts", id="dbx_unregistered_view"),
+            pytest.param("orders", id="single_segment_never_matches"),
+        ],
+    )
+    def test_an_identifier_that_matches_nothing_is_skipped_not_guessed(self, system_db, identifier):
+        """The steady state is a semantic layer describing more tables than
+        the instance registers. A near-miss must not fall through onto the
+        one registered row — a metric bound to the wrong table is worse than
+        a metric that is absent."""
+        from src.repositories import metric_repo
+        from src.semantic.projection import resolve_dataset_table
+
+        _register_table("snowflake", "RAW", "ORDERS", "warehouse_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": identifier}, table_id=identifier),
+            source="ossie_git",
+            source_ref="repo-a",
+        )
+
+        assert [m for m in metric_repo().list() if m.get("source") == "ossie_git"] == []
+        assert resolve_dataset_table({"name": "orders", "source": identifier}, "ossie_git") is None
+
+    def test_a_keboola_identifier_still_takes_the_keboola_path(self, system_db):
+        """Regression guard for the shapes above: a Keboola tableId's bucket
+        is itself dotted (``in.c-shop.orders``), so a last-two-segments split
+        would read bucket=``c-shop``. Registering warehouse-shaped rows
+        alongside must not start routing it there."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+        _register_table("snowflake", "c-shop", "orders", "snowflake_orders")
+
+        project_document(
+            _doc(metric_ext={"dataset": "in.c-shop.orders"}),
+            source="keboola_metastore",
+            source_ref="conn-1",
+        )
+
+        assert _only_metric()["table_name"] == "shop_orders"
+
 
 class TestConstraints:
     def test_model_constraints_reach_the_metric_they_name(self, system_db):
@@ -469,18 +657,26 @@ class TestDatasetGrain:
 
 
 class TestColumnBinding:
-    """The column leg keys `column_metadata` on the RAW dataset id
-    (`dataset.source` or `dataset.name`), never resolved through the table
-    binder to the Agnes `table_registry` view name — unlike the metric leg.
-    `column_metadata` is keyed `(table_id, column_name)` with a single
-    `source` column (no source dimension), so a naive bind under the view
-    name collides with rows the profiler / import_proposal / admin already
-    own there and clobbers them on every sync. (A view-name bind was tried
-    and reverted — see the regression test below.) Surfacing Keboola
-    per-column descriptions under the view name is deferred pending an
-    ownership-aware design for that key."""
+    """The column leg keys `column_metadata` on the RESOLVED Agnes
+    `table_registry` id (via `resolve_dataset_table`), the same identifier
+    `/api/v2/schema/{table_id}` and every other `column_metadata` reader
+    already key on — mirroring the metric leg's own table-binding above.
+    Before this resolution step, a Keboola dataset's raw tableId
+    (`in.c-shop.orders`) was stored verbatim: nothing else ever reads
+    `column_metadata` under a raw Keboola tableId, so an imported column
+    description was written but never surfaced anywhere (a silent no-op).
 
-    def test_keboola_field_descriptions_land_under_the_raw_id_registered_or_not(self, system_db):
+    Resolving onto a real, shared table id reopens a collision risk a prior
+    attempt at this exact change hit and had to revert: the profiler / admin
+    metadata API / ai_enrichment already own rows under that same id. The
+    write path guards against it (see the regression test below) — an
+    existing row owned by a DIFFERENT writer always wins over this
+    projection's write, the same precedence the manual-model path already
+    had (`_column_source`), now applied unconditionally since resolution can
+    land ANY source's write on an id another writer already owns.
+    """
+
+    def test_keboola_field_descriptions_land_under_the_resolved_agnes_id(self, system_db):
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         doc = {
@@ -505,14 +701,45 @@ class TestColumnBinding:
         from src.repositories import column_metadata_repo
 
         repo = column_metadata_repo()
-        under_raw_id = repo.list_for_table("in.c-shop.orders")
-        assert [c["column_name"] for c in under_raw_id] == ["amount"]
-        assert under_raw_id[0]["description"] == "Order amount, in cents."
-        # Nothing lands under the resolved view name — even though the table
-        # IS registered — because the column leg no longer binds through it.
-        assert repo.list_for_table("shop_orders") == []
+        under_resolved_id = repo.list_for_table("shop_orders")
+        assert [c["column_name"] for c in under_resolved_id] == ["amount"]
+        assert under_resolved_id[0]["description"] == "Order amount, in cents."
+        # Nothing lands under the raw Keboola tableId anymore.
+        assert repo.list_for_table("in.c-shop.orders") == []
 
-    def test_prune_stays_scoped_to_the_raw_id(self, system_db):
+        # And it's retrievable through the actual production read path
+        # (`GET /api/v2/schema/{table_id}`), not just the repo directly.
+        from app.api.v2_schema import _column_metadata_descriptions
+
+        assert _column_metadata_descriptions("shop_orders") == {"amount": "Order amount, in cents."}
+
+    def test_keboola_field_descriptions_fall_back_to_the_raw_id_when_unregistered(self, system_db):
+        """A dataset whose Keboola tableId doesn't resolve to any registered
+        table (yet) keeps the pre-fix behavior — written under the raw id —
+        rather than being dropped outright."""
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "in.c-ghost.nowhere",
+                            "fields": [{"name": "amount", "datatype": "Decimal", "description": "n/a"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        report = project_document(doc, source="keboola_metastore", source_ref="conn-1")
+        assert report.columns_written == 1
+
+        from src.repositories import column_metadata_repo
+
+        under_raw_id = column_metadata_repo().list_for_table("in.c-ghost.nowhere")
+        assert [c["column_name"] for c in under_raw_id] == ["amount"]
+
+    def test_prune_stays_scoped_to_the_resolved_id(self, system_db):
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         def _doc_with_fields(field_names):
@@ -536,16 +763,17 @@ class TestColumnBinding:
 
         from src.repositories import column_metadata_repo
 
-        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("in.c-shop.orders")}
-        assert remaining == {"amount"}, "the dropped field must be pruned under the raw id"
+        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("shop_orders")}
+        assert remaining == {"amount"}, "the dropped field must be pruned under the resolved id"
 
     def test_profiler_authored_description_survives_keboola_projection(self, system_db):
         """Regression guard for the reverted column-binding change: a
         profiler/admin-authored `column_metadata` row for a Keboola-registered
-        table (keyed under the VIEW name) must not be clobbered by a semantic
-        layer sync for that table, because the projector now writes under the
-        raw dataset id — a different key entirely, so no collision, no
-        overwrite, no prune."""
+        table (keyed under the resolved Agnes id) must not be clobbered by a
+        semantic layer sync for that same table — the projection now resolves
+        onto the SAME id the profiler already wrote, so the write-path
+        precedence guard (an existing row owned by a different writer wins)
+        is what keeps this description intact, not a difference in keys."""
         _register_keboola_table("in.c-shop", "orders", "shop_orders")
 
         from src.repositories import column_metadata_repo
@@ -580,6 +808,148 @@ class TestColumnBinding:
         row = repo.get("shop_orders", "amount")
         assert row["description"] == "Authored by the profiler."
         assert row["source"] == "profiler"
+
+    def test_sibling_keboola_models_sharing_a_resolved_table_do_not_prune_each_others_columns(self, system_db):
+        """Regression: the column leg's write path resolves `table_id` via
+        `resolve_dataset_table`, but `_sibling_column_claims` used to key its
+        claims on the RAW dataset id — a mismatch invisible for `source=
+        'manual'` (whose raw id already IS the resolved one) but live for
+        every other source. A partial projection's `keep_by_table.get
+        (resolved_id)` then always missed a sibling's claim, so projecting
+        one Keboola model onto a shared table pruned a sibling model's
+        columns for that same table outright."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        def _doc(model_name, field_names):
+            return {
+                "semantic_model": [
+                    {
+                        "name": model_name,
+                        "datasets": [
+                            {
+                                "name": "orders",
+                                "source": "in.c-shop.orders",
+                                "fields": [{"name": n} for n in field_names],
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        # `_sibling_column_claims` reads OTHER models' claims from their
+        # STORED `semantic_models` rows (as the real importer writes them
+        # before projecting, per `src/semantic/importer.py`) — a bare
+        # `project_document` call alone never populates that table, so each
+        # model's document must be seeded here too, or the sibling read sees
+        # nothing and the test can't tell a real fix from a no-op one.
+        from src.repositories import semantic_model_repo
+
+        def _seed(model_name, field_names):
+            doc = _doc(model_name, field_names)
+            semantic_model_repo().upsert(
+                id=f"keboola_metastore/conn-1/{model_name}",
+                slug=model_name,
+                name=model_name,
+                description=None,
+                document="version: '0.2.0.dev0'",
+                document_json=doc,
+                spec_version="0.2.0.dev0",
+                content_hash=model_name,
+                source="keboola_metastore",
+                source_ref="conn-1",
+                status="valid",
+                validation_errors=None,
+                validated_at=None,
+            )
+            return doc
+
+        project_document(_seed("retail", ["col_a"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+        project_document(_seed("finance", ["col_b"]), source="keboola_metastore", source_ref="conn-1", partial=True)
+
+        from src.repositories import column_metadata_repo
+
+        remaining = {c["column_name"] for c in column_metadata_repo().list_for_table("shop_orders")}
+        assert remaining == {"col_a", "col_b"}, "projecting finance must not prune retail's sibling columns"
+
+    def test_deleting_a_keboola_model_prunes_its_own_columns_under_the_resolved_id(self, system_db):
+        """Regression: `prune_model`'s `written_by_table` used to key on the
+        RAW dataset id too, so `repo.list_for_table(raw_id)` found nothing
+        for a Keboola model (whose rows now live under the resolved id) and
+        deleting the model's document left its `column_metadata` rows
+        orphaned — never cleaned up."""
+        _register_keboola_table("in.c-shop", "orders", "shop_orders")
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "in.c-shop.orders",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="keboola_metastore", source_ref="conn-1")
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("shop_orders", "amount") is not None
+
+        prune_model(doc, source="keboola_metastore", source_ref="conn-1")
+
+        assert repo.get("shop_orders", "amount") is None, "deleting the model must not orphan its column_metadata row"
+
+    def test_manual_dataset_source_is_never_resolved(self, system_db):
+        """Regression (Devin, PR #1673): a manual dataset's `source` is
+        ALREADY an Agnes table id by convention, so it must land under that
+        literal string, not whatever `resolve_dataset_table` maps it to.
+        `table_registry.id` is derived from `name` (e.g. `request.name
+        .strip().lower().replace(" ", "_")` in `app/api/admin.py`), so a
+        table registered with a display name containing spaces/uppercase
+        has `id != name` — before this guard, a manual dataset whose
+        `source` matched that NAME would silently resolve onto the
+        DIFFERENT `id`, orphaning any pre-existing column row under the
+        raw name key."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="orders_table",
+                name="Orders Table",
+                source_type="local",
+                query_mode="local",
+            )
+        finally:
+            conn.close()
+
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "retail",
+                    "datasets": [
+                        {
+                            "name": "orders",
+                            "source": "Orders Table",
+                            "fields": [{"name": "amount"}],
+                        }
+                    ],
+                }
+            ]
+        }
+        project_document(doc, source="manual", source_ref=None)
+
+        from src.repositories import column_metadata_repo
+
+        repo = column_metadata_repo()
+        assert repo.get("Orders Table", "amount") is not None, "must land under the raw dataset source, unresolved"
+        assert repo.get("orders_table", "amount") is None, "must NOT resolve onto table_registry's derived id"
 
 
 class TestDuplicateModelName:
@@ -624,6 +994,53 @@ class TestDuplicateModelName:
         names = {m["name"] for m in metric_repo().list()}
         assert "metric_a" in names
         assert "metric_b" not in names
+
+
+class TestNameCollision:
+    """`metric_definitions.name` has no uniqueness constraint (see
+    `src/db.py`'s comment on the table) — a same-named metric from a
+    DIFFERENT source is a same-transaction WARN + count, never a block: both
+    rows are written under their own ids."""
+
+    def _doc(self, model_name: str, metric_name: str) -> dict:
+        return {
+            "semantic_model": [
+                {
+                    "name": model_name,
+                    "datasets": [_stub_dataset(f"{model_name}_ds")],
+                    "metrics": [
+                        {
+                            "name": metric_name,
+                            "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "SUM(x)"}]},
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_same_name_different_source_is_counted_and_both_rows_land(self, system_db):
+        project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        report = project_document(self._doc("second", "revenue"), source="git", source_ref="repo-b")
+
+        assert report.name_collisions == 1
+        assert report.metrics_written == 1
+
+        from src.repositories import metric_repo
+
+        rows = [m for m in metric_repo().list() if m["name"] == "revenue"]
+        assert len(rows) == 2
+        assert {r["source_ref"] for r in rows} == {"repo-a", "repo-b"}
+
+    def test_same_name_same_source_ref_reprojection_is_not_a_collision(self, system_db):
+        """Re-projecting the SAME (source, source_ref)'s own metric under its
+        own id must never count as a collision against itself."""
+        project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        report = project_document(self._doc("first", "revenue"), source="git", source_ref="repo-a")
+        assert report.name_collisions == 0
+
+    def test_no_collision_when_name_is_unclaimed(self, system_db):
+        report = project_document(self._doc("first", "brand_new_metric"), source="git", source_ref="repo-a")
+        assert report.name_collisions == 0
 
 
 class TestGlossarySlugCollision:

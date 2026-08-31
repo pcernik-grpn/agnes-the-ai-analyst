@@ -1,0 +1,164 @@
+# Semantic-layer eval question set.
+#
+# Consumed by tests/e2e/test_semantic_layer_eval.py (a @pytest.mark.real_llm
+# test) through tests/e2e/semantic_eval_harness.py. Each question is asked
+# twice against a real LLM: once against an instance with NO semantic layer
+# (the "baseline" arm) and once against the same instance WITH one (the
+# "semantic" arm). The gate is the gap between the two arms — see the test.
+#
+# The fixture world the questions are asked about (four tables, four metrics,
+# a small glossary, and the deliberate gaps) lives in
+# tests/e2e/semantic_eval_harness.py. Read it before adding a question: an
+# `expects` entry naming a table or metric that world does not define can
+# never pass, and the harness fails loudly on that rather than scoring it 0.
+#
+# Fields per question:
+#   id        — stable slug, unique; used in the per-question report
+#   category  — what the question probes; grouping only, never scored
+#   question  — the analyst's prompt, verbatim
+#   expects.tables
+#             — table ids that must appear in an ACTUAL tool call's arguments
+#               (a schema lookup or the SQL of a query). Naming a table only
+#               in the prose answer does not count: the whole point is that
+#               the agent reached the right data, not that it can talk about
+#               it.
+#   expects.metrics
+#             — canonical metric ids the agent must have LOOKED UP (via the
+#               metric-show or semantic-model-context tool) before computing.
+#               This is the expectation the baseline arm structurally cannot
+#               meet: with no semantic layer there is no definition to fetch.
+#   expects.must_ask_for_clarification
+#             — true when the question turns on a term the layer does not
+#               define at all. Passing means the agent asked / said the term
+#               is undefined AND did not quietly compute an aggregate for its
+#               own invented definition.
+#
+# Categories covered, per the phase-4 plan: an existing metric, a table with
+# no semantics, a term entirely outside the vocabulary, and plain catalog work
+# that must keep working (the control against a layer that makes the agent
+# refuse everything).
+
+questions:
+  # -- existing metric: the agent must reuse the declared definition ---------
+  - id: net_revenue_last_90_days
+    category: declared_metric
+    question: How much net revenue did we make in the last 90 days?
+    expects:
+      tables: [orders, order_refunds]
+      metrics: [revenue/net_revenue]
+      must_ask_for_clarification: false
+
+  - id: gross_revenue_by_country
+    category: declared_metric
+    question: Show gross revenue by country for the last 30 days.
+    expects:
+      tables: [orders]
+      metrics: [revenue/gross_revenue]
+      must_ask_for_clarification: false
+
+  - id: average_order_value
+    category: declared_metric
+    question: What is our average order value at the moment?
+    expects:
+      tables: [orders]
+      metrics: [revenue/average_order_value]
+      must_ask_for_clarification: false
+
+  - id: active_customers
+    category: declared_metric
+    question: How many active customers do we have?
+    expects:
+      tables: [customers, orders]
+      metrics: [customers/active_customers]
+      must_ask_for_clarification: false
+
+  - id: active_customers_by_segment
+    category: declared_metric
+    question: Break our active customers down by segment.
+    expects:
+      tables: [customers, orders]
+      metrics: [customers/active_customers]
+      must_ask_for_clarification: false
+
+  - id: net_revenue_top_country
+    category: declared_metric
+    question: Which country produced the most net revenue over the last 90 days?
+    expects:
+      tables: [orders, order_refunds]
+      metrics: [revenue/net_revenue]
+      must_ask_for_clarification: false
+
+  # -- term outside the vocabulary: ask, do not invent -----------------------
+  - id: churn_rate
+    category: undefined_term
+    question: What was our churn rate last month?
+    expects:
+      tables: []
+      metrics: []
+      must_ask_for_clarification: true
+
+  - id: marketing_qualified_leads
+    category: undefined_term
+    question: How many marketing qualified leads did we get last month?
+    expects:
+      tables: []
+      metrics: []
+      must_ask_for_clarification: true
+
+  - id: annual_recurring_revenue
+    category: undefined_term
+    question: What is our current ARR?
+    expects:
+      tables: []
+      metrics: []
+      must_ask_for_clarification: true
+
+  - id: customer_lifetime_value
+    category: undefined_term
+    question: What is the average customer lifetime value?
+    expects:
+      tables: []
+      metrics: []
+      must_ask_for_clarification: true
+
+  # -- table registered but deliberately outside the semantic model ----------
+  - id: web_sessions_by_country
+    category: table_without_semantics
+    question: How many web sessions did we get per country in the last 7 days?
+    expects:
+      tables: [web_sessions]
+      metrics: []
+      must_ask_for_clarification: false
+
+  # -- plain catalog work: must keep working with the layer switched on ------
+  - id: orders_row_count
+    category: catalog_control
+    question: How many rows are in the orders table?
+    expects:
+      tables: [orders]
+      metrics: []
+      must_ask_for_clarification: false
+
+  - id: customers_columns
+    category: catalog_control
+    question: What columns does the customers table have?
+    expects:
+      tables: [customers]
+      metrics: []
+      must_ask_for_clarification: false
+
+  - id: refunds_recorded
+    category: catalog_control
+    question: How many refunds are recorded in order_refunds?
+    expects:
+      tables: [order_refunds]
+      metrics: []
+      must_ask_for_clarification: false
+
+  - id: customer_countries
+    category: catalog_control
+    question: Which countries do our customers come from?
+    expects:
+      tables: [customers]
+      metrics: []
+      must_ask_for_clarification: false

@@ -1,121 +1,772 @@
-{% extends "base_page.html" %}
+{% extends "base_index.html" %}
+{% from "macros/_fbar_card.html" import fbar_card %}
+{% import "macros/_state.html" as state %}
 
-{% block title %}Semantic layer — {{ config.INSTANCE_NAME }}{% endblock %}
+{# NAME: "Semantic models", never "Semantic layer" — that name was worn by
+   three of the four semantic surfaces at once, so a browser tab could not
+   tell them apart. The eyebrow keeps the concept; the title names the page's
+   contents. Guarded by tests/test_semantic_page_names_contract.py.
 
-{% set page_hero_eyebrow = "Semantic layer" %}
-{% set page_hero_title = "Semantic layer" %}
-{% set page_hero_plain = True %}
-{% set page_hero_subtitle = "Browse your organization's datasets, metrics, relationships and glossary — the stored document itself, not just the flat metric list." %}
+   The name does NOT change per tab. Since the fold (#1707 N5) this one page
+   carries three views — the stored documents, and the flat metric/glossary
+   projections that used to live at /catalog/semantics — and a <title> that
+   changed under the reader would put three names back into circulation,
+   which is the exact collision that contract exists to prevent. #}
+{% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{#- The writer badge on a flat registry row. Kept in step with its client-side
+    twin in this page's own script (the glossary list is fetched, not
+    server-rendered), which reads the same server-injected source set. -#}
+{% macro source_badge(source) -%}
+{%- if source in keboola_semantic_layer_sources -%}
+<span class="badge badge--success">Keboola sync</span>
+{%- elif source == 'yaml_import' -%}
+<span class="badge badge--info">YAML import</span>
+{%- elif source == 'web_upload' -%}
+<span class="badge badge--info">Uploaded</span>
+{%- elif source == 'openmetadata' -%}
+<span class="badge badge--warn">OpenMetadata</span>
+{%- else -%}
+<span class="badge">{{ source or 'manual' }}</span>
+{%- endif -%}
+{%- endmacro %}
 
 {% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <style>
-/* ── Model cards ─────────────────────────────────────────────────────── */
-.slb-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: var(--space-4);
-    margin: var(--space-5) 0 var(--space-9);
-}
-.slb-card {
-    display: block;
-    padding: var(--space-4) var(--space-5);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    text-decoration: none;
-    color: inherit;
-    transition: border-color 0.12s, box-shadow 0.12s;
-}
-.slb-card:hover {
-    border-color: var(--ds-primary);
-    box-shadow: 0 2px 10px color-mix(in srgb, var(--ds-primary) 10%, transparent);
-}
-.slb-card--invalid { border-color: var(--ds-accent-danger-line); }
-.slb-card__head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-3);
-    margin-bottom: 4px;
-}
-.slb-card__name { font-size: 15px; font-weight: 700; color: var(--ds-text-primary); }
-.slb-card__desc {
-    font-size: 12.5px;
-    color: var(--ds-text-secondary);
-    margin: 4px 0 var(--space-3);
-    min-height: 1em;
-}
-.slb-card__dialects {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    margin-bottom: var(--space-3);
-}
-.slb-counts {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-}
-.slb-count {
-    font-size: 11px;
-    color: var(--ds-text-muted);
-    background: var(--ds-surface-dim);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-full);
-    padding: 2px 8px;
-}
-.slb-errors {
-    margin: var(--space-3) 0 0;
+/* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
+.sl-head { margin: 2px 0 0; }
+.sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
+.sl-head h1 { font-size: 24px; margin: 2px 0 0; }
+.sl-head .lede { color: var(--ds-text-secondary); font-size: 15px; margin: 6px 0 0; max-width: 64ch; }
+
+/* `.fbar-grid` (filter_toolbar.css) is fixed at 3 columns; auto-fill reads
+   better for a collection this short and matches the pre-shell grid's own
+   sizing — same page-specific-override pattern as admin_data_packages'
+   own `.adp-grid`. */
+.sl-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+
+/* An invalid document is still a real card, flagged rather than styled
+   away — an attribute selector rather than a second class on the `<article>`
+   `fbar_card()` already stamps with `class="fbar-card"` (a caller-supplied
+   class would collide with it). Survives `:hover` (which only touches
+   `box-shadow`, never `border-color`) and defers to `:focus-within`'s own
+   primary-colored ring, same as every other card. */
+.fbar-card[data-status="invalid"] { border-color: var(--ds-accent-danger-line); }
+
+/* The invalid state's footer content: the "Invalid" badge plus its stored
+   validation errors — rendered instead of the object-count tags, since an
+   invalid document's `document_json` may be stale or absent. */
+.sl-invalid { display: flex; flex-direction: column; gap: 4px; }
+.sl-errors {
+    margin: 0;
     padding: 0 0 0 18px;
     font-size: 12px;
     color: var(--ds-accent-danger-ink);
 }
-.slb-errors li { margin-bottom: 2px; }
+.sl-errors li { margin-bottom: 2px; }
+
+/* The cross-link under the empty panel — a plain body line, deliberately not
+   the panel's CTA (see the note on the empty block below). Renamed into this
+   page's `.sl-*` vocabulary along with the rest of the page-local CSS. */
+.sl-empty-related-link {
+    margin: var(--space-3) 0 0;
+    font-size: 12.5px;
+    color: var(--ds-text-secondary);
+}
+
+/* ── Shell: sidebar + main ───────────────────────────────────────────── */
+.sl-shell {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--ds-surface);
+    min-height: 480px;
+    margin-bottom: var(--space-9);
+}
+@media (max-width: 660px) {
+    .sl-shell { grid-template-columns: 1fr; }
+    .sl-sidebar { border-right: none; border-bottom: 1px solid var(--ds-border); }
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────── */
+.sl-sidebar {
+    border-right: 1px solid var(--ds-border);
+    background: var(--ds-surface-dim);
+    display: flex;
+    flex-direction: column;
+}
+
+.sl-sidebar-body { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.sl-sidebar-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+.sl-sidebar-panel.is-active { display: flex; }
+
+.sl-sidebar-search {
+    padding: 10px 10px 8px;
+    flex-shrink: 0;
+}
+.sl-sidebar-search input {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-md);
+    background: var(--ds-surface);
+    color: var(--ds-text-primary);
+    font: 12px/1.4 inherit;
+    padding: 6px 10px;
+    outline: none;
+}
+.sl-sidebar-search input:focus {
+    border-color: var(--ds-primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--ds-primary) 18%, transparent);
+}
+.sl-sidebar-search input::placeholder { color: var(--ds-text-muted); }
+
+.sl-cat-nav { display: block; flex: 1; overflow-y: auto; padding: 4px 0 8px; }
+.sl-cat-btn {
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: none;
+    cursor: pointer;
+    padding: 6px 12px;
+    font: 13px/1.4 inherit;
+    color: var(--ds-text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+    transition: background 0.1s, color 0.1s;
+}
+.sl-cat-btn:hover { background: color-mix(in srgb, var(--ds-primary) 5%, transparent); color: var(--ds-text-primary); }
+.sl-cat-btn.is-active { background: color-mix(in srgb, var(--ds-primary) 9%, transparent); color: var(--ds-primary); font-weight: 600; }
+.sl-cat-n {
+    font-size: 10px;
+    background: var(--ds-surface);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-full);
+    padding: 1px 6px;
+    color: var(--ds-text-muted);
+    flex-shrink: 0;
+}
+.sl-cat-btn.is-active .sl-cat-n {
+    background: color-mix(in srgb, var(--ds-primary) 8%, transparent);
+    border-color: color-mix(in srgb, var(--ds-primary) 28%, transparent);
+    color: var(--ds-primary);
+}
+
+/* ── Main ────────────────────────────────────────────────────────────── */
+.sl-main { display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.sl-main-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+.sl-main-panel.is-active { display: flex; }
+
+.sl-main-bar {
+    padding: var(--space-3) var(--space-4);
+    border-bottom: 1px solid var(--ds-border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}
+.sl-main-title { font-size: 14px; font-weight: 600; color: var(--ds-text-primary); flex: 1; }
+.sl-n-pill {
+    font-size: 11px;
+    background: var(--ds-surface-dim);
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-full);
+    padding: 2px 8px;
+    color: var(--ds-text-muted);
+}
+
+.sl-scroll { flex: 1; overflow-y: auto; }
+
+/* ── Metric rows ─────────────────────────────────────────────────────── */
+.sl-item { border-bottom: 1px solid var(--ds-border); }
+.sl-item:last-child { border-bottom: none; }
+.sl-item[hidden] { display: none; }
+
+.sl-row {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 18px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+    transition: background 0.1s;
+}
+.sl-row:hover { background: var(--ds-surface-dim); }
+.sl-item.is-open .sl-row {
+    background: color-mix(in srgb, var(--ds-primary) 4%, var(--ds-surface));
+}
+
+.sl-row__dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--ds-primary);
+    opacity: 0.5;
+    flex-shrink: 0;
+    transition: opacity 0.1s;
+}
+.sl-item.is-open .sl-row__dot { opacity: 1; }
+.sl-row:hover .sl-row__dot { opacity: 0.85; }
+
+.sl-row__main { flex: 1; min-width: 0; }
+.sl-row__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); }
+.sl-row__desc {
+    font-size: 12px;
+    color: var(--ds-text-muted);
+    margin-top: 1px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sl-row__right {
+    display: flex;
+    gap: 5px;
+    align-items: center;
+    flex-shrink: 0;
+}
+.sl-row__chev {
+    color: var(--ds-text-muted);
+    flex-shrink: 0;
+    transition: transform 0.15s;
+    font-size: 16px;
+    line-height: 1;
+}
+.sl-item.is-open .sl-row__chev { transform: rotate(90deg); }
+
+/* ── Detail panel ────────────────────────────────────────────────────── */
+.sl-detail {
+    display: none;
+    padding: 14px 18px 14px 38px;
+    background: var(--ds-surface-dim);
+    border-top: 1px solid var(--ds-border);
+    font-size: 13px;
+    color: var(--ds-text-secondary);
+}
+.sl-item.is-open .sl-detail { display: block; }
+.sl-detail p { margin: 0 0 8px; line-height: 1.5; }
+.sl-detail p:last-child { margin-bottom: 0; }
+.sl-detail ul { margin: 0 0 8px; padding-left: 18px; }
+
+.sl-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    font-size: 12px;
+    color: var(--ds-text-muted);
+    margin-bottom: 10px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--ds-border);
+}
+.sl-meta-row span { display: inline-flex; gap: 4px; }
+.sl-meta-row strong { color: var(--ds-text-secondary); }
+
+.sl-detail pre {
+    background: var(--ds-code-bg);
+    color: var(--ds-code-ink);
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+    overflow-x: auto;
+    font-size: 11px;
+    margin: 0 0 8px;
+    border: 1px solid var(--ds-border);
+    line-height: 1.5;
+}
+.sl-detail__desc { margin: 0 0 10px; overflow-x: auto; }
+.sl-variant-name { margin: 0 0 4px; font-size: 11px; color: var(--ds-text-muted); }
+/* Every heading level, not just h2-h3. The html_source allowlist preserves
+   h1/h5/h6 because dropping them fused the sections they separated
+   ("Section ASection B") — but a preserved tag with no rule here falls back
+   to the browser default, so an imported <h1> rendered at ~2em inside a
+   compact metric row and out-shouted the page's own heading. h4 was in the
+   same position before this change. Structure is preserved; the row decides
+   how big it looks. */
+.sl-detail__desc h1, .sl-detail__desc h2, .sl-detail__desc h3,
+.sl-detail__desc h4, .sl-detail__desc h5, .sl-detail__desc h6 {
+    font-size: 13px; font-weight: 600; color: var(--ds-text-primary); margin: 8px 0 4px;
+}
+.sl-detail__desc table { border-collapse: collapse; margin: 0 0 8px; }
+.sl-detail__desc th, .sl-detail__desc td { border: 1px solid var(--ds-border); padding: 2px 8px; font-size: 12px; }
+.sl-detail__desc code { background: var(--ds-surface); padding: 0 4px; border-radius: var(--radius-sm); font-size: 11px; }
+.sl-detail__model-link { margin: 0 0 8px; font-size: 12px; }
+
+/* ── Glossary grid ───────────────────────────────────────────────────── */
+.sl-glossary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 10px;
+    padding: 14px 18px;
+    align-content: start;
+}
+
+.sl-term {
+    border: 1px solid var(--ds-border);
+    border-radius: var(--radius-lg);
+    background: var(--ds-surface);
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    padding: 0;
+    overflow: hidden;
+    transition: box-shadow 0.12s, border-color 0.12s;
+    display: block;
+    width: 100%;
+}
+.sl-term:hover {
+    border-color: color-mix(in srgb, var(--ds-primary) 35%, transparent);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--ds-primary) 8%, transparent);
+}
+.sl-term.is-open { border-color: color-mix(in srgb, var(--ds-primary) 45%, transparent); }
+
+.sl-term__head { padding: 12px 12px 8px; }
+.sl-term__letter {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px; height: 24px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--ds-primary) 10%, transparent);
+    color: var(--ds-primary);
+    font: 700 11px/1 inherit;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+.sl-term__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); margin-bottom: 4px; }
+.sl-term__preview {
+    font-size: 12px;
+    color: var(--ds-text-muted);
+    line-height: 1.4;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.sl-term__foot {
+    padding: 6px 12px 10px;
+    display: flex;
+    justify-content: flex-end;
+}
+.sl-term__body {
+    display: none;
+    padding: 10px 12px 12px;
+    border-top: 1px solid var(--ds-border);
+    background: var(--ds-surface-dim);
+    font-size: 12px;
+    color: var(--ds-text-secondary);
+    line-height: 1.5;
+}
+.sl-term.is-open .sl-term__body { display: block; }
+.sl-term__body p { margin: 0 0 6px; }
+.sl-term__body p:last-child { margin-bottom: 0; }
+
+/* ── Empty / loading ─────────────────────────────────────────────────── */
+.sl-empty {
+    padding: 40px 18px;
+    text-align: center;
+    color: var(--ds-text-muted);
+    font-size: 13px;
+}
+.sl-empty code {
+    background: var(--ds-surface-dim);
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    border: 1px solid var(--ds-border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .sl-cat-btn, .sl-row, .sl-row__dot, .sl-row__chev, .sl-term {
+        transition: none;
+    }
+}
 </style>
 {% endblock %}
 
-{% block page %}
+{% block page_head %}
+<div class="sl-head">
+  <div class="sl-kicker">Semantic layer</div>
+  <h1>Semantic models</h1>
+  <p class="lede">Browse your organization's datasets, metrics, relationships and glossary — the stored documents, and the flat metric and glossary registries projected from them.</p>
+</div>
+{# ── One page, three views (#1707 N5) ─────────────────────────────────────
+   The flat `metric_definitions` / `glossary_terms` projection used to be its
+   own page (/catalog/semantics, now a 308 onto the All-metrics tab). Two
+   pages over one semantic layer asked the reader to know, before arriving,
+   whether the thing they wanted was "a metric" or "the model a metric came
+   from" — and each page's way to the other was a single line of prose.
+
+   Server-rendered LINK tabs (`ds.tabs`, the same strip one model's own
+   object types use a level down), not client-side toggles: the tab is part
+   of the address, so a deep link, a bookmark and a browser Back all agree —
+   which is precisely what the retired page's `#metrics` fragment could not
+   do, since a fragment never reaches the server. #}
+{{ ds.tabs(items=tabs, aria_label='Semantic layer views') }}
+{% endblock %}
+
+{% block page_surface %}
+{% if active_tab == 'models' %}
 {% if models %}
-<div class="slb-grid">
+<div class="fbar-grid sl-grid">
     {% for m in models %}
-    <a class="slb-card{% if m.status == 'invalid' %} slb-card--invalid{% endif %}" href="/semantic-layer/{{ m.slug }}">
-        <div class="slb-card__head">
-            <span class="slb-card__name">{{ m.name }}</span>
-            {% if m.is_imported %}
-            <span class="badge">Imported from {{ m.source_label }}</span>
-            {% endif %}
-        </div>
-        <p class="slb-card__desc">{{ m.description or "" }}</p>
-        {% if m.dialects %}
-        <div class="slb-card__dialects">SQL dialect{{ '' if m.dialects | length == 1 else 's' }}: {{ m.dialects | join(', ') }}</div>
-        {% endif %}
-        {% if m.status == 'invalid' %}
+    {% set _is_invalid = m.status == 'invalid' %}
+    {% set _card = {
+         'kind': 'data',
+         'title': m.name,
+         'href': '/semantic-layer/' ~ m.slug,
+         'description': m.description or '',
+         'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
+         'tags': [] if _is_invalid else [
+             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's'),
+             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's'),
+             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's'),
+             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's'),
+             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's'),
+         ],
+         'attrs': 'data-status="invalid"' if _is_invalid else None,
+       } %}
+    {% if m.is_imported or _is_invalid %}
+    {% call fbar_card(_card) %}
+      {% if m.is_imported %}
+      <span class="badge">Imported from {{ m.source_label }}</span>
+      {% endif %}
+      {% if _is_invalid %}
+      <div class="sl-invalid">
         <span class="badge badge--danger">Invalid</span>
         {% if m.validation_errors %}
-        <ul class="slb-errors">
+        <ul class="sl-errors">
             {% for err in m.validation_errors %}
             <li>{{ err }}</li>
             {% endfor %}
         </ul>
         {% endif %}
-        {% else %}
-        <div class="slb-counts">
-            <span class="slb-count">{{ m.counts.datasets }} dataset{{ '' if m.counts.datasets == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.metrics }} metric{{ '' if m.counts.metrics == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.constraints }} constraint{{ '' if m.counts.constraints == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.relationships }} relationship{{ '' if m.counts.relationships == 1 else 's' }}</span>
-            <span class="slb-count">{{ m.counts.glossary }} glossary term{{ '' if m.counts.glossary == 1 else 's' }}</span>
-        </div>
-        {% endif %}
-    </a>
+      </div>
+      {% endif %}
+    {% endcall %}
+    {% else %}
+    {{ fbar_card(_card) }}
+    {% endif %}
     {% endfor %}
 </div>
 {% else %}
-<div class="empty-state">
-    <h3 class="empty-state__title">No semantic model available</h3>
-    <p class="empty-state__description">
-        Ask an admin to import or author one, or to grant you access to an existing one
-        (<a href="/catalog/semantics">the metric &amp; glossary catalog</a> is a related, separate view).
-    </p>
+{# No `q` on this tab — every model the caller can read is listed, so a
+   zero-row result is the collection genuinely being empty, never a filter
+   collapse. `empty`, not `nothing_found`.
+
+   The CTA must be a path that can actually succeed (spec §3): on a fresh
+   instance the metric registry is ANOTHER empty collection, so it can't be
+   the primary action. Only an admin can act on this state (import/register a
+   source), so the primary CTA is admin-only, mirroring how the rest of the
+   chrome gates admin actions; a non-admin (or a page that somehow doesn't
+   know the caller) gets a neutral body line instead, never a CTA that
+   dead-ends. #}
+{% if session.user.is_admin %}
+{{ state.panel('empty', 'No semantic model available',
+               body='Import or author a semantic model to get started.',
+               cta_label='Add a semantic source', cta_href='/admin/semantic-sources') }}
+{% else %}
+{{ state.panel('empty', 'No semantic model available',
+               body='Ask an admin to import or author one, or to grant you access to an existing one.') }}
+{% endif %}
+<p class="sl-empty-related-link">The <a href="/semantic-layer?tab=all_metrics">All metrics</a> tab lists every metric registered here, document-backed or not.</p>
+{% endif %}
+
+{% else %}
+{# ── The flat projections ────────────────────────────────────────────────
+   Ported whole from the retired /catalog/semantics: the same sidebar+main
+   shell, the same accordion rows and the same client-side filter over
+   server-rendered markup (the scale is tens-to-low-hundreds, so there is no
+   search endpoint to add). What changed is the SHELL around it — this is a
+   tab of the model list now, so the page's own back link, stats header and
+   client-side tab row are gone; the strip above owns the switch. #}
+<div class="sl-shell">
+
+  <aside class="sl-sidebar">
+    <div class="sl-sidebar-body">
+      {% if active_tab == 'all_metrics' %}
+      <div class="sl-sidebar-panel is-active" id="sidebar-metrics">
+        <div class="sl-sidebar-search">
+          <input id="metric-filter" type="search" placeholder="Filter metrics…" autocomplete="off" aria-label="Filter metrics">
+        </div>
+        <nav class="sl-cat-nav" aria-label="Metric categories">
+          <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
+            <span>All</span>
+            <span class="sl-cat-n">{{ metric_count }}</span>
+          </button>
+          {% for cat in metric_categories %}
+          <button type="button" class="sl-cat-btn" data-cat="{{ cat.name | lower }}">
+            <span>{{ cat.name }}</span>
+            <span class="sl-cat-n">{{ cat.metrics | length }}</span>
+          </button>
+          {% endfor %}
+        </nav>
+      </div>
+      {% else %}
+      <div class="sl-sidebar-panel is-active" id="sidebar-glossary">
+        <div class="sl-sidebar-search">
+          <input id="glossary-search" type="search" placeholder="Search glossary…" autocomplete="off" aria-label="Search glossary">
+        </div>
+      </div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <main class="sl-main">
+
+    {% if active_tab == 'all_metrics' %}
+    <div class="sl-main-panel is-active" id="panel-metrics">
+      <div class="sl-main-bar">
+        <span class="sl-main-title" id="metrics-title">All metrics</span>
+        <span class="sl-n-pill" id="metrics-shown">{{ metric_count }}</span>
+      </div>
+      <div class="sl-scroll" id="metrics-list">
+        {% if metric_categories %}
+          {% for cat in metric_categories %}
+          <div class="sl-cat-group" data-cat="{{ cat.name | lower }}">
+            {% for m in cat.metrics %}
+            <div class="sl-item"
+                 data-ft="{{ ((m.name or '') ~ ' ' ~ (m.display_name or '') ~ ' ' ~ (m.description_text or '') ~ ' ' ~ ((m.synonyms or []) | join(' '))) | lower }}"
+                 data-cat="{{ cat.name | lower }}">
+              <button type="button" class="sl-row">
+                <span class="sl-row__dot"></span>
+                <div class="sl-row__main">
+                  <div class="sl-row__name">{{ m.display_name or m.name }}</div>
+                  {% if m.description_text %}<div class="sl-row__desc">{{ m.description_text }}</div>{% endif %}
+                </div>
+                <div class="sl-row__right">
+                  {{ source_badge(m.source) }}
+                  {% if m.tables %}<span class="badge">JOIN</span>{% endif %}
+                  <span class="sl-row__chev">›</span>
+                </div>
+              </button>
+              <div class="sl-detail">
+                {% if m.description_html %}<div class="sl-detail__desc">{{ m.description_html | safe }}</div>{% endif %}
+                <div class="sl-meta-row">
+                  <span><strong>Type</strong> {{ m.type or '—' }}</span>
+                  {% if m.unit %}<span><strong>Unit</strong> {{ m.unit }}</span>{% endif %}
+                  {% if m.grain %}<span><strong>Grain</strong> {{ m.grain }}</span>{% endif %}
+                  {% if m.tables %}<span><strong>Tables</strong> {{ m.tables | join(', ') }}</span>
+                  {% elif m.table_name %}<span><strong>Table</strong> {{ m.table_name }}</span>{% endif %}
+                  {% if m.dimensions %}<span><strong>Dimensions</strong> {{ m.dimensions | join(', ') }}</span>{% endif %}
+                  {% if m.synonyms %}<span><strong>Synonyms</strong> {{ m.synonyms | join(', ') }}</span>{% endif %}
+                  {% if m.time_column %}<span><strong>Time column</strong> {{ m.time_column }}</span>{% endif %}
+                </div>
+                {# The upstream definition, above the SQL composed from it. A
+                   metric imported from an external catalog carries its
+                   expression verbatim, and that — not the generated query — is
+                   what an analyst opens this detail to read. #}
+                {% if m.expression %}
+                <p><strong>Expression</strong></p>
+                <pre><code>{{ m.expression }}</code></pre>
+                {% endif %}
+                <pre><code>{{ m.sql }}</code></pre>
+                {% if m.sql_variants %}
+                <p><strong>Variants</strong></p>
+                {% for variant, variant_sql in m.sql_variants.items() %}
+                <p class="sl-variant-name"><code>{{ variant }}</code></p>
+                <pre><code>{{ variant_sql }}</code></pre>
+                {% endfor %}
+                {% endif %}
+                {# Door into the document this row was projected from — set
+                   only for a metric that HAS such an object and whose model
+                   the caller can read (app/web/router.py::
+                   _document_metric_hrefs). A hand-authored or yaml_import
+                   metric renders without it. #}
+                {% if m.model_href %}
+                <p class="sl-detail__model-link"><a href="{{ m.model_href }}">Open in the model &rarr;</a></p>
+                {% endif %}
+                {% if m.filters %}<p><strong>Filters</strong></p><ul>{% for f in m.filters %}<li><code>{{ f }}</code></li>{% endfor %}</ul>{% endif %}
+                {% if m.notes %}<p><strong>Notes:</strong></p><ul>{% for n in m.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+                {% if m.validation %}<p><strong>Validation:</strong> <code>{{ m.validation }}</code></p>{% endif %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        {% else %}
+        <div class="sl-empty">
+          {% if models %}
+          {# Zero metrics is the DEFAULT state of an imported document that
+             declares datasets and relationships but no aggregations, so the
+             empty state has to explain the split — otherwise the tab reads as
+             "nothing was imported" while the document sits one tab away. #}
+          No metrics registered yet — but this instance has a semantic model.<br>
+          <a href="/semantic-layer">Models — its datasets and relationships →</a><br>
+          Metrics are a separate projection; import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
+          {% else %}
+          No metrics registered yet.<br>Import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="sl-main-panel is-active" id="panel-glossary">
+      <div class="sl-main-bar">
+        <span class="sl-main-title">Glossary</span>
+        <span class="sl-n-pill" id="glossary-shown">{{ glossary_count }}</span>
+      </div>
+      <div class="sl-scroll">
+        <div id="glossary-list" class="sl-glossary-grid">
+          <div class="sl-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+  </main>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    // ── Legacy fragment → tab ────────────────────────────────────────────
+    //    /catalog/semantics carried its tab in a FRAGMENT (`#metrics` /
+    //    `#glossary`), which the 308 on that route cannot read — a fragment
+    //    never reaches the server, and the browser re-appends it to whatever
+    //    the redirect names. So an old `#glossary` bookmark arrives here on
+    //    the metrics tab. Corrected once, client-side, with `replace()` so
+    //    the wrong tab never enters history. Nothing else reads the hash.
+    if (window.location.hash === '#glossary' && !/[?&]tab=/.test(window.location.search)) {
+        window.location.replace('/semantic-layer?tab=all_glossary');
+        return;
+    }
+
+    // Pre- and post-flat-table-cutover Keboola writer sources
+    // (`src.semantic.keboola_sources`) — server-injected so this client-side
+    // badge never drifts from the Jinja `source_badge` macro above.
+    const KEBOOLA_SEMANTIC_LAYER_SOURCES = new Set({{ keboola_semantic_layer_sources | list | tojson }});
+    function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+    function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
+    function sourceBadge(src) {
+        if (KEBOOLA_SEMANTIC_LAYER_SOURCES.has(src)) return '<span class="badge badge--success">Keboola sync</span>';
+        if (src === 'yaml_import') return '<span class="badge badge--info">YAML import</span>';
+        if (src === 'openmetadata') return '<span class="badge badge--warn">OpenMetadata</span>';
+        return '<span class="badge">' + esc(src || 'manual') + '</span>';
+    }
+
+    // ── Accordion ──
+    document.addEventListener('click', (e) => {
+        const btn = e.target.closest('.sl-row, .sl-term');
+        if (!btn) return;
+        const item = btn.closest('.sl-item') || btn;
+        item.classList.toggle('is-open');
+    });
+
+    // ── Metrics: filter + category ──
+    const metricFilter = document.getElementById('metric-filter');
+    const catBtns = document.querySelectorAll('.sl-cat-btn');
+    const metricsTitle = document.getElementById('metrics-title');
+    const metricsShown = document.getElementById('metrics-shown');
+    let activeCat = '__all__';
+
+    function applyMetrics() {
+        const q = metricFilter ? metricFilter.value.trim().toLowerCase() : '';
+        let n = 0;
+        document.querySelectorAll('.sl-item[data-cat]').forEach(item => {
+            const catOk = activeCat === '__all__' || item.dataset.cat === activeCat;
+            const txtOk = !q || (item.dataset.ft || '').includes(q);
+            const show = catOk && txtOk;
+            item.hidden = !show;
+            if (show) n++;
+        });
+        document.querySelectorAll('.sl-cat-group[data-cat]').forEach(g => {
+            g.hidden = activeCat !== '__all__' && g.dataset.cat !== activeCat;
+        });
+        if (metricsShown) metricsShown.textContent = String(n);
+    }
+
+    if (metricFilter) metricFilter.addEventListener('input', applyMetrics);
+    catBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            catBtns.forEach(b => b.classList.remove('is-active'));
+            btn.classList.add('is-active');
+            activeCat = btn.dataset.cat;
+            if (metricsTitle) metricsTitle.textContent = activeCat === '__all__' ? 'All metrics' : btn.querySelector('span').textContent.trim();
+            applyMetrics();
+        });
+    });
+
+    // The return leg of the deep link: a metric's object page links back here
+    // with `?tab=all_metrics&q=<metric name>`, so the row it means is the one
+    // visible result instead of one entry in an unfiltered list. Read once on
+    // load; typing in the box afterwards is unaffected (the URL is not
+    // rewritten). The same `q` prefills the glossary search, so one parameter
+    // means one thing on both flat tabs.
+    const initialQuery = new URLSearchParams(window.location.search).get('q');
+    if (initialQuery && metricFilter) {
+        metricFilter.value = initialQuery;
+        applyMetrics();
+    }
+
+    // ── Glossary ──
+    const gList = document.getElementById('glossary-list');
+    const gInput = document.getElementById('glossary-search');
+    const gShown = document.getElementById('glossary-shown');
+    let gTimer;
+
+    function renderTerm(t) {
+        const letter = (t.term || '?')[0];
+        // `definition_text` is the server's plain-text projection: this column
+        // also holds definitions imported verbatim from an external catalog,
+        // which are often rich HTML, and esc() would render those tags as
+        // visible text. Falls back to the stored column.
+        const definition = t.definition_text || t.definition;
+        return '<button type="button" class="sl-term">' +
+            '<div class="sl-term__head">' +
+            '<div class="sl-term__letter">' + esc(letter) + '</div>' +
+            '<div class="sl-term__name">' + esc(t.term) + '</div>' +
+            '<div class="sl-term__preview">' + esc(trunc(definition, 100)) + '</div>' +
+            '</div>' +
+            '<div class="sl-term__foot">' + sourceBadge(t.source) + '</div>' +
+            '<div class="sl-term__body"><p>' + esc(definition) + '</p>' +
+            (t.see_also && t.see_also.length ? '<p><strong>See also:</strong> ' + t.see_also.map(esc).join(', ') + '</p>' : '') +
+            '</div>' +
+            '</button>';
+    }
+
+    async function loadGlossary(q) {
+        if (!gList) return;
+        gList.innerHTML = '<div class="sl-empty">Loading…</div>';
+        try {
+            const url = q ? '/api/glossary/search?q=' + encodeURIComponent(q) + '&limit=50' : '/api/glossary?limit=500';
+            const r = await fetch(url, { credentials: 'same-origin' });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const data = await r.json();
+            const terms = data.terms || [];
+            if (gShown) gShown.textContent = String(q ? terms.length : data.count);
+            gList.innerHTML = terms.length ? terms.map(renderTerm).join('') : '<div class="sl-empty">No terms found.</div>';
+        } catch (e) {
+            gList.innerHTML = '<div class="sl-empty">Could not load glossary: ' + esc(e.message) + '</div>';
+        }
+    }
+
+    if (gInput) {
+        gInput.addEventListener('input', () => {
+            clearTimeout(gTimer);
+            gTimer = setTimeout(() => loadGlossary(gInput.value.trim()), 250);
+        });
+    }
+    // The glossary tab is its own request now, so the list loads on arrival
+    // rather than on a tab click — there is no other moment.
+    if (gList) {
+        if (initialQuery && gInput) { gInput.value = initialQuery; }
+        loadGlossary(initialQuery || '');
+    }
+})();
+</script>
 {% endblock %}

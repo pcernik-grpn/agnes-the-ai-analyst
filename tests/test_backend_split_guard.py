@@ -262,6 +262,7 @@ _GRANDFATHERED_GET_SYSTEM_DB: set[str] = {
     # (`resolve_prompt` resolves through the factory when given nothing), so
     # the list keeps shrinking instead of growing for a new module. Devin
     # review on PR #1235.
+    "app/chat/agent_profile.py",
     "app/main.py",
     "app/marketplace_server/git_router.py",
     "app/web/router.py",

@@ -1407,6 +1407,38 @@
            toolbar and the rows it acts on. #}
         <div class="apg-strip apg-strip--warn" id="adminTablesConnectorNotice" hidden></div>
 
+        {# ─── The auto-draft sweep, said out loud ───────────────────────────
+           Agnes drafts a semantic model for tables with no coverage every 55
+           minutes and files each one in the moderation queue. That queue is
+           somewhere else entirely, so the work landed where nobody who had
+           not already found it would look — the page about these very tables
+           never mentioned it. One strip, only when something is actually
+           waiting, tinted because it is a thing to act on.
+
+           The link is conditional, not the strip: the queue page redirects
+           home while the Studio surface is off, and rows filed before it was
+           turned off survive it. Announcing them with a door that bounces
+           would be the same invisibility in mirror image, so that branch
+           names the switch instead. #}
+        {% if semantic_draft_pending_count %}
+        <div class="apg-strip apg-strip--warn" id="adminTablesSemanticDrafts">
+          <span class="apg-strip__mark" aria-hidden="true">{{ ico.icon('sparkle', 15) }}</span>
+          <span>
+            <strong>{{ semantic_draft_pending_count }}{{ '+' if semantic_draft_pending_overflow }}</strong>
+            {{ 'table awaits' if semantic_draft_pending_count == 1 and not semantic_draft_pending_overflow else 'tables await' }}
+            approval of a suggested model — Agnes drafted one for each table with no
+            semantic-layer coverage, and nothing it drafts is applied until you approve it.
+          </span>
+          <span class="apg-strip__end">
+            {% if studio_enabled %}
+            <a href="/admin/studio/suggestions">Review the queue →</a>
+            {% else %}
+            Reviewing them needs the Studio surface — set <code>studio.enabled</code>.
+            {% endif %}
+          </span>
+        </div>
+        {% endif %}
+
         {# ─── One toolbar: search, narrowing, order, then the page's actions ──
            `.fbar` — the Library's control chrome, the same component People,
            Groups and /chats run, and now on the same ENGINE as well
@@ -4095,18 +4127,29 @@
     // Populates + shows the per-project picker from the registry, so the
     // Register/Edit modals need no new server-rendered context for it.
     // Hidden (and the form falls back to the legacy instance-level path)
-    // when the registry has zero Keboola connections — today's behaviour
-    // on a single-source instance, unchanged. `preselectId` re-selects a
-    // row's own connection when re-opening Edit on it. Also unconditional —
-    // called from the modal-open handlers, which run on every instance.
-    async function _populateKbProjectPicker(prefix, preselectId) {
+    // when the registry has zero connections of `sourceType` — today's
+    // behaviour on a single-source instance, unchanged. `preselectId`
+    // re-selects a row's own connection when re-opening Edit on it. Also
+    // unconditional — called from the modal-open handlers, which run on
+    // every instance. `sourceType` defaults to 'keboola' so the original
+    // call sites (`_populateKbProjectPicker('kb')` /
+    // `_populateKbProjectPicker('editKb', preselectId)`) keep working
+    // unchanged; other source types (e.g. 'snowflake') pass it explicitly.
+    async function _populateKbProjectPicker(prefix, preselectId, sourceType) {
+        sourceType = sourceType || 'keboola';
         var group = document.getElementById(prefix + 'ProjectPickerGroup');
         var select = document.getElementById(prefix + 'ProjectSelect');
         if (!group || !select) return;
         select.innerHTML = '';
         var rows = [];
+        // Keboola keeps its own literal URL (rather than always building it
+        // from `sourceType`) so this stays byte-for-byte the endpoint the
+        // original picker always hit.
+        var url = sourceType === 'keboola'
+            ? '/api/admin/source-connections?source_type=keboola'
+            : '/api/admin/source-connections?source_type=' + encodeURIComponent(sourceType);
         try {
-            var r = await fetch('/api/admin/source-connections?source_type=keboola', { credentials: 'include' });
+            var r = await fetch(url, { credentials: 'include' });
             if (r.ok) rows = await r.json();
         } catch (e) {
             rows = [];
@@ -4125,7 +4168,8 @@
         // modal to open by default": the /api/admin/discover-tables legacy
         // path routes by it, not by the registry, so it alone decides
         // whether that fallback is actually reachable as an option here.
-        if (DATA_SOURCE_TYPE === 'keboola') {
+        // Only Keboola has this legacy instance-level path.
+        if (sourceType === 'keboola' && DATA_SOURCE_TYPE === 'keboola') {
             var legacy = document.createElement('option');
             legacy.value = '';
             legacy.textContent = 'Instance-level Keboola (legacy)';
@@ -4446,8 +4490,10 @@
         // Preselect the row's own project so Discover/List/Use-as-base look
         // at the project this table actually came from, not whichever the
         // picker happened to default to. Informational only — saving does
-        // not change a row's connection_id (the PUT schema has no field for
-        // that today).
+        // not change a row's connection_id: `UpdateTableRequest` accepts the
+        // field (an admin can re-pin a row via `agnes admin update-table
+        // --connection-id` or a direct PUT), but this Edit modal doesn't
+        // wire the picker's selection into `_buildKeboolaEditPayload` yet.
         _populateKbProjectPicker('editKb', table.connection_id || null);
         var bucket = table.bucket || '';
         var sourceTable = table.source_table || '';

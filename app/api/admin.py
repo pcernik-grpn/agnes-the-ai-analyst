@@ -4623,6 +4623,18 @@ class UpdateTableRequest(BaseModel):
     access_policy_sql: Optional[str] = None
     access_policy_note: Optional[str] = None
     policy_mapping: Optional[bool] = None
+    # v79 — see RegisterTableRequest.connection_id. PUT lets an admin pin (or
+    # re-pin) an already-registered row to a named connection — including
+    # fixing a row that was registered before this field existed and is
+    # sitting on a NULL connection_id.
+    connection_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type. "
+            "The referenced connection must exist; an unknown id returns 400."
+        ),
+    )
 
     @field_validator("access_policy_sql", mode="before")
     @classmethod
@@ -6020,6 +6032,21 @@ async def update_table(
     if not existing:
         raise HTTPException(status_code=404, detail="Table not found")
 
+    # v79 — validate connection_id FK before persisting, mirroring
+    # register_table. Checked directly against the request field (not
+    # `updates`) so an explicit `connection_id: null` (meaning "use the
+    # default connection") is treated the same as omission -- both skip
+    # the FK lookup, and an omitted field never clobbers the stored value
+    # once `updates`/`merged` below apply exclude_unset=True.
+    if request.connection_id is not None:
+        from src.repositories import source_connections_repo
+
+        if source_connections_repo().get(request.connection_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"connection_id '{request.connection_id}' not found in source_connections",
+            )
+
     # `exclude_unset=True` honors the PUT-shape distinction between
     # "field omitted from body" (keep existing) vs "field sent as null"
     # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
@@ -6456,6 +6483,11 @@ async def update_table(
             "access_policy_updated_at",
             "access_policy_updated_by",
             "policy_mapping",
+            # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
+            # bookkeeping, not a human-editable PUT field. register() doesn't
+            # accept it; it has its own setters
+            # (mark_semantic_draft_pending / clear_semantic_draft_pending).
+            "semantic_draft_pending_at",
         ):
             merged.pop(_policy_key, None)
 
@@ -7235,6 +7267,20 @@ async def unregister_table(
     (sync_state-driven) and the orchestrator's next rebuild could
     resurrect a master view from the leftover parquet (E2E sub-agent
     finding 2026-05-01).
+
+    The table's `data_package_tables` memberships and `resource_grants`
+    rows go with it — cleared inside `TableRegistryRepository.unregister`
+    on both backends, since a DELETE that leaves them behind means
+    something different on DuckDB (a foreign-key violation surfacing as a
+    raw 500) than on Postgres (an orphan junction row). See that repo
+    method's docstring.
+
+    How many of each went with it is recorded in the audit row
+    (`package_memberships_removed` / `grants_revoked`, both always present
+    even at zero — same shape as the plugin-disable precedent in
+    `app/api/marketplaces.py`). Revoking grants is an access-control
+    change, and without the counts the audit log cannot answer "who lost
+    access to what" for the event that caused it.
     """
     repo = table_registry_repo()
     existing = repo.get(table_id)
@@ -7246,7 +7292,7 @@ async def unregister_table(
     source_type = existing.get("source_type") or ""
     name = existing.get("name") or table_id
 
-    repo.unregister(table_id)
+    cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the
@@ -7316,6 +7362,7 @@ async def unregister_table(
                 "source_type": existing.get("source_type"),
                 "bucket": existing.get("bucket"),
                 "source_table": existing.get("source_table"),
+                **cascade,
             }
         ),
     )
@@ -9198,3 +9245,27 @@ async def run_reap_stuck_reviews(
         params={"grace_seconds": grace, "reaped": result.get("reaped", 0), "skipped": result.get("skipped", False)},
     )
     return {"ok": True, "details": result}
+
+
+@router.get("/source-pipelines")
+async def get_source_pipelines(
+    user: dict = Depends(require_admin),
+):
+    """The per-source pipeline strip — tables → sync → semantic → feeds.
+
+    Read-only, and deliberately no new data: it returns exactly the dict
+    ``/admin/data-sources`` inlines into its own HTML (``SOURCE_PIPELINES``),
+    from the same ``_source_pipelines()`` fold. The page needs it because
+    everything on it — the Add-tables wizard, package creation, token
+    saves — happens over fetch, so a strip baked at render time kept
+    reporting "Add the first tables → / Never synced / 0 packages" long
+    after the admin had registered two dozen tables. Same admin gate as the
+    page, so this exposes nothing the caller could not already read there.
+
+    ``user`` is threaded through for the one caller-scoped cell (a
+    SharePoint source's facts/edges counts); every other cell is
+    caller-independent.
+    """
+    from app.web.router import _source_pipelines
+
+    return _source_pipelines(user=user)

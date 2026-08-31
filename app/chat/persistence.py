@@ -517,6 +517,8 @@ class ChatRepository:
         parts: Optional[list[dict]] = None,
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
         model: Optional[str] = None,
         sender_email: Optional[str] = None,
     ) -> ChatMessage:
@@ -529,9 +531,18 @@ class ChatRepository:
                 parts=parts,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=cache_creation_tokens,
                 model=model,
                 sender_email=sender_email,
             )
+        # DuckDB app-state path: the two prompt-cache columns exist only on
+        # Postgres (migration 0092 — the DuckDB ladder is frozen at
+        # FROZEN_DUCKDB_SCHEMA_VERSION and takes no new step, A3). The
+        # figures are accepted and dropped rather than refused: recording a
+        # turn is the caller's actual job here, and losing an accounting
+        # detail must not fail a chat. `cost_breakdown` below reports the
+        # gap explicitly instead of serving zeros as if they were measured.
         msg_id = _gen_id("msg")
         now = datetime.now(timezone.utc)
         # DuckDB 1.5.3 bug: updating a column that is part of a secondary
@@ -916,8 +927,13 @@ class ChatRepository:
         self._conn.execute("DELETE FROM user_workdirs WHERE user_email = ?", [user_email])
 
     def session_total_tokens(self, session_id: str) -> int:
-        """Sum of (tokens_in + tokens_out) across every persisted message in
-        this session.
+        """Tokens charged against ``max_session_tokens`` for this session.
+
+        Postgres counts ``tokens_in + tokens_out + cache_creation_tokens``
+        (``src.llm_pricing.budget_tokens``'s definition — a cache write is
+        real billed input); the frozen DuckDB backend has no such column and
+        counts the two it has, so a DuckDB instance under-counts a
+        cache-heavy session. Documented, not silently divergent.
 
         Used by ChatManager.send_user_message to enforce
         ChatConfig.max_session_tokens. A session row is a slow-changing
@@ -934,7 +950,13 @@ class ChatRepository:
         return int(row[0] or 0)
 
     def daily_anthropic_tokens(self, user_email: str) -> tuple[int, int]:
-        """Sum of tokens_in / tokens_out for this user's messages since UTC midnight."""
+        """Sum of tokens_in / tokens_out for this user's messages since UTC midnight.
+
+        On Postgres ``tokens_in`` folds in ``cache_creation_tokens`` so this
+        durable aggregate matches what the live daily counter is incremented
+        by (see ``ChatManager._record_daily_tokens``); the frozen DuckDB
+        backend has no such column and returns the raw pair.
+        """
         if self._messages_pg is not None:
             return self._messages_pg.daily_anthropic_tokens(user_email)
         row = self._conn.execute(
@@ -944,3 +966,24 @@ class ChatRepository:
             [user_email],
         ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
+
+    def cost_breakdown(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        user_email: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Per-(session, model) token sums for the cost readout.
+
+        Postgres-only: the two prompt-cache columns the readout exists to
+        expose have no DuckDB sibling (migration 0092, A3 freeze). Raises
+        ``RequiresPostgresBackend`` on the DuckDB backend so the route
+        answers a typed ``501`` rather than serving cache-blind zeros that
+        would read as a measured "this workload used no cache".
+        """
+        if self._messages_pg is None:
+            from src.repositories import RequiresPostgresBackend
+
+            raise RequiresPostgresBackend("chat cost breakdown")
+        return self._messages_pg.cost_breakdown(since=since, user_email=user_email, limit=limit)

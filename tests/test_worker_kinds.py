@@ -241,7 +241,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({})
@@ -257,7 +259,9 @@ class TestDataRefreshHandler:
         calls = []
         monkeypatch.setattr(
             "app.api.sync._run_sync",
-            lambda tables=None, source_type_filter=None: calls.append((tables, source_type_filter)),
+            lambda tables=None, source_type_filter=None, result_sink=None: calls.append(
+                (tables, source_type_filter)
+            ),
         )
 
         JOB_KINDS["data-refresh"].handler({"tables": ["orders"], "source": "keboola"})
@@ -277,7 +281,10 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: False)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: False,
+        )
 
         with pytest.raises(RuntimeError):
             JOB_KINDS["data-refresh"].handler({})
@@ -291,9 +298,59 @@ class TestDataRefreshHandler:
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: run_sync_result)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: run_sync_result,
+        )
 
         JOB_KINDS["data-refresh"].handler({})  # must not raise
+
+    def test_returns_result_sink_populated_by_run_sync(self, monkeypatch):
+        """#1620: the handler's return value is what `app/worker/runtime.py`
+        passes to `JobsRepository.complete(..., result=...)` — it must be
+        the exact dict `_run_sync` filled via `result_sink`, not `None`,
+        so a job that "succeeded" but silently skipped every table (the
+        reported bug) is diagnosable via `GET /api/jobs/{id}`."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        fake_summary = {
+            "materialized": {"materialized": [], "skipped": [{"table": "t1", "reason": "due_check"}], "errors": []},
+            "errors": [],
+            "synced_tables": [],
+        }
+
+        def _fake_run_sync(tables=None, source_type_filter=None, result_sink=None):
+            if result_sink is not None:
+                result_sink.update(fake_summary)
+            return True
+
+        monkeypatch.setattr("app.api.sync._run_sync", _fake_run_sync)
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result == fake_summary
+
+    def test_returns_none_when_run_sync_is_a_noop(self, monkeypatch):
+        """`_run_sync` returning `None` (lock-contention no-op) never
+        populates `result_sink` — the handler must return `None`, not an
+        empty dict, so `complete()`'s `result is not None` branch (which
+        writes `payload_json["result"]`) is skipped for a call that did
+        nothing."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        monkeypatch.setattr(
+            "app.api.sync._run_sync",
+            lambda tables=None, source_type_filter=None, result_sink=None: None,
+        )
+
+        result = JOB_KINDS["data-refresh"].handler({})
+
+        assert result is None
 
 
 class TestMarketplacesSyncHandler:

@@ -16,7 +16,12 @@ def test_every_agnes_command_this_module_suggests_is_runnable():
 
     from cli.main import app
 
-    src = (pathlib.Path(__file__).resolve().parents[1] / "cli" / "commands" / "admin_semantic_layer.py").read_text(
+    # Re-pointed by #1707 Block 6: this module's one command became
+    # `agnes admin semantic keboola-import` and its body moved to
+    # cli/commands/admin_semantic.py, which is now where every printed
+    # suggestion on this surface lives (admin_semantic_layer.py is a hidden
+    # alias shim that prints nothing but its deprecation line).
+    src = (pathlib.Path(__file__).resolve().parents[1] / "cli" / "commands" / "admin_semantic.py").read_text(
         encoding="utf-8"
     )
     printed = re.findall(r'typer\.echo\(\s*[fr]?"([^"]*)"', src)
