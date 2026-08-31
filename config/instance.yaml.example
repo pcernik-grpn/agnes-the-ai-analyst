@@ -79,6 +79,15 @@ instance:
   #                                  # `name` above still drives browser <title> text and page
   #                                  # headings — keep it populated. Env override:
   #                                  # AGNES_INSTANCE_LOGO_SVG.
+  # logo_mark_svg: |                  # Inline <svg> brand MARK — a square monogram, not a
+  #   <svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+  #     <rect width="28" height="28" rx="7" fill="#333"/>
+  #   </svg>
+  #                                  # lockup. Rendered where a wordmark does not fit: the
+  #                                  # left rail collapsed to its 56px icon strip. Only read
+  #                                  # when `logo_svg` above is set; unset, that slot shows an
+  #                                  # initial derived from `brand`. Env override:
+  #                                  # AGNES_INSTANCE_LOGO_MARK_SVG.
   # favicon: "img/my-icon.png"       # Favicon href. A path (no leading slash) is resolved
                                      # as a static asset under app/web/static/ (same
                                      # cache-busting `static_url()` every other asset gets);
@@ -1227,11 +1236,19 @@ facts:
 # with a config error rather than a crash until a producer is configured.
 #
 # `extraction.enabled` is a registered switch (app/switches.py) — set it
-# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
-# NOT editable from /admin/server-config (locked: requires the
-# extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`producer`, `schedule`,
-# `timeout_s`) is plain instance data, read directly via get_value.
+# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It IS
+# editable from /admin/server-config, alongside the rest of this block
+# (`producer.command`/`.module`/`.env_passthrough`, `schedule`, `timeout_s`)
+# — reversing this switch's original deploy-time-only stance. `enabled`,
+# `producer.command` and `producer.module` each still honor their own
+# deploy-time env var (AGNES_EXTRACTION_ENABLED /
+# AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)
+# AHEAD of a value set here or via the panel — a Terraform-provisioned
+# instance shows those three leaves read-only in the panel ("set by
+# deployment (Terraform)") and a save touching one 409s
+# (`field_locked_by_deployment`) instead of persisting a value the running
+# process would never read. `schedule`/`timeout_s`/`env_passthrough` carry
+# no such override and are always plain writable instance data.
 #
 # Flipping `enabled` here is NOT, by itself, enough to run the
 # extraction-worker compose service. That service sets AGNES_ROLE=worker
@@ -1244,6 +1261,27 @@ facts:
 # boot the worker container.
 extraction:
   enabled: false
+  # How many `corpus-extraction` jobs the extraction lane runs at once
+  # (Stage 1 of Agnes-owned extraction parallelism — before this, the ONLY
+  # parallelism was inside the external producer's own `--workers` flag;
+  # this made multiple SharePoint CONNECTIONS extract strictly one-at-a-
+  # time). Different connections only — the per-connection idempotency key
+  # (app/api/admin_sharepoint.py::_extraction_idempotency_key) still
+  # prevents two jobs for the SAME connection from ever coexisting,
+  # unaffected by this setting. AGNES_EXTRACTION_CONCURRENCY (env) overrides
+  # this at runtime; either way it is resolved ONCE when the worker process
+  # starts (app/worker/runtime.py::_extraction_concurrency) — changing it
+  # needs a worker restart, not just an admin-panel edit. Invalid or
+  # out-of-[1, 8]-range values are clamped/defaulted with a logged warning,
+  # never a crash.
+  #
+  # SIZING: each slot is a FULL producer subprocess — its own crawl workers
+  # plus an LLM pass — not a lightweight thread. The `extraction-worker`
+  # compose service's default 4g/2cpu (AGNES_EXTRACTION_WORKER_MEM_LIMIT/
+  # _CPUS in docker-compose.yml) assumes exactly ONE concurrent producer
+  # run; raising `concurrency` without raising those two env vars in lock
+  # step risks OOM/CPU starvation under N concurrent producers.
+  concurrency: 1
   producer:
     # Full command line for the producer entrypoint, e.g.:
     #   command: "python -m your_producer.run"
@@ -1252,6 +1290,15 @@ extraction:
     #   module: your_producer.run
     # `command` wins when both are set. Either form MAY be a YAML list
     # instead of a string, taken verbatim (no shell-splitting needed then).
+    #
+    # Both also have an env override — AGNES_EXTRACTION_PRODUCER_COMMAND /
+    # AGNES_EXTRACTION_PRODUCER_MODULE — which wins over the yaml value here,
+    # same env-overrides-instance.yaml posture as `enabled` above. This is
+    # what lets a deploy-time mechanism (e.g. a Terraform module rendering
+    # /opt/agnes/.env) activate the producer without an applier-owned edit
+    # of this file on the VM's data disk. Unlike the yaml key, the env
+    # override for `command` is ALWAYS a plain string split with
+    # `shlex.split` — a YAML/JSON list is not supported via env.
     command: ""
     module: ""
     # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
@@ -1303,14 +1350,16 @@ extraction:
   # different keys, or the same person pseudonymizes identically across
   # tenants). Neither var is set when no scope is anonymize-marked.
   #
-  # Producer callback credential (TCRD-226): the producer calls BACK into
-  # Agnes's own REST API (corpus-map, scopes, POST /api/facts/ingest) to do
-  # its actual work, so the child env ALSO carries AGNES_API_URL (this
-  # instance's own base URL — resolved from SERVER_URL, falling back to
-  # AGNES_INTERNAL_URL, then to this process's own loopback) and, when
-  # SCHEDULER_API_TOKEN is configured, AGNES_API_TOKEN (that SAME
-  # shared-secret bearer token). On a role-split `extraction-worker`
-  # container (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
+  # Producer callback credential: the producer calls BACK into Agnes's own
+  # REST API (corpus-map, scopes, the collections upload, POST
+  # /api/facts/ingest, GET /api/facts/corrections) to do its actual work,
+  # so the child env ALSO carries AGNES_API_URL (this instance's own base
+  # URL — resolved from SERVER_URL, falling back to AGNES_INTERNAL_URL,
+  # then to this process's own loopback) and AGNES_API_TOKEN — a
+  # short-lived, PRODUCER-SCOPED JWT (`app/auth/producer_token.py`) minted
+  # fresh for this run, naming only THIS connection and its own confirmed
+  # scope collections. On a role-split `extraction-worker` container
+  # (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
   # `extraction-worker` service in docker-compose.yml) that loopback
   # fallback would be the WORKER's own address, not the instance's real
   # callback surface — so on that topology the job refuses cleanly instead
@@ -1318,18 +1367,13 @@ extraction:
   # the two is set explicitly. A single-container ("all-in-one") deployment
   # is unaffected: there, the producer's parent process IS the app, so the
   # loopback fallback is correct and no explicit configuration is required.
-  # The token itself is a DELIBERATE OVER-GRANT, not an
-  # oversight: presenting that token resolves to a synthetic user in the
-  # Admin system group (see app/auth/scheduler_token.py) — god-mode on
-  # every RBAC check — while the producer only ever needs to read its own
-  # connection's scope map, upload into its own scope collections, and
-  # POST to the facts-ingest endpoint. It is reused because it is the only
-  # existing credential class a headless subprocess can already present; a
-  # narrower, producer-scoped credential is the right long-term fix and is
-  # out of scope here. A compromised or merely misbehaving producer under
-  # this token can do anything an admin can, not merely ingest facts —
-  # weigh that before pointing `producer` at anything you have not
-  # reviewed.
+  # The token resolves to a RESTRICTED principal — never a real user, never
+  # Admin — accepted on only the small, fixed set of endpoints named above;
+  # every other endpoint 403s it. This replaces an earlier design that
+  # forwarded the scheduler shared secret here (a genuine over-grant: that
+  # secret resolves to a synthetic Admin-group user, god-mode on every RBAC
+  # check) — SCHEDULER_API_TOKEN is unrelated to this token and does not
+  # need to be configured for extraction to work.
   anonymization:
     # Name of the env var holding the per-instance HMAC key — checked
     # against ITS OWN allowlist before the value is read (the name here is
@@ -1344,6 +1388,26 @@ extraction:
     # resolvable key fails the extraction job clean rather than running the
     # producer without a key.
     hmac_key_env: ""
+
+
+# Microsoft Graph change-notification receiver for SharePoint connections —
+# POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
+# drive push near-real-time notifications instead of Agnes waiting for
+# extraction.schedule above. A SEPARATE top-level section from `extraction:`
+# on purpose (see app/switches.py's `extraction_webhook_enabled` entry): that
+# section's own `enabled` flag is deployment-locked (needs a worker lane +
+# producer), while this one is a plain, always-editable route gate.
+#
+# Off by default: the whole route answers 404 when off. Gates the RECEIVER
+# route only — a notification it accepts still needs `extraction.enabled` +
+# a configured producer + a worker polling the `extraction` lane to actually
+# run the resulting `corpus-extraction` job. Agnes never creates, renews, or
+# deletes the Graph subscription itself; an operator runs the producer's own
+# `subscriptions.py create --url <webhook_url>` against the URL + secret
+# `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
+# AGNES_EXTRACTION_WEBHOOK_ENABLED overrides this at the environment level.
+extraction_webhook:
+  enabled: false
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,

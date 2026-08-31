@@ -96,18 +96,75 @@ _COHORT: dict[str, tuple[str, str]] = {
     # Semantic-layer coverage: why a connected project's metrics are (or are
     # not) landing in metric_definitions.
     "/api/admin/semantic-layer/coverage": (
-        "admin semantic-layer coverage",
+        "admin semantic keboola-import",
         "admin_semantic_layer_coverage",
+    ),
+    # Source-agnostic semantic-layer coverage (semantic-phase5, wave 1):
+    # registered tables with NO valid semantic model at all, regardless of
+    # source — distinct from the Keboola-only endpoint above.
+    "/api/admin/semantic-coverage": ("admin semantic coverage tables", "admin_semantic_coverage"),
+    # Cross-domain, cross-source completeness (F4.1) — deliberately a
+    # DIFFERENT path from the Keboola-only report above, which it aggregates
+    # rather than replaces. The tag/untag mutations are in the cohort, not
+    # _EXEMPT: neither standing exemption (credential-provisioning writes,
+    # security-posture diagnostics) covers an admin tagging a skill to a
+    # source.
+    "/api/admin/semantic-model/coverage": (
+        "admin semantic coverage show",
+        "semantic_model_coverage",
+    ),
+    "/api/admin/semantic-model/coverage/tags": (
+        "admin semantic coverage tag",
+        "semantic_model_coverage_tag",
+    ),
+    "/api/admin/semantic-model/coverage/tags/{tag_id}": (
+        "admin semantic coverage untag",
+        "semantic_model_coverage_untag",
+    ),
+    # Semantic-layer health roll-up (F4.2) — sync failures, disconnected
+    # models, invalid documents, static document-quality checks, F4.1's
+    # coverage counts, and F4.3's active mutes, in one read.
+    "/api/admin/semantic-layer/health": ("admin semantic health", "semantic_layer_health"),
+    # Muting a semantic-layer health check (F4.3) — "I know, it is deliberate".
+    # Same reasoning as the tag/untag pair above for why the mutations are in
+    # the cohort rather than _EXEMPT; and a mute an agent can create but not
+    # SEE would be the silent disappearance the feature exists to prevent, so
+    # the list is triple-surface too. One cohort row per PATH: the first row's
+    # MCP column names the GET's tool, and the POST's `mute_semantic_check` is
+    # asserted in FOUNDATION_TOOL_NAMES by tests/test_mcp_tool_parity.py (same
+    # shape as the /api/store/entities/{entity_id} row above).
+    "/api/admin/semantic-layer/mutes": ("admin semantic mutes", "semantic_mutes_list"),
+    "/api/admin/semantic-layer/mutes/{mute_id}": ("admin semantic unmute", "unmute_semantic_check"),
+    # Semantic-layer feedback (F4.5) — "that answer looked wrong". Submit is
+    # open to any signed-in caller (and is the tool the chat agent offers when
+    # it cannot ground an answer); the queue and resolve are admin. All three
+    # are in the cohort rather than _EXEMPT: neither standing exemption
+    # (credential-provisioning writes, security-posture diagnostics) covers a
+    # bug report about a metric.
+    "/api/semantic-feedback": ("semantic-model feedback submit", "flag_semantic_issue"),
+    "/api/admin/semantic-feedback": ("admin semantic feedback list", "semantic_feedback_list"),
+    "/api/admin/semantic-feedback/{feedback_id}/resolve": (
+        "admin semantic feedback resolve",
+        "semantic_feedback_resolve",
     ),
     # Open semantic-layer contract (Task 10/11/12) — public, resource-gated
     # export of one canonical Ossie document. `semantic_model_get` reads
-    # this same endpoint (wraps its raw YAML text into a dict); `agnes admin
-    # semantic-model export` is the CLI counterpart.
-    "/api/semantic-models/{slug}.yaml": ("admin semantic-model export", "semantic_model_get"),
+    # this same endpoint (wraps its raw YAML text into a dict); `agnes
+    # semantic-model export` is the CLI counterpart — an any-user command
+    # since #1707 Block 6, because reading a document you are already
+    # granted is not an admin operation.
+    # Finding a model you can read (#1707 Block 6). This was _EXEMPT with the
+    # reason "no dedicated CLI subcommand: `agnes admin semantic-model list`
+    # covers interactive listing" — which was false for the caller who needs
+    # it most: that endpoint is admin-only, so a non-admin analyst had an MCP
+    # tool and a web page but no CLI at all. `agnes semantic-model search`
+    # closes it against this same public, RBAC-filtered endpoint.
+    "/api/semantic-models/search": ("semantic-model search", "semantic_model_search"),
+    "/api/semantic-models/{slug}.yaml": ("semantic-model export", "semantic_model_get"),
     # Query-validation engine wiring (wave 3): validate SQL against the
     # caller's accessible semantic models before running it. CLI is the
-    # non-admin `semantic-model` group (distinct from `admin semantic-model
-    # validate`, which schema-checks a document, not a query).
+    # non-admin `semantic-model` group (distinct from its sibling
+    # `semantic-model validate`, which schema-checks a document, not a query).
     "/api/semantic-models/validate-query": ("semantic-model validate-query", "validate_semantic_query"),
     # Agent read-parity tools (wave 4) — typed context lookup + JSON Schema
     # introspection over the caller's accessible semantic models. Same RBAC
@@ -118,6 +175,45 @@ _COHORT: dict[str, tuple[str, str]] = {
     # surface with outcome branching (admin → applied, non-admin → queued
     # for moderation).
     "/api/semantic-models/apply": ("semantic-model apply", "apply_semantic_model"),
+    # Where documents are synced FROM (#1707). These three families were
+    # _EXEMPT with the reason "no MCP analogue by design"; the owner reversed
+    # that — neither standing exemption covers them, and an admin PAT is what
+    # gates the tools exactly as it gates the endpoints.
+    #
+    # The old exemption's SECOND argument was not hand-waving and is not
+    # dropped here: "a tool that can point this server at an arbitrary git
+    # remote and trigger a fetch is a credential/config surface, not a read
+    # tool". That was true, and it was true of REST and the CLI too — the
+    # same two calls exfiltrated a server env var through git's credential
+    # helper long before an MCP tool existed. It is answered at the
+    # transport, where every caller passes: `src.semantic.transports.
+    # validate_git_config` gates the URL scheme, the credential env var
+    # (`is_semantic_git_token_env_allowed`) and the repository host
+    # (`is_semantic_git_host_allowed`) before any egress, and the write
+    # endpoints repeat it so an admin is refused at POST. See
+    # tests/test_semantic_git_source_egress.py.
+    #
+    # One cohort row per PATH, so the MCP column names one tool per path and
+    # the siblings (`semantic_source_add` on the POST,
+    # `semantic_model_reattach`) are asserted in FOUNDATION_TOOL_NAMES by
+    # tests/test_mcp_tool_parity.py — the same shape as the
+    # /api/admin/semantic-layer/mutes rows above.
+    "/api/admin/semantic-sources": ("admin semantic source list", "semantic_source_list"),
+    "/api/admin/semantic-sources/{source_id}": ("admin semantic source rm", "semantic_source_remove"),
+    "/api/admin/semantic-sources/{source_id}/sync": ("admin semantic source sync", "semantic_source_sync"),
+    # Taking a source-owned model off the sync path so it can be edited, and
+    # handing it back.
+    "/api/admin/semantic-models/{model_id}/detach": ("admin semantic detach", "semantic_model_detach"),
+    "/api/admin/semantic-models/{model_id}/reattach": ("admin semantic reattach", "semantic_model_reattach"),
+    # Which Data Package carries a model to non-admin readers.
+    "/api/admin/semantic-models/{slug}/packages": (
+        "admin semantic link-package",
+        "semantic_model_link_package",
+    ),
+    "/api/admin/semantic-models/{slug}/packages/{package_id}": (
+        "admin semantic unlink-package",
+        "semantic_model_unlink_package",
+    ),
     # Contributed-skill triple-surface (GET list + DELETE; POST contribute is _EXEMPT below).
     "/api/admin/contributed-skills": ("admin skill list", "list_contributed_skills"),
     "/api/admin/contributed-skills/{name}": ("admin skill delete", "delete_contributed_skill"),
@@ -209,48 +305,76 @@ def test_cli_subcommands_registered():
     """CLI surface — every cohort entry has a matching ``agnes <cmd>`` subcommand.
 
     Walks the typer command tree at the top-level ``app`` and asserts each
-    ``<group> <subcmd>`` pair from the cohort resolves to a registered command.
-    Supports two-level (``group cmd``) and three-level (``group sub cmd``) paths.
+    path from the cohort resolves to a registered command, at ANY depth: a
+    single token (a callback-style group registered at the top level, e.g.
+    ``agnes search``), or a chain of groups ending in a command
+    (``admin semantic coverage tables``). Hidden registrations count — a
+    deprecated alias is still a reachable surface.
     """
     from cli.main import app
+    from typer.models import DefaultPlaceholder
 
-    # Top-level groups (name → registered Typer instance).
-    groups: dict[str, object] = {g.name: g.typer_instance for g in app.registered_groups if g.name}
+    def invoke_without_command(group_info) -> bool:
+        """Is this GROUP runnable on its own, per Typer's own resolution order?
+
+        Typer resolves a group's settings from three places, first one that
+        was actually set wins: the ``add_typer()`` call, the group's
+        ``@app.callback()``, then the ``typer.Typer()`` constructor. Anything
+        left unset is a ``DefaultPlaceholder``, not a bool — reading the
+        attribute off any single one of them would report ``False`` for a
+        group that IS callable (and, worse, a placeholder is truthy).
+        """
+        instance = group_info.typer_instance
+        for source in (
+            group_info,
+            getattr(instance, "registered_callback", None),
+            getattr(instance, "info", None),
+        ):
+            if source is None:
+                continue
+            value = getattr(source, "invoke_without_command", None)
+            if value is None or isinstance(value, DefaultPlaceholder):
+                continue
+            return bool(value)
+        return False
+
+    def resolve(tokens: list[str]) -> bool:
+        node = app
+        for i, tok in enumerate(tokens):
+            groups = {g.name: g for g in getattr(node, "registered_groups", []) if g.name}
+            commands = {c.name for c in getattr(node, "registered_commands", []) if c.name}
+            last = i == len(tokens) - 1
+            if tok in commands:
+                # A command consumes the rest of the path only if it IS the rest.
+                if last:
+                    return True
+                return False
+            if tok in groups:
+                group_info = groups[tok]
+                # A path may END on a group only when that group is itself
+                # callable (`agnes search`, `agnes admin semantic coverage`).
+                # A group that is NOT — `agnes admin semantic` alone prints
+                # help and exits 2 — is not a CLI surface for the endpoint,
+                # so the cohort row is unsatisfied and must say so.
+                if last:
+                    return invoke_without_command(group_info)
+                node = group_info.typer_instance
+                continue
+            return False
+        return False
+
+    # The resolver has to DISCRIMINATE or the loop below is vacuous: a group
+    # that only dispatches (`agnes admin semantic` prints help and exits 2)
+    # is not a CLI surface, while one with `invoke_without_command=True`
+    # (`agnes admin semantic coverage`) is.
+    assert not resolve(["admin", "semantic"])
+    assert resolve(["admin", "semantic", "coverage"])
 
     for path, (cli_cmd, _mcp_tool) in _COHORT.items():
-        if " " not in cli_cmd:
-            # Single-token command: a callback-style Typer group registered at
-            # the top level (e.g. `agnes search`, same shape as `agnes pull`) —
-            # the group's existence IS the command surface.
-            assert cli_cmd in groups, (
-                f"CLI command '{cli_cmd}' missing for {path} — register via `app.add_typer(...)` in cli/main.py"
-            )
-            continue
-        head, tail = cli_cmd.split(" ", 1)
-        assert head in groups, (
-            f"CLI group '{head}' missing for {path} — register via `app.add_typer(...)` in cli/main.py"
+        assert resolve(cli_cmd.split(" ")), (
+            f"CLI command 'agnes {cli_cmd}' missing for {path} — register it in "
+            "cli/main.py or the owning cli/commands/ module"
         )
-        sub = groups[head]
-        if " " in tail:
-            # 3-level command: top-group → sub-group → command (e.g. "admin skill list")
-            sub_group_name, cmd_name = tail.split(" ", 1)
-            sub_groups = {g.name: g.typer_instance for g in sub.registered_groups if g.name}  # type: ignore[attr-defined]
-            assert sub_group_name in sub_groups, (
-                f"CLI subgroup '{head} {sub_group_name}' missing for {path} — "
-                f"register via `{head}_app.add_typer(..., name='{sub_group_name}')` in cli/commands/{head}.py"
-            )
-            leaf = sub_groups[sub_group_name]
-            leaf_names = {c.name for c in leaf.registered_commands if c.name}  # type: ignore[attr-defined]
-            assert cmd_name in leaf_names, (
-                f"CLI subcommand '{cli_cmd}' missing for {path} — define "
-                f'`@{sub_group_name}_app.command("{cmd_name}")` in cli/commands/{head}_{sub_group_name}.py'
-            )
-        else:
-            sub_names = {c.name for c in sub.registered_commands if c.name}  # type: ignore[attr-defined]
-            assert tail in sub_names, (
-                f"CLI subcommand '{cli_cmd}' missing for {path} — define "
-                f'`@{head}_app.command("{tail}")` in cli/commands/{head}.py'
-            )
 
 
 def test_mcp_tools_registered():
@@ -375,31 +499,14 @@ _SEMANTIC_MODELS_ADMIN_REASON = (
     "admin CRUD over the canonical Ossie semantic-model registry (open "
     "semantic-layer contract, Task 10) — creating/renaming/deleting a "
     "hand-authored document is an admin action. Reachable via `agnes admin "
-    "semantic-model list/show/import`; no MCP analogue by design — an "
+    "semantic list/show/import/delete`; no MCP analogue by design — an "
     "agent's read path is `semantic_model_search`/`semantic_model_get` "
     "(paired with the public, resource-gated export endpoint in _COHORT "
-    "above), not the admin corpus-management surface, mirroring the "
-    "/api/admin/data-packages and /api/admin/metrics admin-CRUD precedent."
-)
-_SEMANTIC_SOURCES_ADMIN_REASON = (
-    "admin CRUD + manual sync-trigger over registered semantic-layer sync "
-    "sources (git/upload/connection), open semantic-layer contract Task 10 "
-    "— configuring where documents come from, and triggering a fetch, are "
-    "admin actions. Reachable via `agnes admin semantic-source add/list/"
-    "sync`; no MCP analogue by design, mirroring the "
-    "_SOURCE_CONNECTIONS_CRUD_REASON precedent above (an agent-invokable "
-    "tool that can point this server at an arbitrary git remote or upload "
-    "payload and trigger a fetch is a credential/config surface, not a "
-    "read tool)."
-)
-_SEMANTIC_MODELS_SEARCH_REASON = (
-    "public, resource-gated substring search over semantic models — has an "
-    "MCP tool (`semantic_model_search`) but no dedicated CLI subcommand: "
-    "`agnes admin semantic-model list` covers interactive listing via the "
-    "admin endpoint instead. Mirrors the /api/glossary + /api/glossary/"
-    "search split (list has no MCP tool; search is the agent-facing path) "
-    "in the opposite direction — here the admin list, not the search, is "
-    "the one without an MCP pairing."
+    "above) and its write path is `apply_semantic_model`, not the admin "
+    "corpus-management surface, mirroring the /api/admin/data-packages and "
+    "/api/admin/metrics admin-CRUD precedent. Scoped to THESE two paths "
+    "since #1707: detach/reattach, the package links and semantic-sources "
+    "are now triple-surface in _COHORT."
 )
 _BROKER_REASON = (
     "chat sandbox secret broker (2026-07-14 incident hardening) — internal "
@@ -973,6 +1080,14 @@ _EXEMPT: dict[str, str] = {
     "/api/store/entities/{entity_id}/publisher": _TRUST_LINE_REASON,
     "/api/store/entities/{entity_id}/verification": _TRUST_LINE_REASON,
     "/api/store/entities/{entity_id}/verification/request": _TRUST_LINE_REASON,
+    "/api/admin/telemetry/chat-cost": (
+        "admin-only cost telemetry read, and it DOES have a CLI surface "
+        "(`agnes admin usage chat-cost`) alongside the rest of `agnes admin "
+        "usage`. No MCP tool, matching its siblings `/api/admin/telemetry/"
+        "summary` and `/export`: the MCP foundation tools are the ANALYST "
+        "surface over their own data, and an agent has no business reading "
+        "every user's spend."
+    ),
     "/api/admin/prompts/{kind}": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/source": _PROMPTS_REASON,
     "/api/admin/prompts/{kind}/bind-git": _PROMPTS_REASON,
@@ -1038,6 +1153,16 @@ _EXEMPT: dict[str, str] = {
         "keboola-only browse-and-register primitive with no analyst CLI/MCP analogue; "
         "`agnes admin register-table` already covers the actual registration step"
     ),
+    "/api/admin/source-pipelines": (
+        "the /admin/data-sources source cards' own pipeline strip, as data — "
+        "read-only, and by construction NOT new data: it re-serves the exact "
+        "dict that page already inlines into its HTML, so the page can repaint "
+        "a card after the wizard/token/package mutations that happen on it over "
+        "fetch. No analyst CLI/MCP analogue: every fact in it is a projection of "
+        "surfaces that already have one (`agnes admin list-tables`, `agnes admin "
+        "sync`, `agnes admin data-package list`), assembled in the shape one "
+        "browser card draws"
+    ),
     # SharePoint connect wizard (spec 2026-08-27 §13.2) — admin-only browse
     # and scope-confirmation primitives feeding the wizard's step 2/3, with
     # no analyst CLI/MCP analogue (the wizard itself is the only client; the
@@ -1062,6 +1187,12 @@ _EXEMPT: dict[str, str] = {
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
         "admin-only, no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/changes": (
+        "observed-changes feed (what changed between two timestamps) derived from the "
+        "connection's own corpus_file_events log — admin-only wizard/ops display "
+        "primitive, no analyst CLI/MCP analogue; the eventual document surface is "
+        "`agnes facts …`, already triple-surface in _COHORT above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/certificate": (
         "read-only certificate metadata (thumbprint/subject/issuer/expiry) for the "
         "wizard's source card, derived at request time from the connection's own "
@@ -1080,6 +1211,21 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven sweep firing corpus-extraction for every due SharePoint "
         "connection — admin/scheduler maintenance op, mirrors the "
         "run-knowledge-digests / reap-idle exemptions; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/webhook": (
+        "admin-only (re)generation of the Graph change-notification receiver's "
+        "shared secret + receiver URL, feeding the operator's own Graph "
+        "subscription create call — admin-only wizard bookkeeping, no analyst "
+        "CLI/MCP analogue"
+    ),
+    "/api/webhooks/sharepoint/{connection_id}": (
+        "Microsoft Graph change-notification receiver (validation handshake + "
+        "notification delivery) for a SharePoint connection — system-to-system, "
+        "verified via a per-connection clientState secret in the handler body, "
+        "never a session/PAT; same webhook carve-out class as /webhooks/jira and "
+        "/api/slack/events (CONTRIBUTING.md's standing 'health checks, webhooks, "
+        "OAuth callbacks, and internal/SSE routes' exemption). No analyst CLI/MCP "
+        "analogue — Graph is the only caller."
     ),
     "/api/admin/sharepoint/connections/{connection_id}/acl-sync": (
         "admin 'sync now' trigger for the sharepoint-acl-sync job (spec §5.1, "
@@ -1108,15 +1254,25 @@ _EXEMPT: dict[str, str] = {
         "builder preview, no analyst CLI/MCP analogue"
     ),
     # Open semantic-layer contract (Task 10) — admin CRUD over the
-    # semantic-model registry and its sync sources. The public,
-    # resource-gated export endpoint carries the triple-surface contract in
-    # _COHORT above.
+    # semantic-model registry itself. The public, resource-gated export
+    # endpoint carries the triple-surface contract in _COHORT above, as do
+    # this registry's sync sources since #1707.
     "/api/admin/semantic-models": _SEMANTIC_MODELS_ADMIN_REASON,
     "/api/admin/semantic-models/{model_id}": _SEMANTIC_MODELS_ADMIN_REASON,
-    "/api/admin/semantic-sources": _SEMANTIC_SOURCES_ADMIN_REASON,
-    "/api/admin/semantic-sources/{source_id}": _SEMANTIC_SOURCES_ADMIN_REASON,
-    "/api/admin/semantic-sources/{source_id}/sync": _SEMANTIC_SOURCES_ADMIN_REASON,
-    "/api/semantic-models/search": _SEMANTIC_MODELS_SEARCH_REASON,
+    # F3 detach/re-attach, the package link pair and semantic-sources CRUD
+    # were exempt here with the reason "no MCP analogue by design". That was
+    # reversed in #1707: none of the three fits either standing exemption
+    # (credential-provisioning writes, security-posture diagnostics), so they
+    # are in _COHORT above with the tools that now mirror them.
+    "/api/semantic-models/bundle": (
+        "Fáze 1 physical-distribution cache — RBAC-scoped semantic-model "
+        "bundle consumed by `agnes pull` (renders the read-only local cache "
+        "under `<workspace>/semantic/<slug>/…`, `src/semantic/"
+        "cache_render.py`); no MCP/interactive analogue, mirrors the "
+        "/api/memory/bundle and /api/knowledge/digests/{digest_id}/content "
+        "delivery channels — an agent's live read path is already "
+        "`get_semantic_context`/`get_semantic_schema` (in _COHORT above)."
+    ),
     "/api/attachments/{source}/{attachment_id}/download": (
         "connector-catalogued attachment binary download (Jira first) — one-shot "
         "fetch by id consumed by `agnes attachment get`; binary byte-stream with "
@@ -1201,15 +1357,16 @@ _EXEMPT: dict[str, str] = {
         "credential (not user auth); the analyst-facing equivalent is the "
         "existing /api/initial-workspace.zip flow"
     ),
-    "/api/admin/run-keboola-semantic-layer-refresh": (
-        "scheduler-driven Keboola semantic layer (Metastore) sync trigger — "
-        "admin/scheduler maintenance op, mirrors the run-bq-metadata-refresh / "
-        "run-knowledge-digests exemptions; no analyst CLI/MCP analogue"
-    ),
-    "/api/admin/run-databricks-semantic-layer-refresh": (
-        "scheduler-driven Databricks semantic layer (Unity Catalog metric "
-        "views) sync trigger — admin/scheduler maintenance op, mirrors the "
-        "run-keboola-semantic-layer-refresh exemption; no analyst CLI/MCP analogue"
+    "/api/admin/run-semantic-sources-refresh": (
+        "scheduler-driven refresh over registered semantic_sources rows "
+        "(#1707 Block 3) — admin/scheduler maintenance op, mirrors the "
+        "run-bq-metadata-refresh / run-knowledge-digests exemptions; no "
+        "analyst CLI/MCP analogue (the per-source `agnes admin "
+        "semantic-source sync <id>` manual command already exists and is "
+        "unrelated to this scheduled sweep). It replaced the retired "
+        "run-keboola-semantic-layer-refresh / "
+        "run-databricks-semantic-layer-refresh triggers, which carried the "
+        "same exemption"
     ),
     "/api/admin/run-audit-prune": (
         "scheduler-driven audit_log retention pruning trigger (B8 audit-trail "
@@ -1344,6 +1501,12 @@ _EXEMPT: dict[str, str] = {
         "scheduler-driven idle-app reaper trigger (data-apps platform Task 9) — "
         "admin/scheduler maintenance op, mirrors the run-knowledge-digests / "
         "run-corporate-memory exemptions; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/semantic-auto-draft-sweep": (
+        "scheduler-driven semantic-layer auto-draft sweep trigger "
+        "(semantic-phase5 wave 2) — admin/scheduler maintenance op, mirrors "
+        "the run-semantic-sources-refresh / run-audit-prune "
+        "exemptions; no analyst CLI/MCP analogue"
     ),
     # Build order step 4 (write path). Unlike the read routes (which live
     # in _COHORT with their CLI/MCP halves), this IS a permanent

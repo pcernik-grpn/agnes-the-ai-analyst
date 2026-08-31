@@ -22,16 +22,10 @@ on:
     # loses no coverage.
     branches: [main, integration, "feature/**"]
   pull_request:
-    # NO branch filter, deliberately (#1636). A `branches:` list here means
-    # GitHub fires no workflow at all for a PR whose base is not on it — and
-    # the PR then shows a green rollup that asserted nothing, which is worse
-    # than a red one. That is not hypothetical: the semantic-layer stack took
-    # four PRs into `mf/semantic-layer-v0` with no test run between them, and
-    # the base sat at two alembic heads the whole time with nothing to say so.
-    # Naming stack bases individually was the cheaper option and was rejected:
-    # it needs a naming convention nobody enforces, and it fails silently the
-    # first time someone picks a name outside it. A PR that gets no CI is not
-    # reviewable, whatever it targets.
+    # PRs targeting `integration` must run the full suite too — without
+    # this filter GitHub fires no workflow at all for them and the PR shows
+    # a green rollup that asserted nothing.
+    branches: [main, integration]
   schedule:
     - cron: "0 3 * * *"  # Nightly at 03:00 UTC — runs docker-e2e
   workflow_dispatch:

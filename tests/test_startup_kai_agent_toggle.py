@@ -60,12 +60,15 @@ def test_main_tf_forwards_per_vm_toggle_into_templatefile():
 def test_main_tf_grants_secret_access_conditionally():
     body = (MODULE / "main.tf").read_text()
     # secretAccessor only when some instance enables the engine, and secrets
-    # already granted via runtime_secret_env OR runtime_secrets are
-    # subtracted — the same (project, secret, role, member) binding declared
-    # twice errors the apply.
+    # already granted via runtime_secret_env, runtime_secret_env_multiline OR
+    # runtime_secrets are subtracted — the same (project, secret, role,
+    # member) binding declared twice errors the apply.
     assert re.search(r"kai_agent_any_enabled\s*=\s*anytrue", body)
     assert "setsubtract" in body
-    assert "setunion(toset(keys(var.runtime_secret_env)), toset(var.runtime_secrets))" in body
+    assert (
+        "setunion(toset(keys(var.runtime_secret_env)), "
+        "toset(keys(var.runtime_secret_env_multiline)), toset(var.runtime_secrets))"
+    ) in body
     assert re.search(r'"vm_kai_agent"\s*\{', body)
     # The VM must wait on the grant, or the boot-time fetch can 403 on IAM lag.
     assert "google_secret_manager_secret_iam_member.vm_kai_agent," in body
@@ -88,7 +91,7 @@ def test_tpl_env_block_guarded_by_toggle():
     # chown (postgres runs as uid 70, the app as 999).
     assert "! -name kai-agent-postgres" in body
     # The overlay joins COMPOSE_FILE so auto-upgrade pulls + ups it too.
-    assert "COMPOSE_FILE_VALUE=\"$COMPOSE_FILE_VALUE:docker-compose.kai-agent.yml\"" in body
+    assert 'COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.kai-agent.yml"' in body
 
 
 def test_tpl_kai_blocks_are_toggle_gated():
@@ -127,7 +130,7 @@ def test_tpl_engine_failure_cannot_gate_the_machine():
     assert restore < tolerant_up < cron
     assert body.rindex('if [ "$KAI_AGENT_MATERIALIZE" = "1" ]; then') < restore
     # The strip only works while the overlay is appended LAST — keep it last.
-    assert body.index("COMPOSE_FILE_VALUE=\"$COMPOSE_FILE_VALUE:docker-compose.kai-agent.yml\"") < strip
+    assert body.index('COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.kai-agent.yml"') < strip
 
 
 def test_tpl_engine_requires_public_origin():
@@ -216,7 +219,9 @@ def test_tpl_broker_mcp_halves_are_flag_gated_and_paired():
     assert gate < body.index(url_line) < body.index('echo "${kai_agent_env_b64}" | base64 -d')
     # App half: inside the app .env's kai block, so a VM without the engine
     # renders neither line.
-    kai_block_start = body.index("KAI_HOST_JWT_SECRET=$KAI_HOST_JWT_SECRET", body.index('cat > "$APP_DIR/.env" <<ENVEOF'))
+    kai_block_start = body.index(
+        "KAI_HOST_JWT_SECRET=$KAI_HOST_JWT_SECRET", body.index('cat > "$APP_DIR/.env" <<ENVEOF')
+    )
     assert kai_block_start < body.index(app_line) < body.index("COMPOSE_FILE=$COMPOSE_FILE_VALUE")
 
 
@@ -225,7 +230,7 @@ def test_kai_agent_env_rejects_multiline_values():
     # The map becomes KEY=VALUE lines in the engine's env_file; an embedded
     # newline truncates the value and corrupts the next line — the engine
     # then silently never starts. Must fail the plan, not the runtime.
-    assert 'for k, v in var.kai_agent_env' in body
+    assert "for k, v in var.kai_agent_env" in body
     assert '!strcontains(v, "\\n")' in body
     assert '!strcontains(k, "=")' in body
 
@@ -285,7 +290,7 @@ def test_auto_upgrade_tick_retries_a_downed_engine_every_tick():
     # recreate the engine itself or an image bump never lands via the tick.
     role_split_abort = body.index("role-split rolling recreate ABORTED")
     engine_after_rollout = body.index("up -d kai-agent", role_split_abort)
-    assert engine_after_rollout < body.index("elif [[ \":$COMPOSE_FILE:\"", role_split_abort)
+    assert engine_after_rollout < body.index('elif [[ ":$COMPOSE_FILE:"', role_split_abort)
 
 
 def test_tpl_skipped_boot_tears_down_stale_engine_containers():

@@ -39,6 +39,23 @@ class TestColumnMetadataCreate:
         rows = repo.list_for_table("orders")
         assert len(rows) == 1
 
+    def test_save_accepts_but_does_not_persist_source_ref(self, repo):
+        """``source_ref`` is Postgres-only (A3 PG-first ratchet, see
+        ``src/repositories/column_metadata.py::save``'s docstring): the
+        DuckDB app-state schema is frozen and never gained this column, so
+        it has no key in the returned record at all (not even ``None``).
+        ``save()`` still accepts the kwarg for signature parity with the PG
+        repo, it just never lands anywhere."""
+        result = repo.save(
+            "orders",
+            "region",
+            basetype="STRING",
+            source="databricks_metrics",
+            source_ref="dbc-test.cloud.databricks.com",
+        )
+        assert "source_ref" not in result
+        assert "source_ref" not in repo.get("orders", "region")
+
 
 class TestColumnMetadataRead:
     def test_list_for_table_filters_by_table(self, repo):
@@ -67,6 +84,23 @@ class TestColumnMetadataRead:
     def test_get_missing_returns_none(self, repo):
         result = repo.get("orders", "nonexistent")
         assert result is None
+
+    def test_list_all_returns_rows_across_every_table(self, repo):
+        """Unlike ``list_for_table``, ``list_all`` is not scoped to one
+        ``table_id`` — needed to find rows whose ``table_id`` no longer
+        names a live ``table_registry`` row at all (Block 5 of #1707), which
+        cannot be looked up by the very id that is missing."""
+        repo.save("orders", "id", basetype="STRING")
+        repo.save("customers", "email", basetype="STRING")
+
+        rows = repo.list_all()
+        assert {(r["table_id"], r["column_name"]) for r in rows} == {
+            ("orders", "id"),
+            ("customers", "email"),
+        }
+
+    def test_list_all_empty_instance_returns_empty_list(self, repo):
+        assert repo.list_all() == []
 
 
 class TestColumnMetadataDelete:

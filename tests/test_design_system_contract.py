@@ -1563,3 +1563,90 @@ def test_dsec_clip_yields_to_open_dropdown_menu() -> None:
         "off after its first item. Pair the clip with "
         "`.dsec:has(.ds-dropdown-menu:not([hidden])) { overflow: visible; }`."
     )
+
+
+# --------------------------------------------------------------------------- #
+# #1707 A6 — `.data-table-wrap` needs an overflow rule.
+#
+# Ten admin pages (semantic sources, users, sync, marketplaces, mcp_sources,
+# knowledge_digests, linked_apps, initial_workspace, data_apps, tables) wrap
+# a `.data-table` in `<div class="data-table-wrap">` so a wide/many-column
+# table scrolls horizontally instead of dragging the whole page with it — but
+# no CSS rule ever backed the class, so the wrapper did nothing and the page
+# itself scrolled in a narrow window. `admin_tables.html` wraps a
+# JS-hydrated layout host rather than a literal `.data-table` markup, but
+# gets the same rule once its hydrator injects the table.
+#
+# PR #1823 review, second pass: `overflow-x: auto` makes the wrap a new
+# scrolling ancestor closer than the viewport, which silently re-targets
+# `.data-table`'s `position: sticky` thead (style-custom.css's `.ds-table`
+# family, ~line 5507) onto a container that never itself scrolls (no height
+# cap) — so the header would stop sticking at all instead of degrading
+# gracefully, and the same ancestor change triggers the "rounded corners
+# vanish under a stuck thead" bug `.cloud-chat-table-wrap` (chat.css) works
+# around for its own tables. Decision: rather than adopt that recipe's
+# border-transfer here (all ten pages would need touching, and
+# `admin_tables.html`'s wrap would gain a border around a placeholder that
+# isn't a table yet), sticky is disabled outright for any thead inside
+# `.data-table-wrap` — an unambiguous "off" instead of a silently
+# non-functional "on".
+# --------------------------------------------------------------------------- #
+
+_DATA_TABLE_WRAP_RULE_RE = re.compile(r"\.data-table-wrap\s*\{[^}]*overflow-x\s*:\s*auto[^}]*\}", re.DOTALL)
+_DATA_TABLE_WRAP_STICKY_OFF_RE = re.compile(
+    r"\.data-table-wrap\s+thead\s+th\s*\{[^}]*position\s*:\s*static[^}]*\}", re.DOTALL
+)
+
+
+def test_data_table_wrap_has_overflow_rule() -> None:
+    """`.data-table-wrap` must set `overflow-x: auto` — the whole reason ten
+    admin pages wrap their table in this div (#1707 A6)."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _DATA_TABLE_WRAP_RULE_RE.search(css), (
+        ".data-table-wrap has no `overflow-x: auto` rule in style-custom.css — the "
+        "wrapper div ten admin pages use silently does nothing, and a wide table "
+        "drags the whole page into horizontal scroll instead (#1707 A6)"
+    )
+
+
+def test_data_table_wrap_disables_sticky_thead() -> None:
+    """A thead inside `.data-table-wrap` must NOT stay `position: sticky` —
+    the wrap's `overflow-x: auto` makes it a nearer scrolling ancestor than
+    the viewport, and with no height cap the header would silently stop
+    sticking at all instead of visibly failing. Disable it outright rather
+    than ship an ambiguous no-op (PR #1823 review)."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _DATA_TABLE_WRAP_STICKY_OFF_RE.search(css), (
+        ".data-table-wrap has no `thead th { position: static }` override in "
+        "style-custom.css — a wrapped table's sticky header would silently stop "
+        "sticking instead of being consciously turned off (#1707 A6, PR #1823 review)"
+    )
+
+
+# Every admin page whose `<th>` inline-styled its own right alignment instead
+# of using `.num` — the class style-custom.css already defines for a
+# right-aligned/mono/tabular-nums column and that `admin_moderation_hub.html`
+# already reuses on a non-numeric "Decision"/"Review" action header, the same
+# way these do on "Actions". Narrowly scoped to the `text-align` inline
+# pattern (not every `style=` on a `<th>`) because a couple of admin
+# templates carry unrelated, legitimate inline styles on a `<th>`
+# (`admin_server_config.html`'s padding tweak, `admin_tables.html`'s
+# JS-generated strikethrough for a renamed/hidden column) that this fix has
+# no reason to touch.
+_TH_INLINE_TEXT_ALIGN_RE = re.compile(r'<th[^>]*\sstyle="[^"]*text-align[^"]*"')
+
+
+def test_admin_templates_have_no_inline_text_align_on_table_header() -> None:
+    """No admin template may inline-style a `<th>`'s alignment — reuse
+    `.num` instead (#1707 A6, broadened PR #1823 review). Covers every
+    `admin_*.html`, not just `admin_semantic_sources.html`, so a new
+    occurrence can't land on a sibling page."""
+    offenders: dict[str, list[str]] = {}
+    for path in sorted(TEMPLATES.glob("admin_*.html")):
+        found = _TH_INLINE_TEXT_ALIGN_RE.findall(path.read_text(encoding="utf-8"))
+        if found:
+            offenders[path.name] = found
+    assert not offenders, (
+        "inline `style=\"text-align:...\"` found on a <th> — use the `.num` class "
+        "instead (#1707 A6):\n" + "\n".join(f"  {name}: {vals}" for name, vals in offenders.items())
+    )

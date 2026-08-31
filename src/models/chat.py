@@ -138,6 +138,12 @@ class ChatMessage(Base):
     parts: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
     tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: Prompt-cache halves of the turn's usage (migration 0092). NULL on a
+    #: row written before it, and on every row written by the frozen DuckDB
+    #: app-state backend, which has no such column (A3: no new DuckDB
+    #: schema step) — NULL means "not recorded", never "zero".
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     sender_email: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

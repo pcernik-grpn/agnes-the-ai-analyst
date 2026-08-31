@@ -99,11 +99,24 @@ class TestAuthGating:
         r = seeded_app["client"].get(f"{BASE}/nope/corpus-map", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 403
 
+    def test_changes_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/changes")
+        assert r.status_code == 401
+
+    def test_changes_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/changes", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
 
 class TestConnectionNotFound:
     def test_tree_404_for_unknown_connection(self, seeded_app):
         r = seeded_app["client"].get(f"{BASE}/does-not-exist/tree", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 404
+
+    def test_changes_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/changes", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+        assert r.json()["detail"] == "connection_not_found"
         assert r.json()["detail"] == "connection_not_found"
 
     def test_tree_404_for_non_sharepoint_connection(self, seeded_app, monkeypatch):
@@ -1342,6 +1355,51 @@ class TestCertificateMetadata:
         assert body["reason"].startswith("certificate_unparseable")
 
 
+class TestWebhookSecretRotation:
+    """`POST /connections/{id}/webhook` — (re)generates the Graph
+    change-notification receiver's shared secret, returning it alongside
+    the receiver URL an operator feeds to the producer's own
+    `subscriptions.py create --url ...`."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/webhook", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/webhook")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/does-not-exist/webhook", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_generates_a_secret_and_the_receiver_url(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-conn")
+        r = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["webhook_url"].endswith(f"/api/webhooks/sharepoint/{conn_id}")
+        assert isinstance(body["secret"], str) and len(body["secret"]) >= 32
+
+    def test_persists_the_secret_on_the_connection(self, seeded_app):
+        from src.repositories import source_connections_repo
+
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-persist-conn")
+        r = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token))
+        secret = r.json()["secret"]
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["webhook_secret"] == secret
+
+    def test_rotating_again_mints_a_different_secret(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="webhook-rotate-conn")
+        first = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token)).json()["secret"]
+        second = c.post(f"{BASE}/{conn_id}/webhook", headers=_auth(token)).json()["secret"]
+        assert first != second
+
+
 class TestCorpusMap:
     def test_corpus_map_keys_are_producer_resolver_shaped(self, seeded_app):
         """Keys must be what the producer's corpus_for() resolver matches
@@ -1416,6 +1474,37 @@ class TestCorpusMap:
         assert mapping.json() == {}
 
 
+class TestChangesFeedFailsCleanOnDuckDB:
+    """The observed-changes feed (`GET .../changes`) is PG-only —
+    `corpus_file_events` has no DuckDB counterpart (A3 ratchet). The happy
+    path (real events, since/until filtering, pagination, all four change
+    kinds off a realistic upload/update/rename/delete fixture) lives in
+    tests/db_pg/test_sharepoint_changes_pg.py; this suite (the DuckDB-backed
+    default here) only proves the typed 501 — never a raw 500 — regardless
+    of whether the connection has any confirmed scopes yet."""
+
+    def test_changes_501_on_duckdb_backend_no_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="changes-noscope-conn")
+        r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_changes_501_on_duckdb_backend_with_a_confirmed_scope(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="changes-scoped-conn")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
 # ---------------------------------------------------------------------------
 # Extraction enqueue wiring (TCRD-226) — the admin trigger + the scheduled
 # sweep. Neither test class launches a real producer subprocess; they cover
@@ -1460,9 +1549,14 @@ class TestExtractionTrigger:
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        # AGNES_EXTRACTION_ENABLED wins over the mocked get_value config —
-        # clear it so each test's fake config is what actually decides.
+        # AGNES_EXTRACTION_ENABLED / AGNES_EXTRACTION_PRODUCER_COMMAND /
+        # AGNES_EXTRACTION_PRODUCER_MODULE all win over the mocked
+        # get_value config — clear them so each test's fake config is what
+        # actually decides, except the one test below that sets one on
+        # purpose.
         monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
+        monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
 
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
@@ -1498,6 +1592,17 @@ class TestExtractionTrigger:
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "extraction_producer_not_configured"
+
+    def test_producer_command_env_override_satisfies_readiness(self, seeded_app, monkeypatch):
+        """A deployment that activates extraction purely via env (the
+        Terraform-rendered ``/opt/agnes/.env`` case) needs no
+        ``extraction.producer`` block in ``instance.yaml`` at all."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-env-producer")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
@@ -1621,6 +1726,88 @@ class TestExtractionRunDue:
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["dispatched"] == []
+
+
+# ---------------------------------------------------------------------------
+# Producer-scoped callback credential (replaces forwarding the scheduler
+# secret — see app/worker/kinds.py::_agnes_producer_callback_env). A
+# ProducerPrincipal may call `.../scopes` and `.../corpus-map` for its OWN
+# `connection_id` claim; everything else on this router still requires
+# admin (or 403s off-surface before ever reaching this router at all —
+# see tests/test_producer_token.py for that gate's own coverage).
+# ---------------------------------------------------------------------------
+
+
+def _producer_token(connection_id: str, collection_ids=()) -> str:
+    from app.auth.producer_token import mint_producer_token
+
+    return mint_producer_token(connection_id=connection_id, collection_ids=list(collection_ids), ttl_seconds=3600)
+
+
+class TestProducerCallbackAccess:
+    def test_corpus_map_accepts_producer_for_its_own_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-map")
+        confirm = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        # Keys are the producer resolver's crawler-row shape, not the raw
+        # source_scope_id — see connectors/sharepoint/corpus_map.py::_map_key.
+        assert r.json() == {"A": confirm.json()["collection_id"]}
+
+    def test_scopes_accepts_producer_for_its_own_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-scopes")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["items"][0]["source_scope_id"] == "drive:a"
+
+    def test_corpus_map_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-1")
+        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-2")
+        token = _producer_token(other_conn_id)
+        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_scopes_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-3")
+        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-4")
+        token = _producer_token(other_conn_id)
+        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_scopes_post_still_403s_a_producer_token(self, seeded_app):
+        """POST .../scopes is not on the producer's fixed allowed surface —
+        refused before this router's own dependency ever runs."""
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-write")
+        token = _producer_token(conn_id)
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "x", "display_path": "x"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 403
+
+    def test_tree_still_403s_a_producer_token(self, seeded_app):
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-tree")
+        token = _producer_token(conn_id)
+        r = c.get(f"{BASE}/{conn_id}/tree", headers=_auth(token))
+        assert r.status_code == 403
 
 
 class TestExcludedSubtreeAdvisory:

@@ -198,6 +198,65 @@ def test_column_metadata_import_proposal(ctx, tmp_path):
     assert cols["id"]["source"] == "ai_enrichment"
 
 
+def test_column_metadata_save_accepts_source_ref(ctx):
+    """``source_ref`` (mirrors metric_definitions/glossary_terms) is a
+    Postgres-only column (A3 PG-first ratchet, ``docs/migrations.md`` ->
+    "Adding a PG-only feature") — the DuckDB app-state schema is frozen and
+    never gained it. Both backends' ``save()`` accept the kwarg (signature
+    parity, ``tests/db_pg/test_repo_method_parity.py``), but only Postgres
+    persists it; DuckDB silently drops it rather than erroring, so a shared
+    caller (``src/semantic/projection.py``) works unmodified against either
+    backend."""
+    repo = ctx.column_metadata()
+
+    saved = repo.save(
+        table_id="orders",
+        column_name="region",
+        basetype="STRING",
+        description="Sales region",
+        source="databricks_metrics",
+        source_ref="dbc-test.cloud.databricks.com",
+    )
+    fetched = repo.get("orders", "region")
+    listed = {c["column_name"]: c for c in repo.list_for_table("orders")}
+
+    if ctx.backend == "pg":
+        assert saved["source_ref"] == "dbc-test.cloud.databricks.com"
+        assert fetched["source_ref"] == "dbc-test.cloud.databricks.com"
+        assert listed["region"]["source_ref"] == "dbc-test.cloud.databricks.com"
+
+        # Omitted entirely — stays NULL, same as every other nullable
+        # provenance column on this repo (no implicit default).
+        no_ref = repo.save(table_id="orders", column_name="amount", basetype="DECIMAL", source="manual")
+        assert no_ref["source_ref"] is None
+    else:
+        # No DuckDB column at all — not even a NULL, the key is absent.
+        assert "source_ref" not in saved
+        assert "source_ref" not in fetched
+        assert "source_ref" not in listed["region"]
+
+
+def test_column_metadata_list_all_spans_every_table(ctx):
+    """``list_all`` (Block 5 of #1707, orphaned-column detection) is not
+    scoped to one ``table_id`` like ``list_for_table`` — it has to see rows
+    for a table_id that no longer exists in ``table_registry`` at all, which
+    cannot be looked up by the very id that is missing."""
+    repo = ctx.column_metadata()
+    repo.save(table_id="orders", column_name="id", basetype="STRING")
+    repo.save(table_id="customers", column_name="email", basetype="STRING")
+
+    rows = repo.list_all()
+    assert {(r["table_id"], r["column_name"]) for r in rows} == {
+        ("orders", "id"),
+        ("customers", "email"),
+    }
+
+
+def test_column_metadata_list_all_empty_is_empty_list(ctx):
+    repo = ctx.column_metadata()
+    assert repo.list_all() == []
+
+
 # ---------------------------------------------------------------------------
 # usage — emit_server_event (PG port)
 # ---------------------------------------------------------------------------

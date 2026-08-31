@@ -85,7 +85,7 @@ class TestDataSourcesPageAuth:
         assert "saveMasterToken" in body
         assert "removeMasterToken" in body
         assert "Semantic-layer token" in body
-        assert "MASTER (owner) token" in body
+        assert "master (owner) token" in body
         assert 'kind: "master"' in body
 
         # Reciprocal link to the vault-secrets page.
@@ -101,6 +101,69 @@ class TestDataSourcesPageAuth:
         c = seeded_app["client"]
         resp = c.get("/admin/data-sources", follow_redirects=False)
         assert resp.status_code in (302, 303, 307)
+
+
+class TestMasterTokenCardTooltip:
+    """A12 (#1707): the card's "Semantic-layer token" fact used a native
+    `title=` — a 600ms+ OS-controlled show delay, invisible on touch. It must
+    use the shared `[data-tip]` fast-tooltip mechanism instead: `data-tip` and
+    `aria-label` carrying the same text, never `title` alongside it."""
+
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        """Brace-matched extraction — a naive index-slice to the next known
+        function name would false-fire on an unrelated `title=` introduced
+        anywhere in between by a later, unrelated edit."""
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
+    def _fact_fn(self, seeded_app) -> str:
+        c = seeded_app["client"]
+        body = c.get(
+            "/admin/data-sources",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+        return self._extract_function(body, "function _masterTokenFactHtml(row) {")
+
+    def test_uses_data_tip_and_aria_label_not_title(self, seeded_app):
+        fn = self._fact_fn(seeded_app)
+        assert "data-tip=" in fn
+        assert "aria-label=" in fn
+        assert "title=" not in fn
+        tip = fn.split('data-tip="', 1)[1].split('"', 1)[0]
+        label = fn.split('aria-label="', 1)[1].split('"', 1)[0]
+        # The accessible name must PREFIX the visible label with the tip,
+        # never replace it outright (WCAG 2.5.3 Label in Name) — the
+        # library.html:83 precedent this was modeled on does the same.
+        assert label.startswith("Semantic-layer token")
+        assert label.endswith(tip)
+        assert "master" in tip.lower()
+        assert len(tip) < 160
+
+    def test_a_derived_card_has_no_master_token_widget(self, seeded_app):
+        """`_masterTokenFactHtml` is never called for a derived row (no
+        stored connection to hold the secret in) — proving this here is what
+        makes the pipeline-strip fallback to the plain link, rather than
+        `toggleMasterToken`, for a derived card the only safe choice."""
+        c = seeded_app["client"]
+        body = c.get(
+            "/admin/data-sources",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+        card = self._extract_function(body, "function _connectionCardHtml(row) {")
+        derived_branch = card[: card.index("const c = _connector(row.source_type);")]
+        assert "_masterTokenFactHtml" not in derived_branch
 
 
 class TestDataSourcesPageVaultBanner:
@@ -359,6 +422,37 @@ class TestAddDataWizard:
         assert 'id="ds-new-master"' in body
         assert "owner" in body  # the copy says WHICH token this is
 
+    def test_wizard_master_token_field_names_the_keboola_noun(self, seeded_app):
+        """A12 (#1707): "project owner" is Agnes's own phrasing, not
+        Keboola's — an admin searching their Keboola project for "project
+        owner token" finds nothing, because Keboola's own UI calls it the
+        project MASTER token. The wizard field must say "master" at the
+        point of entry, not only on the connection card two steps later."""
+        body = self._page(seeded_app)
+        field = body[body.index('id="ds-new-master"') : body.index('id="ds-new-master"') + 600]
+        assert "master" in field.lower()
+
+    def test_the_semantic_opt_ins_link_the_source_to_the_connection(self, seeded_app):
+        """`config: {}` is what the created semantic source carries — the
+        adapters resolve their own credentials — but it must carry the
+        `connection_id` link, or the cross-domain coverage report credits the
+        source to nobody and scores a working semantic layer as missing
+        (src/semantic/coverage.py::_native_semantic_status)."""
+        body = self._page(seeded_app)
+        assert "async function _connectSemanticSource(adapter, label, connectionId)" in body
+        assert "connection_id: connectionId" in body
+        # Both opt-ins pass the row the wizard just saved.
+        assert '_connectSemanticSource("snowflake_semantic", "Snowflake semantics", _sfConnId)' in body
+        assert '_connectSemanticSource("databricks_metric_views", "Databricks semantics", _dbxConnId)' in body
+
+    def test_a_failed_databricks_semantic_optin_is_reported_not_swallowed(self, seeded_app):
+        """The Databricks branch closes the wizard and navigates away, so a
+        discarded failure left a checked box, no error and no semantic layer
+        indistinguishable from success. On failure it stays put and says so."""
+        body = self._page(seeded_app)
+        assert "Databricks connection saved." in body
+        assert "Continue to Tables" in body
+
     def test_bundle_and_share_write_through_the_canonical_apis(self, seeded_app):
         """The wizard must create real packages and real grants — the same
         rows /admin/data-packages and a group's Access tab edit — never a
@@ -615,6 +709,97 @@ class TestSourcePipelineStrip:
             assert href in body
 
 
+class TestSemanticLayerCellNoTokenAction:
+    """A13 (#1707): "Token not set" used to link to /admin/semantic-layer —
+    the page renders fine, but has no token field; the token is set on the
+    card itself. The actual fix — Actions → Semantic-layer token — lives on
+    the same card, so a STORED connection's not-set cell must call
+    `toggleMasterToken` directly instead of navigating to a page that cannot
+    help. Once a token IS set, the cell keeps linking to the health page —
+    and so does a DERIVED card's cell regardless of token state, since a
+    derived row (no stored connection) carries no `toggleMasterToken` widget
+    at all (`_masterTokenFactHtml` is never rendered for it — see
+    `TestMasterTokenCardTooltip.test_a_derived_card_has_no_master_token_widget`);
+    calling it there would dereference a DOM element that does not exist.
+    Executed for real via `node` against a seeded `SOURCE_PIPELINES` fixture
+    (same pattern as `TestSharePointSourceCardRendering`)."""
+
+    @staticmethod
+    def _extract_function(tpl: str, signature: str) -> str:
+        start = tpl.index(signature)
+        depth = 0
+        started = False
+        for i in range(start, len(tpl)):
+            ch = tpl[i]
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return tpl[start : i + 1]
+        raise AssertionError(f"unbalanced braces extracting {signature!r}")
+
+    def _run(self, *, token_set: bool, derived: bool = False) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fn = self._extract_function(tpl, "function _pipelineStripHtml(row) {")
+        pipeline = {
+            "tables": {"count": 5},
+            "sync": {},
+            "semantic": {"token": token_set, "metrics": 2 if token_set else 0, "terms": 3 if token_set else 0},
+            "feeds": {"packages": 1, "people": 3},
+        }
+        row = {"id": "kbc-conn-1", "source_type": "keboola", "derived": derived}
+        script = f"""
+function _esc(s) {{ return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }}
+const SOURCE_PIPELINES = {{ "kbc-conn-1": {json.dumps(pipeline)} }};
+
+{fn}
+
+console.log(_pipelineStripHtml({json.dumps(row)}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return proc.stdout
+
+    def test_no_token_cell_calls_toggle_master_token_not_the_health_page(self):
+        html = self._run(token_set=False)
+        assert "Token not set" in html
+        assert "toggleMasterToken('kbc-conn-1')" in html
+        assert 'href="/admin/semantic-layer"' not in html
+
+    def test_token_set_cell_keeps_the_health_page_link(self):
+        html = self._run(token_set=True)
+        assert 'href="/admin/semantic-layer"' in html
+        assert "toggleMasterToken" not in html
+
+    def test_derived_no_token_cell_keeps_the_base_link_not_toggle_master_token(self):
+        """The blocking regression this guards: a derived card has no
+        `ds-master-row-*` element for `toggleMasterToken` to find, so wiring
+        it there would `TypeError` on click (`row.classList` on `null`) the
+        moment the pipeline strip renders for the common case of an
+        instance-credentialed Keboola source with no managed connection yet."""
+        html = self._run(token_set=False, derived=True)
+        assert "Token not set" in html
+        assert "toggleMasterToken" not in html
+        assert 'href="/admin/semantic-layer"' in html
+
+
 class TestSourcesIsEveryConnector:
     """Sources means every source.
 
@@ -833,6 +1018,8 @@ const toasts = [];
 function showToast(msg, ok) {{ toasts.push([msg, ok]); }}
 let loadCalls = 0;
 async function loadConnections() {{ loadCalls++; }}
+let refreshCalls = 0;
+async function refreshSourcePipelines() {{ refreshCalls++; return true; }}
 let sentRequest = null;
 global.fetch = async (url, opts) => {{
   sentRequest = {{ url, opts }};
@@ -850,6 +1037,7 @@ global.fetch = async (url, opts) => {{
     url: sentRequest ? sentRequest.url : null,
     toasts,
     loadCalls,
+    refreshCalls,
     derivedSourcesLength: DERIVED_SOURCES.length,
   }}));
 }})();
@@ -934,6 +1122,10 @@ global.fetch = async (url, opts) => {{
         }
         assert result["toasts"] == [["Keboola imported as a managed connection.", True]]
         assert result["loadCalls"] == 1
+        # The new connection has no entry in the strip snapshot this page was
+        # rendered from, so its card would draw with no pipeline strip at all
+        # until a reload.
+        assert result["refreshCalls"] == 1
         # The stale derived entry is dropped before the reload.
         assert result["derivedSourcesLength"] == 0
 
@@ -1416,12 +1608,17 @@ class TestSharePointSourceCard:
             assert schedule["text"] == "external producer · hourly delta"
             # TCRD-226's in-Agnes schedule state is a SEPARATE, additive
             # sub-object — a fresh connection with no scheduled runs reads
-            # honestly off (never a stale/guessed default).
+            # honestly off (never a stale/guessed default). `extraction.
+            # enabled` is off by default -> the honest-UI gate reads
+            # "not ready, extraction_disabled" (the same slug the manual
+            # trigger's 409 would use for this exact instance state).
             assert schedule["in_agnes"] == {
                 "enabled": False,
                 "schedule": None,
                 "last_run_at": None,
                 "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_disabled",
             }
         finally:
             source_connections_repo().delete(conn_id)
@@ -1467,6 +1664,46 @@ class TestSharePointSourceCard:
             assert in_agnes["last_run_at"] == last_run_at
             # next_due_at(every 4h, last_run_at) == last_run_at + 4h.
             assert in_agnes["next_run_at"] == "2026-08-29T12:00:00+00:00"
+            # Enabled, but `_fake_get_value` never configures a producer ->
+            # the SECOND readiness gate (not the first) is what blocks the
+            # honest-UI gate here.
+            assert in_agnes["extraction_ready"] is False
+            assert in_agnes["extraction_unready_reason"] == "extraction_producer_not_configured"
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_in_agnes_schedule_is_ready_when_enabled_and_producer_configured(self, seeded_app, monkeypatch):
+        """The honest-UI gate flips to ready only once BOTH gates the
+        manual trigger checks (`_extraction_readiness`) pass — mirrors
+        `test_in_agnes_schedule_reflects_live_config_and_dispatch_state`
+        but with a producer command configured, the state a real "Run
+        extraction now" click needs to actually succeed."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "true")
+
+        def _fake_get_value(*keys, default=None):
+            if keys == ("extraction", "producer", "command"):
+                return "python -m fake_producer"
+            return default
+
+        monkeypatch.setattr("app.instance_config.get_value", _fake_get_value)
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+            inv = _source_inventory()
+            in_agnes = inv["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
+            assert in_agnes["extraction_ready"] is True
+            assert in_agnes["extraction_unready_reason"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1683,6 +1920,8 @@ class TestSharePointSourceCardRendering:
                 "function _sharepointFactsHtml(row) {",
                 "const SP_REJECTION_REASON_TEXT = {",
                 "function _spRejectionReasonText(reason) {",
+                "const EXTRACTION_UNREADY_REASON_TEXT = {",
+                "function _extractionUnreadyReasonText(reason) {",
                 "function _spGroupRejectionRows(rows) {",
                 "function _spRejectionRowHtml(r) {",
                 "function toggleFileSourceDrawer(connId, category) {",
@@ -1736,17 +1975,21 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
     # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
 
-    def test_run_extraction_now_button_always_renders_and_is_wired(self):
-        """The action is available regardless of whether in-Agnes
-        scheduling is configured — the fixture above carries no
-        `schedule.in_agnes` at all, and the button must still render and
-        call the SAME endpoint."""
+    def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):
+        """The button never disappears — even on an older/degraded cell
+        shape (the fixture above carries no `schedule.in_agnes` at all) it
+        still renders and is wired to the SAME endpoint — but the honest-UI
+        gate (`extraction_ready`) is missing here, which reads as "not
+        ready" (fail closed), so it renders `disabled`. See
+        `test_in_agnes_schedule_ready_enables_the_run_button` for the
+        enabled case."""
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         html = result["html"]
         assert "Run extraction now" in html
         assert "runSpExtraction('sp-conn-1')" in html
+        assert "disabled" in html
 
-    def test_in_agnes_schedule_renders_last_and_next_run(self):
+    def test_in_agnes_schedule_ready_enables_the_run_button(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
@@ -1755,33 +1998,74 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "schedule": "every 4h",
                 "last_run_at": "2026-08-29T08:00:00+00:00",
                 "next_run_at": "2026-08-29T12:00:00+00:00",
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        # Never a bare "off" badge when enabled.
-        assert "extraction.enabled is off" not in html
+        # Ready -> no unready badge, and the button carries no `disabled`.
+        assert "Extraction is disabled on this instance" not in html
+        assert "No extraction producer is configured" not in html
+        assert "disabled" not in html
         assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
 
     def test_in_agnes_schedule_never_run_reads_honestly(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
-            "in_agnes": {"enabled": True, "schedule": "every 4h", "last_run_at": None, "next_run_at": None},
+            "in_agnes": {
+                "enabled": True,
+                "schedule": "every 4h",
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
+            },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         assert "never run" in result["html"].lower()
 
-    def test_in_agnes_schedule_disabled_shows_an_off_badge(self):
+    def test_in_agnes_schedule_disabled_shows_the_reason_and_disables_the_button(self):
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
-            "in_agnes": {"enabled": False, "schedule": None, "last_run_at": None, "next_run_at": None},
+            "in_agnes": {
+                "enabled": False,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_disabled",
+            },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "off" in html.lower()
+        assert "Extraction is disabled on this instance" in html
         assert "no schedule configured" in html.lower()
+        assert "disabled" in html
+
+    def test_in_agnes_schedule_producer_not_configured_shows_the_reason_and_disables_the_button(self):
+        """A DIFFERENT unready reason than the disabled case above — the
+        instance has `extraction.enabled: true` but no producer command/
+        module set, the exact state a click would otherwise 409
+        `extraction_producer_not_configured` for."""
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {
+                "enabled": True,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": False,
+                "extraction_unready_reason": "extraction_producer_not_configured",
+            },
+        }
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "No extraction producer is configured" in html
+        assert "disabled" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
@@ -2764,3 +3048,416 @@ def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
         "identifier the server suggested"
     )
     assert "_registerErrorText(" in html, "guard has nothing to check — helper is gone"
+
+
+class TestSourcePipelinesEndpoint:
+    """`GET /api/admin/source-pipelines` — the pipeline strip as data.
+
+    The page inlines the same dict at render time (`SOURCE_PIPELINES`), so
+    every card froze at whatever was true when the HTML was built: an admin
+    who registered tables through the wizard kept reading "Add the first
+    tables →" until they hard-reloaded. This endpoint is what the page
+    re-reads after each mutation — read-only, admin-gated exactly like the
+    page it serves.
+    """
+
+    def _get(self, seeded_app, token):
+        return seeded_app["client"].get(
+            "/api/admin/source-pipelines",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    def test_admin_gets_the_strip_dict(self, seeded_app):
+        import uuid
+
+        from src.repositories import source_connections_repo
+
+        conn_id = f"pipeapi-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name=f"Pipe API {conn_id[-4:]}",
+            source_type="keboola",
+            config={"stack_url": "https://connection.example.com"},
+        )
+        try:
+            resp = self._get(seeded_app, seeded_app["admin_token"])
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert conn_id in body
+            assert set(body[conn_id]) == {"tables", "sync", "semantic", "feeds"}
+            assert body[conn_id]["tables"]["count"] == 0
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_it_serves_the_same_dict_the_template_inlines(self, seeded_app):
+        """No new data — it is `_source_pipelines()`, the page's own context."""
+        from app.web.router import _source_pipelines
+
+        resp = self._get(seeded_app, seeded_app["admin_token"])
+        assert resp.status_code == 200
+        assert set(resp.json()) == set(_source_pipelines())
+
+    def test_a_registration_after_page_render_is_visible_without_a_reload(self, seeded_app):
+        """The A14 regression, end to end: register a table AFTER the page
+        HTML was built, and the endpoint must already know about it."""
+        import uuid
+
+        from src.repositories import source_connections_repo, table_registry_repo
+
+        conn_id = f"pipefresh-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name=f"Pipe Fresh {conn_id[-4:]}",
+            source_type="keboola",
+            config={"stack_url": "https://connection.example.com"},
+        )
+        c = seeded_app["client"]
+        auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+        page = c.get("/admin/data-sources", headers=auth).text
+        assert f'"{conn_id}"' in page  # the stale snapshot the page froze
+
+        tid = f"pipefresh-{uuid.uuid4().hex[:6]}"
+        table_registry_repo().register(
+            id=tid,
+            name=f"pipe_fresh_{tid[-6:]}",
+            source_type="keboola",
+            bucket="in.c-test",
+            source_table="pipe_fresh",
+            query_mode="local",
+            connection_id=conn_id,
+        )
+        try:
+            body = self._get(seeded_app, seeded_app["admin_token"]).json()
+            assert body[conn_id]["tables"]["count"] == 1
+        finally:
+            table_registry_repo().unregister(tid)
+            source_connections_repo().delete(conn_id)
+
+    def test_non_admin_is_refused(self, seeded_app):
+        assert self._get(seeded_app, seeded_app["analyst_token"]).status_code == 403
+
+    def test_unauthenticated_is_refused(self, seeded_app):
+        resp = seeded_app["client"].get("/api/admin/source-pipelines")
+        assert resp.status_code in (401, 403)
+
+
+class TestSourceCardRefreshWiring:
+    """Every mutating action on /admin/data-sources re-reads the strip.
+
+    `SOURCE_PIPELINES` is baked into the page at render time, so a card kept
+    reporting "Add the first tables → / Never synced / 0 packages" after the
+    wizard had registered two dozen tables (A14). The fix is one function —
+    `refreshSourcePipelines()` — called from every handler that changes what
+    a strip says; a full page reload is the fallback, never the mechanism,
+    because it throws away expanded cards and scroll position.
+    """
+
+    # Handler → what it changes about a strip.
+    HANDLERS = {
+        "registerSelected": "registers tables (inline browse + Keboola wizard step 2)",
+        "_registerBqRows": "registers BigQuery rows from wizard step 2",
+        "_registerSfRows": "registers Snowflake rows from wizard step 2",
+        "closeWizard": "the wizard registered/bundled/shared, and is now closing",
+        "_createPackagesAndContinue": "creates data packages / attaches tables",
+        "_shareAndFinish": "grants packages to groups (the feeds cell)",
+        "saveRotatedToken": "stores a storage token",
+        "saveMasterToken": "stores the semantic-layer master token",
+        "removeMasterToken": "clears the semantic-layer master token",
+        "saveSpCertificate": "stores a SharePoint certificate",
+        "toggleChatTools": "enables/disables the connection's chat tools",
+        "grantChatTools": "grants the derived MCP tools to a group",
+        "unbindProject": "clears the connection's project binding",
+        "deleteConn": "removes a source (and re-attributes unlinked tables)",
+        "setDefaultConn": "moves the default flag between connections",
+        "runSpExtraction": "queues a SharePoint extraction run",
+        "importKeboolaConnection": "turns the derived card into a real connection",
+        "closeSpWizard": "the SharePoint wizard connected/scoped/shared",
+    }
+
+    @staticmethod
+    def _js_function_body(page: str, name: str) -> str:
+        """The source of one top-level JS function, up to the next one."""
+        import re
+
+        start = re.search(rf"^(?:async )?function {re.escape(name)}\(", page, re.MULTILINE)
+        assert start, f"{name}() is gone from the template — update this guard"
+        rest = page[start.end() :]
+        nxt = re.search(r"^(?:async )?function ", rest, re.MULTILINE)
+        return rest[: nxt.start()] if nxt else rest
+
+    def _page(self, seeded_app) -> str:
+        return (
+            seeded_app["client"]
+            .get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            )
+            .text
+        )
+
+    def test_the_refresh_function_reads_the_endpoint(self, seeded_app):
+        body = self._js_function_body(self._page(seeded_app), "refreshSourcePipelines")
+        assert "/api/admin/source-pipelines" in body
+
+    def test_the_refresh_repaints_instead_of_reloading(self, seeded_app):
+        """A reload loses expanded cards and scroll position — the strip is
+        repainted in place from the fresh dict instead."""
+        page = self._page(seeded_app)
+        body = self._js_function_body(page, "refreshSourcePipelines")
+        assert "window.location.reload" not in body
+        assert "_repaintSourceCards" in body
+        repaint = self._js_function_body(page, "_repaintSourceCards")
+        assert "_pipelineStripHtml" in repaint
+        assert "_sourceHealth" in repaint
+
+    def test_every_mutation_handler_calls_the_refresh(self, seeded_app):
+        page = self._page(seeded_app)
+        missing = [
+            f"{name} ({why})"
+            for name, why in self.HANDLERS.items()
+            if "refreshSourcePipelines(" not in self._js_function_body(page, name)
+        ]
+        assert not missing, (
+            "these handlers mutate what a source card reports but never re-read "
+            "the strip, so the card keeps showing the pre-mutation state until a "
+            "hard reload:\n" + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_the_refresh_is_one_function_not_copy_paste(self, seeded_app):
+        """One reader, many callers — nobody re-implements the fetch."""
+        page = self._page(seeded_app)
+        assert page.count('fetch("/api/admin/source-pipelines"') == 1
+
+    # The strip is not the whole card. These handlers also change something
+    # the card BODY or head draws from the connection ROW (`config`, secret
+    # presence, chat-tools state, or the row's very existence), and the strip
+    # endpoint does not carry rows — so they re-read the list too.
+    REDRAWERS = {
+        "importKeboolaConnection": "the derived card becomes a real connection row",
+        "saveSpCertificate": "secret presence + certificate metadata on the row",
+        "setDefaultConn": "the `default` tag in the card head",
+        "saveRotatedToken": "secret presence badge",
+        "saveMasterToken": "secret presence badge",
+        "removeMasterToken": "secret presence badge",
+        "unbindProject": "`config.project_id` — the subtitle and the Unbind row",
+        "toggleChatTools": "`has_chat_tools` + `chat_tools_source_id`",
+        "runSpExtraction": "the dispatch stamps `config.extraction.last_run_at`",
+        "closeSpWizard": "`config.scopes` — the identity line and scope list",
+        "closeWizard": "a connection created in step 1 has no card at all yet",
+    }
+
+    def test_handlers_that_change_the_row_also_redraw_the_card_list(self, seeded_app):
+        page = self._page(seeded_app)
+        missing = [
+            f"{name} ({why})"
+            for name, why in self.REDRAWERS.items()
+            if "loadConnections(" not in self._js_function_body(page, name)
+        ]
+        assert not missing, (
+            "these handlers change what the card's ROW says, which the strip "
+            "endpoint does not carry — refreshing the strip alone leaves the "
+            "card body stale until a hard reload:\n" + "\n".join(f"  {m}" for m in missing)
+        )
+
+    def test_delete_redraws_from_the_cached_list_on_purpose(self, seeded_app):
+        """The one deliberate exception to the rule above: the deleted row is
+        dropped from `_connections` locally, so re-fetching the list to learn
+        the same thing would be a round-trip for nothing."""
+        body = self._js_function_body(self._page(seeded_app), "deleteConn")
+        assert "renderConnList()" in body
+        assert "loadConnections(" not in body
+
+
+class TestRefreshSourcePipelinesBehavior:
+    """`refreshSourcePipelines()` executed for real via `node` — the strip
+    HTML it writes back into an already-drawn card, from the endpoint's
+    payload, without a reload.
+
+    String-matching the wiring (above) proves every handler CALLS it; this
+    proves what it does when it runs: the fresh dict wins, the new strip is
+    written into the card that is already on screen, and a failed read
+    leaves the stale one alone rather than blanking the card.
+    """
+
+    _extract_function = staticmethod(TestImportKeboolaConnectionBehavior._extract_function)
+
+    # Minimal DOM shim — this repo carries no jsdom, and what matters here is
+    # WHAT gets written WHERE, not HTML parsing.
+    _DOM_SHIM = """
+class El {
+  constructor(cls) {
+    this.className = cls; this.textContent = ""; this.removed = false;
+    this.inserted = []; this.written = null; this.kids = {};
+  }
+  set outerHTML(v) { this.written = v; }
+  get outerHTML() { return this.written; }
+  querySelector(sel) { return this.kids[sel] || null; }
+  insertAdjacentHTML(pos, html) { this.inserted.push([pos, html]); }
+  remove() { this.removed = true; }
+}
+"""
+
+    def _run(self, *, fresh: dict, ok: bool = True, break_repaint: bool = False, concurrent: int = 1) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
+            encoding="utf-8"
+        )
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _relAge(minutes) {",
+                "function _sharepointPipelineStripHtml(row) {",
+                "function _pipelineStripHtml(row) {",
+                "function _sharepointHealth(fs) {",
+                "function _sourceHealth(row) {",
+                "async function refreshSourcePipelines() {",
+                "function _repaintSourceCards() {",
+            )
+        )
+        break_repaint_js = "true" if break_repaint else "false"
+        script = f"""
+{self._DOM_SHIM}
+{fns}
+
+// The page as the admin left it: one card, drawn from a snapshot in which
+// nothing was registered and nothing was shared.
+let SOURCE_PIPELINES = {{
+  "c1": {{"tables": {{"count": 0, "unlinked": 0}}, "sync": {{}},
+          "semantic": {{"token": false, "metrics": 0, "terms": 0}},
+          "feeds": {{"packages": 0, "groups": 0, "people": 0}}}}
+}};
+let _connections = [{{"id": "c1", "source_type": "keboola", "config": {{}}}}];
+// Declared beside the function in the template, so it is not part of what
+// `_extract_function` lifts out.
+let _pipelineRefreshInFlight = null;
+
+const card = new El("ds-src");
+const head = new El("ds-src__head");
+const strip = new El("ds-pipe");
+const chip = new El("ds-src__health is-warn");
+chip.textContent = "No tables yet";
+const acts = new El("ds-src__acts");
+const bodyEl = new El("ds-src__body");
+bodyEl.hidden = false;  // the admin has this card expanded
+card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip}};
+head.kids = {{".ds-src__health": chip, ".ds-src__acts": acts}};
+const breakRepaint = {break_repaint_js};
+global.document = {{
+  getElementById: (id) => {{
+    if (breakRepaint) throw new Error("DOM is gone");
+    return id === "ds-conn-c1" ? card : null;
+  }},
+}};
+
+let fetched = null;
+let fetchCount = 0;
+global.fetch = async (url, opts) => {{
+  fetched = {{ url, opts }};
+  fetchCount++;
+  await new Promise((res) => setTimeout(res, 5));
+  return {{ ok: {str(ok).lower()}, status: {200 if ok else 500},
+            json: async () => ({json.dumps(fresh)}) }};
+}};
+
+(async () => {{
+  const results = await Promise.all(
+    Array.from({{ length: {concurrent} }}, () => refreshSourcePipelines()),
+  );
+  const returned = results[0];
+  console.log(JSON.stringify({{
+    returned,
+    results,
+    fetchCount,
+    inFlightCleared: _pipelineRefreshInFlight === null,
+    fetchedUrl: fetched && fetched.url,
+    credentials: fetched && fetched.opts && fetched.opts.credentials,
+    stripWritten: strip.written,
+    stripRemoved: strip.removed,
+    stripsInserted: head.inserted,
+    chipText: chip.textContent,
+    chipClass: chip.className,
+    chipRemoved: chip.removed,
+    bodyHidden: bodyEl.hidden,
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    _FRESH = {
+        "c1": {
+            "tables": {"count": 3, "unlinked": 0, "basis": "connection"},
+            "sync": {"last_sync": "2026-08-30T10:00:00+00:00", "age_minutes": 5, "errors": 0},
+            "semantic": {"token": True, "metrics": 2, "terms": 1},
+            "feeds": {"packages": 1, "groups": 1, "people": 4},
+        }
+    }
+
+    def test_it_reads_the_endpoint_as_the_signed_in_admin(self):
+        out = self._run(fresh=self._FRESH)
+        assert out["fetchedUrl"] == "/api/admin/source-pipelines"
+        assert out["credentials"] == "include"
+        assert out["returned"] is True
+
+    def test_the_card_on_screen_gets_the_fresh_strip(self):
+        out = self._run(fresh=self._FRESH)
+        written = out["stripWritten"]
+        assert written, "the drawn card's strip was never rewritten"
+        assert "3 registered" in written
+        assert "Add the first tables" not in written
+        assert "1 package → 4 people" in written
+        assert "Never synced" not in written
+        # Rewritten in place — not inserted a second time, not removed.
+        assert out["stripsInserted"] == []
+        assert out["stripRemoved"] is False
+
+    def test_the_status_word_follows_the_strip(self):
+        out = self._run(fresh=self._FRESH)
+        assert out["chipText"] == "Healthy"
+        assert "is-ok" in out["chipClass"]
+        assert out["chipRemoved"] is False
+
+    def test_an_expanded_card_stays_expanded(self):
+        """The reason this repaints instead of reloading: an admin mid-task
+        keeps their open card (and their scroll position)."""
+        assert self._run(fresh=self._FRESH)["bodyHidden"] is False
+
+    def test_a_failed_read_keeps_the_stale_strip_rather_than_blanking_it(self):
+        out = self._run(fresh=self._FRESH, ok=False)
+        assert out["returned"] is False
+        assert out["stripWritten"] is None
+        assert out["stripRemoved"] is False
+        assert out["chipText"] == "No tables yet"
+
+    def test_a_throwing_repaint_is_a_failed_refresh_not_an_escaping_error(self):
+        """Two callers await this from inside a `finally` block. An exception
+        escaping the repaint would replace whatever error that block was
+        already unwinding — so the repaint lives inside the same `try` as the
+        read, and a broken DOM is simply `false`."""
+        out = self._run(fresh=self._FRESH, break_repaint=True)
+        assert out["returned"] is False
+        assert out["inFlightCleared"] is True
+
+    def test_concurrent_callers_share_one_read(self):
+        """A wizard exit reaches this from several places within a tick. Two
+        overlapping reads resolve last-response-wins, and the loser can be the
+        older snapshot — the exact staleness this function removes."""
+        out = self._run(fresh=self._FRESH, concurrent=3)
+        assert out["fetchCount"] == 1
+        assert out["results"] == [True, True, True]
+        # And the marker is cleared, so the NEXT mutation still gets a fresh read.
+        assert out["inFlightCleared"] is True

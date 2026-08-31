@@ -577,6 +577,14 @@ GOOGLE_CLIENT_SECRET=$(gcloud secrets versions access latest --secret="$${OAUTH_
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null || echo "")
 %{ endfor ~}
 
+# Multiline secrets (`runtime_secret_env_multiline`, e.g. a SharePoint
+# cert+key PEM): base64-encoded to a single line so the value survives the
+# .env format, the auto-upgrade script's bash source, and compose env_file
+# parsing. The app decodes on read (connectors/sharepoint/settings).
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
+${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null | base64 -w0 || echo "")
+%{ endfor ~}
+
 # AGNES_VERSION, RELEASE_CHANNEL, AGNES_COMMIT_SHA are baked into the image
 # itself as ENV (see Dockerfile ARG/ENV + release.yml build-args). We do NOT
 # set them here — doing so would override the image-level values with the
@@ -1302,6 +1310,9 @@ GOOGLE_CLIENT_SECRET=$GOOGLE_CLIENT_SECRET
 %{ for secret_name, env_name in runtime_secret_env ~}
 ${env_name}=$${${env_name}}
 %{ endfor ~}
+%{ for secret_name, env_name in runtime_secret_env_multiline ~}
+${env_name}=$${${env_name}}
+%{ endfor ~}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 DATABASE_URL=postgresql+psycopg://agnes:$POSTGRES_PASSWORD@postgres:5432/agnes
 %{ if dispatcher_enabled ~}
@@ -1327,6 +1338,15 @@ AGNES_REDIS_URL=redis://redis:6379/0
 AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
+# The app-side gates for the `corpus-extraction` job kind
+# (app/instance_config.py::feature_enabled, app/worker/kinds.py::
+# _extraction_producer_argv) both check an env override before
+# instance.yaml — the SAME env-overrides-yaml posture as
+# AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
+# what makes this flag alone activate the lane end to end, with no
+# applier-owned instance.yaml edit on the VM's data disk.
+AGNES_EXTRACTION_ENABLED=1
+AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}

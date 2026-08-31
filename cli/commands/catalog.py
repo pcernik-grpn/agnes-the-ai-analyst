@@ -15,16 +15,16 @@ catalog_app = typer.Typer(help="List tables (and metrics, with --metrics) visibl
 def catalog(
     ctx: typer.Context,
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
-    refresh: bool = typer.Option(False, "--refresh", help="Bypass client-side cache"),
+    refresh: bool = typer.Option(False, "--refresh", help="Bypass the server's catalog cache"),
     metrics: bool = typer.Option(
         False,
         "--metrics",
         help="List metric definitions instead of tables. Combine with --show <id> for details.",
     ),
-    show: Optional[str] = typer.Option(
+    show: Optional[list[str]] = typer.Option(
         None,
         "--show",
-        help="Show details for one metric id (implies --metrics).",
+        help="Show details for a metric id — repeatable, so several metrics cost one command (implies --metrics).",
     ),
 ):
     """List tables visible to you (RBAC-filtered).
@@ -40,7 +40,7 @@ def catalog(
 
     if metrics:
         if show:
-            _show_one_metric(show, as_json=json)
+            _show_metrics(show, as_json=json)
         else:
             _list_metrics(as_json=json)
         return
@@ -105,33 +105,71 @@ def _list_metrics(as_json: bool, category: Optional[str] = None) -> None:
             typer.echo(f"  {name:30s} {display}{unit_str}")
 
 
-def _show_one_metric(metric_id: str, as_json: bool) -> None:
-    """Show details for a single metric."""
+def _show_metrics(metric_ids: list[str], as_json: bool) -> None:
+    """Show details for one or more metric ids in a single command.
+
+    Looked up per id (each keeps its own 404/403 semantics — the list
+    endpoint silently omits an inaccessible metric, which would read as
+    "no such metric"), but rendered as ONE result: an agent reading twenty
+    definitions should spend one command and one result on it, not twenty.
+    A failed id is reported and the rest still print; the exit code is
+    non-zero if any id failed.
+    """
+    if as_json:
+        found: list[dict] = []
+        failures: list[dict] = []
+        for metric_id in metric_ids:
+            ok, payload = _fetch_metric(metric_id)
+            (found if ok else failures).append(payload)
+        typer.echo(json_lib.dumps({"metrics": found, "failed": failures}, indent=2, default=str))
+        if failures:
+            raise typer.Exit(1)
+        return
+
+    failed = 0
+    for index, metric_id in enumerate(metric_ids):
+        ok, payload = _fetch_metric(metric_id)
+        if not ok:
+            failed += 1
+            typer.echo(payload["error"], err=True)
+            for hint in payload.get("hints", []):
+                typer.echo(hint, err=True)
+            continue
+        if index:
+            typer.echo("")
+        _echo_one_metric(metric_id, payload)
+    if failed:
+        raise typer.Exit(1)
+
+
+def _fetch_metric(metric_id: str) -> tuple[bool, dict]:
+    """``(ok, payload)`` for one metric id — the metric dict on success, an
+    ``{"error", "hints"}`` dict on failure. No process exit: a multi-id
+    lookup must not lose the ids that did resolve."""
     resp = api_get(f"/api/metrics/{metric_id}")
     if resp.status_code == 404:
-        typer.echo(f"Metric not found: {metric_id}", err=True)
+        hints = []
         # The semantic-layer cutover changed Keboola metric ids from
         # `keboola/<model-uuid>/<name>` to
         # `keboola_metastore/<connection>/<model>/<name>`. A stale old-shape id
         # (from memory or a saved note) 404s — point at a name lookup instead.
         if metric_id.startswith("keboola/"):
             name = metric_id.rsplit("/", 1)[-1]
-            typer.echo(
+            hints.append(
                 f"  Keboola metric ids changed in the semantic-layer cutover. Try: "
-                f"agnes catalog --metrics | grep {name}",
-                err=True,
+                f"agnes catalog --metrics | grep {name}"
             )
-        raise typer.Exit(1)
+        return False, {"id": metric_id, "error": f"Metric not found: {metric_id}", "hints": hints}
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
-        raise typer.Exit(1)
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        return False, {"id": metric_id, "error": f"Failed ({metric_id}): {detail}", "hints": []}
+    return True, resp.json()
 
-    m = resp.json()
 
-    if as_json:
-        typer.echo(json_lib.dumps(m, indent=2, default=str))
-        return
-
+def _echo_one_metric(metric_id: str, m: dict) -> None:
     typer.echo(f"ID:           {m.get('id', metric_id)}")
     typer.echo(f"Name:         {m.get('name', '')}")
     typer.echo(f"Display Name: {m.get('display_name', '')}")

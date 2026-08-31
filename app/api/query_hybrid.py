@@ -87,6 +87,30 @@ async def hybrid_query(
             raise HTTPException(status_code=400, detail=f"Query: {e.error_type}: {e}")
         # bytes_scanned is not directly surfaced by RemoteQueryEngine; deferred TODO.
         rows_returned = len(result.get("rows", [])) if isinstance(result, dict) else None
+        # Soft-enforce semantic check (consumption loop), same as `POST /api/query`
+        # (`app/api/query.py`) -- placed AFTER execution for the same reason: the
+        # statement already ran and `result` is final, so this can only ADD a
+        # qualification, never change the answer. `target_engine="duckdb"` is
+        # correct unconditionally here (unlike the single-engine endpoint, which
+        # tracks which engine ran the statement): a hybrid query always executes
+        # as DuckDB SQL against the analytics connection, with any registered BQ
+        # subqueries already materialized into local views beforehand.
+        # Set before the try: unlike `QueryResponse` (a Pydantic model whose
+        # `semantic_validation` field defaults to `None`), `result` is a plain
+        # dict with no such field, so a failure inside the call below must not
+        # leave the key missing from the response entirely.
+        result["semantic_validation"] = None
+        try:
+            from app.api.semantic_models import semantic_validation_for_query
+
+            result["semantic_validation"] = semantic_validation_for_query(
+                request.sql, user, conn, target_engine="duckdb"
+            )
+        except Exception as exc:
+            # Never let an advisory break a delivered result -- see the
+            # identical guard in `app/api/query.py` for why this is a
+            # warning, not a raised exception.
+            logger.warning("semantic validation failed for hybrid query; returning the result without it: %s", exc)
         try:
             audit_repo().log(
                 user_id=user.get("id"),

@@ -803,6 +803,11 @@ def test_page_header_carries_the_controls_and_the_bands_own_the_top(seeded_app):
     assert "fbar-dock__veil" not in text
     assert "fbar-dock__card" not in text
 
+    # The dock is gone from THIS page — markup, veil and the card the retired
+    # resize animation observed.
+    assert 'class="fbar-dock"' not in text
+    assert "fbar-dock__veil" not in text
+    assert "fbar-dock__card" not in text
 
 def test_library_title_carries_no_setup_caveat(seeded_app):
     """The caveat never rides the TITLE: no `.pnote` panel under the lede, and no

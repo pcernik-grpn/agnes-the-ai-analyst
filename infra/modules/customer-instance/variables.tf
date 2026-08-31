@@ -181,13 +181,19 @@ variable "prod_instance" {
     # `extraction-worker` compose service (AGNES_ROLE=worker), which makes the
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
     # default so a module bump alone never moves the existing fleet. Turning
-    # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL into the
-    # VM's app .env (env overrides instance.yaml — app/coordination/factory.py
-    # — so the applier-owned /data/state/instance.yaml is never touched) and
-    # engages a module-owned docker-compose.extraction.yml overlay carrying
-    # the `redis` service and the worker re-pin. The multi-process startup
-    # guard (app/startup_guards.py) then requires the instance to already run
-    # the Postgres app-state backend and boots refuse loudly on a DuckDB
+    # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL +
+    # AGNES_EXTRACTION_ENABLED=1 + AGNES_EXTRACTION_PRODUCER_COMMAND=<module-
+    # level var.extraction_producer_command> into the VM's app .env (env
+    # overrides instance.yaml for every one of these — app/coordination/
+    # factory.py's posture, mirrored by app/instance_config.py::feature_enabled
+    # and app/worker/kinds.py::_extraction_producer_argv — so the
+    # applier-owned /data/state/instance.yaml is never touched) and engages a
+    # module-owned docker-compose.extraction.yml overlay carrying the `redis`
+    # service and the worker re-pin. This is what makes the flag alone
+    # activate the `corpus-extraction` job kind end to end — no per-VM SSH
+    # edit of instance.yaml required. The multi-process startup guard
+    # (app/startup_guards.py) then requires the instance to already run the
+    # Postgres app-state backend and boots refuse loudly on a DuckDB
     # instance — deliberate: migrate the backend first, then flip this.
     # Requires the module-level extraction_worker_image (validated below).
     extraction_worker_enabled = optional(bool, false)
@@ -653,7 +659,13 @@ variable "runtime_secrets" {
 }
 
 variable "runtime_secret_env" {
-  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN."
+  description = "Map of Secret Manager secret name to env var name to inject into /opt/agnes/.env. Module auto-grants secretAccessor and the startup script fetches each via gcloud secrets versions access latest --secret=<key> and writes a line <env_var>=<fetched> to .env. Missing/403 -> empty string (silent), so production deploys can roll out a secret name before the value lands. Example map: anthropic-api-key -> ANTHROPIC_API_KEY, slack-bot-token -> SLACK_BOT_TOKEN. Single-line values ONLY — a multiline value (a PEM certificate, an SA key JSON) breaks the .env format, the auto-upgrade script's bash source of it, and compose env_file parsing; map those through `runtime_secret_env_multiline` instead."
+  type        = map(string)
+  default     = {}
+}
+
+variable "runtime_secret_env_multiline" {
+  description = "Like `runtime_secret_env`, for MULTILINE secret values — e.g. the SharePoint combined cert+key PEM under SHAREPOINT_CERT_PRIVATE_KEY. The startup script base64-encodes the fetched value so it rides /opt/agnes/.env as a single line; the app decodes it on read (connectors/sharepoint/settings resolves either form). Store the secret in Secret Manager as the RAW value (the module does the encoding). Do not map the same secret name here and in `runtime_secret_env` — the module suppresses the duplicate IAM binding, but the two .env lines would fight."
   type        = map(string)
   default     = {}
 }
@@ -901,6 +913,29 @@ variable "extraction_worker_image" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "extraction_producer_command" {
+  description = <<-EOT
+    The extraction lane's producer command line, written verbatim as
+    AGNES_EXTRACTION_PRODUCER_COMMAND into the app .env of every instance with
+    `extraction_worker_enabled = true` (app/worker/kinds.py::
+    _extraction_producer_argv reads it with shlex.split — a JSON/YAML list is
+    NOT supported via this env var, unlike the instance.yaml
+    `extraction.producer.command` key). Module-level, not per-VM, mirroring
+    `extraction_worker_image`: the producer binary ships INSIDE that image
+    (EXTRACTION_PRODUCER_INSTALL build-arg), so its invocation command is the
+    same across every VM that runs it.
+
+    Together with `extraction_worker_enabled` this is what makes the
+    Terraform flag alone activate the `corpus-extraction` job kind end to
+    end — no applier-owned `instance.yaml` edit on the VM's data disk.
+
+    Default points at the conventional in-image path; override only if the
+    operator's producer build installs somewhere else.
+  EOT
+  type        = string
+  default     = "python /opt/producer/agnes_lane.py"
 }
 
 variable "alert_webhook_url" {

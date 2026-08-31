@@ -809,3 +809,29 @@ class TestCertificateMetadata:
         serialized = json.dumps(result)
         assert "PRIVATE KEY" not in serialized
         assert "BEGIN CERTIFICATE" not in serialized  # no raw PEM at all — only derived fields
+
+
+class TestGetAppTokenClientSecret:
+    """`get_app_token(..., client_secret=...)` — Entra's plain client-secret
+    client-credentials flow. No JWT assertion is built or sent; the secret
+    travels in the form body of the same token endpoint."""
+
+    def test_posts_client_secret_and_no_assertion(self, monkeypatch):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = request.content.decode()
+            return httpx.Response(200, json={"access_token": "graph-token-secret", "expires_in": 3600})
+
+        _install_transport(monkeypatch, handler)
+        token = asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret="s3cr3t"))
+        assert token == "graph-token-secret"
+        assert seen["path"].endswith("/oauth2/v2.0/token")
+        assert "client_secret=s3cr3t" in seen["body"]
+        assert "client_assertion" not in seen["body"]
+
+    def test_no_credential_at_all_is_a_typed_error(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"access_token": "x"}))
+        with pytest.raises(gc.SharePointGraphError):
+            asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret=""))

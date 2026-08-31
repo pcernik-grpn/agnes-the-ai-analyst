@@ -114,6 +114,9 @@ CATALOG: dict[str, AuditEvent] = {
         "store.submission.bundle_downloaded", "read", "A marketplace store submission's bundle was downloaded."
     ),
     "usage.ask": AuditEvent("usage.ask", "read", "A natural-language usage question was answered."),
+    "usage.chat_cost": AuditEvent(
+        "usage.chat_cost", "read", "Measured chat token/cost breakdown was read across users."
+    ),
     "usage.export": AuditEvent("usage.export", "read", "Usage data was exported."),
     "usage.summary": AuditEvent("usage.summary", "read", "A usage summary was read."),
     # -- system: scheduler ticks, startup, broker guardrails, review internals
@@ -472,6 +475,15 @@ CATALOG: dict[str, AuditEvent] = {
     "run_bq_metadata_refresh": AuditEvent(
         "run_bq_metadata_refresh", "system", "The scheduled BigQuery metadata-cache refresh ran."
     ),
+    "run_semantic_sources_refresh": AuditEvent(
+        "run_semantic_sources_refresh", "system", "The scheduled semantic-sources refresh sweep ran."
+    ),
+    # No live writer since #1707 Block 3 step 4 retired the two per-connector
+    # refresh triggers in favour of `run_semantic_sources_refresh` above. Kept
+    # per this module's append-only contract: rows written under these names
+    # before the migration are still in every existing instance's audit_log,
+    # and removing the key would turn them into unknown actions on the read
+    # side.
     "run_keboola_semantic_layer_refresh": AuditEvent(
         "run_keboola_semantic_layer_refresh", "system", "The scheduled Keboola semantic-layer refresh ran."
     ),
@@ -535,6 +547,80 @@ CATALOG: dict[str, AuditEvent] = {
         "upgrade_freeze.lift",
         "mutation",
         "An admin lifted the automatic-upgrade freeze.",
+    ),
+    # Built on `mf/semantic-layer-v0` in parallel with this wave and brought in
+    # by the landing-plan step-0 merge; registered here for the same reason as
+    # the block above — the catalog stays the complete list rather than growing
+    # an exemption.
+    "semantic_auto_draft_sweep": AuditEvent(
+        "semantic_auto_draft_sweep",
+        "mutation",
+        "The headless semantic-model auto-draft sweep ran (one row per sweep, "
+        "params carry queued/skipped/errored counts).",
+    ),
+    "semantic_model.detach": AuditEvent(
+        "semantic_model.detach",
+        "mutation",
+        "An admin detached a semantic model from its source, freezing it against further syncs.",
+    ),
+    "semantic_model.reattach": AuditEvent(
+        "semantic_model.reattach",
+        "mutation",
+        "An admin re-attached a detached semantic model to its source.",
+    ),
+    # The `agnes pull` semantic-cache delivery channel. Minted here because
+    # the wave-2 read-posture ratchet (#1802) reached this branch on the
+    # merge and a bundle read is data content leaving the server — the same
+    # call `memory.bundle_download` and `store.bundle_download` already make.
+    "semantic_model.bundle_download": AuditEvent(
+        "semantic_model.bundle_download",
+        "read",
+        "Someone pulled the RBAC-scoped bundle of readable semantic models "
+        "(the local `<workspace>/semantic/` cache `agnes pull` renders).",
+    ),
+    "semantic_model.link_package": AuditEvent(
+        "semantic_model.link_package",
+        "mutation",
+        "An admin linked a semantic model to a Data Package, granting read access "
+        "to everyone with a grant on that package.",
+    ),
+    "semantic_model.unlink_package": AuditEvent(
+        "semantic_model.unlink_package",
+        "mutation",
+        "An admin unlinked a semantic model from a Data Package.",
+    ),
+    # The coverage-tag pair writes no row of its own; these two exist so the
+    # fallback middleware emits a real domain action for it, since Wave 2 —
+    # Task 1 retired the "fallback" posture literal this branch declared.
+    "semantic_coverage_tag.create": AuditEvent(
+        "semantic_coverage_tag.create",
+        "mutation",
+        "An admin tagged a semantic-layer scope for the cross-domain coverage report.",
+    ),
+    "semantic_coverage_tag.delete": AuditEvent(
+        "semantic_coverage_tag.delete",
+        "mutation",
+        "An admin removed a semantic-layer coverage tag.",
+    ),
+    "semantic_health_mute.create": AuditEvent(
+        "semantic_health_mute.create",
+        "mutation",
+        "An admin silenced a semantic-layer health check for a scope.",
+    ),
+    "semantic_health_mute.delete": AuditEvent(
+        "semantic_health_mute.delete",
+        "mutation",
+        "An admin lifted a semantic-layer health-check mute.",
+    ),
+    "semantic_feedback.submit": AuditEvent(
+        "semantic_feedback.submit",
+        "mutation",
+        "Someone (person or agent) flagged an answer as wrong against the semantic layer.",
+    ),
+    "semantic_feedback.resolved": AuditEvent(
+        "semantic_feedback.resolved",
+        "mutation",
+        "An admin resolved a semantic-layer feedback report.",
     ),
     # -- Wave 2 -- Task 1: declarative action emission -----------------------
     # 127 actions minted while flipping the 135 mutating routes that were
@@ -957,6 +1043,11 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a SharePoint connection's certificate metadata (never the private key).",
     ),
+    "sharepoint_connection.changes_read": AuditEvent(
+        "sharepoint_connection.changes_read",
+        "read",
+        "An admin read a SharePoint connection's observed content-changes feed.",
+    ),
     "sharepoint_connection.corpus_map_read": AuditEvent(
         "sharepoint_connection.corpus_map_read",
         "read",
@@ -1054,6 +1145,22 @@ CATALOG: dict[str, AuditEvent] = {
         "run_sharepoint_extraction",
         "system",
         "The scheduler's SharePoint extraction sweep ran.",
+    ),
+    # -- SharePoint Graph change-notification receiver -------------------------
+    "sharepoint_connection.webhook_secret_rotate": AuditEvent(
+        "sharepoint_connection.webhook_secret_rotate",
+        "mutation",
+        "An admin (re)generated a SharePoint connection's Graph change-notification webhook secret.",
+    ),
+    "webhook.sharepoint_received": AuditEvent(
+        "webhook.sharepoint_received",
+        "system",
+        "A SharePoint Graph change notification passed clientState verification and enqueued a corpus-extraction run.",
+    ),
+    "webhook.sharepoint_rejected": AuditEvent(
+        "webhook.sharepoint_rejected",
+        "system",
+        "A SharePoint Graph change notification was rejected (clientState did not match the connection's secret).",
     ),
     # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
     # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).

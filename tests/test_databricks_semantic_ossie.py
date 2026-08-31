@@ -14,7 +14,7 @@ import pytest
 
 from connectors.databricks.client import DatabricksApiError
 from connectors.databricks.semantic_ossie import (
-    DatabricksSemanticAdapter,
+    DatabricksMetricViewAdapter,
     _list_metric_views,
     compose_document,
     extract_yaml_from_create,
@@ -199,7 +199,7 @@ def test_extract_yaml_from_create_returns_none_for_empty_input():
 
 
 # ---------------------------------------------------------------------------
-# DatabricksSemanticAdapter — fetch half
+# DatabricksMetricViewAdapter — fetch half
 # ---------------------------------------------------------------------------
 
 
@@ -213,7 +213,7 @@ _SETTINGS = {
 
 
 def _extract(config=None, *, settings=_SETTINGS, client=None):
-    adapter = DatabricksSemanticAdapter()
+    adapter = DatabricksMetricViewAdapter()
     if client is not None:
         adapter._client = lambda settings: client  # type: ignore[method-assign]
     import unittest.mock as mock
@@ -267,10 +267,10 @@ class TestAdapterExtract:
         with pytest.raises(RuntimeError, match="catalog"):
             _extract(settings={**_SETTINGS, "catalogs": []}, client=FakeStatementClient())
 
-    def test_adapter_is_registered_under_databricks_semantic(self):
+    def test_adapter_is_registered_under_databricks_metric_views(self):
         from src.semantic.adapters import get_adapter
 
-        assert isinstance(get_adapter("databricks_semantic"), DatabricksSemanticAdapter)
+        assert isinstance(get_adapter("databricks_metric_views"), DatabricksMetricViewAdapter)
 
 
 def test_list_metric_views_reads_the_fake_client():

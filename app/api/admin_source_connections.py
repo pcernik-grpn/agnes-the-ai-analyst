@@ -50,13 +50,31 @@ Surface (all gated by ``Depends(require_admin)``):
                                                        registrations — resend with
                                                        ``?confirm_connection_change=true`` to apply (RBAC
                                                        review second round, 2026-08-26; see
-                                                       ``_guard_default_repoint``).
+                                                       ``_guard_default_repoint``). Success (204) carries an
+                                                       ``X-Agnes-Semantic-References`` header — informational
+                                                       only, never blocks the delete (Block 5 of #1707).
   PUT    /api/admin/source-connections/{id}/secret  — store vault secret (kind=storage|master
                                                        in body); 409 if AGNES_VAULT_KEY missing;
                                                        kind=master is keboola-only and validated
-                                                       live via a verify_token preflight
+                                                       live via a verify_token preflight. A token
+                                                       the stack REFUSES answers 400 with a
+                                                       structured detail — ``{error, message,
+                                                       upstream}``, the wire text confined to
+                                                       ``upstream`` (see ``_preflight_error``);
+                                                       every other detail on this route is a
+                                                       plain string
   DELETE /api/admin/source-connections/{id}/secret  — clear vault secret (?kind=storage|master)
-  POST   /api/admin/source-connections/{id}/test    — verify connectivity; timeout 10s
+  POST   /api/admin/source-connections/{id}/test    — verify connectivity, per source type:
+                                                       ``keboola`` verifies the storage token against
+                                                       ``{stack_url}/v2/storage/tokens/verify`` (10s);
+                                                       ``snowflake`` opens a session against the account
+                                                       and reads one row of metadata
+                                                       (``_test_snowflake_connection``, bounded by
+                                                       ``_SNOWFLAKE_PROBE_TIMEOUT_S``); every other type
+                                                       answers ``{ok: false, status: "unsupported"}``
+                                                       naming the type. Failure is HTTP 200 with
+                                                       ``ok: false`` throughout — only an unknown
+                                                       connection is a status code (404).
   GET    /api/admin/source-connections/{id}/tables  — list buckets/tables for the "add data
                                                        source" wizard; keboola only, REST-only
                                                        admin-UI helper (see _EXEMPT classification
@@ -70,13 +88,13 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
@@ -113,6 +131,16 @@ router = APIRouter(prefix="/api/admin/source-connections", tags=["admin"])
 # stalled download turns into the endpoint's 502-with-retry-hint instead of an
 # admin request that never returns.
 CHAT_TOOLS_INTROSPECT_TIMEOUT_S = 300.0
+
+# Ceiling on the Snowflake connectivity probe behind `POST .../{id}/test`.
+# The Keboola branch of the same endpoint has always been 10s-bounded (its
+# `httpx.AsyncClient(timeout=10)`); the Snowflake branch had no bound at all,
+# because neither the DuckDB Snowflake extension nor the ADBC driver takes a
+# connect deadline — an unreachable account held the admin request open until
+# the OS gave up on the socket. Larger than the Keboola figure on purpose: a
+# cold container has to INSTALL and LOAD a community extension before it can
+# dial at all (`discovery._default_attach_fn`), which the HTTP probe does not.
+_SNOWFLAKE_PROBE_TIMEOUT_S = 45.0
 
 # The exact keyword surface of the repos' `upsert`s. A rollback replays rows it
 # read with `get`/`list_for_source`, and those carry `created_at`/`updated_at`
@@ -372,10 +400,11 @@ _CONFIG_TOKEN_ENV_FIELDS: Dict[str, tuple] = {
     "snowflake": ("token_env", "private_key_env", "private_key_passphrase_env"),
     "databricks": ("token_env",),
     # `connectors.sharepoint.settings.resolve_sharepoint_settings` falls back
-    # to this env var name when the connection has no vault secret of its
-    # own — same admin-writable secret-ref-NAME shape as Snowflake/Databricks
-    # above, and the same exfiltration risk without this guard.
-    "sharepoint": ("cert_private_key_env",),
+    # to these env var names when the connection has no vault secret of its
+    # own (which one depends on `auth_method`) — same admin-writable
+    # secret-ref-NAME shape as Snowflake/Databricks above, and the same
+    # exfiltration risk without this guard.
+    "sharepoint": ("cert_private_key_env", "client_secret_env"),
 }
 
 
@@ -712,6 +741,125 @@ def _reject_project_mismatch(row: Dict[str, Any], payload: Dict[str, Any], *, wh
     message = project_mismatch_message(row, payload, what=what)
     if message is not None:
         raise HTTPException(status_code=400, detail=message)
+
+
+#: Keboola's own error code for "no such token on this stack" — the thing
+#: that identifies a refusal, since the 401 alone does not: an authenticating
+#: proxy in front of a stack answers 401 with its own page, which says
+#: nothing about the token.
+_TOKEN_REFUSED_CODE = "storage.tokenInvalid"
+
+#: The token slots this message is written for. A `what` outside this set is
+#: a programming error, not something to paper over with a default sentence —
+#: the wording is the whole point of the function.
+TokenKind = Literal["master token", "storage token", "connection's token"]
+
+#: Why a refused token is nearly always a token from somewhere else, phrased
+#: per slot — the master token is the project owner's and the one the
+#: semantic layer needs, so the wrong hint sends the admin looking for the
+#: wrong thing.
+_TOKEN_REFUSED_HINTS: Dict[str, str] = {
+    "master token": "Master (owner) tokens are valid only on their own stack and project",
+    "storage token": "A Keboola token is valid only on the stack and project it was created in",
+    "connection's token": "A Keboola token is valid only on the stack and project it was created in",
+}
+
+
+def _reads_as_token_refusal(status: Optional[int], body: Any) -> bool:
+    """True when an upstream answer is Keboola saying "I have never seen this
+    token" — parsed body and status, so both the client's exception and a
+    raw ``httpx`` probe response can ask the same question.
+
+    Deliberately narrow, in two directions. It is NOT a project mismatch
+    (a token this stack knows and accepts, which merely opens a different
+    project) and NOT an outage: three failures, three fixes, so they must
+    not collapse into one sentence. And a bare 401 is not enough — Keboola's
+    own refusal always carries the code, so a 401 whose body is a proxy's
+    HTML gets no confident sentence about a token the proxy never saw. Only
+    when there is no body to inspect at all does the status decide.
+    """
+    if isinstance(body, dict):
+        return body.get("code") == _TOKEN_REFUSED_CODE
+    if isinstance(body, str) and body.strip():
+        # Unparsed text. Keboola's shape relayed as a string still counts;
+        # a proxy's own error page does not.
+        return _TOKEN_REFUSED_CODE in body
+    return status == 401
+
+
+def _is_token_refused(exc: Exception) -> bool:
+    """:func:`_reads_as_token_refusal` for a raised client error. Duck-typed
+    on ``.status``/``.body`` so it covers ``StorageApiError`` without the
+    transport module having to know about this one."""
+    return _reads_as_token_refusal(getattr(exc, "status", None), getattr(exc, "body", None))
+
+
+def token_refused_message(stack_url: str, *, what: TokenKind) -> str:
+    """What to tell an admin whose token the stack refused.
+
+    The raw upstream text used to be the whole toast: an internal
+    ``/v2/storage/tokens/verify`` URL, ``HTTP 401`` and Keboola's JSON body
+    down to its ``exceptionId``. All of it true, none of it the answer —
+    which is that a Keboola token only exists on the stack that issued it,
+    so a token refused outright is expired, revoked, or from somewhere else.
+    Naming the stack this connection is configured for is what makes the
+    last one checkable.
+
+    Shared by the token-save preflight and the ``/test`` probe: the same
+    failure asked from the same card, so it must not have two answers.
+    """
+    host = _log_host(stack_url)
+    # Indexed, not `.get(...)`: a slot with no wording is a bug to raise, not
+    # to smooth over with another slot's sentence.
+    hint = _TOKEN_REFUSED_HINTS[what]
+    return (
+        f"Keboola {host} does not recognise this {what} — expired, revoked, or issued "
+        f"on another stack. {hint} — is this token from {host}?"
+    )
+
+
+def _preflight_error(exc: Exception, redacted: str, stack_url: str, *, what: TokenKind) -> HTTPException:
+    """The HTTP error for a failed ``verify_token`` preflight.
+
+    A refusal is always 400, whatever status carried it. The status and the
+    message have to agree: 502 tells the admin "Agnes is broken" while the
+    sentence beside it says "your token is wrong", and only one of those can
+    be acted on. A proxy relaying Keboola's refusal under a 5xx is the case
+    that makes this concrete. Otherwise a 4xx is still the admin's to fix
+    (400) and anything else is a gateway failure (502).
+
+    Only a refusal gets a translated ``detail.message``; every other upstream
+    failure keeps the raw passthrough, because there the upstream text IS the
+    diagnosis and inventing a sentence for it would only hide it. The raw
+    text is never lost either way — on the translated path it moves to
+    ``detail.upstream``, which the page's ``detailMessage()`` reader (and
+    :func:`_detail_text`) deliberately do not show.
+    """
+    if _is_token_refused(exc):
+        return HTTPException(
+            status_code=400,
+            detail={
+                "error": "storage_api_error",
+                "message": token_refused_message(stack_url, what=what),
+                "upstream": redacted,
+            },
+        )
+    status = 400 if is_upstream_client_error(exc) else 502
+    return HTTPException(status_code=status, detail=f"storage_api_error: {redacted}")
+
+
+def _detail_text(detail: Any) -> str:
+    """The human line out of an ``HTTPException.detail`` that may be a plain
+    string or the structured ``{error, message, upstream}`` shape.
+
+    The server-side twin of the page's ``detailMessage()``: same preference
+    order, same reason for existing — ``str()`` on the structured shape
+    renders a stringified dict and drags the raw upstream text back into
+    whatever an admin reads.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("error") or detail)
+    return detail if isinstance(detail, str) else str(detail)
 
 
 class _VerifiedTokenInfo:
@@ -1161,9 +1309,41 @@ def _resync_derived_chat_tools(connection_id: str) -> None:
         )
 
 
+def _semantic_reference_count(connection_id: str) -> int:
+    """Semantic sources linked to this connection, plus the models fed by
+    them — informational only (Block 5 of #1707's non-destructive-warning
+    leg for the connection-delete surface; see ``src/semantic/orphans.py``
+    for the analogous, also non-blocking, table-delete check).
+
+    A model is credited to the connection two ways, mirroring
+    ``src/semantic/coverage.py``'s own graph: through a linked
+    ``semantic_sources`` row (``config.connection_id == connection_id``,
+    the path every native adapter — Snowflake, Databricks, uploads/git —
+    takes), or directly (``model.source_ref == connection_id``), which is
+    what the Keboola metastore sync stamps
+    (``source='keboola_metastore'``). The auto-migration sweep may also
+    register a ``semantic_sources`` row for it now; projected rows still
+    key off the connection id directly, so this branch stays load-bearing.
+    """
+    from src.repositories import semantic_model_repo, semantic_source_repo
+
+    linked_source_ids = {
+        s["id"]
+        for s in semantic_source_repo().list_all()
+        if (s.get("config") or {}).get("connection_id") == connection_id
+    }
+    model_count = sum(
+        1
+        for m in semantic_model_repo().list_all()
+        if m.get("source_ref") in linked_source_ids or m.get("source_ref") == connection_id
+    )
+    return len(linked_source_ids) + model_count
+
+
 @router.delete("/{connection_id}", status_code=204)
 async def delete_connection(
     connection_id: str,
+    response: Response,
     confirm_connection_change: bool = False,
     _user: dict = Depends(require_admin),
 ):
@@ -1173,6 +1353,12 @@ async def delete_connection(
     (``connection_change_affects_registrations`` — second RBAC review round,
     2026-08-26; ``?confirm_connection_change=true`` to apply). See
     :func:`_guard_default_repoint`.
+
+    Success carries an ``X-Agnes-Semantic-References`` header — the number
+    of semantic sources/models tied to this connection (Block 5 of #1707).
+    A header, not a body field: the response is ``204 No Content`` (pinned
+    by ``test_delete_returns_204``), and this is informational only — it
+    never blocks the delete, unlike the pinned-tables 409 above.
     """
     repo = source_connections_repo()
     row = repo.get(connection_id)
@@ -1226,6 +1412,15 @@ async def delete_connection(
         connection_secrets_repo().delete(master_secret_key(connection_id))
     except Exception:
         logger.debug("no master vault secret for connection %s (expected)", connection_id)
+    # Informational only (Block 5 of #1707) — a broken read here must not
+    # turn an otherwise-successful delete into a 500; the row is already
+    # gone by this point, and there is nothing left to retry.
+    try:
+        response.headers["X-Agnes-Semantic-References"] = str(_semantic_reference_count(connection_id))
+    except Exception:
+        logger.warning(
+            "could not compute semantic-reference count for deleted connection %s", connection_id, exc_info=True
+        )
 
 
 async def _store_connection_secret(connection_id: str, row: Dict[str, Any], value: str, kind: str) -> None:
@@ -1278,11 +1473,9 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
             # programming error should surface as a 500, not be mistaken for
             # an upstream outage.
             #
-            # A 4xx means the Storage API understood us and said no — the
-            # pasted token is invalid, expired, or belongs to another stack.
-            # That is the admin's to fix, so it must not come back as 502:
-            # a Bad Gateway reads as "Agnes is broken" and sends people
-            # hunting infrastructure instead of re-reading the error.
+            # Status and wording both live in `_preflight_error`: a 4xx is the
+            # admin's to fix (400, not a 502 that reads as "Agnes is broken"),
+            # and a flat refusal gets a sentence instead of the wire text.
             redacted = client._redact(exc)
             logger.warning(
                 "master-token preflight failed for connection %s (%s): %s",
@@ -1290,8 +1483,7 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                 _log_host(stack_url),
                 redacted,
             )
-            status = 400 if is_upstream_client_error(exc) else 502
-            raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
+            raise _preflight_error(exc, redacted, stack_url, what="master token") from exc
         if not info.get("isMasterToken"):
             # Reuse require_master_token's exact message rather than duplicating
             # it — it already fetched isMasterToken, so hand it the cached
@@ -1338,20 +1530,32 @@ async def _store_connection_secret(connection_id: str, row: Dict[str, Any], valu
                         _log_host(stack_url),
                         redacted,
                     )
-                    status = 400 if is_upstream_client_error(exc) else 502
-                    raise HTTPException(status_code=status, detail=f"storage_api_error: {redacted}") from exc
+                    raise _preflight_error(exc, redacted, stack_url, what="storage token") from exc
                 _reject_project_mismatch(row, info, what="storage token")
         elif row.get("source_type") == "sharepoint":
-            # Fail fast on unusable certificate material. Without this, any
-            # string stored fine and surfaced hours later as an opaque
-            # provider auth error on the first Graph call — the least
-            # discoverable part of the whole flow is that the credential is
-            # the certificate AND its private key concatenated in one PEM.
-            from connectors.sharepoint.graph_client import validate_certificate_material
+            if ((row.get("config") or {}).get("auth_method") or "certificate") == "client_secret":
+                # A client secret is opaque — no shape to validate — but PEM
+                # material landing here is a real, nameable mix-up.
+                if "-----BEGIN" in value:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "this connection uses client_secret auth, but the value looks like "
+                            "certificate material — paste the Entra client secret, or switch the "
+                            "connection's auth_method to 'certificate' and store the PEM"
+                        ),
+                    )
+            else:
+                # Fail fast on unusable certificate material. Without this, any
+                # string stored fine and surfaced hours later as an opaque
+                # provider auth error on the first Graph call — the least
+                # discoverable part of the whole flow is that the credential is
+                # the certificate AND its private key concatenated in one PEM.
+                from connectors.sharepoint.graph_client import validate_certificate_material
 
-            reason = validate_certificate_material(value)
-            if reason:
-                raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
+                reason = validate_certificate_material(value)
+                if reason:
+                    raise HTTPException(status_code=400, detail=f"sharepoint_pem_invalid: {reason}")
         key = connection_id
 
     try:
@@ -1443,7 +1647,7 @@ async def _seed_keboola_instance_credential(connection_id: str, row: Dict[str, A
     try:
         await _store_connection_secret(connection_id, row, value, "storage")
     except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        detail = _detail_text(exc.detail)
         logger.warning(
             "Keboola import for connection %s: could not seed the instance-vault token: %s",
             connection_id,
@@ -1485,9 +1689,17 @@ async def set_connection_secret(
     API token, required by the semantic-layer sync (Metastore API rejects
     non-master tokens). 400 if the connection isn't ``source_type="keboola"``,
     if the token fails a live ``verify_token`` preflight (not a master token),
-    or if the Storage API refuses the token outright (4xx — an invalid or
-    expired token is the admin's to fix, not a gateway failure). 502 only when
-    the Storage API is unreachable or answers 5xx.
+    or if the Storage API refuses the token outright (an expired, revoked or
+    wrong-stack token is the admin's to fix, not a gateway failure). 502 only
+    when the Storage API is unreachable or answers 5xx for a reason that is
+    not a refusal.
+
+    ``detail`` is a plain string on every branch EXCEPT that refusal, which
+    answers the structured ``{error, message, upstream}`` shape: ``message``
+    is the sentence to show a human, ``upstream`` the raw wire text kept for
+    logs and bug reports and shown to nobody (``_detail_text`` server-side,
+    ``detailMessage()`` on the page, ``_fail`` in the CLI). Readers must
+    handle both shapes — see :func:`_preflight_error`.
 
     409 if AGNES_VAULT_KEY is not configured on the server — checked FIRST, so
     an instance that cannot store secrets says so instead of spending an
@@ -2009,37 +2221,156 @@ async def disable_chat_tools(
     _remove_chat_tools(connection_id)
 
 
+async def _test_snowflake_connection(connection_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Connectivity check for a ``source_type='snowflake'`` row.
+
+    Opens a session against the account this connection names and reads one
+    row of metadata (``connectors.snowflake.discovery.probe_connection``) —
+    the connector's own credential resolution, attach URL and
+    host-allowlist gate, no new credential path. Blocking DuckDB + ADBC
+    driver work, so it runs off the event loop exactly as the table picker
+    does — and bounded by ``_SNOWFLAKE_PROBE_TIMEOUT_S``, since neither the
+    DuckDB extension nor the ADBC driver takes a connect deadline of its own.
+
+    Three failure classes, kept apart on purpose:
+
+    - :class:`~connectors.snowflake.discovery.RemoteAttachHostNotAllowed` —
+      an operator misconfiguration whose message already names the env var
+      to fix, so it passes through verbatim. This used to be a bare
+      ``except ValueError``, which also swallowed the rejected-identifier
+      and unparseable-key ``ValueError``s from the same call path and
+      echoed their raw library text to the admin unclassified.
+    - a wait timeout — reported as its own sentence, because "we gave up
+      waiting" and "the account said no" point the operator at completely
+      different things.
+    - everything else — classified to one sentence, full driver text to the
+      log only.
+
+    Same answer shape as the Keboola branch (``{ok, project_name}`` /
+    ``{ok, error}``). ``project_name`` carries ``<account>/<database>``:
+    a green check that does not say WHICH account answered cannot rule out
+    the one failure worth ruling out.
+    """
+    from connectors.snowflake import discovery
+    from connectors.snowflake.discovery import RemoteAttachHostNotAllowed
+
+    try:
+        probe = await asyncio.wait_for(
+            run_in_threadpool(discovery.probe_connection, row),
+            timeout=_SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # The worker thread is abandoned, not killed — the driver keeps
+        # dialling until its own socket gives up, and its result is
+        # discarded. Bounding the WAIT is the part that matters: it is what
+        # stops one unreachable account from holding an admin request (and
+        # a worker) open indefinitely, and it is all that can be bounded
+        # from here, since the DuckDB/ADBC call takes no deadline.
+        # `:g` so a whole-number ceiling reads "45s", not "45.0s" — the
+        # constant is a float because `asyncio.wait_for` takes one.
+        logger.warning(
+            "connection test for %s (snowflake): timed out after %gs",
+            connection_id,
+            _SNOWFLAKE_PROBE_TIMEOUT_S,
+        )
+        return {
+            "ok": False,
+            "error": (
+                f"connection test timed out after {_SNOWFLAKE_PROBE_TIMEOUT_S:g}s — the account did not "
+                "answer. Check the account identifier, the warehouse state and network reachability, "
+                "then try again."
+            ),
+        }
+    except RemoteAttachHostNotAllowed as exc:
+        # Raised before any session is opened, so nothing went out; the
+        # message names the allowlist env var, so it is worth showing as-is.
+        logger.info("connection test for %s (snowflake): refused — %s", connection_id, exc)
+        return {"ok": False, "error": str(exc)[:300]}
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        # The full driver text (SQLSTATE, Snowflake error code, request id)
+        # is what an operator needs and goes to the log; the caller gets the
+        # classified one-sentence version, same split the browse endpoint
+        # makes (`app/api/admin_source_discovery.py`). Plain `ValueError`s
+        # land here too, deliberately — see the docstring.
+        from app.api.admin_source_discovery import _classify_snowflake_error
+
+        logger.warning("connection test for %s (snowflake): failed — %s", connection_id, exc)
+        return {"ok": False, "error": _classify_snowflake_error(exc)}
+
+    if probe is None:
+        logger.info("connection test for %s (snowflake): not configured", connection_id)
+        return {
+            "ok": False,
+            "error": (
+                "no credential available for this connection (vault empty, no allowlisted "
+                "secret-ref env var) — store one via PUT .../secret, or complete "
+                "config.account/user/database/warehouse"
+            ),
+        }
+
+    logger.info("connection test for %s (snowflake): ok", connection_id)
+    return {"ok": True, "project_name": f"{probe['account']}/{probe['database']}"}
+
+
 @router.post("/{connection_id}/test")
 async def test_connection(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
-    """Verify connectivity for the connection.
+    """Verify connectivity for the connection — per source type.
 
-    Resolves the stack URL and token from the connection row (token_env →
-    environment lookup, or vault secret), then calls
-    ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``keboola``: resolves the stack URL and token from the row (token_env
+      → environment lookup, or vault secret) and calls
+      ``GET {stack_url}/v2/storage/tokens/verify`` with a 10-second timeout.
+    - ``snowflake``: opens a session against the account and reads one row
+      of metadata (:func:`_test_snowflake_connection`).
+    - anything else: ``{ok: false, status: "unsupported", detail: "…"}``
+      naming the type. This branch exists because the handler used to be
+      Keboola-shaped for EVERY row — it demanded a ``stack_url`` a Snowflake
+      or Databricks connection does not have, so "Test" on one of those
+      failed with a message about a field that source type has no concept
+      of, for a connection that may be perfectly healthy. An honest "not
+      implemented for this type yet" is a better answer than a confident
+      wrong one.
 
     Returns ``{ok: true, project_name: "…"}`` on success or
-    ``{ok: false, error: "…"}`` on failure.
+    ``{ok: false, error: "…"}`` on failure. Failure is HTTP 200 throughout —
+    only an unknown connection is a status code (404) — so the unsupported
+    answer keeps that convention rather than minting a new one for its own
+    callers to special-case.
 
-    It used to probe ``/v2/storage?exclude=components``, which measured
-    verified live (2026-08-10): that endpoint is the unauthenticated stack
-    index — it answers **200 with no token at all** and carries no ``owner``
-    block. So "Test" reported OK for any token, including a garbage one, and
-    the ``project_name`` it returned was always the empty string. Verifying
-    the token is the only probe that answers the question the button asks,
-    and it is what makes the project identity below readable at all.
+    The Keboola probe used to be ``/v2/storage?exclude=components``, which
+    measured verified live (2026-08-10): that endpoint is the
+    unauthenticated stack index — it answers **200 with no token at all**
+    and carries no ``owner`` block. So "Test" reported OK for any token,
+    including a garbage one, and the ``project_name`` it returned was always
+    the empty string. Verifying the token is the only probe that answers the
+    question the button asks, and it is what makes the project identity
+    below readable at all.
     """
     row = source_connections_repo().get(connection_id)
     if row is None:
         raise HTTPException(status_code=404, detail="connection_not_found")
 
+    # Audit before the source-type fork so every probe — Keboola, Snowflake,
+    # or an unsupported type — leaves the same one trail entry.
     log_safe(
         user_id=_user.get("id"),
         action="source_connection.test",
         resource=f"source_connection:{connection_id}",
     )
+
+    source_type = (row.get("source_type") or "").strip().lower()
+    if source_type == "snowflake":
+        return await _test_snowflake_connection(connection_id, row)
+    if source_type != "keboola":
+        named = source_type or "unknown"
+        logger.info("connection test for %s: unsupported source_type %s", connection_id, named)
+        return {
+            "ok": False,
+            "status": "unsupported",
+            "detail": f"connection test is not implemented for {named} yet",
+        }
 
     config = row.get("config") or {}
     try:
@@ -2126,6 +2457,16 @@ async def test_connection(
             _log_host(stack_url),
             resp.status_code,
         )
+        # The same refusal the token-save preflight translates, asked from the
+        # same card — so it gets the same sentence instead of the raw body.
+        # The mismatch branch above already refused to dump JSON here; this is
+        # the other half of that.
+        try:
+            probe_body: Any = resp.json()
+        except Exception:
+            probe_body = resp.text
+        if _reads_as_token_refusal(resp.status_code, probe_body):
+            return {"ok": False, "error": token_refused_message(stack_url, what="connection's token")}
         return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         # Scrub the resolved token before logging (replace, then cap, so a

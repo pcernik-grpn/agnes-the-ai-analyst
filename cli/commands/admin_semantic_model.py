@@ -1,182 +1,55 @@
-"""`agnes admin semantic-model` — admin CRUD over canonical Ossie semantic
-models (open semantic-layer contract, Task 11).
+"""`agnes admin semantic-model` — DEPRECATED alias of `agnes admin semantic`.
 
-CLI counterpart to the ``/api/admin/semantic-models`` + public
-``/api/semantic-models/*`` surface:
+Block 6 of #1707 collapsed five semantic-layer command groups into two. This
+group's commands now live in one of two places:
 
-  - ``list``     → ``GET /api/admin/semantic-models``
-  - ``show``     → ``GET /api/admin/semantic-models/{id}``
-  - ``import``   → ``POST /api/admin/semantic-models`` (reads a local file)
-  - ``export``   → ``GET /api/semantic-models/{slug}.yaml``
-  - ``validate`` → local only, no server call, no token: schema-checks a
-    file against the vendored Ossie spec (``src.semantic.document_validation``)
-    so an author can fix a document before ever reaching an admin session.
+  - document CRUD          → ``agnes admin semantic <cmd>``
+    (``list``/``show``/``import``/``detach``/``reattach``/``link-package``/
+    ``unlink-package``; ``delete`` is new there and has no alias here,
+    because there was never an old spelling of it to honor)
+  - the two that were never admin operations → ``agnes semantic-model <cmd>``
+    (``export`` reads the public, resource-gated endpoint; ``validate``
+    schema-checks a local file with no server and no token at all)
+
+Kept, hidden, for one release: an old invocation still runs, prints one line
+on stderr naming its own new path, and delegates to the SAME function the new
+path runs — so this file can never drift from what it forwards to. Delete it
+once callers have caught up.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Optional
-
 import typer
 
-from cli.client import api_get, api_post
+from cli.commands import admin_semantic, semantic_model
+from cli.deprecation import deprecated_group_notice
 
-admin_semantic_model_app = typer.Typer(help="Admin: semantic-model CRUD (semantic model documents)")
-
-
-def _fail(resp) -> None:
-    try:
-        body = resp.json()
-    except Exception:
-        body = {}
-    detail = body.get("detail") if isinstance(body, dict) else None
-    msg = (
-        detail
-        if isinstance(detail, str)
-        else (json.dumps(detail) if detail is not None else (resp.text or f"HTTP {resp.status_code}"))
+admin_semantic_model_app = typer.Typer(help="(deprecated alias of `agnes admin semantic`)")
+admin_semantic_model_app.callback()(
+    deprecated_group_notice(
+        "admin semantic-model",
+        "admin semantic",
+        # The two that left the admin tier entirely — the group's own
+        # destination would name the wrong place for them.
+        overrides={
+            "export": "semantic-model export",
+            "validate": "semantic-model validate",
+        },
     )
-    typer.echo(f"Error ({resp.status_code}): {msg}", err=True)
-    raise typer.Exit(1)
+)
 
-
-def _not_found(ref: str) -> None:
-    typer.echo(f"Semantic model not found: {ref}", err=True)
-    typer.echo("Try: agnes admin semantic-model list", err=True)
-    raise typer.Exit(1)
-
-
-@admin_semantic_model_app.command("list")
-def list_models(
-    term: Optional[str] = typer.Argument(None, help="Filter by substring in slug/name/description"),
-    limit: int = typer.Option(50, "--limit", help="Max rows to show"),
-    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+for _name, _fn in (
+    ("list", admin_semantic.list_models),
+    ("show", admin_semantic.show_model),
+    ("import", admin_semantic.import_model),
+    # No `delete`: `agnes admin semantic delete` is NEW, so there is no old
+    # spelling to keep alive here — an alias for a path that never existed
+    # would ship a deprecated command nobody could have typed before.
+    ("detach", admin_semantic.detach_model),
+    ("reattach", admin_semantic.reattach_model),
+    ("link-package", admin_semantic.link_package),
+    ("unlink-package", admin_semantic.unlink_package),
+    ("export", semantic_model.export_model),
+    ("validate", semantic_model.validate_document),
 ):
-    """List every stored semantic model (any status)."""
-    resp = api_get("/api/admin/semantic-models")
-    if resp.status_code != 200:
-        _fail(resp)
-    rows = resp.json()
-    if term:
-        needle = term.lower()
-        rows = [
-            r
-            for r in rows
-            if needle in " ".join(filter(None, [r.get("slug"), r.get("name"), r.get("description")])).lower()
-        ]
-    rows = rows[:limit]
-
-    if as_json:
-        typer.echo(json.dumps(rows, indent=2, default=str))
-        return
-
-    typer.echo(f"Semantic models: {len(rows)}")
-    for r in rows:
-        typer.echo(f"{r.get('id', ''):<28}  {r.get('slug', ''):<20}  {r.get('source', ''):<10}  {r.get('status', '')}")
-
-
-@admin_semantic_model_app.command("show")
-def show_model(
-    model_ref: str = typer.Argument(..., help="Model id or slug"),
-    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
-):
-    """Show one semantic model's metadata (not the document body — use `export` for that)."""
-    resp = api_get(f"/api/admin/semantic-models/{model_ref}")
-    if resp.status_code == 404:
-        _not_found(model_ref)
-    if resp.status_code != 200:
-        _fail(resp)
-    row = resp.json()
-    if as_json:
-        typer.echo(json.dumps(row, indent=2, default=str))
-        return
-    typer.echo(f"ID:          {row.get('id')}")
-    typer.echo(f"Slug:        {row.get('slug')}")
-    typer.echo(f"Name:        {row.get('name')}")
-    typer.echo(f"Source:      {row.get('source')} (source_ref={row.get('source_ref')})")
-    typer.echo(f"Status:      {row.get('status')}")
-    typer.echo(f"Spec version: {row.get('spec_version')}")
-
-
-@admin_semantic_model_app.command("import")
-def import_model(
-    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
-    description: Optional[str] = typer.Option(None, "--description", help="Optional description to store"),
-):
-    """Upload a local document, creating or replacing the hand-authored
-    (``source='manual'``) model it declares.
-
-    A document imported from a registered `semantic-source` (git/upload/
-    connection) instead — see `agnes admin semantic-source` — is owned by
-    that source and cannot be edited here; only a manually-imported
-    document stays editable through this API.
-    """
-    p = Path(path)
-    if not p.exists():
-        typer.echo(f"Path not found: {path}", err=True)
-        raise typer.Exit(1)
-    text = p.read_text()
-    payload = {"document": text}
-    if description is not None:
-        payload["description"] = description
-    resp = api_post("/api/admin/semantic-models", json=payload)
-    if resp.status_code == 422:
-        body = resp.json().get("detail", {})
-        errors = body.get("errors") if isinstance(body, dict) else None
-        typer.echo("Document failed schema validation:", err=True)
-        for e in errors or [body]:
-            typer.echo(f"  {e}", err=True)
-        raise typer.Exit(1)
-    if resp.status_code not in (200, 201):
-        _fail(resp)
-    body = resp.json()
-    typer.echo(f"Imported semantic model id={body.get('id')} slug={body.get('slug')}")
-
-
-@admin_semantic_model_app.command("export")
-def export_model(
-    slug: str = typer.Argument(..., help="Model slug"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write to this file instead of stdout"),
-):
-    """Export the stored document byte-for-byte (comments and key order survive)."""
-    resp = api_get(f"/api/semantic-models/{slug}.yaml")
-    if resp.status_code == 404:
-        _not_found(slug)
-    if resp.status_code == 403:
-        typer.echo(f"Access denied: {resp.json().get('detail', resp.text)}", err=True)
-        raise typer.Exit(1)
-    if resp.status_code != 200:
-        _fail(resp)
-    text = resp.text
-    if output:
-        Path(output).write_text(text)
-        typer.echo(f"Wrote {output}")
-        return
-    typer.echo(text, nl=not text.endswith("\n"))
-
-
-@admin_semantic_model_app.command("validate")
-def validate_model(
-    path: str = typer.Argument(..., help="Path to a local semantic-model YAML document"),
-):
-    """Schema-check a local file against the vendored semantic-model schema.
-
-    Runs entirely offline: no server, no token. An author fixing a
-    document should not need a reachable instance to iterate.
-    """
-    p = Path(path)
-    if not p.exists():
-        typer.echo(f"Path not found: {path}", err=True)
-        raise typer.Exit(1)
-
-    from src.semantic.document_validation import validate_document
-
-    result = validate_document(p.read_text())
-    if result.ok:
-        typer.echo(f"OK — spec version {result.spec_version}")
-        return
-    typer.echo("Invalid document:", err=True)
-    for e in result.errors:
-        typer.echo(f"  {e}", err=True)
-    raise typer.Exit(1)
+    admin_semantic_model_app.command(_name, hidden=True)(_fn)

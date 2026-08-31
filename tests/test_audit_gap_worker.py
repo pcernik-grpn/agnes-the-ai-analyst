@@ -1,8 +1,14 @@
 """Audit coverage for the worker's single dispatch-level entry point
-(``job.run``) and the four previously-silent scheduler endpoints
-(``run_bq_metadata_refresh``, ``run_keboola_semantic_layer_refresh``,
-``run_databricks_semantic_layer_refresh``, ``run_store_lint_audit``) —
-F2b, audit-full-coverage plan, Task 4.
+(``job.run``) and the previously-silent scheduler endpoints
+(``run_bq_metadata_refresh``, ``run_semantic_sources_refresh``,
+``run_store_lint_audit``) — F2b, audit-full-coverage plan, Task 4.
+
+The two per-connector semantic-layer refreshes this file also covered
+(``run_keboola_semantic_layer_refresh`` / ``run_databricks_semantic_layer_
+refresh``) were retired by #1707 Block 3 step 4; the one generic sweep that
+replaced them carries their audit obligation and is covered here in their
+place. Their catalog entries survive in ``src/audit_events.py`` for the rows
+existing instances already wrote — see the note there.
 """
 
 from __future__ import annotations
@@ -115,7 +121,7 @@ class TestDispatchJobAudit:
 
 
 # ---------------------------------------------------------------------------
-# The four silent scheduler endpoints
+# The silent scheduler endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -155,10 +161,14 @@ class TestBqMetadataRefreshAudit:
         assert _params(rows[0])["duration_ms"] is not None
 
 
-class TestKeboolaSemanticLayerRefreshAudit:
+class TestSemanticSourcesRefreshAudit:
+    """The generic sweep replaced the two per-connector refresh endpoints
+    (#1707 Block 3 step 4), so it inherits their audit obligation: one row
+    per run, counters matching the response body exactly."""
+
     @pytest.fixture(autouse=True)
     def _reset_refresh_state(self):
-        from app.api import keboola_semantic_layer_refresh as endpoint_module
+        from app.api import semantic_sources_refresh as endpoint_module
 
         blank = {
             "run_id": None,
@@ -174,60 +184,40 @@ class TestKeboolaSemanticLayerRefreshAudit:
     def test_run_writes_audit_row(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
-        fake_result = {"status": "ok", "created_or_updated": 3, "pruned": 0, "sources": ["conn-1"]}
-        with patch("app.api.keboola_semantic_layer_refresh.sync_semantic_layer", return_value=fake_result):
-            r = c.post("/api/admin/run-keboola-semantic-layer-refresh", headers=_auth(token))
+        doc = (
+            "version: '0.2.0.dev0'\n"
+            "semantic_model:\n"
+            "  - name: retail\n"
+            "    datasets:\n"
+            "      - name: orders\n"
+            "        source: db.public.orders\n"
+            "        fields: []\n"
+        )
+        created = c.post(
+            "/api/admin/semantic-sources",
+            json={"kind": "upload", "name": "Audited bundle", "adapter": "native", "config": {"documents": [doc]}},
+            headers=_auth(token),
+        )
+        assert created.status_code == 201, created.text
+
+        r = c.post("/api/admin/run-semantic-sources-refresh", headers=_auth(token))
         assert r.status_code == 200, r.text
+        body = r.json()
 
-        rows = _rows("run_keboola_semantic_layer_refresh")
+        rows = _rows("run_semantic_sources_refresh")
         assert rows
-        assert _params(rows[0])["status"] == "ok"
-        assert _params(rows[0])["created_or_updated"] == 3
-        assert _params(rows[0])["sources"] == 1
-
-
-class TestDatabricksSemanticLayerRefreshAudit:
-    @pytest.fixture(autouse=True)
-    def _reset_refresh_state(self):
-        from app.api import databricks_semantic_layer_refresh as endpoint_module
-
-        blank = {"run_id": None, "started_at": None}
-        endpoint_module._refresh_state.update(blank)
-        yield
-        endpoint_module._refresh_state.update(blank)
-
-    def test_run_writes_audit_row(self, seeded_app):
-        from src.semantic.importer import ImportReport
-        from src.semantic.projection import ProjectionReport
-
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        patches = [
-            patch("app.api.databricks_semantic_layer_refresh.ensure_semantic_source", lambda: "databricks_default"),
-            patch(
-                "app.api.databricks_semantic_layer_refresh.import_source",
-                lambda source_id: ImportReport(
-                    models_written=2,
-                    models_unchanged=0,
-                    models_pruned=[],
-                    invalid=[],
-                    projection=ProjectionReport(metrics_written=1, metrics_pruned=0),
-                ),
-            ),
-            patch("app.api.databricks_semantic_layer_refresh.purge_legacy_metric_rows", lambda: 0),
-        ]
-        for p in patches:
-            p.start()
-        try:
-            r = c.post("/api/admin/run-databricks-semantic-layer-refresh", headers=_auth(token))
-        finally:
-            for p in patches:
-                p.stop()
-        assert r.status_code == 200, r.text
-
-        rows = _rows("run_databricks_semantic_layer_refresh")
-        assert rows
-        assert _params(rows[0])["models_written"] == 2
+        params = _params(rows[0])
+        assert params["run_id"] == body["run_id"]
+        assert params["synced"] == body["synced"] >= 1
+        assert params["failed"] == body["failed"] == 0
+        # The counters the sweep actually reports — `skipped_legacy_owned` is
+        # NOT one of them any more (the legacy jobs it used to yield to are
+        # retired), so the audit row must not resurrect it.
+        assert params["skipped_disabled"] == body["skipped_disabled"]
+        assert params["skipped_running"] == body["skipped_running"]
+        assert params["skipped_duplicate_project"] == body["skipped_duplicate_project"]
+        assert params["migrated"] == len(body["migrated"])
+        assert "skipped_legacy_owned" not in params
 
 
 class TestStoreLintAuditAudit:

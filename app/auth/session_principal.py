@@ -9,8 +9,8 @@ carries no participant identity (SR-4), so this object is always live-fresh.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from typing import Mapping, Union
 
 
 @dataclass(frozen=True)
@@ -67,10 +67,53 @@ class AgentPrincipal:
     caller_email: str | None = None
 
 
+@dataclass(frozen=True)
+class ProducerPrincipal:
+    """Auth subject of a corpus-extraction producer's scoped callback
+    credential — see ``app.auth.producer_token`` for how it is minted
+    (``app/worker/kinds.py::_agnes_producer_callback_env``) and resolved.
+
+    Replaces the historical over-grant of the scheduler shared-secret
+    token (which resolved to a synthetic Admin-group user) with a narrow,
+    short-lived JWT naming exactly one connection and its own confirmed
+    scope collections.
+
+    Deliberately carries NO ``intersection`` field the way
+    ``SessionPrincipal``/``AgentPrincipal`` do: its authority is not
+    modeled by the generic per-resource-type grant-intersection primitive
+    those two share (``app.auth.access.can_access_session``) — that helper
+    rejects this principal type outright (see its own docstring).
+    ``app.auth.producer_token`` fail-closes it to a small, FIXED set of
+    endpoints before this object is ever constructed, and each of those
+    endpoints applies its own explicit scope check against
+    ``connection_id``/``collection_ids`` — never a generic grant table.
+    """
+
+    connection_id: str
+    collection_ids: frozenset[str]
+    jti: str
+
+    #: EMPTY, and deliberately so — this principal has no grant-table
+    #: authority at all. It exists because ``PRINCIPAL_TYPES`` conflates two
+    #: questions its members are branched on: "not a full user dict?" (true
+    #: here) and "read its ``intersection``?" (meaningless here). Five sites
+    #: ask the first and then do the second —``src.rbac.get_accessible_ids``,
+    #: ``src.marketplace_filter``, ``app.services.stack_resolver``,
+    #: ``app.api.knowledge_search``, ``app.api.memory`` — so a member without
+    #: the attribute makes each an ``AttributeError`` (a 500) instead of a
+    #: clean deny. Unreachable today only because ``app.auth.producer_token``
+    #: fail-closes this principal to five endpoints none of those sit behind;
+    #: an empty mapping makes the seam TOTAL, so adding a sixth endpoint
+    #: denies rather than crashes. Never the authorization itself: that stays
+    #: the surface allowlist plus each endpoint's own explicit
+    #: ``connection_id``/``collection_ids`` check.
+    intersection: Mapping[str, frozenset[str]] = field(default_factory=dict)
+
+
 #: Either restricted principal. Consumers that mean "not a full user dict —
 #: use the intersection, deny admin" should branch on this union, not on one
 #: member, so a new principal kind cannot silently bypass a seam.
-Principal = Union[SessionPrincipal, AgentPrincipal]
+Principal = Union[SessionPrincipal, AgentPrincipal, ProducerPrincipal]
 
 #: Runtime companion to :data:`Principal` for ``isinstance`` checks —
 #: ``isinstance(x, Principal)`` is a TypeError on a ``typing.Union``. Every
@@ -81,4 +124,4 @@ Principal = Union[SessionPrincipal, AgentPrincipal]
 #: construction site in ``app/auth/pat_resolver.py``) keep naming
 #: ``SessionPrincipal`` directly — that is the signal they are NOT a
 #: restricted-principal seam.
-PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal)
+PRINCIPAL_TYPES: tuple[type, ...] = (SessionPrincipal, AgentPrincipal, ProducerPrincipal)

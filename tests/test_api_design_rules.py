@@ -197,8 +197,22 @@ def test_no_new_verbs_in_path(spec):
 # response body. Returning 200 with a body on DELETE conflates "removed" with
 # "here is the removed representation" — which is a read concern, not a write one.
 #
-# No allowlist: the two pre-existing violations were fixed in this PR.
+# Originally no allowlist: the two pre-existing violations were fixed in
+# that PR. One genuine case has since shown up — an unlink endpoint whose
+# client (the CLI) wants the remaining linked ids back without a follow-up
+# GET, mirroring its linking POST sibling's response shape. Each entry here
+# must declare a `response_model` at the route (checked by hand, not by this
+# test) — an undocumented body is exactly what 204 exists to rule out.
 # ---------------------------------------------------------------------------
+
+_DELETE_200_WITH_BODY_ALLOWLIST = frozenset(
+    {
+        # Symmetric with the linking POST at the same path: both return the
+        # model's current `package_ids` so the CLI/UI can redraw without a
+        # follow-up GET. response_model=SemanticModelPackageIds.
+        "/api/admin/semantic-models/{slug}/packages/{package_id}",
+    }
+)
 
 
 def test_delete_returns_204(spec):
@@ -206,6 +220,8 @@ def test_delete_returns_204(spec):
     violations = []
     for path, method, op in _ops(spec):
         if method != "delete":
+            continue
+        if path in _DELETE_200_WITH_BODY_ALLOWLIST:
             continue
         codes = set(op.get("responses", {}).keys())
         if "204" not in codes:
@@ -319,6 +335,11 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health",
         "/api/health/detailed",
         "/api/version",
+        # Microsoft Graph change-notification receiver — Graph is the only
+        # caller; gated by extraction_webhook.enabled (404 when off), never
+        # a session/PAT (app/api/sharepoint_webhooks.py). Mirrors app/main.py's
+        # own _PUBLIC_API_PATHS.
+        "/api/webhooks/sharepoint/{connection_id}",
     }
 )
 

@@ -171,18 +171,20 @@ _DEFAULTS = {
     # registry, short enough that operator-edited tables show real numbers
     # within an analyst's working day.
     "SCHEDULER_BQ_METADATA_REFRESH_INTERVAL": 4 * 60 * 60,
-    # Keboola semantic layer (Metastore) refresh: walks a Keboola project's
-    # datasets/metrics/constraints and upserts+prunes metric_definitions
-    # rows tagged source='keboola_semantic_layer'. Default 6 h — metrics
-    # change less often than BQ metadata cache entries (4 h default), and
-    # each run does far fewer HTTP calls (a handful of Metastore list
+    # Semantic-sources refresh (issue #1707 Block 3): the ONE scheduled sweep
+    # over every registered `semantic_sources` row (git/upload/connection
+    # kinds), honoring each row's `enabled` flag. Default 6 h — semantic
+    # models change less often than BQ metadata cache entries (4 h default),
+    # and each run does far fewer HTTP calls (a handful of upstream list
     # requests vs one BQ metadata fetch per registered table).
-    "SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL": 6 * 60 * 60,
-    # Databricks semantic layer (Unity Catalog metric views) refresh: same
-    # cadence + rationale as the Keboola sibling — a handful of warehouse
-    # statements per run, syncing the workspace's `connection`-kind semantic
-    # source (source='ossie_connection', source_ref='databricks_default').
-    "SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL": 6 * 60 * 60,
+    #
+    # It REPLACED the two per-connector jobs that used to run beside it
+    # (SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL /
+    # SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL, removed in
+    # step 4): their sources are auto-registered on this sweep under the same
+    # provenance they already carried, so nothing an operator has to do —
+    # see src/semantic/legacy_migration.py.
+    "SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL": 6 * 60 * 60,
     # Pause between scheduler startup and the first tick. Keeps the
     # scheduler from synchronising its "Table never synced, marking as
     # due" burst with the app's own startup cache_warmup. Set to 0 to
@@ -555,8 +557,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
     usage = _read_positive_int("SCHEDULER_USAGE_PROCESSOR_INTERVAL")
     corpmem = _read_positive_int("SCHEDULER_CORPORATE_MEMORY_INTERVAL")
     bqmeta = _read_positive_int("SCHEDULER_BQ_METADATA_REFRESH_INTERVAL")
-    kbsl = _read_positive_int("SCHEDULER_KEBOOLA_SEMANTIC_LAYER_REFRESH_INTERVAL")
-    dbxsl = _read_positive_int("SCHEDULER_DATABRICKS_SEMANTIC_LAYER_REFRESH_INTERVAL")
+    semsrc = _read_positive_int("SCHEDULER_SEMANTIC_SOURCES_REFRESH_INTERVAL")
     usageprune = _read_positive_int("SCHEDULER_USAGE_PRUNE_INTERVAL")
     jirasla = _read_positive_int("SCHEDULER_JIRA_SLA_POLL_INTERVAL")
     jiraconsis = _read_positive_int("SCHEDULER_JIRA_CONSISTENCY_INTERVAL")
@@ -573,8 +574,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         usage,
         corpmem,
         bqmeta,
-        kbsl,
-        dbxsl,
+        semsrc,
         usageprune,
         jirasla,
         jiraconsis,
@@ -755,6 +755,17 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # to review_error so admin can retry. Cheap (one indexed
         # SELECT + N small UPDATEs); short timeout sufficient.
         ("store-reap-stuck-reviews", "every 15m", "/api/admin/run-reap-stuck-reviews", "POST", 60),
+        # Semantic-layer auto-draft sweep (semantic-phase5 wave 2): drafts a
+        # semantic model for a handful of uncovered tables per tick via a
+        # headless chat session, landing each result in the
+        # authoring_suggestions moderation queue. `every 55m` is the V0
+        # cadence; no env override — one more scheduler knob is unwarranted
+        # before this has run in production. 60s timeout is
+        # this HTTP call's own client-side budget only: the endpoint stamps
+        # each table's dedup flag before invoking its session, so a call
+        # that outruns this timeout server-side is never re-triggered for
+        # the same table on the next tick.
+        ("semantic-auto-draft-sweep", "every 55m", "/api/admin/semantic-auto-draft-sweep", "POST", 60),
         # Weekly skill-lint retro-audit (#687). Re-lints published skills,
         # skipping entities whose content is unchanged since their last lint
         # (zero LLM cost on a static store). The endpoint self-guards against
@@ -766,29 +777,18 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # BigQuery metadata refresh — keeps ``bq_metadata_cache`` warm so
         # ``GET /api/v2/catalog`` never has to call BQ at request time.
         ("bq-metadata-refresh", _seconds_to_schedule(bqmeta), "/api/admin/run-bq-metadata-refresh", "POST", 1800),
-        # Keboola semantic layer refresh — keeps metric_definitions rows
-        # tagged source='keboola_semantic_layer' in sync with the project's
-        # Metastore. Short-circuits (returns an error result, doesn't crash)
-        # when Keboola credentials aren't configured or the token isn't a
-        # master token — see connectors/keboola/semantic_layer.py.
+        # Semantic-sources refresh — issue #1707 Block 3. The ONE scheduled
+        # sweep over every registered `semantic_sources` row (git/upload/
+        # connection kinds), skipping `enabled=False` rows. It replaced the
+        # per-connector Keboola and Databricks refresh jobs; each sweep first
+        # auto-registers the sources those retired jobs implied, under the
+        # provenance they already carried (src/semantic/legacy_migration.py).
+        # One source failing never aborts the sweep, so an unconfigured or
+        # unreachable upstream never crashes the scheduler.
         (
-            "keboola-semantic-layer-refresh",
-            _seconds_to_schedule(kbsl),
-            "/api/admin/run-keboola-semantic-layer-refresh",
-            "POST",
-            900,
-        ),
-        # Databricks semantic layer refresh — syncs the workspace's Unity
-        # Catalog metric views into the semantic layer through the same
-        # semantic-source pipeline every other source uses (rows land
-        # tagged source='ossie_connection', source_ref='databricks_default').
-        # Answers 400 (doesn't crash the scheduler) when data_source.databricks
-        # is not configured — see connectors/databricks/semantic_layer.py and
-        # connectors/databricks/semantic_ossie.py.
-        (
-            "databricks-semantic-layer-refresh",
-            _seconds_to_schedule(dbxsl),
-            "/api/admin/run-databricks-semantic-layer-refresh",
+            "semantic-sources-refresh",
+            _seconds_to_schedule(semsrc),
+            "/api/admin/run-semantic-sources-refresh",
             "POST",
             900,
         ),

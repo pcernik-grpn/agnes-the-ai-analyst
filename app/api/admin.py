@@ -500,6 +500,191 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
         )
 
 
+# --- extraction.* admin-editable producer config (T3) -----------------------
+#
+# Three leaves — `enabled`, `producer.command`, `producer.module` — carry a
+# deploy-time env override rendered by the Terraform customer-instance module
+# (`AGNES_EXTRACTION_ENABLED` / `AGNES_EXTRACTION_PRODUCER_COMMAND` /
+# `AGNES_EXTRACTION_PRODUCER_MODULE` — see app/switches.py's `extraction`
+# switch and app/worker/kinds.py::_extraction_producer_argv). Every reader
+# already resolves env-first, so a web save under an active pin would be
+# accepted and then silently never read — worse than refusing outright.
+# `_path` is relative to the `extraction` section's OWN patch dict (i.e.
+# excludes the leading "extraction" segment), matching how
+# `_validate_extraction_section` and `_known_fields_resolved` both walk it.
+_EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("enabled",), "AGNES_EXTRACTION_ENABLED"),
+    (("producer", "command"), "AGNES_EXTRACTION_PRODUCER_COMMAND"),
+    (("producer", "module"), "AGNES_EXTRACTION_PRODUCER_MODULE"),
+)
+
+_EXTRACTION_TIMEOUT_MIN = 60
+_EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+_EXTRACTION_ENV_PASSTHROUGH_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
+    """True if `path` (relative to `patch`) names a leaf this SAME patch sets.
+
+    Same walk as `_switch_touched_by_patch` above, generalized to an
+    arbitrary path instead of a `Switch`'s `config_keys` — used for the
+    `extraction` leaves above, which are plain `_KNOWN_FIELDS` entries, not
+    registry switches.
+    """
+    node: Any = patch
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+
+def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
+    """Field-level constraints + the env-lock refusal for `extraction.*`
+    (T3: admin-editable producer config, reversing the deploy-time-only
+    stance the `extraction` switch shipped with).
+
+    Two independent checks, both BEFORE the deep-merge, mirroring
+    `_validate_materialize_section`'s shape:
+
+      1. Env-lock honesty — refuse (409 `field_locked_by_deployment`) a
+         patch that touches a leaf a deploy-time env var currently pins
+         ahead of `instance.yaml` (see `_EXTRACTION_ENV_LOCKS` above).
+      2. Ordinary field-level shape/range constraints the Pydantic envelope
+         can't enforce on nested leaves.
+    """
+    patch = sections.get("extraction")
+    if not isinstance(patch, dict):
+        return
+
+    for path, env_var in _EXTRACTION_ENV_LOCKS:
+        if _leaf_touched(patch, path) and os.environ.get(env_var) is not None:
+            field = ".".join(path)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "field_locked_by_deployment",
+                    "section": "extraction",
+                    "field": field,
+                    "env_var": env_var,
+                    "message": (
+                        f"extraction.{field} is set by deployment (Terraform) via {env_var} "
+                        "and cannot be changed here — remove the env var on the deployment "
+                        "side first."
+                    ),
+                },
+            )
+
+    if "enabled" in patch and not isinstance(patch["enabled"], bool):
+        raise HTTPException(status_code=422, detail="extraction.enabled must be a boolean")
+
+    producer = patch.get("producer")
+    if isinstance(producer, dict):
+        for key in ("command", "module"):
+            val = producer.get(key)
+            if val is not None and not isinstance(val, str):
+                raise HTTPException(status_code=422, detail=f"extraction.producer.{key} must be a string")
+        passthrough = producer.get("env_passthrough")
+        if passthrough is not None:
+            if not isinstance(passthrough, list) or not all(isinstance(v, str) for v in passthrough):
+                raise HTTPException(
+                    status_code=422,
+                    detail="extraction.producer.env_passthrough must be a list of strings",
+                )
+            bad = [v for v in passthrough if not _EXTRACTION_ENV_PASSTHROUGH_NAME_RE.match(v)]
+            if bad:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.producer.env_passthrough entries must be valid env var "
+                        f"NAMES matching ^[A-Z][A-Z0-9_]*$, got: {bad!r}"
+                    ),
+                )
+
+    schedule = patch.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, str):
+            raise HTTPException(status_code=422, detail="extraction.schedule must be a string")
+        if schedule != "" and not is_valid_schedule(schedule):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "extraction.schedule must be 'every Nm' / 'every Nh' / "
+                    "'daily HH:MM[,HH:MM,...]' / 'cron <min hour dom month dow>' "
+                    f"(e.g. 'cron 0 5 7 * *'), got {schedule!r}"
+                ),
+            )
+
+    timeout_s = patch.get("timeout_s")
+    if timeout_s is not None:
+        if not isinstance(timeout_s, int) or isinstance(timeout_s, bool):
+            raise HTTPException(status_code=422, detail="extraction.timeout_s must be an integer")
+        if timeout_s < _EXTRACTION_TIMEOUT_MIN or timeout_s > _EXTRACTION_TIMEOUT_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"extraction.timeout_s must be between {_EXTRACTION_TIMEOUT_MIN} and "
+                    f"{_EXTRACTION_TIMEOUT_MAX} (got {timeout_s})"
+                ),
+            )
+
+
+def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
+    """Show the ACTUALLY-resolved value for a leaf a deploy-time env var
+    pins (env-lock honesty) rather than whatever `instance.yaml` happens to
+    hold underneath it.
+
+    Every reader resolves env-first (`app.switches.switch_value`,
+    `app.worker.kinds._extraction_producer_argv`), so a stale/absent yaml
+    value under an active pin would otherwise render a value the runtime
+    does not actually use — for a field the operator cannot act on here
+    anyway, that is worse than showing the truth.
+    """
+    from app.instance_config import coerce_flag_value
+
+    extraction = sections.setdefault("extraction", {})
+    if not isinstance(extraction, dict):
+        return
+
+    enabled_env = os.environ.get("AGNES_EXTRACTION_ENABLED")
+    if enabled_env is not None:
+        extraction["enabled"] = coerce_flag_value(enabled_env, False)
+
+    command_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_COMMAND")
+    module_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_MODULE")
+    if command_env is not None or module_env is not None:
+        producer = extraction.get("producer")
+        producer = dict(producer) if isinstance(producer, dict) else {}
+        if command_env is not None:
+            producer["command"] = command_env
+        if module_env is not None:
+            producer["module"] = module_env
+        extraction["producer"] = producer
+
+
+def _apply_extraction_env_locks(fields: Dict[str, Any]) -> None:
+    """Patch `_KNOWN_FIELDS['extraction']`'s leaf specs (already deep-copied
+    by `_known_fields_resolved`) with `env_var`/`env_locked` so the panel
+    knows to render a pinned field read-only with "set by deployment
+    (Terraform)" instead of a normal editable input. `env_locked` is
+    computed per REQUEST (not a static registry fact) — it reflects whether
+    the env var is present RIGHT NOW, exactly what `_validate_extraction_
+    section` checks on write.
+    """
+    extraction = fields.get("extraction")
+    if not isinstance(extraction, dict):
+        return
+    for path, env_var in _EXTRACTION_ENV_LOCKS:
+        node = extraction
+        for key in path[:-1]:
+            node = (node.get(key) or {}).get("fields") or {}
+        spec = node.get(path[-1])
+        if not isinstance(spec, dict):
+            continue
+        spec["env_var"] = env_var
+        spec["env_locked"] = os.environ.get(env_var) is not None
+
+
 # --- Server-config (instance.yaml) editor -----------------------------------
 #
 # The /admin/server-config UI POSTs a partial dict here keyed by section
@@ -588,8 +773,10 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "mcp": "live",  # matches all five switches under it
     "access_policies": "live",  # matches its switch
     "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
+    "extraction_webhook": "live",  # matches its switch — no other known key under this section
     "acl_mirroring": "live",  # matches its switch — no other known key under this section
     "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
+    "extraction": "live",  # every leaf is read per call: feature_enabled() (enabled), app/worker/kinds.py's _extraction_producer_argv/_extraction_producer_env_passthrough/_extraction_timeout_seconds (producer.*/timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -769,6 +956,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             ),
         },
     },
+    "extraction_webhook": {
+        "enabled": {
+            "kind": "bool",
+            "default": _flag_default("extraction_webhook", "enabled", False),
+            "hint": (
+                "Microsoft Graph change-notification receiver for SharePoint "
+                "connections (POST /api/webhooks/sharepoint/{connection_id}) — 404s "
+                "the whole route when off. Gates the receiver route only; the "
+                "corpus-extraction job it enqueues still needs extraction.enabled + a "
+                "configured producer + a worker polling the extraction lane to "
+                "actually run. New feature — off by default."
+            ),
+        },
+    },
     "access_policies": {
         "enabled": {
             "kind": "bool",
@@ -847,6 +1048,95 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "must_not mode only: hours a failed ACL sync may leave mirrored "
                 "grants standing before they are suspended (deleted until the next "
                 "successful sync rewrites them)."
+            ),
+        },
+    },
+    "extraction": {
+        "enabled": {
+            "kind": "bool",
+            "default": _flag_default("extraction", "enabled", False),
+            "hint": (
+                "Document extraction (spec §7.5) as its own worker lane — gates the "
+                "corpus-extraction job kind's handler. New feature — off by default. "
+                "Turning this on is NOT enough by itself to run the worker: a process must "
+                "actually poll the extraction lane (AGNES_WORKER_LANES, e.g. the "
+                "extraction-worker Compose profile), which needs Postgres app-state, "
+                "explicit JWT_SECRET_KEY/SESSION_SECRET, and coordination.backend=redis "
+                "(docs/DEPLOYMENT.md#multi-process) — this panel cannot satisfy those. "
+                "A Terraform-rendered deployment sets this via AGNES_EXTRACTION_ENABLED, "
+                "which always wins over a value saved here — the field renders read-only "
+                "when that env var is present (see env_locked below)."
+            ),
+        },
+        "producer": {
+            "kind": "object",
+            "hint": (
+                "How to invoke the operator-supplied extraction producer (Agnes does not "
+                "ship one — see docs/DEPLOYMENT.md#multi-process). command wins over module "
+                "when both are set."
+            ),
+            "fields": {
+                "command": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Full command line for the producer entrypoint, e.g. "
+                        "'python -m your_producer.run'. This command is executed by the "
+                        "extraction worker process on the server. A Terraform-rendered "
+                        "deployment sets this via AGNES_EXTRACTION_PRODUCER_COMMAND, which "
+                        "always wins over this value — the field renders read-only when "
+                        "that env var is present."
+                    ),
+                },
+                "module": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "python -m <module> shorthand for a producer the worker image "
+                        "installed as a package (EXTRACTION_PRODUCER_INSTALL build-arg). "
+                        "Ignored when command is set. A Terraform-rendered deployment sets "
+                        "this via AGNES_EXTRACTION_PRODUCER_MODULE, which always wins over "
+                        "this value — the field renders read-only when that env var is "
+                        "present."
+                    ),
+                },
+                "env_passthrough": {
+                    "kind": "array",
+                    "item_kind": "string",
+                    "default": [],
+                    "hint": (
+                        "Extra env var NAMES (e.g. HTTP_PROXY_EXTRA) to forward to the "
+                        "producer subprocess from this process's own environment, beyond "
+                        "the curated non-secret allowlist (PATH/locale/timezone/tempdir/TLS/"
+                        "proxy vars). Each entry must be a valid env var name "
+                        "(^[A-Z][A-Z0-9_]*$) — not a way back to forwarding the whole "
+                        "environment, and never a place for a secret name: the producer "
+                        "still never receives this instance's credentials just because a "
+                        "name happens to be listed here."
+                    ),
+                },
+            },
+        },
+        "schedule": {
+            "kind": "string",
+            "default": "",
+            "hint": (
+                "Instance-wide extraction cadence — 'every Nm'/'every Nh', "
+                "'daily HH:MM[,HH:MM,...]' (UTC), or 'cron <min hour dom month dow>' (UTC). "
+                "Empty (default) disables the scheduled sweep entirely; an admin can still "
+                "trigger a one-off run via POST /api/admin/sharepoint/connections/{id}/extract. "
+                "Validated with the same parser the scheduler sweep itself uses "
+                "(src.scheduler.is_valid_schedule) — an invalid value is rejected here rather "
+                "than accepted and silently disabling the sweep later."
+            ),
+        },
+        "timeout_s": {
+            "kind": "int",
+            "default": 3600,
+            "hint": (
+                "Hard ceiling on one producer run, in seconds — the subprocess is killed at "
+                "this timeout and the job fails (no automatic retry). Must be between 60 and "
+                "86400 (24h)."
             ),
         },
     },
@@ -2584,6 +2874,10 @@ def _known_fields_resolved() -> dict:
     fields["auth"]["keboola"]["fields"]["project_id"]["required"] = (
         switch_value("keboola_multi_project_mode") == "disabled"
     )
+    # Env-lock honesty (T3): mark the extraction leaves a deploy-time env var
+    # currently pins so the panel renders them read-only instead of offering
+    # a write path a save would silently never reach.
+    _apply_extraction_env_locks(fields)
     return fields
 
 
@@ -2811,6 +3105,10 @@ async def get_server_config(
     # Always surface the optional BQ knobs so the operator sees them in the
     # UI's JSON editor instead of having to know they exist (Phase J).
     _ensure_bq_optional_fields(sections)
+    # Env-lock honesty (T3): show the ACTUALLY-resolved value for a leaf a
+    # deploy-time env var currently pins, not whatever instance.yaml happens
+    # to hold underneath it — see `_apply_extraction_env_overrides`.
+    _apply_extraction_env_overrides(sections)
     log_safe(
         user_id=user.get("id"),
         action="server_config.read",
@@ -2959,6 +3257,10 @@ async def update_server_config(
 
     # Field-level constraints for sections whose values have documented ranges.
     _validate_materialize_section(request.sections)
+
+    # extraction.*: field-level constraints AND the env-lock refusal (409
+    # field_locked_by_deployment) for a leaf a deploy-time env var pins.
+    _validate_extraction_section(request.sections)
 
     # Defense-in-depth: scrub redaction sentinels (`***` / `<empty>`) out of
     # secret-keyed leaves in the patch before they reach the deep-merge.
@@ -4321,6 +4623,18 @@ class UpdateTableRequest(BaseModel):
     access_policy_sql: Optional[str] = None
     access_policy_note: Optional[str] = None
     policy_mapping: Optional[bool] = None
+    # v79 — see RegisterTableRequest.connection_id. PUT lets an admin pin (or
+    # re-pin) an already-registered row to a named connection — including
+    # fixing a row that was registered before this field existed and is
+    # sitting on a NULL connection_id.
+    connection_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Pin this table to a named source connection (source_connections.id). "
+            "NULL uses the default connection for the row's source_type. "
+            "The referenced connection must exist; an unknown id returns 400."
+        ),
+    )
 
     @field_validator("access_policy_sql", mode="before")
     @classmethod
@@ -5718,6 +6032,21 @@ async def update_table(
     if not existing:
         raise HTTPException(status_code=404, detail="Table not found")
 
+    # v79 — validate connection_id FK before persisting, mirroring
+    # register_table. Checked directly against the request field (not
+    # `updates`) so an explicit `connection_id: null` (meaning "use the
+    # default connection") is treated the same as omission -- both skip
+    # the FK lookup, and an omitted field never clobbers the stored value
+    # once `updates`/`merged` below apply exclude_unset=True.
+    if request.connection_id is not None:
+        from src.repositories import source_connections_repo
+
+        if source_connections_repo().get(request.connection_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"connection_id '{request.connection_id}' not found in source_connections",
+            )
+
     # `exclude_unset=True` honors the PUT-shape distinction between
     # "field omitted from body" (keep existing) vs "field sent as null"
     # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
@@ -6154,6 +6483,11 @@ async def update_table(
             "access_policy_updated_at",
             "access_policy_updated_by",
             "policy_mapping",
+            # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
+            # bookkeeping, not a human-editable PUT field. register() doesn't
+            # accept it; it has its own setters
+            # (mark_semantic_draft_pending / clear_semantic_draft_pending).
+            "semantic_draft_pending_at",
         ):
             merged.pop(_policy_key, None)
 
@@ -6933,6 +7267,20 @@ async def unregister_table(
     (sync_state-driven) and the orchestrator's next rebuild could
     resurrect a master view from the leftover parquet (E2E sub-agent
     finding 2026-05-01).
+
+    The table's `data_package_tables` memberships and `resource_grants`
+    rows go with it — cleared inside `TableRegistryRepository.unregister`
+    on both backends, since a DELETE that leaves them behind means
+    something different on DuckDB (a foreign-key violation surfacing as a
+    raw 500) than on Postgres (an orphan junction row). See that repo
+    method's docstring.
+
+    How many of each went with it is recorded in the audit row
+    (`package_memberships_removed` / `grants_revoked`, both always present
+    even at zero — same shape as the plugin-disable precedent in
+    `app/api/marketplaces.py`). Revoking grants is an access-control
+    change, and without the counts the audit log cannot answer "who lost
+    access to what" for the event that caused it.
     """
     repo = table_registry_repo()
     existing = repo.get(table_id)
@@ -6944,7 +7292,7 @@ async def unregister_table(
     source_type = existing.get("source_type") or ""
     name = existing.get("name") or table_id
 
-    repo.unregister(table_id)
+    cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the
@@ -7014,6 +7362,7 @@ async def unregister_table(
                 "source_type": existing.get("source_type"),
                 "bucket": existing.get("bucket"),
                 "source_table": existing.get("source_table"),
+                **cascade,
             }
         ),
     )
@@ -8896,3 +9245,27 @@ async def run_reap_stuck_reviews(
         params={"grace_seconds": grace, "reaped": result.get("reaped", 0), "skipped": result.get("skipped", False)},
     )
     return {"ok": True, "details": result}
+
+
+@router.get("/source-pipelines")
+async def get_source_pipelines(
+    user: dict = Depends(require_admin),
+):
+    """The per-source pipeline strip — tables → sync → semantic → feeds.
+
+    Read-only, and deliberately no new data: it returns exactly the dict
+    ``/admin/data-sources`` inlines into its own HTML (``SOURCE_PIPELINES``),
+    from the same ``_source_pipelines()`` fold. The page needs it because
+    everything on it — the Add-tables wizard, package creation, token
+    saves — happens over fetch, so a strip baked at render time kept
+    reporting "Add the first tables → / Never synced / 0 packages" long
+    after the admin had registered two dozen tables. Same admin gate as the
+    page, so this exposes nothing the caller could not already read there.
+
+    ``user`` is threaded through for the one caller-scoped cell (a
+    SharePoint source's facts/edges counts); every other cell is
+    caller-independent.
+    """
+    from app.web.router import _source_pipelines
+
+    return _source_pipelines(user=user)

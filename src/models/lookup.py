@@ -43,6 +43,9 @@ class ColumnMetadata(Base):
     source: Mapped[str] = mapped_column(
         String, server_default=text("'manual'"), nullable=False
     )
+    # v125 (0085_column_meta_source_ref): per-connection provenance,
+    # mirrors metric_definitions/glossary_terms.source_ref (v107).
+    source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

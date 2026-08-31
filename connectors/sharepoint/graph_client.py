@@ -247,19 +247,35 @@ def certificate_metadata(private_key_pem: str) -> Dict[str, Any]:
     }
 
 
-async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str) -> str:
-    """Fetch an app-only Graph access token via the certificate-credential
-    flow. Raises :class:`SharePointGraphError` on any non-200 response or a
+async def get_app_token(tenant_id: str, client_id: str, private_key_pem: str, *, client_secret: str = "") -> str:
+    """Fetch an app-only Graph access token — the certificate-credential
+    flow by default, or Entra's plain client-secret flow when
+    ``client_secret`` is provided (``auth_method="client_secret"``
+    connections; ``private_key_pem`` is empty there and never touched).
+    Raises :class:`SharePointGraphError` on any non-200 response or a
     response with no ``access_token`` — never returns a falsy token."""
-    assertion = build_client_assertion(tenant_id, client_id, private_key_pem)
     url = f"{LOGIN_BASE}/{tenant_id}/oauth2/v2.0/token"
-    data = {
-        "client_id": client_id,
-        "scope": "https://graph.microsoft.com/.default",
-        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        "client_assertion": assertion,
-        "grant_type": "client_credentials",
-    }
+    if client_secret:
+        data = {
+            "client_id": client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "client_secret": client_secret,
+            "grant_type": "client_credentials",
+        }
+    elif private_key_pem:
+        assertion = build_client_assertion(tenant_id, client_id, private_key_pem)
+        data = {
+            "client_id": client_id,
+            "scope": "https://graph.microsoft.com/.default",
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": assertion,
+            "grant_type": "client_credentials",
+        }
+    else:
+        raise SharePointGraphError(
+            "no credential to authenticate with — the connection resolved neither certificate material "
+            "nor a client secret"
+        )
     async with _http_client() as client:
         resp = await client.post(url, data=data, timeout=_TOKEN_TIMEOUT_S)
     if resp.status_code != 200:

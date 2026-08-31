@@ -131,6 +131,78 @@ def test_materialized_pass_skips_undue_rows(system_db, stub_bq):
     assert {"table": "orders_daily", "reason": "due_check"} in summary["skipped"]
 
 
+def test_materialized_pass_targeted_bypasses_due_check(system_db, stub_bq, tmp_path):
+    """An explicitly-targeted table (``tables=[...]``) must still be
+    dispatched even when it is inside its schedule window — see #1620.
+    An operator naming a specific table via `agnes admin sync <table>` is
+    making a bounded, explicit request; the routine `due_check` cadence
+    gate exists for the untargeted sweep, not for this path."""
+    repo = TableRegistryRepository(system_db)
+    repo.register(
+        id="orders_daily",
+        name="orders_daily",
+        source_type="bigquery",
+        query_mode="materialized",
+        source_query="SELECT 1",
+        sync_schedule="daily 03:00",
+    )
+    state = SyncStateRepository(system_db)
+    state.update_sync(
+        table_id="orders_daily",
+        rows=1,
+        file_size_bytes=10,
+        hash="x",
+    )
+
+    parquet_dir = tmp_path / "data" / "extracts" / "bigquery" / "data"
+    parquet_dir.mkdir(parents=True, exist_ok=True)
+    (parquet_dir / "orders_daily.parquet").write_bytes(b"PAR1" + b"\x00" * 16 + b"PAR1")
+
+    from app.api import sync as sync_mod
+
+    with patch("app.api.sync._materialize_table") as mock_mat:
+        mock_mat.return_value = {
+            "rows": 1,
+            "size_bytes": 100,
+            "query_mode": "materialized",
+        }
+        summary = sync_mod._run_materialized_pass(system_db, stub_bq, tables=["orders_daily"])
+
+    mock_mat.assert_called_once()
+    assert "orders_daily" in summary["materialized"]
+    assert {"table": "orders_daily", "reason": "due_check"} not in summary["skipped"]
+
+
+def test_materialized_pass_untargeted_sweep_still_honors_due_check(system_db, stub_bq):
+    """Mirrors ``test_materialized_pass_skips_undue_rows`` but pins that an
+    untargeted sweep (``tables=None``, e.g. the scheduler's own tick) is
+    unaffected by the targeted-bypass change above."""
+    repo = TableRegistryRepository(system_db)
+    repo.register(
+        id="orders_daily",
+        name="orders_daily",
+        source_type="bigquery",
+        query_mode="materialized",
+        source_query="SELECT 1",
+        sync_schedule="daily 03:00",
+    )
+    state = SyncStateRepository(system_db)
+    state.update_sync(
+        table_id="orders_daily",
+        rows=1,
+        file_size_bytes=10,
+        hash="x",
+    )
+
+    from app.api import sync as sync_mod
+
+    with patch("app.api.sync._materialize_table") as mock_mat:
+        summary = sync_mod._run_materialized_pass(system_db, stub_bq, tables=None)
+
+    mock_mat.assert_not_called()
+    assert {"table": "orders_daily", "reason": "due_check"} in summary["skipped"]
+
+
 def test_materialized_pass_skips_non_materialized_rows(system_db, stub_bq):
     repo = TableRegistryRepository(system_db)
     repo.register(id="t1", name="t1", source_type="keboola", query_mode="local")
@@ -374,6 +446,62 @@ def test_run_sync_runs_materialized_pass_on_bq_only_deployment(
 
     assert materialized_called["count"] == 1, "materialized pass must run on BQ-only deployment (no local rows)"
     assert orchestrator_called["count"] == 1, "orchestrator rebuild must run so materialized parquets are picked up"
+
+
+def test_run_sync_result_sink_captures_materialized_summary(tmp_path, monkeypatch):
+    """#1620 secondary fix: `_run_sync(result_sink=...)` surfaces the
+    materialized pass's skip/error detail (previously visible only in
+    server logs) so `app.worker.kinds._run_data_refresh` can thread it
+    into `GET /api/jobs/{id}`'s stored result."""
+    import duckdb
+    from src.db import _ensure_schema
+
+    db_path = tmp_path / "system.duckdb"
+    conn = duckdb.connect(str(db_path))
+    _ensure_schema(conn)
+    repo = TableRegistryRepository(conn)
+    repo.register(
+        id="m1",
+        name="m1",
+        source_type="bigquery",
+        query_mode="materialized",
+        source_query="SELECT 1",
+        sync_schedule="every 1m",
+    )
+    conn.close()
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    from app.api import sync as sync_mod
+
+    fake_summary = {
+        "materialized": [],
+        "skipped": [{"table": "m1", "reason": "due_check"}],
+        "errors": [],
+    }
+
+    def _spy_materialized_pass(_conn, _bq, *, tables=None, source_type=None):
+        return fake_summary
+
+    class _OrchStub:
+        def rebuild(self):
+            return {}
+
+    monkeypatch.setattr("app.api.sync._run_materialized_pass", _spy_materialized_pass)
+    monkeypatch.setattr("src.orchestrator.SyncOrchestrator", lambda *a, **kw: _OrchStub())
+    monkeypatch.setattr("app.instance_config.get_data_source_type", lambda: "bigquery")
+    monkeypatch.setattr(
+        "app.instance_config.get_value",
+        lambda *args, **kw: "my-bq-proj" if (args and args[-1] == "project") else kw.get("default", ""),
+    )
+
+    result: dict = {}
+    ok = sync_mod._run_sync(result_sink=result)
+
+    assert ok is True
+    assert result["materialized"] == fake_summary
+    assert result["errors"] == []
+    assert result["synced_tables"] == []
 
 
 @pytest.mark.parametrize(

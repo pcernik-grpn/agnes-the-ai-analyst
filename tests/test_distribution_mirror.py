@@ -498,7 +498,9 @@ class TestChainedEnqueueAfterDataRefresh:
         from src.repositories import jobs_repo
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: True)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync", lambda tables=None, source_type_filter=None, result_sink=None: True
+        )
         monkeypatch.setattr("src.object_store.object_store", lambda: FakeObjectStore())
 
         JOB_KINDS["data-refresh"].handler({})
@@ -512,7 +514,9 @@ class TestChainedEnqueueAfterDataRefresh:
         from src.repositories import jobs_repo
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: True)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync", lambda tables=None, source_type_filter=None, result_sink=None: True
+        )
         monkeypatch.setattr("src.object_store.object_store", lambda: None)
 
         JOB_KINDS["data-refresh"].handler({})
@@ -530,7 +534,9 @@ class TestChainedEnqueueAfterDataRefresh:
         from src.repositories import jobs_repo
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: None)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync", lambda tables=None, source_type_filter=None, result_sink=None: None
+        )
         monkeypatch.setattr("src.object_store.object_store", lambda: FakeObjectStore())
 
         JOB_KINDS["data-refresh"].handler({})
@@ -544,7 +550,9 @@ class TestChainedEnqueueAfterDataRefresh:
         from src.repositories import jobs_repo
 
         register_all_kinds()
-        monkeypatch.setattr("app.api.sync._run_sync", lambda tables=None, source_type_filter=None: False)
+        monkeypatch.setattr(
+            "app.api.sync._run_sync", lambda tables=None, source_type_filter=None, result_sink=None: False
+        )
         monkeypatch.setattr("src.object_store.object_store", lambda: FakeObjectStore())
 
         with pytest.raises(RuntimeError):
