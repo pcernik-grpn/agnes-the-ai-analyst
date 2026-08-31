@@ -364,12 +364,12 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     audits the run-level actions, and applies must_not staleness suspension.
     See :func:`run_acl_sync` for the full contract.
 
-    TODO(acl-sync): this and ``_sweep_connection`` both read-modify-write the
-    same ``source_connections.config`` blob with no lock — a nightly sync and
-    the weekly sweep landing together on one connection can silently drop
-    each other's just-written bookkeeping keys (never grants — those live in
-    ``resource_grants``). Self-healing on the loser's next run; fix is a
-    key-scoped ``config_patch`` merge helper on the repo pair."""
+    Invariant: this and ``_sweep_connection`` never write a whole-``config``
+    snapshot — both patch only their own bookkeeping keys via
+    ``source_connections_repo().config_patch`` (re-reads ``config`` fresh
+    inside its own transaction), so a nightly sync and the weekly sweep
+    landing together on one connection can never drop each other's
+    just-written key (never grants — those live in ``resource_grants``)."""
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
     t0 = time.monotonic()
@@ -408,21 +408,22 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = now.isoformat()
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    new_config = dict(connection.get("config") or {})
-    new_config["acl_sync_last_run"] = {
-        "at": now_iso,
-        "ok": ok,
-        "matched": matched_total,
-        "unmatched": unmatched_total,
-        "unhonored": unhonored_all,
-        "grant_deltas": grant_deltas,
-        "stale_scopes": stale_scopes,
-        "error": error,
-        "duration_ms": duration_ms,
+    config_patch: Dict[str, Any] = {
+        "acl_sync_last_run": {
+            "at": now_iso,
+            "ok": ok,
+            "matched": matched_total,
+            "unmatched": unmatched_total,
+            "unhonored": unhonored_all,
+            "grant_deltas": grant_deltas,
+            "stale_scopes": stale_scopes,
+            "error": error,
+            "duration_ms": duration_ms,
+        }
     }
     if ok:
-        new_config["acl_sync_last_success_at"] = now_iso
-    source_connections_repo().update(connection_id, config=new_config)
+        config_patch["acl_sync_last_success_at"] = now_iso
+    source_connections_repo().config_patch(connection_id, config_patch)
 
     if ok:
         log_safe(
@@ -905,7 +906,21 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     duration_ms = int((time.monotonic() - t0) * 1000)
 
-    all_scopes = list((connection.get("config") or {}).get("scopes") or [])
+    # A full sweep walk can run for a long time (module docstring: "multi-hour,
+    # not a nightly job"), so `connection` (read once at the start of this
+    # call) can be well out of date by now. Re-read fresh immediately before
+    # building the `scopes` patch rather than rebuild it from the stale
+    # snapshot — otherwise this sweep's own `scopes` write would silently
+    # revert anything an admin (or the sync) wrote to `scopes` in the
+    # meantime. `config_patch` below still re-reads a SECOND time inside its
+    # own transaction, so this fresh read only narrows the race window, it
+    # doesn't need to close it perfectly (a per-scope-field merge finer than
+    # whole-`scopes`-list replacement would, but `excluded_subtrees` is a
+    # per-scope value inside a list column, and `confirm_scope`/`remove_scope`
+    # racing this sweep is a human admin action, not a second automated
+    # writer — not worth the extra complexity here).
+    fresh_connection = source_connections_repo().get(connection_id) or connection
+    all_scopes = list((fresh_connection.get("config") or {}).get("scopes") or [])
     updated_scopes = [
         {**s, "excluded_subtrees": exclusions_by_scope[s["source_scope_id"]]}
         if s.get("source_scope_id") in exclusions_by_scope
@@ -913,30 +928,31 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
         for s in all_scopes
     ]
 
-    new_config = dict(connection.get("config") or {})
-    new_config["scopes"] = updated_scopes
-    new_config["acl_sweep_last_run"] = {
-        "at": now_iso,
-        "ok": error is None,
-        "scopes": len(scopes),
-        "excluded": excluded_total,
-        # Request count is exact (one $batch POST per up-to-20 folders, plus
-        # one "list children" call per visited folder). A literal 429-vs-
-        # other-failure breakdown is NOT available without deeper
-        # instrumentation of graph_client.probe_unique_permissions (which
-        # collapses every failure mode — network error, non-200, malformed
-        # body, AND 429 — into the same "unknown" answer, by design: see its
-        # own docstring); `unknown_probes` is the honest proxy this module
-        # can report today, not a literal 429 counter.
-        "requests": requests_total,
-        "unknown_probes": unknown_total,
-        "truncated": truncated_any,
-        "error": error,
-        "duration_ms": duration_ms,
+    config_patch: Dict[str, Any] = {
+        "scopes": updated_scopes,
+        "acl_sweep_last_run": {
+            "at": now_iso,
+            "ok": error is None,
+            "scopes": len(scopes),
+            "excluded": excluded_total,
+            # Request count is exact (one $batch POST per up-to-20 folders, plus
+            # one "list children" call per visited folder). A literal 429-vs-
+            # other-failure breakdown is NOT available without deeper
+            # instrumentation of graph_client.probe_unique_permissions (which
+            # collapses every failure mode — network error, non-200, malformed
+            # body, AND 429 — into the same "unknown" answer, by design: see its
+            # own docstring); `unknown_probes` is the honest proxy this module
+            # can report today, not a literal 429 counter.
+            "requests": requests_total,
+            "unknown_probes": unknown_total,
+            "truncated": truncated_any,
+            "error": error,
+            "duration_ms": duration_ms,
+        },
     }
     if error is None:
-        new_config["acl_sweep_last_full"] = now_iso
-    source_connections_repo().update(connection_id, config=new_config)
+        config_patch["acl_sweep_last_full"] = now_iso
+    source_connections_repo().config_patch(connection_id, config_patch)
 
     return {"scopes": len(scopes), "excluded": excluded_total, "error": error}
 

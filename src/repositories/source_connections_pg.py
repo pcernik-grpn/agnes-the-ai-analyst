@@ -145,6 +145,49 @@ class SourceConnectionsPgRepository:
                         {"id": connection_id},
                     )
 
+    def config_patch(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring for the invariant
+        this closes (NB-1: two writers race a config read-modify-write).
+
+        ``config`` is stored as JSON-as-text here (``src/models/connections
+        .py``'s ``Text`` column), not native ``jsonb``, so this can't lean
+        on Postgres's ``||`` jsonb-concatenation operator to merge
+        server-side in one statement. Instead it takes the row lock
+        explicitly (``SELECT ... FOR UPDATE``) inside the same transaction
+        as the UPDATE, so a concurrent ``config_patch`` on the SAME row
+        blocks until this one commits rather than racing it — Postgres
+        needs no separate retry loop the way the DuckDB sibling does.
+        """
+        with self._engine.begin() as cx:
+            row = cx.execute(
+                sa.text("SELECT config FROM source_connections WHERE id = :id FOR UPDATE"),
+                {"id": connection_id},
+            ).first()
+            if row is None:
+                return None
+            current = row[0]
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except (json.JSONDecodeError, TypeError):
+                    current = {}
+            elif not isinstance(current, dict):
+                current = {}
+            merged = {**current, **patch}
+            cx.execute(
+                sa.text("UPDATE source_connections SET config = :c WHERE id = :id"),
+                {"c": json.dumps(merged), "id": connection_id},
+            )
+            updated = (
+                cx.execute(
+                    sa.text("SELECT * FROM source_connections WHERE id = :id"),
+                    {"id": connection_id},
+                )
+                .mappings()
+                .first()
+            )
+        return self._decode(dict(updated) if updated else None)
+
     def delete(self, connection_id: str) -> None:
         with self._engine.begin() as cx:
             cx.execute(

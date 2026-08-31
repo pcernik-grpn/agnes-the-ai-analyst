@@ -428,3 +428,53 @@ class TestFeatureFlagOff:
         assert result == {"skipped": "acl_mirroring disabled"}
         assert _grants_for_collection(col_id) == []
         assert _group_by_name("entra:g-1") is None
+
+
+class TestConfigPatchRaceRegression:
+    """NB-1 review finding: ``_sync_connection`` and ``_sweep_connection``
+    both read-modify-write ``source_connections.config`` — a nightly sync
+    and the weekly sweep landing on the same connection could silently drop
+    each other's just-written bookkeeping key. Simulate the sweep's write
+    landing strictly between the sync's own connection read and its own
+    config write, and assert both keys survive (the fix: ``config_patch``
+    re-reads fresh instead of trusting the sync's caller-held snapshot)."""
+
+    def test_concurrent_sweep_bookkeeping_key_survives_sync_run(self, acl_env, monkeypatch):
+        from src.repositories import source_connections_repo
+
+        conn_id = _make_connection()
+        col_id = _make_collection("Race Col")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_id, access_mode="mirrored")
+        _make_user("u-frank", "frank@example.com")
+
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "scope-1"): [_group_perm("g-1")]}),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake({"g-1": [{"mail": "frank@example.com", "userPrincipalName": "frank@example.com"}]}),
+        )
+
+        async def _token_then_concurrent_sweep_write(tenant_id, client_id, private_key):
+            # The sync has already read its `connection` snapshot (in
+            # `_run_acl_sync_async`) by the time it gets here — this is the
+            # earliest point in `_sync_connection`'s body we can hook to
+            # land a concurrent write. Simulate the weekly sweep committing
+            # its own bookkeeping key in that window, strictly before the
+            # sync writes its own.
+            source_connections_repo().config_patch(conn_id, {"acl_sweep_last_full": "2026-08-30T00:00:00+00:00"})
+            return "fake-token"
+
+        monkeypatch.setattr(graph_client, "get_app_token", _token_then_concurrent_sweep_write)
+
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        config = source_connections_repo().get(conn_id)["config"]
+        assert config.get("acl_sweep_last_full") == "2026-08-30T00:00:00+00:00", (
+            "the sweep's concurrently-written key must survive the sync's own config write"
+        )
+        assert "acl_sync_last_run" in config
+        assert config.get("acl_sync_last_success_at") is not None
