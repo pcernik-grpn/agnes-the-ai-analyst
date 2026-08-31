@@ -1359,3 +1359,46 @@ class TestRunRecording:
             # the positional contract the crawl actually calls with.
             assert {"self"} <= fake
             assert ("run_id" in real) == ("run_id" in fake), name
+
+
+class TestDetectorUsageRecording:
+    """The LLM tier's token accounting must reach the run record (`usage`)
+    and the crawl report (`ner_usage`) — and `{}`/absence must keep meaning
+    "no tokens spent", never a fabricated zero cost."""
+
+    def test_detector_usage_reads_the_llm_tier(self):
+        class FakeLLM:
+            model = "claude-haiku-4-5"
+            total_usage = {"input_tokens": 1200, "output_tokens": 90, "calls": 2}
+
+        def detect(text):  # the plain-callable contract
+            return []
+
+        detect.llm = FakeLLM()
+        usage = crawler._detector_usage(detect)
+        assert usage["input_tokens"] == 1200
+        assert usage["output_tokens"] == 90
+        assert usage["calls"] == 2
+        assert usage["model"] == "claude-haiku-4-5"
+
+    def test_no_llm_tier_reports_empty_not_zero_dollars(self):
+        assert crawler._detector_usage(None) == {}
+
+        def bare(text):
+            return []
+
+        assert crawler._detector_usage(bare) == {}
+
+    def test_zero_counters_collapse_to_empty(self):
+        """A constructed-but-unused detector spent nothing — `{}` (none
+        spent), not a row of zeros that renders like a measured $0."""
+
+        class FakeLLM:
+            model = "claude-haiku-4-5"
+            total_usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+
+        def detect(text):
+            return []
+
+        detect.llm = FakeLLM()
+        assert crawler._detector_usage(detect) == {}

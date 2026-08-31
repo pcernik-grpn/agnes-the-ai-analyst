@@ -333,6 +333,7 @@ class _RunRecorder:
         status: str,
         report: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
+        usage: Optional[Dict[str, Any]] = None,
     ) -> None:
         if not self.run_id:
             return
@@ -344,11 +345,11 @@ class _RunRecorder:
                 status=status,
                 report=report or {},
                 skips=cap_skips(_skip_rows(stats), total=_skip_total(stats)),
-                # No LLM detector is wired into the crawl's anonymize seam
-                # yet (design §7.2), so no tokens are spent and none are
-                # reported. `{}` means "none spent" — a different claim
-                # from "$0.00", and the UI must keep saying so.
-                usage={},
+                # The LLM detector's own running token accounting
+                # (`_detector_usage`). `{}` still means "none spent" — the
+                # regex tier, or no anonymize scope — a different claim
+                # from "$0.00", and the UI keeps saying so.
+                usage=usage or {},
                 files_seen=stats.items_seen,
                 files_done=stats.items_done,
                 error=error,
@@ -1423,7 +1424,34 @@ def _entity_detector() -> Any:
 
     from src.anonymization_ner import LLMDetector, hybrid_detector
 
-    return hybrid_detector(LLMDetector())
+    llm = LLMDetector()
+    detect = hybrid_detector(llm)
+    # Expose the LLM tier so the run recorder can read its token accounting
+    # (`total_usage`) at finish time — function objects take attributes, and
+    # this keeps the detector contract itself a plain callable. Best-effort:
+    # a detector double that refuses attributes just loses usage reporting.
+    try:
+        detect.llm = llm  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return detect
+
+
+def _detector_usage(detector: Any) -> Dict[str, Any]:
+    """The LLM tier's running token accounting for this run, or ``{}``.
+
+    ``{}`` means "no tokens were spent" — the regex tier, or no anonymize
+    scope in the run — which the UI keeps distinct from a computed $0.00.
+    Never raises: usage is observability, not a gate."""
+    llm = getattr(detector, "llm", None)
+    usage = getattr(llm, "total_usage", None)
+    if not isinstance(usage, dict):
+        return {}
+    model = getattr(llm, "model", None)
+    out: Dict[str, Any] = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
+    if out and model:
+        out["model"] = str(model)
+    return out
 
 
 def _resolve_anonymization_key(scopes: Sequence[Dict[str, Any]]) -> Optional[bytes]:
@@ -1545,20 +1573,27 @@ async def _run_crawl_async(
         # Severity-first: a timeout is the sanctioned stop (records as
         # `interrupted`, reason "timeout"); anything else records via
         # `_record_status_for` so a crash can never dress up as benign.
+        ner_usage = _detector_usage(detector)
+        if ner_usage:
+            interrupted_report["ner_usage"] = ner_usage
         recorder.finish(
             stats,
             status="interrupted" if reason in {r for _, r in _STOP_REASONS} else _record_status_for(exc),
             report=interrupted_report,
             error=f"{type(exc).__name__}: {exc}",
+            usage=ner_usage,
         )
         raise
 
     report = stats.report(max_file_mb=max_file_mb)
     report["connection_id"] = connection_id
     report["scope_errors"] = scope_errors
+    ner_usage = _detector_usage(detector)
+    if ner_usage:
+        report["ner_usage"] = ner_usage
     state["last_run"] = report
     save_state(connection_id, state)
-    recorder.finish(stats, status="done", report=report)
+    recorder.finish(stats, status="done", report=report, usage=ner_usage)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",

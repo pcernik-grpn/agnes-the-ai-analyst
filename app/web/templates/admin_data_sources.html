@@ -1999,7 +1999,7 @@ function _sharepointPipelineStripHtml(row) {
   const extractTitle = extractedTotal
     ? Object.entries(extract).map(([k, v]) => `${k}: ${v}`).join(" · ")
     : "Nothing extracted yet";
-  const cost = fs.cost_estimate || { amount_usd: 0 };
+  const queue = fs.queue || { items: 0 };
   const cells = [
     `<div class="ds-pipe__cell">
        <span class="ds-pipe__k">Crawl</span>
@@ -2014,9 +2014,9 @@ function _sharepointPipelineStripHtml(row) {
        <span class="ds-pipe__k">Facts → graph</span>
        <span class="ds-pipe__v">${fs.graph.facts} fact${fs.graph.facts === 1 ? "" : "s"} · ${fs.graph.edges} edge${fs.graph.edges === 1 ? "" : "s"}</span>
      </div>`,
-    `<div class="ds-pipe__cell" title="Estimated from the last run's rejected/deferred queue — not a real cost model.">
-       <span class="ds-pipe__k">Queue cost</span>
-       <span class="ds-pipe__v">~$${(cost.amount_usd || 0).toFixed(2)}</span>
+    `<div class="ds-pipe__cell" title="Rejected/deferred items from the last ingest run awaiting review — a count, not a price; nothing here invents a dollar figure.">
+       <span class="ds-pipe__k">Review queue</span>
+       <span class="ds-pipe__v">${(queue.items || 0) ? `${queue.items} item${queue.items === 1 ? "" : "s"}` : "empty"}</span>
      </div>`,
   ];
   return `<div class="ds-pipe ds-pipe--${cells.length}">${cells.join("")}</div>`;
@@ -2412,13 +2412,13 @@ function _sharepointFactsHtml(row) {
 
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Crawl runs externally — this line is a label, not live state.">Schedule</span>
+    <span class="ds-src__fact-k" title="Static label — the built-in crawl's live state is the extraction row below.">Schedule</span>
     <span class="ds-src__fact-v">${_esc(fs.schedule.text)}</span>
   </div>
   <div id="ext-block-${row.id}" data-ext-conn="${row.id}" hidden></div>
   <div class="ext-drawer" id="ext-drawer-${row.id}" hidden></div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — a separate lane from the external producer's own crawl schedule above.">In-Agnes extraction</span>
+    <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — the built-in crawl→convert→anonymize→ingest lane.">In-Agnes extraction</span>
     <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
     <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
   </div>
@@ -7019,6 +7019,14 @@ function _extRunLine(run) {
   if (run.unchanged != null) bits.push(`${_extNum(run.unchanged)} unchanged`);
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
   if (run.bytes_downloaded_human) bits.push(`${run.bytes_downloaded_human} downloaded`);
+  // NER token accounting (usage or the report's ner_usage): a token COUNT is a
+  // fact; the drawer says "not priced" rather than inventing a dollar figure
+  // until operator-configured pricing exists. Absence means "no tokens spent".
+  const u = run.usage && Object.keys(run.usage).length ? run.usage : (run.ner_usage || null);
+  if (u && (u.input_tokens || u.output_tokens)) {
+    const tok = (u.input_tokens || 0) + (u.output_tokens || 0);
+    bits.push(`${_extNum(tok)} NER tokens · not priced`);
+  }
   return bits.join(" · ");
 }
 
