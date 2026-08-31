@@ -46,15 +46,11 @@
 {# The card and its icon tile are shared components; this page links their
    sheets and adds nothing to them. `.cc-icon` (the 38px kind-coloured tile)
    lives in catalog_card.css, `.fbar-card` and its grid in filter_toolbar.css. #}
-{# The builder workspace's rules — package_drawer grows into it when
-   opened from "+ New". Without the sheet the two panes stack. #}
-<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{# No builder/drawer sheets here: creating and editing a package both LEAVE
+   this page for /admin/data-packages/new|{id}/edit, the one surface that
+   writes a package. This lens lists and links; it does not author. #}
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
-{# Creating a package happens HERE, in the shared right-side drawer — see the
-   `+ New package` comment below for why it used to happen on another lens. #}
-<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
 <style>
   /* Section heads are the shared `.apg-sechead` (css/admin_page.css) — the
      same row, count and type scale People, Access and Sources carry. */
@@ -198,12 +194,12 @@
      floating under the tab strip with no bar around them and nothing to say
      what they acted on, since the head naming the grid came 400px later.
 
-     "+ New package" is a BUTTON, not a link, and this is the lens that makes
-     packages: it used to send you to `/admin/tables?new_package=1`, because
-     that page owned the only copy of the create form — so asking for a new
-     package on the Packages tab landed you on the Tables tab with a modal
-     over a list of tables. The form is now the shared drawer
-     (js/components/package_drawer.js) and opens over the grid it adds to.
+     "+ New package" is a LINK to the builder — the one page that writes a
+     package, shared with the Library's "+ New" and with editing. It opened a
+     drawer over this grid until three chromes for one object (a page from the
+     Library, a drawer here, a third copy on the Library's detail page) made
+     the same form read differently depending on where you found it.
+     `?from=admin` is how the builder knows to hand THIS lens back.
 
      "Suggest packages by bucket" still crosses to the Tables lens: it reads
      the registry, proposes one package per bucket and assigns the rows, so
@@ -214,7 +210,7 @@
     <span class="apg-sechead__end">
       <a class="btn btn-secondary btn-sm" href="/admin/tables?group_by_bucket=1"
          title="Create one package per distinct bucket and assign its tables">Suggest packages by bucket</a>
-      <button type="button" class="btn btn-primary btn-sm" data-adp-new-package>+ New package</button>
+      <a class="btn btn-primary btn-sm" href="/admin/data-packages/new?from=admin">+ New package</a>
     </span>
   </div>
   {% if package_cards %}
@@ -366,10 +362,12 @@
              row of groups. #}
           <td>{{ share_readout(shares) }}</td>
           <td class="adp-cell--act">
-            {# Edit in place — the same shared drawer the detail page opens, so
-               a rename does not cost a navigation. #}
-            <button type="button" class="btn btn-secondary btn-sm" data-adp-edit-package="{{ entry.id }}"
-                    title="Edit name, description, category and tables in place">Edit</button>
+            {# Edit goes to the builder, the same place "+ New package" goes
+               and the same place the package's own page sends you. A rename
+               costs a navigation; two chromes for one form cost more. #}
+            <a class="btn btn-secondary btn-sm"
+               href="/admin/data-packages/{{ entry.id | urlencode }}/edit?from=admin"
+               title="Edit name, description, category and tables">Edit</a>
           </td>
         </tr>
         {% endfor %}
@@ -385,9 +383,9 @@
       package with a team, and it lands in their workspace.
     </p>
     <p>
-      <button type="button" class="btn btn-primary btn-sm" data-adp-new-package>
+      <a class="btn btn-primary btn-sm" href="/admin/data-packages/new?from=admin">
         Create the first one
-      </button>
+      </a>
     </p>
   </div>
   {% endif %}
@@ -510,14 +508,6 @@
   {% endif %}
 </div>
 
-{# ── "+ New package" ─────────────────────────────────────────────────────
-   Both entry points (the section head and the empty state) open the shared
-   drawer over this grid. A created package is a new card with server-side
-   sharing and delivery joins behind it, so the page reloads rather than
-   inventing a card client-side — the same choice the package's own page makes
-   after a grant change, and for the same reason. #}
-{# package_drawer builds the shared builder workspace when opened
-   from "+ New", so the shell has to be defined before it runs. #}
 {# The shared filter engine — the same one the Library, My Stack and the
    package builder's picker run on. Two instances, one per list: they filter
    different rows against different vocabularies, and a single engine spanning
@@ -565,30 +555,5 @@
     });
   }
 })();
-</script>
-<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
-<script src="{{ static_url('js/components/package_drawer.js') }}" defer></script>
-<script>
-  document.addEventListener("click", function (e) {
-    // Per-card "Edit" — the drawer's edit mode over this grid, reload on
-    // save for the same server-side-joins reason create reloads.
-    var editBtn = e.target.closest("[data-adp-edit-package]");
-    if (editBtn) {
-      if (!window.AgnesPackageDrawer) return;
-      window.AgnesPackageDrawer.open({
-        mode: "edit",
-        pkgId: editBtn.getAttribute("data-adp-edit-package"),
-        onSaved: function () { window.location.reload(); },
-      });
-      return;
-    }
-    if (!e.target.closest("[data-adp-new-package]")) return;
-    // Deferred component, so a click in the first few hundred milliseconds
-    // could land before it exists — do nothing rather than throw.
-    if (!window.AgnesPackageDrawer) return;
-    window.AgnesPackageDrawer.open({
-      onCreated: function () { window.location.reload(); },
-    });
-  });
 </script>
 {% endblock %}
