@@ -54121,7 +54121,7 @@
     },
     "/api/upload/sessions": {
       "post": {
-        "description": "Upload a Claude session transcript (JSONL).",
+        "description": "Upload a Claude session transcript (JSONL).\n\nThe stored file is handed to the usage processor immediately (background\ntask), so its tokens show up in usage data seconds after the push instead\nof on the next ten-minute sweep. The sweep stays as the catch-up path for\ncollector-ingested files and for one-shots that fail here.",
         "operationId": "upload_session_api_upload_sessions_post",
         "parameters": [
           {
