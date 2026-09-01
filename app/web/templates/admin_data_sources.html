@@ -941,6 +941,12 @@
   .sp-tree__name span.leaf { font-weight: 600; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sp-tree__name mark { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-radius: 3px; padding: 0 1px; }
   .sp-tree__anon { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; color: var(--ds-text-muted); }
+  /* "Forget this site" (2026-09-01 manual-sites persistence fix) — a site
+     added by URL that is not (or no longer) a confirmed scope. Deliberately
+     quiet until hovered, same minimal-affordance idiom as the drawer close
+     button, just inline and smaller. */
+  .sp-tree__unlink { flex: 0 0 auto; border: none; background: none; padding: 0 4px; font-size: 15px; line-height: 1; color: var(--ds-text-muted); cursor: pointer; }
+  .sp-tree__unlink:hover { color: var(--ds-accent-danger-ink); }
   .sp-search { margin-bottom: 14px; }
   .sp-search__row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
   .sp-search__q { flex: 1 1 240px; min-width: 200px; }
@@ -6460,6 +6466,7 @@ function spLoadScopesThenTree() {
     spScopes = {};
     (body.items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
     spSeedManualSitesFromScopes();
+    spSeedManualSitesFromConnectionConfig();
   }).catch(() => { spScopes = {}; }).then(spLoadTree);
 }
 
@@ -6481,6 +6488,44 @@ function spSeedManualSitesFromScopes() {
     if (id.indexOf(",") !== -1 && !spManualSites[id]) {
       spManualSites[id] = { id: id, name: s.display_path || id };
     }
+  });
+}
+
+/* Every site an admin has EVER added by URL on this connection
+   (2026-09-01 persistence fix — `POST/DELETE .../manual-sites`), regardless
+   of whether it is also a confirmed scope: before this, a site added by URL
+   lived ONLY in this same client-side `spManualSites` map, which is reset
+   on every wizard open (see `openSpWizard`) — closing and reopening the
+   wizard, or just reloading the page, silently forgot it and the admin had
+   to re-paste the same URL. `_connections` is the SAME page-level cache
+   `loadConnections()` already populated before this wizard could have been
+   opened (the card whose click opened it was itself rendered from that
+   list) — reading it here is simpler than a dedicated GET endpoint, at the
+   cost of trusting it is fresh enough (a stale miss here only means a
+   site added moments ago in a DIFFERENT tab fails to pre-populate, never a
+   correctness issue with this wizard's own reads/writes). Existing entries
+   win — never overwrites a row `spSeedManualSitesFromScopes` above already
+   placed. */
+function spSeedManualSitesFromConnectionConfig() {
+  const conn = (_connections || []).find((c) => c.id === spConnId);
+  const stored = (conn && conn.config && conn.config.manual_sites) || [];
+  stored.forEach((s) => { if (s && s.id && !spManualSites[s.id]) spManualSites[s.id] = s; });
+}
+
+/* Forget a site added by URL (see `spSeedManualSitesFromConnectionConfig`
+   above) — the sites-level row's own "x", rendered only for a manual site
+   that is NOT currently a confirmed scope (`spRenderTree`). Purely local
+   bookkeeping server-side (no collection, no grants), so there is nothing
+   else to reconcile — unlike `spRemoveScope` below. */
+function spRemoveManualSite(siteId) {
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/manual-sites?site_id=${encodeURIComponent(siteId)}`, {
+    method: "DELETE",
+  }).then(() => {
+    delete spManualSites[siteId];
+    spItems = spItems.filter((item) => item.id !== siteId);
+    if (spCurrentLevel() === "sites") spRenderTree("sites");
+  }).catch((e) => {
+    spTreeErr("Could not forget that site: " + e.message);
   });
 }
 
@@ -6566,16 +6611,25 @@ function spLoadTree() {
     });
 }
 
+/* POSTs to the PERSISTING endpoint (2026-09-01 fix) rather than the plain
+   `?site_url=` resolve-only GET on `.../tree` — the same resolution and the
+   same typed errors (`invalid_site_url`, `sharepoint_site_not_granted`,
+   `sharepoint_graph_error`), but the result now also survives a wizard
+   reopen (see `spSeedManualSitesFromConnectionConfig`), never just this
+   in-memory `spManualSites` map. */
 function spAddSiteByUrl() {
   const input = document.getElementById("spw-site-by-url");
   const btn = document.getElementById("spw-site-by-url-btn");
   const url = input.value.trim();
   if (!url || !spConnId) return;
   btn.disabled = true;
-  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/tree?site_url=${encodeURIComponent(url)}`)
-    .then((body) => {
+  spApi(`${SP_API}/${encodeURIComponent(spConnId)}/manual-sites`, {
+    method: "POST",
+    body: { site_url: url },
+  })
+    .then((site) => {
       btn.disabled = false;
-      (body.items || []).forEach((s) => { spManualSites[s.id] = s; });
+      spManualSites[site.id] = site;
       input.value = "";
       if (spCurrentLevel() === "sites") {
         spTreeErr("");
@@ -6691,15 +6745,27 @@ function spRenderTree(level) {
     const uniquePermsBadge = spUniquePerms[item.id] === true
       ? `<span class="sp-badge sp-badge--unique-perms" title="Has its own permissions in the source — people who can't open it there may still see its content once this scope is shared here.">${SP_UNIQUE_PERMS_LABEL}</span>`
       : "";
+    // A site added by URL that is NOT (or no longer) a confirmed scope can
+    // be forgotten again (2026-09-01 persistence fix) — a CONFIRMED site
+    // scope already has its own removal path (unticking the checkbox,
+    // `spRemoveScope`), which also tidies up its collection; offering a
+    // second one here would only confuse which one an admin just used.
+    const unlinkBtn = level === "sites" && !checked && spManualSites[item.id]
+      ? `<button type="button" class="sp-tree__unlink" data-spw-unlink="${spEsc(item.id)}" title="Forget this site" aria-label="Forget ${spEsc(item.name)}">&times;</button>`
+      : "";
     return `<div class="sp-tree__row" data-spw-item="${spEsc(item.id)}" data-spw-path="${spEsc(path)}"${visible ? "" : " hidden"}>` +
       `<input type="checkbox" data-spw-select="${spEsc(item.id)}" aria-label="Select ${spEsc(item.name)}"${checked ? " checked" : ""}>` +
       `<span class="sp-tree__name">${nameHtml}</span>` +
       `<label class="sp-tree__anon"><input type="checkbox" data-spw-anon="${spEsc(item.id)}"${anon ? " checked" : ""}${checked ? "" : " disabled"}> anonymize</label>` +
       badge +
       uniquePermsBadge +
+      unlinkBtn +
       `</div>`;
   }).join("") + (anyVisible ? "" : '<div class="ds-empty" data-spw-nomatch>No folders match the filter.</div>');
 
+  host.querySelectorAll("[data-spw-unlink]").forEach((b) => {
+    b.addEventListener("click", () => spRemoveManualSite(b.dataset.spwUnlink));
+  });
   host.querySelectorAll("[data-spw-drill]").forEach((b) => {
     b.addEventListener("click", () => {
       const id = b.dataset.spwDrill;
