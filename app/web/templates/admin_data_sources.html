@@ -993,7 +993,6 @@
     padding: 2px 8px; border-radius: var(--ds-radius-pill);
     background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
   }
-  .sp-corpus-map { font-size: 12px; }
 </style>
 <style>
   /* ── Extraction observability (2026-08-31 design §4/§6) ───────────────
@@ -1029,6 +1028,12 @@
     background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
   }
   .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-activity__path { font-family: var(--font-mono, ui-monospace, monospace); color: var(--ds-text-primary); }
+  .ext-activity__recent { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+  .ext-activity__recent-item {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+  }
   .ext-drawer { margin: 4px 16px 8px; }
   .ext-runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .ext-runs li {
@@ -1610,13 +1615,13 @@
          never travel through conversation) and the certificate choice. #}
       <section class="ds-drawer__pane is-on" data-spw-pane="1">
         <div class="sp-existing" id="spw-existing" hidden style="margin-bottom:14px;">
-          <div class="ds-field">
+          <div class="ds-field" id="spw-existing-picker">
             <label for="spw-existing-select">Continue an existing connection</label>
             <select id="spw-existing-select" class="ds-dropdown-native"></select>
             {{ ds.dropdown(id='spw-existing-select-dd', target='spw-existing-select', aria_label='Existing SharePoint connection', options=[]) }}
           </div>
           <button type="button" class="btn btn-secondary" id="spw-existing-btn">Continue to scope &rarr;</button>
-          <div class="ds-wor"><span>or connect a new tenant</span></div>
+          <div class="ds-wor" id="spw-new-tenant-sep"><span>or connect a new tenant</span></div>
         </div>
 
         <div class="ds-field">
@@ -1633,7 +1638,7 @@
           <input type="text" id="spw-client" placeholder="app registration client id" autocomplete="off" spellcheck="false">
         </div>
 
-        <div class="ds-field">
+        <div class="ds-field" id="spw-credential-field">
           <label for="spw-cert-choice">Credential</label>
           <select id="spw-cert-choice" class="ds-dropdown-native">
             <option value="upload" selected>Upload certificate</option>
@@ -1750,10 +1755,6 @@
           Who gets these collections? A collection with no group is indexed but invisible.
         </p>
         <div id="spw-share-rows"><div class="ds-loading">Loading…</div></div>
-        <p class="sp-corpus-map" id="spw-corpus-map-wrap" hidden>
-          <a href="#" id="spw-corpus-map-link" download="corpus-map.json">Download corpus map</a>
-          — the scope-to-collection mapping the crawl pipeline reads.
-        </p>
         <div id="spw-share-error" class="ds-wizard-error"></div>
       </section>
 
@@ -6131,6 +6132,13 @@ let spUniquePerms = {};
 // the ONLY way the sites level can populate there). Merged into every
 // sites-level render so an added site survives navigating away and back.
 let spManualSites = {};
+// True while the drawer is bound to an EXISTING connection (opened from a
+// card, not from "+ Add source"). Step 1 then SHOWS that connection instead
+// of offering a blank new-tenant form — see spBindStep1ToConnection.
+let spBoundToExisting = false;
+// The in-flight `?source_type=sharepoint` listing openSpWizard already
+// starts, reused by the binding below so it costs no second request.
+let spConnListPromise = null;
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -6192,11 +6200,22 @@ function openSpWizard() {
   document.getElementById("spw-client-secret").value = "";
   document.getElementById("spw-cert-status").style.display = "none";
   document.getElementById("spw-connect-error").style.display = "none";
+  // The drawer is reused, so the bound presentation must be undone here or
+  // it would survive into the next "+ Add source" and make connecting a new
+  // tenant impossible (read-only fields carrying someone else's values).
+  spBoundToExisting = false;
+  ["spw-name", "spw-tenant", "spw-client"].forEach((id) => {
+    document.getElementById(id).readOnly = false;
+  });
+  document.getElementById("spw-credential-field").style.display = "";
+  document.getElementById("spw-new-tenant-sep").style.display = "";
+  document.getElementById("spw-existing-picker").style.display = "";
   spSetCertChoice("upload");
   spGoStep(1);
 
   const sel = document.getElementById("spw-existing-select");
-  spApi(SP_CONN_API + "?source_type=sharepoint").then((rows) => {
+  spConnListPromise = spApi(SP_CONN_API + "?source_type=sharepoint");
+  spConnListPromise.then((rows) => {
     rows = Array.isArray(rows) ? rows : [];
     const existing = document.getElementById("spw-existing");
     if (!rows.length) { existing.hidden = true; return; }
@@ -6227,10 +6246,54 @@ function openSpWizard() {
    alone. Mirrors the "Continue an existing connection" step-1 button's own
    click handler below, without needing the (async) existing-connections
    list to have loaded first — the caller already knows the id. */
+/* Step 1 for a wizard bound to an EXISTING connection: show that
+   connection instead of a blank form for a new one. Reported from a live
+   instance (2026-09-01) — managing scopes and then looking at the Connect
+   step gave an empty Connection name / Tenant ID / Client ID, so nothing
+   on screen said which connection was being edited. The values were always
+   in the `?source_type=sharepoint` listing the drawer already fetches (the
+   source card renders the tenant id from it); step 1 was simply never told.
+
+   Read-only on purpose: the SharePoint card offers no connection editor,
+   and `spw-connect-btn` POSTs a NEW connection — so a prefilled, editable
+   form under it would silently create a duplicate instead of saving an
+   edit. Showing the truth is this fix; an editor is a separate feature.
+   The credential block and that button are hidden here for the same
+   reason: both belong to creating a tenant, not to reading one. */
+function spBindStep1ToConnection(connId) {
+  spBoundToExisting = true;
+  document.getElementById("spw-credential-field").style.display = "none";
+  document.getElementById("spw-new-tenant-sep").style.display = "none";
+  document.getElementById("spw-connect-btn").style.display = "none";
+  // "Continue an existing connection" asks a question already answered —
+  // this drawer was opened FROM one. The block around it stays (it carries
+  // "Continue to scope", the way back to step 2, which reads spConnId
+  // rather than the hidden picker while bound).
+  document.getElementById("spw-existing-picker").style.display = "none";
+  document.getElementById("spw-existing").hidden = false;
+  ["spw-name", "spw-tenant", "spw-client"].forEach((id) => {
+    document.getElementById(id).readOnly = true;
+  });
+  // Reuses openSpWizard's in-flight listing — no second request. A failure
+  // leaves the fields empty rather than blocking the wizard: step 2 is what
+  // the caller came for, and it does not depend on any of this.
+  return (spConnListPromise || Promise.resolve([]))
+    .then((rows) => {
+      const row = (Array.isArray(rows) ? rows : []).find((c) => c.id === connId);
+      if (!row) return;
+      const config = row.config || {};
+      document.getElementById("spw-name").value = row.name || "";
+      document.getElementById("spw-tenant").value = config.tenant_id || "";
+      document.getElementById("spw-client").value = config.client_id || "";
+    })
+    .catch(() => {});
+}
+
 function openSpWizardForConnection(connId, opts) {
   opts = opts || {};
   openSpWizard();
   spConnId = connId;
+  spBindStep1ToConnection(connId);
   spEnableStep(2);
   spEnableStep(3);
   spLevel = { site_id: null, drive_id: null, item_id: null };
@@ -6276,7 +6339,10 @@ function spGoStep(step) {
     b.classList.toggle("is-now", n === step);
     b.classList.toggle("is-done", n < step);
   });
-  document.getElementById("spw-connect-btn").style.display = step === 1 ? "" : "none";
+  // Never on a bound connection: that button creates a NEW connection, and
+  // step 1 there is a read-only view of the one already being edited.
+  document.getElementById("spw-connect-btn").style.display =
+    step === 1 && !spBoundToExisting ? "" : "none";
   document.getElementById("spw-scope-continue-btn").style.display = step === 2 ? "" : "none";
   document.getElementById("spw-finish-btn").style.display = step === 3 ? "" : "none";
   document.getElementById("spw-done-btn").style.display = "none";
@@ -6305,7 +6371,10 @@ function spConnectErr(msg) {
 }
 
 document.getElementById("spw-existing-btn").addEventListener("click", () => {
-  const id = document.getElementById("spw-existing-select").value;
+  // While bound the picker is hidden, so its value is whatever the listing
+  // happened to preselect — the connection this drawer was opened for is
+  // the only right answer.
+  const id = spBoundToExisting ? spConnId : document.getElementById("spw-existing-select").value;
   if (!id) return;
   spConnId = id;
   spEnableStep(2);
@@ -6396,8 +6465,8 @@ function spLoadScopesThenTree() {
 
 /* A saved SITE scope can rebuild its own sites-level row: its
    source_scope_id IS the Graph site id ("host,siteCollection,web" — the
-   only scope id containing commas, the same discriminator
-   connectors/sharepoint/corpus_map.py::_map_key keys on) and its
+   only scope id containing commas, the same structural discriminator the
+   crawler's _scope_kind keys on) and its
    display_path IS the site name (sites are ticked at the sites level,
    where the crumb path is just the name). Seeding spManualSites here is
    what keeps a saved site visible when the wizard reopens on an existing
@@ -6897,8 +6966,6 @@ function spLoadGroups() {
 }
 
 function spLoadShare() {
-  document.getElementById("spw-corpus-map-wrap").hidden = false;
-  document.getElementById("spw-corpus-map-link").href = `${SP_API}/${encodeURIComponent(spConnId)}/corpus-map`;
   document.getElementById("spw-share-rows").innerHTML = '<div class="ds-loading">Loading…</div>';
   // Returns the promise (unlike before) so `openSpWizardForConnection` can
   // chain a row-highlight onto "rendered", not just "requested".
@@ -7048,8 +7115,11 @@ document.addEventListener("keydown", (e) => {
    * A typed 501 (PG-only `extraction_runs` on a DuckDB instance) renders
      once, explains itself, and STOPS polling — the same degradation the
      card already words for the facts graph.
-   * No Stop control: v1 has no cooperative cancel flag in the crawl
-     (`can_stop: false`), and a button without a mechanism is a lie. #}
+   * The Stop control only draws when the run reports `can_stop !== false`
+     — a cooperative flag, not a hard kill, so the row says "Stopping…"
+     until the next checkpoint confirms it, never a claim it ended instantly.
+     `can_stop === false` keeps the old honest sentence instead of a button
+     that cannot succeed. #}
 <script>
 const EXT_POLL_ACTIVE_MS = 3000;
 const EXT_POLL_IDLE_MS = 30000;
@@ -7064,7 +7134,9 @@ let _extTimer = null;
 let _extInFlight = false;
 
 function _extS(id) {
-  if (!_extState[id]) _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null };
+  if (!_extState[id]) {
+    _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null, stopping: false };
+  }
   return _extState[id];
 }
 
@@ -7088,6 +7160,19 @@ function _extDuration(seconds) {
 
 function _extNum(n) {
   return Number(n || 0).toLocaleString();
+}
+
+/* Middle-truncation keeps a long SharePoint path on one line without hiding
+   which file it is — the START (library/folder) and the END (filename) are
+   the two ends an operator actually reads; the middle is what a `…` can
+   safely eat. The untruncated string still travels in a `title` attribute. */
+function _extTruncMiddle(path, max) {
+  const s = String(path || "");
+  if (s.length <= max) return s;
+  const keep = Math.max(0, max - 1);
+  const head = Math.ceil(keep * 0.6);
+  const tail = keep - head;
+  return `${s.slice(0, head)}…${tail > 0 ? s.slice(s.length - tail) : ""}`;
 }
 
 /* One dot per outcome. `running` is the ONLY animated one — a run past its
@@ -7152,6 +7237,7 @@ function _extRunLine(run) {
 const EXT_STOP_REASON_TEXT = {
   timeout: "the run hit its time ceiling (extraction.timeout_s)",
   throttled: "the tenant's throttling budget was exhausted (HTTP 429)",
+  stopped: "stopped by an admin",
   error: "an unexpected error",
 };
 
@@ -7163,6 +7249,36 @@ function _extThrottleLine(run) {
   if (!run.http_429) return "";
   const waited = run.throttle_wait_s ? `, ${_extDuration(run.throttle_wait_s)} waited` : "";
   return `<div class="ext-sub ext-warn">throttled — ${_extNum(run.http_429)}× HTTP 429${_extEsc(waited)}</div>`;
+}
+
+/* What the crawl is touching RIGHT NOW (design §4 follow-up: "can't see what
+   it's doing"). Older rows (recorded before this field existed, or a DuckDB
+   instance that never got it) carry no `activity` at all — that renders
+   nothing, never empty scaffolding. Every path is untrusted-ish (it is a
+   filename a document owner chose), so it goes through `_extEsc` exactly
+   like every other server string on this card — never raw `innerHTML`. */
+function _extActivityHtml(activity) {
+  if (!activity) return "";
+  const bits = [];
+  if (activity.phase) bits.push(`<strong>${_extEsc(activity.phase)}</strong>`);
+  if (activity.current_path) {
+    const shown = _extTruncMiddle(activity.current_path, 64);
+    bits.push(
+      `<span class="ext-activity__path" title="${_extEsc(activity.current_path)}">${_extEsc(shown)}</span>`,
+    );
+  }
+  let html = bits.length ? `<div class="ext-sub ext-activity">${bits.join(" · ")}</div>` : "";
+  const recent = Array.isArray(activity.recent) ? activity.recent.slice(0, 5) : [];
+  if (recent.length) {
+    const items = recent
+      .map((r) => {
+        const p = _extTruncMiddle(r && r.path, 40);
+        return `<span class="ext-activity__recent-item">${_extDot(r && r.outcome)}<span title="${_extEsc(r && r.path)}">${_extEsc(p)}</span></span>`;
+      })
+      .join(" ");
+    html += `<div class="ext-sub ext-activity__recent">recent: ${items}</div>`;
+  }
+  return html;
 }
 
 /* The `Run` fact row. Counters are absolute; the caption names the moment
@@ -7187,6 +7303,7 @@ function _extRunRowHtml(connId, st) {
     if (run.outcome === "stalled") {
       sub += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note || "no recent checkpoint")}</div>`;
     }
+    if (run.activity) sub += _extActivityHtml(run.activity);
     if (status.can_stop === false) {
       sub += `<div class="ext-sub">A running crawl cannot be stopped from here yet — it finishes, or the worker ends it.</div>`;
     }
@@ -7210,8 +7327,18 @@ function _extRunRowHtml(connId, st) {
   }
 
   const total = status.runs_total || 0;
+  // Cooperative, not a hard kill — the button says "Stopping…" once clicked
+  // and stays disabled until the next poll shows the run actually gone,
+  // never a claim it ended the instant the request was sent. Mirrors the
+  // `can_stop === false` sentence above: exactly one of the two ever shows.
+  const canStopNow = !!run && (run.outcome === "running" || run.outcome === "stalled") && status.can_stop !== false;
+  const stopBtn = canStopNow
+    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extStopRun('${connId}')"
+               ${st.stopping ? "disabled" : ""}>${st.stopping ? "Stopping…" : "Stop run"}</button>`
+    : "";
   const actions = `
       <div class="ext-actions">
+        ${stopBtn}
         <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
                 ${total ? "" : "disabled"}>Run history (${total})</button>
       </div>`;
@@ -7321,6 +7448,11 @@ async function _extFetchOne(connId) {
     st.lastOk = st.data.as_of;
     st.failures = 0;
     st.error = null;
+    // Once the run this admin stopped is no longer the live one — finished,
+    // interrupted, or gone — the "Stopping…" lock is stale. Clearing it here
+    // (rather than on a timer) is what lets a LATER run on this same
+    // connection show a clickable Stop button of its own.
+    if (!st.data.running) st.stopping = false;
   } catch (e) {
     // Keep the last good numbers, VISIBLY marked stale. Blanking them, or
     // redrawing them as current, are the two ways this goes wrong.
@@ -7372,6 +7504,43 @@ function extRetry(connId) {
   st.failures = 0;
   st.error = null;
   _extFetchOne(connId);
+}
+
+/* Cooperative stop (owner ask: "can't see it, can't stop it"). `confirm()`
+   matches this page's other destructive one-click actions (e.g. the
+   master-token / project-lock removals above) rather than the async
+   `confirmModal` — no extra element to wire up in a script that is
+   otherwise dependency-free from the rest of the page. A 202 flips the
+   button to a disabled "Stopping…" and lets the existing 3 s poll carry the
+   outcome; the button never claims the run ended before that poll confirms it. */
+async function extStopRun(connId) {
+  if (!confirm("Stop this extraction run? What it has already ingested is kept — the next run can resume.")) return;
+  const st = _extS(connId);
+  st.stopping = true;
+  _extRender(connId);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/stop`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (r.status === 202) {
+      const body = await r.json().catch(() => ({}));
+      if (typeof showToast === "function") {
+        showToast(body && body.note ? body.note : "Stop requested — the run will end at its next checkpoint.", true);
+      }
+      await _extFetchOne(connId);
+      return;
+    }
+    const body = await r.json().catch(() => ({}));
+    st.stopping = false;
+    const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't stop the run") : "couldn't stop the run";
+    if (typeof showToast === "function") showToast(`Stop failed: ${msg}`, false);
+    _extRender(connId);
+  } catch (e) {
+    st.stopping = false;
+    if (typeof showToast === "function") showToast("Request failed.", false);
+    _extRender(connId);
+  }
 }
 
 document.addEventListener("visibilitychange", () => {

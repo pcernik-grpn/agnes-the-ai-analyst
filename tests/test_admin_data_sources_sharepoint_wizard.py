@@ -83,11 +83,6 @@ class TestThreeStepDrawer:
         assert "indexed but invisible" in body
         assert 'id="spw-share-rows"' in body
 
-    def test_step3_has_corpus_map_download(self, seeded_app):
-        body = _page(seeded_app)
-        assert 'id="spw-corpus-map-link"' in body
-        assert "corpus-map" in body
-
 
 class TestStep2MarkupTCRD240:
     """Step-2 page-shell markers for subfolder browsing (#1), the
@@ -603,7 +598,7 @@ class TestSavedSiteScopeVisibleOnReopen:
     cannot include it — under ``Sites.Selected`` discovery is 403-forbidden,
     and ``list_sites`` is first-page-only anyway. A site scope's
     ``source_scope_id`` IS the Graph site id ("host,siteCol,web" — the only
-    scope id with commas, see ``connectors/sharepoint/corpus_map._map_key``)
+    scope id with commas)
     and its ``display_path`` IS the site name, so the row is rebuildable
     from the scope alone. Regression: the row only rendered when live
     discovery happened to list it, so a reopened wizard showed
@@ -790,6 +785,144 @@ class TestSavedSiteScopeVisibleOnReopen:
         )
         assert "01ABCDEF123" not in result["html"]
         assert "data-spw-item=" not in result["html"]
+
+
+#: Enough of a DOM for the step-1 code paths the other harness blocks never
+#: reach: `openSpWizard` writes `document.body.style`, and `spEnableStep`
+#: uses `querySelector`, neither of which the shared preamble stubs.
+_STEP1_DOM = """
+document.body = { style: {} };
+document.querySelector = (sel) => el("qs:" + sel);
+global._syncDropdownRebuild = () => {};
+const _CONN = {
+  id: "conn-1", name: "SharePoint — test tenant",
+  config: { tenant_id: "b6386aaa-b5c5-4d24-a9a9-337fb28d6d4f",
+            client_id: "66a7be5c-3664-4e3e-8649-e4779da0706e" },
+};
+global.fetch = async (url) => {
+  if (String(url).indexOf("/source-connections") !== -1) {
+    return { ok: true, status: 200, json: async () => [_CONN] };
+  }
+  if (String(url).indexOf("/scopes") !== -1) {
+    return { ok: true, status: 200, json: async () => ({ items: [] }) };
+  }
+  return { ok: true, status: 200, json: async () => ({ level: "sites", items: [] }) };
+};
+function step1State() {
+  return {
+    name: el("spw-name").value,
+    tenant: el("spw-tenant").value,
+    client: el("spw-client").value,
+    nameReadOnly: !!el("spw-name").readOnly,
+    tenantReadOnly: !!el("spw-tenant").readOnly,
+    clientReadOnly: !!el("spw-client").readOnly,
+    credentialShown: el("spw-credential-field").style.display !== "none",
+    connectBtnShown: el("spw-connect-btn").style.display !== "none",
+    pickerShown: el("spw-existing-picker").style.display !== "none",
+  };
+}
+"""
+
+
+class TestStep1ShowsTheBoundConnection:
+    """Opening the wizard on an EXISTING connection must load that
+    connection's saved values into step 1. Reported from a live instance
+    (2026-09-01): managing scopes and then looking at the Connect step
+    showed an empty new-tenant form — no connection name, no tenant, no
+    client id — so nothing on screen said which connection was being
+    edited. The values are already in the `/api/admin/source-connections`
+    payload the card renders from, so step 1 was simply never told.
+
+    They load read-only: the SharePoint card offers no connection editor,
+    and a prefilled form whose button POSTs would create a duplicate
+    rather than save an edit. Showing the truth is the fix; an editor is
+    a separate feature.
+    """
+
+    def test_bound_wizard_loads_the_saved_values(self):
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            process.stdout.write(JSON.stringify(step1State()));
+            """
+        )
+        assert result["name"] == "SharePoint — test tenant"
+        assert result["tenant"] == "b6386aaa-b5c5-4d24-a9a9-337fb28d6d4f"
+        assert result["client"] == "66a7be5c-3664-4e3e-8649-e4779da0706e"
+        assert result["nameReadOnly"] is True
+        assert result["tenantReadOnly"] is True
+        assert result["clientReadOnly"] is True
+        # The create-a-new-tenant affordances have no meaning here, and a
+        # prefilled form under a "Connect & validate" button is a trap.
+        assert result["credentialShown"] is False
+        assert result["connectBtnShown"] is False
+        # "Continue an existing connection" asks a question this drawer
+        # already answered by being opened from that connection.
+        assert result["pickerShown"] is False
+
+    def test_new_connection_flow_is_untouched(self):
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizard();
+            await _settle();
+            process.stdout.write(JSON.stringify(step1State()));
+            """
+        )
+        assert result["name"] == ""
+        assert result["tenant"] == ""
+        assert result["client"] == ""
+        assert result["nameReadOnly"] is False
+        assert result["credentialShown"] is True
+        assert result["connectBtnShown"] is True
+        assert result["pickerShown"] is True
+
+    def test_bound_continue_to_scope_uses_the_bound_connection(self):
+        """The picker is hidden while bound, so its value is whatever the
+        listing preselected — "Continue to scope" must follow spConnId, not
+        that. With several connections the preselection is another one
+        entirely, which would silently scope the wrong source."""
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            el("spw-existing-select").value = "some-other-connection";
+            const calls = [];
+            spLoadScopesThenTree = () => calls.push("loadScopes");
+            el("spw-existing-btn").dispatchEvent({ type: "click" });
+            await _settle();
+            process.stdout.write(JSON.stringify({ spConnId: spConnId, calls: calls }));
+            """
+        )
+        assert result["spConnId"] == "conn-1"
+        assert result["calls"] == ["loadScopes"]
+
+    def test_reopening_for_a_new_connection_clears_the_bound_state(self):
+        """The bound presentation must not leak into the next open — the
+        drawer is reused, so a stale read-only prefilled form would make
+        connecting a new tenant impossible."""
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            const bound = step1State();
+            openSpWizard();
+            await _settle();
+            process.stdout.write(JSON.stringify({ bound: bound, after: step1State() }));
+            """
+        )
+        assert result["bound"]["name"] == "SharePoint — test tenant"
+        after = result["after"]
+        assert after["name"] == ""
+        assert after["tenant"] == ""
+        assert after["nameReadOnly"] is False
+        assert after["credentialShown"] is True
+        assert after["connectBtnShown"] is True
+        assert after["pickerShown"] is True
 
 
 class TestUniquePermissionsBadgeUI:
