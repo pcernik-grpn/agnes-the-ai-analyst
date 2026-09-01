@@ -229,6 +229,8 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/telemetry/ask": "usage.ask",
     "POST /api/admin/telemetry/prune": "usage.prune",
     "POST /api/admin/telemetry/reprocess": "usage.reprocess",
+    # -- app.api.admin_user_sessions --------------------------------------------
+    "POST /api/admin/users/{user_id}/revoke-sessions": "user.revoke_sessions",
     # -- app.api.agent_builder -------------------------------------------------
     "POST /api/agents/{agent_id}/builder/turn": "agent.builder_turn",
     # -- app.api.agent_memory --------------------------------------------------
@@ -435,6 +437,13 @@ POSTURE: dict[str, str] = {
     "POST /api/memory/admin/bulk-update": "corporate_memory.dynamic",
     "POST /api/memory/admin/contradictions": "corporate_memory.contradiction_create",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve": "corporate_memory.dynamic",
+    # A dry-run diagnostic that writes nothing to knowledge_items by design
+    # (issue #1971 Part 4) — the canonical "noise" exemption example in this
+    # module's own docstring above. It DOES try to record an observability
+    # row (memory_detection_runs, dry_run=True), but that write goes through
+    # src.memory_detection_logging.record_detection_run, which is best-effort
+    # and never the reason this call succeeds or fails.
+    "POST /api/memory/admin/detection-dry-run": "exempt:noise",
     "POST /api/memory/admin/duplicate-candidates/resolve": "corporate_memory.dynamic",
     "POST /api/memory/admin/edit": "corporate_memory.dynamic",
     "POST /api/memory/admin/mandate": "memory_item.set_required",
@@ -996,6 +1005,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/memory": "exempt:ui_support",
     "GET /api/memory/admin/audit": "memory.admin_audit_read",
     "GET /api/memory/admin/contradictions": "exempt:ui_support",
+    # Run-history rows: outcomes, counters, a policy fingerprint (a hash,
+    # never the policy prose) — no document content, no secrets. Same
+    # exemption class as the SharePoint extraction run-history drawer's
+    # `GET …/extraction/runs` (issue #1971 Part 3).
+    "GET /api/memory/admin/detection-runs": "exempt:ui_support",
     "GET /api/memory/admin/duplicate-candidates": "exempt:ui_support",
     "GET /api/memory/admin/pending": "exempt:ui_support",
     "GET /api/memory/admin/{item_id}": "exempt:ui_support",

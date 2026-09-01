@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import duckdb
@@ -775,6 +775,15 @@ async def reset_confirm(
         # Clear the forced-rotation flag: the user has now set their own password.
         must_change_password=False,
     )
+    # Issue #1676 remainder: a completed reset bumps the same
+    # session_revoked_before floor POST /auth/logout does — a session token
+    # captured before the reset (a synced browser profile, host malware, a
+    # shared machine the account was rotating away from) stops working too.
+    # Unlike password_change below, the caller isn't logged in through THIS
+    # flow, so there's no "current session" to preserve — the fresh login
+    # cookie minted just below is simply the reset's normal sign-in, minted
+    # after the floor so it is never caught by its own revocation.
+    repo.revoke_sessions(user["id"])
 
     response = RedirectResponse(url="/login/password?msg=password_reset", status_code=302)
     _set_login_cookie(response, user["id"], user["email"], request)
@@ -992,6 +1001,7 @@ async def password_change_page(request: Request, user: dict = Depends(require_se
 async def password_change(
     request: Request,
     body: PasswordChangeRequest,
+    response: Response,
     user: dict = Depends(require_session_token),
 ):
     """Change the caller's own password. Session token only (PAT rejected by
@@ -1014,10 +1024,18 @@ async def password_change(
     even for an SSO-only account with no form to submit — so this ordering
     never blocks a legitimate caller who visited it first.
 
-    Existing sessions and PATs are NOT invalidated by a password change —
-    this endpoint only replaces the password hash. Revoking sessions/PATs is
-    a separate action (`DELETE /auth/tokens/{id}`), same as every other
-    password door in this module (reset, setup, admin reset).
+    Issue #1676 remainder: a successful change now bumps the same
+    `session_revoked_before` floor `POST /auth/logout` does, so any OTHER
+    copy of the caller's session token (a second device, a synced browser
+    profile, host malware) stops working. The CALLER's own request must not
+    be the collateral damage of its own success, though — this handler sets
+    the floor FIRST and then mints and sets a fresh `access_token` cookie in
+    this same response (mirroring how every login provider mints one), so
+    the browser that just changed its password keeps working without
+    needing to sign in again. PATs are untouched either way — they run
+    their own `personal_access_tokens.revoked_at` chain, revoked separately
+    via `DELETE /auth/tokens/{id}`, same as every other password door in
+    this module (reset, setup, admin reset).
     """
     from app.web.router import _web_csrf_ok
 
@@ -1063,5 +1081,11 @@ async def password_change(
         reset_token_created=None,
         must_change_password=False,
     )
+    # Set the floor BEFORE minting the caller's replacement cookie below —
+    # the new token's `iat` must never land before its own revocation floor
+    # (see app.auth.jwt's SESSION_TOKEN_TTL_DAYS comment / the pat_resolver
+    # same-second tolerance this relies on).
+    repo.revoke_sessions(user["id"])
     _audit(user["id"], "password_changed", result="success")
+    _set_login_cookie(response, user["id"], row["email"], request)
     return {"status": "ok"}

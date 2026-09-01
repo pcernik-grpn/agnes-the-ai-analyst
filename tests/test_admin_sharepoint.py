@@ -2246,6 +2246,27 @@ class TestExtractionTrigger:
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "resync": True}
 
+    def test_force_reprocess_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """The stronger 're-process everything' control (unlike `resync`,
+        also ignores cTags — see `connectors.sharepoint.crawler._process_
+        item`): no key when unset (same "absent means off" contract as
+        every other option here), `force_reprocess: true` when the admin
+        ticks the box — and nothing else rides along uninvited."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-force")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"force_reprocess": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "force_reprocess": True}
+
     def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
         """The crawler would clamp these silently; the endpoint refuses them
         instead, where the admin can see why the run isn't what they asked
