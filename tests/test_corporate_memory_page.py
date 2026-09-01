@@ -102,3 +102,54 @@ class TestAdminGroupsContract:
             "a `{` prefix means we regressed to passing a dict and "
             "renderItemCard's GROUPS.map(...) will crash at runtime."
         )
+
+
+class TestDetectionExplanationPanel:
+    """#1957 interim hotfix: admins previously had no visibility into what
+    feeds the review queue. `/admin/corporate-memory` now renders a static
+    "How detection works" panel naming both extraction paths, the fixed
+    confidence lookup, and the two session-transcript kill-switches."""
+
+    def test_panel_renders_with_confidence_mapping(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/admin/corporate-memory", headers=_auth(token))
+        assert resp.status_code == 200
+        body = resp.text
+        assert "How detection works" in body
+        # The real, fixed confidence-by-detection-type mapping (services/
+        # corporate_memory/confidence.py) — not a quality score.
+        assert "0.90" in body
+        assert "0.60" in body
+        # Names the tuning surface for the two kill-switches.
+        assert "/admin/server-config" in body
+        assert "corporate_memory.sources.session_transcripts" in body
+        # Default config (no corporate_memory section): both detection types
+        # named, no "disabled" callout.
+        assert "correction" in body
+        assert "confirmation" in body
+        assert "Currently disabled" not in body
+
+    def test_panel_reflects_disabled_session_transcripts(self, seeded_app, monkeypatch, tmp_path):
+        """The panel reads the same live corporate_memory config the
+        verification processor does — an admin who disables session-transcript
+        detection sees that reflected here, not a stale static description."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        import yaml as _yaml
+
+        (state / "instance.yaml").write_text(
+            _yaml.dump({"corporate_memory": {"sources": {"session_transcripts": {"enabled": False}}}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+        try:
+            c = seeded_app["client"]
+            token = seeded_app["admin_token"]
+            resp = c.get("/admin/corporate-memory", headers=_auth(token))
+            assert resp.status_code == 200
+            assert "Currently disabled" in resp.text
+        finally:
+            ic._instance_config = None

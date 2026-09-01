@@ -78,6 +78,64 @@ def test_corp_memory_nested_sources_session_transcripts_detection_types(seeded_a
     assert "unprompted_definition" in dt["default"]
 
 
+def test_corp_memory_session_transcripts_enabled_and_detection_types_are_live(seeded_app):
+    """#1957 interim hotfix: enabled + detection_types are now read on every
+    verification-processor run — the schema hint must say so (not "restart"),
+    so an admin doesn't bounce the server for nothing."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    sess = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["session_transcripts"]
+    assert sess["fields"]["enabled"]["kind"] == "bool"
+    assert sess["fields"]["enabled"]["default"] is True
+    assert "Live" in sess["fields"]["enabled"]["hint"]
+    assert "Live" in sess["fields"]["detection_types"]["hint"]
+
+
+def test_corp_memory_session_transcripts_confidence_and_turns_marked_not_wired(seeded_app):
+    """confidence_base and max_turns_per_session are siblings of the two
+    knobs #1957 wired, but stayed inert — the hint must say so honestly
+    rather than implying they already do something (#1971)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    sess = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["session_transcripts"]
+    assert "#1971" in sess["fields"]["confidence_base"]["hint"]
+    assert "#1971" in sess["fields"]["max_turns_per_session"]["hint"]
+
+
+def test_corp_memory_claude_local_md_marked_not_wired(seeded_app):
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    claude_local_md = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["claude_local_md"]
+    assert "#1971" in claude_local_md["hint"]
+
+
+def test_corp_memory_distribution_mode_hint_describes_real_enforcement(seeded_app):
+    """The hint used to say distribution_mode was NOT YET ENFORCED (#1573).
+    It has been enforced since select_distributable_items landed — the hint
+    must describe the real three-mode behavior, not the stale caveat."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    hint = r.json()["known_fields"]["corporate_memory"]["distribution_mode"]["hint"]
+    assert "NOT YET ENFORCED" not in hint
+    assert "select_distributable_items" in hint
+
+
+def test_corp_memory_extraction_and_review_period_and_entity_resolution_marked_not_wired(seeded_app):
+    """The remaining known-inert corporate_memory knobs (#1971) must say so
+    rather than silently implying they already take effect."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    fields = r.json()["known_fields"]["corporate_memory"]
+    assert "#1971" in fields["extraction"]["hint"]
+    assert "#1971" in fields["review_period_months"]["hint"]
+    assert "#1971" in fields["entity_resolution"]["hint"]
+
+
 def test_corp_memory_extraction_section_present(seeded_app):
     c = seeded_app["client"]
     token = seeded_app["admin_token"]

@@ -9,16 +9,15 @@ VERIFICATION_EXTRACT_PROMPT = """You are analyzing a conversation between a user
 
 1. **Corrections** -- user corrects the AI's output or assumption
    Signal phrases: "no, it's actually", "that's wrong", "not quite", "the correct way is"
-   Base confidence: 0.90
 
 2. **Confirmations** -- user confirms AI's output as correct
    Signal phrases: "yes", "correct", "that's right", "exactly"
-   Base confidence: 0.60
-   NOTE: only extract if the confirmed fact is domain-specific (not generic)
+   NOTE: only extract if the confirmed fact is substantive, not a trivially
+   generic acknowledgement -- e.g. skip plain agreement on small talk or an
+   obvious statement
 
 3. **Unprompted definitions** -- user proactively shares institutional knowledge
    Signal phrases: "for reference", "FYI", "our convention is", "we define X as"
-   Base confidence: 0.90
 
 ## Rules
 - Only extract facts that are reusable across the organization (not personal preferences)
@@ -26,6 +25,11 @@ VERIFICATION_EXTRACT_PROMPT = """You are analyzing a conversation between a user
 - Determine the domain (finance, engineering, product, data, operations, infrastructure)
 - Extract entity names mentioned (team names, product names, metric names)
 - EXCLUDE: personal preferences, one-off instructions, project-specific paths
+- EXCLUDE: facts scoped to a single client, engagement, deal, or project --
+  a one-off date, price, or correction that belongs on that engagement's own
+  record, not on the organization's shared knowledge. Test: "would this
+  still be true and useful outside that one engagement?" -- if no, don't
+  extract it.
 
 For each verification provide:
 - detection_type: "correction" | "confirmation" | "unprompted_definition"
