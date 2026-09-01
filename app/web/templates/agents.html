@@ -2028,9 +2028,17 @@
     var params = new URLSearchParams(window.location.search);
     var openId = params.get('open');
     var wantNew = params.get('new');
-    if (!openId && !wantNew) return false;
+    /* `?template=<entity_id>` — the Library's "Start an agent" row action.
+       Creates straight from that template rather than opening the picker: the
+       caller already chose one, and showing them a list to choose again would
+       undo the choice they just made. An unknown or unreadable id is the
+       server's call, not ours — POST /api/v1/agents answers 404
+       `template_not_found` through the store's own visibility gate. */
+    var wantTemplate = params.get('template');
+    if (!openId && !wantNew && !wantTemplate) return false;
     params.delete('open');
     params.delete('new');
+    params.delete('template');
     var qs = params.toString();
     try {
       history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
@@ -2039,6 +2047,7 @@
       openBuilder(openId);
       return true;
     }
+    if (wantTemplate) { createAgent(null, wantTemplate); return true; }
     if (wantNew) { createAgent(null); return true; }
     return false;
   }

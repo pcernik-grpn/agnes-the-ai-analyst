@@ -58,6 +58,18 @@
    search box narrows the list, and when a query matches a metric or term the
    band says so — the only one-step term lookup the rail chrome has (it renders
    no global search box, by design). #}
+{# One link ACROSS from a band to where its subject continues. The Agent
+   templates band uses it for /agents: the band says what a template is, and
+   this is where the agents built from them live. A sibling of the collapse
+   toggle, never inside it — that toggle is a <button>, and an anchor nested in
+   a button is neither valid nor clickable. #}
+{% macro band_link(link) %}
+{% if link %}
+<div class="lib-defs__links">
+  <a class="lib-defs__link" href="{{ link.href }}">{{ link.label }} &rarr;</a>
+</div>
+{% endif %}
+{% endmacro %}
 {% macro defs_links(defs) %}
 {% if defs %}
 <div class="lib-defs__links" id="lib-defs" data-defs-search="{{ defs.search }}">
@@ -542,6 +554,17 @@
                         {{ c.stack_action or 'Add to my agents' }}
                       </span>
                     </button>
+                    {% endif %}
+                    {# The template's OTHER job, offered where the reader is.
+                       Installing gives every agent the specialist; this gives
+                       that specialist its own scope, budget and address. Both
+                       are real and only one of them was discoverable — the
+                       builder's picker is behind "New agent" on another page,
+                       so nothing here said you could start from this at all
+                       (#1956 item 3). Agent-template rows only. #}
+                    {% if c.type_key == 'agent' %}
+                    <a class="lib-rowlink" href="/agents?template={{ c.id | urlencode }}"
+                       aria-label="Start an agent from {{ c.title }}">Start an agent &rarr;</a>
                     {% endif %}
                   </span>
                   {# No "Open" button: the whole row is the link (see the
@@ -1530,6 +1553,34 @@
   .lib-field > span em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
   .lib-field input[type=text] { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; background: var(--ds-surface); color: var(--ds-text-primary); }
   .lib-field input[type=file] { width: 100%; font: inherit; font-size: 13px; color: var(--ds-text-secondary); }
+  /* A row with TWO actions stacks them. The actions column is a fixed 170px
+     under `table-layout: fixed` (`.lib-col-actions`), which fits one pill and
+     nothing else — side by side, the pill spilled out of its own cell and was
+     clipped mid-word. Widening the column would take that width from every
+     other row on the page to serve the one band that has a second action, so
+     the row grows downward instead, and only where the link exists. */
+  .lib-slot--stack:has(.lib-rowlink) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 3px;
+  }
+  /* A row's secondary destination, under its stack pill. Quiet — the pill is
+     the row's primary act and this must not compete with it. */
+  .lib-rowlink {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--ds-text-secondary);
+    text-decoration: none;
+    white-space: nowrap;
+    padding: 2px 6px;
+    border-radius: var(--ds-radius-btn);
+    text-align: center;
+  }
+  .lib-rowlink:hover { color: var(--ds-primary); background: var(--ds-surface-sunken); }
+  .lib-rowlink:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+  }
   .lib-modal-hint { font-size: 12.5px; color: var(--ds-text-secondary); margin: 0 0 14px; }
   .lib-modal-err { font-size: 13px; color: var(--ds-warn-ink); background: var(--ds-warn-bg); border: 1px solid var(--ds-warn-line); border-radius: 9px; padding: 8px 12px; margin-bottom: 12px; }
   .lib-modal-foot { display: flex; justify-content: flex-end; gap: 10px; }
@@ -1822,6 +1873,16 @@
   .fbar-card__foot .lib-instack { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
   .fbar-card__foot .lib-stackpill svg { width: 12px; height: 12px; }
   .fbar-card__foot .lib-stackpill:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  /* In the card the footer is one line, so the second action sits BESIDE the
+     pill rather than under it — the stacking the table needs is a consequence
+     of that view's fixed 170px column, not of the pair itself.
+
+     It wraps, though, and only on the cards that carry it: three items in a
+     ~340px footer squeezed the sharing chip until "Private" truncated to
+     "P…". A second line costs a few pixels of card height on one band; a
+     state the reader cannot read costs them the state. */
+  .fbar-card__foot:has(.fbar-card__rowlink) { flex-wrap: wrap; row-gap: 6px; }
+  .fbar-card__foot .fbar-card__rowlink { flex: 0 0 auto; }
   /* A membership the caller cannot act on. Same 26px box as the pill beside it
      so the right slot is one size in every state, but a STATUS: no border, no
      pointer, and — for a locked group grant — the same lock the table row
@@ -2454,7 +2515,7 @@
     {# The band is the block host of the shared component (`.fbar-groupband`),
        sticky at the top of its own section so the group you are reading stays
        named while its rows scroll. #}
-    <div class="fbar-groupband lib-band{% if sec.defs %} lib-band--defs{% endif %}">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}</div>
+    <div class="fbar-groupband lib-band{% if sec.defs or sec.band_link %} lib-band--defs{% endif %}">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}{{ band_link(sec.band_link) }}</div>
     {% if sec.defs %}<p class="lib-defs__hit" id="lib-defs-hit" hidden></p>{% endif %}
     <div class="lib-tablewrap">
       <table class="data-table lib-table">
@@ -3277,6 +3338,16 @@
         status.innerHTML = '<span>Not addable</span>';
         foot.appendChild(status);
       }
+    }
+    // The template's second action, mirrored from the row (`.lib-rowlink`).
+    // The card is BUILT, not cloned, so a link added to the table markup does
+    // not arrive here on its own — and a row action that exists in one view and
+    // not the other is the drift the footer notes above keep guarding against.
+    const rowLink = row.querySelector('.lib-rowlink');
+    if (rowLink) {
+      const start = rowLink.cloneNode(true);
+      start.classList.add('fbar-card__rowlink');
+      foot.appendChild(start);
     }
     card.appendChild(foot);
 

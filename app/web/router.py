@@ -509,7 +509,9 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "data_app": ("/library?section=files", "Library"),
     "plugin": ("/library?section=plugin", "All plugins"),
     "skill": ("/library?section=skill", "All skills"),
-    "agent": ("/library?section=agent", "All agents"),
+    # "All agents" pointed at the templates band — the one link most likely
+    # to be read as "the agents I run", which live at /agents.
+    "agent": ("/library?section=agent", "All agent templates"),
     "files": ("/library?section=files", "Library"),
     # The flat metric/glossary registries are not a `type_key`: they are a
     # destination the Semantic models band links OUT to, not one of the
@@ -3366,7 +3368,14 @@ async def library_page(
                 href=f"/marketplace/flea/{inst['id']}?from=library",
                 glyph="doc",
                 type_key="agent",
-                type_label="Agent",
+                # "Agent" was the row's tag while the section above it said
+                # "Agent templates" and /agents held something else entirely
+                # (#1956 item 3). The two are different things: a template is
+                # a portable role DEFINITION, an agent is a running one with
+                # its own scope, budget and address. The `/agents` picker
+                # already spells this out for the same entity; the Library
+                # never got the fix.
+                type_label="Agent template",
                 origin="installed",
                 origin_label="From the marketplace",
                 added=inst.get("installed_at") or inst.get("created_at"),
@@ -3855,7 +3864,11 @@ async def library_page(
         "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
-        "agent": "Assistants you installed.",
+        # NOT "assistants": these are definitions, and the thing they define
+        # is not running. Says both jobs, because installing one does both —
+        # every agent gains the specialist, and you can start an agent of your
+        # own from it (the row's second action).
+        "agent": "Reusable role definitions. Install one and your agents gain a ready-made specialist — or start an agent of your own from it.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
         "semantic_model": "What your data means — your agents answer with these.",
@@ -3942,6 +3955,12 @@ async def library_page(
                 # built). Only this section supplies them; every other renders
                 # its band exactly as before.
                 "defs": definitions_footer if key == "semantic_model" else None,
+                # One link across to the OTHER half of the story. The band
+                # explains what a template is; this is where the agents built
+                # from them live. Same slot as `defs` — a band-level
+                # destination, not a row — because it is true of the section
+                # rather than of any item in it.
+                "band_link": ({"href": "/agents", "label": "Your agents"} if key == "agent" else None),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
