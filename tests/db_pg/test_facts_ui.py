@@ -93,6 +93,137 @@ def test_facts_section_absent_when_zero_facts_on_pg(seeded_app_both, state_backe
 
 
 # ---------------------------------------------------------------------------
+# Library entity facets — Client / Industry / Offering / Document type
+# (TCRD-250 piece 4). The absence contract is asserted on BOTH backends, the
+# content on PG only, matching this module's own convention above.
+# ---------------------------------------------------------------------------
+
+
+def _seed_entity(corpus_id: str, file_id: str, fact_type: str, label: str) -> str:
+    from src.repositories import facts_repo
+
+    fact_id = facts_repo().create_fact(type=fact_type)
+    facts_repo().add_alias(fact_id=fact_id, type=fact_type, natural_key=label, corpus_id=corpus_id)
+    facts_repo().add_claim(
+        fact_id=fact_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256="sha_a.md",
+        quote=f"{label} appears in this document.",
+    )
+    return fact_id
+
+
+def test_library_entity_facets_absent_when_flag_off(seeded_app_both):
+    """Default instance: no graph, so no Client category — and, critically,
+    no dangling `data-client` attribute on a row either. A row carrying a
+    facet the menu does not offer is how a filter that matches nothing gets
+    shipped."""
+    s = seeded_app_both
+    corpus_id = _new_corpus("Facetless", "facetless")
+    _new_file(corpus_id)
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert 'data-cat="client"' not in r.text
+    assert "data-client=" not in r.text
+
+
+def test_library_entity_facets_absent_on_duckdb_even_with_flag_on(seeded_app_both, state_backend, monkeypatch):
+    """The facts repo is PG-only under the A3 ratchet; the flag alone must
+    not surface a category the backend cannot answer."""
+    if state_backend != "duckdb":
+        pytest.skip("DuckDB-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Duck Facets", "duck-facets")
+    _new_file(corpus_id)
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert 'data-cat="client"' not in r.text
+    assert "data-client=" not in r.text
+
+
+def test_library_entity_facets_render_from_the_graph_on_pg(seeded_app_both, state_backend, monkeypatch):
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Client Work", "client-work")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+    _seed_entity(corpus_id, file_id, "industry", "Logistics")
+    _seed_entity(corpus_id, file_id, "service_offering", "Warehouse migration")
+    _seed_entity(corpus_id, file_id, "doc_type", "sow")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    for cat in ("client", "industry", "offering", "doctype"):
+        assert f'data-cat="{cat}"' in r.text, f"{cat} category missing from the filter menu"
+    # The menu offers the value...
+    assert 'data-facet="client" value="Parts Authority"' in r.text
+    # ...and the row carries it, which is what makes the filter bite.
+    assert 'data-client="Parts Authority"' in r.text
+    assert 'data-doctype="sow"' in r.text
+
+
+def test_library_entity_facet_values_are_caller_scoped(seeded_app_both, state_backend, monkeypatch):
+    """The filter menu must not become the existence oracle the read path
+    closes: a caller with no grant on the collection sees neither the value
+    nor a row carrying it."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Secret Work", "secret-work", created_by="admin1")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Undisclosed Bank")
+
+    r = s["client"].get("/library", headers=_headers(s["analyst_token"]))
+    assert r.status_code == 200
+    assert "Undisclosed Bank" not in r.text
+
+
+def test_a_type_map_chip_deep_link_opens_that_facet(seeded_app_both, state_backend, monkeypatch):
+    """`?type=<node_type>` is what the type map's chips have always linked
+    to. Nothing consumed it, so every chip reloaded the same unfiltered page
+    — this pins the consumer."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Deep Link", "deep-link")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "service_offering", "Warehouse migration")
+
+    r = s["client"].get("/library?type=service_offering", headers=_admin_headers(s))
+    assert 'OPEN_FACET = "offering"' in r.text
+    # An unknown or unfaceted type resolves to nothing rather than to a
+    # category that does not exist.
+    r2 = s["client"].get("/library?type=engagement", headers=_admin_headers(s))
+    assert 'OPEN_FACET = ""' in r2.text
+    r3 = s["client"].get("/library", headers=_admin_headers(s))
+    assert 'OPEN_FACET = ""' in r3.text
+
+
+def test_a_type_map_chip_is_a_link_only_where_the_page_can_act_on_it(seeded_app_both, state_backend, monkeypatch):
+    """A chip advertises itself as a way in. A node type the Library has no
+    facet for gets a static chip rather than a link back to the same page."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Mixed Types", "mixed-types")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+    _seed_entity(corpus_id, file_id, "engagement", "engagement:acme")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert 'href="/library?type=client"' in r.text
+    assert 'href="/library?type=engagement"' not in r.text
+    assert "tmap-chip--static" in r.text, "the unfaceted type still renders, just not as a link"
+
+
+# ---------------------------------------------------------------------------
 # Collection detail — facts section content + caller scoping (PG only).
 # ---------------------------------------------------------------------------
 
@@ -477,6 +608,7 @@ def test_library_card_fact_counts_do_not_grow_with_the_number_of_collections(
         "the readable set must be resolved a fixed number of times per page, "
         f"not once per card (4 collections -> {n4} resolutions, 8 -> {n8})"
     )
+
 
 def test_library_card_fact_count_zero_for_ungranted_caller(seeded_app_both, state_backend, monkeypatch):
     """A caller who cannot reach a collection at all never sees its row —

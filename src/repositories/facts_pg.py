@@ -1857,6 +1857,86 @@ class FactsPgRepository:
                 )
         return out
 
+    def facet_values_for_collections(
+        self, caller, corpus_ids: List[str], *, types: List[str]
+    ) -> Dict[str, Dict[str, List[str]]]:
+        """``{corpus_id: {type: [label, ...]}}`` — what each collection is
+        ABOUT, for the Library's entity facets (spec §13.2 "Library",
+        TCRD-250 piece 4).
+
+        :meth:`facet_values` answers "what values exist, and how many
+        documents each covers" — the menu's vocabulary. This answers the
+        other half the toolbar needs: which values does THIS row carry, so
+        the engine can slice rows by them. Both share
+        :meth:`_visible_facts_for_corpus_cte`'s gate via
+        ``all_collections=True`` rather than restating it, for the reason
+        that method's docstring gives: a second copy of the visibility rule
+        is how the two drift, and drift in this gate is an existence oracle.
+
+        Narrower than :meth:`facet_values` on one axis, deliberately: a
+        subject is attributed to a collection only through a claim whose
+        collection the caller can READ. Endpoint-edge visibility is enough
+        to reach a subject (so it earns a place in the menu) but not to say
+        a particular collection is about it — a row's facet values are a
+        claim about that row, and evidence the caller cannot open cannot
+        support one. The practical effect is the honest one: a value the
+        caller can see in the menu may match no row here.
+
+        Returns only collections that carry at least one value, so a caller
+        can `.get(corpus_id, {})` and a graph-less instance costs nothing.
+        """
+        if not corpus_ids or not types:
+            return {}
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence, all_collections=True)
+        vis_claims = self._visibility_predicate("c.corpus_id", is_admin)
+        alias_readable = self._alias_readable_sql(
+            revealed_expr="fa.fact_id IN (SELECT subject_id FROM revealed_ids)", is_admin=is_admin
+        )
+        params: Dict[str, Any] = {"types": list(types), "corpus_ids": list(corpus_ids)}
+        # `readable is not None` rather than `not is_admin`: the two are the
+        # same condition by construction (``is_admin = readable is None``
+        # above), and spelling it this way lets a type checker see that the
+        # bind below is over a real set.
+        if readable is not None:
+            params["readable"] = list(readable)
+            params["tiered_hidden"] = tiered_hidden
+            params["audience_pairs"] = audience_pairs
+        sql = sa.text(
+            f"""
+            WITH {cte},
+            readable_claims AS (
+                SELECT DISTINCT c.fact_id, c.corpus_id
+                FROM claims c
+                JOIN visible v ON v.subject_id = c.fact_id
+                WHERE c.corpus_id = ANY(:corpus_ids) AND {vis_claims}
+            ),
+            labels AS (
+                SELECT fa.fact_id, MIN(fa.natural_key) AS label
+                FROM fact_aliases fa
+                WHERE fa.fact_id IN (SELECT subject_id FROM visible)
+                  AND {alias_readable}
+                GROUP BY fa.fact_id
+            )
+            SELECT rc.corpus_id AS corpus_id, f.type AS type,
+                   COALESCE(l.label, rc.fact_id) AS label
+            FROM readable_claims rc
+            JOIN facts f ON f.id = rc.fact_id
+            LEFT JOIN labels l ON l.fact_id = rc.fact_id
+            WHERE f.type = ANY(:types)
+            GROUP BY rc.corpus_id, f.type, COALESCE(l.label, rc.fact_id)
+            ORDER BY rc.corpus_id, f.type, COALESCE(l.label, rc.fact_id)
+            """
+        )
+        out: Dict[str, Dict[str, List[str]]] = {}
+        with self._engine.connect() as conn:
+            for r in conn.execute(sql, params).mappings():
+                out.setdefault(r["corpus_id"], {}).setdefault(r["type"], []).append(r["label"])
+        return out
+
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the
         Library collection card's "M facts" number (spec §13.2 "Library").

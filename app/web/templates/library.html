@@ -176,6 +176,16 @@
                 data-copy-undo="{{ c.stack_undo or 'Remove' }}"
                 data-copy-pill="{{ c.stack_pill or 'Agents can use this' }}"
                 data-tag="{{ c.tags | join('|') }}"
+                {# What this row is ABOUT, from the fact graph: one attribute per
+                   entity facet the menu is offering (client, industry, offering,
+                   document type). Rendered from the same server-side list the
+                   menu and the JS facet definitions read, so a row can never
+                   carry a value the menu cannot offer or vice versa. Absent
+                   entirely when the graph is off, empty, or unreachable — the
+                   facet is not offered either, so nothing dangles. #}
+                {%- for facet_key, _cat_label, _options in (library_entity_cats or []) %}
+                data-{{ facet_key }}="{{ (c['entity_' ~ facet_key] or []) | join('|') }}"
+                {%- endfor %}
                 {# Cumulative recency buckets as a SET, so "Last 30 days" matches
                    everything inside 30 days rather than a 23-day slice (see
                    `age_buckets` in the router). Empty when we do not know when
@@ -2041,7 +2051,8 @@
 {% from "macros/_type_map.html" import type_map %}
 {% if library_type_map %}
 <div id="lib-typemap" hidden>
-  {{ type_map(library_type_map, library_type_map | sum(attribute="count"), base_url="/library") }}
+  {{ type_map(library_type_map, library_type_map | sum(attribute="count"), base_url="/library",
+            actionable=library_type_map_actionable) }}
 </div>
 {% endif %}
 <section class="lib-section">
@@ -2150,7 +2161,7 @@
          menu is not built at all rather than built empty. It comes back on its
          own — these are page-load facts, and the next render with two of
          anything in it has a live control again. #}
-      {% set _cats = [
+      {% set _cats = (library_entity_cats or []) + [
          ('tag', 'Tags', library_tags),
          ('age', 'Added', library_ages),
          ('ownership', 'Yours or shared', library_ownerships),
@@ -3371,6 +3382,13 @@
     // in the menu (value="available"), a chip that states the condition.
     { key: 'availability', attr: 'data-stack', label: 'Not added yet', toggle: true },
     { key: 'requirement', attr: 'data-requirement', label: 'Access' },
+    // Entity facets from the fact graph — `multi` because a collection is
+    // about as many clients as its documents name. Emitted from the SAME
+    // server list that renders the menu and the row attributes; an entry
+    // here whose category did not render would filter every row out.
+{%- for facet_key, cat_label, _options in (library_entity_cats or []) %}
+    { key: {{ facet_key | tojson }}, attr: {{ ('data-' ~ facet_key) | tojson }}, label: {{ cat_label | tojson }}, multi: true },
+{%- endfor %}
     { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
     // `multi` because the recency buckets are cumulative sets on the row.
     { key: 'age', attr: 'data-age', label: 'Added', multi: true },
@@ -3762,6 +3780,34 @@
   //    writing it to COLLAPSE_KEY would silently rewrite a preference the
   //    caller set by clicking. Server-validated against the real section
   //    keys, so this is one of ours or empty.
+  // ── Type-map deep link: a chip in "What the graph knows" arrives as
+  //    /library?type=<node_type>, resolved server-side to the entity facet
+  //    that answers it. Open the Filter menu on that category, so the chip
+  //    lands the reader in the vocabulary — which client, which offering —
+  //    rather than filtering to "anything with a client", a slice nobody
+  //    asked for. Server-validated against the categories that actually
+  //    rendered, so this is one of ours or empty.
+  const OPEN_FACET = {{ (library_open_facet or '') | tojson }};
+  if (OPEN_FACET) {
+    const openFacetMenu = () => {
+      const btn = document.getElementById('lib-filter-btn');
+      const cat = document.querySelector('.fbar-cat[data-cat="' + OPEN_FACET + '"]');
+      if (!btn || btn.disabled || !cat) return;
+      if (btn.getAttribute('aria-expanded') !== 'true') btn.click();
+      const catBtn = cat.querySelector('.fbar-cat__btn');
+      if (catBtn && catBtn.getAttribute('aria-expanded') !== 'true') catBtn.click();
+      // `preventScroll`: focusing the first value is for the keyboard, not a
+      // reason to yank a freshly-loaded page down past its own heading.
+      const first = cat.querySelector('input[data-facet]');
+      if (first) first.focus({ preventScroll: true });
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', openFacetMenu, { once: true });
+    } else {
+      openFacetMenu();
+    }
+  }
+
   const OPEN_SEC = {{ (library_open_section or '') | tojson }};
   if (OPEN_SEC) {
     const sec = document.querySelector('[data-lib-sec="' + OPEN_SEC + '"]');
