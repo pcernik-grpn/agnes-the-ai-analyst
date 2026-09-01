@@ -77,6 +77,7 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/registry/rebuild": "rebuild_registry",
     "POST /api/admin/registry/{table_id}/policy/compile": "access_policy.compile",
     "POST /api/admin/registry/{table_id}/policy/preview": "access_policy.preview",
+    "POST /api/admin/registry/{table_id}/policy/preview-groups": "access_policy.preview_groups",
     "POST /api/admin/run-audit-prune": "run_audit_prune",
     # Landed on `integration` in parallel with this wave.
     "POST /api/admin/upgrade-freeze": "upgrade_freeze.set",

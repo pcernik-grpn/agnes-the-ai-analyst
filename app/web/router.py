@@ -8174,7 +8174,8 @@ async def admin_tables(
         # above) so the modal can show the notice + disable Save up front
         # instead of after a rejected save. The flag only gates ATTACHING a
         # policy; enforcement of an existing one always runs (see the
-        # switch's own description in app/switches.py).
+        # switch's own description in app/switches.py). Drafting and
+        # previewing a policy stay fully usable either way.
         access_policies_enabled=feature_enabled(
             "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
         ),

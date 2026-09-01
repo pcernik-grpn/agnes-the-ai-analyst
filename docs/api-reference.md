@@ -78,6 +78,7 @@ are the unit of curation and user-facing discovery.
 | `PATCH` | `/api/admin/registry/{table_id}/docs` | see §3.5 | Update **extended LLM-facing docs** (grain, gotchas, …) |
 | `DELETE` | `/api/admin/registry/{table_id}` | — | Unregister |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
+| `POST` | `/api/admin/registry/{table_id}/policy/preview-groups` | see §3.7 | Preview a stored or candidate access policy across every real group in one call |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
 | `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
@@ -283,6 +284,35 @@ to the raw sample's window (e.g. it names the table with a schema qualifier) and
 sample is not provably the whole table — in that case the two lists must **not** be
 diffed row-by-row, only read on their own.
 
+Both `.../policy/preview` and `.../policy/preview-groups` below carry a `mapping_warning`
+field (`null` unless a referenced `policy_mapping` table is empty or has never synced),
+mirroring the `mapping_empty` reason `GET /api/me/effective-access` already reports for
+the same condition — a suspiciously-low `rows_visible` in the preview explains itself
+instead of reading as "you legitimately have no data."
+
+#### `POST /api/admin/registry/{table_id}/policy/preview-groups`
+
+Runs the same preview once per **real** `user_groups` row and reports `rows_visible`/
+`rows_total` for each in a single call — a `CASE`-on-`$user_groups` policy with a missing
+or wrong `ELSE` branch shows up as an unexpected group seeing the whole table, without
+manually re-running `.../policy/preview` once per group.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sql` | string, optional | Same meaning as `.../policy/preview` — omit to preview the stored policy. |
+
+```bash
+curl -s -X POST \
+  "https://{your-instance}/api/admin/registry/orders_daily/policy/preview-groups" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+# {"rows_total": 4200,
+#  "groups": [{"group": "Finance", "rows_visible": 1200, "error": null},
+#             {"group": "Everyone", "rows_visible": 0, "error": null}],
+#  "mapping_warning": null}
+```
+
 ### 3.8 No-SQL policy builder — `GET .../policy/columns`, `POST .../policy/compile`
 
 Lets an admin author a policy by picking columns and masks instead of writing SQL by
@@ -294,8 +324,18 @@ never has to know the table's structure up front:
 curl -s "https://{your-instance}/api/admin/registry/orders_daily/policy/columns" \
   -H "Authorization: Bearer $PAT"
 # {"columns": [{"name": "email", "type": "VARCHAR", "samples": ["a@x.com"], "distinct": 42, "pii": true}, ...],
-#  "mapping_tables": ["cost_centers"], "eligible": true}
+#  "mapping_tables": ["cost_centers"], "eligible": true,
+#  "schema_available": true, "columns_error": null}
 ```
+
+The schema comes from the same lookup `GET /api/v2/schema/{table_id}` (`agnes schema`)
+uses — BigQuery's own INFORMATION_SCHEMA for a remote BQ row, Unity Catalog for a remote
+Databricks row, the table's own parquet otherwise — so a `query_mode='remote'` table that
+has never synced locally still lists its columns. When the lookup itself fails,
+`columns` is empty, `schema_available` is `false` and `columns_error` carries a
+caller-facing reason, so "this table has never synced" is distinguishable from "this
+table has no columns". `.../policy/compile` shares the same source and refuses with
+`422 policy_builder_schema_unavailable` rather than compile against an empty column list.
 
 `eligible` mirrors the distribution interlock (§3.7's PUT gate): a policy can only be
 attached to a `query_mode='remote'` or `server_only=true` table — the builder shows
@@ -762,6 +802,7 @@ checks against.
 - /api/admin/registry/{table_id}
 - /api/admin/registry/{table_id}/docs
 - /api/admin/registry/{table_id}/policy/preview
+- /api/admin/registry/{table_id}/policy/preview-groups
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
 - /api/admin/registry/{table_id}/policy/revisions

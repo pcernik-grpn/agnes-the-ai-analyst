@@ -89,6 +89,11 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.preview": AuditEvent(
         "access_policy.preview", "read", "An admin previewed a table access policy's effect."
     ),
+    "access_policy.preview_groups": AuditEvent(
+        "access_policy.preview_groups",
+        "read",
+        "An admin previewed a table access policy's effect across every group.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),
@@ -645,6 +650,14 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),
+    # `PUT /api/admin/registry/{id}` writes its generic `update_table` row
+    # too; these two name the policy change itself, so "every access-policy
+    # change in the last N days" is a direct `action_prefix=access_policy.`
+    # query rather than a grep through `update_table` params.
+    "access_policy.set": AuditEvent(
+        "access_policy.set", "mutation", "An admin attached or edited a table access policy."
+    ),
+    "access_policy.clear": AuditEvent("access_policy.clear", "mutation", "An admin cleared a table's access policy."),
     "data_source.bigquery_connection_test": AuditEvent(
         "data_source.bigquery_connection_test",
         "read",

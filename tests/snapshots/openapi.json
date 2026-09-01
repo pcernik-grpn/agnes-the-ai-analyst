@@ -8204,6 +8204,24 @@
         "title": "PolicyCompileRequest",
         "type": "object"
       },
+      "PolicyPreviewGroupsRequest": {
+        "description": "Body for ``POST /registry/{table_id}/policy/preview-groups`` (review\nplan P1.4). ``sql`` is optional, same meaning as\n:class:`PolicyPreviewRequest` -- omitted previews the stored policy,\ngiven previews a candidate body first.",
+        "properties": {
+          "sql": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql"
+          }
+        },
+        "title": "PolicyPreviewGroupsRequest",
+        "type": "object"
+      },
       "PolicyPreviewRequest": {
         "description": "Body for ``POST /registry/{table_id}/policy/preview`` (design doc\n\u00a713.1). ``sql`` is optional \u2014 omitted previews the table's currently\nstored ``access_policy_sql``; given, it previews a CANDIDATE body\nbefore it is ever saved. Exactly one of ``as_user`` / ``as_groups``\nselects the persona to run the policy as: ``as_user`` binds a real,\nexisting user's identity (id/email) AND their LIVE group membership;\n``as_groups`` is an ad-hoc group set with no real user behind it \u2014 the\nshape Task 15's persona matrix repeatedly calls this endpoint with, one\ndistinct group-set at a time, per \u00a713.1's \"enumerates the distinct\ngroup-sets\" (an ad-hoc set never needs a real account to exist).",
         "properties": {
@@ -27876,6 +27894,79 @@
           }
         },
         "summary": "Preview Table Policy",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/registry/{table_id}/policy/preview-groups": {
+      "post": {
+        "description": "Batch single-group preview across every real group in the instance.\n\n``preview_table_policy`` above already lets an admin check one persona\nat a time; a policy that branches on ``$user_groups`` with a ``CASE``\n(the documented \"missing ``ELSE``\" bug class -- see\n``docs/table-access-policies.md``'s \"Row filtering\" section) needs every\ngroup checked before anyone trusts it, and doing that one API call per\ngroup by hand is exactly the friction that lets the bug slip through.\nThis runs the SAME policy once per real ``user_groups`` row and reports\n``rows_visible``/``rows_total`` for each in one response.\n\nDeliberately cheaper than the full persona-matrix TODO left in\n``preview_table_policy``'s docstring (union coverage + pairwise overlap\nacross every distinct group-set real users actually hold, which needs a\n\"list the distinct group-sets of users with access to this table\"\nprimitive that does not exist yet): this previews one group at a time,\nnever a combination, and only counts rows -- no sample-row\nmaterialization -- so it stays a single cheap ``COUNT(*)`` per group.",
+        "operationId": "preview_table_policy_all_groups_api_admin_registry__table_id__policy_preview_groups_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyPreviewGroupsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Table Policy All Groups",
         "tags": [
           "admin"
         ]
