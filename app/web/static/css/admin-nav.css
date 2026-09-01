@@ -324,29 +324,10 @@ html[data-ui-layout="rail"] .admin-nav .admin-nav__group-hd {
 
 /* Content beside the column takes its own comfortable measure. The container is
    `--full` on admin pages (see the note in base_admin.html) so this column can
-   hug the rail instead of drifting with the page's centring — without a cap
-   the page body would then sprawl to whatever width the monitor happens to be.
-
-   `--width-wide`, not `--width-app` (#1956 item 7). 1400px is the token the
-   design system already keeps for this kind of surface — `.container--wide`,
-   whose own comment names "admin index lists" — so this is the system's
-   existing wide measure rather than a new number.
-
-   Be precise about what it buys, because it is less than it looks. The column
-   is `viewport − 292` (56px collapsed rail + 16px gutter + 200px sidebar +
-   20px gap), so the cap only binds from a 1572px viewport up: at 1440 and
-   1536 the column is 1148px and 1244px and was never touching the old 1280
-   either. This closes the gap between roughly 1572 and 1692, and shrinks it
-   above that — 1920 still carries a 228px band, down from 348.
-
-   It does NOT centre the column, which is what item 7 literally asks for.
-   Centring would pull the content away from the sidebar it belongs to, and
-   that sidebar hugs the rail deliberately (see the note above). Left as a
-   width decision on purpose; if the dead band on very wide monitors is still
-   the complaint, the answer is a product decision about the whole
-   `.admin-split` block, not another number here. */
+   hug the rail instead of drifting with the page's centring — without this cap
+   the page body would then sprawl to whatever width the monitor happens to be. */
 .admin-main {
-    max-width: var(--width-wide, 1400px);
+    max-width: var(--width-app, 1280px);
 }
 
 /* ── Section list ────────────────────────────────────────────────────── */
