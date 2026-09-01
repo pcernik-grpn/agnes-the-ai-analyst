@@ -782,6 +782,9 @@ CATALOG: dict[str, AuditEvent] = {
         "collection.file_delete", "mutation", "A file was deleted from a knowledge collection."
     ),
     "collection.create": AuditEvent("collection.create", "mutation", "A knowledge collection was created."),
+    "collection.update": AuditEvent(
+        "collection.update", "mutation", "A knowledge collection's name, slug or description was edited."
+    ),
     "collection.file_add": AuditEvent(
         "collection.file_add", "mutation", "A file was uploaded into a knowledge collection."
     ),

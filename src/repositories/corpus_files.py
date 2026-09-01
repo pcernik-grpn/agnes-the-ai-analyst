@@ -133,6 +133,21 @@ class CorpusFilesRepository:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def count_by_corpus(self) -> Dict[str, int]:
+        """``corpus_id -> file count`` for every corpus that has files, in ONE
+        query.
+
+        For listings that need only the number: the admin /access projection
+        shows a file count per collection, and doing that with
+        ``list_for_corpus`` per collection made the page's query count grow
+        with the number of collections — which on an instance where every chat
+        file-drop is its own one-file collection is the common case, not the
+        pathological one. A corpus with no files is simply absent (the caller
+        renders 0), so nothing here has to know which corpora exist.
+        """
+        rows = self.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_files GROUP BY corpus_id").fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         rows = self.conn.execute(

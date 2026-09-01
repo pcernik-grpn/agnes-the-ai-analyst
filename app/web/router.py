@@ -5019,6 +5019,13 @@ async def library_file_detail(
         raise HTTPException(status_code=404, detail="file_not_found")
 
     size = row.get("size_bytes")
+    # A file inside a source-managed collection is a mirror of something at the
+    # source: deleting it here would be undone by the next crawl, so the page
+    # says who manages it instead of offering a control that cannot stick.
+    from app.api.collections import source_managing_connection
+
+    managing = source_managing_connection(col["id"])
+    managing_name = (managing.get("name") or managing.get("id")) if managing else None
     ctx = _build_context(
         request,
         user=user,
@@ -5030,6 +5037,14 @@ async def library_file_detail(
         file_visibility=visibility_for(ResourceType.CORPUS_FILE.value, file_id),
         # An owner (or admin) may change this one file's sharing from here.
         can_share=is_admin or col.get("created_by") == user["id"],
+        # …and remove the file. `DELETE /api/collections/{id}/files/{fid}`
+        # gates on collection ACCESS, which is wider than this: a page that
+        # offered the control to every grant-holder would invite one reader to
+        # delete another's upload, so the CONTROL is owner-or-admin even where
+        # the endpoint is more permissive. (Narrowing the endpoint itself is a
+        # separate change with its own callers — the producer path included.)
+        can_manage=is_admin or col.get("created_by") == user["id"],
+        source_managed_by=managing_name,
     )
     return templates.TemplateResponse(request, "library_file_detail.html", ctx)
 
@@ -5110,6 +5125,13 @@ async def library_detail(
         owner_name=(_resolve_owner_display(owner_id) if owner_id else None),
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
+        # Same value as `can_share`, deliberately a SECOND name: sharing and
+        # editing/deleting are different authorities that happen to share a
+        # predicate today (owner-or-admin, exactly what PATCH and DELETE
+        # /api/collections/{id} enforce). A template gating a rename on
+        # `can_share` would silently follow sharing if that predicate ever
+        # widens — e.g. to a group an admin delegated re-sharing to.
+        can_manage=is_admin or owner_id == user["id"],
         facts_summary=facts_summary,
         source_managed_by=(managing.get("name") or managing.get("id")) if managing else None,
     )
