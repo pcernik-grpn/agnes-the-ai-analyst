@@ -723,11 +723,17 @@ body.chat-page-body main { margin: 0; padding: 0; }
 /* A table / metric chip is an <a> to the thing it names (chat.js _claimHref).
    It keeps the chip's own state colour — the verified/unverified signal is what
    the row is FOR, and repainting it link-blue would trade that for a second
-   statement of "this is clickable" that the pointer and hover already make. */
+   statement of "this is clickable" that the pointer and hover already make.
+
+   No `color` declaration here, deliberately. `color: inherit` looked like the
+   way to keep the state ink and did the opposite: this selector is (0,2,1) to
+   `.msg-source-chip.is-ok`'s (0,2,0), so it WON and every linked chip took the
+   surrounding text colour instead. Nothing needs to be said about colour at
+   all — the state rules are author-level, so they already outrank the UA's
+   default anchor blue. (Copilot review on #1985.) */
 a.msg-source-chip.is-link {
   cursor: pointer;
   text-decoration: none;
-  color: inherit;
 }
 a.msg-source-chip.is-link:hover,
 a.msg-source-chip.is-link:focus-visible {

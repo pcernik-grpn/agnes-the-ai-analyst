@@ -1244,6 +1244,46 @@ process.stdout.write(JSON.stringify({
     assert "is-done" not in res["replayed_cls"]
 
 
+def test_the_live_label_names_the_call_that_is_still_running():
+    """Calls settle out of order, so "the last card" is not "the card that is
+    running". Once the newest one finished while an earlier one was still
+    going, the header read as running while naming a step already done.
+    (Copilot review on #1985.)"""
+    script = (
+        _GROUP_HARNESS
+        + _group_source()
+        + """
+const g = _buildToolGroup();
+const body = g.querySelector('.cloud-chat-tool-group-body');
+body.appendChild(card('is-running', 'Reading a file'));
+body.appendChild(card('is-done', 'Querying data'));
+_updateToolGroupSummary(g);
+process.stdout.write(JSON.stringify({
+  cls: g.className, label: head(g, '.cloud-chat-tool-group-label'),
+  meta: head(g, '.cloud-chat-tool-group-meta'),
+}));
+"""
+    )
+    res = json.loads(_node_run(script))
+    assert "is-running" in res["cls"]
+    assert res["label"] == "Reading a file", "the header must name the call still in flight, not the last one added"
+    assert res["meta"] == "2 steps"
+
+
+def test_a_run_only_continues_while_its_group_is_still_the_stream_tail():
+    """`_endToolGroup` is called from every appender that knows about runs, but
+    the preview paths append an assistant article without going through any of
+    them. A card dropped into the older group would jump visually back above
+    that article, so the open group is tail-checked rather than trusted.
+    (Copilot review on #1985.)"""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _appendToolCard") : js.index("/** Close the open run.")]
+    assert "if (_currentToolGroup && stream.lastElementChild !== _currentToolGroup) _endToolGroup();" in fn
+    assert fn.index("_endToolGroup()") < fn.index("if (_currentToolGroup) {"), (
+        "the guard has to run BEFORE the group is used, or it guards nothing"
+    )
+
+
 def test_a_run_is_ended_by_everything_that_is_not_another_tool_card():
     """A group means "these ran together, between these two things the agent
     said". Anything else appended to the stream has to close it, or a group

@@ -178,6 +178,25 @@ def _types(frames: list[dict]) -> list[str]:
     return [f["type"] for f in frames]
 
 
+async def _read_trailing(handle, quiet_for: float = 0.2) -> list[dict]:
+    """Whatever else reaches stdout, until it stays quiet for `quiet_for`.
+
+    For assertions about what must NOT be on the stream. `_drain_until_done`
+    stops at `done`, so a frame a side task emits a tick later never reaches
+    it — and a test that only drains cannot tell "never sent" from "sent
+    late", which is how an orphan resolution frame slipped through review.
+    """
+    frames: list[dict] = []
+    while True:
+        try:
+            line = await asyncio.wait_for(handle.stdout.readline(), quiet_for)
+        except asyncio.TimeoutError:
+            return frames
+        if not line:
+            return frames
+        frames.append(json.loads(line))
+
+
 # ---------------------------------------------------------------------------
 # SSE → frame translation
 # ---------------------------------------------------------------------------
@@ -1095,10 +1114,15 @@ def test_ask_user_question_is_not_gated_behind_an_approval_card():
         handle = await _spawn(provider)
         await _send(handle, {"type": "user_msg", "text": "hi"})
         frames = await _drain_until_done(handle)
+        # The approval POST is a side task, so it can land AFTER `done`. Wait
+        # for it and then read whatever else reached the stream: draining only
+        # up to `done` would miss a resolution frame emitted a tick later, and
+        # that is exactly the frame this test is about. (Copilot review.)
         for _ in range(50):
             if engine.approvals:
                 break
             await asyncio.sleep(0.02)
+        frames += await _read_trailing(handle)
         await handle.kill()
 
         assert "approval_request" not in _types(frames), "no card for a tool that only asks the user something"

@@ -4023,9 +4023,20 @@ function _updateToolGroupSummary(group) {
   if (label) {
     // Live: the name of the call in progress, so a collapsed group still says
     // what is happening right now. Settled: the size of the run.
-    const last = n ? cards[n - 1] : null;
-    const lastName = last ? last.querySelector(".cloud-chat-tool-name") : null;
-    label.textContent = running > 0 && lastName ? lastName.textContent : steps;
+    //
+    // The last RUNNING card, not simply the last card. Calls can settle out of
+    // order, so once the newest one finished while an earlier one was still
+    // going, "last card" named a step that was already done while the group
+    // still read as running. (Copilot review on #1985.)
+    let active = null;
+    for (let i = n - 1; i >= 0; i--) {
+      if (cards[i].classList.contains("is-running")) {
+        active = cards[i];
+        break;
+      }
+    }
+    const activeName = active ? active.querySelector(".cloud-chat-tool-name") : null;
+    label.textContent = activeName ? activeName.textContent : steps;
   }
   const meta = group.querySelector(".cloud-chat-tool-group-meta");
   if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
@@ -4035,6 +4046,14 @@ function _updateToolGroupSummary(group) {
  *  when that card is still the last thing in the stream. */
 function _appendToolCard(wrap) {
   const stream = $("chat-messages");
+  // The open group only counts while it is still the LAST thing in the stream.
+  // `_endToolGroup` is called from every appender that knows about runs, but
+  // the preview paths append an assistant article without going through any of
+  // them — and a card then dropped into the older group would jump visually
+  // back above that article. Tail-checked rather than fixed at those two call
+  // sites, so a future appender cannot reintroduce it. (Copilot review
+  // on #1985.)
+  if (_currentToolGroup && stream.lastElementChild !== _currentToolGroup) _endToolGroup();
   if (_currentToolGroup) {
     _currentToolGroup.querySelector(".cloud-chat-tool-group-body").appendChild(wrap);
     _updateToolGroupSummary(_currentToolGroup);

@@ -190,11 +190,11 @@ SCENARIOS: dict[str, list[dict]] = {
         {"type": "finish"},
     ],
     # The turn shape from #1974: a research question that opens with a RUN of
-    # consecutive calls, two of them failing, before the answer's first
+    # six consecutive calls, THREE of them failing, before the answer's first
     # sentence. Nothing else here reproduces it — every other scenario puts
     # prose between its tool calls — and it is the shape the tool-call group
-    # exists for. The failures name an internal endpoint on purpose: that URL
-    # must reach the reader as text, never as a link.
+    # exists for. The last failure names an internal endpoint on purpose: that
+    # URL must reach the reader as text, never as a link.
     "wall": [
         _tool_call("call_w1", "fact_search", {"q": "AI roadmap building products", "limit": 20}),
         _tool_error("call_w1", "Error executing tool fact_search: 404: facts_disabled"),

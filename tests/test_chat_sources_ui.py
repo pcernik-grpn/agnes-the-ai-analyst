@@ -372,7 +372,13 @@ def test_a_linked_chip_is_an_anchor_and_keeps_its_verification_state():
     css = _read(CHAT_CSS)
     block = css[css.index("a.msg-source-chip.is-link {") :]
     block = block[: block.index("}")]
-    assert "color: inherit" in block, (
-        "the chip keeps its own state colour — link-blue would trade the verified/unverified "
-        "signal for a second statement of 'this is clickable'"
+    # NO colour declaration at all. `color: inherit` looked like the way to keep
+    # the state ink and did the opposite: this selector is (0,2,1) against
+    # `.msg-source-chip.is-ok`'s (0,2,0), so it won and every linked chip took
+    # the surrounding text colour. The state rules are author-level and already
+    # outrank the UA's anchor blue, so there is nothing to say here.
+    # (Copilot review on #1985.)
+    assert "color" not in block, (
+        "the chip keeps its own state colour — anything said about colour here outranks the "
+        "state rules and erases the verified/unverified signal"
     )

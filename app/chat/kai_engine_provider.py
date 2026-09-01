@@ -470,12 +470,20 @@ class KaiEngineHandle:
         except Exception:  # noqa: BLE001 - a failed stop must not kill the handle
             logger.warning("kai engine handle: stop failed for %s", self._chat_id, exc_info=True)
 
-    async def _post_approval(self, request_id: str, decision: str) -> None:
+    async def _post_approval(self, request_id: str, decision: str, *, silent: bool = False) -> None:
         """Forward a web approval decision, then resolve the card.
 
         ``request_id`` is the engine's ``toolCallId`` verbatim (that is what
         the approval_request frame carried). ``allow_session`` collapses to a
         plain allow — the engine's wire contract has no per-session grant.
+
+        ``silent`` suppresses the closing ``approval_resolved`` frame, for the
+        one caller that answered an approval NO CARD was ever raised for (see
+        ``_AUTO_APPROVED_TOOLS``). That frame retires a card; sent for a card
+        the client never saw, it is a resolution of nothing. The error frame
+        below is NOT silenced: a decision that failed to reach the engine
+        leaves the tool call hanging either way, which the reader has to be
+        told about. (Copilot review on #1985.)
         """
         approved = decision in ("allow", "allow_session")
         try:
@@ -502,6 +510,8 @@ class KaiEngineHandle:
         state = self._turn_state
         if state is not None:
             state.pending_approvals.discard(request_id)
+        if silent:
+            return
         self.stdout.feed_frame(
             {
                 "type": "approval_resolved",
@@ -677,6 +687,9 @@ class KaiEngineHandle:
                 # to put a question in front of them (#1974). Not added to
                 # `pending_approvals` precisely because nothing was raised —
                 # the resolution frames below retire cards, and there is none.
+                # `silent=True` for the same reason: `_post_approval` would
+                # otherwise close with an `approval_resolved` of its own, which
+                # is the exact orphan this branch exists to avoid.
                 #
                 # Ahead of the `approvals_enabled` kill-switch below on
                 # purpose. That switch exists so tool calls do not sit waiting
@@ -684,7 +697,7 @@ class KaiEngineHandle:
                 # denying it would only cost the agent the ability to ask a
                 # clarifying question on exactly the instances that turned
                 # human round-trips off.
-                self._spawn_side_task(self._post_approval(tool_call_id, "allow"))
+                self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
                 return
             state.pending_approvals.add(tool_call_id)
             # No-args tools send "" (not "{}"): the client only renders the
