@@ -32,11 +32,14 @@ see the exemption reasons in
 from __future__ import annotations
 
 import json as json_lib
+from pathlib import Path
 from typing import Optional
 
+import httpx
 import typer
 
 from cli.client import api_delete, api_get, api_patch, api_post
+from cli.config import get_token
 
 data_apps_app = typer.Typer(help="Manage hosted data apps")
 
@@ -382,6 +385,79 @@ def draft_delete(
 # ---------------------------------------------------------------------------
 # logs
 # ---------------------------------------------------------------------------
+
+
+@data_apps_app.command("fetch")
+def fetch_app(
+    slug: str = typer.Argument(..., help="App slug"),
+    path: str = typer.Argument("/", help="Path on the app, e.g. /provenance.json"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Write the body to a file instead of stdout"),
+    timeout: float = typer.Option(30.0, "--timeout", help="Seconds to wait for the app"),
+):
+    """GET a path from a hosted data app, authenticated as you.
+
+    Reaches exactly what a browser reaches: the same ingress proxy, the same
+    authentication, the same RBAC. It opens no door a grant-holder did not
+    already have — the one thing it changes is who holds the credential. The
+    CLI resolves your token itself, so it never appears in a command, in shell
+    history, or in an agent's transcript. That is the entire point, which is
+    why the target is built from the URL the API returns and never from
+    anything you type: a `path` that could name a host would turn this into a
+    way to post an Agnes token wherever someone asked.
+
+    Reaching the app also requires that the deployment serves apps on their own
+    origin (`data_apps.subdomain_base`). Without it the API hands back the
+    `/apps/<slug>/` form, which the ingress refuses outright — this says so
+    rather than letting a bare 403 surface.
+    """
+    if "://" in path or path.startswith("//"):
+        typer.echo("The path argument is a path on the app, not a URL.", err=True)
+        typer.echo("Your Agnes token is only ever sent to the app's own origin.", err=True)
+        raise typer.Exit(1)
+
+    resp = api_get(f"/api/data-apps/{slug}")
+    if resp.status_code == 404:
+        _not_found(slug)
+    if resp.status_code != 200:
+        _fail(resp)
+
+    base = (resp.json().get("url") or "").strip()
+    if not base.startswith(("http://", "https://")):
+        typer.echo(f"This deployment does not serve data apps on their own origin (got {base!r}).", err=True)
+        typer.echo("Apps are refused on the main origin, so there is nothing to fetch.", err=True)
+        typer.echo("An admin sets `data_apps.subdomain_base` to enable it.", err=True)
+        raise typer.Exit(1)
+
+    # Resolve against the app root and refuse anything that escapes it. `..`
+    # cannot reach the app's filesystem — this is HTTP, not a file read — but a
+    # traversal that walks off the origin would still aim the token elsewhere.
+    target = httpx.URL(base).join(path)
+    if not str(target).startswith(base.rstrip("/") + "/") and str(target).rstrip("/") != base.rstrip("/"):
+        typer.echo(f"That path resolves outside the app ({target}).", err=True)
+        raise typer.Exit(1)
+
+    try:
+        r = httpx.get(
+            str(target),
+            headers={"Authorization": f"Bearer {get_token() or ''}"},
+            timeout=timeout,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        typer.echo(f"Could not reach the app: {exc}", err=True)
+        raise typer.Exit(1)
+
+    if r.status_code != 200:
+        typer.echo(f"Failed: HTTP {r.status_code} from {target}", err=True)
+        if r.status_code in (502, 503):
+            typer.echo("The app may still be waking — try again in a moment.", err=True)
+        raise typer.Exit(1)
+
+    if output:
+        Path(output).write_bytes(r.content)
+        typer.echo(f"Wrote {len(r.content)} bytes to {output}", err=True)
+        return
+    typer.echo(r.text)
 
 
 @data_apps_app.command("logs")
