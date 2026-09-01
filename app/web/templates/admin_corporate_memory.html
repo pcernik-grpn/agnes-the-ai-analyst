@@ -1263,7 +1263,7 @@
                         </svg>
                         Approve Selected
                     </button>
-                    <button class="btn btn-danger" id="batchRejectBtn" disabled onclick="batchAction('reject')">
+                    <button class="btn btn-danger" id="batchRejectBtn" disabled onclick="bulkRejectSelected()">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <line x1="18" y1="6" x2="6" y2="18"/>
                             <line x1="6" y1="6" x2="18" y2="18"/>
@@ -4021,6 +4021,45 @@
         } catch (e) {
             console.error(`Batch ${action} failed:`, e);
             showToast(`Network error: batch ${action} failed`, 'error');
+        }
+    }
+
+    // Review Queue's dedicated bulk-reject (issue #1957). Every item shown
+    // in this tab is already `pending`, so this is functionally the same
+    // action as `batchAction('reject')` from here — but it routes through
+    // POST /api/memory/admin/bulk-reject, the endpoint that (a) skips a row
+    // instead of silently re-rejecting it if its status changed between page
+    // load and click, and (b) reports that per id. The All Items tab keeps
+    // `batchAction('reject')` on purpose — it legitimately targets items in
+    // any status, which a pending-only endpoint would refuse.
+    async function bulkRejectSelected() {
+        const ids = getSelectedIds('review');
+        if (ids.length === 0) return;
+        if (!confirm(`Reject ${ids.length} selected item${ids.length !== 1 ? 's' : ''}?`)) return;
+
+        try {
+            const resp = await fetch('/api/memory/admin/bulk-reject', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({item_ids: ids}),
+            });
+
+            const result = await resp.json();
+            if (resp.ok) {
+                const rejectedCount = (result.rejected || []).length;
+                const skippedCount = (result.skipped_not_pending || []).length;
+                const failCount = (result.not_found || []).length + Object.keys(result.errors || {}).length;
+                let msg = `${rejectedCount} item${rejectedCount !== 1 ? 's' : ''} rejected`;
+                if (skippedCount > 0) msg += `, ${skippedCount} skipped (no longer pending)`;
+                if (failCount > 0) msg += `, ${failCount} failed`;
+                showToast(msg, failCount > 0 ? 'error' : (skippedCount > 0 ? 'warning' : 'success'));
+                refreshCurrentTab();
+            } else {
+                showToast(result.error || result.detail || 'Bulk reject failed', 'error');
+            }
+        } catch (e) {
+            console.error('Bulk reject failed:', e);
+            showToast('Network error: bulk reject failed', 'error');
         }
     }
 

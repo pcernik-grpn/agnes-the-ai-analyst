@@ -3053,6 +3053,7 @@ KNOWN_UNTESTED = {
     "POST /api/memory-domain-suggestions",
     "POST /api/memory/admin/approve",
     "POST /api/memory/admin/batch",
+    "POST /api/memory/admin/bulk-reject",
     "POST /api/memory/admin/bulk-update",
     "POST /api/memory/admin/contradictions",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve",

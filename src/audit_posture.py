@@ -415,6 +415,7 @@ POSTURE: dict[str, str] = {
     "POST /api/memory": "corporate_memory.create",
     "POST /api/memory/admin/approve": "corporate_memory.dynamic",
     "POST /api/memory/admin/batch": "corporate_memory.dynamic",
+    "POST /api/memory/admin/bulk-reject": "corporate_memory.dynamic",
     "POST /api/memory/admin/bulk-update": "corporate_memory.dynamic",
     "POST /api/memory/admin/contradictions": "corporate_memory.contradiction_create",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve": "corporate_memory.dynamic",
