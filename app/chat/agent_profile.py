@@ -200,6 +200,75 @@ outside your access, it is not evidence the fact is absent — fall back to
 outright.
 """
 
+#: File-delivery rails appended after :data:`DATA_ACCESS_RAILS`, ungated.
+#:
+#: Same failure shape as :data:`FACTS_ACCESS_RAILS`, one section over:
+#: `config/claude_md_template.txt` carries the "Files you produce" section
+#: that names ``outputs/`` as the ONE directory a deliverable can reach the
+#: user from — and a persona REPLACES that template wholesale. So a persona'd
+#: agent asked for a ``.docx`` had no text telling it where to write one, and
+#: none of the "never disclaim the handover" rule either; the observed
+#: behavior (#1975) was an agent writing to ``/tmp`` or a skill directory and
+#: then telling the user that this sandbox has no download channel and they
+#: should copy markdown into their own editor — while the chat's Files panel
+#: sat beside the conversation waiting for a file that was never written
+#: anywhere it could see.
+#:
+#: Ungated on purpose, unlike the facts rails: ``outputs/`` is not a feature
+#: switch but the platform's one delivery convention, shared by the chat
+#: files channel (``app/api/chat_session_files.py``) and the agent API's
+#: artifact harvest (``app/chat/artifact_harvest.py``, which scans exactly
+#: ``{workdir}/outputs``). Every surface that spawns a persona'd agent honors
+#: it, so there is no instance where this text would steer an agent at
+#: something that does not exist.
+#:
+#: The closing paragraph is not padding: an agent that overclaims ("click the
+#: download button below") is the mirror-image bug, and it is the likelier
+#: one once the agent knows a panel exists at all. It cannot see which
+#: controls the surface draws, so it must say what it produced and stop.
+FILE_DELIVERY_RAILS = """
+
+---
+
+## Files you produce
+
+Agnes adds this section to every agent; it holds regardless of the persona
+above.
+
+A **document** — a `.docx`, a `.pptx`, an `.xlsx`, a PDF, a CSV export —
+reaches the user as a file, and where you write it decides whether it reaches
+them at all: write it to **`outputs/`**, relative to your working directory,
+under a descriptive filename. Create the directory if it isn't there.
+
+`outputs/` is the one place the user can reach. A file written anywhere else
+stays in this sandbox: `.claude/` (skill directories included), `/tmp`, or a
+bare filename in the working directory are all invisible to them — however
+well the file itself rendered. A skill whose scaffolds live in
+`.claude/skills/<name>/` must still write its *output* to `outputs/`.
+
+```
+outputs/q3-revenue.xlsx      <- they get this
+.claude/skills/deck/out.pptx <- they never see it
+```
+
+A **chart** is the one exception: it belongs inside your reply as inline SVG,
+not in `outputs/` — a picture the user has to open in another window is not an
+answer.
+
+**Never disclaim the handover.** Writing the file to `outputs/` IS the
+delivery; it is settled the moment you write it. Do not tell the user that
+this filesystem is not their machine, that you cannot hand them a downloadable
+file, that there is no download channel here, that they need Claude Code or
+the Agnes CLI to fetch it, or that they should copy your answer into their own
+editor instead — each of those is false, and each sends the reader hunting for
+a problem that does not exist. Say what you produced and that it is ready.
+
+Do not overclaim in the other direction either: you cannot see which controls
+the surface draws around a reply, so do not promise a download button and do
+not say where to click. "The deck is ready as `outputs/q3-review.pptx`" is the
+whole job — true on every surface, and it needs no caveat on either side.
+"""
+
 
 def _facts_rails_enabled() -> bool:
     """Whether this instance has the `facts` feature switched on — the sole
@@ -399,7 +468,9 @@ def build_profile(
     never be able to silently drop the platform's data-access floor — then,
     when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
     it (see that constant for why a persona needs its own copy of the
-    fact-tool guidance too), and finally :func:`_semantic_layer_section`.
+    fact-tool guidance too), then :data:`FILE_DELIVERY_RAILS` (the
+    ``outputs/`` handover convention, ungated — see that constant), and
+    finally :func:`_semantic_layer_section`.
     The early return above means this only ever applies where a persona
     actually replaces the workspace prompt; an agent with no persona keeps
     the full symlinked rails — including the template's own facts and
@@ -422,6 +493,7 @@ def build_profile(
     claude_md = system_prompt + DATA_ACCESS_RAILS
     if _facts_rails_enabled():
         claude_md += FACTS_ACCESS_RAILS
+    claude_md += FILE_DELIVERY_RAILS
     claude_md += _semantic_layer_section(user_email)
     return ChatProfile(
         slug=f"agent-{slug}",

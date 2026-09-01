@@ -604,6 +604,81 @@ def test_preview_points_an_image_at_the_raw_viewer_without_reading_it(
     assert body["text"] is None
 
 
+def _xlsx_bytes(*sheets: tuple[str, list[list[str]]]) -> bytes:
+    """A minimal but structurally real .xlsx — a workbook part naming the tabs
+    in order, its relationship part, and one worksheet part each, every value
+    written as an inline string so the fixture needs no shared-string table.
+    Parts are written in REVERSE so a test proves the workbook's tab order
+    wins over the archive's."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        tabs = "".join(
+            f'<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>' for n, (name, _) in enumerate(sheets, start=1)
+        )
+        zf.writestr(
+            "xl/workbook.xml",
+            f'<?xml version="1.0"?><workbook xmlns:r="r"><sheets>{tabs}</sheets></workbook>',
+        )
+        rels = "".join(
+            f'<Relationship Id="rId{n}" Type="t" Target="worksheets/sheet{n}.xml"/>' for n in range(1, len(sheets) + 1)
+        )
+        zf.writestr("xl/_rels/workbook.xml.rels", f'<?xml version="1.0"?><Relationships>{rels}</Relationships>')
+        for number, (_, rows) in reversed(list(enumerate(sheets, start=1))):
+            body = ""
+            for r, cells in enumerate(rows, start=1):
+                cs = "".join(
+                    f'<c r="{chr(65 + c)}{r}" t="inlineStr"><is><t>{value}</t></is></c>'
+                    for c, value in enumerate(cells)
+                    if value
+                )
+                body += f'<row r="{r}">{cs}</row>'
+            zf.writestr(
+                f"xl/worksheets/sheet{number}.xml",
+                f'<?xml version="1.0"?><worksheet xmlns="x"><sheetData>{body}</sheetData></worksheet>',
+            )
+        zf.writestr("[Content_Types].xml", "<Types/>")
+    return buf.getvalue()
+
+
+def test_preview_reads_an_xlsx_sheet_by_sheet(client: TestClient, session_dir: Path) -> None:
+    """The workbook half of the same complaint (#1975): the prompt tells an
+    agent an `.xlsx` is a deliverable, so a spreadsheet it built must be
+    glanceable in the drawer rather than answering "no preview for '.xlsx'"."""
+    (session_dir / "outputs").mkdir()
+    (session_dir / "outputs" / "q3-revenue.xlsx").write_bytes(
+        _xlsx_bytes(
+            ("Q3 Revenue", [["Region", "Revenue"], ["EMEA", "1250000"], ["AMER", "980000"]]),
+            ("Notes", [["draft"]]),
+        )
+    )
+
+    body = _preview(client, "outputs/q3-revenue.xlsx").json()
+    assert body["kind"] == "sheets"
+    assert body["source"] == "extracted"
+    assert body["truncated"] is False
+    assert [s["name"] for s in body["sheets"]] == ["Q3 Revenue", "Notes"]
+    assert body["sheets"][0]["rows"] == [
+        ["Region", "Revenue"],
+        ["EMEA", "1250000"],
+        ["AMER", "980000"],
+    ]
+    assert body["sheets"][0]["truncated"] is False
+    assert body["slides"] is None
+
+
+def test_preview_of_an_xlsx_that_is_not_really_an_xlsx_is_none_not_500(client: TestClient, session_dir: Path) -> None:
+    """Same posture as the deck: the extension is the agent's claim about the
+    bytes, and a wrong one degrades to the row's own download affordance."""
+    (session_dir / "broken.xlsx").write_bytes(b"this is not a zip archive")
+
+    body = _preview(client, "broken.xlsx").json()
+    assert body["kind"] == "none"
+    assert "download" in body["reason"].lower()
+
+
 def test_preview_of_an_unpreviewable_format_says_download_it(client: TestClient, session_dir: Path) -> None:
     (session_dir / "data.parquet").write_bytes(b"PAR1")
 

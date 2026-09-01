@@ -16,7 +16,7 @@ import zipfile
 
 import pytest
 
-from src.office_preview import docx_paragraphs, is_office_preview_ext, pptx_slides
+from src.office_preview import docx_paragraphs, is_office_preview_ext, pptx_slides, xlsx_sheets
 
 
 def _zip(members: dict[str, str | bytes]) -> bytes:
@@ -119,8 +119,206 @@ def test_the_two_formats_share_the_local_element_names() -> None:
     one prefix silently breaks the other format."""
     assert is_office_preview_ext("pptx") == "slides"
     assert is_office_preview_ext(".DOCX") == "text"
-    assert is_office_preview_ext("xlsx") is None
+    assert is_office_preview_ext("xlsx") == "sheets"
+    assert is_office_preview_ext("csv") is None
     assert is_office_preview_ext("") is None
+
+
+def _workbook(*sheet_names: str) -> str:
+    """``xl/workbook.xml`` — the tab order, which is not the archive order."""
+    sheets = "".join(
+        f'<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>' for n, name in enumerate(sheet_names, start=1)
+    )
+    return f'<?xml version="1.0"?><workbook xmlns:r="r"><sheets>{sheets}</sheets></workbook>'
+
+
+def _workbook_rels(count: int) -> str:
+    rels = "".join(
+        f'<Relationship Id="rId{n}" Type="t" Target="worksheets/sheet{n}.xml"/>' for n in range(1, count + 1)
+    )
+    return f'<?xml version="1.0"?><Relationships>{rels}</Relationships>'
+
+
+def _shared(*strings: str) -> str:
+    items = "".join(f"<si><t>{s}</t></si>" for s in strings)
+    return f'<?xml version="1.0"?><sst count="{len(strings)}">{items}</sst>'
+
+
+def _sheet(*rows: str) -> str:
+    """``rows`` are pre-rendered ``<row>`` fragments — see :func:`_row`."""
+    return f'<?xml version="1.0"?><worksheet xmlns="x"><sheetData>{"".join(rows)}</sheetData></worksheet>'
+
+
+def _row(number: int, cells: dict[str, str]) -> str:
+    """One ``<row>``; ``cells`` maps a column letter to a raw ``<c>`` body."""
+    body = "".join(f'<c r="{col}{number}"{frag}' for col, frag in cells.items())
+    return f'<row r="{number}">{body}</row>'
+
+
+def _num(value: str) -> str:
+    return f"><v>{value}</v></c>"
+
+
+def _sst(index: int) -> str:
+    return f' t="s"><v>{index}</v></c>'
+
+
+def _one_sheet_workbook(*rows: str, name: str = "Data", strings: tuple[str, ...] = ()) -> bytes:
+    members: dict[str, str | bytes] = {
+        "xl/workbook.xml": _workbook(name),
+        "xl/_rels/workbook.xml.rels": _workbook_rels(1),
+        "xl/worksheets/sheet1.xml": _sheet(*rows),
+    }
+    if strings:
+        members["xl/sharedStrings.xml"] = _shared(*strings)
+    return _zip(members)
+
+
+# ---------------------------------------------------------------------------
+# Workbooks (kind: "sheets")
+# ---------------------------------------------------------------------------
+
+
+def test_sheets_come_back_in_tab_order_not_archive_order() -> None:
+    """The workbook's ``<sheets>`` order is what a reader sees as tabs; the
+    archive can hold the parts in any order at all, and a third sheet whose
+    part is written first must not be previewed first."""
+    data = _zip(
+        {
+            "xl/worksheets/sheet3.xml": _sheet(_row(1, {"A": _num("3")})),
+            "xl/worksheets/sheet1.xml": _sheet(_row(1, {"A": _num("1")})),
+            "xl/worksheets/sheet2.xml": _sheet(_row(1, {"A": _num("2")})),
+            "xl/_rels/workbook.xml.rels": _workbook_rels(3),
+            "xl/workbook.xml": _workbook("First", "Second", "Third"),
+        }
+    )
+    sheets, truncated = xlsx_sheets(data)
+    assert [s.name for s in sheets] == ["First", "Second", "Third"]
+    assert [s.rows for s in sheets] == [[["1"]], [["2"]], [["3"]]]
+    assert truncated is False
+
+
+def test_a_shared_string_cell_reads_the_table_not_its_index() -> None:
+    """``t="s"`` means ``<v>`` holds an INDEX. Rendering it verbatim would
+    show a column of small integers where the labels should be."""
+    data = _one_sheet_workbook(
+        _row(1, {"A": _sst(0), "B": _sst(1)}),
+        _row(2, {"A": _sst(1), "B": _num("42")}),
+        strings=("Region", "Revenue"),
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert sheets[0].rows == [["Region", "Revenue"], ["Revenue", "42"]]
+
+
+def test_a_shared_index_the_table_does_not_have_is_blank_not_an_error() -> None:
+    """A malformed workbook is a blank cell, never an IndexError that 500s the
+    whole preview. The row then holds nothing, so it drops out like any other
+    valueless row — the sheet survives, empty."""
+    data = _one_sheet_workbook(_row(1, {"A": _sst(7), "B": _sst(0)}), strings=("only one",))
+    sheets, _ = xlsx_sheets(data)
+    assert [(s.name, s.rows) for s in sheets] == [("Data", [["", "only one"]])]
+
+
+def test_cells_are_placed_by_reference_so_a_gap_keeps_its_column() -> None:
+    """SpreadsheetML omits empty cells entirely: a row whose only value is in
+    column D is written as one ``<c r="D2">``. Appending it in part order
+    would slide it under column A and misreport the whole grid."""
+    data = _one_sheet_workbook(
+        _row(1, {"A": _num("1"), "B": _num("2"), "C": _num("3"), "D": _num("4")}),
+        _row(2, {"D": _num("9")}),
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert sheets[0].rows == [["1", "2", "3", "4"], ["", "", "", "9"]]
+
+
+def test_rows_are_padded_to_one_width() -> None:
+    """The client draws a grid; a ragged ``rows`` would make it re-derive the
+    column count and get a different answer per row."""
+    data = _one_sheet_workbook(
+        _row(1, {"A": _num("1"), "B": _num("2")}),
+        _row(2, {"A": _num("3")}),
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert sheets[0].rows == [["1", "2"], ["3", ""]]
+
+
+def test_an_inline_string_and_a_boolean_read_as_text() -> None:
+    data = _one_sheet_workbook(
+        _row(1, {"A": ' t="inlineStr"><is><t>inline value</t></is></c>', "B": ' t="b"><v>1</v></c>'}),
+        _row(2, {"A": ' t="str"><v>formula result</v></c>', "B": ' t="b"><v>0</v></c>'}),
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert sheets[0].rows == [["inline value", "TRUE"], ["formula result", "FALSE"]]
+
+
+def test_a_styled_but_valueless_row_is_dropped() -> None:
+    """A row of formatting with no ``<v>`` anywhere is not data; keeping it
+    would push the reader's eye down a preview that shows nothing."""
+    data = _one_sheet_workbook(
+        _row(1, {"A": _num("1")}),
+        _row(2, {"A": ' s="3"/>', "B": ' s="3"/>'}),
+        _row(3, {"A": _num("2")}),
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert sheets[0].rows == [["1"], ["2"]]
+
+
+def test_a_sheet_past_the_row_ceiling_reports_truncated_on_that_sheet() -> None:
+    """Per sheet, not per workbook: one small tab can sit beside a 50 000-row
+    export, and a modal-wide notice would be wrong about the small one."""
+    from src.office_preview import _MAX_ROWS
+
+    big = _sheet(*[_row(n, {"A": _num(str(n))}) for n in range(1, _MAX_ROWS + 20)])
+    data = _zip(
+        {
+            "xl/workbook.xml": _workbook("Big", "Small"),
+            "xl/_rels/workbook.xml.rels": _workbook_rels(2),
+            "xl/worksheets/sheet1.xml": big,
+            "xl/worksheets/sheet2.xml": _sheet(_row(1, {"A": _num("1")})),
+        }
+    )
+    sheets, workbook_truncated = xlsx_sheets(data)
+    assert len(sheets[0].rows) == _MAX_ROWS
+    assert sheets[0].truncated is True
+    assert sheets[1].truncated is False
+    assert workbook_truncated is False
+
+
+def test_a_workbook_past_the_sheet_ceiling_reports_truncated() -> None:
+    from src.office_preview import _MAX_SHEETS
+
+    count = _MAX_SHEETS + 3
+    members: dict[str, str | bytes] = {
+        "xl/workbook.xml": _workbook(*[f"S{n}" for n in range(1, count + 1)]),
+        "xl/_rels/workbook.xml.rels": _workbook_rels(count),
+    }
+    for n in range(1, count + 1):
+        members[f"xl/worksheets/sheet{n}.xml"] = _sheet(_row(1, {"A": _num(str(n))}))
+    sheets, truncated = xlsx_sheets(_zip(members))
+    assert len(sheets) == _MAX_SHEETS
+    assert truncated is True
+
+
+def test_a_workbook_with_no_rels_falls_back_to_the_conventional_part_names() -> None:
+    """A workbook we can still show under its real tab names beats one we
+    refuse because one auxiliary part was unreadable."""
+    data = _zip(
+        {
+            "xl/workbook.xml": _workbook("Alpha", "Beta"),
+            "xl/worksheets/sheet1.xml": _sheet(_row(1, {"A": _num("1")})),
+            "xl/worksheets/sheet2.xml": _sheet(_row(1, {"A": _num("2")})),
+        }
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert [(s.name, s.rows) for s in sheets] == [("Alpha", [["1"]]), ("Beta", [["2"]])]
+
+
+def test_an_empty_sheet_is_a_sheet_with_no_rows_not_a_dropped_tab() -> None:
+    """An empty sheet is an answer — it tells the reader the agent made the
+    tab and wrote nothing into it, which a missing tab would not."""
+    data = _one_sheet_workbook(name="Blank")
+    sheets, _ = xlsx_sheets(data)
+    assert [(s.name, s.rows) for s in sheets] == [("Blank", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +337,7 @@ def test_the_two_formats_share_the_local_element_names() -> None:
 def test_unreadable_input_is_empty_never_an_exception(data: bytes) -> None:
     assert pptx_slides(data) == ([], False)
     assert docx_paragraphs(data) == ("", False)
+    assert xlsx_sheets(data) == ([], False)
 
 
 def test_a_zip_without_the_expected_parts_is_empty() -> None:
@@ -146,6 +345,7 @@ def test_a_zip_without_the_expected_parts_is_empty() -> None:
     is a claim about the bytes and not a fact."""
     assert pptx_slides(_zip({"word/document.xml": _document("Hi")})) == ([], False)
     assert docx_paragraphs(_zip({"ppt/slides/slide1.xml": _slide("Hi")})) == ("", False)
+    assert xlsx_sheets(_zip({"word/document.xml": _document("Hi")})) == ([], False)
 
 
 def test_a_slide_path_that_only_looks_like_one_is_ignored() -> None:
