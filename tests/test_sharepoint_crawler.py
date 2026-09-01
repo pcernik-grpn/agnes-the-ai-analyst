@@ -792,6 +792,95 @@ class TestTransport:
 
 
 # --------------------------------------------------------------------------
+# `/content` redirect (Graph answers a file download with a 302 to a
+# pre-authenticated URL on a different host, not the bytes themselves).
+# --------------------------------------------------------------------------
+
+
+class TestDownloadRedirect:
+    """Direct unit tests of ``GraphTransport.download_to_temp`` — lower-level
+    than :class:`TestTransport`'s full-crawl runs, because asserting "no
+    Authorization header on the redirect target" needs the raw request the
+    MockTransport handler saw."""
+
+    _REDIRECT_TARGET = "https://contoso-my.blob.example/download?sig=abc"
+
+    @staticmethod
+    def _transport(monkeypatch) -> crawler.GraphTransport:
+        stats = crawler.CrawlStats()
+
+        async def _acquire() -> str:
+            return "tok"
+
+        auth = crawler.GraphAuth(acquire=_acquire, stats=stats)
+        return crawler.GraphTransport(auth, stats)
+
+    def _handler(
+        self, *, redirect_response: Callable[[httpx.Request], httpx.Response]
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == self._REDIRECT_TARGET:
+                return redirect_response(request)
+            return httpx.Response(302, headers={"Location": self._REDIRECT_TARGET})
+
+        return handler
+
+    def test_a_302_is_followed_and_the_bytes_land_in_the_temp_file(self, monkeypatch):
+        _install_graph(
+            monkeypatch, self._handler(redirect_response=lambda req: httpx.Response(200, content=b"the-real-bytes"))
+        )
+        transport = self._transport(monkeypatch)
+
+        path = asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+        try:
+            assert path.read_bytes() == b"the-real-bytes"
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_the_redirect_target_gets_no_authorization_header(self, monkeypatch):
+        seen_auth: Dict[str, Optional[str]] = {}
+
+        def redirect_response(request: httpx.Request) -> httpx.Response:
+            seen_auth["value"] = request.headers.get("authorization")
+            return httpx.Response(200, content=b"bytes")
+
+        _install_graph(monkeypatch, self._handler(redirect_response=redirect_response))
+        transport = self._transport(monkeypatch)
+
+        path = asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+        path.unlink(missing_ok=True)
+
+        assert seen_auth["value"] is None
+
+    def test_max_bytes_is_still_enforced_on_the_redirected_body(self, monkeypatch):
+        _install_graph(
+            monkeypatch, self._handler(redirect_response=lambda req: httpx.Response(200, content=b"x" * 100))
+        )
+        transport = self._transport(monkeypatch)
+
+        with pytest.raises(crawler.CrawlError, match="cap"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=10))
+
+    def test_a_genuine_4xx_still_fails_no_regression(self, monkeypatch):
+        _install_graph(monkeypatch, lambda request: httpx.Response(404, json={}))
+        transport = self._transport(monkeypatch)
+
+        with pytest.raises(gc.SharePointGraphError, match="404"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+
+    def test_a_genuine_5xx_still_retries_then_fails(self, monkeypatch):
+        _install_graph(monkeypatch, lambda request: httpx.Response(503, json={}))
+        transport = self._transport(monkeypatch)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with pytest.raises(gc.SharePointGraphError, match="503"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+
+
+# --------------------------------------------------------------------------
 # Scope resolution & excluded subtrees
 # --------------------------------------------------------------------------
 
