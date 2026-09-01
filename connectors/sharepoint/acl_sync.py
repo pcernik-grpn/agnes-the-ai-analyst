@@ -1336,6 +1336,15 @@ def _cleanup_connection_content(
     — its subtree was never crawled, so nothing arrives for it under that
     path anyway.
 
+    KNOWN GAP, not yet closed (#2011): for an anonymize-marked scope, path
+    matching above compares an ANONYMIZED ``corpus_files.path`` against a
+    REAL ``rel_path`` (the admin's exclusion/zone config never was, and
+    should never be, anonymized) — they can never agree, so a folder
+    exclusion or zone dissolution added after a document was already
+    ingested into such a scope no longer retroactively purges it. Stable-id
+    (file-kind exclusion) matching is unaffected. See the inline comment at
+    the match site.
+
     Deletion uses the EXACT machinery ``DELETE /files/{id}`` uses
     (``app.api.collections._purge_file_row`` / ``_record_corpus_file_event``
     / ``_sweep_facts_orphans_after_delete`` — imported locally to avoid a
@@ -1409,6 +1418,21 @@ def _cleanup_connection_content(
 
         removed_here = 0
         for row in corpus_files_repo().list_for_corpus(collection_id):
+            # KNOWN GAP for an anonymize-marked scope: `row["path"]` is the
+            # ANONYMIZED path once the source scope anonymizes (the crawler
+            # never stores the real one — see
+            # `connectors.sharepoint.crawler._anonymize_identity`), but
+            # `prefix` below is the REAL folder path an admin picked in the
+            # exclusion/zone UI. The two can never prefix-match each other,
+            # so a folder-kind exclusion or a zone dissolution added AFTER a
+            # document was already ingested into such a scope silently stops
+            # retroactively purging it here — file-kind exclusions (the
+            # `excluded_file_ids` stable-id branch below) are UNAFFECTED.
+            # Tracked, not silently accepted (#2011): reconstructing `prefix`
+            # through the same per-instance anonymization (deterministic, so
+            # it CAN be derived) is the fix; it needs the scope's own
+            # key/detector threaded in here, which is more than this pass
+            # does today.
             path = row.get("path")
             matched = bool(path and any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes))
             if not matched and excluded_file_ids:
