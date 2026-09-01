@@ -32,7 +32,7 @@ from pathlib import Path
 
 import typer
 
-from cli.client import api_get, api_post
+from cli.client import api_get, api_post, error_detail
 from cli.commands import admin_semantic as _admin
 from cli.deprecation import deprecated_alias, deprecation_notice
 
@@ -196,7 +196,7 @@ def export_model(
         typer.echo(f"  Look for it: agnes semantic-model search {slug}", err=True)
         raise typer.Exit(1)
     if resp.status_code == 403:
-        typer.echo(f"Access denied: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Access denied: {error_detail(resp)}", err=True)
         typer.echo("  Ask an admin to link the model to a Data Package you are granted.", err=True)
         raise typer.Exit(1)
     if resp.status_code != 200:

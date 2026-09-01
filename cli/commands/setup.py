@@ -5,7 +5,7 @@ import os
 
 import typer
 
-from cli.client import api_get, api_post
+from cli.client import api_get, api_post, error_detail
 
 setup_app = typer.Typer(help="Instance setup (guided by AI agent)")
 
@@ -80,7 +80,7 @@ def bootstrap(
             typer.echo("Token saved — you are now logged in as admin.")
             typer.echo("\nNext: agnes setup test-connection")
         elif resp.status_code == 403:
-            typer.echo(f"Bootstrap disabled: {resp.json().get('detail', '')}")
+            typer.echo(f"Bootstrap disabled: {error_detail(resp)}")
             typer.echo("Users already exist. Use: agnes login --email your@email.com")
         else:
             typer.echo(f"Failed: {resp.text}", err=True)
