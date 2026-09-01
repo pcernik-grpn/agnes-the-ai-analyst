@@ -29,6 +29,8 @@ from typing import Any, Optional, Tuple
 
 import jsonschema
 
+from app.chat.sources import strip_block, strip_next_actions_block
+
 #: Matches a fenced code block anywhere in the text (```json ... ``` or
 #: plain ``` ... ```) — greedy-minimal so the FIRST fenced block wins, which
 #: is what a single-JSON-value answer wrapped once in a fence looks like.
@@ -69,11 +71,23 @@ def validate(answer: str, response_format: Optional[dict]) -> Tuple[bool, Any, O
     snippet (e.g. a schema field holding example code) would have
     ``_strip_fence`` mangle it into the substring between the embedded
     fences instead of parsing the whole answer as-is.
+
+    The two wire-format trailers come off FIRST, before either attempt. The
+    sandbox system prompt asks every reply to end with a ``next_actions``
+    fence (and the workspace prompt asks for ``sources``); those exist for
+    the chat UI, and a caller who asked for JSON did not ask for them. Left
+    on, they are worse than noise here: the raw parse fails on the trailing
+    fence, and ``_strip_fence`` then returns the TRAILER's body rather than
+    the JSON, so a perfectly good structured answer is reported as "not
+    valid JSON". The prompt also tells the model to skip the trailer for a
+    machine-readable reply — this is the half that does not depend on the
+    model having listened.
     """
     if not response_format or response_format.get("type") != "json_schema":
         return True, None, None
 
     schema = response_format.get("schema") or {}
+    answer = strip_next_actions_block(strip_block(answer or ""))
 
     try:
         parsed = json.loads((answer or "").strip())

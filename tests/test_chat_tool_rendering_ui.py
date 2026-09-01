@@ -138,7 +138,7 @@ def test_the_prompt_mandates_the_next_actions_trailer():
     flat = re.sub(r"\s+", " ", md)
     assert "```next_actions" in md
     assert "one-click buttons" in flat
-    assert "Skip the block" in flat, "the prompt must say when NOT to emit it"
+    assert "Omit it in exactly two cases" in flat, "the prompt must say when NOT to emit it"
 
 
 def test_the_template_carries_the_trailer_for_the_sandbox_only():
@@ -918,3 +918,126 @@ def test_reset_clears_the_seal_bookkeeping():
     reset = js[js.index("function _resetStreamingState") : js.index("function _sealStreamingSegment")]
     assert '_turnSealedText = ""' in reset
     assert "_turnSealedArticles = []" in reset
+
+
+# ── the trailer is a system-prompt contract, not only project memory ─────────
+
+
+def test_the_sandbox_system_prompt_carries_the_next_actions_contract():
+    """Why this exists at all, given the CLAUDE.md sections above already say
+    it: an admin Workspace Prompt override (src/initial_workspace.py::
+    resolve_prompt) REPLACES the shipped template wholesale, so on such an
+    instance the section is simply gone and no template edit can bring the
+    chips back. The system prompt is the surface an override cannot reach.
+    NOT justified as a compliance fix — a 3-arm A/B against a real model
+    could not distinguish it from the CLAUDE.md wording alone."""
+    src = Path("app/chat/runner.py").read_text(encoding="utf-8")
+    assert "_NEXT_ACTIONS_CONTRACT" in src
+    start = src.index('_NEXT_ACTIONS_CONTRACT = """')
+    contract = src[start : src.index('"""\n', start + len('_NEXT_ACTIONS_CONTRACT = """'))]
+    assert "```next_actions" in contract
+    assert "exactly TWO" in contract, "a fixed count is what makes compliance checkable"
+    # It must reach the CLI as an append to the stock preset — assigning
+    # `system_prompt` outright would replace Claude Code's own preset.
+    assert 'options_kwargs["system_prompt"] = {' in src
+    assert '"preset": "claude_code"' in src
+    assert '"append": "\\n\\n".join(append_parts)' in src, (
+        "the contract and the restored transcript must COMPOSE — an earlier shape "
+        "had the restore branch own the append slot, so one silently replaced the other"
+    )
+    assert "append_parts = [_NEXT_ACTIONS_CONTRACT]" in src
+    # A sandbox image older than the wheel's SDK pin has no `system_prompt`
+    # field; passing it is a TypeError that kills every turn. Before this
+    # change the append slot was reached only by the rare restore path, so
+    # the guard was optional. It is not any more.
+    assert 'if "system_prompt" in getattr(ClaudeAgentOptions, "__dataclass_fields__", {}):' in src
+
+
+def test_the_trailer_is_written_before_the_sources_block():
+    """Both trailers are withheld from the painter while they stream
+    (_streamingSafeText), so their ORDER decides when the buttons can be
+    drawn: next_actions first means the chips land with the answer instead
+    of after the whole tail. All three prompt surfaces must agree, or the
+    model picks one at random."""
+    runner = Path("app/chat/runner.py").read_text(encoding="utf-8")
+    assert "BEFORE any `sources` block" in runner
+    for path in (Path("config/claude_md_template.txt"), WORKSPACE_CLAUDE_MD):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "before any `sources` block" in flat, path
+
+
+def test_no_prompt_surface_keeps_the_conversation_is_over_opt_out():
+    """The root cause was a judgement call the model kept making. Naming two
+    hard cases in the system prompt is worthless while a workspace prompt
+    loaded alongside it still says "skip the block when the conversation is
+    clearly over" — the model would simply follow the permissive one, and the
+    admin-readable contract would not be the same contract. (Copilot review
+    on this PR.)"""
+    for path in (
+        Path("app/chat/runner.py"),
+        Path("config/claude_md_template.txt"),
+        WORKSPACE_CLAUDE_MD,
+    ):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "conversation is clearly over" not in flat, path
+    for path in (Path("config/claude_md_template.txt"), WORKSPACE_CLAUDE_MD):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "Omit it in exactly two cases" in flat, path
+
+
+def test_pending_chips_are_inert_until_the_turn_ends():
+    """The mid-stream row exists to SHOW the follow-ups early, not to let one
+    be fired into a running turn: submitUserMessage has no in-flight guard
+    and calls _resetStreamingState(), so the old turn's remaining frames
+    would render below the new user message."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
+    assert "function renderNextActions(bubble, actions, pending = false)" in js
+    assert "btn.disabled = pending;" in body
+    assert "if (btn.disabled) return;" in body, "the handler must refuse too, not only the attribute"
+    stream = js[js.index("function _renderStreamingMarkdown") : js.index("function _flushStreamingTail")]
+    assert "streamedActions, true)" in stream, "the streaming draw is the only pending one"
+    # Every finish path renders the row enabled — a chip that stayed dead
+    # after the turn ended would be worse than no chip at all.
+    for call in re.findall(r"renderNextActions\([^;]*?\);", js[js.index("function finalizeAssistantMessage") :]):
+        assert "true)" not in call, f"finalize must render enabled chips: {call}"
+
+
+def test_chips_are_drawn_mid_stream_not_only_at_finalize():
+    """The trailer rides inside the same stream, so the buttons are knowable
+    the moment its closing fence arrives. Everything between that moment and
+    the assistant_message frame is turn-close latency the reader used to
+    spend watching a caret."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function _renderStreamingMarkdown") : js.index("function _flushStreamingTail")]
+    assert "extractNextActions(currentAssistantText).actions" in body
+    assert "renderNextActions(" in body
+    assert "if (streamedActions.length)" in body, (
+        "a paint mid-trailer parses nothing yet and must not clear a row already up"
+    )
+
+
+def test_structured_output_validation_survives_the_trailer():
+    """The contract makes the trailer near-certain on EVERY reply, agent-API
+    ones included. Left on, it broke JSON validation twice over: the raw
+    parse fails on the trailing fence, and the fence fallback then returns
+    the TRAILER's body instead of the JSON."""
+    from app.chat.structured_output import validate
+
+    fmt = {"type": "json_schema", "schema": {"type": "object", "required": ["n"]}}
+    answer = '{"n": 4}\n\n```next_actions\n- Chart it\n- Break it down\n```'
+    ok, parsed, err = validate(answer, fmt)
+    assert ok, err
+    assert parsed == {"n": 4}
+
+    both = '{"n": 4}\n\n```next_actions\n- Chart it\n```\n\n```sources\ntable: orders\n```'
+    ok, parsed, err = validate(both, fmt)
+    assert ok, err
+    assert parsed == {"n": 4}
+
+    # A fenced JSON answer still parses, and an unfenced one whose own string
+    # content holds a fence is still parsed whole (the pre-existing rule).
+    ok, parsed, _ = validate('```json\n{"n": 1}\n```', fmt)
+    assert ok and parsed == {"n": 1}
+    ok, parsed, _ = validate('{"n": 1, "code": "```py\\npass\\n```"}', fmt)
+    assert ok and parsed["n"] == 1

@@ -698,7 +698,7 @@ function renderFactsScopeLine(bubble) {
   _resetFactsTurnEvidence();
 }
 
-function renderNextActions(bubble, actions) {
+function renderNextActions(bubble, actions, pending = false) {
   _clearNextActions();
   if (!bubble || !actions || actions.length === 0) return;
   const row = document.createElement("div");
@@ -708,7 +708,20 @@ function renderNextActions(bubble, actions) {
     btn.type = "button";
     btn.className = "cloud-chat-next-action";
     btn.textContent = action;
+    // `pending` is the mid-stream draw: the trailer has closed but the turn
+    // has not. Showing the row there is the point — the reader learns the
+    // follow-ups exist while the tail is still arriving — but CLICKING it
+    // must not be possible yet. The click submits, submitUserMessage has no
+    // in-flight guard (typing into the composer mid-turn is already allowed
+    // and the runner buffers the second user_msg), and it calls
+    // _resetStreamingState(), which drops the stream pointers: the old
+    // turn's remaining frames — the sources verdict, the final
+    // assistant_message — would then land in a fresh bubble BELOW the new
+    // user message. Finalize re-renders this same row enabled a moment
+    // later. (Copilot review on this PR.)
+    btn.disabled = pending;
     btn.addEventListener("click", () => {
+      if (btn.disabled) return;
       const ta = $("chat-input");
       if (!ta) return;
       ta.value = action;
@@ -2930,6 +2943,24 @@ function _renderStreamingMarkdown() {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
   } catch (_e) {
     currentAssistantBody.textContent = visible;
+  }
+  // The chips do not have to wait for the turn to end. The trailer streams
+  // inside THIS answer, so the moment its closing fence arrives the buttons
+  // are already knowable — and what sits between that moment and the
+  // `assistant_message` frame is the entire turn close: whatever the model
+  // still has to write, the SDK's ResultMessage, the manager's persist and
+  // fan-out. That was seconds of a blinking caret with nothing to show for
+  // it. Drawing here is what the kai-agent turn engine's own client does:
+  // it reads next_actions off the streaming message, not off a finished one.
+  //
+  // Idempotent by construction: renderNextActions clears the existing row
+  // before it draws, and finalize renders the identical row from the
+  // server's content — so a repaint, a seal, and the final frame all
+  // converge on one row. Guarded on a non-empty list so a paint mid-trailer
+  // (nothing parseable yet) never clears a row that is already up.
+  const streamedActions = extractNextActions(currentAssistantText).actions;
+  if (streamedActions.length) {
+    renderNextActions(currentAssistantBody.closest(".msg-bubble"), streamedActions, true);
   }
   maybeScrollToBottom();
 }
