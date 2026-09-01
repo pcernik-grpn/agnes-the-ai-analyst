@@ -32,14 +32,18 @@ CORPUS_ID = "col_test"
 BASE = "/api/admin/sharepoint/connections"
 
 
-def _producer_auth(conn_id: str, collection_id: str) -> dict:
-    """Doc-sync uploads ride the producer's scoped credential — the scope-
-    confirmed collection refuses interactive uploads with a typed 409
-    (`collection_source_managed`), and the crawler is these tests' real
-    caller anyway."""
-    from app.auth.producer_token import mint_producer_token
+@pytest.fixture(autouse=True)
+def _pipeline_bypass():
+    """A scope-confirmed collection refuses interactive uploads with a typed
+    409 (`collection_source_managed`) — its documents only ever arrive
+    through the in-process pipeline, and the external producer's HTTP
+    credential no longer exists. These tests' real writer is the crawler,
+    so suspend the integrity rule module-wide and upload as admin; the
+    refusal itself is covered in tests/test_api_collections.py."""
+    from unittest import mock
 
-    return _auth(mint_producer_token(connection_id=conn_id, collection_ids=[collection_id], ttl_seconds=3600))
+    with mock.patch("app.api.collections.source_managing_connection", return_value=None):
+        yield
 
 
 def _auth(token: str) -> dict:
@@ -307,7 +311,7 @@ def test_full_fixture_added_updated_renamed_deleted(tmp_path, monkeypatch, pg_en
     assert scope.status_code == 201, scope.text
     collection_id = scope.json()["collection_id"]
 
-    upload_kwargs = dict(headers=_producer_auth(conn_id, collection_id))
+    upload_kwargs = dict(headers=_auth(token))
 
     # 1. added
     r1 = client.post(
@@ -381,7 +385,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
             f"/api/collections/{collection_id}/files",
             files=[("files", (f"f{i}.md", io.BytesIO(f"content-{i}".encode()), "text/markdown"))],
             data={"paths": f"docs/f{i}.md"},
-            headers=_producer_auth(conn_id, collection_id),
+            headers=_auth(token),
         )
         assert r.status_code == 201, r.text
 

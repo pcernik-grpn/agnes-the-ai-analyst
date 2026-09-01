@@ -3,13 +3,14 @@
 ``app/web/static/js/file_preview.js`` was the Library's modal and is now also
 the chat session-files drawer's, which makes two things worth pinning:
 
-1. The ``slides`` kind renders. It is the whole reason the chat can preview a
-   deliverable at all — a browser has no renderer for ``.pptx``, so the server
-   sends the deck's words and this file draws them. A test that only greps the
+1. The ``slides`` and ``sheets`` kinds render. They are the whole reason the
+   chat can preview a deliverable at all — a browser has no renderer for a
+   ``.pptx`` or an ``.xlsx``, so the server sends the deck's words / the
+   workbook's cells and this file draws them. A test that only greps the
    source for ``'slides'`` would pass on a renderer that throws.
-2. Server strings still land via ``textContent``. Slide titles and bullets are
-   agent-authored text arriving over JSON; the day one of them reaches
-   ``innerHTML`` the drawer becomes stored XSS against its own reader.
+2. Server strings still land via ``textContent``. Slide titles, bullets and
+   cell values are agent-authored text arriving over JSON; the day one of them
+   reaches ``innerHTML`` the drawer becomes stored XSS against its own reader.
 
 Same ``node -e`` pattern as ``tests/test_chat_files_drawer_ui.py`` — there is
 no DOM harness in CI, so the stub stands in for the document and the fetch and
@@ -195,6 +196,126 @@ def test_a_slide_with_no_text_says_so_rather_than_rendering_an_empty_card() -> N
     tree = _render({"kind": "slides", "name": "x.pptx", "slides": [{"index": 1, "title": "", "lines": []}]})
     empties = [n["text"] for n in _flatten(tree) if n["cls"] == "fp-slide__empty"]
     assert empties == ["No text on this slide."]
+
+
+def _grid_rows(tree: dict) -> list[list[list[str]]]:
+    """Every sheet's cell text, sheet by sheet then row by row — the shape the
+    reader actually sees, rebuilt from the tree the renderer built."""
+    out: list[list[list[str]]] = []
+    for wrap in [n for n in _flatten(tree) if n["cls"] == "fp-sheet__wrap"]:
+        rows: list[list[str]] = []
+        for node in _flatten(wrap):
+            if node["tag"] == "tr":
+                rows.append([c["text"] for c in node["kids"] if c["tag"] == "td"])
+        out.append(rows)
+    return out
+
+
+def test_a_workbook_renders_one_grid_per_sheet_in_tab_order() -> None:
+    """The workbook half of the same promise the deck test makes: a browser
+    cannot draw an .xlsx, so the server sends the stored cells and this has to
+    turn them back into a readable grid — in tab order, cell order intact."""
+    tree = _render(
+        {
+            "kind": "sheets",
+            "name": "q3-revenue.xlsx",
+            "file_type": "xlsx",
+            "truncated": False,
+            "sheets": [
+                {
+                    "name": "Q3 Revenue",
+                    "rows": [["Region", "Revenue"], ["EMEA", "1250000"], ["AMER", "980000"]],
+                    "truncated": False,
+                },
+                {"name": "Notes", "rows": [["second tab", ""], ["", "sparse"]], "truncated": False},
+            ],
+        }
+    )
+    nodes = _flatten(tree)
+    assert [n["text"] for n in nodes if n["cls"] == "fp-sheet__name"] == ["Q3 Revenue", "Notes"]
+    assert _grid_rows(tree) == [
+        [["Region", "Revenue"], ["EMEA", "1250000"], ["AMER", "980000"]],
+        [["second tab", ""], ["", "sparse"]],
+    ]
+
+    # Cells are shown as STORED — a formula's cached result, a date's serial
+    # number — and the note has to say so, or a reader takes 46266 for a bug.
+    note = next(n for n in nodes if n["cls"] == "fp-note")
+    assert "Stored cell values" in note["text"]
+    assert "Showing the first" not in note["text"]
+
+
+def test_cell_text_never_reaches_innerhtml() -> None:
+    """Same security property as the deck's, one kind over. A cell value is
+    agent-authored and arrives over JSON, and a sheet NAME is too."""
+    tree = _render(
+        {
+            "kind": "sheets",
+            "name": "x.xlsx",
+            "sheets": [
+                {
+                    "name": "<img src=x onerror=alert(1)>",
+                    "rows": [["<script>alert(2)</script>", "=cmd|'/c calc'!A0"]],
+                    "truncated": False,
+                }
+            ],
+        }
+    )
+    nodes = _flatten(tree)
+    assert any(n["text"] == "<img src=x onerror=alert(1)>" for n in nodes)
+    assert any(n["text"] == "<script>alert(2)</script>" for n in nodes)
+    with_html = [n["html"] for n in nodes if n["html"]]
+    assert len(with_html) == 1
+    assert with_html[0].startswith("<svg")
+    assert "onerror" not in with_html[0]
+
+
+def test_a_clipped_sheet_and_a_clipped_workbook_each_say_so() -> None:
+    """Two independent ceilings, two independent sentences: rows/columns are
+    clipped per sheet, sheets are clipped per workbook, and a reader who is
+    missing columns must not be told they are missing tabs instead."""
+    per_sheet = _render(
+        {
+            "kind": "sheets",
+            "name": "wide.xlsx",
+            "truncated": False,
+            "sheets": [{"name": "Wide export", "rows": [["a", "b"]], "truncated": True}],
+        }
+    )
+    note = next(n for n in _flatten(per_sheet) if n["cls"] == "fp-note")
+    assert "Showing the first rows and columns." in note["text"]
+    assert "Showing the first sheets." not in note["text"]
+
+    per_workbook = _render(
+        {
+            "kind": "sheets",
+            "name": "many.xlsx",
+            "truncated": True,
+            "sheets": [{"name": "S1", "rows": [["a"]], "truncated": False}],
+        }
+    )
+    note = next(n for n in _flatten(per_workbook) if n["cls"] == "fp-note")
+    assert "Showing the first sheets." in note["text"]
+    assert "Showing the first rows and columns." not in note["text"]
+
+
+def test_an_empty_sheet_says_so_rather_than_rendering_an_empty_grid() -> None:
+    """An empty tab is an answer — the agent made it and wrote nothing into
+    it — and a bare bordered box would read as a broken render instead."""
+    tree = _render(
+        {
+            "kind": "sheets",
+            "name": "x.xlsx",
+            "sheets": [
+                {"name": "Data", "rows": [["1"]], "truncated": False},
+                {"name": "Empty", "rows": [], "truncated": False},
+            ],
+        }
+    )
+    nodes = _flatten(tree)
+    assert [n["text"] for n in nodes if n["cls"] == "fp-sheet__empty"] == ["This sheet is empty."]
+    # The empty tab draws no table at all, so the one grid is the first sheet's.
+    assert _grid_rows(tree) == [[["1"]]]
 
 
 def test_an_image_kind_still_draws_from_raw_url() -> None:
