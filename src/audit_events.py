@@ -805,6 +805,9 @@ CATALOG: dict[str, AuditEvent] = {
         "collection.file_delete", "mutation", "A file was deleted from a knowledge collection."
     ),
     "collection.create": AuditEvent("collection.create", "mutation", "A knowledge collection was created."),
+    "collection.update": AuditEvent(
+        "collection.update", "mutation", "A knowledge collection's name, slug or description was edited."
+    ),
     "collection.file_add": AuditEvent(
         "collection.file_add", "mutation", "A file was uploaded into a knowledge collection."
     ),
@@ -1310,6 +1313,21 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_acl.sweep_triggered",
         "mutation",
         "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
+    ),
+    # -- read-only view-as (app/auth/view_as.py) ---------------------------
+    # Both rows are attributed to the VIEWER and name the target in
+    # `resource`, so "who looked through whose eyes, and when" is one query.
+    # Category "auth": what changed is the effective principal of a browser
+    # session, not any domain object.
+    "view_as.start": AuditEvent(
+        "view_as.start",
+        "auth",
+        "An admin began viewing Agnes read-only as another user (resource names the target).",
+    ),
+    "view_as.end": AuditEvent(
+        "view_as.end",
+        "auth",
+        "An admin left a read-only view-as session (resource names the target).",
     ),
     # -- 2026-09-01 owner decision: the anonymize-in-front pipeline's
     # per-instance HMAC key (design spec §9.2) is generated and stored by

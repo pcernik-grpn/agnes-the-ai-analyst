@@ -119,6 +119,52 @@ def test_log_all_kwargs_round_trip(audit_repo):
     assert _as_dict(row["params_before"]) == {"cron": "0 */1 * * *"}
 
 
+def test_log_reattributes_a_row_written_during_view_as(audit_repo):
+    """Both backends re-attribute to the VIEWER while a read-only view-as is
+    active (``src.audit_context.apply_view_as_attribution``).
+
+    ``get_current_user`` resolves to the TARGET during view-as, so a handler
+    writing ``user_id=user["id"]`` names someone who did nothing — the
+    correction has to live where every row passes, and it has to behave the
+    same on both engines.
+    """
+    from app.auth.view_as import ViewAsTicket, reset_for_request, set_active_for_request
+
+    repo, _, _ = audit_repo
+    token = set_active_for_request(
+        ViewAsTicket(
+            viewer_user_id="admin1",
+            viewer_email="admin@example.com",
+            target_user_id="analyst1",
+            target_email="analyst@example.com",
+        )
+    )
+    try:
+        repo.log(user_id="analyst1", action="sync.manifest", correlation_id="corr-va-1")
+        # A row this request writes ABOUT a third party keeps its own subject.
+        repo.log(user_id="someone_else", action="sync.manifest", correlation_id="corr-va-2")
+    finally:
+        reset_for_request(token)
+
+    rows, _ = repo.query(correlation_id="corr-va-1", limit=10)
+    assert rows[0]["user_id"] == "admin1"
+    assert _as_dict(rows[0]["params"]) == {"viewed_as": "analyst1"}
+
+    rows, _ = repo.query(correlation_id="corr-va-2", limit=10)
+    assert rows[0]["user_id"] == "someone_else"
+
+
+def test_log_outside_view_as_is_untouched(audit_repo):
+    """Positive control for the rewrite above: no ticket, no rewrite, no
+    ``viewed_as`` key — which is every row on an instance that never uses the
+    feature."""
+    repo, _, _ = audit_repo
+    repo.log(user_id="analyst1", action="sync.manifest", correlation_id="corr-va-3")
+    rows, _ = repo.query(correlation_id="corr-va-3", limit=10)
+    assert rows[0]["user_id"] == "analyst1"
+    assert _as_dict(rows[0]["params"]) in (None, {})
+
+
 def test_query_time_range(audit_repo):
     repo, _, _ = audit_repo
     repo.log(action="a.1")

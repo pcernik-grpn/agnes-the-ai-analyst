@@ -610,13 +610,11 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     pins (env-lock honesty) rather than whatever `instance.yaml` happens to
     hold underneath it.
 
-    Every reader resolves env-first (`app.worker.kinds
-    ._extraction_producer_argv` for the two leaves below; the connector's
-    `enabled` state itself lives on the separate `sharepoint` switch, not
-    here — see `app.switches.switch_value`), so a stale/absent yaml value
-    under an active pin would otherwise render a value the runtime does not
-    actually use — for a field the operator cannot act on here anyway, that
-    is worse than showing the truth.
+    Currently a no-op body: `_EXTRACTION_ENV_LOCKS` above is empty, since
+    the external-producer leaves it used to cover were removed along with
+    external-producer mode (the connector's `enabled` state lives on the
+    separate `sharepoint` switch — see `app.switches.switch_value`). Kept
+    as the mechanism a future locked `extraction.*` leaf slots back into.
     """
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):
@@ -1169,13 +1167,14 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
     "mcp": {
         "allow_query_param_token": {
             "kind": "bool",
-            "default": _flag_default("mcp", "allow_query_param_token", True),
+            "default": _flag_default("mcp", "allow_query_param_token", False),
             "hint": (
                 "Accept an MCP access token in the `?token=` query string as "
-                "well as the Authorization header. Convenient for clients that "
-                "cannot set headers, but a URL travels through proxy logs, "
-                "browser history and Referer headers, so turn it off once every "
-                "client you use sends the header."
+                "well as the Authorization header. OFF by default (#1656 audit "
+                "follow-up) — a URL travels through proxy logs, browser history "
+                "and Referer headers (CWE-598). Turn it on only for a client "
+                "that genuinely cannot set the Authorization header; every "
+                "connection snippet Agnes hands out is header-based already."
             ),
         },
         "session_pool": {

@@ -41,19 +41,60 @@
 #
 # `docker logs` / `docker compose logs` keep working via Docker's dual-logging
 # local cache (Docker >= 20.10).
+#
+# SCOPE: exactly the services `docker-compose.yml` defines — no more, no
+# less, pinned by tests/test_gcp_logging_overlay_placement.py.
+#
+# No less, because this list was written once (#679) against the compose
+# file of the day and then drifted: `extraction-worker`, `apps-runner`,
+# `egress-proxy` and `kai-agent-stub` were all added to the base compose
+# later and silently stayed on json-file. On a live customer VM that meant
+# the connector crawl logs — the ones an operator goes looking for — never
+# left the box and died with every auto-upgrade container recreate, while
+# app/scheduler/caddy shipped fine and made the setup look healthy. Note
+# `extract` and `extraction-worker` are two different services (a one-shot
+# extractor under the `extract` profile vs. the long-running extraction
+# lane); covering one is not covering the other.
+#
+# No more, because this overlay is engaged from file presence alone, so it
+# must stay loadable next to ANY combination of the other overlays. A
+# service named here but defined only in a conditional overlay — `redis`
+# and `extraction-worker`'s image in the module-written
+# docker-compose.extraction.yml, `postgres` on side-car backends,
+# `kai-agent` in docker-compose.kai-agent.yml — would appear to compose as
+# a service with no image/build on every instance that does not load that
+# overlay, and compose then refuses to parse the whole stack: every
+# `docker compose` call on the VM fails, which is the fleet-freeze shape of
+# #1557 through a different door. Those services take their log driver in
+# the overlay that defines them.
+#
+# Order below mirrors docker-compose.yml so a future addition there is
+# visibly missing here.
 services:
   app:
+    logging:
+      driver: gcplogs
+  extract:
     logging:
       driver: gcplogs
   scheduler:
     logging:
       driver: gcplogs
-  caddy:
+  extraction-worker:
+    logging:
+      driver: gcplogs
+  apps-runner:
+    logging:
+      driver: gcplogs
+  egress-proxy:
+    logging:
+      driver: gcplogs
+  kai-agent-stub:
     logging:
       driver: gcplogs
   telegram-bot:
     logging:
       driver: gcplogs
-  extract:
+  caddy:
     logging:
       driver: gcplogs

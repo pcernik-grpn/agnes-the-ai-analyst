@@ -328,38 +328,39 @@ credential-bearing URL.
 
 #### Reverse-proxy access logs — MCP SSE `?token=`
 
-The MCP SSE transport accepts the bearer token as a `?token=` query parameter,
-a fallback for clients that cannot set an `Authorization` header on a GET. When
-a client uses it, the token — a long-lived PAT, not a single-use code — lands in
-the access log of every intermediary that records request URIs (CWE-598). Agnes
-logs a one-time warning naming this the first time the fallback is used, so
-check your logs for it.
+The MCP SSE transport can accept the bearer token as a `?token=` query
+parameter, a fallback for a client that cannot set an `Authorization` header
+on a GET. **Off by default since the #1656 audit follow-up** — a request that
+carries only `?token=` is refused exactly like an unauthenticated request
+(`401`) unless an operator opts back in. Most instances need no action: an
+upgrade from an older release that never wrote this setting picks up the new,
+safe default automatically. If you (or an earlier config export) ever
+explicitly saved `true` here, that value persists across upgrades and the
+fallback stays on until you flip it — check its `effective` value on
+`/admin/server-config`.
 
-Two ways to handle it, in order of preference:
+Every connection snippet Agnes hands out on the MCP connect page is
+header-based already — the `?token=` snippet was removed in the 2026-07-24
+audit follow-up — so nothing in a typical fleet needs the parameter.
 
-1. **Turn the fallback off.** Every connection snippet Agnes hands out on the
-   MCP connect page is header-based — the `?token=` snippet was removed in the
-   2026-07-24 audit follow-up — so unless you have a hand-rolled client, nothing
-   in your fleet needs the parameter. Set `mcp.allow_query_param_token: false`
-   in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=false`); the
-   parameter is then ignored and such requests get a 401. This removes the
-   exposure rather than containing it. Default is `true` so an upgrade never
-   breaks a client that still relies on it — check for the one-time warning in
-   your logs before flipping it.
+Turn it on (`mcp.allow_query_param_token: true` in `/admin/server-config`, or
+`AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) only for a documented client that
+genuinely cannot set the header. When enabled and a client actually uses it,
+the token — a long-lived PAT, not a single-use code — lands in the access log
+of every intermediary that records request URIs (CWE-598); Agnes logs a
+one-time warning naming this the first time the fallback fires, so check your
+logs for it. Prefer containing the exposure over carrying it indefinitely:
 
-   **Write `false`, `off`, `no`, or `0` — nothing else disables it.** Agnes's
-   flag parser treats every unrecognized string as truthy, so `disabled`,
-   `disable`, or `n` leave the fallback **on** with no error. That convention is
-   harmless for flags whose default is inert, but this one defaults to
-   permissive, so a typo silently keeps the exposure you were trying to remove.
-   Confirm the change took by reading the flag's `effective` value back from
-   `/admin/server-config` rather than trusting the save.
-2. **Keep it and redact.** If a client genuinely cannot set the header, add a
-   proxy rule that drops or masks the `token` query parameter for
-   `/api/mcp/*`, as above for the OAuth callback. Note this only covers *your*
-   proxy — the token still travels in the URL and can be captured anywhere else
-   on the path, so treat any PAT used this way as exposed and rotate it if the
-   log retention worries you.
+- Add a proxy rule that drops or masks the `token` query parameter for
+  `/api/mcp/*`, as above for the OAuth callback. This only covers *your*
+  proxy — the token still travels in the URL and can be captured anywhere else
+  on the path, so treat any PAT used this way as exposed and rotate it if the
+  log retention worries you.
+- **Write `true`/`false` (or `on`/`off`, `yes`/`no`, `1`/`0`) — Agnes's flag
+  parser treats every unrecognized string as truthy**, so a typo like
+  `disabled` or `n` when turning it back off leaves it **enabled** with no
+  error. Confirm any change took by reading the flag's `effective` value back
+  from `/admin/server-config` rather than trusting the save.
 
 #### VPN/intranet-only instances — MCP connector reachability
 
@@ -643,29 +644,35 @@ On a VM provisioned by the Terraform module
 (`infra/modules/customer-instance`), none of this is assembled by hand —
 the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
 reverted on the next recreate. Instead set the per-instance
-`extraction_worker_enabled = true` (default off) together with the
-module-level `extraction_worker_image` — normally the SAME ref as the app
-image, since every standard app image already carries the `extraction`
-optional extra (markitdown, pypdfium2); it stays a separate variable only
-so an operator can hold the worker on a different tag during a canary.
-The module refuses the flag without an image at plan time. The module then
-renders the Redis coordination backend, the `.env` coordination
-declaration, an `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint
-connector, not just extraction — see the migration note in
+`extraction_worker_enabled = true` (default off). The module then renders
+the Redis coordination backend, the `.env` coordination declaration, an
+`AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint connector, not just
+extraction — see the migration note in
 [`feature-flags.md`](feature-flags.md)), and an always-on
-`extraction-worker` service into the boot path. (The former
-`AGNES_EXTRACTION_PRODUCER_COMMAND` line died with the external-producer
-mode; the module variable is kept declared but deprecated and inert.) Because these ride `.env`
-(env overrides `instance.yaml` — the same posture
-`app/coordination/factory.py` already uses for the coordination backend
-itself), the TF flag alone activates `corpus-extraction` end to end — no
-applier-owned edit of `instance.yaml` on the VM's data disk is needed for
-the ordinary case. The startup script is under `lifecycle.ignore_changes`,
-so flipping the flag on an existing VM takes effect only through a VM
-recreate (`terraform apply -replace=<vm address>`); the Postgres app-state
-and explicit-secrets prerequisites above remain yours to satisfy — on a
-DuckDB app-state instance the app still refuses to boot, naming the
-missing piece.
+`extraction-worker` service into the boot path. By DEFAULT the service gets
+no `image:` override at all and inherits the SAME image/tag as
+`app`/`scheduler` (`AGNES_IMAGE_REPO`/`AGNES_TAG`), since the built-in
+extraction pipeline needs nothing bundled that image does not already
+carry — this is what keeps the worker from drifting behind the app as the
+fleet auto-upgrades. The module-level `extraction_worker_image` can still
+pin the worker to a DIFFERENT tag for a deliberate, temporary reason (a
+canary, holding the worker back mid-rollout); leaving such a pin in place
+risks the exact crash loop the default avoids once the app migrates the
+database past what the pinned image's Alembic head knows — see that
+variable's own description. Because these ride `.env` (env overrides
+`instance.yaml` — the same posture `app/coordination/factory.py` already
+uses for the coordination backend itself), the TF flag alone activates
+`corpus-extraction` end to end — no applier-owned edit of `instance.yaml`
+on the VM's data disk is needed for the ordinary case. The startup script
+is under `lifecycle.ignore_changes`, so flipping the flag on an existing VM
+takes effect only through a VM recreate (`terraform apply
+-replace=<vm address>`); the Postgres app-state and explicit-secrets
+prerequisites above remain yours to satisfy — on a DuckDB app-state
+instance the app still refuses to boot, naming the missing piece.
+
+(The module-level `extraction_producer_command` variable, from the retired
+external-producer design, is still accepted for tfvars compatibility but is
+no longer read — see its `variables.tf` description.)
 
 If any SharePoint scope is anonymize-marked, provision the per-instance
 pseudonym key **before the first run** — generation, `runtime_secret_env`

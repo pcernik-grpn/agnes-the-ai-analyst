@@ -141,7 +141,22 @@ def is_user_admin(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None
 
     ``conn`` honored when explicitly passed (test isolation); falls back
     to the global factory otherwise.
+
+    **Always False for the subject of an active read-only view-as** (see
+    ``app/auth/view_as.py``). This is the choke point every admin gate in the
+    codebase is built out of — ``require_admin``, ``is_admin_session``,
+    ``src.rbac``'s short-circuit, ``_attach_admin_flag``'s chrome flag — so
+    suppressing god-mode HERE is what makes "view-as can only ever narrow"
+    true by construction rather than by remembering to check it at each gate.
+    It matters most in the case that looks harmless: viewing as another ADMIN
+    must not hand the mode admin authority. Subject-scoped, so a question
+    asked about somebody ELSE (an admin page listing who is an admin) still
+    gets its true answer.
     """
+    from app.auth.view_as import is_narrowed_subject
+
+    if is_narrowed_subject(user_id):
+        return False
     admin_id = _get_group_id_by_name(SYSTEM_ADMIN_GROUP, conn=conn)
     if admin_id is None:
         # No Admin group seeded — defensively deny. Fail-closed beats the
