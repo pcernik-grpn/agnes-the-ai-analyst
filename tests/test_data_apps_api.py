@@ -892,6 +892,114 @@ class TestDeploy:
         assert r.status_code == 400 and r.json()["detail"] == "prod_on_draft"
 
 
+def _seed_app_with_bad_file(data_dir, slug="badapp", owner_id="owner1"):
+    """Like `_seed_app_with_commit`, but the commit's tree carries a DA001
+    finding (an exposed `express.static(__dirname)` root) — the fixture the
+    deploy-check `warn`/`block` tests deploy."""
+    from src.data_apps.git_repos import init_app_repo
+    from src.db import get_system_db
+    from src.repositories.data_apps import DataAppsRepository
+
+    conn = get_system_db()
+    try:
+        DataAppsRepository(conn).create(slug=slug, name=slug.upper(), owner_user_id=owner_id)
+    finally:
+        conn.close()
+
+    repo_dir = init_app_repo(slug)
+    work = data_dir / f"work-{slug}"
+    subprocess.run(["git", "clone", str(repo_dir), str(work)], check=True, capture_output=True)
+    (work / "server").mkdir(parents=True, exist_ok=True)
+    (work / "server" / "index.ts").write_text("app.use(express.static(__dirname));\n")
+    subprocess.run(["git", "-C", str(work), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(work), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "c1"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "-C", str(work), "push", "origin", "HEAD:main"], check=True, capture_output=True)
+
+
+def _set_deploy_check_mode(mode):
+    """Overrides `data_apps.deploy_checks` in-process the same way
+    `test_feature_disabled_404s` overrides `enabled` — returns the ORIGINAL
+    `_instance_config` for the caller to restore in a `finally`."""
+    import app.instance_config as instance_config
+
+    original = instance_config._instance_config
+    instance_config._instance_config = {**(original or {}), "data_apps": {"enabled": True, "deploy_checks": mode}}
+    return original
+
+
+class TestDeployCheck:
+    """Deploy-time exposure scan (#1946) — `POST .../deploy` wiring only;
+    the rules themselves are unit-tested in test_data_apps_deploy_check.py."""
+
+    def test_warn_mode_surfaces_findings_and_deploy_still_runs(self, client_as_user, fake_runner, api_env):
+        _seed_app_with_bad_file(api_env["data_dir"], slug="badapp1")
+        r = client_as_user.post("/api/data-apps/badapp1/deploy", json={})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["deploy_check"]["status"] == "warn"
+        assert body["deploy_check"]["findings"][0]["rule_id"] == "DA001"
+        assert fake_runner.up_calls
+
+    def test_block_mode_refuses_deploy_and_never_advances_agnes_live(self, client_as_user, fake_runner, api_env):
+        _seed_app_with_bad_file(api_env["data_dir"], slug="badapp2")
+        from src.data_apps.git_repos import resolve_ref
+
+        original = _set_deploy_check_mode("block")
+        try:
+            before = resolve_ref("badapp2", "agnes-live")
+            r = client_as_user.post("/api/data-apps/badapp2/deploy", json={})
+            assert r.status_code == 422
+            assert r.json()["detail"]["error"] == "deploy_check_failed"
+            assert r.json()["detail"]["deploy_check"]["findings"]
+            assert not fake_runner.up_calls
+            assert resolve_ref("badapp2", "agnes-live") == before
+        finally:
+            import app.instance_config as instance_config
+
+            instance_config._instance_config = original
+
+    def test_external_repo_warn_mode_reports_skipped(self, client_as_user, fake_runner, api_env):
+        _seed_external_app(slug="eappwarn", owner_id="owner1")
+        r = client_as_user.post("/api/data-apps/eappwarn/deploy", json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["deploy_check"] == {
+            "status": "skipped",
+            "findings": [],
+            "rules_run": [],
+            "files_scanned": 0,
+            "skipped": "external_repo",
+        }
+
+    def test_external_repo_block_mode_refuses(self, client_as_user, fake_runner, api_env):
+        _seed_external_app(slug="eappblock", owner_id="owner1")
+        original = _set_deploy_check_mode("block")
+        try:
+            r = client_as_user.post("/api/data-apps/eappblock/deploy", json={})
+            assert r.status_code == 422
+            assert r.json()["detail"]["error"] == "deploy_check_unavailable_external_repo"
+            assert not fake_runner.up_calls
+        finally:
+            import app.instance_config as instance_config
+
+            instance_config._instance_config = original
+
+    def test_off_mode_omits_deploy_check_key(self, client_as_user, fake_runner, api_env):
+        _seed_app_with_commit(api_env["data_dir"], slug="offapp")
+        original = _set_deploy_check_mode("off")
+        try:
+            r = client_as_user.post("/api/data-apps/offapp/deploy", json={})
+            assert r.status_code == 200, r.text
+            assert "deploy_check" not in r.json()
+        finally:
+            import app.instance_config as instance_config
+
+            instance_config._instance_config = original
+
+
 class TestStop:
     def test_stop_happy_path(self, client_as_user, fake_runner, seeded_repo_with_commit):
         client_as_user.post("/api/data-apps/sapp/deploy", json={})
