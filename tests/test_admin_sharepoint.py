@@ -367,6 +367,192 @@ class TestSiteByUrl:
         assert r.json()["detail"]["error"] == "sharepoint_graph_error"
 
 
+class TestManualSites:
+    """Persistence for a site added by URL (2026-09-01 bug report): the
+    ``Sites.Selected`` escape hatch (``?site_url=`` on ``.../tree``) only
+    ever RESOLVED a site — the result lived in the wizard's own in-memory
+    ``spManualSites`` and vanished the moment the wizard was reopened,
+    forcing the admin to re-paste the same URL every time. These two routes
+    store the resolved site on the connection's own ``config.manual_sites``
+    so it survives a reopen, same idempotent-on-id contract as a confirmed
+    scope's collection."""
+
+    def _mock_graph(self, monkeypatch, handler):
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def full_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            return handler(request)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(full_handler), timeout=10)
+        )
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/X"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_delete_requires_admin(self, seeded_app):
+        r = seeded_app["client"].delete(
+            f"{BASE}/nope/manual-sites", params={"site_id": "x"}, headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/X"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_adding_a_site_by_url_persists_it_on_the_connection(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200, json={"id": "s-by-url", "displayName": "Project Hub", "webUrl": "https://contoso/x"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-persist")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json() == {"id": "s-by-url", "name": "Project Hub", "web_url": "https://contoso/x"}
+
+        # Persisted on the connection's own config, readable via the generic
+        # listing the wizard already fetches on every page load.
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == [
+            {"id": "s-by-url", "name": "Project Hub", "web_url": "https://contoso/x"}
+        ]
+
+    def test_adding_the_same_site_twice_is_idempotent(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "s-dup", "displayName": "Dup Site", "webUrl": "https://contoso/dup"})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-idempotent")
+
+        for _ in range(2):
+            r = c.post(
+                f"{BASE}/{conn_id}/manual-sites",
+                json={"site_url": "https://contoso.sharepoint.com/sites/Dup"},
+                headers=_auth(token),
+            )
+            assert r.status_code == 201, r.text
+
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == [{"id": "s-dup", "name": "Dup Site", "web_url": "https://contoso/dup"}]
+
+    def test_malformed_site_url_is_a_typed_422(self, seeded_app, monkeypatch):
+        self._mock_graph(monkeypatch, lambda request: httpx.Response(500))
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-bad-url")
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "http://contoso.sharepoint.com/sites/X"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_site_url"
+
+    def test_not_granted_site_is_a_typed_error(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-not-granted")
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/NotGranted"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_site_not_granted"
+
+    def test_removing_a_manual_site(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"id": "s-remove", "displayName": "Remove Me", "webUrl": "https://contoso/rm"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-remove")
+        c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/Remove"},
+            headers=_auth(token),
+        )
+
+        r = c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "s-remove"}, headers=_auth(token))
+        assert r.status_code == 204, r.text
+
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == []
+
+    def test_removing_unknown_manual_site_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-remove-404")
+        r = c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "nope"}, headers=_auth(token))
+        assert r.status_code == 404
+
+    def test_delete_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].delete(
+            f"{BASE}/does-not-exist/manual-sites", params={"site_id": "x"}, headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_add_and_remove_are_audited(self, seeded_app, monkeypatch):
+        from src.repositories import audit_repo
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"id": "s-audit", "displayName": "Audit Site", "webUrl": "https://contoso/audit"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-audit")
+
+        c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/Audit"},
+            headers=_auth(token),
+        )
+        c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "s-audit"}, headers=_auth(token))
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.manual_site_add", limit=10)
+        assert any(conn_id in (row.get("resource") or "") for row in rows)
+        rows, _ = audit_repo().query(action="sharepoint_connection.manual_site_remove", limit=10)
+        assert any(conn_id in (row.get("resource") or "") for row in rows)
+
+
 class TestSubfolderBrowsing:
     """TCRD-240: `?item_id=` lets the wizard browse below the drive root at
     any depth — the pre-existing contract stopped at "sites -> drives ->

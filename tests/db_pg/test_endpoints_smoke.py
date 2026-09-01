@@ -3277,6 +3277,15 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
+    # Manual-site persistence (2026-09-01 fix) — a site added by URL under
+    # the `Sites.Selected` escape hatch is stored on the SAME EXISTING
+    # `source_connections.config` JSON column the scope rows above already
+    # use (a new `manual_sites` key, no new schema surface). Auth matrix,
+    # typed cert/Graph-error responses, idempotency-on-site-id, and removal
+    # are all covered by tests/test_admin_sharepoint.py::TestManualSites;
+    # not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/manual-sites",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/manual-sites",
     "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
     # Certificate metadata (thumbprint/subject/issuer/expiry) — derived at
     # request time from the connection's own stored PEM, no new schema

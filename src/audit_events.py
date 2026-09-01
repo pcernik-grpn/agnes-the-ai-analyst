@@ -698,6 +698,16 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin confirmed a SharePoint site/library/folder as an ingested scope.",
     ),
+    "sharepoint_connection.manual_site_add": AuditEvent(
+        "sharepoint_connection.manual_site_add",
+        "mutation",
+        "An admin added a SharePoint site by URL, persisting it on the connection.",
+    ),
+    "sharepoint_connection.manual_site_remove": AuditEvent(
+        "sharepoint_connection.manual_site_remove",
+        "mutation",
+        "An admin removed a SharePoint site previously added by URL.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",

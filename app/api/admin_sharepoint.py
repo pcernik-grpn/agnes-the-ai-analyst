@@ -24,6 +24,20 @@ Surface:
                                                                 (``?q=``, ``?mode=``) over the
                                                                 same tree — never Graph's own
                                                                 ``/search`` (TCRD-240).
+  POST   /api/admin/sharepoint/connections/{id}/manual-sites — resolve a site by URL (the
+                                                                same ``Sites.Selected`` escape
+                                                                hatch as ``?site_url=`` above)
+                                                                AND persist it on the
+                                                                connection's own
+                                                                ``config.manual_sites``, so it
+                                                                survives a wizard reopen
+                                                                (2026-09-01 bug: the tree
+                                                                endpoint alone only ever
+                                                                resolved, never stored).
+                                                                Idempotent on the resolved
+                                                                site id.
+  DELETE /api/admin/sharepoint/connections/{id}/manual-sites — forget one site added by URL
+                                                                (``?site_id=``).
   GET    /api/admin/sharepoint/connections/{id}/scopes       — list the connection's
                                                                 confirmed scope rows,
                                                                 enriched with collection +
@@ -301,6 +315,15 @@ class ScopeRemovalOut(BaseModel):
     collection: Optional[ScopeCollectionRef] = None
 
 
+class AddManualSiteBody(BaseModel):
+    """The URL an admin pasted into "Add a site by URL" (step 2) — the SAME
+    input :func:`browse_tree`'s ``?site_url=`` already resolves, just carried
+    in a POST body instead of a query param so this call can also persist the
+    result (see :func:`add_manual_site`)."""
+
+    site_url: str = Field(..., min_length=1)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -337,8 +360,18 @@ class ScopeRemovalOut(BaseModel):
 #: ``retired_scope_collections`` (2026-08-31) is the fourth: the
 #: untick tombstones :func:`remove_scope` writes so :func:`confirm_scope`
 #: can re-adopt a scope's previous collection on re-tick instead of minting
-#: a duplicate.
-SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret", "retired_scope_collections")
+#: a duplicate. ``manual_sites`` (2026-09-01) is the fifth: the sites an
+#: admin added by URL under the ``Sites.Selected`` escape hatch
+#: (:func:`add_manual_site` / :func:`remove_manual_site`) — without this the
+#: wizard forgot every one of them the moment the connection was next edited
+#: through the generic form, forcing a re-paste of the same URL.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = (
+    "scopes",
+    "extraction",
+    "webhook_secret",
+    "retired_scope_collections",
+    "manual_sites",
+)
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -459,6 +492,11 @@ async def _annotate_unique_permissions(token: str, drive_id: str, items: List[Di
 def _scopes(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     scopes = (row.get("config") or {}).get("scopes")
     return list(scopes) if isinstance(scopes, list) else []
+
+
+def _manual_sites(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sites = (row.get("config") or {}).get("manual_sites")
+    return list(sites) if isinstance(sites, list) else []
 
 
 async def _resolved_token(row: Dict[str, Any]) -> str:
@@ -975,6 +1013,84 @@ async def browse_tree(
             status_code=502,
             detail={"error": "sharepoint_graph_error", "message": str(exc)},
         ) from exc
+
+
+@router.post("/connections/{connection_id}/manual-sites", status_code=201)
+async def add_manual_site(
+    connection_id: str,
+    body: AddManualSiteBody,
+    _user: dict = Depends(require_admin),
+):
+    """Resolve a site by URL AND persist it on the connection (2026-09-01 bug
+    report): ``GET .../tree?site_url=`` (the ``Sites.Selected`` escape hatch
+    documented on :func:`browse_tree`) only ever RESOLVED a site — the result
+    lived in the wizard's own client-side ``spManualSites`` and was reset
+    every time the wizard opened, forcing the admin to re-paste the same URL
+    on every visit. This route reuses the exact same validation
+    (:func:`_parse_site_url`) and resolution (``get_site_by_path``) as that
+    query param, then stores the result on ``config.manual_sites`` — a plain
+    list of ``{id, name, web_url}`` rows, the same normalized shape
+    ``get_site_by_path`` already returns — so a reopen (or a page reload) can
+    read it straight back from the connection listing instead of losing it.
+
+    Idempotent on the resolved site id: adding the same site twice (the same
+    URL, or two URLs that resolve to the same site) replaces its row in
+    place rather than appending a duplicate — the same "storage anchor is
+    the id, not what the admin typed" principle the confirmed-scope
+    collections use (module docstring).
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    hostname, site_path = _parse_site_url(body.site_url)  # typed 422 before any token resolution
+    token = await _resolved_token(row)
+    try:
+        site = await get_site_by_path(token, hostname, site_path)
+    except SharePointGraphError as exc:
+        # Same classification as `browse_tree`'s own `?site_url=` branch —
+        # a Graph 403 here is a permission verdict on a NAMED site, never an
+        # outage.
+        if exc.status_code == 403:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_site_not_granted",
+                    "message": (
+                        "Graph refused this site (HTTP 403): the app registration has no grant on it. "
+                        "Grant the app access to this site (Sites.Selected), or check the URL."
+                    ),
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "sharepoint_graph_error", "message": str(exc)},
+        ) from exc
+
+    manual_sites = [s for s in _manual_sites(row) if s.get("id") != site["id"]]
+    manual_sites.append(site)
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
+    new_config = {**(row.get("config") or {}), "manual_sites": manual_sites}
+    source_connections_repo().update(connection_id, config=new_config)
+    return site
+
+
+@router.delete("/connections/{connection_id}/manual-sites", status_code=204)
+async def remove_manual_site(
+    connection_id: str,
+    site_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Forget one site previously added by URL (see :func:`add_manual_site`).
+    Purely local bookkeeping — unlike a confirmed scope, a manual site owns
+    no collection and no grants, so there is nothing else to reconcile."""
+    row = _sharepoint_connection_or_404(connection_id)
+    manual_sites = _manual_sites(row)
+    remaining = [s for s in manual_sites if s.get("id") != site_id]
+    if len(remaining) == len(manual_sites):
+        raise HTTPException(status_code=404, detail="manual_site_not_found")
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
+    new_config = {**(row.get("config") or {}), "manual_sites": remaining}
+    source_connections_repo().update(connection_id, config=new_config)
 
 
 # Real library scale (measured, 2026-08-29): 443k files / 97,899 folders in
@@ -1573,6 +1689,8 @@ class ExtractionRunOptions(BaseModel):
         le=86400,
         description="Hard ceiling for this one run, seconds (0 = unbounded).",
     )
+
+
 # --- Graph subscription lifecycle -------------------------------------------
 #
 # The secret-minting endpoint above is only half of what near-real-time

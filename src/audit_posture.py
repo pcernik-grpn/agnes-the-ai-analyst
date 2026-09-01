@@ -157,6 +157,15 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # Persistence for a site added by URL (2026-09-01 bug report): the
+    # ``Sites.Selected`` escape hatch used to resolve a site without ever
+    # storing it, forcing a re-paste on every wizard reopen. Same
+    # "handler writes nothing itself; fallback middleware emits" posture as
+    # scope_confirm/scope_remove above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/manual-sites": "sharepoint_connection.manual_site_add",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/manual-sites": (
+        "sharepoint_connection.manual_site_remove"
+    ),
     # (Re)generates the Graph change-notification receiver's shared secret.
     # Handler writes its own row (log_safe), same as scope_confirm above.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
