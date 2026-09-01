@@ -459,6 +459,61 @@ class TestChatsPageScript:
         assert "segValue === 'all' && !segMulti" in js
 
 
+# ── Nothing in the list may be unreachable ────────────────────────────────
+#
+# The default view excludes archived conversations, so the count read "7 of 27
+# chats" with no control anywhere near it and a search for a hidden chat's own
+# title returned nothing: twenty conversations that were put away looked
+# exactly like twenty that were lost (#1974).
+
+
+class TestNothingIsUnreachable:
+    def test_search_looks_in_every_view_not_just_the_one_showing(self):
+        """A search is a request for one named thing. A view that hides it makes
+        the thing unfindable, not merely unlisted — so on /chats the search
+        outranks the segment. Opt-in on the shared engine: a page whose segments
+        are a real scope ("mine" vs "everyone's") means them, search included."""
+        js = TOOLBAR_JS.read_text(encoding="utf-8")
+        assert "searchSpansSegments" in js
+        seg = js[js.index("function segMatch(row)") : js.index("function facetMatch(row)")]
+        assert "if (segSpansOnSearch && searchActive()) return true;" in seg
+        assert seg.index("segSpansOnSearch") < seg.index("segValue === 'all'"), (
+            "the search override has to come BEFORE the segment test, or it never runs"
+        )
+        # Facets are NOT overridden — those the user set on purpose.
+        facet = js[js.index("function facetMatch(row)") : js.index("// ── Facets whose control sits OUTSIDE")]
+        assert "segSpansOnSearch" not in facet
+
+        page = PAGE_JS.read_text(encoding="utf-8")
+        assert "searchSpansSegments: true" in page, "/chats is the page that opts in"
+
+    def test_the_count_has_a_control_behind_it(self):
+        """"7 of 27" is a filter's readout; without something to click it reads
+        as a fault. The way into the archived view sits beside the number that
+        raises the question, not only inside the Filter menu."""
+        html = (TEMPLATES / "chats.html").read_text(encoding="utf-8")
+        assert 'id="ch-show-archived"' in html
+        assert html.index('id="ch-count"') < html.index('id="ch-show-archived"'), (
+            "the control belongs next to the count it explains"
+        )
+        page = PAGE_JS.read_text(encoding="utf-8")
+        fn = page[page.index("function syncHiddenNote()") : page.index("// ---- Segment badge counts")]
+        assert 'toolbar.setSegment("archived")' in page, "clicking it must actually change the view"
+        assert '"Show " + archived + " archived"' in fn
+        # Shown ONLY when the view is what's hiding rows: a search now spans
+        # every view, and an applied facet is already explained by its chip.
+        assert 'view === "all" && !searching && archived > 0' in fn
+        # …and recomputed after an action, or archiving the last chat leaves a
+        # control offering a view with nothing in it.
+        counts = page[page.index("function updateSegmentCounts()") :]
+        assert "syncHiddenNote();" in counts[: counts.index("\n  }")]
+
+    def test_the_engine_exposes_the_segment_setter_it_needs(self):
+        js = TOOLBAR_JS.read_text(encoding="utf-8")
+        api = js[js.index("    return {\n      apply: apply") :]
+        assert "setSegment: setSegment," in api[: api.index("};")]
+
+
 # ── The rail is a working set now ─────────────────────────────────────────
 
 

@@ -318,3 +318,67 @@ class TestAnUnsourcedFigureIsNotSilent:
         fn = js[js.index("function _bubbleHasFigure") : js.index("function renderSourcesChips")]
         for sel in ("table", "svg", "pre.mermaid"):
             assert sel in fn, f"figure check misses {sel}"
+
+
+# ── the chip is the link ───────────────────────────────────────────────────
+# Checking a number means opening the thing it came from, and the chip that
+# names that thing rendered as a dead label — the answer's most obvious next
+# click went nowhere (#1974).
+
+
+def test_table_and_metric_chips_link_to_the_thing_they_name():
+    """The workspace prompt asks for the REGISTRY ID on a `table:` line and the
+    canonical `family/name` on a `metric:` one, which is what these two
+    destinations take. An `assumption:` names nothing to open and stays a
+    label."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _claimHref") : js.index("function renderSourcesChips")]
+    script = (
+        fn
+        + """
+process.stdout.write(JSON.stringify({
+  table: _claimHref({kind: 'table', ref: 'hr_headcount'}),
+  metric: _claimHref({kind: 'metric', ref: 'headcount/active'}),
+  assumption: _claimHref({kind: 'assumption', ref: 'contractors excluded'}),
+  empty: _claimHref({kind: 'table', ref: ''}),
+  escaped: _claimHref({kind: 'table', ref: 'a b/c?d&e'}),
+}));
+"""
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["table"] == "/catalog/t/hr_headcount"
+    assert res["metric"] == "/semantic-layer?tab=all_metrics&q=headcount%2Factive"
+    assert res["assumption"] == "", "an assumption has nothing to open"
+    assert res["empty"] == ""
+    assert res["escaped"] == "/catalog/t/a%20b%2Fc%3Fd%26e", (
+        "the ref is model output landing in a URL — encoded, never pasted"
+    )
+
+
+def test_a_linked_chip_is_an_anchor_and_keeps_its_verification_state():
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert 'document.createElement(href ? "a" : "span")' in fn, (
+        "a chip with somewhere to go is an <a> — not a span with a click handler"
+    )
+    assert 'chip.className = `msg-source-chip ${state}${href ? " is-link" : ""}`' in fn, (
+        "the state class must survive the link class, or the verified/unverified signal is lost"
+    )
+    css = _read(CHAT_CSS)
+    block = css[css.index("a.msg-source-chip.is-link {") :]
+    block = block[: block.index("}")]
+    # NO colour declaration at all. `color: inherit` looked like the way to keep
+    # the state ink and did the opposite: this selector is (0,2,1) against
+    # `.msg-source-chip.is-ok`'s (0,2,0), so it won and every linked chip took
+    # the surrounding text colour. The state rules are author-level and already
+    # outrank the UA's anchor blue, so there is nothing to say here.
+    # (Copilot review on #1985.)
+    assert "color" not in block, (
+        "the chip keeps its own state colour — anything said about colour here outranks the "
+        "state rules and erases the verified/unverified signal"
+    )
