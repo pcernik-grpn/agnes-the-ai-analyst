@@ -160,6 +160,8 @@ _THROTTLE_BURST_429S = 2
 _THROTTLE_BURST_WAIT_S = 30.0
 #: Largest skipped files kept in the report.
 _OVERSIZE_SAMPLE = 20
+#: Completed items kept in the live checkpoint's `activity.recent` list.
+_RECENT_ACTIVITY_SAMPLE = 5
 #: Delta page size asked of Graph — also the state-checkpoint granularity.
 _DELTA_PAGE_SIZE = 200
 #: How many passes a single item is retried through the failure queue (see
@@ -193,14 +195,23 @@ class GraphGone(Exception):
 class CrawlTimeout(CrawlError):
     """The run exceeded ``extraction.timeout_s``.
 
-    v1 has no other stop mechanism — no UI cancel, and (since the external
-    producer was removed) no subprocess to kill — so this bound is the only
-    thing standing between a pathological estate and a worker slot occupied
-    forever. Raised between files and between delta pages, i.e. always at a
-    point where the crawl state on disk is consistent: the run aborts through
-    the same path a :class:`GraphThrottled` abort takes, which persists the
+    Raised between files and between delta pages, i.e. always at a point
+    where the crawl state on disk is consistent: the run aborts through the
+    same path a :class:`GraphThrottled` abort takes, which persists the
     state and the (interrupted) report, and the next run resumes from the
-    deltaLink + cTags already written.
+    deltaLink + cTags already written. See also :class:`CrawlStopped` — the
+    admin-requested counterpart to this deadline.
+    """
+
+
+class CrawlStopped(CrawlError):
+    """An admin asked this run to stop (``POST …/extraction/stop`` —
+    owner-frustration fix, 2026-09-01: "can't see it, can't stop it").
+
+    Raised at the SAME quiescent points :class:`CrawlTimeout` is — see
+    :func:`request_stop`, :func:`_clear_stale_stop` and :class:`_StopWatcher`
+    below — so the crawl state on disk is exactly as consistent as a
+    timeout's: the next run resumes from the persisted deltaLink + cTags.
     """
 
 
@@ -215,19 +226,139 @@ class GraphThrottled(CrawlError):
 #: nothing is known about how far the state file got, and "your work is safe"
 #: must never be guessed.
 #:
-#: Order is irrelevant (the two classes are disjoint siblings), but the
-#: mapping is a tuple rather than a dict because ``isinstance`` — not an
-#: exact type lookup — is what has to decide, so a future subclass of either
+#: Order is irrelevant (the classes are disjoint siblings), but the mapping
+#: is a tuple rather than a dict because ``isinstance`` — not an exact type
+#: lookup — is what has to decide, so a future subclass of any of them
 #: inherits the right reason instead of silently falling through to "error".
 _STOP_REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (CrawlTimeout, "timeout"),
+    (CrawlStopped, "stopped"),
     (GraphThrottled, "throttled"),
 )
 
 
 def _stop_reason(exc: BaseException) -> str:
-    """``"timeout"`` / ``"throttled"`` / ``"error"`` for an aborted run."""
+    """``"timeout"`` / ``"stopped"`` / ``"throttled"`` / ``"error"`` for an
+    aborted run."""
     return next((reason for cls, reason in _STOP_REASONS if isinstance(exc, cls)), "error")
+
+
+# --------------------------------------------------------------------------
+# Cooperative stop — the owner's other complaint ("can't stop it"), fixed
+# WITHOUT a new store: the signal lives on the connection row's own
+# ``config.extraction`` sub-object — the same JSON column
+# ``_record_extraction_dispatch`` already writes ``last_run_at``/
+# ``last_job_id`` into, one key over. That is what makes this work on BOTH
+# app-state backends unlike ``extraction_runs`` (PG-only, A3): a DuckDB
+# instance has always had ``source_connections``/``config_patch``.
+#
+# ``extraction`` is already carried forward whole by the generic connection
+# editor (``app.api.admin_sharepoint.SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``),
+# so an admin editing the connection's name or certificate cannot erase a
+# pending stop request any more than it can erase the dispatch bookkeeping
+# next to it.
+# --------------------------------------------------------------------------
+
+#: The key itself, inside ``config["extraction"]`` — named once so the
+#: three functions below and the admin endpoint that writes it
+#: (``app/api/admin_extraction.py``) cannot spell it two different ways.
+STOP_REQUESTED_AT_KEY = "stop_requested_at"
+
+
+def request_stop(connection_id: str) -> str:
+    """Ask this connection's crawl to stop at its next quiescent point.
+
+    Returns the ISO timestamp recorded. Safe to call whether or not a run is
+    currently active: a stop requested while nothing is running simply
+    waits on the connection row until the NEXT run starts, at which point
+    :func:`_clear_stale_stop` clears it unconsumed — a stop meant for a run
+    that already finished (or never started) must never reach forward and
+    kill a future, unrelated one.
+    """
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id) or {}
+    extraction = dict((row.get("config") or {}).get("extraction") or {})
+    stamp = _now_iso()
+    extraction[STOP_REQUESTED_AT_KEY] = stamp
+    repo.config_patch(connection_id, {"extraction": extraction})
+    return stamp
+
+
+def _clear_stale_stop(connection_id: str) -> None:
+    """Clear any stop flag left over from a PREVIOUS run, at the START of
+    THIS one. A stop requested for a run that already finished, failed, or
+    never started must not be honored by the next, unrelated run — this is
+    what keeps the flag from reaching forward past the run it was meant to
+    stop.
+    """
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id) or {}
+    extraction = dict((row.get("config") or {}).get("extraction") or {})
+    if extraction.pop(STOP_REQUESTED_AT_KEY, None) is not None:
+        repo.config_patch(connection_id, {"extraction": extraction})
+
+
+def _stop_requested(connection_id: str) -> Optional[str]:
+    """This connection's live stop flag, or ``None``.
+
+    A fresh repo read every call — deliberately, not cached — because the
+    signal is written by a DIFFERENT process (the admin API handling
+    ``POST …/extraction/stop``) than the one running this crawl.
+    """
+    from src.repositories import source_connections_repo
+
+    row = source_connections_repo().get(connection_id)
+    if not row:
+        return None
+    extraction = (row.get("config") or {}).get("extraction") or {}
+    stamp = extraction.get(STOP_REQUESTED_AT_KEY)
+    return str(stamp) if stamp else None
+
+
+#: Cadence for the file-boundary stop check. Between delta pages the check
+#: is unconditional (a 200-row page is already several network round trips,
+#: so one more row read is noise there) — but a repo read on EVERY file
+#: would not be, on a fast, mostly-``unchanged`` re-crawl of a large estate.
+#: Charged only once every this many COMPLETED items instead.
+_STOP_CHECK_EVERY_ITEMS = 10
+
+
+class _StopWatcher:
+    """Polls :func:`_stop_requested` at the crawl's existing quiescent
+    points — the cooperative-stop counterpart to :class:`_Deadline`.
+
+    Unlike the deadline (an in-memory clock comparison), honoring a stop
+    costs a repo read every time it is checked, which is why — unlike the
+    deadline — the two call sites below use a DIFFERENT cadence: always
+    between delta pages (:meth:`check_page_boundary`), but only every
+    :data:`_STOP_CHECK_EVERY_ITEMS` completed items between files
+    (:meth:`maybe_check_item_boundary`). Both raise :class:`CrawlStopped` at
+    a boundary the resume guarantee already treats as consistent, exactly
+    like a timeout.
+    """
+
+    def __init__(self, connection_id: str, *, every: int = _STOP_CHECK_EVERY_ITEMS) -> None:
+        self.connection_id = connection_id
+        self.every = max(1, int(every))
+        self._last_checked = 0
+
+    def check_page_boundary(self) -> None:
+        self._raise_if_stopped()
+
+    def maybe_check_item_boundary(self, items_done: int) -> None:
+        if items_done - self._last_checked < self.every:
+            return
+        self._last_checked = items_done
+        self._raise_if_stopped()
+
+    def _raise_if_stopped(self) -> None:
+        stamp = _stop_requested(self.connection_id)
+        if stamp:
+            raise CrawlStopped(f"stop requested at {stamp} — stopping; the next run resumes")
 
 
 # --------------------------------------------------------------------------
@@ -442,6 +573,13 @@ def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
         "throttle_wait_s": round(stats.throttle_wait_s, 1),
         "oversize_files": stats.oversize_files,
         "elapsed_s": round(max(time.monotonic() - stats.started, 0.0), 1),
+        # What the crawl is touching RIGHT NOW (owner-frustration fix,
+        # 2026-09-01: "I can't see what's happening in the extraction") —
+        # see `CrawlStats.activity_snapshot`. Read by the status endpoint's
+        # `running` payload; absent from a finished run's stored `report`
+        # (a different dict — see `CrawlStats.report`), which is the honest
+        # answer for a run with nothing left in flight.
+        "activity": stats.activity_snapshot(phase="crawl"),
     }
 
 
@@ -613,6 +751,23 @@ class CrawlStats:
     #: perfectly serial run has item_seconds ≈ duration_s, a run at N-way
     #: overlap approaches N × duration_s.
     item_seconds: float = 0.0
+    #: Items currently being downloaded/converted/ingested, for the live
+    #: checkpoint's ``activity`` block (owner-frustration fix, 2026-09-01:
+    #: "I can't see what it's doing") — ``{token: (path, started_at_iso)}``.
+    #: Under concurrency several of these are non-empty at once; the
+    #: checkpoint picks whichever ONE is still there when it reads this dict
+    #: (:meth:`activity_snapshot`) — the block exists to prove the crawl is
+    #: alive, not to enumerate every worker. Paths only, NEVER file content —
+    #: they are drive-relative paths already handled as ordinary (if
+    #: untrusted-ish) data everywhere else in this module, and this surface
+    #: is admin-only (``extraction_runs`` sits behind ``require_admin``), so
+    #: no extra redaction is needed here beyond that existing gate.
+    _in_flight_paths: Dict[int, Tuple[str, str]] = field(default_factory=dict, repr=False, compare=False)
+    _in_flight_token: int = field(default=0, repr=False, compare=False)
+    #: Last up to 5 completed items, newest first — ``{path, outcome}``. Not
+    #: part of :meth:`report`'s contract (that stays unchanged); read only by
+    #: :meth:`activity_snapshot`.
+    recent: List[Dict[str, Any]] = field(default_factory=list, repr=False, compare=False)
     #: Guards every counter above. Not compared, not printed — it is machinery.
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -669,6 +824,43 @@ class CrawlStats:
             self.oversize_largest.append({"path": path, "size": size})
             self.oversize_largest.sort(key=lambda e: -int(e["size"]))
             del self.oversize_largest[_OVERSIZE_SAMPLE:]
+
+    def enter_item_activity(self, path: str) -> int:
+        """One file's download/convert/ingest pipeline STARTING, for the
+        live ``activity`` checkpoint block. Returns a token to pass back to
+        :meth:`exit_item_activity` — under concurrency several items are
+        in flight at once, and a token is what lets a fast neighbour's exit
+        remove exactly ITS OWN entry rather than a slower one's."""
+        with self._lock:
+            self._in_flight_token += 1
+            token = self._in_flight_token
+            self._in_flight_paths[token] = (path, _now_iso())
+        return token
+
+    def exit_item_activity(self, token: int, path: str, outcome: str) -> None:
+        """The pipeline for ``token`` finished (whatever the outcome) —
+        drop it from the in-flight set and push it onto ``recent``."""
+        with self._lock:
+            self._in_flight_paths.pop(token, None)
+            self.recent.insert(0, {"path": path, "outcome": outcome})
+            del self.recent[_RECENT_ACTIVITY_SAMPLE:]
+
+    def activity_snapshot(self, *, phase: str) -> Dict[str, Any]:
+        """``{phase, current_path, current_started_at, recent}`` for the live
+        checkpoint. ``current_path`` names ANY one in-flight item — under
+        concurrency several are true at once, and this block exists to prove
+        the crawl is alive, not to enumerate every worker."""
+        with self._lock:
+            current_path: Optional[str] = None
+            current_started_at: Optional[str] = None
+            if self._in_flight_paths:
+                current_path, current_started_at = next(iter(self._in_flight_paths.values()))
+            return {
+                "phase": phase,
+                "current_path": current_path,
+                "current_started_at": current_started_at,
+                "recent": list(self.recent[:_RECENT_ACTIVITY_SAMPLE]),
+            }
 
     def report(
         self,
@@ -1199,9 +1391,8 @@ class DriveTarget:
 
 def _scope_kind(source_scope_id: str) -> str:
     """Site / drive / folder, decided STRUCTURALLY from the Graph id shape —
-    the same rule ``connectors/sharepoint/corpus_map.py`` uses, and for the
-    same reason: it must work for scope rows confirmed before this module
-    existed, with no Graph round trip."""
+    it must work for scope rows confirmed before this module existed, with
+    no Graph round trip."""
     if "," in source_scope_id:
         return "site"
     if source_scope_id.startswith("b!"):
@@ -1339,7 +1530,7 @@ def _should_skip_name(name: str) -> bool:
 def _drive_relative_path(parent_reference: Dict[str, Any], name: str) -> str:
     """``parentReference.path`` + item name, with Graph's
     ``/drives/<id>/root:`` prefix stripped — the DRIVE-relative path the
-    corpus-map resolver and the collections ``path`` key both speak."""
+    zone router and the collections ``path`` key both speak."""
     parent = str(parent_reference.get("path") or "")
     rel = _DRIVE_ROOT_PREFIX_RE.sub("", parent).strip("/")
     return f"{rel}/{name}".strip("/") if rel else name.strip("/")
@@ -1729,88 +1920,108 @@ async def _process_item(
         return
 
     mime = str((item.get("file") or {}).get("mimeType") or "")
+    # In flight from here to the end of the function — the download/convert/
+    # ingest span, i.e. the part slow enough to be worth SHOWING an admin
+    # watching live (owner-frustration fix, 2026-09-01). `outcome_label`
+    # names how it ended for the `activity.recent` list; the `finally`
+    # guarantees exactly one `exit_item_activity` per `enter_item_activity`,
+    # whatever branch below returns or raises.
+    activity_token = stats.enter_item_activity(path)
+    outcome_label = "error"
     try:
-        tmp_path = await transport.download_to_temp(
-            target.drive_id, str(item["id"]), name, max_bytes=_max_file_bytes(max_file_mb)
-        )
-    except GraphThrottled:
-        # NOT a per-file fault, despite being a CrawlError: the tenant is
-        # throttling this app registration as a whole, so absorbing it here
-        # would turn "back off" into "keep hammering, one 429 budget per
-        # file". Aborts the run; the next one resumes from the persisted
-        # deltaLink + cTags. Under concurrency the page driver also stops
-        # feeding the pool the moment this escapes, so a 429 storm costs one
-        # budget per IN-FLIGHT item, never one per remaining file.
-        raise
-    except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
-        stats.add(errors=1)
-        logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
-        _note_retry(state, stats, stable_id, target=target, item=item, path=path)
-        return
+        try:
+            tmp_path = await transport.download_to_temp(
+                target.drive_id, str(item["id"]), name, max_bytes=_max_file_bytes(max_file_mb)
+            )
+        except GraphThrottled:
+            # NOT a per-file fault, despite being a CrawlError: the tenant is
+            # throttling this app registration as a whole, so absorbing it
+            # here would turn "back off" into "keep hammering, one 429
+            # budget per file". Aborts the run; the next one resumes from
+            # the persisted deltaLink + cTags. Under concurrency the page
+            # driver also stops feeding the pool the moment this escapes,
+            # so a 429 storm costs one budget per IN-FLIGHT item, never one
+            # per remaining file.
+            outcome_label = "throttled"
+            raise
+        except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
+            stats.add(errors=1)
+            outcome_label = "download_failed"
+            logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
 
-    try:
-        prepared: _PreparedDocument = await _run_blocking(
-            pool,
-            _prepare_document,
-            tmp_path,
-            mime=mime,
-            path=path,
-            anonymize=ctx.anonymize,
-            anonymization_key=anonymization_key,
-            detector=detector,
-        )
+        try:
+            prepared: _PreparedDocument = await _run_blocking(
+                pool,
+                _prepare_document,
+                tmp_path,
+                mime=mime,
+                path=path,
+                anonymize=ctx.anonymize,
+                anonymization_key=anonymization_key,
+                detector=detector,
+            )
+        finally:
+            # The local copy never persists — success, skip, or failure.
+            tmp_path.unlink(missing_ok=True)
+
+        if prepared.outcome == "convert_failed":
+            stats.add(convert_failed=1, errors=1)
+            outcome_label = "convert_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+        if prepared.outcome == "convert_empty":
+            # Not a failure to retry: the document converted fine and
+            # genuinely has no text. Unlike the other three outcomes here,
+            # running it through the pipeline again cannot change the answer.
+            stats.add(convert_failed=1)
+            outcome_label = "convert_empty"
+            return
+        if prepared.outcome == "anonymize_failed":
+            stats.add(anonymize_failed=1)
+            outcome_label = "anonymize_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+
+        try:
+            _file_id, was_new = await _run_blocking(
+                pool,
+                ingestor.ingest,
+                collection_id=collection_id,
+                stable_id=stable_id,
+                path=path,
+                filename=f"{Path(name).stem or name}.md",
+                markdown=prepared.markdown,
+                source_sha256=prepared.source_sha256,
+            )
+        except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
+            stats.add(errors=1)
+            outcome_label = "ingest_failed"
+            logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+
+        outcome_label = "new" if was_new else "changed"
+        if was_new:
+            stats.add(new=1)
+        else:
+            stats.add(changed=1)
+        # Written only AFTER the document is durably ingested: a cTag
+        # recorded before the ingest would make a resumed run skip a file it
+        # never landed. Per ITEM, not per page — a slow neighbour in the
+        # same page must not hold this one's cTag hostage — but always
+        # under the state lock, so it can never land inside a `save_state`
+        # serialization.
+        if ctag:
+            with _state_lock:
+                ctags[stable_id] = ctag
+        # However it got here — a normal delta row or a queued retry — it
+        # just ingested cleanly, so it owes the failure queue nothing more.
+        if _clear_retry(state, stable_id):
+            stats.add(item_retry_recovered=1)
     finally:
-        # The local copy never persists — success, skip, or failure.
-        tmp_path.unlink(missing_ok=True)
-
-    if prepared.outcome == "convert_failed":
-        stats.add(convert_failed=1, errors=1)
-        _note_retry(state, stats, stable_id, target=target, item=item, path=path)
-        return
-    if prepared.outcome == "convert_empty":
-        # Not a failure to retry: the document converted fine and genuinely
-        # has no text. Unlike the other three outcomes here, running it
-        # through the pipeline again cannot change the answer.
-        stats.add(convert_failed=1)
-        return
-    if prepared.outcome == "anonymize_failed":
-        stats.add(anonymize_failed=1)
-        _note_retry(state, stats, stable_id, target=target, item=item, path=path)
-        return
-
-    try:
-        _file_id, was_new = await _run_blocking(
-            pool,
-            ingestor.ingest,
-            collection_id=collection_id,
-            stable_id=stable_id,
-            path=path,
-            filename=f"{Path(name).stem or name}.md",
-            markdown=prepared.markdown,
-            source_sha256=prepared.source_sha256,
-        )
-    except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
-        stats.add(errors=1)
-        logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
-        _note_retry(state, stats, stable_id, target=target, item=item, path=path)
-        return
-
-    if was_new:
-        stats.add(new=1)
-    else:
-        stats.add(changed=1)
-    # Written only AFTER the document is durably ingested: a cTag recorded
-    # before the ingest would make a resumed run skip a file it never landed.
-    # Per ITEM, not per page — a slow neighbour in the same page must not
-    # hold this one's cTag hostage — but always under the state lock, so it
-    # can never land inside a `save_state` serialization.
-    if ctag:
-        with _state_lock:
-            ctags[stable_id] = ctag
-    # However it got here — a normal delta row or a queued retry — it just
-    # ingested cleanly, so it owes the failure queue nothing more.
-    if _clear_retry(state, stable_id):
-        stats.add(item_retry_recovered=1)
+        stats.exit_item_activity(activity_token, path, outcome_label)
 
 
 class _ConcurrencyGovernor:
@@ -1901,8 +2112,11 @@ class _ConcurrencyGovernor:
 #: Higher wins when several workers fail in the same page — the run reports
 #: the WORST thing that happened to it, never the first one to be noticed.
 #: A tenant-wide throttle outranks the clock: "we ran out of time" invites a
-#: retry, "the tenant is refusing us" is what an operator has to act on.
-_ABORT_SEVERITY: Tuple[type, ...] = (GraphThrottled, CrawlTimeout, GraphGone)
+#: retry, "the tenant is refusing us" is what an operator has to act on. An
+#: admin-requested stop outranks GraphGone (a routine 410-resync trigger,
+#: never a run-ending fault on its own) for the same reason a timeout does:
+#: it is a deliberate, named exit, not an incidental one.
+_ABORT_SEVERITY: Tuple[type, ...] = (GraphThrottled, CrawlTimeout, CrawlStopped, GraphGone)
 
 
 def _abort_rank(exc: BaseException) -> int:
@@ -1926,6 +2140,7 @@ async def _process_page(
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
     concurrency: int = 1,
+    stop_watcher: Optional["_StopWatcher"] = None,
 ) -> None:
     """Run ONE delta page's rows, up to ``concurrency`` items at a time.
 
@@ -1979,6 +2194,11 @@ async def _process_page(
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            # Between files, cadence-limited (see `_StopWatcher`): a
+            # completed item's cTag is already in `state`, so a stop here
+            # is exactly as safe to resume from as the deadline check above.
+            if stop_watcher is not None:
+                stop_watcher.maybe_check_item_boundary(stats.items_done)
         return
 
     if not items:
@@ -2043,6 +2263,17 @@ async def _process_page(
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            # Same drain mechanism as the deadline check above and the
+            # abort-on-exception path in the `try` block: appended to
+            # `aborts` and returned, never raised past this loop, so
+            # `_next_item()` stops handing out work to the OTHER workers too
+            # and the in-flight ones still get to finish this iteration.
+            if stop_watcher is not None:
+                try:
+                    stop_watcher.maybe_check_item_boundary(stats.items_done)
+                except CrawlStopped as exc:
+                    aborts.append(exc)
+                    return
 
     try:
         # `gather` without `return_exceptions` would cancel the peers on the
@@ -2155,12 +2386,16 @@ async def _crawl_drive(
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
     governor: Optional[_ConcurrencyGovernor] = None,
+    stop_watcher: Optional["_StopWatcher"] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
 
     ``recorder`` (optional, defaults to no recording) rides the checkpoint
     this function already writes — see :class:`_RunRecorder`.
+
+    ``stop_watcher`` (optional) is checked unconditionally at every page
+    boundary, same as ``deadline`` — see :class:`_StopWatcher`.
 
     ``governor`` supplies the WITHIN-PAGE item concurrency (see
     :func:`_process_page`) and is fed this drive's throttling at every page
@@ -2204,6 +2439,8 @@ async def _crawl_drive(
         # deltaLink/cTags are on disk, so stopping here costs nothing.
         if deadline is not None:
             deadline.check()
+        if stop_watcher is not None:
+            stop_watcher.check_page_boundary()
         if page_throttle_mark is None:
             page_throttle_mark = stats.throttle_snapshot()
         try:
@@ -2257,6 +2494,7 @@ async def _crawl_drive(
             detector=detector,
             deadline=deadline,
             concurrency=governor.current(),
+            stop_watcher=stop_watcher,
         )
         # The page's OWN throttling, not the run's running total: the
         # governor folds a DELTA, so one bad page cannot keep halving the
@@ -2497,6 +2735,16 @@ async def _run_crawl_async(
     concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
+    # A stop requested for a PREVIOUS run (already finished, failed, or one
+    # that never actually started) must never reach forward and kill this
+    # one — clear it unconsumed, at the very start, before anything else.
+    # Best-effort: a repo hiccup here must not block the run it is trying to
+    # let start cleanly.
+    try:
+        _clear_stale_stop(connection_id)
+    except Exception as exc:  # noqa: BLE001 — never load-bearing
+        logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+    stop_watcher = _StopWatcher(connection_id)
     scopes = _confirmed_scopes(connection)
     if only_scope_ids:
         wanted = set(only_scope_ids)
@@ -2602,6 +2850,7 @@ async def _run_crawl_async(
                     detector=detector,
                     deadline=deadline,
                     governor=governor,
+                    stop_watcher=stop_watcher,
                 )
 
         # ---- the LLM stage (owner decision 2026-09-01) -------------------
@@ -2734,17 +2983,18 @@ def run_builtin_crawl(payload: dict) -> dict:
     (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
     this).
 
-    Bounded by ``extraction.timeout_s`` — v1's ONLY deliberate stop mechanism
-    (no UI cancel, and since the external producer was removed, no subprocess
-    to kill). On expiry the run saves its state, reports
-    ``interrupted_reason="timeout"``, and fails the job; the next run resumes
-    from the persisted deltaLinks and cTags. ``payload["timeout_s"]``
-    overrides the configured value for one run (0 = unbounded).
+    Bounded by ``extraction.timeout_s``. On expiry the run saves its state,
+    reports ``interrupted_reason="timeout"``, and fails the job; the next
+    run resumes from the persisted deltaLinks and cTags.
+    ``payload["timeout_s"]`` overrides the configured value for one run
+    (0 = unbounded).
 
     An exhausted 429 budget stops a run the same way, reporting
-    ``interrupted_reason="throttled"`` — see :data:`_STOP_REASONS` for why
-    those two, and only those two, license a caller to tell the operator the
-    next run picks up where this one stopped.
+    ``interrupted_reason="throttled"``. So does an admin-requested
+    cooperative stop (``POST …/extraction/stop`` — see :func:`request_stop`),
+    reporting ``interrupted_reason="stopped"`` — see :data:`_STOP_REASONS`
+    for why those three, and only those three, license a caller to tell the
+    operator the next run picks up where this one stopped.
 
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of
