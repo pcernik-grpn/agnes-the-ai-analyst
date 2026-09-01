@@ -1187,11 +1187,6 @@ _EXEMPT: dict[str, str] = {
         "hatch's other half, keeping the wizard's step-2 sites level populated across "
         "reopens; admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
     ),
-    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": (
-        "producer handoff: the flat {source_scope_id: collection_id} mapping "
-        "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "
-        "admin-only, no analyst CLI/MCP analogue"
-    ),
     "/api/admin/sharepoint/connections/{connection_id}/changes": (
         "observed-changes feed (what changed between two timestamps) derived from the "
         "connection's own corpus_file_events log — admin-only wizard/ops display "
@@ -1275,6 +1270,13 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    # Cooperative stop for the same card's Stop button (owner-frustration fix,
+    # 2026-09-01) — an admin-only control over the SAME crawl the trigger
+    # above starts, no analyst CLI/MCP analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/stop": (
+        "admin 'stop this run' control for the source card's Run row — admin display "
+        "primitive, no analyst CLI/MCP analogue"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
         "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "

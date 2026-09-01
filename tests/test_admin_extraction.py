@@ -438,3 +438,32 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["interrupted_reason"] is None
+
+    def test_a_cooperative_stop_is_resumable(self):
+        """An admin-requested stop (`POST …/extraction/stop`) aborts at the
+        same consistent point a timeout does — see `_STOP_REASONS` on the
+        crawl side — so it earns the same "next run resumes" promise."""
+        from app.api.admin_extraction import RESUMABLE_STOP_REASONS, _run_out
+
+        assert "stopped" in RESUMABLE_STOP_REASONS
+        out = _run_out({"id": "er_1", "status": "failed", "report": {"interrupted_reason": "stopped"}})
+        assert out["interrupted_reason"] == "stopped"
+        assert out["resumable"] is True
+
+    def test_activity_rides_the_same_checkpoint_projection(self):
+        """`activity` (owner-frustration fix, 2026-09-01) is read from
+        whichever of `report`/`progress` `live` resolves to — no separate
+        lookup, so it can never disagree with the counters next to it."""
+        from app.api.admin_extraction import _run_out
+
+        activity = {"phase": "crawl", "current_path": "Reports/q3.docx", "recent": []}
+        out = _run_out({"id": "er_1", "status": "running", "progress": {"activity": activity}})
+        assert out["activity"] == activity
+
+    def test_a_finished_run_has_no_live_activity(self):
+        """`report` (the FINAL shape `finish()` stores) never grows an
+        `activity` key — a completed run honestly has nothing in flight."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
+        assert out["activity"] is None

@@ -1188,11 +1188,7 @@ Admin-only surface behind the "connect → scope → share" file-source wizard o
 `/admin/data-sources`. The SharePoint connection itself is an ordinary
 `source_type=sharepoint` row through `/api/admin/source-connections` (tenant/
 client id, certificate via vault secret or `config.cert_private_key_env`);
-these three routes are the wizard's own steps 2/3. `GET …/scopes` and
-`GET …/corpus-map` additionally accept a corpus-extraction producer's own
-scoped callback credential (`ProducerPrincipal`, `app/auth/producer_token.py`)
-when its `connection_id` claim matches the path — a producer token minted
-for a DIFFERENT connection 403s.
+these three routes are the wizard's own steps 2/3.
 
 `POST/DELETE …/manual-sites` is the other half of the `?site_url=` escape
 hatch on `…/tree`: that browse resolves a named site but stores nothing, so
@@ -1205,7 +1201,6 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
-- /api/admin/sharepoint/connections/{connection_id}/corpus-map
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1307,11 +1302,6 @@ gate, shared with every other route under `/api/admin/sharepoint/*`), `409
 acl_sync_already_running` when one is already queued/running for this
 connection.
 
-`GET …/corpus-map` is the scope→collection routing map for this
-connection, in the crawler resolver's own key shape (`"<site>"` or
-`"<site>/<drive-relative folder path>"` → `collection_id`); `409
-corpus_map_ambiguous` rather than a best-guess map when two scopes collapse
-to one key with different collections.
 `POST …/subtree-sweep` (2026-08-31 plan, Task 8) is the admin "re-check
 subtrees now" trigger for the `sharepoint-subtree-sweep` job — identical
 mechanics to `POST …/acl-sync` above (same enqueue/flag-gate/dedup shape,
@@ -1320,20 +1310,10 @@ sweep_already_running`), except the explicit-connection payload also bypasses
 the job's own per-connection due-guard (`acl_sync.sweep_interval_days`), so
 this always triggers a real sweep rather than a same-day no-op.
 
-`GET …/corpus-map` is the producer handoff: `{corpus_for()-key:
-collection_id}` in the producer resolver's own shape — `"<site display
-name>"` or `"<site display name>/<drive-relative folder path>"` — that
-`ship_to_agnes.py --corpus-map` consumes until crawling moves inside Agnes.
-Every ACTIVE permission zone (2026-08-31 plan, Task 3/7) folds in as an
-ADDITIONAL, NESTED key under its parent scope's own key (a zone's
-`display_path` always extends its parent's, e.g. parent `"Site/Team"`, zone
-`"Site/Team/Legal"`) — the producer's resolver MUST match these
-longest-prefix-first; a resolver that gets that wrong still fails closed via
-the server-side ingest gate (Task 5) rather than leaking zone content to the
-wider parent collection. A dissolved zone is never mapped. The exclusion
+The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
-job, not this endpoint) may now also contain unique-permission FILE item
-ids, riding the same per-scope item-id list as folder exclusions.
+job) may also contain unique-permission FILE item ids, riding the same
+per-scope item-id list as folder exclusions.
 
 `GET …/certificate` returns read-only certificate metadata — the thumbprint
 the client actually presents (`thumbprint_x5t`, the JWT assertion's `x5t`
@@ -1490,7 +1470,7 @@ Two request shapes on the same route, matching Graph's own contract:
   admin trigger uses, with the same idempotency key (so a burst of
   notifications for one connection collapses onto a single run) and a
   ~60s `run_after` debounce; skipped (still `202`) when the `sharepoint`
-  switch is off or its producer isn't configured, so a webhook burst never
+  switch is off, so a webhook burst never
   queues a job doomed to fail. Hard 1 MiB request-body cap, enforced by
   streaming rather than buffering first (`413` on overflow).
 
@@ -1499,14 +1479,16 @@ analogue — Graph is the only caller.
 
 ### `/api/admin/sharepoint/connections/{connection_id}/extraction` — extraction observability (design 2026-08-31)
 
-Read-only surface (`app/api/admin_extraction.py`) behind the SharePoint source
-card's live crawl cell, its run-history drawer and its configuration drawer. No
-new page and no new nav entry — the card is the only client.
+Mostly read-only surface (`app/api/admin_extraction.py`) behind the SharePoint
+source card's live crawl cell, its run-history drawer and its configuration
+drawer — plus one write, the cooperative stop below. No new page and no new
+nav entry — the card is the only client.
 
 - /api/admin/sharepoint/connections/{connection_id}/extraction/status
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}
 - /api/admin/sharepoint/connections/{connection_id}/extraction/config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/stop
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1517,8 +1499,16 @@ ended comes back as `failed` — the stored `running` is reported separately as
 (files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
 there is no fraction, no progress bar and no ETA, because the crawl enumerates
 and processes in lockstep per delta page and `files_per_s` counts only
-new+changed documents. `can_stop` is `false` — v1 has no cooperative cancel
-flag, so no Stop control is drawn.
+new+changed documents. `can_stop` is `true` — a running (or `stalled`) run
+draws a Stop control (owner-frustration fix, 2026-09-01: "it's a black box, I
+can't see what's happening and I can't stop it"). A running run's payload also
+carries an `activity` block — `{phase, current_path, current_started_at,
+recent}`, where `current_path` is a drive-relative path of ANY one file
+currently being downloaded/converted/ingested (any of several under
+concurrency) and `recent` is the last up to 5 completed items
+(`{path, outcome}`) — so the card can show what the crawl is touching right
+now instead of only aggregate counters. `activity` is `null`/absent on older
+rows and on a finished run (nothing left in flight).
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1541,6 +1531,25 @@ section name and then deep-merges, so one editable key would make the section
 that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
 `sharepoint_connection.extraction_config_read`.
+
+`POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
+connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
+column the extraction dispatch bookkeeping already lives in, carried forward
+on every generic connection edit. The crawl polls this flag at the same
+quiescent points its own `extraction.timeout_s` ceiling already checks
+(unconditionally between delta pages, every 10 completed items between
+files) and stops there exactly like a timeout — `interrupted_reason:
+"stopped"`, a run that is resumable, state saved. Unlike the four routes
+above, this one touches no `extraction_runs` row, so it answers `202` on
+BOTH app-state backends (`source_connections`/`config_patch` predate the A3
+Postgres-only ratchet) even though the run-state reads next to it are
+PG-only. Always `202` once the connection exists, whether or not a run is
+visibly active — a stop requested with nothing running simply waits on the
+connection row until the next run starts, at which point it is consumed (or,
+unconsumed, cleared); the response's `note` says so when this instance can
+tell no run is currently active. `404` for an unknown or non-SharePoint
+connection. Audited as `extraction.stop_requested` (emitted by the fallback
+middleware — the handler writes no row of its own).
 
 Admin-only display primitives with no analyst CLI/MCP analogue.
 
@@ -2252,12 +2261,8 @@ repository directly — facts have no local scope, so every result is labeled
 `[server]` on the CLI's stderr, a deliberate deviation from the `--scope
 auto|local|server` convention (spec §12).
 
-**Write surface** (build order step 4) — scheduler token, admin PAT, or a
-corpus-extraction producer's own scoped callback credential
-(`ProducerPrincipal`, `app/auth/producer_token.py`; `ingest` additionally
-rejects, itemized (`403` `producer_corpus_out_of_scope`), any document
-whose `corpus_id` is outside that credential's own `collection_ids`), no
-CLI/MCP by design (a producer contract, not an analyst command). `ingest`
+**Write surface** (build order step 4) — scheduler token or admin PAT, no
+CLI/MCP by design (a pipeline contract, not an analyst command). `ingest`
 is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,
 `413`; a single document's evidence alone over the claim cap is a `422`
 `document_exceeds_claim_cap`, never split), the verbatim gate (§8, a quote
