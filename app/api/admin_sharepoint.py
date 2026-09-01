@@ -1619,6 +1619,19 @@ class ExtractionRunOptions(BaseModel):
             "connection whose delta cursor ran past documents it never actually ingested."
         ),
     )
+    force_reprocess: Optional[bool] = Field(
+        None,
+        description=(
+            "Ignore this connection's persisted deltaLinks AND cTags for this run only, "
+            "so every item is re-downloaded, re-converted and re-ingested even when it "
+            "looks unchanged — the control for 're-process everything', e.g. after a "
+            "converter or anonymizer setting change with no content diff. Re-downloads "
+            "and re-converts the whole corpus and, when facts extraction is on, re-runs "
+            "the LLM pass over every document — a materially more expensive run than a "
+            "plain trigger or `resync`. Never written to the state file up front: an "
+            "interrupted run leaves the connection exactly as resumable as before."
+        ),
+    )
 
 
 # --- Graph subscription lifecycle -------------------------------------------
@@ -1814,7 +1827,15 @@ async def trigger_extraction(
     THIS run only — configured values stay untouched — plus ``resync``, the
     supported alternative to hand-editing the crawl state file on the data
     disk when a connection's delta cursor ran past documents it never
-    ingested: see ``connectors.sharepoint.crawler._apply_resync``.
+    ingested (see ``connectors.sharepoint.crawler._apply_resync``), and
+    ``force_reprocess``, the stronger "re-process everything" control that
+    additionally ignores cTags so already-unchanged documents are
+    re-downloaded and re-ingested too — never persisted beyond this one run.
+
+    Every option here is per-run, not a setting: an absent key falls back to
+    whatever is currently configured (or, for the two booleans, to "off"),
+    and nothing in this endpoint ever writes an option's value anywhere an
+    admin could re-read it as the new default.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
@@ -1850,6 +1871,8 @@ async def trigger_extraction(
             payload["timeout_s"] = options.timeout_s
         if options.resync:
             payload["resync"] = True
+        if options.force_reprocess:
+            payload["force_reprocess"] = True
 
     job = jobs_repo().enqueue(
         "corpus-extraction",

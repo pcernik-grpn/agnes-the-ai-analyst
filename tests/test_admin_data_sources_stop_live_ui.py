@@ -69,6 +69,7 @@ _SIGNATURES = (
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
+    "function _extRenderInAgnesButton(connId, status) {",
     "function _extRender(connId) {",
 )
 
@@ -86,6 +87,7 @@ def _elements_js() -> str:
 const _elements = {
   "ext-block-sp1": { hidden: true, innerHTML: "" },
   "ext-crawl-live-sp1": { hidden: true, innerHTML: "" },
+  "ext-inagnes-btn-sp1": { dataset: { extractionReady: "1" }, disabled: false, title: "" },
 };
 const document = { getElementById: (id) => _elements[id] };
 """
@@ -404,3 +406,65 @@ class TestActivityDoesNotBreakOlderRows:
         html = _run_row_html(run)
         assert "no checkpoint for 4200s" in html
         assert "ext-activity" not in html
+
+
+class TestInAgnesButtonReflectsLiveRun:
+    """The static "In-Agnes extraction" fact row's own trigger button is
+    server-rendered once, from dispatch bookkeeping (`config.extraction.
+    last_run_at`) — but it must never keep offering "Run extraction now"
+    while a run is already active, since the server can only ever 409 that
+    click (`extraction_already_running`). `_extRenderInAgnesButton` reuses
+    the SAME status this script already polls for the `Run` row above,
+    rather than opening a second live-state channel for one button."""
+
+    def test_disables_the_button_while_a_run_is_active(self):
+        out = _run_js(
+            f"""
+_extRenderInAgnesButton("sp1", {json.dumps(_running())});
+console.log(JSON.stringify({{
+  disabled: _elements["ext-inagnes-btn-sp1"].disabled,
+  title: _elements["ext-inagnes-btn-sp1"].title,
+}}));
+"""
+        )
+        assert out["disabled"] is True
+        assert "already running" in out["title"]
+
+    def test_re_enables_once_the_run_is_gone_and_the_connection_stays_ready(self):
+        idle_status = {"running": None, "last_completed": None, "runs_total": 9, "can_stop": True}
+        out = _run_js(
+            f"""
+_extRenderInAgnesButton("sp1", {json.dumps(_running())});
+_extRenderInAgnesButton("sp1", {json.dumps(idle_status)});
+console.log(JSON.stringify({{
+  disabled: _elements["ext-inagnes-btn-sp1"].disabled,
+  title: _elements["ext-inagnes-btn-sp1"].title,
+}}));
+"""
+        )
+        assert out["disabled"] is False
+        assert out["title"] == ""
+
+    def test_stays_disabled_when_the_server_never_marked_extraction_ready(self):
+        """A run ending must restore the SERVER's own capability gate
+        (producer configured, `sharepoint.enabled`) — never blindly
+        re-enable a button that was never allowed to run in the first
+        place."""
+        out = _run_js(
+            """
+_elements["ext-inagnes-btn-sp1"].dataset.extractionReady = "0";
+_extRenderInAgnesButton("sp1", null);
+console.log(JSON.stringify({ disabled: _elements["ext-inagnes-btn-sp1"].disabled }));
+"""
+        )
+        assert out["disabled"] is True
+
+    def test_a_missing_button_element_is_a_no_op(self):
+        out = _run_js(
+            f"""
+let threw = false;
+try {{ _extRenderInAgnesButton("no-such-conn", {json.dumps(_running())}); }} catch (e) {{ threw = true; }}
+console.log(JSON.stringify({{ threw }}));
+"""
+        )
+        assert out["threw"] is False

@@ -195,6 +195,8 @@ __all__ = [
     "semantic_feedback_repo",
     # Muted semantic-layer health checks (F4.3) — Postgres-only
     "semantic_health_mutes_repo",
+    # Corporate-memory detection run logs (issue #1971 Part 3) — Postgres-only
+    "memory_detection_runs_repo",
 ]
 
 
@@ -676,6 +678,15 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "usage_turns": {
         PG: ("src.repositories.usage_turns_pg", "UsageTurnsPgRepository"),
     },
+    # Corporate-memory detection run logs (issue #1971 Part 3) — POSTGRES-ONLY,
+    # A3 ratchet: no DuckDB backend. Resolving this key on a DuckDB-backed
+    # instance raises RequiresPostgresBackend (translated to a typed 501 by
+    # app/main.py) — the run-log WRITE path (src.memory_detection_logging)
+    # catches that and degrades to one warning log line so a DuckDB instance
+    # never fails detection itself over a missing observability table.
+    "memory_detection_runs": {
+        PG: ("src.repositories.memory_detection_runs_pg", "MemoryDetectionRunsPgRepository"),
+    },
 }
 
 
@@ -1117,3 +1128,12 @@ def semantic_feedback_repo() -> Any:
 # RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
 def semantic_health_mutes_repo() -> Any:
     return _build("semantic_health_mutes")
+
+
+# Corporate-memory detection run logs (issue #1971 Part 3) — POSTGRES-ONLY.
+# Raises RequiresPostgresBackend on a DuckDB-backed instance; callers write
+# through src.memory_detection_logging.record_detection_run, which catches
+# that (and any other error) and degrades to one warning log line rather
+# than letting a missing observability table fail detection itself.
+def memory_detection_runs_repo() -> Any:
+    return _build("memory_detection_runs")

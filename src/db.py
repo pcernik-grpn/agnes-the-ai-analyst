@@ -3572,6 +3572,26 @@ _CANONICAL_MEMORY_DOMAINS_SEED = [
     ("md_infrastructure", "infrastructure", "Infrastructure", "🏗️", "#fef2f2"),
 ]
 
+# Issue #1971 Part 5 — a dedicated, always-existing, non-required memory
+# domain that engagement-scoped detected facts route to instead of the
+# general review pool. Deliberately tracked separately from
+# ``_CANONICAL_MEMORY_DOMAINS_SEED`` above: it isn't one of the legacy
+# ``VALID_DOMAINS`` content-taxonomy values (it's an RBAC/distribution
+# bucket, not a subject-matter classification), so folding it into that
+# list would misdescribe what's in it. Seeded the SAME idempotent way (the
+# app lifespan's ``memory_domains_repo().ensure_seed`` call, both backends)
+# — see ``app/main.py``. No new memory_domains column, no new table: this
+# is a data row through an existing, generic mechanism, not a schema change.
+ENGAGEMENT_SCOPED_DOMAIN_ID = "md_engagement_scoped"
+ENGAGEMENT_SCOPED_DOMAIN_SLUG = "engagement-scoped"
+ENGAGEMENT_SCOPED_DOMAIN_SEED = (
+    ENGAGEMENT_SCOPED_DOMAIN_ID,
+    ENGAGEMENT_SCOPED_DOMAIN_SLUG,
+    "Engagement-Scoped",
+    "🔒",
+    "#fee2e2",
+)
+
 
 def _seed_system_groups(conn: duckdb.DuckDBPyConnection) -> None:
     """Idempotently insert/promote the Admin and Everyone system groups.

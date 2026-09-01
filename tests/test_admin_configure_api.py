@@ -1300,7 +1300,7 @@ class TestDocumentedServerConfigKeysAreWritable:
         assert "mcp" in _EDITABLE_SECTIONS
         field = _KNOWN_FIELDS["mcp"]["allow_query_param_token"]
         assert field["kind"] == "bool"
-        assert field["default"] is True, "the fallback is on by default; the switch turns it off"
+        assert field["default"] is False, "off by default since #1656; the switch opts back in"
 
 
 class TestBooleanConfigFieldsAreNeverMasked:

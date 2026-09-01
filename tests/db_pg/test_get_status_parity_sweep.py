@@ -120,6 +120,14 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "share_requests_repo() is PG-only (A3 ratchet) -- DuckDB has no "
         "implementation to resolve; see src/repositories/share_requests_pg.py"
     ),
+    # Corporate-memory detection run logs (issue #1971 Part 3) —
+    # parameter-free (page/per_page are query params with defaults) and
+    # reaches memory_detection_runs_repo() -- DuckDB -> typed 501, Postgres
+    # -> 200 (empty list, nothing recorded).
+    "GET /api/memory/admin/detection-runs": (
+        "memory_detection_runs_repo() is PG-only (A3 ratchet) -- DuckDB has no "
+        "implementation to resolve; see src/repositories/memory_detection_runs_pg.py"
+    ),
 }
 
 
