@@ -1672,6 +1672,10 @@ class FakeRunsRepo:
         self.started: List[Dict[str, Any]] = []
         self.checkpoints: List[Dict[str, Any]] = []
         self.finished: List[Dict[str, Any]] = []
+        self.abandon_calls: List[str] = []
+        #: Connection ids `abandon_stale_running` should report as having
+        #: closed something, for tests that want to see the log line fire.
+        self.abandon_returns: List[str] = []
 
     def start(self, *, connection_id, job_id=None, phase="crawl"):
         self.started.append({"connection_id": connection_id, "job_id": job_id, "phase": phase})
@@ -1682,6 +1686,10 @@ class FakeRunsRepo:
 
     def finish(self, run_id, **kwargs):
         self.finished.append({"run_id": run_id, **kwargs})
+
+    def abandon_stale_running(self, connection_id):
+        self.abandon_calls.append(connection_id)
+        return list(self.abandon_returns)
 
 
 def _install_runs_repo(monkeypatch, repo=None):
@@ -1717,6 +1725,46 @@ class TestRunRecording:
         # No detector is wired into the anonymize seam yet, so no tokens are
         # spent — `{}` is "none spent", not a computed $0.00.
         assert final["usage"] == {}
+
+    def test_a_new_run_sweeps_this_connections_abandoned_rows_first(self, crawl_env, monkeypatch):
+        """A worker that died mid-crawl leaves its row `running` forever
+        unless something closes it. The next run for the SAME connection —
+        the only time it is safe to assume any `running` row left over is
+        not us — sweeps it before opening its own."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert runs.abandon_calls == ["conn1"]
+        # The sweep runs BEFORE this run's own row is opened.
+        assert len(runs.started) == 1
+
+    def test_a_failed_sweep_never_blocks_the_new_run_from_starting(self, crawl_env, monkeypatch):
+        """The same 'observability, never load-bearing' posture the rest of
+        `_RunRecorder` already has."""
+
+        class FlakySweep(FakeRunsRepo):
+            def abandon_stale_running(self, connection_id):
+                raise RuntimeError("connection reset")
+
+        runs = _install_runs_repo(monkeypatch, FlakySweep())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert len(runs.started) == 1
 
     def test_progress_carries_absolute_counters_only(self, crawl_env, monkeypatch):
         """No fraction, no percentage, no ETA — the crawl enumerates and
@@ -1920,7 +1968,7 @@ class TestRunRecording:
 
         from src.repositories.extraction_runs_pg import ExtractionRunsPgRepository
 
-        for name in ("start", "checkpoint", "finish"):
+        for name in ("start", "checkpoint", "finish", "abandon_stale_running"):
             real = set(inspect.signature(getattr(ExtractionRunsPgRepository, name)).parameters)
             fake = set(inspect.signature(getattr(FakeRunsRepo, name)).parameters)
             # The fake absorbs the rest through **kwargs; what must match is

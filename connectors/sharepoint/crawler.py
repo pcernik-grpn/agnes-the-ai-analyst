@@ -496,7 +496,37 @@ class _RunRecorder:
         # ``clock`` is a test seam only — production never passes one.
         self._last_progress_at = clock()
         try:
-            self.run_id = self._resolve().start(
+            repo = self._resolve()
+        except Exception as exc:  # noqa: BLE001 — recording is never load-bearing
+            self.run_id = None
+            logger.info(
+                "sharepoint crawl: run recording unavailable for connection %s (%s) — crawling anyway",
+                self.connection_id,
+                type(exc).__name__,
+            )
+            return
+        # BEFORE opening this run's own row: only one crawl per connection
+        # runs at a time (the trigger's own idempotency dedup on the owning
+        # job), so a row still `running` here cannot be us — it is a
+        # previous worker's crawl that died without ever calling `finish`.
+        # Closing it now is what stops the source card from reading a
+        # run that will never move again (see `abandon_stale_running`).
+        try:
+            abandoned = repo.abandon_stale_running(self.connection_id)
+            if abandoned:
+                logger.warning(
+                    "sharepoint crawl: closed %d abandoned run row(s) for connection %s before starting a new one",
+                    len(abandoned),
+                    self.connection_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — never blocks the new run
+            logger.debug(
+                "sharepoint crawl: could not sweep abandoned runs for connection %s (%s) — continuing",
+                self.connection_id,
+                type(exc).__name__,
+            )
+        try:
+            self.run_id = repo.start(
                 connection_id=self.connection_id,
                 job_id=self.job_id,
                 phase="crawl",

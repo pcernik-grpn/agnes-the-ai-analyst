@@ -121,11 +121,19 @@ OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 #: The crawl's own vocabulary is ``"timeout"`` | ``"stopped"`` |
 #: ``"throttled"`` | ``"error"`` | ``None``, classified in one place on its
 #: side (``_STOP_REASONS`` / ``_stop_reason()``): the named values are
-#: exactly the stops that leave consistent state on disk. ``"error"`` is
-#: deliberately absent from the set below, and an unknown reason claims
-#: nothing — a new stop has to be vouched for here explicitly before this
-#: surface will promise anything about it.
-RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped"})
+#: exactly the stops that leave consistent state on disk. ``"abandoned"``
+#: is the one member of this set the crawl process itself never sets — it
+#: is written by ``ExtractionRunsPgRepository.abandon_stale_running``, from
+#: an ENTIRELY different (later) process, when a NEW run for the same
+#: connection finds a still-``running`` row left behind by a worker that
+#: died outright (a native crash, a killed process) — resumable for the
+#: exact same reason a self-detected stop is: the per-item cTag write only
+#: ever happens after a durable ingest, so a dead run's persisted state is
+#: never ahead of what it actually finished. ``"error"`` is deliberately
+#: absent from the set below, and an unknown reason claims nothing — a new
+#: stop has to be vouched for here explicitly before this surface will
+#: promise anything about it.
+RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped", "abandoned"})
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
