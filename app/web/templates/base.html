@@ -62,6 +62,10 @@
          Library table + grid, catalog cards and every detail hero. Replaced four
          separate spellings, two of which read from different data. -->
     <link rel="stylesheet" href="{{ static_url('css/trustmark.css') }}">
+    {# Read-only view-as banner. Legacy base, but "every page" has to mean
+       every page — the handful of templates still extending this one would
+       otherwise be the only place the mode is invisible. #}
+    <link rel="stylesheet" href="{{ static_url('css/view_as.css') }}">
     {# app.js is loaded by _app_rail.html itself (the sole nav partial now),
        so any page rendering it gets the nav-dropdown wiring regardless of
        which base template it extends. #}
@@ -75,6 +79,8 @@
     {% endfor %}
 </head>
 <body {% block body_attrs %}{% endblock %}>
+    {# Self-guarded: renders nothing outside a read-only view-as session. #}
+    {% include '_view_as_banner.html' %}
     {# Production nav — the fixed left sidebar. The topnav chrome
        (`_app_header.html`) was retired in Wave 0 (2026-08); rail is the
        only layout now. #}

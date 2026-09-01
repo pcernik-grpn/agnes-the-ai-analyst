@@ -7,6 +7,8 @@ are pure-function tests: no app, no server, no database.
 
 from __future__ import annotations
 
+import yaml
+
 from app.api.ontology import _draft_to_ontology_dict
 from scripts.ontology.import_ontology import translate_ontology
 from src.semantic.document_validation import validate_document
@@ -63,6 +65,24 @@ def test_evidence_required_true_is_the_default_and_adds_no_note():
     )
     ontology = _draft_to_ontology_dict(draft)
     assert ontology["edge_types"]["related"].get("description") is None
+
+
+def test_relationship_description_lands_in_the_relationship_ai_context():
+    """A relationship's own description -- distinct from either endpoint
+    entity's description -- must reach the Ossie document's relationship, not
+    just validate; ``connectors/sharepoint/facts_extraction.py::render_ontology``
+    reads exactly this field back out for the extraction prompt."""
+    draft = _draft(
+        node_types={"a": {"attrs": {}}, "b": {"attrs": {}}},
+        edge_types={"linked_to": {"src": "a", "dst": "b", "description": "what this relationship represents"}},
+    )
+    ontology = _draft_to_ontology_dict(draft)
+    document_text, _ = translate_ontology(ontology)
+
+    parsed = yaml.safe_load(document_text)
+    model = parsed["semantic_model"][0]
+    relationship = next(r for r in model["relationships"] if r["name"] == "linked_to")
+    assert relationship["ai_context"] == "what this relationship represents"
 
 
 def test_empty_draft_translates_but_fails_schema_validation():

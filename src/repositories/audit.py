@@ -8,6 +8,7 @@ from typing import Any, Optional, List, Dict
 import duckdb
 
 from src.audit_context import (
+    apply_view_as_attribution,
     auto_client_ip,
     auto_client_kind,
     auto_correlation_id,
@@ -132,6 +133,11 @@ class AuditRepository:
             correlation_id = auto_correlation_id()
         if client_kind is None:
             client_kind = auto_client_kind()
+        # Read-only view-as: the actor is the VIEWER, never the person whose
+        # surfaces they are looking at. Same autofill layer as the four above
+        # (a request-scoped fact no call site can be expected to thread
+        # through); mirrored verbatim in audit_pg.py.
+        user_id, params = apply_view_as_attribution(user_id, params)
         self.conn.execute(
             """INSERT INTO audit_log
                (id, timestamp, user_id, action, resource, params, result, duration_ms,

@@ -899,6 +899,17 @@ _EXEMPT: dict[str, str] = {
         "If an `agnes admin simulate <user>` CLI ever lands, this should "
         "join its cohort rather than stay exempt"
     ),
+    "/api/admin/users/{user_id}/revoke-sessions": (
+        "server-side session termination without deactivation (issue #1676 "
+        "remainder) — admin-only, /admin/access's own security action on "
+        "another person's account. Mirrors the grandfathered "
+        "/api/memory/admin/bulk-update precedent for an admin-only write "
+        "with no analyst/agent workflow behind it: no CLI verb (this is a "
+        "one-off incident-response click, not a scriptable analyst task) "
+        "and deliberately no MCP tool — an agent-invokable 'force-logout "
+        "another user' call is a blast-radius surface CONTRIBUTING.md's "
+        "standing exemptions caution against, not a convenience"
+    ),
     "/api/auth/keboola/projects": _KEBOOLA_LOGIN_PROJECTS_REASON,
     "/api/admin/server-config/overlay": (
         "raw editable-section-only instance.yaml overlay — the export "

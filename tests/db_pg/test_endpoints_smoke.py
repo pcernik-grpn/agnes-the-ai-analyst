@@ -473,6 +473,69 @@ class TestAdminLibraryPreviewSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Admin — force-end a user's sessions without deactivating (issue #1676
+# remainder)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminRevokeSessionsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/users/{user_id}/revoke-sessions",
+    }
+
+    def test_revoke_sessions_honest_per_backend(self, seeded_app_both):
+        """200 on both backends. PG actually bumps `session_revoked_before`;
+        DuckDB has no such column (A3 ratchet) and stays a documented no-op —
+        the response body says which happened rather than always claiming
+        success."""
+        from src.repositories import users_repo
+
+        backend = seeded_app_both["backend"]
+        before = users_repo().get_by_id("analyst1")
+        assert before.get("session_revoked_before") is None
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["revoked"] is (backend == "pg"), body
+        assert body["backend_supports_revocation"] is (backend == "pg"), body
+
+        after = users_repo().get_by_id("analyst1")
+        if backend == "pg":
+            assert after["session_revoked_before"] is not None
+        else:
+            assert after.get("session_revoked_before") is None
+
+    def test_revoke_sessions_denied_for_non_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert r.status_code == 403, r.text
+
+    def test_revoke_sessions_unknown_user_404(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/nope-does-not-exist/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_revoke_sessions_writes_an_audit_row(self, seeded_app_both):
+        from src.repositories import audit_repo
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        rows, _ = audit_repo().query(action_in=["user.revoke_sessions"])
+        assert any(row.get("resource", "").endswith("analyst1") for row in rows), rows
+
+
+# ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
 
@@ -2127,6 +2190,59 @@ class TestUpgradeFreezeSmoke:
 # ---------------------------------------------------------------------------
 # Route-coverage guard
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Read-only view-as
+# ---------------------------------------------------------------------------
+
+
+class TestViewAsSmoke:
+    """The two view-as routes, on both backends.
+
+    Behavioural depth lives in tests/test_view_as_readonly.py (the read-only
+    guard, narrowing, ticket binding, audit attribution, the banner). What is
+    worth re-asserting HERE is the part that is backend-shaped: entering and
+    exiting both write an audit row through the frozen DuckDB/Postgres pair,
+    and these are the gates that must refuse before any of that is reached.
+    """
+
+    COVERED_ROUTES = {
+        "POST /admin/view-as",
+        "POST /admin/view-as/exit",
+    }
+
+    def test_a_non_admin_cannot_enter(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "admin1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_analyst_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_an_automation_credential_cannot_enter(self, seeded_app_both):
+        """A PAT has no browser to show the banner in and no cookie jar to exit
+        with, so the mode would be invisible state on an automation token — the
+        route refuses even for a real admin."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "analyst1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_exiting_without_a_csrf_token_is_refused(self, seeded_app_both):
+        """Exit mounts no auth dependency by design (get_current_user resolves
+        to the TARGET while the mode is on), so its CSRF check is the gate that
+        has to hold."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as/exit",
+            data={"csrf_token": "", "next": "/me/profile"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
 
 KNOWN_UNTESTED = {
     # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both

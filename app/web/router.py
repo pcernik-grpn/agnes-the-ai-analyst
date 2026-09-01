@@ -6,55 +6,62 @@ Replicates all Flask webapp routes with DuckDB-backed data.
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Optional
+from typing import Any, Final
 from urllib.parse import quote, urlencode
 
+import duckdb
+import jinja2
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-import duckdb
 
-import jinja2
-
+from app.api.me_debug import (
+    _decoded_claims,
+    _last_sync_summary,
+    _read_session_token,
+    _token_fingerprint,
+    require_debug_auth_enabled,
+)
 from app.auth.access import is_user_admin, require_admin
-from app.web import vocabulary
-from app.web.studio import STUDIO_DOMAINS, get_domain as get_studio_domain
-from app.auth.dependencies import get_current_user, get_optional_user, _get_db
+from app.auth.dependencies import _get_db, get_current_user, get_optional_user
 from app.instance_config import (
     FEATURE_FLAGS,
-    get_instance_name,
-    get_instance_subtitle,
-    get_theme_css_overrides,
-    get_home_route,
+    feature_enabled,
+    get_agent_profiles_enabled,
+    get_contribute_skill_enabled,
+    get_custom_scripts,
+    get_data_apps_config,
+    get_hidden_login_features,
     get_home_automode_visibility,
+    get_home_route,
     get_instance_brand,
     get_instance_brand_short,
     get_instance_copyright,
-    get_privacy_policy_url,
-    get_workspace_dir_name,
-    get_workspace_launcher_word,
+    get_instance_custom_preamble,
+    get_instance_favicon,
     get_instance_logo_mark_svg,
     get_instance_logo_svg,
-    get_instance_favicon,
+    get_instance_name,
     get_instance_overview,
+    get_instance_subtitle,
     get_instance_support,
-    get_hidden_login_features,
-    get_instance_custom_preamble,
     get_instance_theme,
-    get_ui_layout,
-    get_custom_scripts,
-    get_data_apps_config,
-    get_studio_enabled,
-    get_news_enabled,
     get_knowledge_digests_ui_enabled,
-    get_contribute_skill_enabled,
-    get_store_moderation_enabled,
-    get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
-    feature_enabled,
+    get_news_enabled,
+    get_privacy_policy_url,
+    get_store_moderation_enabled,
+    get_studio_enabled,
+    get_theme_css_overrides,
+    get_ui_layout,
+    get_workspace_dir_name,
+    get_workspace_launcher_word,
 )
+from app.web import vocabulary
+from app.web.studio import STUDIO_DOMAINS
+from app.web.studio import get_domain as get_studio_domain
 from src.repositories import (
     audit_repo,
     corpus_files_repo,
@@ -83,13 +90,6 @@ from src.repositories import (
     users_repo,
 )
 from src.semantic.keboola_sources import KEBOOLA_SEMANTIC_LAYER_SOURCES
-from app.api.me_debug import (
-    require_debug_auth_enabled,
-    _read_session_token,
-    _decoded_claims,
-    _token_fingerprint,
-    _last_sync_summary,
-)
 
 
 def _resolved_home_route() -> str:
@@ -174,7 +174,7 @@ class _SilentUndefined(jinja2.Undefined):
 templates.env.undefined = _SilentUndefined
 
 # Add custom JSON filter that handles _SilentUndefined and _FlexDict
-import json as _json  # noqa: E402
+import json as _json
 
 
 class _SafeEncoder(_json.JSONEncoder):
@@ -298,7 +298,7 @@ def _posthog_config_global() -> dict:
     }
 
 
-def _posthog_user_block(request: Optional[Request]) -> Optional[dict]:
+def _posthog_user_block(request: Request | None) -> dict | None:
     from src.observability import get_posthog
 
     pc = get_posthog()
@@ -410,11 +410,51 @@ def _is_paper_theme() -> bool:
 templates.env.globals["is_paper"] = _is_paper_theme
 
 
+@jinja2.pass_context
+def _view_as_state(ctx) -> dict | None:
+    """Banner payload for a live read-only view-as, else ``None``.
+
+    A Jinja GLOBAL rather than a context key, for the reason the mode exists:
+    the banner has to appear on every page, and a key each route must remember
+    to pass is a key some route will not pass — the one page where the admin
+    then forgets which eyes they are looking through.
+
+    Reads the same request-scoped ticket the read-only guard enforces
+    (``app.auth.view_as.active_ticket``), so banner-visible and
+    mutations-refused are the same condition, not two that can drift.
+
+    ``pass_context`` for the request: the exit form needs this page's path
+    (to come back to) and the caller's own ``web_csrf`` token (double-submit,
+    read server-side because the cookie is HttpOnly).
+    """
+    from app.auth.view_as import active_ticket
+
+    ticket = active_ticket()
+    if ticket is None:
+        return None
+    request = ctx.get("request")
+    path = "/"
+    csrf_token = ""
+    if isinstance(request, Request):
+        path = request.url.path
+        csrf_token = request.cookies.get(_WEB_CSRF_COOKIE, "")
+    return {
+        "viewer_email": ticket.viewer_email,
+        "target_email": ticket.target_email,
+        "target_user_id": ticket.target_user_id,
+        "path": path,
+        "csrf_token": csrf_token,
+    }
+
+
+templates.env.globals["view_as_state"] = _view_as_state
+
+
 # Grouped /admin sidebar (issue #896 follow-up mock) — data + active-state
 # resolver registered as globals (like `static_url`/`is_paper` above) so
 # `_admin_nav.html` (included from base_admin.html / base_admin_page.html)
 # resolves them regardless of which context builder the enclosing page uses.
-from app.web.admin_nav import (  # noqa: E402
+from app.web.admin_nav import (
     ADMIN_NAV_DOCS,
     ADMIN_NAV_HOME,
     ADMIN_NAV_SECTIONS,
@@ -674,7 +714,7 @@ def _url_for_shim(endpoint: str, **kw) -> str:
     return _URL_MAP.get(endpoint, f"/{endpoint}")
 
 
-def _read_agnes_ca_pem() -> Optional[str]:
+def _read_agnes_ca_pem() -> str | None:
     """Read the Agnes server's TLS fullchain for inlining into the setup prompt.
 
     Returns the PEM string when the cert needs trust-bootstrapping —
@@ -757,7 +797,7 @@ def _read_agnes_ca_pem() -> Optional[str]:
 _CONN_UNSET: Any = object()
 
 
-def _compute_can_chat(request: Request, user: Optional[dict]) -> bool:
+def _compute_can_chat(request: Request, user: dict | None) -> bool:
     """Cloud-chat nav visibility, shared by every page-context builder.
 
     The /chat link is shown only when chat is enabled AND one of the viewer's
@@ -852,7 +892,7 @@ def _config_proxy() -> type:
 
 def _build_context(
     request: Request,
-    user: Optional[dict] = None,
+    user: dict | None = None,
     conn: Any = _CONN_UNSET,
     **extra,
 ) -> dict:
@@ -940,7 +980,7 @@ def _build_context(
 
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+async def index(request: Request, user: dict | None = Depends(get_optional_user)):
     if user:
         from app.instance_config import get_home_route
 
@@ -994,7 +1034,7 @@ async def privacy_page(request: Request):
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    from app.auth.dependencies import is_local_dev_mode, _get_local_dev_user
+    from app.auth.dependencies import _get_local_dev_user, is_local_dev_mode
 
     if is_local_dev_mode():
         # Only short-circuit to the home route if the dev user is actually
@@ -1750,7 +1790,7 @@ async def setup_advanced_page(
     return templates.TemplateResponse(request, "setup_advanced.html", ctx)
 
 
-def _resolve_in_stack_is_local(explicit: Optional[bool]) -> bool:
+def _resolve_in_stack_is_local(explicit: bool | None) -> bool:
     """Whether `in_stack` on these cards means "a local copy exists".
 
     True only under auto-membership, where membership follows from the grant
@@ -1773,9 +1813,9 @@ def _data_package_entry_dict(
     entry,
     drilldown_url: str,
     table_count: int = 0,
-    source_types: Optional[list] = None,
+    source_types: list | None = None,
     is_admin_view: bool = False,
-    in_stack_is_local: Optional[bool] = None,
+    in_stack_is_local: bool | None = None,
 ) -> dict:
     """Adapt a ResourceEntry → template entry dict for the _stack_card macro.
 
@@ -1865,7 +1905,7 @@ def _data_package_entry_dict(
     return out
 
 
-def _facts_repo_if_available() -> Optional[Any]:
+def _facts_repo_if_available() -> Any | None:
     """The facts repo when the ``facts`` feature flag is on AND the active
     backend is Postgres, else ``None`` — the single "is the facts UI even
     reachable" gate every facts-aware web surface uses (spec §13.2: "flag
@@ -2339,7 +2379,7 @@ def _readable_semantic_model_rows(user: dict, conn, *, surface: str) -> list[dic
         return []
 
 
-def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Optional[list[dict]] = None) -> bool:
+def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: list[dict] | None = None) -> bool:
     """Whether to offer this caller the ``/semantic-layer`` browse pages.
 
     The same ``_can_read_model`` gate those pages apply, so a caller who can
@@ -2384,7 +2424,7 @@ def _library_type_map(user: dict) -> list[dict]:
         from src.repositories import facts_repo
 
         counts = facts_repo().count_visible_facts_by_type(user)
-    except Exception:  # noqa: BLE001 - decoration must never break the page
+    except Exception:
         logger.debug("library: type map unavailable", exc_info=True)
         return []
     return [{"type": t, "count": n} for t, n in counts.items()]
@@ -2408,7 +2448,7 @@ def _library_type_map(user: dict) -> list[dict]:
         from src.repositories import facts_repo
 
         counts = facts_repo().count_visible_facts_by_type(user)
-    except Exception:  # noqa: BLE001 - decoration must never break the page
+    except Exception:
         logger.debug("library: type map unavailable", exc_info=True)
         return []
     return [{"type": t, "count": n} for t, n in counts.items()]
@@ -2947,8 +2987,12 @@ async def library_page(
     # store entity is readable by every authenticated user, so listing all of
     # them would make every user's Library a copy of /marketplace rather than
     # "the things I have". Installed items are the honest subset.
+    # The kinds StackResolver does not serve (plugins, recipes) resolve through
+    # `app.services.library_grants` — the one definition the admin Simulate
+    # lens's Library preview reads too, so the preview OF this page and this
+    # page cannot answer the same question differently.
+    from app.services.library_grants import granted_plugins, granted_recipes
     from app.services.stack_resolver import StackResolver
-    from src.repositories import marketplace_plugins_repo
 
     resolver = StackResolver()
 
@@ -2975,6 +3019,19 @@ async def library_page(
                 _via_cache[rt] = {}
         return _via_cache[rt]
 
+    #: Row type key -> RBAC resource type, where the two vocabularies differ.
+    #: A row's `type_key` is the Library's own word: it drives `data-kind` in
+    #: the DOM and the toolbar facet, so it cannot simply be renamed to match.
+    #: For plugins the row says "plugin" while the grant is stored as
+    #: "marketplace_plugin", and passing the row's word straight into
+    #: `ResourceType()` raised `'plugin' is not a valid ResourceType` on EVERY
+    #: render — swallowed by `_granted_via`, so the only visible effect was
+    #: that plugin rows silently lost the "because you are in X" clause, the
+    #: one part of the tooltip a member can actually act on. Found by running
+    #: the page rather than by reading it: the warning is in the log of every
+    #: single Library render.
+    _GRANT_TYPE_FOR_ROW = {"plugin": ResourceType.MARKETPLACE_PLUGIN.value}
+
     def _because_of(type_key: str, item_id: str) -> str:
         """The trailing clause naming the caller's granting groups.
 
@@ -2984,7 +3041,7 @@ async def library_page(
         being a fact a person holds in their head and the count is the more
         useful shape.
         """
-        names = _granted_via(type_key).get(item_id) or []
+        names = _granted_via(_GRANT_TYPE_FOR_ROW.get(type_key, type_key)).get(item_id) or []
         if not names:
             return ""
         if len(names) == 1:
@@ -3205,140 +3262,124 @@ async def library_page(
         except Exception as e:
             _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
-    # Recipes — granted, resolved straight off the repo (no _fetch_entries
-    # support for this type in StackResolver).
+    # Recipes — granted, resolved off `granted_recipes` (no _fetch_entries
+    # support for this type in StackResolver, so the grant rows are the
+    # projection; the shared helper is what keeps the Simulate preview of this
+    # band reading the same rows as the band).
     try:
-        recipe_ids = _granted_ids(ResourceType.RECIPE.value)
-        if recipe_ids:
-            for r in recipes_repo().list(limit=100000):
-                if r["id"] not in recipe_ids:
-                    continue
-                _add_shared_row(
-                    item_id=r["id"],
-                    title=r.get("title") or r.get("slug"),
-                    description=r.get("description"),
-                    href=f"/catalog/r/{r.get('slug') or r['id']}",
-                    glyph="doc",
-                    type_key="recipe",
-                    type_label="Recipe",
-                    origin="granted",
-                    origin_label="Shared with you",
-                    added=r.get("created_at"),
-                    meta_text="",
-                    owner_label="Your workspace",
-                )
+        for g in granted_recipes(uid):
+            _add_shared_row(
+                item_id=g.id,
+                title=g.name,
+                description=g.description,
+                href=g.href,
+                glyph="doc",
+                type_key="recipe",
+                type_label="Recipe",
+                origin="granted",
+                origin_label="Shared with you",
+                added=g.row.get("created_at"),
+                meta_text="",
+                owner_label="Your workspace",
+            )
     except Exception as e:
         _lost("recipes", e)
 
-    # Curated marketplace plugins — grant resource_id is the canonical
-    # "<marketplace_slug>/<plugin_name>" path, so match on that.
+    # Curated marketplace plugins.
+    #
+    # The grant's resource_id is the canonical "<marketplace_id>/<plugin_name>"
+    # path — the SAME key `require_resource_access(MARKETPLACE_PLUGIN,
+    # "{marketplace_id}/{plugin_name}")` gates the API with. Matching it (and
+    # dropping admin-disabled rows, which are instance-wide "does not exist"
+    # for every user-facing surface, grants notwithstanding) lives in
+    # `granted_plugins`; this loop renders what it returns.
+    #
+    # Plugins are the one granted kind whose membership is NOT automatic, so
+    # they override the stack fields `_add_shared_row` sets: for a plugin the
+    # grant is only ELIGIBILITY. Model B (v28+) has `resolve_user_marketplace`
+    # serve `subscriptions ∪ required-tier grants`, so a plugin granted at the
+    # `available` tier and never subscribed is genuinely absent from the
+    # caller's served set — its skills and commands are NOT loaded in their
+    # Claude Code. Treating the grant as membership (as this once did) made the
+    # Library claim a locked "In stack" for every eligible plugin: it
+    # contradicted both the /marketplace card and the agent's own
+    # `marketplace_search`, and — because the row rendered locked — it removed
+    # the only affordance that could have fixed the state. `granted_plugins`
+    # derives `in_stack` from `_curated_stack_sets`, the same helper
+    # `GET /api/marketplace/items` computes its `installed` flag from, which is
+    # what keeps those surfaces from drifting again.
     try:
-        plugin_paths = _granted_ids(ResourceType.MARKETPLACE_PLUGIN.value)
-        if plugin_paths:
-            # The grant's resource_id is "<marketplace_id>/<plugin_name>" — the
-            # SAME key `require_resource_access(MARKETPLACE_PLUGIN,
-            # "{marketplace_id}/{plugin_name}")` gates the API with, and
-            # `marketplace_plugins.marketplace_id` already IS that id. This
-            # used to indirect through a `{id: row["slug"]}` map, but
-            # `marketplace_registry` has no `slug` column (its PRIMARY KEY id
-            # *is* the slug), so every lookup produced None → "None/<plugin>",
-            # matched no grant, and silently dropped EVERY curated plugin from
-            # the Library — invisibly, because a non-matching path is not an
-            # exception the enclosing handler could report.
-            #
-            # Plugins are the one granted kind whose membership is NOT
-            # automatic, so they override the stack fields `_add_shared_row`
-            # sets: for a plugin the grant is only ELIGIBILITY. Model B (v28+)
-            # has `resolve_user_marketplace` serve `subscriptions ∪
-            # required-tier grants`, so a plugin granted at the `available`
-            # tier and never subscribed is genuinely absent from the caller's
-            # served set — its skills and commands are NOT loaded in their
-            # Claude Code. Treating the grant as membership (as this did) made
-            # the Library claim a locked "In stack" for every eligible plugin:
-            # it contradicted both the /marketplace card and the agent's own
-            # `marketplace_search`, and — because the row rendered locked — it
-            # removed the only affordance that could have fixed the state.
-            # Deriving it from `_curated_stack_sets`, the same helper
-            # `GET /api/marketplace/items` computes its `installed` flag from,
-            # is what keeps the two surfaces from drifting again.
-            from app.api.marketplace import _curated_stack_sets
-            from app.api.store import ORGANIZATION_PUBLISHER_LABEL
+        from app.api.store import ORGANIZATION_PUBLISHER_LABEL
 
-            plugin_in_stack, plugin_required = _curated_stack_sets(None, uid)
-            for pl in marketplace_plugins_repo().list_all():
-                # Admin-disabled is instance-wide "does not exist" for every
-                # user-facing surface, grants notwithstanding — same
-                # post-filter as the v2 /skills admin branch
-                # (app/api/v2_marketplace.py). Without it the Library kept
-                # rendering the card with a working "+ Add to stack" button.
-                if pl.get("admin_disabled"):
-                    continue
-                mid, pname = pl.get("marketplace_id"), pl.get("name")
-                path = f"{mid}/{pname}"
-                if path not in plugin_paths:
-                    continue
-                key = (mid, pname)
-                _add_shared_row(
-                    item_id=path,
-                    title=pl.get("display_name") or pl.get("name"),
-                    description=pl.get("description"),
-                    href=f"/marketplace/curated/{mid}/{pname}",
-                    glyph="plugins",
-                    type_key="plugin",
-                    type_label="Plugin",
-                    origin="granted",
-                    origin_label="Shared with you",
-                    added=None,
-                    meta_text=pl.get("category") or "",
-                    # A curated plugin is served off an admin-registered
-                    # marketplace: the organization stands behind it, exactly as
-                    # `/api/marketplace/items` reports it (`publisher_kind=
-                    # "organization"`, `publisher_name=ORGANIZATION_PUBLISHER_LABEL`).
-                    # The Library used to call the same item "Your workspace" and
-                    # emit no trust marker, so the one class of item that IS
-                    # organization-published was the one class showing no
-                    # Organization marker — the two surfaces contradicted each
-                    # other on the same row.
-                    owner_label=ORGANIZATION_PUBLISHER_LABEL,
-                    # The tier is real for plugins too, so the Optional/Required
-                    # facet slices them the way it slices data packages.
-                    requirement=("required" if key in plugin_required else "optional"),
-                )
-                row = items[-1]
-                # Same three fields the store-entity rows carry, so the trust
-                # marker macro reads one vocabulary across every Library row.
-                # A curated plugin has no per-item verification state — the
-                # organization publishing it outranks verification anyway (see
-                # `level_for()` in macros/_trustmark.html).
-                row["publisher_kind"] = "organization"
-                row["verified"] = False
-                row["trust_level"] = "org"
-                # Same endpoint both ways: POST subscribes, DELETE unsubscribes
-                # (`curated_install` / `curated_uninstall`). The Library's toggle
-                # is kind-agnostic — it POSTs/DELETEs whatever the row names.
-                row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-                # Same verb as a store entity, and for the same reason.
-                row["stack_action"] = "Install"
-                row["stack_undo"] = "Uninstall"
-                # Droppable unless an admin pinned it globally (`is_system`) or
-                # required-tier-granted it to one of the caller's groups. Those
-                # are precisely the two cases `curated_uninstall` answers 409
-                # to, so the lock promises exactly what the API enforces.
-                locked = bool(pl.get("is_system")) or key in plugin_required
-                row["stack_action"] = _AGENT_ADD
-                row["stack_undo"] = _AGENT_REMOVE
-                if key in plugin_in_stack:
-                    row["stack_state"] = "in_stack"
-                    row["stack_pill"] = _AGENT_HAS
-                    row["stack_locked"] = locked
-                    row["stack_removable"] = not locked
-                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
-                else:
-                    row["stack_state"] = "available"
-                    row["stack_pill"] = ""
-                    row["stack_locked"] = False
-                    row["stack_addable"] = True
-                    row["stack_title"] = _AGENT_ADD_TOOLTIP
+        for g in granted_plugins(uid):
+            pl = g.row
+            mid, pname = pl.get("marketplace_id"), pl.get("name")
+            _add_shared_row(
+                item_id=g.id,
+                title=g.name,
+                description=g.description,
+                href=g.href,
+                glyph="plugins",
+                type_key="plugin",
+                type_label="Plugin",
+                origin="granted",
+                origin_label="Shared with you",
+                added=None,
+                meta_text=pl.get("category") or "",
+                # A curated plugin is served off an admin-registered
+                # marketplace: the organization stands behind it, exactly as
+                # `/api/marketplace/items` reports it (`publisher_kind=
+                # "organization"`, `publisher_name=ORGANIZATION_PUBLISHER_LABEL`).
+                # The Library used to call the same item "Your workspace" and
+                # emit no trust marker, so the one class of item that IS
+                # organization-published was the one class showing no
+                # Organization marker — the two surfaces contradicted each
+                # other on the same row.
+                owner_label=ORGANIZATION_PUBLISHER_LABEL,
+                # The tier is real for plugins too, so the Optional/Required
+                # facet slices them the way it slices data packages.
+                requirement=("required" if g.requirement == "required" else "optional"),
+            )
+            row = items[-1]
+            # Same three fields the store-entity rows carry, so the trust
+            # marker macro reads one vocabulary across every Library row.
+            # A curated plugin has no per-item verification state — the
+            # organization publishing it outranks verification anyway (see
+            # `level_for()` in macros/_trustmark.html).
+            row["publisher_kind"] = "organization"
+            row["verified"] = False
+            row["trust_level"] = "org"
+            # Same endpoint both ways: POST subscribes, DELETE unsubscribes
+            # (`curated_install` / `curated_uninstall`). The Library's toggle
+            # is kind-agnostic — it POSTs/DELETEs whatever the row names.
+            row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+            # Droppable unless an admin pinned it globally (`is_system`) or
+            # required-tier-granted it to one of the caller's groups. Those
+            # are precisely the two cases `curated_uninstall` answers 409
+            # to, so the lock promises exactly what the API enforces.
+            locked = bool(pl.get("is_system")) or g.requirement == "required"
+            # Same verb as a store entity, and for the same reason.
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
+            if g.in_stack:
+                row["stack_state"] = "in_stack"
+                row["stack_pill"] = _AGENT_HAS
+                row["stack_locked"] = locked
+                row["stack_removable"] = not locked
+                # `_add_shared_row` already composed a tooltip ending in the
+                # "because you are in X" clause; these two lines REPLACE it,
+                # so the clause has to be re-appended or a plugin row is the
+                # one granted kind that never says why the caller has it —
+                # the exact question the clause exists to answer, and the
+                # only part of the row a member can act on.
+                _why = _because_of("plugin", g.id)
+                row["stack_title"] = (_LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP) + _why
+            else:
+                row["stack_state"] = "available"
+                row["stack_pill"] = ""
+                row["stack_locked"] = False
+                row["stack_addable"] = True
+                row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
         _lost("plugins from your organization", e)
 
@@ -3710,9 +3751,10 @@ async def library_page(
     #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
     #: containment test. A row with no date carries nothing and is simply never
     #: matched, which is honest — we do not know when it arrived.
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
 
-    _now = _dt.now(_tz.utc)
+    _now = _dt.now(UTC)
     _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
     _age_counts: dict = {}
     for c in items:
@@ -3722,7 +3764,7 @@ async def library_page(
             try:
                 when = _dt.fromisoformat(iso)
                 if when.tzinfo is None:
-                    when = when.replace(tzinfo=_tz.utc)
+                    when = when.replace(tzinfo=UTC)
                 age = _now - when
                 buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
             except ValueError:
@@ -3984,6 +4026,50 @@ async def library_page(
     else:
         library_active_tab = _TAB_KNOWLEDGE
 
+    # WHICH emptiness, when there is nothing to list. This page is grant-scoped
+    # and deliberately NOT admin god-mode (see the handler docstring), so a
+    # fully stocked workspace still renders nothing here for a caller no admin
+    # has granted anything to. The page had ONE empty state for both cases and
+    # it said "your library is empty — upload a file", i.e. it framed the
+    # surface as purely self-authored; an admin who had just connected a source
+    # and registered a marketplace read that as the product being broken. Same
+    # class of mistake `library_load_errors` exists to prevent one branch away:
+    # "empty" is a claim about the world, and the page may only make it when it
+    # knows the world is.
+    #
+    # Computed ONLY when the empty state can actually render — the template
+    # branches on `library_sections`, so a stocked Library pays nothing. Even
+    # then it is close to free: the package map and the domain item counts were
+    # already read above for the rows, and plugins come from a grouped COUNT,
+    # never a body read. Deliberately not exhaustive across every grantable
+    # kind — these are the three the copy names, and a miss only falls back to
+    # the copy the page shipped before, which is the safe direction. It is
+    # coarse the other way too: a package still in `draft` counts, so an
+    # instance whose only content is unpublished says "nothing shared with you
+    # yet". That reading is the useful one for both readers — an admin's next
+    # move really is publish-and-grant, and it is not a fresh instance.
+    #
+    # Memory counts on ITEMS, not on domains: every instance ships six empty
+    # starter domains, and an empty domain is hidden from the band even when
+    # granted (see `dom_counts` above), so counting domains would make the
+    # genuinely-empty state unreachable and the split meaningless. `dom_counts`
+    # has no entry for a domain with nothing in it, and is None when the count
+    # could not be read — both fall to False, which is the conservative side.
+    #
+    # What this discloses is an AGGREGATE — that the workspace holds grantable
+    # content at all — never a name, a count, or any kind's inventory. Naming a
+    # specific resource to a caller with no grant is the disclosure
+    # docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md
+    # rules out, and an aggregate stays on the right side of that line.
+    library_grantable_exists = False
+    if not library_sections:
+        library_grantable_exists = bool(pkg_slugs) or bool(dom_counts)
+        if not library_grantable_exists:
+            try:
+                library_grantable_exists = bool(marketplace_plugins_repo().count_by_marketplace())
+            except Exception as e:  # noqa: BLE001 - a copy decision must never take the page down
+                logger.debug("/library: plugin existence check unavailable: %s", e)
+
     from app.instance_config import feature_enabled
 
     ctx = _build_context(
@@ -4010,6 +4096,10 @@ async def library_page(
         library_formats=_present_multi("format_keys"),
         library_ownerships=library_ownerships,
         library_load_errors=_load_errors,
+        # Which empty state is the honest one — see where this is computed.
+        # Read only by the `{% else %}` branch, and only after
+        # `library_load_errors`: a failed read outranks both claims.
+        library_grantable_exists=library_grantable_exists,
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
@@ -4133,10 +4223,9 @@ async def skills_page(
     The route keeps its ``/skills`` path: it is the target of the Marketplace
     "submit" CTA, the ``?from=skills`` detail back-link and the tour anchors.
     ``?type=skill|plugin|agent`` deep-links past the picker."""
+    from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
     from src.store_categories import STORE_CATEGORIES
     from src.store_naming import sanitize_username
-
-    from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
 
     # The name an author types is not the name their item answers to — the
     # store appends `-by-<owner>`. /store/new has always shown that; the
@@ -4219,7 +4308,7 @@ def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
         return {}
 
 
-def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> Optional[str]:
+def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> str | None:
     """The flat-registry URL that lands on this document metric's projected
     row — the model list's "All metrics" tab — or ``None`` when the metric
     has no row this caller would see there (#1707).
@@ -4332,7 +4421,7 @@ def _semantic_layer_tab_label(tab: str) -> str:
     }[tab]
 
 
-def _readable_model_by_slug(slug: str, user: dict, conn) -> Optional[dict]:
+def _readable_model_by_slug(slug: str, user: dict, conn) -> dict | None:
     """Resolve a slug to the newest ``semantic_models`` row the CALLER CAN READ.
 
     Slugs are unique only per ``(source, source_ref)`` (``upsert`` prunes only
@@ -4985,14 +5074,14 @@ async def catalog_package_detail(
     # the row like any other column, and rendered by the shared trust marker
     # every other surface uses (the amber `pkg-badge--curated` chip lived only
     # on the frozen pre-redesign page, retired with it).
-    from datetime import datetime, timedelta, timezone as _tz
+    from datetime import datetime, timedelta
 
     badges: list[str] = []
 
     created_at = pkg.get("created_at")
     if isinstance(created_at, datetime):
-        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=_tz.utc)
-        if (datetime.now(_tz.utc) - ts) < timedelta(days=30):
+        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
+        if (datetime.now(UTC) - ts) < timedelta(days=30):
             badges.append("new")
 
     total_size = sum(t["size_bytes"] for t in tables)
@@ -5190,9 +5279,9 @@ async def catalog_table_detail(
     table. Falls back to 403 otherwise — analysts only see tables that
     belong to packages they're granted on.
     """
-    from src.rbac import get_accessible_ids
-    from src.access_policy import effective_schema
     from app.resource_types import ResourceType
+    from src.access_policy import effective_schema
+    from src.rbac import get_accessible_ids
 
     table_repo = table_registry_repo()
     table = table_repo.get(table_id)
@@ -5441,7 +5530,7 @@ def _memory_domain_entry_dict(
     drilldown_url: str,
     items_count: int = 0,
     required_count: int = 0,
-    in_stack_is_local: Optional[bool] = None,
+    in_stack_is_local: bool | None = None,
 ) -> dict:
     """Adapt a ResourceEntry (memory_domain) → template entry dict.
 
@@ -5515,8 +5604,8 @@ async def corporate_memory(
     (the pending-review banner) stay gated server-side: ``is_admin_view``
     zeroes ``pending_review_count`` for non-admins.
     """
-    from app.services.stack_resolver import StackResolver
     from app.resource_types import ResourceType
+    from app.services.stack_resolver import StackResolver
 
     # Rail: the Library's Memory band IS this page now (counts, add-to-stack,
     # the empty-domain rule all moved there — spec 2026-08-12). 302, not 308,
@@ -5587,7 +5676,7 @@ async def corporate_memory(
     # under auto-membership it applies to BOTH grids — see /catalog's
     # ``_req_first_key`` comment — while classic keeps the pre-redesign
     # contract (Browse only).
-    _req_first_key = lambda e: (0 if e.requirement == "required" else 1, e.name or "")  # noqa: E731
+    _req_first_key = lambda e: (0 if e.requirement == "required" else 1, e.name or "")
     browse_entries = sorted(browse_entries, key=_req_first_key)
     if auto_membership:
         stack_entries = sorted(stack_entries, key=_req_first_key)
@@ -5761,7 +5850,7 @@ def _dev_preview_enabled() -> bool:
     return is_local_dev_mode()
 
 
-def _resolve_dev_preview(request: Request) -> Optional[str]:
+def _resolve_dev_preview(request: Request) -> str | None:
     """Which audience this render is pretending to be for, or None.
 
     Changes only what is RENDERED. No authority, no grant and no repo read is
@@ -5774,7 +5863,7 @@ def _resolve_dev_preview(request: Request) -> Optional[str]:
     return value if value in DEV_PREVIEW_MODES else None
 
 
-def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
+def _chrome_ctx(request: Request, user: dict | None) -> dict:
     """Single owner of every chrome-level template-context key (#996).
 
     Routes that render ``base_ds.html``/``base_page.html`` MUST spread this
@@ -6380,7 +6469,7 @@ async def admin_activity(
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_page(
     request: Request,
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Setup instructions for the local agent (CLI + Claude Code).
@@ -6396,10 +6485,10 @@ async def setup_page(
     override is set, the live default from
     setup_instructions.resolve_lines() is used.
     """
-    from src.welcome_template import compute_default_agent_prompt, _sanitize_banner_html
     from jinja2 import TemplateError
 
     from src.prompt_render import make_prompt_env
+    from src.welcome_template import _sanitize_banner_html, compute_default_agent_prompt
 
     base_url = str(request.base_url).rstrip("/")
 
@@ -6519,7 +6608,7 @@ def _web_csrf_ok(request: Request, supplied: str) -> bool:
 
 
 @router.get("/auth/logout", response_class=HTMLResponse)
-async def logout_page(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+async def logout_page(request: Request, user: dict | None = Depends(get_optional_user)):
     """Logout CONFIRMATION page (no state change) — issue #1675.
 
     The Logout menu item used to be a plain ``GET`` link to ``/login``,
@@ -6549,7 +6638,7 @@ async def logout_page(request: Request, user: Optional[dict] = Depends(get_optio
 async def logout_submit(
     request: Request,
     csrf_token: str = Form(""),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
 ):
     """End the session — clear the cookie AND revoke it server-side.
 
@@ -6606,7 +6695,7 @@ _SLACK_BIND_CSRF_COOKIE = "slack_bind_csrf"
 async def slack_bind(
     request: Request,
     code: str = "",
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Render the Slack-identity binding CONFIRMATION page (no state change).
@@ -6660,7 +6749,7 @@ async def slack_bind_confirm(
     request: Request,
     code: str = Form(""),
     csrf_token: str = Form(""),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Redeem a Slack binding code — the only state-changing bind path (F2).
@@ -6705,6 +6794,167 @@ async def slack_bind_confirm(
     resp = templates.TemplateResponse(request, "slack_bind.html", ctx)
     resp.delete_cookie(_SLACK_BIND_CSRF_COOKIE, path="/slack/bind")
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Read-only view-as — see app/auth/view_as.py for the mechanism and its threat
+# model, and app/middleware/view_as_readonly.py for the read-only guard.
+#
+# Deliberately web routes, not `/api/*`: this is browser chrome that needs an
+# interactive session and a CSRF token, and the REST×CLI×MCP coverage rule
+# would otherwise push it toward an agent-invokable tool. An MCP tool that can
+# re-point whose eyes the caller is looking through is the same class of
+# privilege-escalation seam the standing exemptions in CONTRIBUTING.md name for
+# credential provisioning — so there is no CLI command and no MCP tool for it,
+# by design rather than by omission.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/admin/view-as")
+async def view_as_enter(
+    request: Request,
+    user_id: str = Form(""),
+    csrf_token: str = Form(""),
+    next: str = Form(""),
+    user: dict = Depends(require_admin),
+):
+    """Begin a read-only view-as session for ``user_id``.
+
+    POST-only and CSRF-gated (``web_csrf`` double-submit, the
+    :func:`slack_bind_confirm` shape): a mode change reachable from a menu
+    item must not fire on ambient cookie auth alone — security playbook §10,
+    which this repo learned from a GET that bound an attacker's Slack identity
+    to a victim's account.
+
+    ``Depends(require_admin)`` is the gate. It also makes the mode
+    non-nestable for free: while a view-as is active the caller is not an
+    admin (``app.auth.access.is_user_admin`` answers False for the narrowed
+    subject), so re-entering requires exiting first — and the read-only guard
+    refuses this very POST anyway.
+    """
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    from app.auth.dependencies import non_interactive_credential_kind
+
+    credential = non_interactive_credential_kind(request)
+    if credential is not None:
+        # A PAT/service token has no browser to show a banner in and no
+        # cookie jar to exit with — the mode would be invisible state on an
+        # automation credential.
+        raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
+
+    target_id = (user_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if target_id == str(user["id"]):
+        raise HTTPException(status_code=400, detail="view_as_self")
+
+    target = users_repo().get_by_id(target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bool(target.get("active", True)):
+        raise HTTPException(status_code=400, detail="view_as_inactive_user")
+
+    from app.auth.public_url import cookie_secure
+    from app.auth.view_as import VIEW_AS_COOKIE, safe_internal_path, sign_ticket
+    from src.audit_helpers import log_safe
+
+    ticket = sign_ticket(
+        viewer_user_id=str(user["id"]),
+        viewer_email=str(user.get("email") or ""),
+        target_user_id=str(target["id"]),
+        target_email=str(target.get("email") or ""),
+    )
+
+    log_safe(
+        user_id=str(user["id"]),
+        action="view_as.start",
+        resource=f"user:{target['id']}",
+        params={"target_user_id": str(target["id"])},
+        result="success",
+    )
+
+    destination = safe_internal_path(next, "/")
+    response = RedirectResponse(url=destination, status_code=303)
+    response.set_cookie(
+        VIEW_AS_COOKIE,
+        ticket,
+        httponly=True,
+        secure=cookie_secure(request),
+        samesite="strict",
+        path="/",
+        # No max_age/expires on purpose: the ticket dies with the browser
+        # session, and its own signed timestamp expires it well before that.
+    )
+    # Guarantee the banner's exit form has a token to submit even if the
+    # caller reached here without one in their jar.
+    _refresh_web_csrf_cookie(response, request, _get_or_mint_web_csrf(request))
+    return response
+
+
+@router.post("/admin/view-as/exit")
+async def view_as_exit(
+    request: Request,
+    csrf_token: str = Form(""),
+    next: str = Form(""),
+):
+    """End a read-only view-as session — clear the ticket cookie, nothing else.
+
+    The one path ``ViewAsReadOnlyMiddleware`` lets through as a non-GET while
+    the mode is active, so it is deliberately the smallest handler in the
+    file: it reads no target, writes no state, and touches exactly one cookie.
+
+    It mounts **no auth dependency**, and that is the point rather than an
+    oversight. ``get_current_user`` resolves to the TARGET while the mode is
+    on, so ``require_admin`` would 403 the very person trying to leave and
+    ``get_optional_user`` would hand back an identity that is not the actor's.
+    The caller is instead identified by the HttpOnly, server-signed ticket
+    itself, and the action is gated by the same ``web_csrf`` double-submit
+    token as every other state-changing web POST — a cross-site page can read
+    neither.
+    """
+    from app.auth.public_url import cookie_secure
+    from app.auth.view_as import (
+        VIEW_AS_COOKIE,
+        safe_internal_path,
+        session_matches_viewer,
+        verify_ticket,
+    )
+    from src.audit_helpers import log_safe
+
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    # The ticket alone is a BEARER string — `verify_ticket` checks signature
+    # and expiry, nothing about who is holding it. Writing the audit row off
+    # that alone let anyone with a leaked ticket value forge a `view_as.end`
+    # entry against the real admin: `active_ticket()` is never stamped for
+    # such a request (the middleware's own binding check refuses to engage),
+    # so `apply_view_as_attribution` sees no active ticket and leaves the
+    # forged `user_id` in place. Bind it to the caller's own session, the same
+    # check the middleware and the auth layer each already make — now one
+    # shared definition rather than a rule kept in three places.
+    ticket = verify_ticket(request.cookies.get(VIEW_AS_COOKIE))
+    if ticket is not None and session_matches_viewer(request.cookies.get("access_token"), ticket):
+        log_safe(
+            user_id=ticket.viewer_user_id,
+            action="view_as.end",
+            resource=f"user:{ticket.target_user_id}",
+            params={"target_user_id": ticket.target_user_id},
+            result="success",
+        )
+
+    destination = safe_internal_path(next, "/admin/access")
+    response = RedirectResponse(url=destination, status_code=303)
+    response.delete_cookie(
+        VIEW_AS_COOKIE,
+        path="/",
+        secure=cookie_secure(request),
+        httponly=True,
+        samesite="strict",
+    )
+    return response
 
 
 @router.get("/install", response_class=HTMLResponse)
@@ -7282,8 +7532,9 @@ async def marketplace_format_guide(
     # so no new pinning is needed. Commonmark preset + the table extension
     # gives us fenced code blocks (rendered as <pre><code class="language-X">)
     # and GFM-style tables — enough to render the format guide cleanly.
-    from markdown_it import MarkdownIt
     from pathlib import Path
+
+    from markdown_it import MarkdownIt
 
     md_path = Path(__file__).resolve().parent.parent.parent / "docs" / "curated-marketplace-format.md"
     try:
@@ -7318,8 +7569,9 @@ async def documentation_api(
     Freshness is enforced by tests/test_api_docs_coverage.py, which fails
     CI when a public /api/* route is missing from the document.
     """
-    from markdown_it import MarkdownIt
     from pathlib import Path
+
+    from markdown_it import MarkdownIt
 
     from app.version import APP_VERSION
 
@@ -7529,8 +7781,8 @@ async def admin_data_packages(
     whether an empty package needs table assignment) independent of their
     own group grants.
     """
-    from app.services.stack_resolver import StackResolver
     from app.resource_types import ResourceType
+    from app.services.stack_resolver import StackResolver
 
     resolver = StackResolver(conn)
     pkg_repo = data_packages_repo()
@@ -7724,7 +7976,7 @@ async def admin_package_detail(
     ``users.last_pull_at`` (stamped by app/api/sync.py on every human pull) is
     what turns "shared with 14 people" into "11 of them actually have it".
     """
-    from datetime import timedelta, timezone
+    from datetime import timedelta
 
     from src.repositories import (
         resource_grants_repo,
@@ -7740,14 +7992,14 @@ async def admin_package_detail(
     if pkg is None:
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     def _aware(ts):
         """Timestamps come back naive from DuckDB and aware from Postgres;
         comparing the two raises. Normalise to UTC at every read."""
         if ts is None:
             return None
-        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+        return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
     # ── What is in it ────────────────────────────────────────────────────
     # `list_tables` returns only (id, name) — the registry row carries the
@@ -8432,6 +8684,166 @@ _DERIVED_SOURCES: dict[str, dict] = {
 }
 
 
+#: `query_mode` values whose parquet reaches an analyst through a data package
+#: (`agnes pull`) — blank/NULL reads as `local`. The same fold `/admin`'s gap
+#: card (`admin_dashboard._DISTRIBUTABLE_QUERY_MODES`) and the unpackaged tray
+#: use, so they cannot disagree about which rows "reach nobody" applies to.
+#: `remote` rows answer server-side WITHOUT a package.
+_PACKAGEABLE_QUERY_MODES = ("", "local", "materialized")
+
+#: The verify step. The Access page's person lens previews a Library from the
+#: same `StackResolver.browse` projection `/library` runs, so it cannot drift
+#: from what they will really see. NOT the analyst page, which arrives as
+#: YOURSELF — a different question (admin_package_detail.html says so too).
+_SIMULATE_LENS_HREF = "/admin/access?lens=simulate"
+
+
+def _source_next_step(source_type: str, tables: dict, feeds: dict) -> dict | None:
+    """The ONE thing to do next so this source's data reaches a person — or
+    ``None`` when there is nothing honest to say.
+
+    A connected source shows its tables on /admin/data-sources and reaches
+    nobody until an admin has put them in a data package AND granted that
+    package to a group somebody is in. Connecting does neither, nothing said
+    so, and the reported symptom was an admin concluding the product was
+    broken because /library (grant-scoped, deliberately not admin god-mode)
+    read "Your library is empty". This is the missing bridge, on the card the
+    admin is already looking at. Derived from the strip's OWN cells rather
+    than a second read, so a card's counts and its next step cannot disagree.
+
+    The ladder, in the order the work happens: ``package`` (some distributable
+    table is in no package) → ``share`` (all bundled, no group holds those
+    packages) → ``people`` (granted to groups nobody is in) → ``None``.
+
+    Besides that finished chain, four situations answer ``None`` on purpose:
+
+    * **no tables at all** — the strip's Tables cell already renders "Add the
+      first tables →"; a second copy of that verb on the same card is noise;
+    * **nothing packageable** — a `remote`-only source (BigQuery live queries)
+      is reachable server-side without a package;
+    * **``people == -1``** — the strip's "granted to Everyone" sentinel, which
+      read as a falsy zero would nag the setup that reaches the most people;
+    * **a file source** — SharePoint delivers through collections + groups and
+      carries its own sharing rows on the same card; the package chain must
+      not speak over them.
+
+    The later rungs read ``feeds``, which counts packages holding ANY of this
+    source's tables — coarser than the first rung, which counts unpackaged
+    DISTRIBUTABLE rows exactly. A source whose remote rows are bundled while
+    its local ones are not is caught by ``package``, which fires first.
+    """
+    if source_type == "sharepoint":
+        return None
+    distributable = tables.get("distributable") or 0
+    if not distributable:
+        return None
+
+    unpackaged = tables.get("unpackaged") or 0
+    groups = feeds.get("groups") or 0
+    people = feeds.get("people") or 0
+
+    if unpackaged:
+        # "3 of this source's tables" only once some ARE bundled: on the
+        # common fresh-connection path every row is unpackaged, and "5 of 5"
+        # is a riddle where "This source's 5 tables" is a sentence. No
+        # denominator either way — it would be the DISTRIBUTABLE count, which
+        # is not the number in the Tables cell beside it on a source that also
+        # has remote rows.
+        subject = (
+            f"This source's {distributable} {_plural_word(distributable, 'table is', 'tables are')}"
+            if unpackaged >= distributable
+            else f"{unpackaged} of this source's tables {_plural_word(unpackaged, 'is', 'are')}"
+        )
+        step = {
+            "key": "package",
+            "text": (
+                f"{subject} in no data package, so nobody can see "
+                f"{_plural_word(unpackaged, 'it', 'them')} yet — a package is the unit you share, "
+                "and a table outside one reaches no analyst however it is granted."
+            ),
+            "cta": f"Put {_plural_word(unpackaged, 'it', 'them')} in a data package",
+            # The pile itself, pre-filtered: `?unpackaged=1` arms the Tables
+            # lens's "In no package" facet, so the reader lands on exactly the
+            # rows this sentence is about rather than on every table.
+            "href": "/admin/tables?unpackaged=1",
+        }
+    elif not groups:
+        packages = feeds.get("packages") or 0
+        step = {
+            "key": "share",
+            "text": (
+                f"Bundled into {packages} data {_plural_word(packages, 'package', 'packages')}, "
+                "shared with no group — a package reaches a person only through a group they are "
+                "in, so this data is still in nobody's Library."
+            ),
+            "cta": "Share it with a group",
+            "href": "/admin/data-packages",
+        }
+    elif people == 0:
+        step = {
+            "key": "people",
+            "text": (
+                f"Shared with {groups} {_plural_word(groups, 'group', 'groups')} that nobody is in "
+                "yet. Add people to the group and this data lands in their Library."
+            ),
+            "cta": "Add people to the group",
+            "href": "/admin/access",
+        }
+    else:
+        return None
+
+    step["verify_cta"] = "Preview someone's Library"
+    step["verify_href"] = _SIMULATE_LENS_HREF
+    return step
+
+
+def _plural_word(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def _marketplace_plugin_delivery() -> dict:
+    """Marketplace plugins that no group can reach — the same funnel gap as
+    `_source_next_step`, one page over.
+
+    `/admin/marketplaces` lists every plugin a synced repo produced, while the
+    served feed (`/marketplace.zip`, `/marketplace.git/*`) is filtered per
+    caller by joining `resource_grants ↔ marketplace_plugins` against their
+    groups. So a freshly-registered marketplace is fully present for the admin
+    who registered it and in nobody's Library, and the page never said so.
+
+    Admin-disabled plugins are excluded — hidden from every served surface
+    deliberately, so "nobody can see it" is the intended state, not a gap
+    (the same exclusion `resource_types._marketplace_plugin_blocks` makes).
+
+    Returns ``{"ungranted": int, "marketplaces": [slug, …], "total": int}``.
+    Never raises: this is chrome on a page an admin opens when something is
+    already wrong, so an unreadable repo means the strip says nothing.
+    """
+    empty: dict = {"ungranted": 0, "marketplaces": [], "total": 0}
+    try:
+        from src.repositories import marketplace_plugins_repo, resource_grants_repo
+
+        plugins = [p for p in marketplace_plugins_repo().list_all() if not p.get("admin_disabled")]
+        granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
+    except Exception as e:  # noqa: BLE001 — a missing strip beats a 500
+        logger.warning("marketplace delivery: could not enumerate plugins or grants: %s", e)
+        return empty
+
+    ungranted_slugs: list[str] = []
+    ungranted = 0
+    for p in plugins:
+        mid = p.get("marketplace_id")
+        name = p.get("name")
+        if not mid or not name:
+            continue
+        if f"{mid}/{name}" in granted:
+            continue
+        ungranted += 1
+        if mid not in ungranted_slugs:
+            ungranted_slugs.append(mid)
+    return {"ungranted": ungranted, "marketplaces": ungranted_slugs, "total": len(plugins)}
+
+
 def _source_pipelines(user: dict | None = None) -> dict:
     """The pipeline strip for every source card, keyed by connection id.
 
@@ -8476,7 +8888,6 @@ def _source_inventory(user: dict | None = None) -> dict:
     resolvers: this page is where an admin lands when a source is already
     broken.
     """
-    from datetime import timezone
 
     from src.repositories import (
         data_packages_repo,
@@ -8582,6 +8993,14 @@ def _source_inventory(user: dict | None = None) -> dict:
         packages = {p["id"]: p for p in data_packages_repo().list()}
     except Exception:
         pkg_members, packages = {}, {}
+    # Every table any package carries — what the next-step row's first rung
+    # subtracts a source's distributable rows from. Same `pid in packages`
+    # filter `feeds` applies below, so a membership row pointing at a deleted
+    # package cannot make a table look delivered.
+    packaged_table_ids: set[str] = set()
+    for _pid, _tids in pkg_members.items():
+        if _pid in packages:
+            packaged_table_ids.update(_tids)
     try:
         pkg_grants: dict[str, list] = {}
         for g in resource_grants_repo().list_all(resource_type="data_package"):
@@ -8618,7 +9037,7 @@ def _source_inventory(user: dict | None = None) -> dict:
         except Exception:
             return False
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for conn in [*connections, *derived]:
         cid = conn["id"]
         cells: dict[str, dict] = {}
@@ -8635,7 +9054,17 @@ def _source_inventory(user: dict | None = None) -> dict:
             own += unlinked
             basis = "source_type"
             unlinked = []
-        cells["tables"] = {"count": len(own), "basis": basis, "unlinked": len(unlinked)}
+        # How many of this source's rows a package could carry to a laptop,
+        # and how many of those nobody has bundled. `_source_next_step` keys
+        # off THESE, not the raw count — see `_PACKAGEABLE_QUERY_MODES`.
+        distributable_rows = [t for t in own if (t.get("query_mode") or "") in _PACKAGEABLE_QUERY_MODES]
+        cells["tables"] = {
+            "count": len(own),
+            "basis": basis,
+            "unlinked": len(unlinked),
+            "distributable": len(distributable_rows),
+            "unpackaged": sum(1 for t in distributable_rows if t["id"] not in packaged_table_ids),
+        }
 
         # ── Sync: the freshest run across this source's tables, and how many
         # are currently in error. `internal`/remote rows have no sync state,
@@ -8649,7 +9078,7 @@ def _source_inventory(user: dict | None = None) -> dict:
             ts = st.get("last_sync")
             if ts is not None:
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    ts = ts.replace(tzinfo=UTC)
                 if latest is None or ts > latest:
                     latest = ts
         cells["sync"] = {
@@ -8741,6 +9170,11 @@ def _source_inventory(user: dict | None = None) -> dict:
             "groups": len(granted_group_ids),
             "people": people,
         }
+        # …and, when that chain is unfinished, the one move that advances it.
+        # Folded from the two cells above, and carried in the same dict
+        # `/api/admin/source-pipelines` serves — so a mutation that finishes
+        # the chain drops the row without a page reload.
+        cells["feeds"]["next"] = _source_next_step(stype, cells["tables"], cells["feeds"])
 
         out[cid] = cells
     return {"pipelines": out, "derived": derived}
@@ -8761,7 +9195,7 @@ def _source_inventory(user: dict | None = None) -> dict:
 _VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
 
 
-def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
+def _resolve_sharepoint_rejection_doc(doc_id: str) -> dict | None:
     """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
     ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
     file name + collection name it belongs to, for the card's drawer — a
@@ -8803,7 +9237,7 @@ def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
     never replaces the raw fields the drawer's category counts and any
     other reader of this cell already depend on.
     """
-    doc_cache: dict[str, Optional[dict]] = {}
+    doc_cache: dict[str, dict | None] = {}
     enriched = []
     for row in rows:
         row = dict(row)
@@ -8827,14 +9261,20 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
 
-    **"Scope collections" is an interim heuristic**
-    (`facts_ingest_runs_repo().distinct_corpus_ids()` — see that method's
-    own docstring): every collection this instance has EVER ingested facts
-    into, because there is no persisted connection → collection mapping yet
-    (the connect wizard's step 2 owns that; a sibling, independent effort).
-    Two sharepoint connections on one instance would not be told apart by
-    this alone — acceptable for a single-connection instance, named here so
-    it is not rediscovered as a surprise later.
+    **"Scope collections" is this connection's OWN scope mapping** — every
+    confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
+    same rows the crawl itself routes documents into (`connectors.
+    sharepoint.crawler._confirmed_scopes` reads the identical field). This
+    used to be `facts_ingest_runs_repo().distinct_corpus_ids()` — every
+    collection this INSTANCE had ever ingested FACTS into, a proxy that only
+    worked once a document reached the (opt-in, off-by-default) facts stage.
+    A crawl with `extraction.facts.enabled: false` — the common case — has
+    ALWAYS ingested documents, but the proxy returned `[]` for it, so
+    `cell["crawl"]["documents"]` and `cell["extract"]` read as zero/empty on
+    an instance that had already indexed real files (live symptom: "CRAWL —
+    0 documents", "EXTRACTION — Nothing yet" on a connection with 71
+    `indexed` files). The connection's own scopes are exact, not a proxy,
+    and read correctly whether or not the facts stage has ever run.
 
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
@@ -8860,10 +9300,9 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
 
     scope_ids: list[str] = []
     try:
-        from src.repositories import facts_ingest_runs_repo
-
-        scope_ids = facts_ingest_runs_repo().distinct_corpus_ids()
-    except Exception as e:
+        raw_scopes = (conn.get("config") or {}).get("scopes") or []
+        scope_ids = sorted({s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")})
+    except Exception as e:  # noqa: BLE001 — a malformed config degrades, never a 500
         logger.debug("sharepoint pipeline cell: could not resolve scope collections: %s", e)
 
     # ── crawl / extract: corpus_files across scope collections, bucketed by
@@ -9088,9 +9527,11 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # dropping the row or failing the whole cell; a repo-wide failure
     # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
     # all rather than a 500 for the whole card — same posture as every
-    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
-    # heuristic over ingest history), this list is direct — every scope this
-    # CONNECTION has confirmed, whether or not it has ingested anything yet.
+    # other sub-block here. Reads `config.scopes` a second time rather than
+    # projecting from `scope_ids` above: that one is a bare set of collection
+    # ids, this one needs the full row (`source_scope_id`, `display_path`,
+    # `anonymize`) `_scope_out` renders — two projections of the SAME field,
+    # not two different sources of truth for it.
     scopes: list[dict[str, Any]] = []
     try:
         from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
@@ -9716,7 +10157,13 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     from app.instance_config import get_allowed_domains
 
     ctx["invite_domains"] = get_allowed_domains() or []
-    return templates.TemplateResponse(request, "admin_access.html", ctx)
+    # Double-submit CSRF token for the person lens's "Open a page as them"
+    # POST (F2) — the same mint-and-set pair /me/profile and /auth/logout use.
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx["csrf_token"] = csrf_token
+    response = templates.TemplateResponse(request, "admin_access.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
 
 
 @router.get("/admin/grants", response_class=HTMLResponse)
@@ -9738,7 +10185,15 @@ async def admin_marketplaces_page(
     user: dict = Depends(require_admin),
 ):
     """Admin page for marketplace git repositories (register / sync / delete)."""
+    # NOTE: keep the docstring above to ONE line — FastAPI publishes it as this
+    # route's OpenAPI `description`, so prose here drifts tests/snapshots/openapi.json.
+    #
+    # `plugin_delivery` carries the one thing this page could not see about its
+    # own content: a synced plugin is listed here for the admin and served to
+    # nobody until a group is granted it. See `_marketplace_plugin_delivery`.
     ctx = _build_context(request, user=user)
+    ctx["plugin_delivery"] = _marketplace_plugin_delivery()
+    ctx["simulate_lens_href"] = _SIMULATE_LENS_HREF
     return templates.TemplateResponse(request, "admin_marketplaces.html", ctx)
 
 
@@ -9855,7 +10310,7 @@ def admin_contribute_skill_submit(
     except SkillContributionError as e:
         ctx["error"] = str(e)
         ctx["skill_md"] = skill_md
-    except Exception as e:  # noqa: BLE001 — surface any failure in the page
+    except Exception as e:
         logger.exception("contribute-skill failed")
         ctx["error"] = f"Unexpected error: {e}"
         ctx["skill_md"] = skill_md
@@ -10150,13 +10605,13 @@ def _pending_agent_share_requests_for_admin() -> list:
 @router.get("/admin/store/submissions", response_class=HTMLResponse)
 async def admin_store_submissions_page(
     request: Request,
-    status: Optional[str] = None,
-    submitter: Optional[str] = None,
-    type: Optional[str] = None,  # noqa: A002 — FastAPI query-param name
-    name: Optional[str] = None,
-    version: Optional[str] = None,
-    sort: Optional[str] = None,
-    order: Optional[str] = None,
+    status: str | None = None,
+    submitter: str | None = None,
+    type: str | None = None,
+    name: str | None = None,
+    version: str | None = None,
+    sort: str | None = None,
+    order: str | None = None,
     limit: int = 50,
     skip: int = 0,
     user: dict = Depends(require_admin),
@@ -11115,9 +11570,9 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     sync, and rendering becomes a single round-trip with no client-side
     fetch races. JSON gets embedded by the template via ``| tojson``.
     """
-    from src.rbac import get_accessible_tables
-    from src.marketplace_filter import resolve_allowed_plugins
     from app.api.marketplace import _curated_stack_sets
+    from src.marketplace_filter import resolve_allowed_plugins
+    from src.rbac import get_accessible_tables
 
     by_source: dict[str, int] = {}
     try:
