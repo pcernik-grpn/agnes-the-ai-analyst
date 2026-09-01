@@ -6295,7 +6295,29 @@ function spLoadScopesThenTree() {
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`).then((body) => {
     spScopes = {};
     (body.items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
+    spSeedManualSitesFromScopes();
   }).catch(() => { spScopes = {}; }).then(spLoadTree);
+}
+
+/* A saved SITE scope can rebuild its own sites-level row: its
+   source_scope_id IS the Graph site id ("host,siteCollection,web" — the
+   only scope id containing commas, the same discriminator
+   connectors/sharepoint/corpus_map.py::_map_key keys on) and its
+   display_path IS the site name (sites are ticked at the sites level,
+   where the crumb path is just the name). Seeding spManualSites here is
+   what keeps a saved site visible when the wizard reopens on an existing
+   connection: the live listing can't be relied on to include it —
+   Sites.Selected 403-forbids discovery outright, and list_sites is
+   first-page-only — and spManualSites is reset on every wizard open.
+   Folder/drive scopes carry no site identity, so no row can be rebuilt
+   for them (the flat step-3 list still shows every scope). */
+function spSeedManualSitesFromScopes() {
+  Object.values(spScopes).forEach((s) => {
+    const id = String(s.source_scope_id || "");
+    if (id.indexOf(",") !== -1 && !spManualSites[id]) {
+      spManualSites[id] = { id: id, name: s.display_path || id };
+    }
+  });
 }
 
 /* The current browse level, derived from spLevel — one place, since
