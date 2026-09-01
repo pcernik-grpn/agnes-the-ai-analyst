@@ -15,11 +15,14 @@ The merge facts worth a real ``docker compose config`` run:
   worker is always-on with the overlay present, absent without it. This is
   the overlay's entire activation mechanism and it rides a compose merge
   feature (``!reset``) that plain YAML tooling does not implement.
-* The overlay carries no ``image:`` for the worker any more — it inherits
-  docker-compose.prod.yml's own app-image pin (``AGNES_IMAGE_REPO``/
+* By DEFAULT the overlay carries no ``image:`` for the worker — it
+  inherits docker-compose.prod.yml's own app-image pin (``AGNES_IMAGE_REPO``/
   ``AGNES_TAG``), the SAME pin the ``app``/``scheduler`` services get, while
   ``AGNES_ROLE``/``AGNES_WORKER_LANES`` and the resource-limit interpolations
-  also inherit from the base service.
+  also inherit from the base service. Set ``AGNES_EXTRACTION_WORKER_IMAGE``
+  (module variable ``extraction_worker_image``) and the overlay pins the
+  worker to that ref instead — a deliberate, optional divergence (a canary,
+  holding the worker back), never the default.
 * ``depends_on`` merges additively (app: service_healthy stays, redis:
   service_healthy joins).
 * The app service is untouched except for what ``env_file: .env`` carries —
@@ -53,18 +56,40 @@ JWT_SECRET_KEY=test-jwt
 SESSION_SECRET=test-session
 """
 
+WORKER_IMAGE = "registry.example.com/agnes/extraction-worker:canary-1.2.3"
 
-def overlay_as_written_on_vm() -> str:
+VM_ENV_WITH_WORKER_IMAGE = VM_ENV + f"AGNES_EXTRACTION_WORKER_IMAGE={WORKER_IMAGE}\n"
+
+
+def _resolve_image_conditional(text: str, image_set: bool) -> str:
+    """Hand-evaluate the ONE Terraform conditional this harness does not run
+    ``templatefile()`` for: ``%{ if extraction_worker_image != "" ~}`` /
+    ``%{ endif ~}``. Mirrors exactly what Terraform renders for each case —
+    the guarded lines survive when ``image_set`` is True, vanish otherwise.
+    """
+    guard = '%{ if extraction_worker_image != "" ~}\n'
+    endif = "%{ endif ~}\n"
+    start = text.index(guard)
+    close = text.index(endif, start)
+    inner = text[start + len(guard) : close]
+    kept = inner if image_set else ""
+    return text[:start] + kept + text[close + len(endif) :]
+
+
+def overlay_as_written_on_vm(image_set: bool = False) -> str:
     """The exact docker-compose.extraction.yml bytes a VM ends up with.
 
     The template writes the overlay through a quoted heredoc, so the only
     transformation between template text and on-disk file is Terraform's
-    ``$${`` → ``${`` unescape (templatefile), which the shell's quoted
-    heredoc then passes through verbatim.
+    ``$${`` → ``${`` unescape (templatefile) plus resolving the
+    ``extraction_worker_image`` conditional above, which the shell's quoted
+    heredoc then passes through verbatim. ``image_set=False`` (the default)
+    is the normal, unpinned case every other test in this file exercises.
     """
     m = re.search(r"<<'EXTRYAML'\n(.*?)\nEXTRYAML\n", TPL.read_text(), re.DOTALL)
     assert m, "startup-script.sh.tpl must write the extraction overlay via an EXTRYAML heredoc"
-    return m.group(1).replace("$${", "${") + "\n"
+    raw = m.group(1).replace("$${", "${") + "\n"
+    return _resolve_image_conditional(raw, image_set)
 
 
 def _compose_config(project: Path, files: list[str]) -> dict:
@@ -93,11 +118,23 @@ def compose_available():
 @pytest.fixture()
 def project(tmp_path: Path, compose_available) -> Path:
     """A VM-like compose project dir: the repo's real compose chain + the
-    overlay exactly as the startup script writes it + a VM-like .env."""
+    overlay exactly as the startup script writes it (default, unpinned case)
+    + a VM-like .env."""
     for name in ("docker-compose.yml", "docker-compose.prod.yml", "docker-compose.host-mount.yml"):
         shutil.copy(REPO / name, tmp_path / name)
-    (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm())
+    (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm(image_set=False))
     (tmp_path / ".env").write_text(VM_ENV)
+    return tmp_path
+
+
+@pytest.fixture()
+def project_with_worker_image(tmp_path: Path, compose_available) -> Path:
+    """Same as ``project``, but for a VM whose root module set
+    ``extraction_worker_image`` — the deliberate-pin case."""
+    for name in ("docker-compose.yml", "docker-compose.prod.yml", "docker-compose.host-mount.yml"):
+        shutil.copy(REPO / name, tmp_path / name)
+    (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm(image_set=True))
+    (tmp_path / ".env").write_text(VM_ENV_WITH_WORKER_IMAGE)
     return tmp_path
 
 
@@ -123,12 +160,14 @@ def test_overlay_activates_and_worker_follows_the_app_image(project: Path):
     worker = services["extraction-worker"]
     assert not worker.get("profiles"), "profiles must be cleared, not merged"
 
-    # No image re-pin any more: the overlay carries no `image:` for the
+    # No image re-pin by DEFAULT: the overlay carries no `image:` for the
     # worker, so it falls through to docker-compose.prod.yml's own pin —
-    # the exact same image/tag the app service resolves to. Pinning the
-    # worker to a separate, immutable image used to crash-loop it forever
-    # once the fleet's auto-upgrade migrated the DB past that image's
-    # baked-in schema — this is the regression guard for that bug.
+    # the exact same image/tag the app service resolves to. A REQUIRED,
+    # immutable worker image used to crash-loop it forever once the fleet's
+    # auto-upgrade migrated the DB past that image's baked-in schema; making
+    # the override optional (see test_overlay_pins_the_worker_when_
+    # extraction_worker_image_is_set below for the still-supported pinned
+    # case) and empty-by-default is the regression guard for that bug.
     assert worker["image"] == "ghcr.io/keboola/agnes-the-ai-analyst:stable"
     assert services["app"]["image"] == "ghcr.io/keboola/agnes-the-ai-analyst:stable"
 
@@ -145,6 +184,29 @@ def test_overlay_activates_and_worker_follows_the_app_image(project: Path):
 
     # Additive depends_on merge: the base app-healthy gate survives, the
     # overlay's redis-healthy gate joins it.
+    deps = {k: v["condition"] for k, v in worker["depends_on"].items()}
+    assert deps == {"app": "service_healthy", "redis": "service_healthy"}
+
+
+def test_overlay_pins_the_worker_when_extraction_worker_image_is_set(project_with_worker_image: Path):
+    """The override capability itself is legitimate and stays fully
+    functional — a deliberate, temporary divergence from the app's own
+    image (a canary, holding the worker back mid-rollout). Only the
+    REQUIREMENT was the bug; see test_overlay_activates_and_worker_follows_
+    the_app_image above for the (now default) unpinned case."""
+    cfg = _compose_config(project_with_worker_image, BASE_CHAIN + ["docker-compose.extraction.yml"])
+    services = cfg["services"]
+    worker = services["extraction-worker"]
+
+    # The pin wins over docker-compose.prod.yml's app-image pin — the app
+    # itself is untouched, exactly the "canary" scenario this exists for.
+    assert worker["image"] == WORKER_IMAGE
+    assert services["app"]["image"] == "ghcr.io/keboola/agnes-the-ai-analyst:stable"
+
+    # Base-service inheritance still holds even with the pin in place.
+    env = worker["environment"]
+    assert env["AGNES_ROLE"] == "worker"
+    assert env["AGNES_WORKER_LANES"] == "extraction"
     deps = {k: v["condition"] for k, v in worker["depends_on"].items()}
     assert deps == {"app": "service_healthy", "redis": "service_healthy"}
 

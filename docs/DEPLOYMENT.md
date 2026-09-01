@@ -648,12 +648,19 @@ the Redis coordination backend, the `.env` coordination declaration, an
 `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint connector, not just
 extraction — see the migration note in
 [`feature-flags.md`](feature-flags.md)), and an always-on
-`extraction-worker` service into the boot path — pinned to the SAME
-image/tag as `app`/`scheduler` (`AGNES_IMAGE_REPO`/`AGNES_TAG`), since the
-built-in extraction pipeline needs nothing bundled that image does not
-already carry. Because these ride `.env` (env overrides `instance.yaml` —
-the same posture `app/coordination/factory.py` already uses for the
-coordination backend itself), the TF flag alone activates
+`extraction-worker` service into the boot path. By DEFAULT the service gets
+no `image:` override at all and inherits the SAME image/tag as
+`app`/`scheduler` (`AGNES_IMAGE_REPO`/`AGNES_TAG`), since the built-in
+extraction pipeline needs nothing bundled that image does not already
+carry — this is what keeps the worker from drifting behind the app as the
+fleet auto-upgrades. The module-level `extraction_worker_image` can still
+pin the worker to a DIFFERENT tag for a deliberate, temporary reason (a
+canary, holding the worker back mid-rollout); leaving such a pin in place
+risks the exact crash loop the default avoids once the app migrates the
+database past what the pinned image's Alembic head knows — see that
+variable's own description. Because these ride `.env` (env overrides
+`instance.yaml` — the same posture `app/coordination/factory.py` already
+uses for the coordination backend itself), the TF flag alone activates
 `corpus-extraction` end to end — no applier-owned edit of `instance.yaml`
 on the VM's data disk is needed for the ordinary case. The startup script
 is under `lifecycle.ignore_changes`, so flipping the flag on an existing VM
@@ -662,10 +669,9 @@ takes effect only through a VM recreate (`terraform apply
 prerequisites above remain yours to satisfy — on a DuckDB app-state
 instance the app still refuses to boot, naming the missing piece.
 
-(The module-level `extraction_worker_image` and `extraction_producer_command`
-variables from an earlier, external-producer design are still accepted for
-backward compatibility but are no longer read — see their `variables.tf`
-descriptions.)
+(The module-level `extraction_producer_command` variable, from the retired
+external-producer design, is still accepted for tfvars compatibility but is
+no longer read — see its `variables.tf` description.)
 
 If any SharePoint scope is anonymize-marked, provision the per-instance
 pseudonym key **before the first run** — generation, `runtime_secret_env`

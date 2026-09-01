@@ -187,17 +187,21 @@ variable "prod_instance" {
     # posture, mirrored by app/instance_config.py::feature_enabled — so the
     # applier-owned /data/state/instance.yaml is never touched) and engages a
     # module-owned docker-compose.extraction.yml overlay carrying the `redis`
-    # service and an always-on `extraction-worker`. The worker carries no
-    # image override any more: the built-in document pipeline (owner decision
-    # 2026-08-31 — connectors/sharepoint/crawler.py, one pipeline) needs
-    # nothing bundled that the app image does not already carry, so the
-    # service falls through to docker-compose.prod.yml's own pin and simply
-    # follows AGNES_IMAGE_REPO/AGNES_TAG like app/scheduler. This is what
-    # makes the flag alone activate the `corpus-extraction` job kind end to
-    # end — no per-VM SSH edit of instance.yaml required. AGNES_SHAREPOINT_
-    # ENABLED gates the WHOLE SharePoint connector (2026-09-01 flag
-    # consolidation), not just extraction, so this also turns on the connect
-    # wizard, admin routes, and ACL mirroring on this VM. The multi-process
+    # service and an always-on `extraction-worker`. By DEFAULT the worker
+    # carries no image override: the built-in document pipeline (owner
+    # decision 2026-08-31 — connectors/sharepoint/crawler.py, one pipeline)
+    # needs nothing bundled that the app image does not already carry, so
+    # the service falls through to docker-compose.prod.yml's own pin and
+    # simply follows AGNES_IMAGE_REPO/AGNES_TAG like app/scheduler — this is
+    # what stops pin rot. The module-level extraction_worker_image can still
+    # pin the worker away from that deliberately (a canary, holding the
+    # worker back mid-rollout); see that variable's own description for why
+    # a pin left in place risks a crash loop. This is what makes the flag
+    # alone activate the `corpus-extraction` job kind end to end — no per-VM
+    # SSH edit of instance.yaml required. AGNES_SHAREPOINT_ENABLED gates the
+    # WHOLE SharePoint connector (2026-09-01 flag consolidation), not just
+    # extraction, so this also turns on the connect wizard, admin routes, and
+    # ACL mirroring on this VM. The multi-process
     # startup guard (app/startup_guards.py) then requires the instance to
     # already run the Postgres app-state backend and boots refuse loudly on a
     # DuckDB instance — deliberate: migrate the backend first, then flip this.
@@ -895,26 +899,36 @@ variable "kai_agent_env" {
 
 variable "extraction_worker_image" {
   description = <<-EOT
-    Deprecated, ignored — the module no longer reads this variable.
+    OPTIONAL override for the `extraction-worker` service's image/tag — a
+    deliberate, TEMPORARY divergence from the app, NOT the normal way to run
+    this lane.
 
-    It used to re-pin the `extraction-worker` compose service to a separate
-    image built with a bundled external document-extraction producer. That
-    external-producer mode was removed (owner decision 2026-08-31 — the
-    built-in pipeline, connectors/sharepoint/crawler.py, is the only
-    pipeline there is): the `worker` Dockerfile stage is now byte-for-byte
-    the same image as `app`/`scheduler`, and the `extraction` optional
-    extra (markitdown, pypdfium2) ships in the DEFAULT image build, so
-    there is nothing left to bundle separately. `extraction-worker` now
-    follows AGNES_IMAGE_REPO/AGNES_TAG exactly like every other service —
-    see docker-compose.prod.yml. A separately pinned worker tag drifted
-    behind the live database's migrations and crash-looped the worker
-    forever once the fleet's auto-upgrade moved the schema forward, which
-    is why this is a removal rather than a design kept as-is.
+    Empty (the default) is normal: the module renders no `image:` key on the
+    service at all, so it falls through to docker-compose.prod.yml's own
+    AGNES_IMAGE_REPO/AGNES_TAG pin — the SAME ref `app`/`scheduler` run. This
+    is what stops pin rot: the worker follows the app by construction, with
+    nothing separate to fall behind. The built-in extraction pipeline needs
+    nothing bundled that the app image does not already carry (the
+    `extraction` optional extra ships in the DEFAULT image build), so this
+    is also the right default on pure "does it work" grounds, not just
+    safety.
 
-    Kept declared, accepted and unused only so a root module that still
-    sets it does not fail `terraform plan` with "unsupported argument".
-    Slated for removal in a later cleanup once known consumers have
-    dropped it from their own configuration.
+    Set it only for a genuine, SHORT-LIVED reason to run the worker on a
+    different tag than the app — a canary (rebuild the worker while the app
+    stays on `:stable`), or holding the worker back mid-rollout. WARNING: a
+    pin left in place is a liability, not a feature. The app keeps
+    auto-upgrading and migrating the database forward
+    (src/db_pg.py::assert_pg_at_head refuses to boot an image whose
+    migrations trail the live schema) — once the database moves past what
+    THIS pinned image's Alembic head knows, the worker refuses to start and
+    crash-loops under `restart: unless-stopped` forever, silently killing
+    extraction. This happened on a live deployment and is the reason this
+    variable is optional rather than mandatory. Clear it again as soon as
+    the divergence is no longer needed.
+
+    Registry access: same rule as kai_agent_image — `gcloud auth
+    configure-docker` is run for a *-docker.pkg.dev host, any other private
+    registry needs pre-authenticated pull access on the VM.
   EOT
   type        = string
   default     = ""
