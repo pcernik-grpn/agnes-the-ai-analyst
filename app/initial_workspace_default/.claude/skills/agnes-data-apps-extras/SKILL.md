@@ -139,6 +139,31 @@ Where a figure corresponds to a defined business metric, read the metric's
 definition and run *its* SQL instead of writing your own — see the
 "Metrics before hand-written SQL" section of that reference.
 
+## 8. What the app must never expose
+
+Everything the app serves is reachable by everyone holding a grant on it — with
+a browser, and with `agnes app fetch`. Two mistakes turn that into a leak, and
+neither is caught by anything today (see the deploy-check issue):
+
+**Never serve a static directory at or above the project root.** The shipped
+scaffold does not: its nginx config is a single `location /` proxying to the app
+process, with no `root` and no `alias`, so nothing on disk is served unless you
+add it. An `express.static(<project root>)` makes every committed file
+downloadable — fixtures, dumps, a `.env` someone checked in by mistake. Serve a
+named subdirectory of built assets, never the root.
+
+**Never return `process.env`, or any part of it, in a response.** This is the
+sharper one. The runtime is handed the app owner's real `AGNES_TOKEN` as an
+environment variable, so a debug endpoint, a verbose error page, or an
+exception rendered with the environment attached hands out a live Agnes
+credential to anyone who can open the app. Read the variables you need into
+local constants and use them to build outgoing requests; never put the
+environment itself, or an error object that closes over it, into a response
+body.
+
+The scaffold's error handling is a worked example: it returns the upstream
+response text on failure, never the request headers it sent.
+
 ## References
 
 - `references/path-d.md` — how Agnes shows up as a deployment path in the

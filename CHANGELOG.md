@@ -11,6 +11,21 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+- **`agnes app fetch <slug> <path>` — an authenticated GET against a hosted data
+  app.** Prints the body, or writes it with `--output`. It exists so nobody has
+  to hand a credential to an agent: writing the call by hand means reading a
+  token into the agent's own context, which is indistinguishable from
+  exfiltration and is correctly refused by security tooling. The CLI resolves
+  the token itself, so it appears in no command, no shell history and no
+  transcript.
+  It opens nothing new — same ingress proxy, same authentication, same RBAC,
+  same paths a browser reaches; the only thing that changes is who holds the
+  credential. The target is built from the `url` the API returns and never from
+  the `path` argument, and a `path` naming a host or resolving off the origin is
+  refused, because a command that resolves your token for you must never be
+  aimable at someone else's server. On a deployment that does not serve apps on
+  their own origin the API returns the `/apps/<slug>/` form, which the ingress
+  refuses outright; the command explains that instead of surfacing a bare 403.
 
 - **SharePoint permission zones** (part of the `sharepoint` switch, no separate opt-in): a broken-inheritance subtree becomes its own collection with its own mirrored ACL instead of being excluded outright; the sweep now also detects single files with unique permissions and excludes them fail-closed, records drive-relative paths for server-side enforcement, and retroactively purges already-ingested content (files, chunks, claims) under newly detected exclusions/zones — including fully retiring a dissolved zone's collection and grants. Zone roots are re-read by every ACL sync run, so zone-level revocations land within the same window as scope-level ones, and `must_not` staleness suspension covers zone collections.
 - **Preview a chat deliverable without downloading it.** Every row in the session-files drawer gains a preview action (click the eye, or the filename) that opens the same modal the Library uses. A `.pptx` — which no browser can render — is previewed as its own slides, read straight out of the OOXML archive with no optional extra and no conversion service; `.docx` shows its paragraphs; images and PDFs are drawn by the browser from a new inline viewer (`GET /api/chat/sessions/{chat_id}/files/raw`), and textual files show their first 20 000 characters. The viewer serves a closed image/PDF allowlist and nothing else, so an agent-authored `.html` or `.svg` still has no inline route at all — it previews as source. Backed by `GET /api/chat/sessions/{chat_id}/files/preview`, which answers for both the docker session dir and the kai-agent engine sandbox.
