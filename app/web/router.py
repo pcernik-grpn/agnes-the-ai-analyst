@@ -4857,28 +4857,14 @@ async def semantic_layer_list(
         if f
     ]
 
-    # #1956 item 1: the metrics sidebar's "All / <model slugs>" filter reads
-    # `category`, which `src/semantic/projection.py` sets to the owning
-    # model's own name for every document-projected metric. `glossary_terms`
-    # has no equivalent per-model column — `project_document` stamps every
-    # term from a call with the SAME `(source, source_ref)` regardless of
-    # which of a multi-model document's models it came from (see
-    # `src/semantic/importer.py`'s module docstring, step 5), so a document
-    # declaring more than one model cannot be told apart here. `source` is
-    # the finest attribution a glossary row actually carries — the same
-    # provenance the term's own source badge already renders — so that is
-    # what this buckets by; true per-model glossary attribution is tracked
-    # as a #1956 follow-up, not invented here.
-    glossary_categories: list[dict] = []
-    if active_tab == "all_glossary":
-        by_source: dict[str, int] = {}
-        for t in glossary_repo().list(limit=500):
-            src = t.get("source") or "manual"
-            by_source[src] = by_source.get(src, 0) + 1
-        glossary_categories = [
-            {"key": src, "label": source_label(src), "count": n}
-            for src, n in sorted(by_source.items(), key=lambda kv: source_label(kv[0]))
-        ]
+    # NOTE (#1956 item 1): main's first pass at this bucketed the glossary by
+    # `source` and said so — "true per-model glossary attribution is tracked as
+    # a #1956 follow-up, not invented here". That follow-up is what the Model
+    # facet above now does: the term's owning model is read from the DOCUMENT
+    # (`model_glossary`), which is the one place that knows, rather than from a
+    # column the projector never stamps. So the source bucketing is gone with
+    # the sidebar it fed — `source` survives as its own facet, beside Model,
+    # where it is one axis rather than a stand-in for another.
 
     tab_counts = {
         "models": len(models),
@@ -4912,7 +4898,6 @@ async def semantic_layer_list(
         glossary_terms=glossary_terms,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
-        glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 
