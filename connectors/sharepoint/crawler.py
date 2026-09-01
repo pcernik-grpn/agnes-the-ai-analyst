@@ -1745,11 +1745,63 @@ class _PreparedDocument:
     thread: the caller (on the event loop) turns the outcome into the exact
     same counters the sequential pipeline recorded, so a fail-closed refusal
     is still counted once, per item, whatever thread noticed it.
+
+    ``path``/``filename`` are the RESOLVED values the caller ingests — the
+    real drive-relative path and ``<stem>.md`` for a plain scope, or their
+    anonymized equivalents for an anonymize-marked one (see
+    :func:`_anonymize_identity`). Never the raw ones when the scope
+    anonymizes: a caller that ingested ``path``/``filename`` on ``"ok"``
+    needs no branch of its own on ``anonymize`` to know which to use.
     """
 
     outcome: str  # "ok" | "convert_failed" | "convert_empty" | "anonymize_failed"
     markdown: str = ""
     source_sha256: str = ""
+    path: str = ""
+    filename: str = ""
+
+
+def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
+    """The ``(path, filename)`` an anonymize-marked scope stores instead of
+    the real ones — same key, same detector as the document body.
+
+    The source name and folder path are routinely the single most
+    re-identifying string in a document (a deal name, a client name); an
+    anonymize-marked scope's promise that "Agnes never holds the original at
+    all" (``docs/anonymization.md``) is broken if they survive verbatim
+    while the body is redacted.
+
+    Each path SEGMENT is anonymized independently — not the path as one
+    string — and the ``"/"`` separator structure is kept: two files under
+    the same real folder still share the same anonymized folder prefix
+    (the substitution is deterministic under one key), so prefix matching,
+    the exclusion index and the corpus-map resolver keep working the same
+    SHAPE against the anonymized tree they worked against the real one, even
+    though no segment is readable any more.
+
+    The returned ``path``'s leaf segment keeps the SOURCE file's extension
+    (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
+    mirroring the exact relationship the un-anonymized values already have
+    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
+    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
+    converted markdown's own name). Only the identity-bearing STEM changes,
+    never the suffix a downstream reader keys extension logic on.
+
+    Routing decisions (which collection, which exclusion rule) are made
+    EARLIER in the pipeline against the RAW path — those decisions come from
+    admin-configured real folder names and must see the real thing. This
+    function only prepares what gets PERSISTED.
+    """
+    stem = Path(name).stem or name
+    suffix = Path(name).suffix
+    anonymized_stem = str(anonymize_markdown(stem, key=key, detector=detector).text)
+    filename = f"{anonymized_stem}.md"
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    segments = [
+        str(anonymize_markdown(segment, key=key, detector=detector).text) for segment in folder.split("/") if segment
+    ]
+    anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
+    return anonymized_path, filename
 
 
 def _prepare_document(
@@ -1757,11 +1809,13 @@ def _prepare_document(
     *,
     mime: str,
     path: str,
+    name: str,
     anonymize: bool,
     anonymization_key: Optional[bytes],
     detector: Any,
 ) -> _PreparedDocument:
-    """Hash, convert and (for an anonymize-marked scope) anonymize one file.
+    """Hash, convert and (for an anonymize-marked scope) anonymize one file —
+    its BODY, and (see :func:`_anonymize_identity`) its filename and path.
 
     Pure with respect to crawl state — it touches no counters, no cTags and
     no state file — which is what makes it safe to run on a worker thread.
@@ -1781,18 +1835,23 @@ def _prepare_document(
 
     if anonymize:
         # FAIL CLOSED. An anonymize-marked scope promised its audience that
-        # no raw identifier reaches the collection; a document that cannot be
-        # anonymized is therefore counted and dropped, never ingested in its
-        # original form. Unchanged by concurrency: the refusal is decided per
-        # document, inside this function, before any caller can ingest it.
+        # no raw identifier reaches the collection — not in the body, and not
+        # in the filename or folder path either; a document any part of which
+        # cannot be anonymized is therefore counted and dropped, never
+        # ingested in its original form. Unchanged by concurrency: the
+        # refusal is decided per document, inside this function, before any
+        # caller can ingest it.
         if anonymization_key is None:
             return _PreparedDocument("anonymize_failed")
         try:
             markdown = str(anonymize_markdown(markdown, key=anonymization_key, detector=detector).text)
+            out_path, out_filename = _anonymize_identity(path, name, key=anonymization_key, detector=detector)
         except Exception as exc:  # noqa: BLE001 — incl. ImportError / DetectionUnavailable
             logger.warning("sharepoint crawl: anonymization failed for %s: %s", path, type(exc).__name__)
             return _PreparedDocument("anonymize_failed")
-    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256)
+    else:
+        out_path, out_filename = path, f"{Path(name).stem or name}.md"
+    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256, path=out_path, filename=out_filename)
 
 
 def _note_retry(
@@ -1958,6 +2017,7 @@ async def _process_item(
                 tmp_path,
                 mime=mime,
                 path=path,
+                name=name,
                 anonymize=ctx.anonymize,
                 anonymization_key=anonymization_key,
                 detector=detector,
@@ -1990,8 +2050,13 @@ async def _process_item(
                 ingestor.ingest,
                 collection_id=collection_id,
                 stable_id=stable_id,
-                path=path,
-                filename=f"{Path(name).stem or name}.md",
+                # RESOLVED values from `_prepare_document` — the real
+                # path/name for a plain scope, the anonymized ones for a
+                # marked scope. NOT the raw `path`/`name` locals above:
+                # those are for routing and logging only, and must never
+                # reach storage for a marked scope.
+                path=prepared.path,
+                filename=prepared.filename,
                 markdown=prepared.markdown,
                 source_sha256=prepared.source_sha256,
             )
