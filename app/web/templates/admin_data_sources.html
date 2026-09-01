@@ -1610,7 +1610,7 @@
          never travel through conversation) and the certificate choice. #}
       <section class="ds-drawer__pane is-on" data-spw-pane="1">
         <div class="sp-existing" id="spw-existing" hidden style="margin-bottom:14px;">
-          <div class="ds-field">
+          <div class="ds-field" id="spw-existing-picker">
             <label for="spw-existing-select">Continue an existing connection</label>
             <select id="spw-existing-select" class="ds-dropdown-native"></select>
             {{ ds.dropdown(id='spw-existing-select-dd', target='spw-existing-select', aria_label='Existing SharePoint connection', options=[]) }}
@@ -6208,6 +6208,7 @@ function openSpWizard() {
   });
   document.getElementById("spw-credential-field").style.display = "";
   document.getElementById("spw-new-tenant-sep").style.display = "";
+  document.getElementById("spw-existing-picker").style.display = "";
   spSetCertChoice("upload");
   spGoStep(1);
 
@@ -6263,6 +6264,12 @@ function spBindStep1ToConnection(connId) {
   document.getElementById("spw-credential-field").style.display = "none";
   document.getElementById("spw-new-tenant-sep").style.display = "none";
   document.getElementById("spw-connect-btn").style.display = "none";
+  // "Continue an existing connection" asks a question already answered —
+  // this drawer was opened FROM one. The block around it stays (it carries
+  // "Continue to scope", the way back to step 2, which reads spConnId
+  // rather than the hidden picker while bound).
+  document.getElementById("spw-existing-picker").style.display = "none";
+  document.getElementById("spw-existing").hidden = false;
   ["spw-name", "spw-tenant", "spw-client"].forEach((id) => {
     document.getElementById(id).readOnly = true;
   });
@@ -6363,7 +6370,10 @@ function spConnectErr(msg) {
 }
 
 document.getElementById("spw-existing-btn").addEventListener("click", () => {
-  const id = document.getElementById("spw-existing-select").value;
+  // While bound the picker is hidden, so its value is whatever the listing
+  // happened to preselect — the connection this drawer was opened for is
+  // the only right answer.
+  const id = spBoundToExisting ? spConnId : document.getElementById("spw-existing-select").value;
   if (!id) return;
   spConnId = id;
   spEnableStep(2);

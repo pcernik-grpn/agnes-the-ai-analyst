@@ -823,6 +823,7 @@ function step1State() {
     clientReadOnly: !!el("spw-client").readOnly,
     credentialShown: el("spw-credential-field").style.display !== "none",
     connectBtnShown: el("spw-connect-btn").style.display !== "none",
+    pickerShown: el("spw-existing-picker").style.display !== "none",
   };
 }
 """
@@ -862,6 +863,9 @@ class TestStep1ShowsTheBoundConnection:
         # prefilled form under a "Connect & validate" button is a trap.
         assert result["credentialShown"] is False
         assert result["connectBtnShown"] is False
+        # "Continue an existing connection" asks a question this drawer
+        # already answered by being opened from that connection.
+        assert result["pickerShown"] is False
 
     def test_new_connection_flow_is_untouched(self):
         result = _run(
@@ -878,6 +882,28 @@ class TestStep1ShowsTheBoundConnection:
         assert result["nameReadOnly"] is False
         assert result["credentialShown"] is True
         assert result["connectBtnShown"] is True
+        assert result["pickerShown"] is True
+
+    def test_bound_continue_to_scope_uses_the_bound_connection(self):
+        """The picker is hidden while bound, so its value is whatever the
+        listing preselected — "Continue to scope" must follow spConnId, not
+        that. With several connections the preselection is another one
+        entirely, which would silently scope the wrong source."""
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            el("spw-existing-select").value = "some-other-connection";
+            const calls = [];
+            spLoadScopesThenTree = () => calls.push("loadScopes");
+            el("spw-existing-btn").dispatchEvent({ type: "click" });
+            await _settle();
+            process.stdout.write(JSON.stringify({ spConnId: spConnId, calls: calls }));
+            """
+        )
+        assert result["spConnId"] == "conn-1"
+        assert result["calls"] == ["loadScopes"]
 
     def test_reopening_for_a_new_connection_clears_the_bound_state(self):
         """The bound presentation must not leak into the next open — the
@@ -901,6 +927,7 @@ class TestStep1ShowsTheBoundConnection:
         assert after["nameReadOnly"] is False
         assert after["credentialShown"] is True
         assert after["connectBtnShown"] is True
+        assert after["pickerShown"] is True
 
 
 class TestUniquePermissionsBadgeUI:
