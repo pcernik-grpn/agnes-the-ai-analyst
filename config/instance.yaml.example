@@ -1370,6 +1370,26 @@ extraction:
     # run report's `skipped_oversize` block so a corpus of large files is
     # visible, never silently dropped. 0 = unlimited (streamed download).
     max_file_mb: 50
+    # How many files of ONE delta page the crawl pipelines (download ->
+    # convert -> anonymize -> ingest) at a time. The page boundary is
+    # unchanged: a drive's deltaLink is still persisted only after every row
+    # of that page has been handled, and each file's cTag only after its own
+    # ingest — so resume semantics are identical at any value. Raise it if a
+    # run report shows `max_in_flight` pinned at this number with few
+    # `http_429`s; lower it if the tenant is throttling. 1 = fully
+    # sequential (the pre-parallel behaviour). Clamped to 1..32. If the
+    # tenant throttles hard the crawl halves its own in-flight target per
+    # page (floor 1) and climbs back by 1 per clean page, reporting
+    # `concurrency.downshifts` / `.floor_hit` so the pushback is visible.
+    # Plain instance data in the admin-editable `extraction` section (read
+    # via get_value, not a registered switch), so it shows up in the admin
+    # extraction drawer with a config origin; a single run can override it
+    # with the `corpus-extraction` job payload's `concurrency` (max 16).
+    # NOT the same knob as `extraction.concurrency`, which sizes the
+    # worker's extraction LANE (how many crawl JOBS run at once). The two
+    # multiply: two concurrent crawls at 6 = twelve files in flight against
+    # the same tenant.
+    concurrency: 6
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails

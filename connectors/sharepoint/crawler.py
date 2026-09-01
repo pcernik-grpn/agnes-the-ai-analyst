@@ -72,6 +72,7 @@ Security posture:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -79,7 +80,9 @@ import os
 import random
 import re
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,6 +125,24 @@ _REQUEST_TIMEOUT_S = 120.0
 
 #: Default per-file size cap (``extraction.crawler.max_file_mb``; 0 disables).
 _DEFAULT_MAX_FILE_MB = 50
+#: Default in-page item concurrency (``extraction.crawler.concurrency``).
+#: Six is deliberately modest: the bound that matters on a real tenant is
+#: Graph's own throttling, and the point of this knob is to stop OUR loop
+#: from being the narrower one — not to race the tenant into a 429 storm.
+#: ``1`` is the pre-parallel behaviour, exactly (see :func:`_process_page`).
+_DEFAULT_CONCURRENCY = 6
+#: Hard ceiling on the configured value. Past this the extra parallelism buys
+#: 429s, temp-file pressure and RAM, never throughput.
+_MAX_CONCURRENCY = 32
+#: Ceiling on a PER-RUN ``payload["concurrency"]`` override. Lower than the
+#: configured ceiling on purpose: an ad-hoc run (an admin pressing "run now")
+#: is the wrong place to go looking for a tenant's throttling limit.
+_MAX_PAYLOAD_CONCURRENCY = 16
+#: Adaptive downshift trigger. A delta page that met MORE than this many
+#: throttled responses — or spent more than :data:`_THROTTLE_BURST_WAIT_S`
+#: waiting on them — is a tenant pushing back, not one stray 429.
+_THROTTLE_BURST_429S = 2
+_THROTTLE_BURST_WAIT_S = 30.0
 #: Largest skipped files kept in the report.
 _OVERSIZE_SAMPLE = 20
 #: Delta page size asked of Graph — also the state-checkpoint granularity.
@@ -199,6 +220,15 @@ def _stop_reason(exc: BaseException) -> str:
 # --------------------------------------------------------------------------
 
 _STATE_SUBDIR = "sharepoint_crawl"
+#: ONE writer for the state file, and one mutator for the in-memory state it
+#: is serialized from. Under in-page concurrency several items finish inside
+#: one page and each writes its own cTag; the page boundary then serializes
+#: the whole dict. A `json.dumps` racing a `dict.__setitem__` is a
+#: "dictionary changed size during iteration" crash on the exact write the
+#: resume guarantee depends on, so both sides take this lock. Re-entrant
+#: because the 410-resync path mutates `delta_links` and then calls
+#: :func:`save_state` while still holding it.
+_state_lock = threading.RLock()
 #: Connection ids are repo-minted, but this value reaches a filesystem path,
 #: so it is validated as a single safe segment before use (playbook §6).
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -248,11 +278,17 @@ def load_state(connection_id: str) -> Dict[str, Any]:
 
 
 def save_state(connection_id: str, state: Dict[str, Any]) -> None:
-    """Atomically replace this connection's state file (tmp + ``os.replace``)."""
-    path = state_path(connection_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    """Atomically replace this connection's state file (tmp + ``os.replace``).
+
+    Serialized on :data:`_state_lock`: one writer at a time, and never
+    concurrent with an in-page cTag write (which takes the same lock), so the
+    bytes on disk are always a whole, self-consistent snapshot.
+    """
+    with _state_lock:
+        path = state_path(connection_id)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +478,20 @@ def human_bytes(n: int) -> str:
 @dataclass
 class CrawlStats:
     """What the run cost and what it refused to do. Every skip is counted:
-    an unindexed document must never be invisible in the report."""
+    an unindexed document must never be invisible in the report.
+
+    **Every counter here is mutated concurrently.** In-page item concurrency
+    means several pipelines increment ``new`` / ``errors`` / ``bytes_
+    downloaded`` at once, and the blocking convert/anonymize/ingest section of
+    each runs on a worker THREAD (a bounded pool, see
+    :func:`_run_blocking`), so "the event loop
+    only switches at await points" is not the guarantee it would be for a pure
+    coroutine. ``x += 1`` is a read-modify-write and loses increments under
+    that; an undercounted skip is a document that silently did not get indexed,
+    which is the one thing this report exists to make impossible. So all
+    accumulation goes through :meth:`add` (and :meth:`note_oversize`) under
+    :attr:`_lock` — never a bare ``+=`` from crawl code.
+    """
 
     started: float = field(default_factory=time.monotonic)
     started_at: str = field(default_factory=_now_iso)
@@ -477,14 +526,92 @@ class CrawlStats:
     #: checkpoint and there is no meaningful denominator to divide by).
     items_seen: int = 0
     items_done: int = 0
+    #: In-page item concurrency CEILING for this run (1 = sequential): the
+    #: configured value, or the per-run payload override that replaced it.
+    concurrency: int = 1
+    #: What ``extraction.crawler.concurrency`` alone said — kept next to the
+    #: effective ceiling so a payload override is visible as an override.
+    concurrency_configured: int = 1
+    #: "config" | "payload" | "adaptive" — where the EFFECTIVE in-flight
+    #: target came from. "adaptive" wins when throttling pulled it below the
+    #: ceiling, because that is the number that actually governed the run.
+    concurrency_source: str = "config"
+    #: The adaptive target the run ENDED on, the lowest it ever reached, how
+    #: many times it was halved, and whether it bottomed out at 1. Together
+    #: these are the operator's view of the tenant pushing back — the run is
+    #: never aborted by a downshift, so without them it would be invisible.
+    concurrency_effective_max: int = 1
+    concurrency_min_target: int = 1
+    concurrency_downshifts: int = 0
+    concurrency_floor_hit: bool = False
+    #: Peak number of item pipelines in flight at once, observed. Read next to
+    #: `concurrency` it answers the only question the knob raises: did the pool
+    #: actually fill, or is something else (page size, tenant throttling) the
+    #: real bound?
+    max_in_flight: int = 0
+    #: Live in-flight count — bookkeeping for `max_in_flight`, not reported.
+    in_flight: int = 0
+    #: Summed wall time spent inside the per-item pipeline across all workers.
+    #: Against the run's own `duration_s` this is the honest overlap figure: a
+    #: perfectly serial run has item_seconds ≈ duration_s, a run at N-way
+    #: overlap approaches N × duration_s.
+    item_seconds: float = 0.0
+    #: Guards every counter above. Not compared, not printed — it is machinery.
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    def add(self, **deltas: float) -> None:
+        """Atomically accumulate one or more counters: ``stats.add(new=1)``.
+
+        Unknown names raise rather than quietly minting an attribute — a typo
+        here would be an invisible, permanently-zero counter in the report.
+        """
+        with self._lock:
+            for name, delta in deltas.items():
+                current = getattr(self, name)  # AttributeError on a typo, deliberately
+                setattr(self, name, current + delta)
+
+    def enter_item(self) -> None:
+        """One item pipeline started — track the pool's observed peak."""
+        with self._lock:
+            self.in_flight += 1
+            if self.in_flight > self.max_in_flight:
+                self.max_in_flight = self.in_flight
+
+    def exit_item(self, seconds: float) -> None:
+        """One item pipeline finished (successfully or not)."""
+        with self._lock:
+            self.in_flight -= 1
+            self.item_seconds += max(0.0, seconds)
+
+    def throttle_snapshot(self) -> Tuple[int, float]:
+        """``(http_429, throttle_wait_s)`` read atomically together.
+
+        The adaptive governor diffs two of these across a page; reading the
+        two counters separately could straddle a concurrent update and
+        manufacture a burst that never happened.
+        """
+        with self._lock:
+            return self.http_429, self.throttle_wait_s
+
+    def note_concurrency(self, *, target: int, downshift: bool = False) -> None:
+        """Record where the adaptive in-flight target has moved to."""
+        with self._lock:
+            self.concurrency_effective_max = target
+            self.concurrency_min_target = min(self.concurrency_min_target, target)
+            if downshift:
+                self.concurrency_downshifts += 1
+                self.concurrency_source = "adaptive"
+            if target <= 1 and self.concurrency > 1:
+                self.concurrency_floor_hit = True
 
     def note_oversize(self, path: str, size: int) -> None:
         size = int(size or 0)
-        self.oversize_files += 1
-        self.oversize_bytes += size
-        self.oversize_largest.append({"path": path, "size": size})
-        self.oversize_largest.sort(key=lambda e: -int(e["size"]))
-        del self.oversize_largest[_OVERSIZE_SAMPLE:]
+        with self._lock:
+            self.oversize_files += 1
+            self.oversize_bytes += size
+            self.oversize_largest.append({"path": path, "size": size})
+            self.oversize_largest.sort(key=lambda e: -int(e["size"]))
+            del self.oversize_largest[_OVERSIZE_SAMPLE:]
 
     def report(
         self,
@@ -529,6 +656,22 @@ class CrawlStats:
             "retry_wait_s": round(self.retry_wait_s, 1),
             "token_refreshes": self.token_refreshes,
             "delta_resyncs": self.delta_resyncs,
+            # What the pool was ALLOWED to do, what the tenant let it do, and
+            # what it actually did. `max_in_flight` below `effective_max`
+            # means something other than the knob bounded the run; a non-zero
+            # `downshifts` means the tenant did, which is a fact an operator
+            # has to be able to SEE rather than infer from a slow run.
+            "concurrency": {
+                "configured": self.concurrency_configured,
+                "requested": self.concurrency,
+                "source": self.concurrency_source,
+                "effective_max": self.concurrency_effective_max,
+                "min_target": self.concurrency_min_target,
+                "downshifts": self.concurrency_downshifts,
+                "floor_hit": self.concurrency_floor_hit,
+            },
+            "max_in_flight": self.max_in_flight,
+            "item_seconds": round(self.item_seconds, 1),
             "downloads": self.downloads,
             "bytes_downloaded": self.bytes_downloaded,
             "bytes_downloaded_human": human_bytes(self.bytes_downloaded),
@@ -580,6 +723,19 @@ class GraphAuth:
     of expiry — before requests start failing, not after. The exchange itself
     is ``graph_client.get_app_token``: this class holds a token's lifetime,
     it does not reimplement the certificate-credential flow.
+
+    **One refresh, not N.** With concurrent in-flight requests the expiry
+    window is crossed by every one of them at once, and a 401 storm arrives
+    at every one of them at once. Both paths therefore go through
+    :attr:`_lock` and re-check under it: the first caller performs the
+    exchange, the rest observe the fresh token and reuse it. Without that,
+    a crawl at concurrency N burns N certificate exchanges per expiry and
+    per 401 — against a tenant that is already rate-limiting it.
+
+    The lock is an ``asyncio.Lock`` rather than a ``threading.Lock`` because
+    every token holder is a coroutine on this run's single event loop; the
+    worker threads this crawl uses run the convert/ingest section, which
+    never touches a token.
     """
 
     #: Refresh 5 min early: clock skew plus requests already in flight.
@@ -599,17 +755,50 @@ class GraphAuth:
         self._clock = clock
         self._token: Optional[str] = None
         self.expires_at = 0.0
+        self._lock = asyncio.Lock()
+
+    def _fresh(self) -> bool:
+        return self._token is not None and self._clock() < self.expires_at - self.REFRESH_MARGIN
 
     async def token(self) -> str:
-        if self._token is None or self._clock() >= self.expires_at - self.REFRESH_MARGIN:
-            await self.refresh()
-        assert self._token is not None  # refresh() never leaves it None
-        return self._token
+        if self._fresh():
+            assert self._token is not None
+            return self._token
+        async with self._lock:
+            # Re-checked under the lock: while this caller waited, another
+            # may have done the exchange already.
+            if self._fresh():
+                assert self._token is not None
+                return self._token
+            return await self._acquire_locked()
 
     async def refresh(self) -> str:
+        """Force an exchange (the 401 path). Callers that know WHICH token
+        they saw fail should prefer :meth:`refresh_stale`, which coalesces a
+        concurrent 401 storm into one exchange."""
+        async with self._lock:
+            return await self._acquire_locked()
+
+    async def refresh_stale(self, observed: Optional[str]) -> str:
+        """Refresh only if ``observed`` is still the live token.
+
+        Under concurrency, N in-flight requests can each meet a 401 against
+        the SAME expired token. The first one through replaces it; the others
+        would otherwise each buy an identical new token (and each count a
+        `token_refreshes`, overstating what the run actually did). Seeing a
+        token other than the one they failed with is proof the refresh they
+        needed has already happened.
+        """
+        async with self._lock:
+            if self._token is not None and observed is not None and self._token != observed:
+                return self._token
+            return await self._acquire_locked()
+
+    async def _acquire_locked(self) -> str:
+        """The exchange itself. Callers hold :attr:`_lock`."""
         self._token = str(await self._acquire())
         self.expires_at = self._clock() + self._DEFAULT_TTL
-        self._stats.token_refreshes += 1
+        self._stats.add(token_refreshes=1)
         return self._token
 
 
@@ -652,8 +841,12 @@ class GraphTransport:
             wait = self._backoff_seconds(attempt)  # an HTTP-date, or garbage
         return max(0.0, min(wait, self.max_single_wait_s))
 
-    async def _authorized(self) -> Dict[str, str]:
-        return {"Authorization": f"Bearer {await self.auth.token()}"}
+    async def _authorized(self) -> Tuple[Dict[str, str], str]:
+        """``(headers, token)``. The token is returned as well as stamped so
+        a 401 can name WHICH token failed — :meth:`GraphAuth.refresh_stale`
+        needs that to coalesce a concurrent 401 storm into one exchange."""
+        token = await self.auth.token()
+        return {"Authorization": f"Bearer {token}"}, token
 
     async def _wait(self, seconds: float) -> None:
         """The crawl's ONLY wall-clock wait, resolved at call time through
@@ -667,12 +860,14 @@ class GraphTransport:
         attempt = 0
         throttle_wait = 0.0
         refreshed = False
+        used_token: Optional[str] = None
         while True:
             attempt += 1
-            self.stats.requests += 1
+            self.stats.add(requests=1)
             try:
+                headers, used_token = await self._authorized()
                 async with graph_client._http_client() as client:
-                    resp = await client.get(url, headers=await self._authorized(), timeout=_REQUEST_TIMEOUT_S)
+                    resp = await client.get(url, headers=headers, timeout=_REQUEST_TIMEOUT_S)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 if attempt >= self.max_attempts:
                     raise CrawlError(f"graph GET failed after {attempt} attempts: {type(exc).__name__}") from exc
@@ -689,15 +884,13 @@ class GraphTransport:
                 raise GraphThrottled(f"429 budget exhausted after {attempt} attempts / {throttle_wait:.0f}s of waiting")
             if action == "refresh":
                 refreshed = True
-                self.stats.retries += 1
+                self.stats.add(retries=1)
                 logger.info("sharepoint crawl: 401 — forcing a token refresh")
-                await self.auth.refresh()
+                await self.auth.refresh_stale(used_token)
                 continue
             if action == "throttle":
                 throttle_wait += wait
-                self.stats.http_429 += 1
-                self.stats.throttle_wait_s += wait
-                self.stats.retries += 1
+                self.stats.add(http_429=1, throttle_wait_s=wait, retries=1)
                 logger.info("sharepoint crawl: 429 — pausing %.0fs (attempt %d)", wait, attempt)
                 await self._wait(wait)
                 continue
@@ -721,7 +914,7 @@ class GraphTransport:
         if status == 429:
             wait = self._retry_after(resp, attempt)
             if attempt >= self.max_attempts or throttle_wait + wait > self.max_throttle_wait_s:
-                self.stats.http_429 += 1
+                self.stats.add(http_429=1)
                 return "throttled", 0.0
             return "throttle", wait
         if status == 410:
@@ -734,8 +927,7 @@ class GraphTransport:
 
     async def _sleep_backoff(self, attempt: int, why: str) -> None:
         wait = self._backoff_seconds(attempt)
-        self.stats.retries += 1
-        self.stats.retry_wait_s += wait
+        self.stats.add(retries=1, retry_wait_s=wait)
         logger.info("sharepoint crawl: %s — retry %d/%d in %.1fs", why, attempt, self.max_attempts, wait)
         await self._wait(wait)
 
@@ -759,16 +951,16 @@ class GraphTransport:
         attempt = 0
         throttle_wait = 0.0
         refreshed = False
+        used_token: Optional[str] = None
         try:
             while True:
                 attempt += 1
-                self.stats.requests += 1
+                self.stats.add(requests=1)
                 written = 0
                 try:
+                    headers, used_token = await self._authorized()
                     async with graph_client._http_client() as client:
-                        async with client.stream(
-                            "GET", url, headers=await self._authorized(), timeout=_REQUEST_TIMEOUT_S
-                        ) as resp:
+                        async with client.stream("GET", url, headers=headers, timeout=_REQUEST_TIMEOUT_S) as resp:
                             action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
                             if action == "ok":
                                 with open(tmp_path, "wb") as fh:
@@ -779,8 +971,7 @@ class GraphTransport:
                                                 f"download exceeded the {max_bytes}-byte cap for item {item_id}"
                                             )
                                         fh.write(chunk)
-                                self.stats.downloads += 1
-                                self.stats.bytes_downloaded += written
+                                self.stats.add(downloads=1, bytes_downloaded=written)
                                 return tmp_path
                             await resp.aread()  # drain before deciding, so the connection is reusable
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
@@ -795,14 +986,12 @@ class GraphTransport:
                     raise GraphThrottled(f"429 budget exhausted downloading item {item_id}")
                 if action == "refresh":
                     refreshed = True
-                    self.stats.retries += 1
-                    await self.auth.refresh()
+                    self.stats.add(retries=1)
+                    await self.auth.refresh_stale(used_token)
                     continue
                 if action == "throttle":
                     throttle_wait += wait
-                    self.stats.http_429 += 1
-                    self.stats.throttle_wait_s += wait
-                    self.stats.retries += 1
+                    self.stats.add(http_429=1, throttle_wait_s=wait, retries=1)
                     await self._wait(wait)
                     continue
                 if action == "retry":
@@ -1232,6 +1421,88 @@ def _max_file_bytes(max_file_mb: int) -> int:
     return max(0, int(max_file_mb)) * 1024 * 1024
 
 
+async def _run_blocking(pool: Optional[ThreadPoolExecutor], fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a BLOCKING step, on ``pool`` when the run is parallel.
+
+    Convert, anonymize, hash and ingest are synchronous CPU/DB work. On the
+    event loop they stall every other item's download for their whole
+    duration, which would make "concurrency: 6" buy almost nothing — the six
+    downloads would queue behind one markitdown call. Off the loop they
+    overlap with downloads and with each other.
+
+    The pool is passed in rather than taken from ``asyncio.to_thread``'s
+    default executor on purpose: that one is sized ``min(32, cpu+4)``, so on
+    a 4-core host a configured concurrency above 8 would silently not
+    happen — the knob would stop meaning what it says.
+
+    ``pool=None`` (concurrency 1) makes the call INLINE, so the sequential
+    path is exactly the pre-parallel one: same call, same thread, same
+    ordering, no executor in the picture at all.
+    """
+    if pool is None:
+        return fn(*args, **kwargs)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(pool, functools.partial(fn, *args, **kwargs))
+
+
+@dataclass
+class _PreparedDocument:
+    """Outcome of the blocking half of one item: hash -> convert -> anonymize.
+
+    A value rather than in-place counter bumps, because this runs on a worker
+    thread: the caller (on the event loop) turns the outcome into the exact
+    same counters the sequential pipeline recorded, so a fail-closed refusal
+    is still counted once, per item, whatever thread noticed it.
+    """
+
+    outcome: str  # "ok" | "convert_failed" | "convert_empty" | "anonymize_failed"
+    markdown: str = ""
+    source_sha256: str = ""
+
+
+def _prepare_document(
+    tmp_path: Path,
+    *,
+    mime: str,
+    path: str,
+    anonymize: bool,
+    anonymization_key: Optional[bytes],
+    detector: Any,
+) -> _PreparedDocument:
+    """Hash, convert and (for an anonymize-marked scope) anonymize one file.
+
+    Pure with respect to crawl state — it touches no counters, no cTags and
+    no state file — which is what makes it safe to run on a worker thread.
+    An unexpected failure of the HASH itself still propagates (as it did
+    before): a file we cannot read is not a convert failure.
+    """
+    source_sha256 = _sha256_file(tmp_path)
+    try:
+        converted = convert_to_markdown(tmp_path, mime)
+        markdown = str(getattr(converted, "markdown", "") or "")
+    except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
+        logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
+        return _PreparedDocument("convert_failed")
+    if not markdown.strip():
+        logger.info("sharepoint crawl: conversion produced no text for %s", path)
+        return _PreparedDocument("convert_empty")
+
+    if anonymize:
+        # FAIL CLOSED. An anonymize-marked scope promised its audience that
+        # no raw identifier reaches the collection; a document that cannot be
+        # anonymized is therefore counted and dropped, never ingested in its
+        # original form. Unchanged by concurrency: the refusal is decided per
+        # document, inside this function, before any caller can ingest it.
+        if anonymization_key is None:
+            return _PreparedDocument("anonymize_failed")
+        try:
+            markdown = str(anonymize_markdown(markdown, key=anonymization_key, detector=detector).text)
+        except Exception as exc:  # noqa: BLE001 — incl. ImportError / DetectionUnavailable
+            logger.warning("sharepoint crawl: anonymization failed for %s: %s", path, type(exc).__name__)
+            return _PreparedDocument("anonymize_failed")
+    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256)
+
+
 async def _process_item(
     item: Dict[str, Any],
     *,
@@ -1244,38 +1515,50 @@ async def _process_item(
     max_file_mb: int,
     anonymization_key: Optional[bytes],
     detector: Any = None,
+    pool: Optional[ThreadPoolExecutor] = None,
 ) -> None:
     """One delta row -> at most one ingested document. Never raises for a
     per-file fault: a locked, vanished, unconvertible, or un-anonymizable
     document is COUNTED and skipped, because one bad file must not cost a
-    100k-file pass."""
+    100k-file pass.
+
+    Safe to run concurrently with itself: every counter goes through
+    :meth:`CrawlStats.add`, and the two state mutations (this item's cTag) are
+    taken under :data:`_state_lock`, which is the same lock
+    :func:`save_state` serializes on. ``pool`` puts the blocking
+    convert/anonymize/ingest section on a worker thread; at ``None`` the
+    calls are inline, i.e. the pre-parallel path exactly.
+    """
     name = str(item.get("name") or "")
     stable_id = f"graph:{item['id']}"
     ctags: Dict[str, Any] = state["ctags"]
 
     if item.get("deleted"):
         for candidate in ctx.candidate_collection_ids(target.drive_id):
-            if ingestor.delete(candidate, stable_id):
-                stats.deleted += 1
+            if await _run_blocking(pool, ingestor.delete, candidate, stable_id):
+                stats.add(deleted=1)
                 break
-        ctags.pop(stable_id, None)
+        with _state_lock:
+            ctags.pop(stable_id, None)
         return
     if "file" not in item or _should_skip_name(name):
         return
 
     path = _drive_relative_path(item.get("parentReference") or {}, name)
     if _excluded_file(path, stable_id, ctx.exclusions):
-        stats.excluded_subtree_skips += 1
+        stats.add(excluded_subtree_skips=1)
         return
     if ctx.exclusions.folder_prefixes and _under_prefix(path, ctx.exclusions.folder_prefixes):
-        stats.excluded_subtree_skips += 1
+        stats.add(excluded_subtree_skips=1)
         return
 
     collection_id = _route_collection(path, target.drive_id, ctx)
 
     ctag = item.get("cTag") or item.get("eTag")
-    if ctag and ctags.get(stable_id) == ctag:
-        stats.unchanged += 1
+    with _state_lock:
+        already = bool(ctag) and ctags.get(stable_id) == ctag
+    if already:
+        stats.add(unchanged=1)
         return
 
     size = int(item.get("size") or 0)
@@ -1294,68 +1577,312 @@ async def _process_item(
         # throttling this app registration as a whole, so absorbing it here
         # would turn "back off" into "keep hammering, one 429 budget per
         # file". Aborts the run; the next one resumes from the persisted
-        # deltaLink + cTags.
+        # deltaLink + cTags. Under concurrency the page driver also stops
+        # feeding the pool the moment this escapes, so a 429 storm costs one
+        # budget per IN-FLIGHT item, never one per remaining file.
         raise
     except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
-        stats.errors += 1
+        stats.add(errors=1)
         logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
         return
 
     try:
-        source_sha256 = _sha256_file(tmp_path)
-        try:
-            converted = convert_to_markdown(tmp_path, mime)
-            markdown = str(getattr(converted, "markdown", "") or "")
-        except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
-            stats.convert_failed += 1
-            stats.errors += 1
-            logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
-            return
-        if not markdown.strip():
-            stats.convert_failed += 1
-            logger.info("sharepoint crawl: conversion produced no text for %s", path)
-            return
-
-        if ctx.anonymize:
-            # FAIL CLOSED. An anonymize-marked scope promised its audience
-            # that no raw identifier reaches the collection; a document that
-            # cannot be anonymized is therefore counted and dropped, never
-            # ingested in its original form.
-            if anonymization_key is None:
-                stats.anonymize_failed += 1
-                return
-            try:
-                markdown = str(anonymize_markdown(markdown, key=anonymization_key, detector=detector).text)
-            except Exception as exc:  # noqa: BLE001 — incl. ImportError / DetectionUnavailable
-                stats.anonymize_failed += 1
-                logger.warning("sharepoint crawl: anonymization failed for %s: %s", path, type(exc).__name__)
-                return
+        prepared: _PreparedDocument = await _run_blocking(
+            pool,
+            _prepare_document,
+            tmp_path,
+            mime=mime,
+            path=path,
+            anonymize=ctx.anonymize,
+            anonymization_key=anonymization_key,
+            detector=detector,
+        )
     finally:
         # The local copy never persists — success, skip, or failure.
         tmp_path.unlink(missing_ok=True)
 
+    if prepared.outcome == "convert_failed":
+        stats.add(convert_failed=1, errors=1)
+        return
+    if prepared.outcome == "convert_empty":
+        stats.add(convert_failed=1)
+        return
+    if prepared.outcome == "anonymize_failed":
+        stats.add(anonymize_failed=1)
+        return
+
     try:
-        _file_id, was_new = ingestor.ingest(
+        _file_id, was_new = await _run_blocking(
+            pool,
+            ingestor.ingest,
             collection_id=collection_id,
             stable_id=stable_id,
             path=path,
             filename=f"{Path(name).stem or name}.md",
-            markdown=markdown,
-            source_sha256=source_sha256,
+            markdown=prepared.markdown,
+            source_sha256=prepared.source_sha256,
         )
     except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
-        stats.errors += 1
+        stats.add(errors=1)
         logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
         return
 
     if was_new:
-        stats.new += 1
+        stats.add(new=1)
     else:
-        stats.changed += 1
+        stats.add(changed=1)
     # Written only AFTER the document is durably ingested: a cTag recorded
     # before the ingest would make a resumed run skip a file it never landed.
+    # Per ITEM, not per page — a slow neighbour in the same page must not
+    # hold this one's cTag hostage — but always under the state lock, so it
+    # can never land inside a `save_state` serialization.
     if ctag:
-        ctags[stable_id] = ctag
+        with _state_lock:
+            ctags[stable_id] = ctag
+
+
+class _ConcurrencyGovernor:
+    """The in-flight target, and the AIMD that moves it when Graph pushes back.
+
+    Multiplicative decrease, additive increase, evaluated ONCE per delta page
+    — the boundary where the crawl is already quiescent, so a change of
+    target never splits a page across two policies:
+
+    * a page that met a THROTTLE BURST (more than
+      :data:`_THROTTLE_BURST_429S` throttled responses, or more than
+      :data:`_THROTTLE_BURST_WAIT_S` of honored ``Retry-After``) halves the
+      target, floor 1;
+    * a clean page adds 1 back, ceiling the configured cap.
+
+    A downshift NEVER aborts anything: the run keeps going, more slowly. The
+    hard stop stays where it was — the per-request 429 budget raising
+    :class:`GraphThrottled`. Backing off and giving up are different answers
+    and the tenant is telling us the first one.
+
+    Adaptive only when the cap is > 1: an operator who pinned concurrency to
+    1 asked for the sequential crawl, not for a governor that agrees with them.
+    """
+
+    def __init__(
+        self,
+        cap: int,
+        *,
+        stats: Optional[CrawlStats] = None,
+        burst_429s: int = _THROTTLE_BURST_429S,
+        burst_wait_s: float = _THROTTLE_BURST_WAIT_S,
+    ) -> None:
+        self.cap = max(1, int(cap))
+        self.target = self.cap
+        self.adaptive = self.cap > 1
+        self.burst_429s = burst_429s
+        self.burst_wait_s = burst_wait_s
+        self.downshifts = 0
+        self.floor_hit = False
+        self._stats = stats
+        # Its own lock, not the stats one: the target is read on the event
+        # loop at every page start and could be written from anywhere a
+        # future caller decides to observe from.
+        self._lock = threading.Lock()
+        if stats is not None:
+            stats.note_concurrency(target=self.target)
+
+    def current(self) -> int:
+        with self._lock:
+            return self.target
+
+    def observe_page(self, throttled_429s: int, throttle_wait_s: float) -> int:
+        """Fold ONE page's throttling into the target; return the new target.
+
+        Arguments are the page's own deltas (see
+        :meth:`CrawlStats.throttle_snapshot`), never running totals — a
+        cumulative count would keep halving forever after a single bad page.
+        """
+        if not self.adaptive:
+            return self.current()
+        burst = throttled_429s > self.burst_429s or throttle_wait_s > self.burst_wait_s
+        with self._lock:
+            before = self.target
+            if burst:
+                self.target = max(1, self.target // 2)
+                if self.target < before:
+                    self.downshifts += 1
+                if self.target == 1:
+                    self.floor_hit = True
+            else:
+                self.target = min(self.cap, self.target + 1)
+            target, downshifted = self.target, burst and self.target < before
+        if self._stats is not None:
+            self._stats.note_concurrency(target=target, downshift=downshifted)
+        if downshifted:
+            logger.info(
+                "sharepoint crawl: %d throttled responses in one page (%.0fs waited) — "
+                "halving in-flight target to %d (cap %d)",
+                throttled_429s,
+                throttle_wait_s,
+                target,
+                self.cap,
+            )
+        return target
+
+
+#: How severely an exception escaping one item's pipeline ends the run.
+#: Higher wins when several workers fail in the same page — the run reports
+#: the WORST thing that happened to it, never the first one to be noticed.
+#: A tenant-wide throttle outranks the clock: "we ran out of time" invites a
+#: retry, "the tenant is refusing us" is what an operator has to act on.
+_ABORT_SEVERITY: Tuple[type, ...] = (GraphThrottled, CrawlTimeout, GraphGone)
+
+
+def _abort_rank(exc: BaseException) -> int:
+    for rank, kind in enumerate(_ABORT_SEVERITY):
+        if isinstance(exc, kind):
+            return len(_ABORT_SEVERITY) - rank
+    return 0
+
+
+async def _process_page(
+    items: Sequence[Dict[str, Any]],
+    *,
+    target: DriveTarget,
+    ctx: _ScopeContext,
+    transport: GraphTransport,
+    ingestor: _Ingestor,
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    max_file_mb: int,
+    anonymization_key: Optional[bytes],
+    detector: Any = None,
+    deadline: Optional[_Deadline] = None,
+    concurrency: int = 1,
+) -> None:
+    """Run ONE delta page's rows, up to ``concurrency`` items at a time.
+
+    The page is the unit of the resume contract, and this function is what
+    keeps that true under parallelism:
+
+    * every item's cTag is still written by the item itself, right after its
+      own durable ingest — a slow neighbour cannot delay it, and a fast
+      neighbour cannot claim it;
+    * this function does not return until every worker has finished, so the
+      caller's ``deltaLink`` persist + recorder checkpoint still happen after
+      *all* of the page's rows, never in the middle of it;
+    * the deadline is re-checked before each item is picked up, so an expired
+      budget stops FEEDING the pool and then drains it, rather than starting
+      work it has no time to finish;
+    * an exception in one item stops further pickups and is re-raised only
+      after the in-flight ones are done — their completed work is already
+      recorded (counters, cTags) and is not thrown away.
+
+    ``concurrency <= 1`` takes the sequential branch: the same loop, the same
+    inline calls and the same ordering the crawl had before this existed, so
+    "1 == today's behaviour" is a property of the code, not a hope.
+    """
+    workers = max(1, int(concurrency))
+    if workers == 1:
+        for item in items:
+            stats.add(items_seen=1)
+            # Between files. The cTag of the item just finished is already in
+            # `state`; the page's deltaLink is not written until the page
+            # completes, so a stop here re-reads this page next run and every
+            # already-ingested item in it upserts to a no-op.
+            if deadline is not None:
+                deadline.check()
+            # Pure bookkeeping, so the report says `max_in_flight: 1` here
+            # rather than a 0 that reads as "nothing ever ran".
+            stats.enter_item()
+            started = time.monotonic()
+            try:
+                await _process_item(
+                    item,
+                    target=target,
+                    ctx=ctx,
+                    transport=transport,
+                    ingestor=ingestor,
+                    state=state,
+                    stats=stats,
+                    max_file_mb=max_file_mb,
+                    anonymization_key=anonymization_key,
+                    detector=detector,
+                )
+            finally:
+                stats.exit_item(time.monotonic() - started)
+            stats.add(items_done=1)
+        return
+
+    if not items:
+        return
+
+    cursor = 0
+    aborts: List[BaseException] = []
+    # Bounded, and sized to the target the governor handed us — not the event
+    # loop's default executor, whose min(32, cpu+4) ceiling would quietly cap
+    # a configured concurrency above it. The `shutdown(wait=True)` below joins
+    # every worker thread, a second and independent guarantee that no blocking
+    # step of this page is still running when the caller persists the page's
+    # deltaLink.
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sp-crawl")
+
+    def _next_item() -> Optional[Dict[str, Any]]:
+        # Single-threaded by construction: every worker below is a coroutine
+        # on this run's event loop and there is no await between the read and
+        # the write, so the index cannot be handed out twice.
+        nonlocal cursor
+        if aborts or cursor >= len(items):
+            return None
+        item = items[cursor]
+        cursor += 1
+        return item
+
+    async def _worker() -> None:
+        while True:
+            if deadline is not None:
+                try:
+                    deadline.check()
+                except CrawlTimeout as exc:
+                    aborts.append(exc)
+                    return
+            item = _next_item()
+            if item is None:
+                return
+            stats.add(items_seen=1)
+            stats.enter_item()
+            started = time.monotonic()
+            try:
+                await _process_item(
+                    item,
+                    target=target,
+                    ctx=ctx,
+                    transport=transport,
+                    ingestor=ingestor,
+                    state=state,
+                    stats=stats,
+                    max_file_mb=max_file_mb,
+                    anonymization_key=anonymization_key,
+                    detector=detector,
+                    pool=pool,
+                )
+            except BaseException as exc:  # noqa: BLE001 — re-raised after the drain
+                # Anything escaping `_process_item` is by definition NOT a
+                # per-file fault (those are counted inside it): a throttle
+                # budget spent, the deadline, a dead deltaLink. Stop taking
+                # new items; the drain below still lets the peers finish.
+                aborts.append(exc)
+                return
+            finally:
+                stats.exit_item(time.monotonic() - started)
+            stats.add(items_done=1)
+
+    try:
+        # `gather` without `return_exceptions` would cancel the peers on the
+        # first failure — exactly the "one bad future loses the others'
+        # completed work" this must not do. Every worker returns normally and
+        # parks its exception in `aborts` instead.
+        await asyncio.gather(*[_worker() for _ in range(min(workers, len(items)))])
+    finally:
+        pool.shutdown(wait=True)
+
+    if aborts:
+        raise max(aborts, key=_abort_rank)
 
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
@@ -1383,23 +1910,41 @@ async def _crawl_drive(
     recorder: Optional["_RunRecorder"] = None,
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
+    governor: Optional[_ConcurrencyGovernor] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
 
     ``recorder`` (optional, defaults to no recording) rides the checkpoint
-    this function already writes — see :class:`_RunRecorder`."""
+    this function already writes — see :class:`_RunRecorder`.
+
+    ``governor`` supplies the WITHIN-PAGE item concurrency (see
+    :func:`_process_page`) and is fed this drive's throttling at every page
+    boundary, so a tenant pushing back shrinks the target for the pages that
+    follow. Pages themselves remain strictly sequential: the next page's URL
+    is only known once this page's response has been read, and its deltaLink
+    must not be persisted before the current page's rows are on disk. Drives,
+    likewise, remain sequential — see the note in :func:`_run_crawl_async`."""
+    governor = governor or _ConcurrencyGovernor(1)
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
     url: Optional[str] = delta_links.get(target.state_key) or base
     resynced = False
-    stats.drives += 1
+    stats.add(drives=1)
+    # Where this page's throttle accounting starts. Taken BEFORE the delta
+    # fetch, so a 429 storm on the page request itself counts as the tenant
+    # pushing back too — and deliberately not reset by a 410 resync, so that
+    # detour's throttling carries into the next observation instead of
+    # vanishing.
+    page_throttle_mark: Optional[Tuple[int, float]] = None
 
     while url:
         # Between pages: the previous page's rows are ingested and its
         # deltaLink/cTags are on disk, so stopping here costs nothing.
         if deadline is not None:
             deadline.check()
+        if page_throttle_mark is None:
+            page_throttle_mark = stats.throttle_snapshot()
         try:
             page = await transport.get_json(url)
         except GraphGone:
@@ -1410,9 +1955,10 @@ async def _crawl_drive(
             # wrong, so the second 410 propagates.
             if resynced:
                 raise
-            delta_links.pop(target.state_key, None)
-            save_state(connection_id, state)
-            stats.delta_resyncs += 1
+            with _state_lock:
+                delta_links.pop(target.state_key, None)
+                save_state(connection_id, state)
+            stats.add(delta_resyncs=1)
             resynced = True
             logger.info(
                 "sharepoint crawl: 410 Gone — dropped dead deltaLink, full resync of %s",
@@ -1429,7 +1975,7 @@ async def _crawl_drive(
             # past, not a reason to fail the whole connection's crawl — the
             # same posture `graph_client.search_folders` takes. Counted, never
             # silent: a drive nobody could read must be visible in the report.
-            stats.permission_skips += 1
+            stats.add(permission_skips=1)
             logger.warning(
                 "sharepoint crawl: HTTP %s on drive %s — skipping it (no access for this app registration)",
                 exc.status_code,
@@ -1437,37 +1983,38 @@ async def _crawl_drive(
             )
             return
 
-        for item in page.get("value", []):
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
-            stats.items_seen += 1
-            # Between files. The cTag of the item just finished is already in
-            # `state`; the page's deltaLink is not written until the page
-            # completes, so a stop here re-reads this page next run and every
-            # already-ingested item in it upserts to a no-op.
-            if deadline is not None:
-                deadline.check()
-            await _process_item(
-                item,
-                target=target,
-                ctx=ctx,
-                transport=transport,
-                ingestor=ingestor,
-                state=state,
-                stats=stats,
-                max_file_mb=max_file_mb,
-                anonymization_key=anonymization_key,
-                detector=detector,
-            )
-            stats.items_done += 1
+        await _process_page(
+            [item for item in page.get("value", []) if isinstance(item, dict) and item.get("id")],
+            target=target,
+            ctx=ctx,
+            transport=transport,
+            ingestor=ingestor,
+            state=state,
+            stats=stats,
+            max_file_mb=max_file_mb,
+            anonymization_key=anonymization_key,
+            detector=detector,
+            deadline=deadline,
+            concurrency=governor.current(),
+        )
+        # The page's OWN throttling, not the run's running total: the
+        # governor folds a DELTA, so one bad page cannot keep halving the
+        # target for the rest of the crawl.
+        throttled_after, waited_after = stats.throttle_snapshot()
+        governor.observe_page(throttled_after - page_throttle_mark[0], waited_after - page_throttle_mark[1])
+        page_throttle_mark = None
 
         # Rows first, then the link: the deltaLink is persisted only after
         # everything the page produced is ingested and its cTags are on disk,
         # so a crash between the two costs re-work, never coverage.
         delta_link = page.get("@odata.deltaLink")
         if delta_link:
-            delta_links[target.state_key] = _require_graph_url(str(delta_link))
-            save_state(connection_id, state)
+            # Under the state lock like every other mutation of `state`, even
+            # though the pool is provably drained by here — the invariant is
+            # enforced by the lock, not by an argument about who is running.
+            with _state_lock:
+                delta_links[target.state_key] = _require_graph_url(str(delta_link))
+                save_state(connection_id, state)
             url = None
         else:
             next_link = page.get("@odata.nextLink")
@@ -1499,6 +2046,51 @@ def _max_file_mb() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return _DEFAULT_MAX_FILE_MB
+
+
+def _crawl_concurrency() -> int:
+    """``extraction.crawler.concurrency`` — how many items of ONE delta page
+    the crawl pipelines at a time.
+
+    Clamped to ``[1, _MAX_CONCURRENCY]``; a missing or unparseable value is
+    the default. ``1`` is the pre-parallel behaviour exactly — the escape
+    hatch for an operator whose tenant is throttling hard, and the setting
+    the crawl's own golden test pins.
+
+    NOT to be confused with its neighbour ``extraction.concurrency``
+    (``app/worker/runtime.py::_extraction_concurrency``), which sizes the
+    worker's extraction LANE — how many crawl jobs run at once. The two
+    multiply: two concurrent crawls at 6 put twelve files in flight against
+    the same tenant.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "concurrency", default=_DEFAULT_CONCURRENCY)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CONCURRENCY
+    return max(1, min(_MAX_CONCURRENCY, value))
+
+
+def _resolve_concurrency(override: Any) -> Tuple[int, int, str]:
+    """``(effective_cap, configured, source)`` for one run.
+
+    ``payload["concurrency"]`` overrides the configured value for THIS run
+    only — the same shape ``payload["timeout_s"]`` already has — clamped to
+    ``[1, _MAX_PAYLOAD_CONCURRENCY]``. An unparseable override is ignored in
+    favour of config rather than guessed at: a typo in an ad-hoc payload must
+    not silently re-tune the crawl.
+    """
+    configured = _crawl_concurrency()
+    if override is None:
+        return configured, configured, "config"
+    try:
+        requested = int(override)
+    except (TypeError, ValueError):
+        logger.warning("sharepoint crawl: ignoring unparseable payload concurrency %r — using config", override)
+        return configured, configured, "config"
+    return max(1, min(_MAX_PAYLOAD_CONCURRENCY, requested)), configured, "payload"
 
 
 def _timeout_seconds() -> int:
@@ -1603,6 +2195,7 @@ async def _run_crawl_async(
     only_scope_ids: Optional[Sequence[str]] = None,
     job_id: Optional[str] = None,
     timeout_s: Optional[float] = None,
+    concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     scopes = _confirmed_scopes(connection)
@@ -1622,9 +2215,23 @@ async def _run_crawl_async(
     # and an instance on the LLM tier never pays for a detector no scope uses.
     detector = _entity_detector() if anonymization_key is not None else None
     max_file_mb = _max_file_mb()
+    cap, configured_concurrency, concurrency_source = _resolve_concurrency(concurrency)
     deadline = _Deadline(_timeout_seconds() if timeout_s is None else timeout_s)
 
-    stats = CrawlStats()
+    # Recorded on the stats object rather than threaded through `report()`:
+    # the report is assembled in one place at the end of this function and
+    # that block is deliberately left alone.
+    stats = CrawlStats(
+        concurrency=cap,
+        concurrency_configured=configured_concurrency,
+        concurrency_source=concurrency_source,
+        concurrency_effective_max=cap,
+        concurrency_min_target=cap,
+    )
+    # ONE governor for the whole run: the tenant throttles an app
+    # registration, not a drive, so what one drive learns about backing off
+    # must carry to the next.
+    governor = _ConcurrencyGovernor(cap, stats=stats)
     auth = GraphAuth(
         acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
         stats=stats,
@@ -1649,7 +2256,7 @@ async def _run_crawl_async(
                 # cost the connection's other scopes their pass — the same
                 # per-unit failure isolation `acl_sync` applies per connection.
                 scope_errors.append({"scope": source_scope_id, "error": str(exc)})
-                stats.errors += 1
+                stats.add(errors=1)
                 continue
 
             ctx = _ScopeContext(
@@ -1659,7 +2266,15 @@ async def _run_crawl_async(
                 exclusions=exclusions,
                 zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
             )
-            stats.scopes += 1
+            stats.add(scopes=1)
+            # Drives stay SEQUENTIAL, deliberately. Parallelising them is the
+            # second axis and it is not worth its risk here: every drive
+            # shares one state file whose per-drive deltaLink is the resume
+            # contract, and the 410-resync path mutates that file mid-drive;
+            # the 429 budget and the deadline are likewise run-wide, so a
+            # second axis mostly converts into 429s against the same tenant
+            # rather than into throughput. In-page concurrency already
+            # saturates a 200-row page. Correctness beats the second axis.
             for target in targets:
                 await _crawl_drive(
                     target,
@@ -1674,6 +2289,7 @@ async def _run_crawl_async(
                     recorder=recorder,
                     detector=detector,
                     deadline=deadline,
+                    governor=governor,
                 )
     except BaseException as exc:
         # A crashed — or deliberately stopped — run still owes the operator
@@ -1754,8 +2370,11 @@ def run_builtin_crawl(payload: dict) -> dict:
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of
     ``source_scope_id``s to narrow the run to; every confirmed scope
-    otherwise). Credentials are resolved from the row, never from the
-    payload.
+    otherwise) and ``concurrency`` (this run's in-page item concurrency,
+    overriding ``extraction.crawler.concurrency``, clamped to
+    ``[1, 16]`` — the same one-run override shape ``timeout_s`` has; the
+    report's ``concurrency`` block names the effective value and its source).
+    Credentials are resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
@@ -1784,6 +2403,7 @@ def run_builtin_crawl(payload: dict) -> dict:
                 only_scope_ids=payload.get("scopes"),
                 job_id=payload.get("job_id"),
                 timeout_s=payload.get("timeout_s"),
+                concurrency=payload.get("concurrency"),
             )
         )
     except SharePointSettingsError as exc:

@@ -104,6 +104,13 @@ uses only these; §7 lists separately the small set of additions it requires.**
 | Volume | `scopes`, `drives`, `new`, `changed`, `unchanged`, `deleted`, `downloads`, `bytes_downloaded` (+ `_human`), `files_per_s` |
 | Transport | `requests`, `retries`, `http_429`, `throttle_wait_s`, `retry_wait_s`, `token_refreshes`, `delta_resyncs` |
 | Refusals | `errors`, `convert_failed`, `anonymize_failed`, `excluded_subtree_skips`, `permission_skips`, `skipped_oversize {files, bytes, largest[≤20]}`, `max_file_mb` |
+| Throughput (added 2026-09-01, when the crawl became parallel) | `concurrency {configured, requested, source, effective_max, min_target, downshifts, floor_hit}`, `max_in_flight`, `item_seconds` |
+
+The Throughput row is what makes "why was this crawl slow" answerable without
+guessing: `max_in_flight` below `concurrency.effective_max` means something
+other than the knob bounded the run, and a non-zero `downshifts` means the
+tenant did — the crawl halves its own in-flight target on a throttle burst and
+climbs back one per clean page, so backing off is visible rather than silent.
 
 Two properties matter for the UI. First, **an interrupted run still reports**:
 the `except BaseException` path writes the same report with

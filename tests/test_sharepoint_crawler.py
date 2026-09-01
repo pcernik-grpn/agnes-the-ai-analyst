@@ -16,7 +16,10 @@ wrappers exist to provide.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1695,3 +1698,602 @@ class TestDetectorUsageRecording:
 
         detect.llm = FakeLLM()
         assert crawler._detector_usage(detect) == {}
+
+
+# --------------------------------------------------------------------------
+# Parallel crawl (2026-09-01)
+#
+# The crawl pipelines several files of ONE delta page at a time. Everything
+# below is a rule the resume contract depends on, restated for concurrency:
+# a counter that races is a document that silently went unindexed, and a page
+# boundary that lands early is coverage lost. `concurrency: 1` remains the
+# pre-parallel path and is pinned as such.
+# --------------------------------------------------------------------------
+
+
+def _many_items(n: int, *, prefix: str = "f", size: int = 1024) -> List[Dict[str, Any]]:
+    return [_file_item(f"{prefix}{i}", name=f"{prefix}{i}.docx", ctag=f"c-{prefix}{i}", size=size) for i in range(n)]
+
+
+def _one_page(items: List[Dict[str, Any]], token: str = "END") -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/content"):
+            return _content_response()
+        return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?token={token}"})
+
+    return handler
+
+
+def _at_concurrency(monkeypatch, n: int) -> None:
+    monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: n)
+
+
+#: Report keys that legitimately differ between two otherwise identical runs
+#: (wall clock, thread-pool observations, the knob itself).
+_VOLATILE_REPORT_KEYS = {
+    "started_at",
+    "finished_at",
+    "duration_s",
+    "files_per_s",
+    "item_seconds",
+    "max_in_flight",
+    "concurrency",
+    "connection_id",
+}
+
+
+def _stable(report: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in report.items() if k not in _VOLATILE_REPORT_KEYS}
+
+
+class TestConcurrencyResolution:
+    """The knob itself: config, its clamp, and the per-run payload override."""
+
+    def test_the_configured_value_is_read_and_clamped(self, monkeypatch):
+        values: Dict[str, Any] = {}
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: values.get("v", default))
+
+        values["v"] = 4
+        assert crawler._crawl_concurrency() == 4
+        values["v"] = 0
+        assert crawler._crawl_concurrency() == 1, "0 must clamp UP to sequential, never to 'no workers'"
+        values["v"] = 9999
+        assert crawler._crawl_concurrency() == crawler._MAX_CONCURRENCY
+        values["v"] = "not-a-number"
+        assert crawler._crawl_concurrency() == crawler._DEFAULT_CONCURRENCY
+
+    def test_an_unset_value_is_the_default(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert crawler._crawl_concurrency() == crawler._DEFAULT_CONCURRENCY
+
+    def test_a_payload_override_replaces_the_configured_value_for_one_run(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 6)
+        assert crawler._resolve_concurrency(3) == (3, 6, "payload")
+        assert crawler._resolve_concurrency(None) == (6, 6, "config")
+
+    def test_a_payload_override_is_clamped_to_its_own_lower_ceiling(self, monkeypatch):
+        """An ad-hoc run is the wrong place to go looking for a tenant's
+        throttling limit, so the payload ceiling is below the config one."""
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 6)
+        assert crawler._resolve_concurrency(999)[0] == crawler._MAX_PAYLOAD_CONCURRENCY
+        assert crawler._MAX_PAYLOAD_CONCURRENCY < crawler._MAX_CONCURRENCY
+        assert crawler._resolve_concurrency(0)[0] == 1
+
+    def test_an_unparseable_override_falls_back_to_config_not_to_a_guess(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 6)
+        assert crawler._resolve_concurrency("lots") == (6, 6, "config")
+
+    def test_the_payload_override_reaches_the_run_and_is_reported(self, crawl_env, monkeypatch):
+        _at_concurrency(monkeypatch, 6)
+        _install_graph(monkeypatch, _one_page(_many_items(3)))
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        report = crawler.run_builtin_crawl({"connection_id": "conn1", "concurrency": 2})
+
+        assert report["concurrency"]["requested"] == 2
+        assert report["concurrency"]["configured"] == 6
+        assert report["concurrency"]["source"] == "payload"
+        assert report["new"] == 3
+
+
+class TestConcurrencyGovernor:
+    """AIMD. Halve on a throttle burst, +1 per clean page, floor 1, ceiling
+    the configured cap — and never abort: backing off and giving up are
+    different answers to a 429."""
+
+    def test_a_throttle_burst_halves_the_target(self):
+        gov = crawler._ConcurrencyGovernor(8)
+        assert gov.current() == 8
+        assert gov.observe_page(throttled_429s=5, throttle_wait_s=1.0) == 4
+        assert gov.observe_page(throttled_429s=5, throttle_wait_s=1.0) == 2
+        assert gov.downshifts == 2
+
+    def test_a_long_wait_counts_as_a_burst_even_with_few_429s(self):
+        gov = crawler._ConcurrencyGovernor(8)
+        assert gov.observe_page(throttled_429s=1, throttle_wait_s=crawler._THROTTLE_BURST_WAIT_S + 1) == 4
+
+    def test_one_stray_429_is_not_a_burst(self):
+        gov = crawler._ConcurrencyGovernor(8)
+        assert gov.observe_page(throttled_429s=1, throttle_wait_s=0.5) == 8
+        assert gov.downshifts == 0
+
+    def test_clean_pages_climb_back_one_at_a_time_up_to_the_cap(self):
+        gov = crawler._ConcurrencyGovernor(4)
+        gov.observe_page(throttled_429s=9, throttle_wait_s=0.0)  # -> 2
+        assert gov.observe_page(0, 0.0) == 3
+        assert gov.observe_page(0, 0.0) == 4
+        assert gov.observe_page(0, 0.0) == 4, "additive increase must not exceed the configured cap"
+
+    def test_the_floor_is_one_and_is_recorded(self):
+        gov = crawler._ConcurrencyGovernor(2)
+        assert gov.observe_page(9, 0.0) == 1
+        assert gov.observe_page(9, 0.0) == 1
+        assert gov.floor_hit is True
+        assert gov.downshifts == 1, "a target already at the floor cannot downshift again"
+
+    def test_adaptive_is_off_when_the_operator_asked_for_sequential(self):
+        gov = crawler._ConcurrencyGovernor(1)
+        assert gov.adaptive is False
+        assert gov.observe_page(99, 999.0) == 1
+        assert gov.downshifts == 0
+        assert gov.floor_hit is False
+
+    def test_the_governor_writes_through_to_the_report_block(self):
+        stats = crawler.CrawlStats(concurrency=4, concurrency_effective_max=4, concurrency_min_target=4)
+        gov = crawler._ConcurrencyGovernor(4, stats=stats)
+        gov.observe_page(9, 0.0)
+        gov.observe_page(0, 0.0)
+
+        block = stats.report(max_file_mb=50)["concurrency"]
+        assert block["downshifts"] == 1
+        assert block["min_target"] == 2
+        assert block["effective_max"] == 3
+        assert block["source"] == "adaptive", "the number that governed the run is the one to name"
+
+    def test_a_downshift_is_driven_by_the_page_delta_not_the_running_total(self, crawl_env, monkeypatch):
+        """A cumulative 429 count would keep halving forever after one bad
+        page; the governor is fed each page's own throttling."""
+        _at_concurrency(monkeypatch, 4)
+        pages = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            pages["n"] += 1
+            if pages["n"] == 1:
+                # One page of nothing but throttling, then clean pages.
+                return httpx.Response(429, headers={"Retry-After": "1"}, json={})
+            if pages["n"] <= 4:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": _many_items(1, prefix=f"p{pages['n']}"),
+                        "@odata.nextLink": f"{DRIVE_DELTA}?page={pages['n']}",
+                    },
+                )
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # The throttling was real, the run finished anyway, and the target
+        # climbed back once the tenant stopped pushing back.
+        assert report["http_429"] >= 1
+        assert report["interrupted"] is False
+        assert report["concurrency"]["effective_max"] >= report["concurrency"]["min_target"]
+
+
+class TestParallelCounters:
+    """Counters must be EXACT under concurrency. A lost `+=` is a document
+    that went unindexed with nothing in the report to say so."""
+
+    def test_every_outcome_is_counted_exactly_once_across_many_items(self, crawl_env, monkeypatch):
+        _at_concurrency(monkeypatch, 8)
+        monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
+
+        def _convert(path: Path, mime: str) -> ConvertResult:
+            if path.suffix == ".bad":
+                raise RuntimeError("markitdown said no")
+            if path.suffix == ".empty":
+                return ConvertResult("   \n ")
+            return ConvertResult("# converted")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+
+        items: List[Dict[str, Any]] = []
+        items += [_file_item(f"ok{i}", name=f"ok{i}.docx", ctag=f"c-ok{i}") for i in range(30)]
+        items += [_file_item(f"big{i}", name=f"big{i}.pdf", ctag=f"c-big{i}", size=5 * 1024 * 1024) for i in range(10)]
+        items += [_file_item(f"bad{i}", name=f"bad{i}.bad", ctag=f"c-bad{i}") for i in range(10)]
+        items += [_file_item(f"emp{i}", name=f"emp{i}.empty", ctag=f"c-emp{i}") for i in range(10)]
+
+        _install_graph(monkeypatch, _one_page(items))
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 30
+        assert report["changed"] == 0
+        assert report["unchanged"] == 0
+        # 10 unconvertible + 10 that converted to nothing; only the former
+        # are errors, exactly as in the sequential pipeline.
+        assert report["convert_failed"] == 20
+        assert report["errors"] == 10
+        assert report["skipped_oversize"]["files"] == 10
+        assert report["skipped_oversize"]["bytes"] == 10 * 5 * 1024 * 1024
+        assert report["downloads"] == 50, "the 10 oversize files are never fetched"
+        # Only the 30 that landed are marked crawled — the rest must be
+        # retried by the next run, not treated as done.
+        assert len(_state(crawl_env)["ctags"]) == 30
+
+    def test_a_second_pass_sees_every_item_as_unchanged(self, crawl_env, monkeypatch):
+        """The cTag map written concurrently has to be complete and correct,
+        or a re-crawl re-downloads what it already has."""
+        _at_concurrency(monkeypatch, 8)
+        items = _many_items(40)
+        _install_graph(monkeypatch, _one_page(items))
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        second = _run(connection, monkeypatch)
+
+        assert first["new"] == 40
+        assert second["unchanged"] == 40
+        assert second["new"] == 0 and second["changed"] == 0
+        assert second["downloads"] == 0
+
+    def test_add_refuses_a_counter_that_does_not_exist(self):
+        """A typo in `stats.add(...)` must not mint a silent, always-zero
+        counter — the report's whole job is that nothing is invisible."""
+        stats = crawler.CrawlStats()
+        with pytest.raises(AttributeError):
+            stats.add(nwe=1)
+
+
+class TestParallelOrdering:
+    """The page boundary, and what may and may not cross it."""
+
+    def _snapshotting_save(self, monkeypatch) -> List[Dict[str, Any]]:
+        snapshots: List[Dict[str, Any]] = []
+        real = crawler.save_state
+
+        def _save(connection_id: str, state: Dict[str, Any]) -> None:
+            snapshots.append(json.loads(json.dumps(state)))
+            real(connection_id, state)
+
+        monkeypatch.setattr(crawler, "save_state", _save)
+        return snapshots
+
+    def test_the_delta_link_is_persisted_only_after_every_row_of_its_page(self, crawl_env, monkeypatch):
+        _at_concurrency(monkeypatch, 6)
+        snapshots = self._snapshotting_save(monkeypatch)
+        _install_graph(monkeypatch, _one_page(_many_items(24)))
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        with_link = [s for s in snapshots if s.get("delta_links", {}).get("b!drive1")]
+        assert with_link, "the page's deltaLink must be persisted"
+        assert len(with_link[0]["ctags"]) == 24, (
+            "a deltaLink written while any row of its page was still in flight would "
+            "make the next run skip that row forever"
+        )
+
+    def test_a_slow_item_does_not_hold_its_neighbours_ctags_hostage(self, crawl_env, monkeypatch):
+        """cTags are per ITEM (written right after that item's own ingest),
+        the page boundary is per PAGE. One slow convert must delay only the
+        latter."""
+        _at_concurrency(monkeypatch, 4)
+        shared: Dict[str, Any] = {"delta_links": {}, "ctags": {}}
+        monkeypatch.setattr(crawler, "load_state", lambda cid: shared)
+
+        observed: Dict[str, Any] = {}
+
+        def _peek() -> Dict[str, Any]:
+            # Under the crawl's own state lock — the same one the cTag
+            # writers take, so this copy can never straddle a write.
+            with crawler._state_lock:
+                return dict(shared["ctags"])
+
+        def _convert(path: Path, mime: str) -> ConvertResult:
+            if path.suffix == ".slow":
+                # Stay in flight until the NEIGHBOURS' cTags have landed. If
+                # a cTag were held until the page boundary this would time
+                # out with an empty map, which is the regression to catch.
+                deadline = time.monotonic() + 10
+                while len(_peek()) < 3 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                observed["ctags"] = _peek()
+            return ConvertResult("# converted")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+
+        items = [_file_item("slow", name="slow.slow", ctag="c-slow")] + _many_items(3)
+        _install_graph(monkeypatch, _one_page(items))
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert set(observed["ctags"]) == {"graph:f0", "graph:f1", "graph:f2"}
+        assert "graph:slow" not in observed["ctags"], "a cTag before its own ingest would lose the file on resume"
+        # ...and the page boundary still waited for the slow one.
+        assert report["new"] == 4
+        assert len(_state(crawl_env)["ctags"]) == 4
+        assert report["max_in_flight"] >= 2
+
+    def test_the_worker_pool_is_sized_to_the_configured_concurrency(self, crawl_env, monkeypatch):
+        """Not the event loop's default executor, whose min(32, cpu+4) ceiling
+        would silently cap a configured concurrency above it — the knob has to
+        mean what it says. Twelve items that only make progress once all
+        twelve are inside the blocking step: a smaller pool cannot get there."""
+        _at_concurrency(monkeypatch, 12)
+        barrier = threading.Barrier(12, timeout=15)
+
+        def _convert(path: Path, mime: str) -> ConvertResult:
+            barrier.wait()  # BrokenBarrierError -> counted as convert_failed
+            return ConvertResult("# converted")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        _install_graph(monkeypatch, _one_page(_many_items(12)))
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 0
+        assert report["new"] == 12
+        assert report["max_in_flight"] == 12
+
+    def test_fail_closed_stays_per_item_under_concurrency(self, crawl_env, monkeypatch):
+        """An anonymize-marked scope drops the documents it cannot redact —
+        each on its own, with no neighbour dragged down and none let through."""
+        _at_concurrency(monkeypatch, 6)
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
+
+        def _anonymize(text: str, *, key: bytes, detector: Any = None) -> AnonymizeResult:
+            if text == "UNREDACTABLE":
+                raise RuntimeError("anonymizer blew up")
+            return AnonymizeResult(f"redacted:{text}")
+
+        monkeypatch.setattr(crawler, "anonymize_markdown", _anonymize)
+        # The convert seam only ever sees the TEMP file, whose suffix the
+        # download takes from the item's name — so the marker rides there.
+        monkeypatch.setattr(
+            crawler,
+            "convert_to_markdown",
+            lambda path, mime: ConvertResult("UNREDACTABLE" if path.suffix == ".pii" else "# converted"),
+        )
+
+        items = [
+            _file_item(f"f{i}", name=f"f{i}.pii" if i in (3, 7) else f"f{i}.docx", ctag=f"c{i}") for i in range(10)
+        ]
+        _install_graph(monkeypatch, _one_page(items))
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 2
+        assert report["new"] == 8
+        ingested = FakeIngestor.instances[-1].ingested
+        assert all(row["markdown"].startswith("redacted:") for row in ingested)
+        # The two refusals are NOT marked crawled: a dropped document must be
+        # retried, never silently treated as done.
+        assert len(_state(crawl_env)["ctags"]) == 8
+
+    def test_a_throttled_worker_aborts_the_run_with_state_saved(self, crawl_env, monkeypatch):
+        """A 429 budget spent is tenant-wide. The run stops — but only after
+        the in-flight items drain, and what they finished is on disk."""
+        _at_concurrency(monkeypatch, 4)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "boom" in url:
+                    return httpx.Response(429, headers={"Retry-After": "300"}, json={})
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": _many_items(3) + [_file_item("boom", name="boom.docx", ctag="c-boom")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with pytest.raises(crawler.GraphThrottled):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted"] is True
+        # `throttled`, not the generic `error`: GraphThrottled has its own
+        # entry in `_STOP_REASONS` so the run records as RESUMABLE — the UI
+        # offers "resume", and the next run picks up from the saved cTags.
+        assert state["last_run"]["interrupted_reason"] == "throttled"
+        # The three that landed before the abort are recorded — an aborted
+        # run costs re-work, never coverage.
+        assert set(state["ctags"]) == {"graph:f0", "graph:f1", "graph:f2"}
+        # ...and the page's deltaLink was NOT persisted, so the next run
+        # re-reads this page rather than believing it complete.
+        assert not state.get("delta_links")
+
+    def test_the_worst_abort_wins_when_several_workers_fail(self):
+        """A tenant refusing us outranks a clock running out: one invites a
+        retry, the other is what an operator has to act on."""
+        assert crawler._abort_rank(crawler.GraphThrottled("x")) > crawler._abort_rank(crawler.CrawlTimeout("x"))
+        assert crawler._abort_rank(crawler.CrawlTimeout("x")) > crawler._abort_rank(crawler.GraphGone("x"))
+        assert crawler._abort_rank(crawler.GraphGone("x")) > crawler._abort_rank(RuntimeError("x"))
+
+    def test_the_deadline_stops_feeding_the_pool_and_drains_it(self, crawl_env, monkeypatch):
+        _at_concurrency(monkeypatch, 2)
+        _install_graph(monkeypatch, _one_page(_many_items(12)))
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        def _clock() -> float:
+            landed = FakeIngestor.instances and FakeIngestor.instances[-1].ingested
+            return 1_000_000.0 if landed else 0.0
+
+        monkeypatch.setattr(crawler.time, "monotonic", _clock)
+
+        with pytest.raises(crawler.CrawlTimeout):
+            crawler.run_builtin_crawl({"connection_id": "conn1", "timeout_s": 60})
+
+        state = _state(crawl_env)
+        ingested = FakeIngestor.instances[-1].ingested
+        assert 0 < len(ingested) < 12, "the pool must stop being fed, not run the page to completion"
+        assert state["last_run"]["interrupted_reason"] == "timeout"
+        assert len(state["ctags"]) == len(ingested), "every item that landed before the stop is recorded"
+        assert not state.get("delta_links")
+
+
+class TestConcurrencyOneIsTheOldPath:
+    """`concurrency: 1` is the escape hatch AND the reference implementation.
+    It must stay observably identical to the pre-parallel crawl."""
+
+    def _mixed_pages(self) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            _file_item("p2a", name="p2a.docx", ctag="c-p2a"),
+                            _file_item("p2b", name="~$lock.docx", ctag="c-p2b"),
+                        ],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?token=NEW",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("p1a", name="p1a.docx", ctag="c-p1a"),
+                        _file_item("p1b", name="p1b.bad", ctag="c-p1b"),
+                        _file_item("p1c", name="p1c.pdf", ctag="c-p1c", size=5 * 1024 * 1024),
+                    ],
+                    "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1",
+                },
+            )
+
+        return handler
+
+    def _run_at(self, monkeypatch, crawl_env, n: int, connection_id: str) -> Dict[str, Any]:
+        # Two independent fresh crawls are being compared — the class-level
+        # ingest store (which persists across runs to model the real repo)
+        # must not make the second run's files look pre-existing.
+        FakeIngestor.reset()
+        _at_concurrency(monkeypatch, n)
+        monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
+
+        def _convert(path: Path, mime: str) -> ConvertResult:
+            if path.suffix == ".bad":
+                raise RuntimeError("nope")
+            return ConvertResult("# converted")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        _install_graph(monkeypatch, self._mixed_pages())
+        report = _run(_connection([_drive_scope()], connection_id=connection_id), monkeypatch)
+        return report
+
+    def test_the_report_and_the_state_match_a_parallel_run_exactly(self, crawl_env, monkeypatch):
+        sequential = self._run_at(monkeypatch, crawl_env, 1, "conn1")
+        seq_state = _state(crawl_env, "conn1")
+        parallel = self._run_at(monkeypatch, crawl_env, 6, "conn2")
+        par_state = _state(crawl_env, "conn2")
+
+        assert _stable(sequential) == _stable(parallel)
+        assert seq_state["ctags"] == par_state["ctags"]
+        assert seq_state["delta_links"]["b!drive1"] == par_state["delta_links"]["b!drive1"]
+        # And the knob itself is reported honestly on both sides.
+        assert sequential["concurrency"]["requested"] == 1
+        assert parallel["concurrency"]["requested"] == 6
+
+    def test_sequential_runs_the_pipeline_inline_with_no_worker_thread(self, crawl_env, monkeypatch):
+        """At 1 there is no executor in the picture at all — the convert and
+        ingest calls happen on the crawl's own thread, exactly as before."""
+        _at_concurrency(monkeypatch, 1)
+        threads: List[int] = []
+        main = threading.get_ident()
+
+        def _convert(path: Path, mime: str) -> ConvertResult:
+            threads.append(threading.get_ident())
+            return ConvertResult("# converted")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        _install_graph(monkeypatch, _one_page(_many_items(4)))
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert threads and set(threads) == {main}
+
+    def test_items_are_still_processed_in_page_order(self, crawl_env, monkeypatch):
+        _at_concurrency(monkeypatch, 1)
+        _install_graph(monkeypatch, _one_page(_many_items(6)))
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == [f"graph:f{i}" for i in range(6)]
+
+
+class TestTokenRefreshUnderConcurrency:
+    """One token exchange per expiry, not one per in-flight request."""
+
+    def test_concurrent_holders_share_a_single_acquisition(self):
+        stats = crawler.CrawlStats()
+        acquisitions = {"n": 0}
+
+        async def _acquire() -> str:
+            acquisitions["n"] += 1
+            await asyncio.sleep(0)  # a real suspension, as the HTTP exchange is
+            return f"tok{acquisitions['n']}"
+
+        auth = crawler.GraphAuth(acquire=_acquire, stats=stats)
+
+        async def _main() -> List[str]:
+            return list(await asyncio.gather(*[auth.token() for _ in range(8)]))
+
+        tokens = asyncio.run(_main())
+        assert acquisitions["n"] == 1
+        assert set(tokens) == {"tok1"}
+        assert stats.token_refreshes == 1
+
+    def test_a_401_storm_on_one_token_buys_exactly_one_new_token(self):
+        stats = crawler.CrawlStats()
+        acquisitions = {"n": 0}
+
+        async def _acquire() -> str:
+            acquisitions["n"] += 1
+            await asyncio.sleep(0)
+            return f"tok{acquisitions['n']}"
+
+        auth = crawler.GraphAuth(acquire=_acquire, stats=stats)
+
+        async def _main() -> List[str]:
+            stale = await auth.token()
+            # Six in-flight requests all meet a 401 against the same token.
+            return list(await asyncio.gather(*[auth.refresh_stale(stale) for _ in range(6)]))
+
+        tokens = asyncio.run(_main())
+        assert acquisitions["n"] == 2, "one initial acquisition plus exactly one refresh"
+        assert set(tokens) == {"tok2"}
+
+    def test_a_forced_refresh_still_forces_one(self):
+        """`refresh()` has no observed token to compare against, so it always
+        exchanges — the 401 path that cannot name what it sent."""
+        stats = crawler.CrawlStats()
+        acquisitions = {"n": 0}
+
+        async def _acquire() -> str:
+            acquisitions["n"] += 1
+            return f"tok{acquisitions['n']}"
+
+        auth = crawler.GraphAuth(acquire=_acquire, stats=stats)
+        asyncio.run(auth.refresh())
+        asyncio.run(auth.refresh())
+        assert acquisitions["n"] == 2

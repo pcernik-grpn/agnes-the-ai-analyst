@@ -1255,6 +1255,12 @@ def _run_corpus_extraction(payload: dict) -> dict:
         files and between delta pages; this handler's own lease is derived
         from the CONFIGURED value, so a payload override far above it would
         outlive the lease and be reclaimed mid-run.
+      - ``concurrency`` (optional) — overrides
+        ``extraction.crawler.concurrency`` for this one run, clamped to
+        ``[1, 16]``: how many files of ONE delta page the crawl pipelines at
+        a time (``1`` = the sequential pre-parallel behaviour). NOT the same
+        knob as ``extraction.concurrency``, which sizes how many extraction
+        JOBS this worker runs at once — the two multiply against one tenant.
 
     Returns the crawl report (the same dict persisted as ``last_run`` in the
     connection's crawl state, so the job result and the state file can never
