@@ -1205,6 +1205,7 @@ for a DIFFERENT connection 403s.
 - /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure
 - /api/admin/sharepoint/connections/{connection_id}/subscriptions
 - /api/admin/sharepoint/subscriptions/run-due
+- /api/admin/sharepoint/anonymization/preview
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
@@ -1343,13 +1344,23 @@ or an unparseable one is a typed absence — `{"certificate": null, "reason":
 admin trigger for the existing `corpus-extraction` job kind
 (`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
 `{"connection_id": connection_id}` and returns `202
-{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
-any other work; refuses cleanly (never a job that fails 30 minutes later in
-a worker) with `409 extraction_disabled` (the `sharepoint` switch is false) or
-`409 extraction_producer_not_configured` (no `extraction.producer.command`/
-`.module` set); a run already queued/running for the same connection is
-`409 extraction_already_running` — deduped on a stable per-connection
-idempotency key shared with the sweep below.
+{"job_id", "status"}`. An optional JSON body carries per-run overrides —
+`concurrency` (files pipelined at once, 1–16) and `timeout_s` (0–86400) —
+which ride the job payload for THIS run only; out-of-range values are
+refused with `422` rather than silently re-clamped. 404s on an
+unknown/non-sharepoint connection before any other work; refuses cleanly
+(never a job that fails 30 minutes later in a worker) with
+`409 extraction_disabled` (the `sharepoint` switch is false) or
+`409 extraction_dependencies_missing` (the `extraction` optional dependency
+extra is not installed); a run already queued/running for the same
+connection is `409 extraction_already_running` — deduped on a stable
+per-connection idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/anonymization/preview` is the config drawer's
+dry-run: an admin pastes a sample (≤50 000 chars) and gets back what the
+anonymizer would redact, under the instance's real pseudonym key — nothing
+is persisted, and the audit row records length and per-kind counts, never
+the text.
 
 `POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
 sweep: fires `corpus-extraction` for every SharePoint connection whose
