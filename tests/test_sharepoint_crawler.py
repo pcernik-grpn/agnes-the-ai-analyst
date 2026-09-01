@@ -3960,23 +3960,50 @@ class TestLiveActivity:
         deterministically by
         ``TestActivityBookkeeping::test_recent_is_capped_and_newest_first``
         below, which drives ``enter``/``exit_item_activity`` directly in a
-        fixed order. This test is the integration half: a REAL crawl, at
-        this instance's default concurrency (6), exercises it end to end.
+        fixed order. This test is the integration half: a REAL crawl
+        exercises it end to end, in two parts.
 
         Six real workers finish 8 trivial items in whatever order they
-        actually complete — not dispatch order — so asserting an exact
-        finishing position here would pin a race, not a behavior (confirmed
-        empirically: the SAME non-determinism reproduces identically on the
-        pre-process-isolation code, so it is not something conversion
-        running in a child process introduced). What the checkpoint
-        actually promises, and what this asserts, is the cap itself and
-        that the LAST item enumerated is never silently dropped from it —
-        the one thing a real crawl adds over the deterministic unit test.
+        actually complete — not dispatch order — so asserting WHICH item
+        survives the cap at this instance's default concurrency (6) would
+        pin a race, not a behavior (confirmed empirically: the SAME
+        non-determinism reproduces identically on the pre-process-isolation
+        code, so it is not something conversion running in a child process
+        introduced, and it is exactly why CI has been seen to fail this
+        assertion on its first attempt and pass on rerun). What IS
+        deterministic under real concurrent completions is the cap itself
+        holding without corruption, so the first half runs at default
+        concurrency and asserts exactly that: 5 entries, every one of them
+        genuinely among the 8 enumerated items.
+
+        The "last item enumerated is never silently dropped" guarantee the
+        original version of this test tried to pin — the one thing a real
+        crawl adds over the deterministic unit test above — is still
+        checked, in the second half, pinned to concurrency 1: sequential
+        completion order equals enumeration order by construction — the
+        same equivalence `TestConcurrencyOneIsTheOldPath` and the other
+        `_at_concurrency(monkeypatch, 1)` call sites in this file rely on —
+        so the assertion is meaningful without racing.
         """
         runs = _install_runs_repo(monkeypatch)
-        _install_graph(monkeypatch, _one_page(_many_items(8)))
+        enumerated_paths = {f"Reports/f{i}.docx" for i in range(8)}
 
+        # Part 1: default concurrency — the cap holds under real concurrent
+        # completions, without asserting which item that leaves behind.
+        _install_graph(monkeypatch, _one_page(_many_items(8)))
         _run(_connection([_drive_scope()]), monkeypatch)
+
+        activity = runs.checkpoints[-1]["progress"]["activity"]
+        assert len(activity["recent"]) == 5
+        paths = {entry["path"] for entry in activity["recent"]}
+        assert paths <= enumerated_paths
+
+        # Part 2: concurrency 1 — completion order is enumeration order, so
+        # the last item enumerated must be the last one completed, and it
+        # must still be in `recent`.
+        _at_concurrency(monkeypatch, 1)
+        _install_graph(monkeypatch, _one_page(_many_items(8)))
+        _run(_connection([_drive_scope()], connection_id="conn2"), monkeypatch)
 
         activity = runs.checkpoints[-1]["progress"]["activity"]
         assert len(activity["recent"]) == 5
