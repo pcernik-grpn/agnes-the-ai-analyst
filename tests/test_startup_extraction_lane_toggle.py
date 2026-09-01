@@ -109,11 +109,11 @@ def test_tpl_gates_everything_on_the_flag():
         "AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}",
         "AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}",
         "AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}",
-        # TCRD-259 follow-up: the app-side gates (extraction.enabled + the
+        # TCRD-259 follow-up: the app-side gates (the sharepoint switch + the
         # producer command) must also ride .env, or the TF flag alone never
         # activates the corpus-extraction job kind — it would still need the
         # per-VM instance.yaml SSH edit this env plumbing exists to avoid.
-        "AGNES_EXTRACTION_ENABLED=1",
+        "AGNES_SHAREPOINT_ENABLED=1",
         "AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}",
     ):
         idx = body.index(needle)

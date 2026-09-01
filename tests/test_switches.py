@@ -212,18 +212,18 @@ class TestDataAppsAllowSameOriginSwitch:
         assert sw.switch_value("data_apps_allow_same_origin") is True
 
 
-class TestExtractionSwitch:
-    """`extraction.enabled` (spec §7.5 / §16 step 7) gates the
-    `corpus-extraction` job kind's handler. Editable from `/admin/server-config`
-    (T3: reversing this switch's original deploy-time-only stance) — a
-    deploy-time env var still wins per field ahead of a web save (see
-    `TestExtractionEnvLock` below), so the panel's write path is never
-    silently inert even though the switch itself is no longer locked."""
+class TestSharePointSwitch:
+    """`sharepoint.enabled` (2026-09-01 flag consolidation) is the single
+    switch for the whole SharePoint connector: connect wizard and admin
+    routes, document crawling/extraction, and source-ACL mirroring including
+    permission zones and the ingest gate. It replaces the four narrower
+    switches this consolidation retired (`extraction`,
+    `extraction_webhook_enabled`, `acl_mirroring`, `acl_zones`)."""
 
     def test_identity_and_lock(self):
-        s = get_switch("extraction")
-        assert s.config_keys == ("extraction", "enabled")
-        assert s.env_var == "AGNES_EXTRACTION_ENABLED"
+        s = get_switch("sharepoint")
+        assert s.config_keys == ("sharepoint", "enabled")
+        assert s.env_var == "AGNES_SHAREPOINT_ENABLED"
         assert s.kind == "bool"
         assert s.default is False
         assert s.editable is True
@@ -235,19 +235,28 @@ class TestExtractionSwitch:
         a hand-rolled `get_value` pair (sync-map: "new user-visible switch")."""
         from app.instance_config import feature_enabled
 
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
-        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is False
-        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "1")
-        assert feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False) is True
+        assert feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False) is False
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "1")
+        assert feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False) is True
+
+    def test_resolves_through_the_registry(self, monkeypatch):
+        import app.switches as sw
+
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert sw.switch_value("sharepoint") is False
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "1")
+        assert sw.switch_value("sharepoint") is True
 
 
 class TestAclCadenceSwitches:
     """2026-08-31 plan, Task 2 — hours-scale ACL cadence switches.
     `acl_sync_interval_hours` drives the scheduler's `sharepoint-acl` row
-    (see `services/scheduler/__main__.py::_acl_sync_schedule`);
-    `acl_zones` is read by Tasks 3-7's sweep/sync/gate code (not yet wired
-    in this task — the switch exists so those tasks have something to read)."""
+    (see `services/scheduler/__main__.py::_acl_sync_schedule`). Permission
+    zones themselves are no longer a separate switch (2026-09-01: folded
+    into the single `sharepoint` switch — see `TestSharePointSwitch`)."""
 
     def test_interval_hours_identity(self):
         s = get_switch("acl_sync_interval_hours")
@@ -258,30 +267,12 @@ class TestAclCadenceSwitches:
         assert s.editable is True
         assert not s.lock_reason.strip()
 
-    def test_zones_identity(self):
-        s = get_switch("acl_zones")
-        assert s.config_keys == ("acl_sync", "zones_enabled")
-        assert s.env_var == "AGNES_ACL_ZONES_ENABLED"
-        assert s.kind == "bool"
-        assert s.default is False
-        assert s.editable is True
-        assert not s.lock_reason.strip()
-
     def test_sweep_interval_days_default_lowered_to_one(self):
         """Weekly -> daily sweep cadence (MUST NOT posture): the per-connection
         self-guard's default must not outlive the scheduler row's own cadence
         change in the same task."""
         s = get_switch("acl_sweep_interval_days")
         assert s.default == 1
-
-    def test_zones_resolves_through_the_registry(self, monkeypatch):
-        import app.switches as sw
-
-        monkeypatch.delenv("AGNES_ACL_ZONES_ENABLED", raising=False)
-        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
-        assert sw.switch_value("acl_zones") is False
-        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "1")
-        assert sw.switch_value("acl_zones") is True
 
     def test_interval_hours_resolves_through_the_registry(self, monkeypatch):
         import app.switches as sw

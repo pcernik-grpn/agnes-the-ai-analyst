@@ -1608,7 +1608,7 @@ class TestSharePointSourceCard:
             assert schedule["text"] == "external producer · hourly delta"
             # TCRD-226's in-Agnes schedule state is a SEPARATE, additive
             # sub-object — a fresh connection with no scheduled runs reads
-            # honestly off (never a stale/guessed default). `extraction.
+            # honestly off (never a stale/guessed default). `sharepoint.
             # enabled` is off by default -> the honest-UI gate reads
             # "not ready, extraction_disabled" (the same slug the manual
             # trigger's 409 would use for this exact instance state).
@@ -1635,7 +1635,7 @@ class TestSharePointSourceCard:
         from app.web.router import _source_inventory
         from src.repositories import source_connections_repo
 
-        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
 
         def _fake_get_value(*keys, default=None):
             if keys == ("extraction", "schedule"):
@@ -1683,7 +1683,7 @@ class TestSharePointSourceCard:
         from app.web.router import _source_inventory
         from src.repositories import source_connections_repo
 
-        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
 
         def _fake_get_value(*keys, default=None):
             if keys == ("extraction", "producer", "command"):

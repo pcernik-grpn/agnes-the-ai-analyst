@@ -1,7 +1,16 @@
 """Admin REST API for the SharePoint file-source connect wizard (spec
 2026-08-27 §13.2 — "Connect wizard (file source): three steps").
 
-Surface (all gated by ``Depends(require_admin)``):
+Every route on this router is gated FIRST by the module-level
+``dependencies=[Depends(_require_sharepoint_enabled)]`` — the whole SharePoint
+admin surface answers ``409 feature_disabled`` when the single ``sharepoint``
+switch (``app/switches.py``) is off, before any per-route auth even runs. On
+top of that, most individual routes are also gated by ``Depends(require_admin)``
+(a couple by ``Depends(require_admin_or_producer_connection(...))`` for the
+corpus-extraction producer's own callback reads — see those routes' own
+docstrings).
+
+Surface:
 
   GET    /api/admin/sharepoint/connections/{id}/tree        — one level of the live
                                                                 Graph folder tree
@@ -61,7 +70,7 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 kind (TCRD-226). Refuses BEFORE
                                                                 enqueueing (typed 409, never a job
                                                                 that fails 30 minutes later in a
-                                                                worker) when ``extraction.enabled``
+                                                                worker) when ``sharepoint.enabled``
                                                                 is off or no producer is configured
                                                                 — the same two gates
                                                                 ``app/worker/kinds.py::
@@ -88,20 +97,22 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 (``connectors/sharepoint/
                                                                 acl_sync.py::run_acl_sync``). Same
                                                                 enqueue/dedup mechanics as
-                                                                ``.../extract`` above; refuses with
-                                                                ``409 feature_disabled`` when
-                                                                ``acl_mirroring.enabled`` is off.
+                                                                ``.../extract`` above; the
+                                                                router-level ``sharepoint.enabled``
+                                                                gate already refuses with ``409
+                                                                feature_disabled`` when the
+                                                                connector is off.
   POST   /api/admin/sharepoint/connections/{id}/subtree-sweep  — admin "re-check subtrees now"
                                                                 trigger (2026-08-31 plan, Task 8)
                                                                 for the ``sharepoint-subtree-sweep``
                                                                 job (``connectors/sharepoint/
                                                                 acl_sync.py::run_subtree_sweep``).
-                                                                Identical enqueue/dedup/flag-gate
-                                                                mechanics to ``.../acl-sync``
-                                                                above — the explicit-connection
-                                                                payload bypasses the job's own
-                                                                per-connection due-guard, so this
-                                                                is always a real, immediate sweep.
+                                                                Identical enqueue/dedup mechanics
+                                                                to ``.../acl-sync`` above — the
+                                                                explicit-connection payload bypasses
+                                                                the job's own per-connection
+                                                                due-guard, so this is always a real,
+                                                                immediate sweep.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -167,7 +178,38 @@ from src.repositories import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
+
+def _require_sharepoint_enabled() -> None:
+    """Router-level dependency: refuse the whole SharePoint admin surface
+    with a typed ``409 feature_disabled`` when the ``sharepoint`` switch
+    (``app/switches.py``) is off.
+
+    ``409``, not ``404``: unlike the anonymous Graph webhook receiver
+    (``app/api/sharepoint_webhooks.py``'s ``require_sharepoint_enabled`` in
+    ``app/auth/access.py``, which 404s because Graph is an unauthenticated
+    caller that never had a route to discover), every route here already
+    requires admin (or a scoped producer credential) — a reachable,
+    authenticated caller being told a KNOWN feature is off is exactly what
+    409 means elsewhere in this module (``extraction_disabled``,
+    ``acl_sync_already_running``, ...).
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "feature_disabled",
+                "message": "sharepoint.enabled is false — enable it in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
+            },
+        )
+
+
+router = APIRouter(
+    prefix="/api/admin/sharepoint",
+    tags=["admin"],
+    dependencies=[Depends(_require_sharepoint_enabled)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -626,15 +668,15 @@ def _create_scope_collection(*, connection_name: str, display_path: str, source_
 def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     """Whether the ``corpus-extraction`` job kind can actually run right now
     — the SAME two gates ``app/worker/kinds.py::_run_corpus_extraction``
-    itself checks (``extraction.enabled`` + a configured producer command/
+    itself checks (``sharepoint.enabled`` + a configured producer command/
     module), read here so an admin (or the scheduled sweep below) finds out
     BEFORE a job is queued rather than 30 minutes later when a worker claims
     it and the handler raises.
 
-    Both gates already honor a deploy-time env override ahead of
-    ``instance.yaml`` — ``AGNES_EXTRACTION_ENABLED`` (via
-    ``feature_enabled`` below) and ``AGNES_EXTRACTION_PRODUCER_COMMAND`` /
-    ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
+    The first gate already honors a deploy-time env override ahead of
+    ``instance.yaml`` — ``AGNES_SHAREPOINT_ENABLED`` (via ``feature_enabled``
+    below) — and the producer gate honors ``AGNES_EXTRACTION_PRODUCER_COMMAND``
+    / ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
     :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
     this function and the handler it mirrors see the identical truth
     regardless of which source (env or yaml) an instance configures
@@ -645,10 +687,10 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
         return False, {
             "error": "extraction_disabled",
-            "message": "extraction.enabled is false — enable it in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
+            "message": "sharepoint.enabled is false — enable it in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
         }
 
     from app.worker.kinds import _extraction_producer_argv
@@ -706,7 +748,7 @@ def _extraction_schedule_config() -> Optional[str]:
     in ``instance.yaml``'s ``extraction:`` block) — applied independently to
     each SharePoint connection's own ``last_run_at`` by
     :func:`_dispatch_extraction_if_due`. Off by default: absent/empty means
-    no scheduled sweep (mirrors ``extraction.enabled``'s own default)."""
+    no scheduled sweep (mirrors ``sharepoint.enabled``'s own default)."""
     from app.instance_config import get_value
 
     raw = get_value("extraction", "schedule", default="")
@@ -1409,7 +1451,7 @@ async def trigger_extraction(
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
     worker) when the feature isn't usable: ``409 extraction_disabled``
-    (``extraction.enabled`` is false) or ``409
+    (``sharepoint.enabled`` is false) or ``409
     extraction_producer_not_configured`` (neither ``extraction.producer
     .command`` nor ``.module`` is set) — see :func:`_extraction_readiness`.
 
@@ -1465,24 +1507,17 @@ async def trigger_acl_sync(
     ``{"connection_id": connection_id}``, the SAME mechanics as
     :func:`trigger_extraction`.
 
-    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
-    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
-    .enabled`` is off — the job handler itself would just no-op (spec §5.1
-    "the scheduler enqueues this kind unconditionally"), but a manual
-    trigger should tell the admin why nothing happened rather than return a
-    202 for a run that will do nothing.
+    404 on an unknown/non-sharepoint connection BEFORE any other work. The
+    router-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``
+    above) already refuses the whole surface with ``409 feature_disabled``
+    when the connector is off, so there is no separate per-route check here.
 
     Deduped on a STABLE per-connection idempotency key
     (:func:`_acl_sync_idempotency_key`) — a second trigger while one is
     already queued/running for this connection gets ``409
     acl_sync_already_running`` instead of a second job.
     """
-    from app.instance_config import feature_enabled
-
     _sharepoint_connection_or_404(connection_id)
-
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
 
     from src.repositories import jobs_repo
 
@@ -1525,24 +1560,17 @@ async def trigger_subtree_sweep(
     (:func:`connectors.sharepoint.acl_sync._sweep_due`), so this always
     triggers a real sweep, never a same-day no-op.
 
-    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
-    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
-    .enabled`` is off — same reasoning as :func:`trigger_acl_sync`: the job
-    handler itself would just no-op, but a manual trigger should tell the
-    admin why nothing happened rather than return a 202 for a run that will
-    do nothing.
+    404 on an unknown/non-sharepoint connection BEFORE any other work. The
+    router-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``
+    above) already refuses the whole surface with ``409 feature_disabled``
+    when the connector is off, so there is no separate per-route check here.
 
     Deduped on a STABLE per-connection idempotency key
     (:func:`_sweep_idempotency_key`) — a second trigger while one is already
     queued/running for this connection gets ``409 sweep_already_running``
     instead of a second job.
     """
-    from app.instance_config import feature_enabled
-
     _sharepoint_connection_or_404(connection_id)
-
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
 
     from src.repositories import jobs_repo
 
@@ -1575,10 +1603,10 @@ async def run_due_extraction(
     Scheduler row: ``extraction-run-due`` in
     ``services/scheduler/__main__.py``, registered only when
     ``extraction.schedule`` is configured (absent/empty = off, same
-    default posture as ``extraction.enabled``).
+    default posture as ``sharepoint.enabled``).
 
     A clean, typed no-op (never an error) when the feature isn't usable —
-    ``extraction.enabled`` is false, no producer is configured, or no
+    ``sharepoint.enabled`` is false, no producer is configured, or no
     schedule is configured — since this endpoint, once registered, fires
     UNCONDITIONALLY on its own cadence; the JOB HANDLER
     (``_run_corpus_extraction``) raises on the same conditions because a

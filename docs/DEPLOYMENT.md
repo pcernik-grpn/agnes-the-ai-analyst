@@ -626,13 +626,14 @@ call their endpoint synchronously (full split in
 with `agnes admin jobs list` (`--status`/`--kind` to filter) or
 `agnes admin jobs show <job_id>` for one row.
 
-A third, opt-in lane — `extraction` (document extraction, off by default;
-see the `extraction:` block in `config/instance.yaml.example` and
+A third, opt-in lane — `extraction` (document extraction, part of the
+SharePoint connector and off by default with it; see the `extraction:`
+block in `config/instance.yaml.example` and
 [`architecture.md`](architecture.md#background-jobs)) — is normally split
 into its own process via the `extraction-worker` Compose service
 (`docker-compose.yml`, profile `extraction-worker`, `AGNES_ROLE=worker`,
 `AGNES_WORKER_LANES=extraction`). Starting that service is itself a role
-split: flipping `extraction.enabled: true` and the Compose profile is not
+split: flipping `sharepoint.enabled: true` and the Compose profile is not
 sufficient on its own — the three prerequisites above (Postgres app-state,
 explicit secrets, `coordination.backend: redis`) must already hold, or
 `validate_deployment` refuses to boot that container exactly like any other
@@ -647,7 +648,9 @@ module-level `extraction_worker_image` (a worker image that carries your
 extraction producer — the plain app image has no producer on PATH, and the
 module refuses the flag without an image at plan time). The module then
 renders the Redis coordination backend, the `.env` coordination
-declaration, an `AGNES_EXTRACTION_ENABLED=1` line, an
+declaration, an `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint
+connector, not just extraction — see the migration note in
+[`feature-flags.md`](feature-flags.md)), an
 `AGNES_EXTRACTION_PRODUCER_COMMAND` line (module-level
 `extraction_producer_command`, defaulting to the conventional in-image
 path `python /opt/producer/agnes_lane.py` — override only if your
@@ -684,18 +687,20 @@ WORKER_MEM_LIMIT=6g` (headroom over the naive 3.6 GiB, not just the raw
 multiple) and `AGNES_EXTRACTION_WORKER_CPUS` raised to match — measure your
 own producer's footprint rather than assuming this example holds.
 
-`extraction.enabled`, `extraction.producer.command`/`.module`/
-`.env_passthrough`, `extraction.schedule` and `extraction.timeout_s` are all
-editable from `/admin/server-config` (or `agnes admin server-config`),
-reversing the switch's original deploy-time-only stance. This does not
-weaken the TF-first posture above: `enabled`, `producer.command` and
-`producer.module` each still honor their env var (`AGNES_EXTRACTION_ENABLED`
-/ `_PRODUCER_COMMAND` / `_PRODUCER_MODULE`) ahead of a web save, exactly the
-resolution order every other switch uses. On a Terraform-provisioned
-instance the panel shows those three leaves as read-only ("set by deployment
-(Terraform)") and a `POST` touching one 409s (`field_locked_by_deployment`)
-rather than persisting a value the running process would never read — clear
-the env var on the deployment side first if you need to hand-edit it here.
+`extraction.producer.command`/`.module`/`.env_passthrough`,
+`extraction.schedule` and `extraction.timeout_s` are all editable from
+`/admin/server-config` (or `agnes admin server-config`), reversing the
+`extraction` section's original deploy-time-only stance — the connector's
+own on/off state lives separately on `sharepoint.enabled`
+(`AGNES_SHAREPOINT_ENABLED`), not in this section. This does not weaken the
+TF-first posture above: `producer.command` and `producer.module` each
+still honor their env var (`AGNES_EXTRACTION_PRODUCER_COMMAND` /
+`_PRODUCER_MODULE`) ahead of a web save, exactly the resolution order every
+other switch uses. On a Terraform-provisioned instance the panel shows
+those two leaves as read-only ("set by deployment (Terraform)") and a
+`POST` touching one 409s (`field_locked_by_deployment`) rather than
+persisting a value the running process would never read — clear the env
+var on the deployment side first if you need to hand-edit it here.
 `schedule`/`timeout_s`/`env_passthrough` carry no such override and are
 always plain writable fields, on every deployment shape.
 

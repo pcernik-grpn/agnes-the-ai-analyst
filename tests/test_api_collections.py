@@ -2275,7 +2275,7 @@ def _seed_sharepoint_scope(corpus_id: str, *, connection_id: str) -> None:
 
 class TestSharePointIngestGateUpload:
     def test_upload_under_excluded_subtree_is_refused_and_stores_nothing(self, seeded_app, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
         c = seeded_app["client"]
         cr = c.post("/api/collections", json={"name": "SP Gate Upload"}, headers=_auth(seeded_app["admin_token"]))
         corpus_id = cr.json()["id"]
@@ -2307,7 +2307,7 @@ class TestSharePointIngestGateUpload:
         assert len(after) - len(before) == 1
 
     def test_upload_outside_excluded_subtree_is_unaffected(self, seeded_app, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
         c = seeded_app["client"]
         cr = c.post("/api/collections", json={"name": "SP Gate Clean Upload"}, headers=_auth(seeded_app["admin_token"]))
         corpus_id = cr.json()["id"]
@@ -2321,7 +2321,7 @@ class TestSharePointIngestGateUpload:
         )
         assert resp.status_code == 201, resp.text
 
-    def test_gate_is_a_noop_when_acl_mirroring_is_off(self, seeded_app):
+    def test_gate_is_a_noop_when_sharepoint_is_off(self, seeded_app):
         """Same excluded-subtree config, but the feature flag stays off — the
         upload must be byte-identical to a plain collection (strict no-op:
         `source_acl_index_for_collection` returns `None`)."""

@@ -9,7 +9,7 @@ no content/extraction machinery involved anywhere). This plan's own spec is
 
 Runs entirely against the DuckDB-backed system db, mirroring
 ``tests/test_sharepoint_acl_sync.py``'s own fixture idiom exactly (fresh
-``system.duckdb`` under a tmp ``DATA_DIR``, ``acl_mirroring.enabled=true``, a
+``system.duckdb`` under a tmp ``DATA_DIR``, the ``sharepoint`` switch on, a
 resolvable-but-never-parsed certificate env var). Reachability is asserted
 at the ``app.auth.access.accessible_collection_ids`` level — the same
 function every read surface (search, neighbors, claims, ``facts_pg.py``'s
@@ -46,7 +46,7 @@ def acl_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("AGNES_DB_URL", raising=False)
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "unused-because-get-app-token-is-faked")
 
     from src.db import close_system_db, get_system_db

@@ -3505,7 +3505,7 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health/detailed",
         "/api/version",
         # Microsoft Graph change-notification receiver — Graph is the only
-        # caller, gated by extraction_webhook.enabled (404 when off), never
+        # caller, gated by the sharepoint switch (404 when off), never
         # a session/PAT (see app/api/sharepoint_webhooks.py). It can never
         # answer 401/403.
         "/api/webhooks/sharepoint/{connection_id}",

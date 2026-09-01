@@ -182,7 +182,7 @@ variable "prod_instance" {
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
     # default so a module bump alone never moves the existing fleet. Turning
     # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL +
-    # AGNES_EXTRACTION_ENABLED=1 + AGNES_EXTRACTION_PRODUCER_COMMAND=<module-
+    # AGNES_SHAREPOINT_ENABLED=1 + AGNES_EXTRACTION_PRODUCER_COMMAND=<module-
     # level var.extraction_producer_command> into the VM's app .env (env
     # overrides instance.yaml for every one of these — app/coordination/
     # factory.py's posture, mirrored by app/instance_config.py::feature_enabled
@@ -191,7 +191,10 @@ variable "prod_instance" {
     # module-owned docker-compose.extraction.yml overlay carrying the `redis`
     # service and the worker re-pin. This is what makes the flag alone
     # activate the `corpus-extraction` job kind end to end — no per-VM SSH
-    # edit of instance.yaml required. The multi-process startup guard
+    # edit of instance.yaml required. AGNES_SHAREPOINT_ENABLED gates the
+    # WHOLE SharePoint connector (2026-09-01 flag consolidation), not just
+    # extraction, so this also turns on the connect wizard, admin routes, and
+    # ACL mirroring on this VM. The multi-process startup guard
     # (app/startup_guards.py) then requires the instance to already run the
     # Postgres app-state backend and boots refuse loudly on a DuckDB
     # instance — deliberate: migrate the backend first, then flip this.

@@ -1335,7 +1335,7 @@ async def upload_files(
     # batch carrying any file whose source path/item sits under an excluded
     # subtree, an excluded unique-permission file, or another collection's
     # active permission zone, BEFORE a single byte is stored. A strict no-op
-    # for every non-SharePoint (or acl_mirroring-off) collection.
+    # for every non-SharePoint (or sharepoint-switch-off) collection.
     from connectors.sharepoint.ingest_gate import source_acl_index_for_collection, source_acl_refusal
 
     acl_index = source_acl_index_for_collection(collection_id)

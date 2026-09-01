@@ -6,7 +6,7 @@ connection lookup), constant-time `clientState` verification (bad state
 dropped silently, `202` regardless — never an existence/secret oracle),
 the `corpus-extraction` enqueue on a verified notification (shared
 idempotency key + debounced `run_after`, so a burst collapses onto one
-job), the `extraction_webhook.enabled` feature gate (`404` when off), the
+job), the single `sharepoint` switch's feature gate (`404` when off), the
 hard request-size cap, and secret rotation invalidating the old
 `clientState`.
 """
@@ -65,11 +65,11 @@ def _config_get_value(config: dict):
 
 
 _ENABLED_EXTRACTION_CONFIG = {
+    "sharepoint": {"enabled": True},
     "extraction": {
-        "enabled": True,
         "producer": {"command": "python -m fake_producer"},
         "timeout_s": 60,
-    }
+    },
 }
 
 
@@ -78,19 +78,19 @@ def _webhook_route_enabled(monkeypatch):
     """Every test in this module exercises the receiver itself, so the
     router's own feature gate is on by default — ``TestFeatureGate`` below
     overrides it back off per test."""
-    monkeypatch.setenv("AGNES_EXTRACTION_WEBHOOK_ENABLED", "1")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "1")
 
 
 class TestFeatureGate:
     def test_route_404s_when_the_switch_is_off(self, seeded_app, monkeypatch):
-        monkeypatch.setenv("AGNES_EXTRACTION_WEBHOOK_ENABLED", "0")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "0")
         r = seeded_app["client"].post(f"{BASE}/does-not-exist", json={"value": []})
         assert r.status_code == 404
 
     def test_validation_handshake_also_404s_when_off(self, seeded_app, monkeypatch):
         """The router-level gate closes the WHOLE surface — even the
         side-effect-free handshake branch never runs when the switch is off."""
-        monkeypatch.setenv("AGNES_EXTRACTION_WEBHOOK_ENABLED", "0")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "0")
         r = seeded_app["client"].post(f"{BASE}/does-not-exist", params={"validationToken": "abc123"})
         assert r.status_code == 404
 
@@ -133,7 +133,6 @@ class TestNotificationDelivery:
         # isolates the assertion to the clientState check itself, rather
         # than passing vacuously because the readiness gate alone would
         # have skipped the enqueue anyway.
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, _secret = self._connection_with_secret(seeded_app)
         r = seeded_app["client"].post(
@@ -158,7 +157,6 @@ class TestNotificationDelivery:
         split was an existence/secret oracle: exactly the property every other
         path in this module is written to deny.
         """
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, _secret = self._connection_with_secret(seeded_app)
         r = seeded_app["client"].post(
@@ -175,7 +173,6 @@ class TestNotificationDelivery:
     def test_non_ascii_clientstate_is_indistinguishable_from_an_unknown_connection(self, seeded_app, monkeypatch):
         """The oracle closed end to end: the same hostile payload gets the
         same answer whether the connection exists with a secret or not."""
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, _secret = self._connection_with_secret(seeded_app)
         payload = {"value": [{"clientState": "\u00fc\u00f1\u00ee\u00e7\u00f8d\u00e9"}]}
@@ -185,7 +182,6 @@ class TestNotificationDelivery:
         assert real.json() == missing.json()
 
     def test_no_secret_configured_yet_returns_202_with_nothing_done(self, seeded_app, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         c, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="webhook-no-secret-conn")
@@ -198,7 +194,6 @@ class TestNotificationDelivery:
         assert not any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
 
     def test_valid_notification_enqueues_corpus_extraction(self, seeded_app, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, secret = self._connection_with_secret(seeded_app)
 
@@ -220,7 +215,6 @@ class TestNotificationDelivery:
         assert job["run_after"] is not None
 
     def test_burst_of_notifications_collapses_onto_one_job(self, seeded_app, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, secret = self._connection_with_secret(seeded_app)
 
@@ -241,8 +235,11 @@ class TestNotificationDelivery:
 
     def test_skips_enqueue_when_extraction_is_not_usable(self, seeded_app, monkeypatch):
         """The webhook never queues a job doomed to fail: same readiness
-        gate the manual admin trigger checks BEFORE enqueueing."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        gate the manual admin trigger checks BEFORE enqueueing. sharepoint
+        stays ON (the router-level gate needs it, same flag as the receiver
+        itself) but no producer is configured, so the SECOND readiness gate
+        is what makes this unusable."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         conn_id, secret = self._connection_with_secret(seeded_app)
 
         r = seeded_app["client"].post(
@@ -263,7 +260,6 @@ class TestNotificationDelivery:
         assert r.status_code == 413
 
     def test_secret_rotation_invalidates_the_old_clientstate(self, seeded_app, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         c, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="webhook-rotation-conn")

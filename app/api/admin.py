@@ -502,18 +502,23 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
 
 # --- extraction.* admin-editable producer config (T3) -----------------------
 #
-# Three leaves — `enabled`, `producer.command`, `producer.module` — carry a
-# deploy-time env override rendered by the Terraform customer-instance module
-# (`AGNES_EXTRACTION_ENABLED` / `AGNES_EXTRACTION_PRODUCER_COMMAND` /
-# `AGNES_EXTRACTION_PRODUCER_MODULE` — see app/switches.py's `extraction`
-# switch and app/worker/kinds.py::_extraction_producer_argv). Every reader
+# Two leaves — `producer.command`, `producer.module` — carry a deploy-time
+# env override rendered by the Terraform customer-instance module
+# (`AGNES_EXTRACTION_PRODUCER_COMMAND` / `AGNES_EXTRACTION_PRODUCER_MODULE`
+# — see app/worker/kinds.py::_extraction_producer_argv). Every reader
 # already resolves env-first, so a web save under an active pin would be
 # accepted and then silently never read — worse than refusing outright.
 # `_path` is relative to the `extraction` section's OWN patch dict (i.e.
 # excludes the leading "extraction" segment), matching how
 # `_validate_extraction_section` and `_known_fields_resolved` both walk it.
+#
+# There is no `enabled` leaf here anymore: the whole SharePoint connector
+# (extraction included) is gated by the single `sharepoint` switch
+# (`app/switches.py`, section `sharepoint`, not `extraction`) — see
+# `docs/superpowers/specs/` for the flag-consolidation note. `extraction`
+# itself carries no switch of its own; it stays a `_STATIC_EDITABLE_SECTIONS`
+# entry purely for its remaining producer/schedule/timeout_s config.
 _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("enabled",), "AGNES_EXTRACTION_ENABLED"),
     (("producer", "command"), "AGNES_EXTRACTION_PRODUCER_COMMAND"),
     (("producer", "module"), "AGNES_EXTRACTION_PRODUCER_MODULE"),
 )
@@ -541,8 +546,7 @@ def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
 
 def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
     """Field-level constraints + the env-lock refusal for `extraction.*`
-    (T3: admin-editable producer config, reversing the deploy-time-only
-    stance the `extraction` switch shipped with).
+    (T3: admin-editable producer config).
 
     Two independent checks, both BEFORE the deep-merge, mirroring
     `_validate_materialize_section`'s shape:
@@ -574,9 +578,6 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     ),
                 },
             )
-
-    if "enabled" in patch and not isinstance(patch["enabled"], bool):
-        raise HTTPException(status_code=422, detail="extraction.enabled must be a boolean")
 
     producer = patch.get("producer")
     if isinstance(producer, dict):
@@ -634,21 +635,17 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     pins (env-lock honesty) rather than whatever `instance.yaml` happens to
     hold underneath it.
 
-    Every reader resolves env-first (`app.switches.switch_value`,
-    `app.worker.kinds._extraction_producer_argv`), so a stale/absent yaml
-    value under an active pin would otherwise render a value the runtime
-    does not actually use — for a field the operator cannot act on here
-    anyway, that is worse than showing the truth.
+    Every reader resolves env-first (`app.worker.kinds
+    ._extraction_producer_argv` for the two leaves below; the connector's
+    `enabled` state itself lives on the separate `sharepoint` switch, not
+    here — see `app.switches.switch_value`), so a stale/absent yaml value
+    under an active pin would otherwise render a value the runtime does not
+    actually use — for a field the operator cannot act on here anyway, that
+    is worse than showing the truth.
     """
-    from app.instance_config import coerce_flag_value
-
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):
         return
-
-    enabled_env = os.environ.get("AGNES_EXTRACTION_ENABLED")
-    if enabled_env is not None:
-        extraction["enabled"] = coerce_flag_value(enabled_env, False)
 
     command_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_COMMAND")
     module_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_MODULE")
@@ -724,6 +721,13 @@ _STATIC_EDITABLE_SECTIONS: tuple[str, ...] = (
     "materialize",
     "marketplace",
     "connectors",
+    # `extraction` carries no switch of its own since the SharePoint feature
+    # flags consolidated onto the single `sharepoint` switch (2026-09-01) —
+    # the connector's on/off state moved to `sharepoint.enabled`. This
+    # section still holds genuinely editable config with nothing else to
+    # derive it from: `producer.command`/`.module`/`.env_passthrough`,
+    # `schedule` and `timeout_s` (see `_KNOWN_FIELDS['extraction']`).
+    "extraction",
 )
 
 _EDITABLE_SECTIONS: tuple[str, ...] = tuple(
@@ -773,10 +777,9 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "mcp": "live",  # matches all five switches under it
     "access_policies": "live",  # matches its switch
     "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
-    "extraction_webhook": "live",  # matches its switch — no other known key under this section
-    "acl_mirroring": "live",  # matches its switch — no other known key under this section
+    "sharepoint": "live",  # matches its switch — no other known key under this section
     "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
-    "extraction": "live",  # every leaf is read per call: feature_enabled() (enabled), app/worker/kinds.py's _extraction_producer_argv/_extraction_producer_env_passthrough/_extraction_timeout_seconds (producer.*/timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot
+    "extraction": "live",  # every leaf is read per call: app/worker/kinds.py's _extraction_producer_argv/_extraction_producer_env_passthrough/_extraction_timeout_seconds (producer.*/timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot; the connector's own on/off state lives on the separate `sharepoint` section above
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -956,17 +959,18 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             ),
         },
     },
-    "extraction_webhook": {
+    "sharepoint": {
         "enabled": {
             "kind": "bool",
-            "default": _flag_default("extraction_webhook", "enabled", False),
+            "default": _flag_default("sharepoint", "enabled", False),
             "hint": (
-                "Microsoft Graph change-notification receiver for SharePoint "
-                "connections (POST /api/webhooks/sharepoint/{connection_id}) — 404s "
-                "the whole route when off. Gates the receiver route only; the "
-                "corpus-extraction job it enqueues still needs extraction.enabled + a "
-                "configured producer + a worker polling the extraction lane to "
-                "actually run. New feature — off by default."
+                "The whole SharePoint connector: connect wizard and admin routes "
+                "(409 when off), document crawling/extraction (schedule, jobs, "
+                "the Microsoft Graph change-notification receiver at POST "
+                "/api/webhooks/sharepoint/{connection_id}, 404 when off), and "
+                "source-ACL mirroring including permission zones and the ingest "
+                "gate. One flag; per-scope choices (mirrored access, anonymize) "
+                "stay in the wizard. New feature — off by default."
             ),
         },
     },
@@ -1015,18 +1019,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             ),
         },
     },
-    "acl_mirroring": {
-        "enabled": {
-            "kind": "bool",
-            "default": _flag_default("acl_mirroring", "enabled", False),
-            "hint": (
-                "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope "
-                "access_mode='mirrored', and the admin sync-now endpoint. OFF by "
-                "default — turning it on changes nothing until a scope opts into "
-                "mirroring."
-            ),
-        },
-    },
     "acl_sync": {
         "guarantee_mode": {
             "kind": "select",
@@ -1060,16 +1052,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "effective after a restart."
             ),
         },
-        "zones_enabled": {
-            "kind": "bool",
-            "default": _flag_default_path(("acl_sync", "zones_enabled"), False),
-            "hint": (
-                "Promote broken-inheritance SharePoint subtrees to their own "
-                "collections with their own mirrored ACLs (permission zones) "
-                "instead of excluding them from the crawl entirely. Requires "
-                "acl_mirroring."
-            ),
-        },
         "sweep_interval_days": {
             "kind": "int",
             "default": _switch_default_path(("acl_sync", "sweep_interval_days"), 1),
@@ -1083,22 +1065,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         },
     },
     "extraction": {
-        "enabled": {
-            "kind": "bool",
-            "default": _flag_default("extraction", "enabled", False),
-            "hint": (
-                "Document extraction (spec §7.5) as its own worker lane — gates the "
-                "corpus-extraction job kind's handler. New feature — off by default. "
-                "Turning this on is NOT enough by itself to run the worker: a process must "
-                "actually poll the extraction lane (AGNES_WORKER_LANES, e.g. the "
-                "extraction-worker Compose profile), which needs Postgres app-state, "
-                "explicit JWT_SECRET_KEY/SESSION_SECRET, and coordination.backend=redis "
-                "(docs/DEPLOYMENT.md#multi-process) — this panel cannot satisfy those. "
-                "A Terraform-rendered deployment sets this via AGNES_EXTRACTION_ENABLED, "
-                "which always wins over a value saved here — the field renders read-only "
-                "when that env var is present (see env_locked below)."
-            ),
-        },
         "producer": {
             "kind": "object",
             "hint": (

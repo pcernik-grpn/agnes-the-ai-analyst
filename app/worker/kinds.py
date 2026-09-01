@@ -99,7 +99,7 @@ distribution mirror, and the api-role write conversions) map onto:
 - ``corpus-extraction``    (EXTRACTION — its own lane, spec §7.5 / §16
   step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
   design.md) — the producer-invocation SEAM for document extraction. Off
-  by default (``extraction.enabled: false``, ``config/instance.yaml
+  by default (``sharepoint.enabled: false``, ``config/instance.yaml
   .example``). Unlike every other handler in this module, this one is
   NOT a thin adapter over an in-process function: it resolves this
   connection's SharePoint/tenant credentials from config/vault
@@ -135,7 +135,7 @@ distribution mirror, and the api-role write conversions) map onto:
   ported into this repo (spec §1 "Out of scope") — see
   ``_run_corpus_extraction`` below for exactly where that boundary is.
   Registered UNCONDITIONALLY (its own no-op guard on
-  ``extraction.enabled`` makes an accidental claim on a process that
+  ``sharepoint.enabled`` makes an accidental claim on a process that
   never opted into the ``extraction`` lane harmless, mirroring
   ``webhook-deliver``'s posture above) but only ever CLAIMED by a lane
   slot that opted into ``AGNES_WORKER_LANES=extraction`` — see
@@ -149,7 +149,7 @@ distribution mirror, and the api-role write conversions) map onto:
   must_not/should_not staleness fork) lives entirely in
   ``connectors.sharepoint.acl_sync.run_acl_sync`` — this kind's handler is a
   thin delegate, same posture as every OTHER kind here. Registered
-  UNCONDITIONALLY: ``run_acl_sync``'s own ``acl_mirroring.enabled`` gate
+  UNCONDITIONALLY: ``run_acl_sync``'s own ``sharepoint.enabled`` gate
   makes an accidental/scheduled claim on an instance that hasn't turned the
   feature on harmless, identical to ``ducklake-maintenance``'s and
   ``corpus-extraction``'s no-op postures above.
@@ -162,7 +162,7 @@ distribution mirror, and the api-role write conversions) map onto:
   NO automatic retry, same "an operator looks at a failed multi-hour run"
   rationale as ``corpus-extraction`` above. The walk/probe/persist body
   lives entirely in ``connectors.sharepoint.acl_sync.run_subtree_sweep``
-  (own ``acl_mirroring.enabled`` gate, own per-connection cadence
+  (own ``sharepoint.enabled`` gate, own per-connection cadence
   self-guard) — this kind's handler is a thin delegate. Registered
   UNCONDITIONALLY, same no-op posture as ``sharepoint-acl-sync`` above. Its
   output (each mirrored scope's ``excluded_subtrees``) feeds
@@ -1380,8 +1380,9 @@ def _excluded_subtree_scope_map(connection: dict) -> dict[str, list[str]]:
     compatibility even though "subtree" now also covers single files.
 
     A broken-inheritance folder that became an ACTIVE permission zone
-    (``acl_sync.zones_enabled`` on) is intentionally ABSENT here — it was
-    never written into ``excluded_subtrees`` in the first place (the sweep's
+    (always the case now — see ``connectors.sharepoint.acl_sync
+    ._walk_subtree_sweep``'s own docstring) is intentionally ABSENT here —
+    it was never written into ``excluded_subtrees`` in the first place (the sweep's
     walk routes a zone candidate into ``config["acl_zones"]`` instead, see
     ``connectors.sharepoint.acl_sync._walk_subtree_sweep``), because a zone
     is crawled now, through its own corpus-map key
@@ -1531,7 +1532,7 @@ def _agnes_producer_callback_env(connection: dict, timeout_s: int, corpus_id: st
     is set AND this process is NOT all-in-one (:func:`app.roles.
     is_all_in_one`), this function raises instead of resolving the
     fallback — the same "refuse before running the producer" posture as
-    the ``extraction.enabled`` / no-producer-configured checks in
+    the ``sharepoint.enabled`` / no-producer-configured checks in
     :func:`_run_corpus_extraction`. Checking the unconfigured DEFAULT
     (both env vars empty) rather than "is the resolved URL a loopback
     address" is deliberate: an operator who explicitly points
@@ -1680,7 +1681,7 @@ def _run_corpus_extraction(payload: dict) -> dict:
     levels.
 
     No-op guard: raises (so the job fails cleanly, not with a confusing
-    subprocess error) when ``extraction.enabled`` is false, no producer
+    subprocess error) when ``sharepoint.enabled`` is false, no producer
     command/module is configured, or (see :func:`_agnes_producer_callback_env`)
     this is a role-split worker with no callback URL configured — the same
     "off unless explicitly turned on" posture as ``ducklake-maintenance``'s
@@ -1690,8 +1691,8 @@ def _run_corpus_extraction(payload: dict) -> dict:
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
-        raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction: sharepoint.enabled is false — refusing to run")
 
     argv = _extraction_producer_argv()
     if not argv:

@@ -265,6 +265,7 @@ def _create_connection(client, token, *, name="corp-sharepoint"):
 
 def test_changes_404_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     r = client.get(f"{BASE}/does-not-exist/changes", headers=_auth(token))
     assert r.status_code == 404
     assert r.json()["detail"] == "connection_not_found"
@@ -272,6 +273,7 @@ def test_changes_404_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
 
 def test_changes_empty_page_when_no_scopes_confirmed(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     r = client.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
     assert r.status_code == 200
@@ -284,6 +286,7 @@ def test_full_fixture_added_updated_renamed_deleted(tmp_path, monkeypatch, pg_en
     import io
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
 
     scope = client.post(
@@ -354,6 +357,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
     import io
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     scope = client.post(
         f"{BASE}/{conn_id}/scopes",
@@ -391,6 +395,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
 
 def test_malformed_cursor_is_typed_400(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     r = client.get(f"{BASE}/{conn_id}/changes", params={"cursor": "garbage"}, headers=_auth(token))
     assert r.status_code == 400

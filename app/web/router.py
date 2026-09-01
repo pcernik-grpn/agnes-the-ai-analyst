@@ -8902,7 +8902,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     #
     # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
     # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
-    # connection — whether extraction.enabled is on, the configured cadence
+    # connection — whether sharepoint.enabled is on, the configured cadence
     # (if any), and this connection's own last/next run (last_run_at is
     # this connection's own `config.extraction.last_run_at`, the SAME
     # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
@@ -8931,7 +8931,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         from src.scheduler import next_due_at
 
         in_agnes_schedule["enabled"] = feature_enabled(
-            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+            "sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False
         )
         schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
         in_agnes_schedule["schedule"] = schedule_cfg

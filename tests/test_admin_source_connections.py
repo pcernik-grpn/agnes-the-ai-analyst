@@ -2757,7 +2757,7 @@ class TestSharePointScopesSurviveOrdinaryEdits:
             "last_job_id": "job_1",
         }
 
-    def test_editing_config_without_webhook_secret_preserves_it(self, seeded_app):
+    def test_editing_config_without_webhook_secret_preserves_it(self, seeded_app, monkeypatch):
         """``config.webhook_secret`` (the Graph change-notification receiver's
         shared secret, ``app/api/admin_sharepoint.py::rotate_webhook_secret``)
         is the THIRD instance of this same shape of server-written
@@ -2765,6 +2765,7 @@ class TestSharePointScopesSurviveOrdinaryEdits:
         generic editor's form. An ordinary edit through this endpoint must
         not silently reset it, which would invalidate every Graph
         subscription signed with the old value."""
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
         c, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = self._connection_with_scopes(c, token, name="sp-webhook-secret-preserve")
 

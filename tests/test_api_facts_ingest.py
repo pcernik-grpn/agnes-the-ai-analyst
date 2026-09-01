@@ -653,7 +653,7 @@ def test_ingest_refuses_a_document_under_an_excluded_sharepoint_subtree(facts_cl
     SharePoint source-ACL exclusions the upload endpoint does — a producer
     that batches claims straight from crawl metadata cannot land them for
     content Agnes has already excluded, even if it skipped the upload."""
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     client, token = facts_client["client"], facts_client["admin_token"]
     _seed_sharepoint_scope_with_exclusion("col_gate_1", connection_id="conn-facts-gate-1")
 
@@ -669,7 +669,7 @@ def test_ingest_refuses_a_document_under_an_excluded_sharepoint_subtree(facts_cl
 
 
 def test_ingest_allows_a_document_outside_the_excluded_subtree(facts_client, monkeypatch):
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     client, token = facts_client["client"], facts_client["admin_token"]
     _seed_sharepoint_scope_with_exclusion("col_gate_2", connection_id="conn-facts-gate-2")
 
@@ -682,7 +682,7 @@ def test_ingest_allows_a_document_outside_the_excluded_subtree(facts_client, mon
     assert r.json()["error"] == "requires_postgres_backend"
 
 
-def test_ingest_source_acl_gate_is_a_noop_when_acl_mirroring_is_off(facts_client):
+def test_ingest_source_acl_gate_is_a_noop_when_sharepoint_is_off(facts_client):
     """Same excluded-subtree config, but the feature flag stays off — the
     gate must be a strict no-op (proven by the 501 falling through
     unchanged, exactly like the pre-existing anonymize/producer no-op

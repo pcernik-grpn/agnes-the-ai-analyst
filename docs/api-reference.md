@@ -1290,7 +1290,8 @@ must_not_forbids_subtree_override` under the `must_not` guarantee mode
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues
 `{"connection_id": connection_id}` and returns `202 {"job_id", "status"}`;
-`409 feature_disabled` when `acl_mirroring.enabled` is off, `409
+`409 feature_disabled` when the `sharepoint` switch is off (router-level
+gate, shared with every other route under `/api/admin/sharepoint/*`), `409
 acl_sync_already_running` when one is already queued/running for this
 connection.
 
@@ -1336,7 +1337,7 @@ admin trigger for the existing `corpus-extraction` job kind
 `{"connection_id": connection_id}` and returns `202
 {"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
 any other work; refuses cleanly (never a job that fails 30 minutes later in
-a worker) with `409 extraction_disabled` (`extraction.enabled` is false) or
+a worker) with `409 extraction_disabled` (the `sharepoint` switch is false) or
 `409 extraction_producer_not_configured` (no `extraction.producer.command`/
 `.module` set); a run already queued/running for the same connection is
 `409 extraction_already_running` — deduped on a stable per-connection
@@ -1397,8 +1398,8 @@ itself.
 
 Public, unauthenticated (Microsoft Graph is the caller) `POST` route that
 lets a SharePoint drive push near-real-time change notifications instead of
-Agnes waiting for `extraction.schedule`'s clock. Feature-gated by
-`extraction_webhook.enabled` (default off) — the whole route 404s when off,
+Agnes waiting for `extraction.schedule`'s clock. Feature-gated by the
+single `sharepoint` switch (default off) — the whole route 404s when off,
 same posture as `/api/facts*`.
 
 Two request shapes on the same route, matching Graph's own contract:
@@ -1417,10 +1418,10 @@ Two request shapes on the same route, matching Graph's own contract:
   notification, enqueues the SAME `corpus-extraction` job kind the manual
   admin trigger uses, with the same idempotency key (so a burst of
   notifications for one connection collapses onto a single run) and a
-  ~60s `run_after` debounce; skipped (still `202`) when `extraction.enabled`
-  or its producer isn't configured, so a webhook burst never queues a job
-  doomed to fail. Hard 1 MiB request-body cap, enforced by streaming rather
-  than buffering first (`413` on overflow).
+  ~60s `run_after` debounce; skipped (still `202`) when the `sharepoint`
+  switch is off or its producer isn't configured, so a webhook burst never
+  queues a job doomed to fail. Hard 1 MiB request-body cap, enforced by
+  streaming rather than buffering first (`413` on overflow).
 
 Admin-only wizard/system-to-system bookkeeping with no analyst CLI/MCP
 analogue — Graph is the only caller.
