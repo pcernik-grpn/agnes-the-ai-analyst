@@ -661,6 +661,32 @@ so this is a deployment-correctness requirement rather than a browser-reachable
 bypass; when `subdomain_base` is unset the marker is never set regardless of
 `Host`.
 
+**Deploy-time exposure check** (#1946, warn-first): `POST
+/api/data-apps/{slug}/deploy` runs a pure, best-effort static scan
+(`src/data_apps/deploy_check.py`) over the target commit's tree before
+fast-forwarding `agnes-live` — a signal, not a gate, unless the operator
+opts into `data_apps.deploy_checks: block` (default `warn`; `off` disables
+it entirely). It flags, line by line: <a id="da001"></a>`DA001` and <a
+id="da002"></a>`DA002` a static-file server root that isn't scoped to a
+named subdirectory (Node `express.static`/`serveStatic`/fastify-static;
+Python `StaticFiles`/`send_from_directory`/`app.static_folder`); <a
+id="da003"></a>`DA003` an nginx `root`/`alias` serving `/`, `/app`, or a
+bare top-level mount, or `autoindex on`; <a id="da004"></a>`DA004` the whole
+process environment serialized into a response; <a id="da005"></a>`DA005`
+the injected `AGNES_TOKEN` echoed back on a response line (v1 checks that
+name only — arbitrary per-app secret names are noisier to match safely and
+are tracked for a v2); and <a id="da006"></a>`DA006` (informational) debug
+mode left on. `agnes app deploy` prints any findings under the `State:`
+line; `POST .../deploy`'s response carries them as an additive
+`deploy_check` key whenever the scan ran. An externally-hosted repo
+(`repo_mode=external`) can't be scanned — its source never reaches Agnes —
+so `warn`/`off` surface `deploy_check: {"status": "skipped", "skipped":
+"external_repo"}` instead, while `block` refuses the deploy outright
+(`deploy_check_unavailable_external_repo`) rather than silently exempting
+an unscannable app from the operator's own policy. No findings are
+persisted and there is no admin UI for them in v1 — each one lives for
+exactly the one deploy request's response and audit row.
+
 **Network egress** (GCP metadata): a data-app container sits on the `agnes-apps`
 bridge with normal egress (its runtime image installs dependencies from PyPI/npm
 at boot). On a cloud VM that reach includes the instance **metadata server**

@@ -1416,6 +1416,11 @@
   .lib-empty { text-align: center; padding: 40px 20px; color: var(--ds-text-secondary); border: 1px dashed var(--ds-border); border-radius: 14px; }
   .lib-empty h3 { margin: 0 0 6px; color: var(--ds-text-primary); font-size: 15px; }
   .lib-empty .cc-btn { margin-top: 12px; }
+  /* The ungranted state is the one empty state with TWO next steps (write the
+     grant, then check it landed), so its actions sit in a row and own the top
+     margin the single-button states set on the button itself. */
+  .lib-empty__actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 12px; }
+  .lib-empty__actions .cc-btn { margin-top: 0; }
 
   /* ── Definitions, ON the Semantic models band ──────────────────────────
      This was a footer aside under the whole inventory — i.e. after every row,
@@ -2574,6 +2579,35 @@
     <h3>Your library couldn’t be loaded</h3>
     <p>Nothing could be read just now, so this list is empty — but your library may not be. Reload to try again; if it keeps happening, tell an admin.</p>
     <button type="button" class="cc-btn cc-btn--primary" onclick="window.location.reload()">Reload</button>
+    {% elif library_grantable_exists %}
+    {# The same lesson one step further in. This page is grant-scoped and NOT
+       admin god-mode, so "nothing is listed" has two causes that used to share
+       one sentence: the workspace holds nothing, or it holds plenty and none of
+       it has been granted to this reader. Saying "your library is empty —
+       upload a file" for the second framed the whole surface as self-authored,
+       and the reader concluded the product was broken rather than that they
+       were ungranted.
+
+       What the branch asserts is an AGGREGATE — the workspace has grantable
+       content — never a name or a count of it (see `library_grantable_exists`
+       in app/web/router.py). The two readers need opposite next steps: the
+       person who cannot grant needs to know who can, and the admin who reads
+       "ask an admin" is being told to ask themselves. #}
+    <h3>Nothing has been shared with you yet</h3>
+    <p>This workspace does hold content: data packages, memory and plugins reach you through a grant, and an admin shares one with a group you are in. Anything you upload or build yourself lands here too.</p>
+    {% if user.is_admin %}
+    <p>You are that admin — grant a group on the access page, then check the result with Simulate, which shows what one person’s Library holds.</p>
+    <div class="lib-empty__actions">
+      <a class="cc-btn cc-btn--primary" href="/admin/access">Grant access</a>
+      <a class="cc-btn" href="/admin/access?lens=simulate">Simulate a person</a>
+    </div>
+    {% else %}
+    <p>Ask an admin to grant your group what you need.</p>
+    {# Not the primary action here — uploading is a real thing this reader can
+       do, but it is not the thing standing between them and the content they
+       came for. #}
+    <button type="button" class="cc-btn" data-new-upload>Upload a file</button>
+    {% endif %}
     {% else %}
     <h3>Your library is empty</h3>
     <p>Use <b>+ Add</b> to upload a file — keep it on its own, or group several into a collection — or to build a skill or a plugin. Everything you make lands here, ready to share.</p>

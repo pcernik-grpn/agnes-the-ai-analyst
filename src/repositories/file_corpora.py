@@ -145,3 +145,41 @@ class FileCorporaRepository:
             "UPDATE file_corpora SET deleted_at = NULL, updated_at = current_timestamp WHERE id = ?",
             [corpus_id],
         )
+
+    #: The only columns :meth:`update` may write. Keys are interpolated into
+    #: the SET clause, so this allowlist — never the caller — is what decides
+    #: which identifiers reach SQL; an unknown key raises before the statement
+    #: is built.
+    _UPDATABLE = ("name", "slug", "description")
+
+    def update(self, corpus_id: str, **fields: Any) -> bool:
+        """Patch one live corpus's editable metadata. ``True`` if a row matched.
+
+        PRESENCE-based, not value-based: a field that is passed gets written
+        even when its value is ``None`` (that is how a description is
+        cleared), and a field that is omitted is left untouched. This is what
+        lets ``PATCH`` distinguish "clear the description" from "don't touch
+        the description" — two requests a single ``description=None`` kwarg
+        cannot tell apart.
+
+        Returns ``False`` when no live row matched (missing or soft-deleted),
+        so a caller can answer 404 without a second read.
+
+        Raises ``duckdb.ConstraintException`` when ``slug`` collides with
+        another corpus — the same failure ``create`` already raises, so the
+        API's 409 handling covers both paths unchanged.
+        """
+        unknown = sorted(set(fields) - set(self._UPDATABLE))
+        if unknown:
+            raise ValueError(f"file_corpora.update: not an updatable column: {unknown}")
+        if not fields:
+            return False
+        cols = list(fields)
+        sets = ", ".join(f"{c} = ?" for c in cols)  # identifiers come from _UPDATABLE
+        params: List[Any] = [fields[c] for c in cols] + [corpus_id]
+        row = self.conn.execute(
+            f"UPDATE file_corpora SET {sets}, updated_at = current_timestamp "
+            "WHERE id = ? AND deleted_at IS NULL RETURNING id",
+            params,
+        ).fetchone()
+        return row is not None

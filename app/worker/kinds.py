@@ -133,8 +133,9 @@ distribution mirror, and the api-role write conversions) map onto:
   mirrored scope's folder tree, probing ``hasUniqueRoleAssignments`` per
   folder, to find and exclude broken-inheritance subtrees (spec §3(b),
   §6.2) — a full pass over a large library is MULTI-HOUR (§6.2's cost
-  model), so this gets a much longer lease
-  (``AGNES_SP_SWEEP_LEASE_S``, default 4h) than every other LIGHT kind and
+  model), but that bounds the SWEEP, not its lease (see the "Lease/retry
+  tuning" note below): it gets the same small, heartbeat-protected lease
+  (``AGNES_SP_SWEEP_LEASE_S``) as every other long-running kind, plus
   NO automatic retry, same "an operator looks at a failed multi-hour run"
   rationale as ``corpus-extraction`` above. The walk/probe/persist body
   lives entirely in ``connectors.sharepoint.acl_sync.run_subtree_sweep``
@@ -162,15 +163,30 @@ is created (see the comment there) — registration is idempotent
 (``register_kind`` replaces any existing entry by name), so calling it
 more than once (e.g. across re-imports in a test process) is harmless.
 
-Lease/retry tuning:
+Lease/retry tuning: a job kind's lease is a LIVENESS ceiling, not a
+DURATION ceiling. ``app/worker/runtime.py``'s heartbeat renews it every
+``lease_seconds/3`` for as long as the handler thread is alive, so the
+lease only has to survive the GAP BETWEEN TWO HEARTBEAT TICKS, never the
+whole run. ``data-refresh``, ``corpus-extraction`` and
+``sharepoint-subtree-sweep`` used to be sized to their own expected
+DURATION instead (900s / timeout_s+margin / 14400s respectively) — that
+buys a live run nothing the heartbeat wasn't already doing, and costs a
+dead one everything: a worker killed mid-job (observed live — a native
+crash in a converter backend, twice in one afternoon) leaves its job
+``status='running'`` with a dead ``leased_by`` until ``lease_expires_at``
+passes, so a duration-sized lease is a duration-sized wait before
+``claim_next()``'s crash-recovery reclaim can even see it. All three now
+share ``_DEFAULT_HEARTBEAT_PROTECTED_LEASE_S`` (300s, the same value the
+LIGHT kinds below already run at) regardless of how long their own work
+may legitimately take:
 
-- ``data-refresh`` gets the longest lease (``AGNES_DATA_REFRESH_LEASE_S``,
-  default 900s / 15min) — a full Keboola extractor subprocess run +
-  materialized pass + orchestrator rebuild can legitimately take that
-  long on a large registry; the worker's heartbeat keeps the lease alive
-  every ``lease_seconds/3`` while the handler thread runs, so this is a
-  ceiling on "how long before a crashed/stuck run is reclaimed", not a
-  hard timeout on the sync itself.
+- ``data-refresh`` (``AGNES_DATA_REFRESH_LEASE_S``, default 300s — also
+  the lease ``analytics-migrate``/``analytics-rebuild`` reuse via
+  ``_data_refresh_lease_seconds()``) — a full Keboola extractor subprocess
+  run + materialized pass + orchestrator rebuild can legitimately take
+  much longer than 300s on a large registry; that's fine, the heartbeat
+  is what keeps a genuinely running sync's lease alive, not the lease's
+  own size.
 - ``jira-refresh`` is also HEAVY (shares the lane with ``data-refresh``,
   and both run through ``_sweep_stale_scratch()`` before every HEAVY
   claim — see ``app/worker/runtime.py``) but is a plain orchestrator
@@ -180,16 +196,28 @@ Lease/retry tuning:
   ``corporate-memory``) default to 300s — bulk git clones / LLM catalog
   refresh / filesystem walks, but bounded by their own internal
   timeouts, not multi-minute by design.
-- ``corpus-extraction``'s lease tracks its own ``extraction.timeout_s``
-  config (default 3600s) plus a margin — same "generous ceiling, not the
-  actual bound" reasoning as ``data-refresh`` above: the worker's
-  heartbeat keeps the lease alive for as long as the crawl thread runs, so
-  this is a ceiling on "how long before a crashed/stuck run is reclaimed",
-  not a hard timeout on the crawl. No retry by default: a failed run (bad
-  credentials, a crawl error, an exhausted throttle budget) usually needs
-  an operator to look at it, not an automatic re-run against the same
-  corpus a few minutes later — and a resumed run picks up from the
-  persisted crawl state anyway.
+- ``corpus-extraction`` (``_DEFAULT_EXTRACTION_LEASE_S``, 300s, no env
+  override) — the run's own wall-clock bound is ``extraction.timeout_s``
+  (default 3600s), enforced INSIDE the crawl between files and between
+  delta pages; the lease no longer tracks it at all (it used to, plus a
+  margin — the exact "long job = long lease" mistake this note warns
+  against: a crashed crawl's job stayed unreclaimable for up to an hour).
+  No retry by default: a failed run (bad credentials, a crawl
+  error, an exhausted throttle budget) usually needs an operator to look
+  at it, not an automatic re-run against the same corpus a few minutes
+  later — and a resumed run picks up from the persisted crawl state
+  anyway.
+- ``sharepoint-subtree-sweep`` (``AGNES_SP_SWEEP_LEASE_S``, default
+  300s) — a full probe pass over a large library is multi-hour (spec
+  §6.2), which used to size the lease itself (4h, i.e. the same mistake
+  as ``corpus-extraction`` above); same fix, same no-retry rationale (an
+  operator looks at a failed multi-hour sweep, not an unattended re-run).
+
+Two kinds still size their lease off their own expected duration
+(``jira-org-refresh``'s ``_DEFAULT_JIRA_ORG_REFRESH_LEASE_S`` and
+``ducklake-maintenance``'s ``_DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S``) —
+same shape of issue, deliberately left alone here rather than folded into
+this fix (out of this change's declared scope; a good follow-up).
 """
 
 from __future__ import annotations
@@ -207,36 +235,57 @@ from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DATA_REFRESH_LEASE_S = 900
+# Shared default for every kind whose OWN work can legitimately run long
+# but is protected by the worker's heartbeat rather than by this lease's
+# size — see the module docstring's "Lease/retry tuning" note for the full
+# reasoning. 300s is not a new number: it's the value marketplaces-sync/
+# session-collector/corporate-memory (_DEFAULT_LIGHT_LEASE_S below) already
+# run at, so reusing it here is the conservative choice, not an invented
+# one. A 300s lease gives a 100s heartbeat cadence (lease_seconds/3): a
+# dead worker's job is reclaimable within minutes, and a live one has three
+# full ticks of slack before the lease could ever lapse out from under it.
+_DEFAULT_HEARTBEAT_PROTECTED_LEASE_S = 300
+_DEFAULT_DATA_REFRESH_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
 _DEFAULT_JIRA_REFRESH_LEASE_S = 300
 # One API request per organization, gently paced — a few-hundred-organization site
 # takes minutes, so the lease has to outlast the whole sweep or the job would be
 # reclaimed mid-run and start over. At ~0.2s pacing plus request latency this covers
 # roughly 3,500 organizations; an estate materially larger than that wants a
 # size-derived lease rather than a bigger constant, or it will reclaim in a loop.
+#
+# NOTE: this sizing shares the same shape of issue _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
+# above exists to fix (the heartbeat, not this constant, is what actually keeps a live
+# sweep's lease alive) — left as-is here, out of this change's declared scope; a good
+# follow-up.
 _DEFAULT_JIRA_ORG_REFRESH_LEASE_S = 1800
 _DEFAULT_LIGHT_LEASE_S = 300
 # merge_adjacent_files/expire_snapshots/cleanup_old_files/VACUUM can each
-# take a while over a large lake — same "generous ceiling, not a hard
-# timeout" reasoning as _DEFAULT_DATA_REFRESH_LEASE_S (the worker's
-# heartbeat keeps the lease alive every lease_seconds/3 while the handler
-# thread runs).
+# take a while over a large lake — same shape of issue
+# _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S above exists to fix; left as-is here,
+# out of this change's declared scope, same follow-up note as
+# _DEFAULT_JIRA_ORG_REFRESH_LEASE_S above.
 _DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S = 900
 # Expected ceiling on one extraction run (extraction.timeout_s in
 # instance.yaml overrides this) — a full crawl+convert+anonymize+ingest
-# pass over a real SharePoint site can legitimately run for a while.
+# pass over a real SharePoint site can legitimately run for a while. This
+# is the run's own wall-clock bound, enforced INSIDE the crawl (between
+# files and between delta pages) — unrelated to the job's lease below.
 _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
-# The job's own lease outlives that ceiling by a margin so a heartbeat tick
-# never expires the lease out from under a still-running crawl — same
-# pattern as _agent_response_job_timeout_seconds()'s lease_seconds below.
-_EXTRACTION_LEASE_MARGIN_S = 120
+# corpus-extraction's lease used to be _extraction_timeout_seconds() plus a
+# margin — tying crash-recovery speed to the run's own expected duration,
+# the defect the module docstring's "Lease/retry tuning" note describes.
+# It is now the same heartbeat-protected default as every other
+# long-running kind, entirely independent of extraction.timeout_s.
+_DEFAULT_EXTRACTION_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
 # 2026-08-30 plan, Task 7: a full sharepoint-subtree-sweep pass (probing
 # hasUniqueRoleAssignments over every folder in a mirrored scope) is
-# multi-hour on a large library (spec §6.2's ~98k-folder reference) — same
-# "generous ceiling, not a hard timeout" reasoning as
-# _DEFAULT_DATA_REFRESH_LEASE_S, just a much larger default since this job's
-# own cost model is an order of magnitude bigger than any other LIGHT kind.
-_DEFAULT_SP_SWEEP_LEASE_S = 14400  # 4h
+# multi-hour on a large library (spec §6.2's ~98k-folder reference) — that
+# used to size the lease itself (4h), same "long job = long lease" mistake
+# as corpus-extraction's old formula above. The heartbeat, not this lease,
+# is what keeps a genuinely multi-hour sweep's lease alive, so this now
+# gets the same small heartbeat-protected default as every other
+# long-running kind too.
+_DEFAULT_SP_SWEEP_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
 
 
 def _data_refresh_lease_seconds() -> int:
@@ -1225,15 +1274,24 @@ def _run_corpus_extraction(payload: dict) -> dict:
         every confirmed scope otherwise.
       - ``timeout_s`` (optional) — overrides ``extraction.timeout_s`` for
         this one run (0 = unbounded). The crawl enforces it itself, between
-        files and between delta pages; this handler's own lease is derived
-        from the CONFIGURED value, so a payload override far above it would
-        outlive the lease and be reclaimed mid-run.
+        files and between delta pages; this handler's own lease is a fixed,
+        heartbeat-protected constant (``_DEFAULT_EXTRACTION_LEASE_S`` — see
+        the module docstring's lease/retry tuning note) that does not track
+        ``extraction.timeout_s`` at all, so a payload override — in either
+        direction — has no bearing on how quickly a crashed run's job is
+        reclaimed.
       - ``concurrency`` (optional) — overrides
         ``extraction.crawler.concurrency`` for this one run, clamped to
         ``[1, 16]``: how many files of ONE delta page the crawl pipelines at
         a time (``1`` = the sequential pre-parallel behaviour). NOT the same
         knob as ``extraction.concurrency``, which sizes how many extraction
         JOBS this worker runs at once — the two multiply against one tenant.
+      - ``resync`` (optional, truthy) — drops this connection's persisted
+        deltaLinks and item-failure queue before crawling, so every drive
+        re-enumerates from scratch (cTags are kept, so unchanged files are
+        not re-downloaded). The supported recovery path for a connection
+        whose delta cursor ran past documents it never actually ingested —
+        see ``connectors.sharepoint.crawler._apply_resync``.
 
     Returns the crawl report (the same dict persisted as ``last_run`` in the
     connection's crawl state, so the job result and the state file can never
@@ -1278,6 +1336,39 @@ def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
     return run_subtree_sweep(payload)
 
 
+#: Kinds whose payload gets this claimed job's own ``id`` merged in before
+#: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
+#: per-kind flag on ``JobKind``: only ``corpus-extraction`` has anywhere to
+#: put it today (``extraction_runs.job_id``), and a second consumer can add
+#: itself here without a registry shape change.
+_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction"})
+
+
+def _payload_for_handler(job: dict) -> dict:
+    """The payload a handler runs with — ``job["payload_json"]`` unchanged,
+    except for :data:`_INJECT_JOB_ID_KINDS`, which get this claimed job's own
+    ``id`` merged in as ``job_id`` when the payload does not already carry
+    one.
+
+    ``kind.handler`` (the ``JobKind`` contract, ``app/worker/registry.py``)
+    only ever receives the payload dict — never the job row — so this is the
+    one seam that can hand a handler its own job's id without widening that
+    contract for every kind. ``connectors.sharepoint.crawler.run_builtin_
+    crawl`` records it on the ``extraction_runs`` row it opens
+    (``job_id``), which is what makes a run traceable back to the job that
+    spawned it; before this it was always null, because nothing upstream of
+    here ever supplied it (see that function's own docstring).
+
+    Never mutates ``job["payload_json"]`` in place: a copy, so a payload
+    that started with no ``job_id`` does not gain one behind the caller's
+    back if it is inspected again after dispatch.
+    """
+    payload = job.get("payload_json") or {}
+    if job.get("kind") in _INJECT_JOB_ID_KINDS and isinstance(payload, dict) and not payload.get("job_id"):
+        return {**payload, "job_id": job.get("id")}
+    return payload
+
+
 def dispatch_job(job: dict) -> dict | None:
     """THE single dispatch-level entry point for running one claimed job's
     handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
@@ -1291,7 +1382,10 @@ def dispatch_job(job: dict) -> dict | None:
     ``asyncio.to_thread``) INSTEAD OF ``kind.handler(job["payload_json"])``
     directly — the one place in the whole worker that actually executes a
     claimed job, so this is also the one place audit coverage needs to
-    live (one dispatch-level wrapper, not one per kind).
+    live (one dispatch-level wrapper, not one per kind), and (see
+    :func:`_payload_for_handler`) the one place a handler's payload can be
+    enriched with the job's own id without widening ``JobKind.handler``'s
+    contract for every kind.
 
     Runs outside any HTTP request — there is no ASGI scope for
     ``src.audit_context``'s autofill to read, so ``duration_ms`` is
@@ -1302,7 +1396,7 @@ def dispatch_job(job: dict) -> dict | None:
     kind = JOB_KINDS[job["kind"]]
     t0 = time.monotonic()
     try:
-        result = kind.handler(job["payload_json"])
+        result = kind.handler(_payload_for_handler(job))
     except Exception as exc:
         log_safe(
             user_id=None,
@@ -1503,10 +1597,10 @@ def register_all_kinds() -> None:
             name="corpus-extraction",
             handler=_run_corpus_extraction,
             lane=EXTRACTION_LANE,
-            # Tracks the run's own expected ceiling (extraction.timeout_s,
-            # default 3600s) plus a margin — see the module docstring's
-            # lease/retry tuning note.
-            lease_seconds=_extraction_timeout_seconds() + _EXTRACTION_LEASE_MARGIN_S,
+            # Heartbeat-protected, NOT tied to extraction.timeout_s (the
+            # crawl's own wall-clock bound, enforced separately, inside the
+            # crawl) — see the module docstring's lease/retry tuning note.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
             # No automatic retry: a failed run (bad credentials, a crawl
             # error, an exhausted throttle budget) needs an operator to look
             # at it, not an unattended re-run a few minutes later.
@@ -1527,10 +1621,10 @@ def register_all_kinds() -> None:
             name="sharepoint-subtree-sweep",
             handler=_run_sharepoint_subtree_sweep,
             lane=LIGHT_LANE,
-            # Tracks the module docstring's lease/retry tuning note — a full
-            # probe pass over a large library is multi-hour (spec §6.2), so
-            # this gets its own, much longer lease than the default LIGHT
-            # kind.
+            # Heartbeat-protected, same default LIGHT-kind lease as every
+            # other kind here — NOT sized to the probe pass's own multi-hour
+            # duration (spec §6.2). See the module docstring's lease/retry
+            # tuning note.
             lease_seconds=_sp_sweep_lease_seconds(),
             # No automatic retry — same rationale as corpus-extraction: a
             # failed multi-hour sweep (throttling, a Graph outage mid-walk)

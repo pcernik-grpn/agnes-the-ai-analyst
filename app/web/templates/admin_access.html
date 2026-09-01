@@ -2635,6 +2635,19 @@
       <span class="ax-simwho" id="ax-sim-who"></span>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
+      {# Read-only view-as. A POST form, never a link: entering changes the
+         effective principal of this browser session, and a state change on a
+         GET is exactly the CSRF hole `slack_bind` was bitten by (security
+         playbook §10). The hidden `user_id` is filled in by the person
+         picker below; `next` sends the admin to the Library, the page whose
+         answer differs most between two people. #}
+      <form method="post" action="/admin/view-as" id="ax-sim-viewas" hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="user_id" id="ax-sim-viewas-uid" value="">
+        <input type="hidden" name="next" value="/library">
+        {{ ds.button('View a page as them →', variant='secondary', type='submit',
+                     attrs='title="Opens Agnes read-only as this person — you cannot change anything until you exit."') }}
+      </form>
     </div>
     <div id="ax-sim-out"><div class="ax-empty">Loading people…</div></div>
   </div>
@@ -2951,6 +2964,25 @@
      on 32 hex characters, and it is what the rest of the product calls it. */
   const itemName = (i) => (i && (i.name || i.slug || i.resource_id)) || "";
 
+  /* WHOSE it is, and how much is in it — returns escaped HTML, so callers
+     must not re-escape. Only the collection/file projections carry these
+     fields today (app/resource_types.py); every other kind renders exactly as
+     before, because both bits are simply absent.
+
+     This exists because an inventory of private uploads is unreadable without
+     an owner: a chat file-drop becomes a one-file collection named after the
+     file, so an admin — who sees every collection by god-mode — got a flat
+     list of filenames with nothing saying they belonged to someone else. */
+  const itemProvenance = (i) => {
+    if (!i) return "";
+    const bits = [];
+    if (i.owner_email) bits.push(`owned by ${esc(i.owner_email)}`);
+    if (typeof i.file_count === "number") {
+      bits.push(`${i.file_count} ${i.file_count === 1 ? "file" : "files"}`);
+    }
+    return bits.join(" · ");
+  };
+
   /* Admin-side page per kind — where an ADMIN goes to change a grant, as
      opposed to where an analyst goes to use the thing. Only the kinds that
      have one; anything else keeps its analyst link. */
@@ -3187,7 +3219,7 @@
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           itemText.set(`${t.type_key}:${i.resource_id}`,
-            `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase());
+            `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase());
         }
       }
     }
@@ -3486,7 +3518,7 @@
     // description, the block it sits in, and the kind it is.
     const fq = resourceFilter.trim().toLowerCase();
     const hits = (t, i) =>
-      !fq || `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.description || ""} ${i._block || ""} ${t.type_display || ""}`
+      !fq || `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.description || ""} ${i.owner_email || ""} ${i._block || ""} ${t.type_display || ""}`
         .toLowerCase().includes(fq);
     // "What does this group actually HAVE?" — the question that otherwise
     // means opening every type in turn to find the two that hold anything.
@@ -3552,9 +3584,17 @@
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
         ${kindTag(t)}
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
-          <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
-            i.description && who ? `<span class="ax-r__sep"> · </span>` : ""}${
-            who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}</span>
+          <span class="ax-r__d">${(() => {
+            /* Built as a list rather than nested ternaries: the separator
+               logic was already the hard-to-read part of this row with two
+               possible chunks, and provenance makes three. */
+            const bits = [];
+            if (i.description) bits.push(esc(String(i.description).slice(0, 120)));
+            const prov = itemProvenance(i);
+            if (prov) bits.push(prov);
+            if (who) bits.push(`<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>`);
+            return bits.join(`<span class="ax-r__sep"> · </span>`);
+          })()}</span>
         </span>
         <span class="ax-r__ctl">${control}</span>
         <span class="ax-r__rd ax-r__manage">${manage}</span>
@@ -4562,9 +4602,17 @@
      package, and a real instance has hundreds of them, which would bury
      every row that carries a decision. `bundleFootnote()` says so on the
      page rather than leaving the omission to be discovered. */
+  /* `corpus_file` is here so the resource lens can answer "what files exist
+     on this instance, and who can reach them" — the question an admin asks
+     after seeing a filename they did not recognise. It is the one kind that
+     can run to thousands of rows, which is exactly what the kind filter and
+     the granted-to-nobody drawer are for: private uploads collect behind one
+     counted line at the foot instead of burying the rows that carry a
+     decision. (`table` stays out for the same volume reason with none of the
+     privacy question attached — a table name is in the catalog already.) */
   const BUNDLE_LEAD = new Set(["data_package", "memory_domain", "semantic_model", "recipe",
                                "marketplace_plugin", "store_entity", "data_app", "agent",
-                               "collection", "chat"]);
+                               "collection", "corpus_file", "chat"]);
 
   /* How many DISTINCT people a set of groups reaches.
 
@@ -4778,7 +4826,7 @@
       if (listKind && t.type_key !== listKind) continue;
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
-          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           const held = (overview.grants || []).filter(
             (g) => g.resource_type === t.type_key && g.resource_id === i.resource_id);
@@ -4855,9 +4903,15 @@
       const who = heldNames.length && heldNames.length <= 3
         ? heldNames.join(", ")
         : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
-      const meta = nobody
+      /* "granted to nobody" is the honest reach of a private upload, but on
+         its own it reads as an oversight to fix. Naming the owner in the same
+         line says which it is: nobody else can reach this AND it belongs to
+         someone — i.e. working as intended. */
+      const prov = itemProvenance(r.i);
+      const reachLine = nobody
         ? "granted to nobody"
         : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+      const meta = prov ? `${reachLine} · ${prov}` : reachLine;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
       <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}" data-bb="${esc(bkey)}"${
@@ -5568,7 +5622,7 @@
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           if (grantOf(pickerState.group, t.type_key, i.resource_id)) continue;
-          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           if (pickerState.kind && t.type_key !== pickerState.kind) continue;
           const fam = t.family || "knowledge";
@@ -5937,13 +5991,26 @@
     if (whoEl) whoEl.textContent = uid && chosen ? chosen.textContent.trim() : "";
     const backEl = el("ax-sim-back");
     if (backEl) backEl.hidden = !uid;
+    // Read-only view-as form: shown only once a person is picked, and the id
+    // is set on the hidden field rather than in the action URL so the POST
+    // body carries it alongside the CSRF token.
+    const viewAsForm = el("ax-sim-viewas");
+    const viewAsUid = el("ax-sim-viewas-uid");
     if (!uid) {
+      // With nobody picked the pane IS the roster, so there is no longer a
+      // "pick a person" placeholder to paint over it. `renderPeopleList`
+      // hides the detail button itself, which is why that is not repeated.
+      if (viewAsForm) viewAsForm.hidden = true;
       await loadUsers();
       renderPeopleList();
       return;
     }
     detailBtn.hidden = false;
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
+    if (viewAsForm && viewAsUid) {
+      viewAsUid.value = uid;
+      viewAsForm.hidden = false;
+    }
     out.innerHTML = `<div class="ax-empty">Resolving…</div>`;
     try {
       const [effResp, memResp, prevResp] = await Promise.all([

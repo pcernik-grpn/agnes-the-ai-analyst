@@ -104,6 +104,21 @@ class CreateCollectionRequest(BaseModel):
     description: Optional[str] = None
 
 
+class UpdateCollectionRequest(BaseModel):
+    """The editable metadata of a collection — every field optional.
+
+    PRESENCE is the signal, not the value: ``{"description": null}`` clears
+    the description while a request that omits ``description`` leaves it
+    alone. The handler reads ``model_fields_set`` for exactly that reason, so
+    do NOT give these fields non-None defaults — that would erase the
+    distinction the repository layer was built to keep.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    slug: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Slug helpers
 # ---------------------------------------------------------------------------
@@ -585,6 +600,131 @@ def _purge_derived_tabular_row_for_file(corpus_id: str, file_id: str) -> None:
         SyncOrchestrator().rebuild_source(source_name)
     except Exception as exc:
         logger.warning("rebuild_source(%s) after single-file purge failed: %s", source_name, exc)
+
+
+@router.patch("/{collection_id}")
+async def update_collection(
+    collection_id: str,
+    payload: UpdateCollectionRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Rename a collection or change its description/slug (owner or admin).
+
+    The gate is deliberately OWNER-OR-ADMIN rather than
+    ``require_collection_access``: a group grant conveys READ access, and a
+    grantee renaming somebody else's collection out from under them is not a
+    read. Same predicate as ``delete_collection`` below, so the two
+    owner-level actions on a collection agree about who may take them.
+
+    Presence-based, per field: a field the request omits is untouched, and
+    ``description: null`` clears it. Editing NOTHING is a 400 rather than a
+    silent 200 — a client that meant to change something and named no known
+    field has a bug, and answering "fine" hides it.
+
+    ``slug`` is normalised the same way ``create_collection`` normalises it,
+    so a patched slug always resolves via ``/library/{slug}``; a collision on
+    the unique index returns **409**. Renaming does NOT move the slug on its
+    own: the slug is this collection's URL, and silently re-deriving it from
+    the new name would break every link and bookmark already pointing here.
+    Callers that want the URL to follow the name pass both.
+
+    A **source-managed** collection (fed by a connection's confirmed scope)
+    is refused with the same typed **409** the upload path uses: its name is
+    derived from the source scope, so a rename here would be silently
+    reverted by the next sync — the "a scheduled sync must not revert a
+    downstream edit" rule the semantic layer states as ``409 source_owned``.
+    """
+    from app.auth.session_principal import PRINCIPAL_TYPES
+
+    if isinstance(user, PRINCIPAL_TYPES):
+        # A restricted principal (co-session / agent-session) has no
+        # ownership identity to check — its authority is the intersection it
+        # was minted with, which conveys READ, never "rename the owner's
+        # collection". Explicit per the PRINCIPAL_TYPES seam contract; without
+        # it, `user["id"]` below would raise TypeError into a 500.
+        raise HTTPException(status_code=403, detail="collection_not_owned")
+
+    row = file_corpora_repo().get(collection_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    if not is_user_admin(user["id"]) and row.get("created_by") != user["id"]:
+        raise HTTPException(status_code=403, detail="collection_not_owned")
+
+    managing = source_managing_connection(collection_id)
+    if managing:
+        _refuse_source_managed(managing, operation="edit")
+
+    sent = payload.model_fields_set
+    fields: dict[str, Any] = {}
+
+    if "name" in sent:
+        name = (payload.name or "").strip()
+        if not name:
+            raise HTTPException(
+                status_code=400,
+                detail="collection_name_empty: a collection must keep a name — omit the field to leave it unchanged.",
+            )
+        fields["name"] = name
+
+    if "slug" in sent:
+        # Mirror create_collection: normalise to [a-z0-9-] so the result is
+        # always reachable at /library/{slug}, falling back to the (new or
+        # current) name when the caller's slug collapses to nothing.
+        raw = (payload.slug or "").strip()
+        fields["slug"] = _auto_slug(raw) if raw else _auto_slug(fields.get("name") or row["name"])
+
+    if "description" in sent:
+        desc = payload.description
+        if desc is not None:
+            desc = desc.strip() or None  # "" is how a form clears a textarea
+        fields["description"] = desc
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "collection_nothing_to_update: send at least one of name, slug, description "
+                '— e.g. {"name": "Q3 contracts"}.'
+            ),
+        )
+
+    try:
+        changed = file_corpora_repo().update(collection_id, **fields)
+    except Exception as exc:
+        # DuckDB raises ConstraintException; PG raises IntegrityError. Same
+        # detection as create_collection, so both paths answer 409 alike.
+        err = str(exc).lower()
+        if "unique" in err or "duplicate" in err or "constraint" in err:
+            raise HTTPException(
+                status_code=409,
+                detail=f"collection_slug_conflict:{fields.get('slug')}",
+            ) from exc
+        raise
+    if not changed:
+        # Deleted between the read above and the write (or by a concurrent
+        # caller) — 404 matches every other entity-scoped read of a gone row.
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    # Field NAMES, never their values: this row lands in the audit trail, and
+    # what an admin needs from it is "who changed what about this collection",
+    # not a second copy of the description.
+    log_safe(
+        action="collection.update",
+        resource=collection_id,
+        user_id=user.get("id"),
+        params={"fields": sorted(fields)},
+    )
+    logger.info(
+        "collection updated id=%s fields=%s by=%s",
+        collection_id,
+        sorted(fields),
+        user.get("email"),
+    )
+    fresh = file_corpora_repo().get(collection_id)
+    # A concurrent delete between the write and this read would make `fresh`
+    # None: the patch really did happen, so answer from what we know rather
+    # than 500 on a missing row.
+    return _collection_out(fresh or {**row, **fields})
 
 
 @router.delete("/{collection_id}", status_code=204)
@@ -1162,16 +1302,30 @@ def source_managing_connection(collection_id: str) -> Optional[dict]:
     return None
 
 
-def _refuse_source_managed(connection: dict) -> None:
+def _refuse_source_managed(connection: dict, *, operation: str = "upload") -> None:
+    """Raise the typed 409 for a write into a source-managed collection.
+
+    ``operation`` picks the sentence, not the contract: the ``error`` and
+    ``connection`` keys are identical for every caller (clients branch on
+    those), while the message names the write that was actually refused —
+    "not manual upload" is the wrong explanation for a rename.
+    """
     name = connection.get("name") or connection.get("id") or "a source connection"
+    why = (
+        (
+            f"Its name and description are derived from that source's scope, so an edit here "
+            "would be silently reverted by the next sync."
+        )
+        if operation == "edit"
+        else "Its content arrives through that source's pipeline, not manual upload."
+    )
     raise HTTPException(
         status_code=409,
         detail={
             "error": "collection_source_managed",
             "connection": name,
             "message": (
-                f"This collection is fed by the '{name}' source connection — its content "
-                "arrives through that source's pipeline, not manual upload. Unselect the "
+                f"This collection is fed by the '{name}' source connection. {why} Unselect the "
                 "scope in the connect wizard first if you really need to hand-manage it."
             ),
         },

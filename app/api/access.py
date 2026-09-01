@@ -1702,17 +1702,28 @@ async def user_library_preview(
     """What the person's Library actually shows — the RESULT, where
     /effective-access is the why.
 
-    Computed by ``StackResolver.browse``, the same grants-based projection
-    the /library page renders the target's shared bands from — deliberately
-    NOT ``browse_admin`` and NOT a re-derivation from the grant rows, so
-    this preview cannot drift from the page it claims to predict (the
-    Library's contract is no admin god-mode, and that applies to a preview
-    OF a person just as it does to the person themselves). Covers the two
-    governed kinds the resolver serves to the Library (data packages,
-    memory domains); the other granted kinds keep their per-type fold in
-    the Simulate chain.
+    Every section is computed by the SAME projection the /library page
+    renders that person's shared bands from — ``StackResolver.browse`` for
+    the two governed kinds, ``app.services.library_grants`` for the two the
+    resolver does not serve. Deliberately NOT ``browse_admin``, and never a
+    private re-derivation from the grant rows, so this preview cannot drift
+    from the page it claims to predict (the Library's contract is no admin
+    god-mode, and that applies to a preview OF a person just as it does to
+    the person themselves).
+
+    Covers every GRANTED kind the Library lists: data packages, curated
+    marketplace plugins, recipes, memory domains — in the Library's own
+    reading order, so the panel looks like the page. It used to iterate the
+    two governed kinds alone, which meant "I can see it in admin but they
+    cannot see it in their Library" got a real answer about a data package
+    and silence about a plugin.
+
+    Deliberately NOT here: what the person INSTALLED for themselves from the
+    community store, and anything they authored. Those are theirs, not an
+    admin's grant, and this lens answers what the grants do.
     """
     from app.instance_config import get_stack_auto_membership
+    from app.services.library_grants import granted_plugins, granted_recipes
     from app.services.stack_resolver import StackResolver
     from src.repositories import data_packages_repo, memory_domains_repo
 
@@ -1728,17 +1739,10 @@ async def user_library_preview(
         ResourceType.DATA_PACKAGE: "/catalog/p/",
         ResourceType.MEMORY_DOMAIN: "/memory/d/",
     }
-    labels = {
-        ResourceType.DATA_PACKAGE: "Data packages",
-        ResourceType.MEMORY_DOMAIN: "Memory",
-    }
 
-    sections: list[LibraryPreviewSection] = []
-    for rt in (ResourceType.DATA_PACKAGE, ResourceType.MEMORY_DOMAIN):
-        entries = resolver.browse(user_id, rt)
-        if not entries:
-            continue
-        items = [
+    def _governed_items(rt: ResourceType) -> list[LibraryPreviewItem]:
+        """A kind ``StackResolver`` serves — packages and memory domains."""
+        return [
             LibraryPreviewItem(
                 id=e.id,
                 name=e.name,
@@ -1747,9 +1751,46 @@ async def user_library_preview(
                 materialized=bool(e.materialized),
                 href=(href_base[rt] + slugs[rt][e.id]) if slugs[rt].get(e.id) else None,
             )
-            for e in sorted(entries, key=lambda e: (e.name or "").lower())
+            for e in sorted(resolver.browse(user_id, rt), key=lambda e: (e.name or "").lower())
         ]
-        sections.append(LibraryPreviewSection(kind=rt.value, label=labels[rt], items=items))
+
+    def _granted_items(fetch) -> list[LibraryPreviewItem]:
+        """A kind the resolver refuses — plugins and recipes, resolved by the
+        one definition the /library page renders them from."""
+        return [
+            LibraryPreviewItem(
+                id=g.id,
+                name=g.name,
+                requirement=g.requirement,
+                in_stack=g.in_stack,
+                materialized=g.materialized,
+                href=g.href,
+            )
+            for g in sorted(fetch(user_id), key=lambda g: (g.name or "").lower())
+        ]
+
+    # The Library's own reading order (`_SECTION_ORDER` in app/web/router.py),
+    # minus the kinds that are not grants: this pane predicts a page, so it
+    # lists the bands in the order that page lists them.
+    bands = [
+        (ResourceType.DATA_PACKAGE.value, "Data packages", lambda: _governed_items(ResourceType.DATA_PACKAGE)),
+        (ResourceType.MARKETPLACE_PLUGIN.value, "Plugins", lambda: _granted_items(granted_plugins)),
+        (ResourceType.RECIPE.value, "Recipes", lambda: _granted_items(granted_recipes)),
+        (ResourceType.MEMORY_DOMAIN.value, "Memory", lambda: _governed_items(ResourceType.MEMORY_DOMAIN)),
+    ]
+
+    sections: list[LibraryPreviewSection] = []
+    for kind, label, build in bands:
+        try:
+            items = build()
+        except Exception as e:  # noqa: BLE001 - one unreadable kind, not a dead pane
+            # The panel is all-or-nothing on the client (a failed fetch renders
+            # no panel at all), so letting one kind's read failure become a 500
+            # would hide the answers that DID resolve. Logged, never silent.
+            logger.warning("library-preview: could not resolve %s for %s: %s", kind, user_id, e)
+            continue
+        if items:
+            sections.append(LibraryPreviewSection(kind=kind, label=label, items=items))
 
     return LibraryPreviewResponse(
         mode="auto" if get_stack_auto_membership() else "classic",

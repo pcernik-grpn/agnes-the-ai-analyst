@@ -1,0 +1,37 @@
+{# Read-only view-as banner — every page, no page opt-in.
+
+   Included once from `base_ds.html` (and legacy `base.html`) rather than
+   composed into any layout, the same way `_dev_preview.html` is: a mode this
+   persistent must not depend on a page remembering to render it, and it must
+   not consume layout space a page had to leave for it.
+
+   `view_as_state()` is a Jinja global (registered in app/web/router.py) that
+   reads the request-scoped ticket stamped by ViewAsReadOnlyMiddleware — so the
+   banner is present on exactly the requests that are frozen read-only, with no
+   per-page context key to forget. If it is showing, mutations are refused; if
+   mutations are refused, it is showing.
+
+   The exit control is a POST form carrying the `web_csrf` double-submit token
+   (security playbook §10) — leaving is a state change, so it is not a link.
+   The token is read server-side from the caller's own HttpOnly cookie; the
+   entering POST guarantees one exists.
+
+   Styling lives entirely in app/web/static/css/view_as.css — `--ds-*` tokens
+   only, no inline style block in the body, no raw hex. #}
+{% set _va = view_as_state() %}
+{% if _va %}
+<div class="view-as-banner" role="status" aria-live="polite">
+  <div class="view-as-banner__inner">
+    <span class="view-as-banner__dot" aria-hidden="true"></span>
+    <span class="view-as-banner__text">
+      <strong>Viewing as {{ _va.target_email }}</strong>
+      <span class="view-as-banner__note">Read-only — nothing you do here can change anything.</span>
+    </span>
+    <form class="view-as-banner__exit" method="post" action="/admin/view-as/exit">
+      <input type="hidden" name="csrf_token" value="{{ _va.csrf_token }}">
+      <input type="hidden" name="next" value="{{ _va.path }}">
+      <button type="submit" class="view-as-banner__button">Exit view-as</button>
+    </form>
+  </div>
+</div>
+{% endif %}

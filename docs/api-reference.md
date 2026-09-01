@@ -1190,8 +1190,16 @@ Admin-only surface behind the "connect → scope → share" file-source wizard o
 client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
+`POST/DELETE …/manual-sites` is the other half of the `?site_url=` escape
+hatch on `…/tree`: that browse resolves a named site but stores nothing, so
+under `Sites.Selected` — where Graph 403-forbids enumeration — the wizard
+forgot it on every reopen. The POST resolves and persists it on the
+connection (`config.manual_sites`, idempotent on the resolved site id), the
+DELETE (`?site_id=`) forgets it again.
+
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
+- /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
@@ -2213,6 +2221,24 @@ a real member's id and filename in this same listing) could re-upload an
 unrelated file under a member's own anchor and have it silently resolve to
 (and overwrite) that member's row.
 
+**Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
+its `name`, `slug` and `description` — the files inside are untouched. The
+gate is **owner-or-admin**, not every grant-holder: a group grant conveys
+reading, and renaming somebody's collection out from under them is not a
+read. Fields are read by PRESENCE, so `{"description": null}` clears the
+description while a request that omits `description` leaves it alone; sending
+no known field is a `400` (`collection_nothing_to_update`) rather than a
+silent no-op. A renamed collection **keeps its slug** — the slug is its
+`/library/{slug}` URL, and re-deriving it from the new name would break links
+already handed out — so pass `slug` too when the URL should follow. A slug
+collision is `409 collection_slug_conflict:<slug>`, and a **source-managed**
+collection (fed by a connection's confirmed scope) is refused with the same
+typed `409 collection_source_managed` the upload path uses: its name comes
+from the source scope, so an edit here would be reverted by the next sync.
+CLI: `agnes collections edit <id> [--name] [--description] [--slug]`. MCP:
+`collection_update` (metadata only — creating, uploading into and deleting a
+collection are deliberately absent from the agent surface).
+
 - /api/collections
 - /api/collections/search
 - /api/collections/{collection_id}
@@ -2726,6 +2752,7 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 - /api/memory/admin/approve
 - /api/memory/admin/audit
 - /api/memory/admin/batch
+- /api/memory/admin/bulk-reject
 - /api/memory/admin/bulk-update
 - /api/memory/admin/contradictions
 - /api/memory/admin/contradictions/{contradiction_id}/resolve
