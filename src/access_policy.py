@@ -886,6 +886,58 @@ def row_scope_payload(policied_table_ids: "list[str] | tuple[str, ...] | None") 
 
 
 # ---------------------------------------------------------------------------
+# S3 (RLS review, #1979) -- the shared "does this policy body join an empty
+# (or never-synced) policy_mapping table" check (§15.1). `GET /api/me/
+# effective-access` (`app/api/access.py::_table_policy_diagnosis`) and
+# `POST /api/query` (`app/api/query.py::execute_query`) both need to answer
+# this question, and MUST answer it identically -- docs/table-access-
+# policies.md explicitly tells an operator to cross-check a suspiciously
+# empty live query against effective-access, which only holds if the two
+# never disagree. This is the ONE implementation both call.
+# ---------------------------------------------------------------------------
+
+
+def raise_if_policy_mapping_empty(policy_sql: str) -> None:
+    """Fail closed with a NAMED reason (`PolicyMappingEmpty`) when a
+    ``policy_mapping`` table ``policy_sql`` references currently has zero
+    (or never-synced) rows, rather than let a broken upstream sync read as
+    "you legitimately have no data" via a bare zero count/row-set.
+
+    Cheap by design: reads ``sync_state`` -- the row count already recorded
+    by the last successful sync -- rather than a live ``COUNT(*)`` against
+    every mapping dependency. Originally the effective-access diagnostic's
+    own private helper (moved here, unchanged, for S3 so ``POST /api/query``
+    can call the exact same check rather than re-deriving it and risking the
+    two surfaces drifting apart).
+
+    No-ops (never raises) when ``policy_sql`` fails to parse -- callers have
+    typically already parsed it successfully via ``policied_relation`` (or
+    otherwise handled a resolve failure) before reaching this point, so this
+    is defensive only, never a NEW failure mode -- and when the policy body
+    references no ``policy_mapping`` table at all, which is the common case
+    and must stay a no-op.
+    """
+    from src.repositories import sync_state_repo, table_registry_repo
+
+    try:
+        statement = sqlglot.parse_one(policy_sql, read="duckdb")
+    except Exception:
+        return
+    referenced_names = {t.name for t in statement.find_all(exp.Table) if t.name}
+    if not referenced_names:
+        return
+
+    mapping_rows = [
+        r for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name") in referenced_names
+    ]
+    for mapping_row in mapping_rows:
+        state = sync_state_repo().get_table_state(mapping_row["id"])
+        rows = state.get("rows") if state else None
+        if not rows:
+            raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
+
+
+# ---------------------------------------------------------------------------
 # Task 12 -- response-cache identity keying (§9). `_sample_cache`
 # (app/api/v2_sample.py) and `_schema_cache` (app/api/v2_schema.py) are both
 # process-global, keyed on `table_id` (plus `n` for sample) alone -- exactly

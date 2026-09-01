@@ -42,10 +42,12 @@ from connectors.internal.access import (
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
+    PolicyMappingEmpty,
     PolicyNameCollision,
     assert_policied_reads_unique,
     assert_unique_output_columns,
     policied_relation,
+    raise_if_policy_mapping_empty,
     rewrite_sql,
     row_scope_payload,
 )
@@ -1657,6 +1659,51 @@ def _assert_select_only(sql_lower: str) -> None:
         raise HTTPException(status_code=400, detail="Query must start with SELECT or WITH")
 
 
+def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
+    """S3 (RLS review, #1979): refuse a live read through a policy whose
+    ``policy_mapping`` dependency is empty or never synced, rather than let
+    it silently return `row_count: 0` for everyone -- indistinguishable
+    from "you legitimately have no data" (docs/table-access-policies.md
+    v1 limitation #3 / §15.1).
+
+    ``policied_table_ids`` is `rewrite_sql`'s own output: it already
+    excludes the admin-bypass case (`relation.policied is False` never
+    lands in that list, see `rewrite_sql`'s own filtering), so this
+    function does not need to re-check the admin bypass itself -- an
+    unrestricted admin never joins the mapping table in the first place,
+    exactly mirroring `_table_policy_diagnosis`'s own
+    `if relation.policied:` gate on this same check (§15.1's admin-bypass
+    note).
+
+    Delegates the actual "is the mapping table empty" question to
+    ``src.access_policy.raise_if_policy_mapping_empty`` -- the SAME
+    function ``GET /api/me/effective-access``
+    (`app/api/access.py::_table_policy_diagnosis`) calls for its
+    ``reason: mapping_empty`` diagnosis, so the two surfaces can never
+    disagree about which tables trip this check.
+    """
+    if not policied_table_ids:
+        return
+    repo = table_registry_repo()
+    for table_id in policied_table_ids:
+        row = repo.get(table_id)
+        policy_sql = row.get("access_policy_sql") if row else None
+        if not policy_sql:
+            continue
+        try:
+            raise_if_policy_mapping_empty(policy_sql)
+        except PolicyMappingEmpty as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "reason": "policy_mapping_empty",
+                    "table": table_id,
+                    "mapping_table": exc.mapping_table,
+                    "note": str(exc),
+                },
+            )
+
+
 @router.post("", response_model=QueryResponse)
 def execute_query(
     request: QueryRequest,
@@ -1818,6 +1865,15 @@ def execute_query(
             # failing policy's error can quote literal values from the
             # policy body.
             raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+
+        # S3 (RLS review, #1979): an empty/never-synced `policy_mapping`
+        # dependency (§15.1) must fail closed with a NAMED reason, not a
+        # silent, indistinguishable-from-legitimate empty result. Placed
+        # right after `policied_table_ids` is known and before ANY engine
+        # (local DuckDB, Databricks, BigQuery push-down/policied-direct)
+        # executes anything, so the check covers every branch below rather
+        # than needing to be duplicated per engine.
+        _assert_no_empty_policy_mapping(policied_table_ids)
 
         # ---- Which remote engine, if any, runs this statement -------------
         # `None` for an all-local query and for BigQuery, which keeps its own
