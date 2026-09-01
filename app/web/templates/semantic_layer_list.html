@@ -45,21 +45,24 @@
 
    `--ds-text-secondary`, not `--ds-text-muted` — muted is 3.67:1 on this
    page's background, under the 4.5:1 AA floor for 13px text. */
+/* Matched to `.apg-back` (admin_page.css), the way-back every other content
+   page renders: same weight, same spacing below, same hover. It diverged on
+   all three, which is the kind of near-miss that makes one page feel like a
+   different product. Still its own class — renaming it is a separate sweep. */
 .slb-back {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    margin: 0 0 10px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
-.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back:hover { color: var(--ds-primary); }
 .slb-back svg { width: 15px; height: 15px; }
 
 /* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
-.sl-head { margin: 2px 0 0; }
-.sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
 
 /* `.fbar-grid` (filter_toolbar.css) is fixed at 3 columns; auto-fill reads
    better for a collection this short and matches the pre-shell grid's own
@@ -146,7 +149,7 @@
 .sl-sidebar-search input::placeholder { color: var(--ds-text-muted); }
 
 .sl-cat-nav { display: block; flex: 1; overflow-y: auto; padding: 4px 0 8px; }
-.sl-cat-btn {
+.sl-cat-btn, .sl-gcat-btn {
     width: 100%;
     text-align: left;
     border: none;
@@ -161,8 +164,8 @@
     gap: 4px;
     transition: background 0.1s, color 0.1s;
 }
-.sl-cat-btn:hover { background: color-mix(in srgb, var(--ds-primary) 5%, transparent); color: var(--ds-text-primary); }
-.sl-cat-btn.is-active { background: color-mix(in srgb, var(--ds-primary) 9%, transparent); color: var(--ds-primary); font-weight: 600; }
+.sl-cat-btn:hover, .sl-gcat-btn:hover { background: color-mix(in srgb, var(--ds-primary) 5%, transparent); color: var(--ds-text-primary); }
+.sl-cat-btn.is-active, .sl-gcat-btn.is-active { background: color-mix(in srgb, var(--ds-primary) 9%, transparent); color: var(--ds-primary); font-weight: 600; }
 .sl-cat-n {
     font-size: 10px;
     background: var(--ds-surface);
@@ -248,12 +251,51 @@
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* A TERM's definition wraps instead of being clipped to one line. Clipping it
+   created the reason to expand and then answered that reason with the same
+   sentence again — a panel that repeats the line above it because the line was
+   two words too long. Two lines of definition on the row, and there is nothing
+   left to reveal. (A metric keeps the one-line clamp: its detail holds SQL,
+   grain, tables and variants, so expanding it was never about the text.) */
+.sl-item[data-gcat] .sl-row__desc {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.45;
+}
 .sl-row__right {
     display: flex;
     gap: 5px;
     align-items: center;
     flex-shrink: 0;
 }
+/* The initial, kept from the card: on a list of 50 terms it is what the eye
+   scans down. Quiet — it is a wayfinding mark, not data. */
+/* A row with nothing behind it: no chevron, no cursor change, no click. It
+   still renders as a row — the term and its wrapped definition ARE the content,
+   and there is simply no second layer. */
+.sl-seealso {
+    padding: 0; border: none; background: none; font: inherit;
+    color: var(--ds-primary); font-weight: 600; cursor: pointer;
+}
+.sl-seealso:hover { text-decoration: underline; }
+.sl-seealso-sep { color: var(--ds-border); margin: 0 2px; }
+.sl-seealso--dead { color: var(--ds-text-muted); }
+.sl-item.is-flat .sl-row { cursor: default; }
+.sl-item.is-flat .sl-row__chev { visibility: hidden; }
+.sl-row__letter {
+  flex: none; display: inline-grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 6px;
+  background: var(--ds-surface-dim); color: var(--ds-text-muted);
+  font-size: 11px; font-weight: 700;
+}
+/* Where a term is defined, on the row — the same quiet register the metrics
+   row uses for its source badge. */
+.sl-row__prov { font-size: 12px; color: var(--ds-text-muted); white-space: nowrap; }
 .sl-row__chev {
     color: var(--ds-text-muted);
     flex-shrink: 0;
@@ -320,73 +362,10 @@
 .sl-detail__model-link { margin: 0 0 8px; font-size: 12px; }
 
 /* ── Glossary grid ───────────────────────────────────────────────────── */
-.sl-glossary-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 10px;
-    padding: 14px 18px;
-    align-content: start;
-}
+/* The glossary's card grid and `.sl-term` styles went with the cards: one
+   registry rendered two ways is one of them drifting. Terms are `.sl-item`
+   rows now, styled above with the metrics. */
 
-.sl-term {
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    cursor: pointer;
-    text-align: left;
-    font: inherit;
-    padding: 0;
-    overflow: hidden;
-    transition: box-shadow 0.12s, border-color 0.12s;
-    display: block;
-    width: 100%;
-}
-.sl-term:hover {
-    border-color: color-mix(in srgb, var(--ds-primary) 35%, transparent);
-    box-shadow: 0 2px 8px color-mix(in srgb, var(--ds-primary) 8%, transparent);
-}
-.sl-term.is-open { border-color: color-mix(in srgb, var(--ds-primary) 45%, transparent); }
-
-.sl-term__head { padding: 12px 12px 8px; }
-.sl-term__letter {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px; height: 24px;
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--ds-primary) 10%, transparent);
-    color: var(--ds-primary);
-    font: 700 11px/1 inherit;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-}
-.sl-term__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); margin-bottom: 4px; }
-.sl-term__preview {
-    font-size: 12px;
-    color: var(--ds-text-muted);
-    line-height: 1.4;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-}
-.sl-term__foot {
-    padding: 6px 12px 10px;
-    display: flex;
-    justify-content: flex-end;
-}
-.sl-term__body {
-    display: none;
-    padding: 10px 12px 12px;
-    border-top: 1px solid var(--ds-border);
-    background: var(--ds-surface-dim);
-    font-size: 12px;
-    color: var(--ds-text-secondary);
-    line-height: 1.5;
-}
-.sl-term.is-open .sl-term__body { display: block; }
-.sl-term__body p { margin: 0 0 6px; }
-.sl-term__body p:last-child { margin-bottom: 0; }
 
 /* ── Empty / loading ─────────────────────────────────────────────────── */
 .sl-empty {
@@ -404,7 +383,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .sl-cat-btn, .sl-row, .sl-row__dot, .sl-row__chev, .sl-term {
+    .sl-cat-btn, .sl-gcat-btn, .sl-row, .sl-row__dot, .sl-row__chev {
         transition: none;
     }
 }
@@ -417,11 +396,21 @@
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
   {{ _back.label }}
 </a>
-<div class="sl-head">
-  <div class="sl-kicker">Semantic layer</div>
-  <h1 class="page-title">Semantic models</h1>
-  <p class="page-lede">Browse your organization's datasets, metrics, relationships and glossary — the stored documents, and the flat metric and glossary registries projected from them.</p>
-</div>
+{# The SAME header every other content page renders — `page-header--plain`
+   with an eyebrow, a title and a subtitle (see `_page_hero.html`). This page
+   hand-rolled its own `.sl-head` / `.sl-kicker` / `.page-title` trio, which
+   is why it read as a different product from the Library one click away: a
+   heavier eyebrow, a different title size, its own spacing. The markup is
+   copied rather than included because this page extends `base_index.html`
+   (whose `.idx` shell paints its own surface) and so cannot take
+   `base_page.html`'s hero variables — one shape, two hosts. #}
+<section class="page-header page-header--plain">
+  <div class="page-header__main">
+    <div class="page-header__eyebrow">Semantic layer</div>
+    <h1 class="page-header__title">Semantic models</h1>
+    <p class="page-header__subtitle">Browse your organization's datasets, metrics, relationships and glossary — the stored documents, and the flat metric and glossary registries projected from them.</p>
+  </div>
+</section>
 {# ── One page, three views (#1707 N5) ─────────────────────────────────────
    The flat `metric_definitions` / `glossary_terms` projection used to be its
    own page (/catalog/semantics, now a 308 onto the All-metrics tab). Two
@@ -539,23 +528,27 @@
         <div class="sl-sidebar-search">
           <input id="glossary-search" type="search" placeholder="Search glossary…" autocomplete="off" aria-label="Search glossary">
         </div>
-        {# #1956 item 1: mirrors the metrics sidebar's category nav above —
-           same markup, same classes. Glossary terms carry no per-MODEL
-           attribution (unlike a document-projected metric's `category`), so
-           this buckets by the term's own `source` instead — the coarser
-           provenance a glossary row actually has (see the router). #}
-        <nav class="sl-cat-nav" aria-label="Glossary sources">
-          <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
+        {# This sidebar held a search box and nothing else, because the terms
+           were FETCHED after the page rendered — the server had nothing to
+           build a nav from. Server-rendering them makes the same filter the
+           metrics tab offers possible here (#1956 item 1): which model
+           declares a term, and "Defined directly" for the ones no document
+           does. The metrics side gets this for free from `category`, which the
+           projector sets to the model name. #}
+        {% if glossary_groups %}
+        <nav class="sl-cat-nav" aria-label="Where a term is defined">
+          <button type="button" class="sl-gcat-btn is-active" data-gcat="__all__">
             <span>All</span>
-            <span class="sl-cat-n">{{ glossary_count }}</span>
+            <span class="sl-cat-n">{{ glossary_terms | length }}</span>
           </button>
-          {% for cat in glossary_categories %}
-          <button type="button" class="sl-cat-btn" data-cat="{{ cat.key | lower }}">
-            <span>{{ cat.label }}</span>
-            <span class="sl-cat-n">{{ cat.count }}</span>
+          {% for g in glossary_groups %}
+          <button type="button" class="sl-gcat-btn" data-gcat="{{ g.key }}">
+            <span>{{ g.label }}</span>
+            <span class="sl-cat-n">{{ g.count }}</span>
           </button>
           {% endfor %}
         </nav>
+        {% endif %}
       </div>
       {% endif %}
     </div>
@@ -656,10 +649,65 @@
         <span class="sl-main-title">Glossary</span>
         <span class="sl-n-pill" id="glossary-shown">{{ glossary_count }}</span>
       </div>
-      <div class="sl-scroll">
-        <div id="glossary-list" class="sl-glossary-grid">
-          <div class="sl-empty">Loading…</div>
+      {# Rows, not cards. One registry rendered two ways — a JS card builder
+         here, server-rendered rows next door — made the two halves look like
+         different products, and put a second copy of the source-badge
+         vocabulary in a script. Same `.sl-item` as the metrics tab, same
+         expand-on-click, same `data-ft` search index. #}
+      <div class="sl-scroll" id="glossary-list">
+        {% for t in glossary_terms %}
+        <div class="sl-item"
+             data-ft="{{ ((t.term or '') ~ ' ' ~ (t.definition_text or '') ~ ' ' ~ ((t.see_also or []) | join(' ')) ~ ' ' ~ (t.defined_in_label or '')) | lower }}"
+             data-gcat="{{ t.defined_in }}"
+             {% if t.has_more %}data-has-more="1"{% endif %}>
+          <button type="button" class="sl-row">
+            <span class="sl-row__letter" aria-hidden="true">{{ t.letter }}</span>
+            <div class="sl-row__main">
+              <div class="sl-row__name">{{ t.term }}</div>
+              {% if t.definition_text %}<div class="sl-row__desc">{{ t.definition_text }}</div>{% endif %}
+            </div>
+            <div class="sl-row__right">
+              <span class="sl-row__prov">{{ t.defined_in_label }}</span>
+              {{ source_badge(t.source) }}
+              {# Hidden on a row with nothing behind it — see `is-flat` in this
+                 page's script. A chevron that opens a verbatim repeat of the
+                 line above it teaches the reader to stop clicking. #}
+              <span class="sl-row__chev">›</span>
+            </div>
+          </button>
+          {# `definition_rich` ONLY, and that is the whole point of the flag.
+             The closed row already shows the definition, wrapped and unclipped
+             — so repeating it here is the duplication this panel exists to
+             stop. It earns its place only when the markdown renders something
+             the plain-text preview above cannot: a link, emphasis, a list. #}
+          <div class="sl-detail">
+            {% if t.definition_rich %}<div class="sl-detail__desc">{{ t.definition_html | safe }}</div>{% endif %}
+            {# A cross-reference is a way TO the other term, not a mention of
+               it. Each one filters this list to that term — the same `?q=`
+               contract the deep links from a model's object page use, applied
+               without a page load since the whole registry is already here. #}
+            {% if t.see_also_refs %}
+            <div class="sl-meta-row"><span><strong>See also</strong>
+              {% for ref in t.see_also_refs %}
+              {%- if ref.kind == 'term' -%}
+              <button type="button" class="sl-seealso" data-seealso="{{ ref.label }}">{{ ref.label }}</button>
+              {%- elif ref.kind == 'metric' -%}
+              <a class="sl-seealso" href="/semantic-layer?tab=all_metrics&amp;q={{ ref.label | urlencode }}">{{ ref.label }}</a>
+              {%- else -%}
+              {# Neither registry has it any more: stated, never linked. #}
+              <span class="sl-seealso--dead" title="No definition with this name">{{ ref.label }}</span>
+              {%- endif -%}
+              {%- if not loop.last %}<span class="sl-seealso-sep">·</span>{% endif -%}
+              {% endfor %}
+            </span></div>
+            {% endif %}
+          </div>
         </div>
+        {% endfor %}
+        {% if not glossary_terms %}
+        <div class="sl-empty">No glossary terms yet.</div>
+        {% endif %}
+        <p class="sl-empty" id="glossary-none" hidden>Nothing matches that search.</p>
       </div>
     </div>
     {% endif %}
@@ -693,18 +741,13 @@
         d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
     }
-    function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
-    function sourceBadge(src) {
-        if (KEBOOLA_SEMANTIC_LAYER_SOURCES.has(src)) return '<span class="badge badge--success">Keboola sync</span>';
-        if (src === 'yaml_import') return '<span class="badge badge--info">YAML import</span>';
-        if (src === 'openmetadata') return '<span class="badge badge--warn">OpenMetadata</span>';
-        return '<span class="badge">' + esc(src || 'manual') + '</span>';
-    }
 
     // ── Accordion ──
     document.addEventListener('click', (e) => {
-        const btn = e.target.closest('.sl-row, .sl-term');
+        const btn = e.target.closest('.sl-row');
         if (!btn) return;
+        // Nothing behind it — see `is-flat` above.
+        if (btn.closest('.sl-item.is-flat')) return;
         const item = btn.closest('.sl-item') || btn;
         item.classList.toggle('is-open');
     });
@@ -761,93 +804,81 @@
     }
 
     // ── Glossary ──
-    const gList = document.getElementById('glossary-list');
+    // ── Glossary: the SAME filter the metrics get ─────────────────────────
+    //    It used to be a fetch, a card builder and a debounce — a second
+    //    rendering of one registry that could disagree with the first, and did
+    //    (cards vs rows, its own source-badge copy, its own limit). The terms
+    //    are server-rendered now, so this is the metrics filter with a
+    //    different pair of attributes.
     const gInput = document.getElementById('glossary-search');
     const gShown = document.getElementById('glossary-shown');
-    // Own bucket state and button set (#1956 item 1) — the glossary list is
-    // fetched client-side (unlike the server-rendered metrics list), so the
-    // source facet is a client-side hide/show over whatever `loadGlossary`
-    // most recently rendered, the same layering `applyMetrics` does over its
-    // server-rendered rows.
-    const glossaryCatBtns = document.querySelectorAll('#sidebar-glossary .sl-cat-btn');
-    let activeGlossarySource = '__all__';
-    let gTimer;
+    const gNone = document.getElementById('glossary-none');
+    const gcatBtns = document.querySelectorAll('.sl-gcat-btn');
+    let activeGcat = '__all__';
 
-    function applyGlossaryFacet() {
+    function applyGlossary() {
+        const q = gInput ? gInput.value.trim().toLowerCase() : '';
         let n = 0;
-        document.querySelectorAll('#glossary-list .sl-term[data-cat]').forEach(item => {
-            const show = activeGlossarySource === '__all__' || item.dataset.cat === activeGlossarySource;
+        document.querySelectorAll('.sl-item[data-gcat]').forEach(item => {
+            const catOk = activeGcat === '__all__' || item.dataset.gcat === activeGcat;
+            const txtOk = !q || (item.dataset.ft || '').includes(q);
+            const show = catOk && txtOk;
             item.hidden = !show;
             if (show) n++;
         });
         if (gShown) gShown.textContent = String(n);
+        if (gNone) gNone.hidden = n !== 0;
     }
 
-    glossaryCatBtns.forEach(btn => {
+    if (gInput) gInput.addEventListener('input', applyGlossary);
+    gcatBtns.forEach(btn => {
         btn.addEventListener('click', () => {
-            glossaryCatBtns.forEach(b => b.classList.remove('is-active'));
+            gcatBtns.forEach(b => b.classList.remove('is-active'));
             btn.classList.add('is-active');
-            activeGlossarySource = btn.dataset.cat;
-            applyGlossaryFacet();
+            activeGcat = btn.dataset.gcat;
+            applyGlossary();
+        });
+    });
+    // A term row is worth opening only if it holds something the closed row
+    // cannot show — `see_also`, or a definition whose markdown renders markup
+    // the preview cannot. The server knows both, so it decides both, and this
+    // flattens the rest: no chevron, no click, no expansion.
+    //
+    // Length used to be a third case, measured here because it depends on the
+    // width. It is gone with the clamp that caused it: a definition two words
+    // too long opened a panel repeating the sentence above it. Term rows wrap
+    // to two lines now (metrics keep the one-line clamp — their detail holds
+    // SQL, not more prose), so length reveals nothing to trade a click for.
+    document.querySelectorAll('.sl-item[data-gcat]').forEach(item => {
+        if (!item.dataset.hasMore) item.classList.add('is-flat');
+    });
+
+    // A cross-reference to another TERM stays on this page: it puts the name
+    // in the search box — the same state a deep link's `?q=` produces — and
+    // scrolls the row into view. A button, not an <a>, because the
+    // destination is this list in a different state.
+    //
+    // A reference to a METRIC is a real <a> to the metrics tab (the server
+    // decides which of the two a name is, and renders a reference to neither
+    // as plain text), so it needs nothing here.
+    document.querySelectorAll('[data-seealso]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();  // …or the row it sits in would close
+            const term = btn.dataset.seealso || '';
+            if (gInput) { gInput.value = term; }
+            activeGcat = '__all__';
+            gcatBtns.forEach(b => b.classList.toggle('is-active', b.dataset.gcat === '__all__'));
+            applyGlossary();
+            const hit = [...document.querySelectorAll('.sl-item[data-gcat]')]
+                .find(i => !i.hidden && i.querySelector('.sl-row__name').textContent.trim().toLowerCase() === term.toLowerCase());
+            if (hit) hit.scrollIntoView({ block: 'center', behavior: 'auto' });
         });
     });
 
-    function renderTerm(t) {
-        const letter = (t.term || '?')[0];
-        // `definition_text` is the server's plain-text projection: this column
-        // also holds definitions imported verbatim from an external catalog,
-        // which are often rich HTML, and esc() would render those tags as
-        // visible text. Falls back to the stored column.
-        const definition = t.definition_text || t.definition;
-        // `data-cat`: same attribute name and matching convention the
-        // metrics tab's `.sl-item[data-cat]` uses for its category facet —
-        // here the term's own `source` (#1956 item 1), lower-cased the same
-        // way the sidebar buttons' `data-cat` is.
-        const cat = String(t.source || 'manual').toLowerCase();
-        return '<button type="button" class="sl-term" data-cat="' + esc(cat) + '">' +
-            '<div class="sl-term__head">' +
-            '<div class="sl-term__letter">' + esc(letter) + '</div>' +
-            '<div class="sl-term__name">' + esc(t.term) + '</div>' +
-            '<div class="sl-term__preview">' + esc(trunc(definition, 100)) + '</div>' +
-            '</div>' +
-            '<div class="sl-term__foot">' + sourceBadge(t.source) + '</div>' +
-            '<div class="sl-term__body"><p>' + esc(definition) + '</p>' +
-            (t.see_also && t.see_also.length ? '<p><strong>See also:</strong> ' + t.see_also.map(esc).join(', ') + '</p>' : '') +
-            '</div>' +
-            '</button>';
-    }
-
-    async function loadGlossary(q) {
-        if (!gList) return;
-        gList.innerHTML = '<div class="sl-empty">Loading…</div>';
-        try {
-            const url = q ? '/api/glossary/search?q=' + encodeURIComponent(q) + '&limit=50' : '/api/glossary?limit=500';
-            const r = await fetch(url, { credentials: 'same-origin' });
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const data = await r.json();
-            const terms = data.terms || [];
-            gList.innerHTML = terms.length ? terms.map(renderTerm).join('') : '<div class="sl-empty">No terms found.</div>';
-            // Re-applies the active source bucket to the freshly rendered
-            // list and sets `gShown` from what actually stayed visible —
-            // the search text and the source facet narrow together, not as
-            // two independent counts.
-            applyGlossaryFacet();
-        } catch (e) {
-            gList.innerHTML = '<div class="sl-empty">Could not load glossary: ' + esc(e.message) + '</div>';
-        }
-    }
-
-    if (gInput) {
-        gInput.addEventListener('input', () => {
-            clearTimeout(gTimer);
-            gTimer = setTimeout(() => loadGlossary(gInput.value.trim()), 250);
-        });
-    }
-    // The glossary tab is its own request now, so the list loads on arrival
-    // rather than on a tab click — there is no other moment.
-    if (gList) {
-        if (initialQuery && gInput) { gInput.value = initialQuery; }
-        loadGlossary(initialQuery || '');
+    if (document.querySelector('.sl-item[data-gcat]')) {
+        // The deep link's term arrives the same way it does for metrics.
+        if (initialQuery && gInput) gInput.value = initialQuery;
+        applyGlossary();
     }
 })();
 </script>

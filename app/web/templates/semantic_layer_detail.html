@@ -5,17 +5,21 @@
 
 {% block head_extra %}
 <style>
+/* Matched to `.apg-back` (admin_page.css), the way-back every other content
+   page renders: it diverged on weight, spacing and hover colour — three
+   near-misses that make one page feel like a different product. Still its own
+   class; renaming it across these pages is a separate sweep. */
 .slb-back {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: var(--space-6) 0 0;
+    margin: 0 0 10px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
-.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back:hover { color: var(--ds-primary); }
 
 /* The gap below the toolbar is `.page-toolbar`'s (components.css). */
 .slb-meta {

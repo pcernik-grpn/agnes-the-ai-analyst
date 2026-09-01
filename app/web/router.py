@@ -4248,6 +4248,23 @@ async def skills_page(
     return templates.TemplateResponse(request, "skills.html", ctx)
 
 
+def _definition_is_rich(html: str) -> bool:
+    """Whether a definition's rendered markdown carries markup its plain-text
+    preview cannot show — a link, emphasis, a list, code.
+
+    Tested by looking for residual markup, NOT by diffing the rendered text
+    against the plain projection: a link's visible text is identical either way
+    ("See the policy…"), so a diff would call the one case most worth expanding
+    — a definition imported verbatim from an external catalog, often rich HTML
+    — plain. Paragraph wrappers and line breaks do not count; they are how the
+    renderer returns a single sentence.
+    """
+    import re as _re
+
+    body = _re.sub(r"</?(?:p|br)\s*/?>", "", html or "", flags=_re.I)
+    return "<" in body
+
+
 def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
     """``{metric_definitions id: object-page URL}`` for every metric of every
     semantic model the caller can read (#1707).
@@ -4457,17 +4474,18 @@ _SEMANTIC_LAYER_LIST_TAB_LABELS = {
 }
 
 
-#: The bound both glossary counts read under — the ``/semantic-layer`` tab
-#: strip and ``/library``'s Definitions strip. Shared so the two numbers, shown
-#: to the same caller one click apart, cannot drift.
+#: The bound every glossary count reads under — the `/semantic-layer` tab
+#: strip, the list it heads, and `/library`'s Definitions card. 500 is
+#: `GET /api/glossary`'s own max `limit` and the repo has no unbounded mode
+#: (it bounds a full-table scan), comfortably above the tens-to-low-hundreds
+#: scale this feature targets — so an exact count in practice rather than a
+#: true cap. Named because those numbers are shown to the same caller one
+#: click apart: two literals that agree today are two literals that can
+#: disagree later.
 _GLOSSARY_COUNT_LIMIT = 500
 
 
 def _glossary_terms_count() -> int:
-    """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
-    unbounded mode (it bounds a full-table scan) — comfortably above the
-    tens-to-low-hundreds scale this feature targets, so an exact count in
-    practice rather than a true cap."""
     return len(glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT))
 
 
@@ -4566,6 +4584,111 @@ async def semantic_layer_list(
     allowed = None if accessible_ids is None else set(accessible_ids)
     visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
     glossary_count = _glossary_terms_count()
+
+    #: The glossary, SERVER-rendered like the metrics beside it. It used to be
+    #: fetched on tab-open and drawn by a JS card builder — which is why the two
+    #: halves of one registry looked like different products (cards vs rows) and
+    #: why the glossary sidebar could only ever hold a search box: the server did
+    #: not know the terms at render time, so it had nothing to build a nav from.
+    #: One shape, one filter, one place that knows what a source badge looks
+    #: like (#1956 item 1).
+    glossary_groups: list[dict] = []
+    glossary_terms: list[dict] = []
+    if active_tab == "all_glossary":
+        from app.markdown_render import render_plain, render_safe
+
+        # NOTE: `model_title` is the #1955 branch's resolver (display_name →
+        # document-declared title → identifier) and does not exist here yet.
+        # Same fallback chain this page already uses for its model cards, so
+        # the two agree until that branch lands.
+        from app.web.semantic_layer_view import model_glossary, model_of
+
+        #: Which model DECLARES each term. The glossary projector does not stamp
+        #: `model_uuid`, so the document is the only place that knows — the same
+        #: join the metrics side gets for free from `category`, which the
+        #: projector sets to the model name.
+        term_model: dict[str, str] = {}
+        model_titles: dict[str, str] = {}
+        for row in newest_by_slug.values():
+            slug = str(row.get("slug") or "")
+            try:
+                doc_model = model_of(row)
+                model_titles[slug] = row.get("name") or doc_model.get("name") or slug
+                for entry in model_glossary(doc_model):
+                    term = str(entry.get("term") or "").strip()
+                    if term:
+                        term_model[term.casefold()] = slug
+            except Exception as e:  # noqa: BLE001 - one bad document costs its own provenance
+                logger.warning("/semantic-layer: glossary provenance unavailable for %s: %s", slug, e)
+
+        _DIRECT = "direct"
+        for t in glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT):
+            term = str(t.get("term") or "")
+            slug = term_model.get(term.casefold())
+            glossary_terms.append(
+                {
+                    **t,
+                    "letter": (term[:1] or "?").upper(),
+                    "definition_html": render_safe(t.get("definition")),
+                    "definition_text": render_plain(t.get("definition")),
+                    "defined_in": slug or _DIRECT,
+                    "defined_in_label": model_titles.get(slug or "", "") if slug else "Defined directly",
+                    #: Whether the rendered definition shows anything its
+                    #: plain-text preview cannot — a link, emphasis, a list.
+                    #: This is the ONLY thing that puts the definition inside
+                    #: the expansion panel too, because the row above it
+                    #: already carries the same sentence, wrapped and
+                    #: unclipped. Repeating it there was the duplication a
+                    #: reader has no reason to click twice for.
+                    "definition_rich": _definition_is_rich(render_safe(t.get("definition"))),
+                }
+            )
+        glossary_terms.sort(key=lambda t: (t.get("term") or "").lower())
+
+        #: Resolve every cross-reference against BOTH registries before drawing
+        #: it. A `see_also` value names another definition, and a definition is
+        #: as often a metric as a term — "Credit note → Net revenue" points at a
+        #: metric, which lives on the other tab. Three outcomes, and the third
+        #: is why this is resolved at all:
+        #:   term   → filters this list, no page load
+        #:   metric → the metrics tab, carrying the name as `?q=`
+        #:   neither→ rendered as plain text, NOT a link. A reference to
+        #:            something that no longer exists must not look clickable;
+        #:            a dead link is worse than an unlinked word.
+        _term_names = {(t.get("term") or "").casefold() for t in glossary_terms}
+        _metric_names = {n.casefold() for m in visible_metrics for n in (m.get("display_name"), m.get("name")) if n}
+        for t in glossary_terms:
+            refs = []
+            for ref in t.get("see_also") or []:
+                label = str(ref).strip()
+                if not label:
+                    continue
+                key = label.casefold()
+                kind = "term" if key in _term_names else ("metric" if key in _metric_names else "")
+                refs.append({"label": label, "kind": kind})
+            t["see_also_refs"] = refs
+            #: A row opens only when opening adds something: cross-references
+            #: to follow, or markup the preview flattened away. LENGTH is
+            #: deliberately not a third reason — it was, and it meant a
+            #: definition two words too long for the row's clamp opened a panel
+            #: repeating that same sentence. The clamp was the bug; a term's
+            #: definition wraps on the row now. (A metric row keeps its
+            #: one-line preview: its panel holds SQL, grain and tables, so
+            #: there is always something behind it.)
+            t["has_more"] = bool(refs) or bool(t.get("definition_rich"))
+
+        counts: dict[str, int] = {}
+        for t in glossary_terms:
+            counts[t["defined_in"]] = counts.get(t["defined_in"], 0) + 1
+        glossary_groups = [
+            {"key": slug, "label": model_titles.get(slug) or slug, "count": counts[slug]}
+            for slug in sorted(counts, key=lambda s: (model_titles.get(s) or s).lower())
+            if slug != _DIRECT
+        ]
+        # Last: on most instances it is the largest group, but it is not what a
+        # reader scans for first.
+        if counts.get(_DIRECT):
+            glossary_groups.append({"key": _DIRECT, "label": "Defined directly", "count": counts[_DIRECT]})
 
     # The per-row rendering (markdown, SQL variants, document links) is paid
     # for only by the tab that shows the rows.
@@ -4673,6 +4796,8 @@ async def semantic_layer_list(
         active_tab=active_tab,
         tabs=tabs,
         metric_categories=metric_categories,
+        glossary_terms=glossary_terms,
+        glossary_groups=glossary_groups,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
         glossary_categories=glossary_categories,

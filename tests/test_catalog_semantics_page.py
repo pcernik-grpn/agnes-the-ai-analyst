@@ -99,11 +99,19 @@ class TestCatalogSemanticsContent:
         # Glossary search input, wired to the existing search endpoint. Its own
         # tab is its own REQUEST now — the two panels no longer share a DOM, so
         # the sidebar that belongs to the glossary renders only there.
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="gl_bench", term="Bench", definition="Unassigned but available time.")
         glossary = c.get("/semantic-layer?tab=all_glossary", headers=_auth(token))
         assert glossary.status_code == 200
         assert 'id="glossary-search"' in glossary.text
-        assert "/api/glossary/search" in glossary.text
-        assert "/api/glossary" in glossary.text
+        # No fetch: the terms are server-rendered like the metrics beside them,
+        # which is what lets this tab's sidebar carry a filter at all (#1956
+        # item 1) — the server had nothing to build a nav from while the list
+        # arrived after the page did.
+        assert "/api/glossary/search" not in glossary.text
+        assert "/api/glossary?limit=" not in glossary.text
+        assert 'class="sl-item"' in glossary.text, "the same row component the metrics use"
 
     def test_metrics_grouped_by_category(self, seeded_app):
         _make_metric(id="revenue/mrr", name="mrr", category="revenue")
@@ -196,23 +204,29 @@ class TestCatalogSemanticsContent:
         body = resp.text
         # 4-slot vocabulary: keboola_semantic_layer/keboola_metastore ->
         # success, yaml_import -> info, openmetadata -> warn, manual + unknown
-        # -> neutral (no accent). One extra "badge--success" occurrence comes
-        # from the client-side `sourceBadge()` JS literal, not a rendered row.
-        assert body.count("badge--success") == 3
+        # -> neutral (no accent). Two occurrences, one per Keboola row: the
+        # third used to come from the client-side `sourceBadge()` JS literal,
+        # a second copy of this vocabulary that went with the fetched glossary
+        # cards. One definition now, in the template macro.
+        assert body.count("badge--success") == 2
         assert "badge--info" in body
         assert "badge--warn" in body
 
-    def test_glossary_client_fetch_limit_matches_server_count_limit(self, seeded_app):
-        """The tab label's initial count comes from glossary_repo().list(limit=500)
-        (app/web/router.py); the client re-fetch on tab-open must use the same
-        limit, or the displayed count silently shrinks from up to 500 to
-        whatever the client asked for once the user opens the Glossary tab."""
+    def test_the_glossary_is_server_rendered_under_one_bound(self, seeded_app):
+        """The two-limits hazard this guarded is gone rather than fixed.
+
+        The tab label's count came from ``glossary_repo().list(limit=500)`` while
+        the panel was FETCHED on tab-open, so a client limit smaller than the
+        server's silently shrank the number the tab had just promised. The terms
+        are rendered server-side now, under one bound, so there is no second
+        number to disagree and no fetch to keep in step."""
         c = seeded_app["client"]
         token = seeded_app["analyst_token"]
-        resp = c.get("/catalog/semantics", headers=_auth(token))
-        body = resp.text
-        assert "/api/glossary?limit=500" in body
-        assert "/api/glossary?limit=200" not in body
+        body = c.get("/semantic-layer?tab=all_glossary", headers=_auth(token)).text
+        assert "/api/glossary?limit=" not in body
+        from app.web.router import _GLOSSARY_COUNT_LIMIT
+
+        assert _GLOSSARY_COUNT_LIMIT == 500
 
 
 class TestCatalogSemanticsRBAC:
@@ -935,3 +949,235 @@ class TestSemanticPagesAreWhiteSheets:
         for name in self.DETAIL_FAMILY:
             text = (tpl / name).read_text(encoding="utf-8")
             assert 'class="detail-page"' in text, f"{name} lost the class that paints its sheet"
+
+
+class TestGlossaryRowExpansion:
+    """A term row opens only when opening shows something.
+
+    A metric always has SQL behind it, so its expansion always pays. A term
+    carries a definition and `see_also` and nothing else — so on the common
+    row, expanding repeated the line above it verbatim, which teaches a reader
+    to stop clicking.
+    """
+
+    def test_a_term_with_see_also_is_expandable(self, seeded_app):
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_credit",
+            term="Credit note",
+            definition="A reduction against an invoice.",
+            see_also=["Net revenue"],
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        row = body.split("data-gcat=", 1)[1]
+        assert 'data-has-more="1"' in row
+
+    def test_a_plain_short_term_is_not_marked_expandable(self, seeded_app):
+        """Nothing behind it, so the page gives it no chevron and no click."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="gl_bench", term="Bench", definition="Unassigned but available time.")
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        row = body.split("data-gcat=", 1)[1].split("</div>", 1)[0]
+        assert "data-has-more" not in row
+
+    def test_a_definition_with_markup_is_expandable(self, seeded_app):
+        """A definition imported verbatim from an external catalog is often rich
+        HTML — the preview can only show its text, so opening it pays."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_rich",
+            term="Recognition",
+            definition="See the [policy](https://example.com/policy) for the full rule.",
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert 'data-has-more="1"' in body
+
+    def test_an_expansion_does_not_repeat_the_definition(self, seeded_app):
+        """The bug this whole rule exists for, in its last hiding place.
+
+        Flattening the plain rows left the expandable ones — and a row opened
+        for its `see_also` still rendered the definition again above it, word
+        for word, under a sentence the closed row had already shown in full.
+        The panel carries the definition only when the markdown renders
+        something the preview could not.
+        """
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_credit",
+            term="Credit note",
+            definition="A reduction against an issued invoice.",
+            see_also=["Net revenue"],
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        detail = body.split('data-gcat="', 1)[1].split('<div class="sl-detail">', 1)[1]
+        detail = detail.split("</div>\n        </div>", 1)[0]
+        assert "sl-seealso" in detail, "the reference is what earned this row its chevron"
+        assert "A reduction against an issued invoice." not in detail, (
+            "the closed row already shows this sentence in full"
+        )
+
+    def test_an_expansion_does_carry_a_definition_the_preview_flattened(self, seeded_app):
+        """The other side of the same rule: markdown the text preview lost."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_rich",
+            term="Recognition",
+            definition="See the [policy](https://example.com/policy) for the rule.",
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert 'href="https://example.com/policy"' in body
+
+    def test_a_long_plain_definition_is_still_not_expandable(self, seeded_app):
+        """Length is not a reason, and this is the regression it replaces.
+
+        A definition that overran the one-line clamp by a couple of words used
+        to earn a chevron, and opening it showed the same sentence again. The
+        row wraps to two lines instead, so the only thing length can now do is
+        take a second line.
+        """
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_long",
+            term="Utilization",
+            definition=(
+                "The share of a delivery person's available hours that were booked to "
+                "client work in the period, excluding internal projects and holiday."
+            ),
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert "data-has-more" not in body
+
+    def test_the_flattening_rule_does_not_measure_the_row(self):
+        """The whole rule is the server's flag — no width, no character count."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert "scrollWidth" not in tpl, "length is not a reason to expand a term row"
+        assert "if (!item.dataset.hasMore) item.classList.add('is-flat');" in tpl
+        assert ".sl-item.is-flat .sl-row__chev { visibility: hidden; }" in tpl
+
+    def test_a_term_definition_wraps_instead_of_clipping(self):
+        """Glossary rows only: a metric's detail holds SQL, so its one-line
+        preview still trades for something."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        clamp = tpl.split(".sl-item[data-gcat] .sl-row__desc {", 1)
+        assert len(clamp) == 2, "glossary rows no longer carry their own desc rule"
+        block = clamp[1].split("}", 1)[0]
+        assert "white-space: normal" in block
+        assert "-webkit-line-clamp: 2" in block
+
+
+class TestGlossaryCrossReferences:
+    """`see_also` names another definition — and a definition is as often a
+    metric as a term, so a reference is resolved against both registries
+    before it is drawn."""
+
+    def test_a_reference_to_a_term_filters_this_list(self, seeded_app):
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="gl_a", term="Bench", definition="Unassigned but available time.")
+        glossary_repo().create(
+            id="gl_b",
+            term="Utilization",
+            definition="Share of available hours booked to client work.",
+            see_also=["Bench"],
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert 'data-seealso="Bench"' in body
+
+    def test_a_reference_to_a_metric_links_to_the_metrics_tab(self, seeded_app):
+        """The reference that motivated resolving them at all: "Credit note →
+        Net revenue" points at a metric, which lives on the other tab. Filtering
+        the glossary for it found nothing."""
+        from src.repositories import glossary_repo, metric_repo
+
+        metric_repo().create(
+            id="rev/net",
+            name="net_revenue",
+            display_name="Net revenue",
+            category="revenue",
+            sql="SELECT 1",
+        )
+        glossary_repo().create(
+            id="gl_credit",
+            term="Credit note",
+            definition="A reduction against an invoice.",
+            see_also=["Net revenue"],
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert "/semantic-layer?tab=all_metrics&amp;q=Net%20revenue" in body
+        assert 'data-seealso="Net revenue"' not in body, "a metric is not filtered out of the glossary"
+
+    def test_a_reference_to_neither_is_not_a_link(self, seeded_app):
+        """A definition can be renamed or deleted out from under a reference.
+        Stating a dead name is honest; offering it as a link is not."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(
+            id="gl_ghost",
+            term="Backlog",
+            definition="Work committed but not started.",
+            see_also=["Deleted concept"],
+        )
+        body = (
+            seeded_app["client"].get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"])).text
+        )
+        assert "Deleted concept" in body
+        assert 'data-seealso="Deleted concept"' not in body
+        assert "q=Deleted%20concept" not in body
+        assert 'class="sl-seealso--dead"' in body
+
+
+class TestSemanticPageChrome:
+    """The two semantic pages had drifted into looking like a different product
+    from the Library one click away."""
+
+    def test_the_semantic_pages_use_the_standard_page_header(self):
+        """`/semantic-layer` hand-rolled its own `.sl-head` / `.sl-kicker` /
+        `.page-title` trio — a heavier eyebrow, a different title size, its own
+        spacing. It renders the same `page-header--plain` block every other
+        content page does (see `_page_hero.html`); the markup is copied rather
+        than included only because this page extends `base_index.html` and
+        cannot take `base_page.html`'s hero variables."""
+        from pathlib import Path
+
+        lst = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert 'class="page-header page-header--plain"' in lst
+        assert 'class="page-header__eyebrow"' in lst
+        assert 'class="page-header__title"' in lst
+        assert 'class="sl-kicker"' not in lst, "the bespoke eyebrow is gone, not just unused"
+
+    def test_the_semantic_back_link_matches_every_other_way_back(self):
+        """It diverged from `.apg-back` on weight, spacing and hover colour —
+        three near-misses that make one page feel like a different product."""
+        from pathlib import Path
+
+        for name in ("semantic_layer_list.html", "semantic_layer_detail.html"):
+            css = Path("app/web/templates/%s" % name).read_text(encoding="utf-8")
+            css = css.split(".slb-back {")[1].split("}")[0]
+            assert "font-weight: 600" in css, name
+            assert "margin: 0 0 10px" in css, name
