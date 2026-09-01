@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field
@@ -485,8 +486,10 @@ class ExportFilter:
     Keboola serves the parquet directly (UNLOADed from Snowflake), the
     extractor renames it into place — no CSV intermediate, no DuckDB
     COPY, no peak-memory load. Falls back to CSV when an admin pins
-    `{"file_type":"csv"}` in source_query (e.g. for projects whose
-    backend can't UNLOAD parquet, or legacy debugging).
+    `{"file_type":"csv"}` in source_query (legacy debugging), and
+    automatically for projects whose backend refuses parquet export —
+    see `is_parquet_file_type_rejected` and the materialized path in
+    `connectors/keboola/extractor.py:materialize_query`.
     """
 
     where_filters: List[dict] = field(default_factory=list)
@@ -608,6 +611,72 @@ def is_upstream_client_error(exc: Exception) -> bool:
     """
     status = getattr(exc, "status", None)
     return isinstance(status, int) and 400 <= status < 500
+
+
+# ---- parquet-export capability, per stack ---------------------------------
+#
+# `fileType=parquet` on export-async is not universally available: some
+# Keboola stacks/projects reject it outright with a 400 naming `fileType` as
+# an invalid choice (#1979, seen on a `us-east4.gcp` project). It is a
+# property of the project's backend, not of the request, so the answer is
+# worth remembering: the materialized path probes parquet once per stack and
+# thereafter goes straight to CSV, which keeps the cost at one refused POST
+# per process instead of one per registered table per sync.
+#
+# Deliberately process-scoped rather than persisted: a project that gains
+# parquet support (or an operator who repoints a stack) recovers on the next
+# restart, with no stale row to hunt down. The classifier below is narrow on
+# purpose — only a 400 that names `fileType` counts, so an unrelated 400
+# (missing table, bad filter) still propagates untouched.
+
+_PARQUET_UNSUPPORTED_STACKS: set[str] = set()
+_PARQUET_CAPABILITY_LOCK = threading.Lock()
+
+
+def is_parquet_file_type_rejected(exc: Exception) -> bool:
+    """True when ``exc`` is Storage API refusing ``fileType=parquet`` itself.
+
+    The live body is::
+
+        {'error': 'Invalid request:\n - fileType: "The value you selected
+                   is not a valid choice."', ...}
+
+    Matching on the `fileType` field name (plus the 400) rather than the
+    sentence keeps this working across stack versions that word the
+    validation error differently, while still not swallowing a 400 about
+    some other field — `whereFilters`, a missing table, an expired token.
+    """
+    if not isinstance(getattr(exc, "status", None), int) or exc.status != 400:  # type: ignore[attr-defined]
+        return False
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    return "filetype" in text
+
+
+def parquet_export_supported(stack: str) -> bool:
+    """False once ``stack`` has refused ``fileType=parquet`` in this process."""
+    with _PARQUET_CAPABILITY_LOCK:
+        return stack not in _PARQUET_UNSUPPORTED_STACKS
+
+
+def note_parquet_export_unsupported(stack: str) -> bool:
+    """Record that ``stack`` refuses parquet export.
+
+    Returns True only for the FIRST caller to record a given stack, which is
+    what lets the caller log one WARNING for the project rather than one per
+    table.
+    """
+    with _PARQUET_CAPABILITY_LOCK:
+        if stack in _PARQUET_UNSUPPORTED_STACKS:
+            return False
+        _PARQUET_UNSUPPORTED_STACKS.add(stack)
+        return True
+
+
+def reset_parquet_export_capability() -> None:
+    """Forget every recorded rejection. Test hook — the memo is module state,
+    so without this a fallback test would leak into the rest of the run."""
+    with _PARQUET_CAPABILITY_LOCK:
+        _PARQUET_UNSUPPORTED_STACKS.clear()
 
 
 def normalize_source_table(bucket: str, source_table: str) -> str:

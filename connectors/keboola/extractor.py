@@ -397,10 +397,15 @@ def materialize_query(
     # Lazy import to avoid pulling `requests` at module import time when only
     # the sync trigger imports `extractor` for `run()`.
     from connectors.keboola.storage_api import (
+        FILE_TYPE_CSV,
         FILE_TYPE_PARQUET,
         ExportFilter,
         KeboolaStorageClient,
+        StorageApiError,
+        is_parquet_file_type_rejected,
         normalize_source_table,
+        note_parquet_export_unsupported,
+        parquet_export_supported,
     )
 
     if storage_client is None:
@@ -466,11 +471,22 @@ def materialize_query(
     # via native Snowflake UNLOAD, the extractor renames it into place,
     # no CSV intermediate, no DuckDB COPY, no peak-memory load. Admin
     # can pin `{"file_type":"csv"}` in source_query to fall back (legacy
-    # debugging, or projects whose backend can't UNLOAD parquet — none
-    # known today, but the escape hatch costs nothing). Only override
-    # when the admin spec didn't *explicitly* set a file_type.
+    # debugging). Only override when the admin spec didn't *explicitly*
+    # set a file_type.
     if "file_type" not in payload and "fileType" not in payload:
         export_filter.file_type = FILE_TYPE_PARQUET
+
+    # Not every project's backend can UNLOAD parquet: some stacks answer
+    # export-async with `400 fileType: "The value you selected is not a
+    # valid choice."` (#1979). We can't ask ahead — there is no capability
+    # endpoint — so the first materialized row of the process probes, and
+    # every row after it reads the remembered answer instead of paying for
+    # another refused POST. This is what makes a plain `register-table`
+    # materialized row work with no `source_query` on such a project,
+    # exactly as a wizard-registered one does.
+    stack_key = str(getattr(storage_client, "base", "") or "")
+    if export_filter.file_type == FILE_TYPE_PARQUET and not parquet_export_supported(stack_key):
+        export_filter.file_type = FILE_TYPE_CSV
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +524,39 @@ def materialize_query(
         with _tmp_ctx as tmpdir:
             full_table_id = f"{bucket}.{source_table}"
 
+            # The parquet probe. It has to happen here rather than as a
+            # `try/except` wrapped around the whole parquet branch below,
+            # because the branch is chosen from `file_type` and a rejection
+            # has to be able to change that choice before we commit to it.
+            # Costs nothing extra on the happy path: the export-async call
+            # would be the branch's first statement anyway, so `prepared` is
+            # simply handed to it. Nothing has been written or downloaded at
+            # this point — the 400 comes back from the POST that *starts* the
+            # export job — so the CSV branch below runs as the first real
+            # export, not as a redo of one.
+            prepared = None
+            if export_filter.file_type == FILE_TYPE_PARQUET:
+                try:
+                    prepared = storage_client.prepare_export(
+                        full_table_id,
+                        export_filter=export_filter,
+                    )
+                except StorageApiError as e:
+                    if not is_parquet_file_type_rejected(e):
+                        raise
+                    # Downgrade, and say so once for the whole project. Per-row
+                    # logging here would put one line per registered table in
+                    # every sync, forever, for a fact that does not change.
+                    if note_parquet_export_unsupported(stack_key):
+                        logger.warning(
+                            "Keboola project at %s refuses parquet export (fileType=parquet rejected by "
+                            "export-async); falling back to CSV for materialized tables on this stack. "
+                            "The data is identical — the CSV path is slower and more memory-hungry. "
+                            'Pin `{"file_type":"csv"}` in the table\'s source_query to make this explicit.',
+                            stack_key or "<unknown stack>",
+                        )
+                    export_filter.file_type = FILE_TYPE_CSV
+
             if export_filter.file_type == FILE_TYPE_PARQUET:
                 # Native parquet path. Storage API serves Snowflake UNLOAD
                 # output directly. Two shapes to handle:
@@ -528,10 +577,7 @@ def materialize_query(
                 #    gigabytes, which is what used to OOM this COPY. Hence the
                 #    explicit `ROW_GROUP_SIZE_BYTES` bound below; see
                 #    `_ROW_GROUP_TARGET_BYTES`.
-                stats = storage_client.prepare_export(
-                    full_table_id,
-                    export_filter=export_filter,
-                )
+                stats = prepared
                 file_info = stats["file_info"]
                 if file_info.get("isSliced"):
                     slice_dir = Path(tmpdir) / "slices"
@@ -639,11 +685,13 @@ def materialize_query(
                                 e,
                             )
             else:
-                # Legacy CSV path. Kept for the explicit `{"file_type":"csv"}`
-                # opt-in. Slower (CSV parse + parquet rewrite) and
-                # memory-heavier (DuckDB pulls the CSV into a buffer with
-                # max_line_size headroom), but doesn't depend on Storage
-                # API parquet support if a future project backend lacks it.
+                # CSV path. Reached two ways: the explicit
+                # `{"file_type":"csv"}` opt-in, and the automatic downgrade
+                # above for a project whose backend refuses parquet export.
+                # Slower (CSV parse + parquet rewrite) and memory-heavier
+                # (DuckDB pulls the CSV into a buffer with max_line_size
+                # headroom), but it depends on nothing beyond plain
+                # export-async, which every project has.
                 csv_path = Path(tmpdir) / f"{table_id}.csv"
                 stats = storage_client.export_table(
                     full_table_id,

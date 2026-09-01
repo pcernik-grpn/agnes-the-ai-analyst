@@ -95,6 +95,19 @@ agnes admin register-table --source-type keboola --bucket "in.c-crm" --table "co
 2. Produces `extract.duckdb` with `_meta` table + parquet files in `/data/extracts/keboola/data/`
 3. The SyncOrchestrator ATTACHes `extract.duckdb` into `analytics.duckdb` and creates views
 
+### Materialized rows: parquet export, with an automatic CSV fallback
+
+A `query_mode='materialized'` Keboola row is exported through the Storage API's
+`export-async` endpoint. Agnes asks for `fileType=parquet` by default — Keboola
+serves it straight from a Snowflake UNLOAD, so there is no CSV intermediate and
+no full-file DuckDB rewrite. Some projects/stacks refuse that request outright
+(`400 fileType: "The value you selected is not a valid choice."`); Agnes detects
+exactly that rejection, retries the export as CSV, and logs one WARNING naming
+the stack, so registering a table needs no knowledge of which kind of project it
+is. The remembered answer is per stack and per process, so the refused request
+costs one POST per restart rather than one per table per sync. To skip the probe
+entirely, pin the format in the row's `source_query`: `{"file_type":"csv"}`.
+
 ### Identifier validation
 
 All Keboola table names, bucket names, and source table identifiers are validated against `_SAFE_QUOTED_IDENTIFIER` regex before use. Invalid identifiers are skipped with error logging.
