@@ -578,7 +578,14 @@
      The reason chain is genuinely page-local: no other surface renders a
      "why" walk. Its chips use the accent vocabulary (`--ds-accent-*`) the
      `.flash` family uses, so success/failure read the same here as anywhere. */
-  .ax-simrow { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  /* The person's name and the one action on them, on one line. `center`, not
+     `flex-end`: the name is plain text and the button carries padding, so
+     aligning their BOTTOM edges left the two visibly off each other. The
+     button is pushed to the end by the name's own auto margin rather than by
+     `space-between`, so it still sits beside a short name instead of being
+     flung to the far side of a wide card. */
+  .ax-simrow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .ax-simrow .ax-simwho { margin-right: auto; }
   .ax-simrow label { display: block; font-size: 12.5px; font-weight: 700; margin-bottom: 5px; color: var(--ds-text-primary); }
   .ax-simrow .fbar-select select { min-width: 320px; }
   .ax-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
@@ -914,7 +921,14 @@
     color: var(--ds-text-secondary); cursor: pointer;
   }
   .ax-revoke:hover { border-color: var(--ds-text-link); color: var(--ds-text-link); }
-  .ax-own__edit { font-size: 11px; color: var(--ds-text-muted); white-space: nowrap; }
+  /* Sits after Revoke in the Manage cell, which is a plain right-aligned
+     block — the two are inline siblings with no whitespace node between
+     them, so without this margin the button's right edge and the link's
+     left edge touch at exactly 0px. */
+  .ax-own__edit {
+    font-size: 11px; color: var(--ds-text-muted); white-space: nowrap;
+    margin-left: 10px;
+  }
   .ax-own__edit:hover { color: var(--ds-text-link); }
 
   /* The People card became a strip. It was a full disclosure section with an

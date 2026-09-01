@@ -83,6 +83,20 @@
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
+/* It is usually a link, but a way BACK is sometimes an in-page act rather
+   than a navigation — returning from one person's chain to the roster on
+   /admin/access, where the list never left the document. A <button> there is
+   the honest element, and without these four lines it arrives wearing the
+   browser's own border and grey fill, which is what "unstyled" looks like. */
+button.apg-back {
+    border: 0;
+    background: none;
+    padding: 0;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+}
 .apg-back:hover { color: var(--ds-primary); }
 .apg-back:focus-visible {
     outline: var(--ds-focus-outline);
