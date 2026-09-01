@@ -4035,7 +4035,11 @@
     async function bulkRejectSelected() {
         const ids = getSelectedIds('review');
         if (ids.length === 0) return;
-        if (!confirm(`Reject ${ids.length} selected item${ids.length !== 1 ? 's' : ''}?`)) return;
+        if (!await confirmModal({
+            title: `Reject ${ids.length} selected item${ids.length !== 1 ? 's' : ''}?`,
+            confirmText: 'Reject',
+            danger: true,
+        })) return;
 
         try {
             const resp = await fetch('/api/memory/admin/bulk-reject', {

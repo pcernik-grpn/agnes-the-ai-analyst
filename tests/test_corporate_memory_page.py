@@ -177,8 +177,12 @@ class TestReviewQueueBulkReject:
         assert 'id="batchRejectBtnAll" disabled onclick="batchAction(\'reject\')"' in body
 
     def test_reject_selected_confirms_the_count(self, seeded_app):
+        """The count lands in a confirmModal() call, never a native confirm()
+        — tests/test_design_system_contract.py bans the latter (#497 §1)."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         resp = c.get("/admin/corporate-memory", headers=_auth(token))
         assert resp.status_code == 200
         assert "Reject ${ids.length} selected item" in resp.text
+        assert "await confirmModal({" in resp.text
+        assert "confirm(`Reject" not in resp.text
