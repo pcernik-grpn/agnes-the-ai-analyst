@@ -11070,6 +11070,18 @@
             "title": "Row Count",
             "type": "integer"
           },
+          "row_scope": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Row Scope"
+          },
           "rows": {
             "items": {
               "additionalProperties": true,
