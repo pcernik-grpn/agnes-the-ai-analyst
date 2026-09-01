@@ -35,7 +35,8 @@ the instance down for 9 minutes. Two additional contracts are pinned here:
   "logging off + loud warning" instead of an outage.
 """
 
-import os
+import contextlib
+import socket
 import re
 import subprocess
 from pathlib import Path
@@ -187,18 +188,6 @@ def compose_dirs(tmp_path):
     return compose_dir, state_dir
 
 
-def _fake_docker(tmp_path: Path, exit_code: int) -> dict[str, str]:
-    """A PATH with a stub `docker` that records its argv and exits as told."""
-    bin_dir = tmp_path / "fake-bin"
-    bin_dir.mkdir(exist_ok=True)
-    stub = bin_dir / "docker"
-    stub.write_text(f'#!/bin/sh\necho "$@" >> "{tmp_path}/docker-calls.log"\nexit {exit_code}\n')
-    stub.chmod(0o755)
-    env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}:{env['PATH']}"
-    return env
-
-
 class TestResolverGate:
     """`agnes_resolve_compose_file` requires the probe marker, not mere
     file presence — presence alone is what armed an unauthorized driver and
@@ -220,52 +209,72 @@ class TestResolverGate:
         assert OVERLAY not in _resolve(compose_dir, state_dir)
 
 
-class TestDriverProbe:
-    """`agnes_gcp_logging_probe` arms/clears the marker by actually starting
-    a no-op container on the gcplogs driver."""
+@contextlib.contextmanager
+def _collector_listening(port: int = 24224):
+    """A real listener on the Ops Agent's forward port, or a skip.
 
-    def test_probe_success_arms_the_marker_and_the_resolver_engages(self, compose_dirs, tmp_path):
+    The probe asks one question — is anything accepting these logs — so the
+    honest test is a socket, not a stubbed binary.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as exc:  # something already owns it on this machine
+        sock.close()
+        pytest.skip(f"127.0.0.1:{port} is not bindable here ({exc})")
+    sock.listen(1)
+    try:
+        yield
+    finally:
+        sock.close()
+
+
+class TestCollectorProbe:
+    """`agnes_gcp_logging_probe` arms/clears the marker by asking whether the
+    Ops Agent is actually receiving on its forward port.
+
+    It used to start a no-op container on the gcplogs driver, because that
+    driver refuses to initialize without credentials and Docker then refuses
+    to start the container (#1557). The overlay forwards asynchronously now,
+    so a missing collector can no longer stop a container — what is left to
+    catch is the quiet failure of buffering every line into a socket nobody
+    is listening on.
+    """
+
+    def test_probe_arms_the_marker_when_the_collector_is_up(self, compose_dirs):
         compose_dir, state_dir = compose_dirs
-        env = _fake_docker(tmp_path, exit_code=0)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
-        )
+        with _collector_listening():
+            result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
         assert result.returncode == 0, result.stderr
         assert (compose_dir / MARKER).exists()
-        calls = (tmp_path / "docker-calls.log").read_text()
-        assert "--log-driver=gcplogs" in calls, (
-            "the probe must exercise the actual gcplogs driver — that is where an unauthorized VM SA fails"
-        )
         assert OVERLAY in _resolve(compose_dir, state_dir)
 
-    def test_probe_failure_clears_a_stale_marker_and_the_overlay_drops(self, compose_dirs, tmp_path):
+    def test_probe_failure_clears_a_stale_marker_and_the_overlay_drops(self, compose_dirs):
         compose_dir, state_dir = compose_dirs
         (compose_dir / MARKER).touch()
-        env = _fake_docker(tmp_path, exit_code=1)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
-        )
+        # Nothing listening: whatever this host has on 24224, the probe must
+        # not arm on a stale marker alone.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            if probe.connect_ex(("127.0.0.1", 24224)) == 0:
+                pytest.skip("something is listening on 127.0.0.1:24224 on this host")
+        result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
         assert result.returncode != 0
         assert not (compose_dir / MARKER).exists()
         assert OVERLAY not in _resolve(compose_dir, state_dir)
 
-    def test_probe_without_the_overlay_file_disarms_without_running_docker(self, compose_dirs, tmp_path):
+    def test_probe_without_the_overlay_file_disarms_without_probing(self, compose_dirs):
         compose_dir, _ = compose_dirs
         (compose_dir / OVERLAY).unlink()
         (compose_dir / MARKER).touch()
-        env = _fake_docker(tmp_path, exit_code=0)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
+        with _collector_listening():
+            result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
+        assert result.returncode != 0, (
+            "a deliberately removed overlay (enable_gcp_logging=false) must disarm "
+            "the gate even while the collector is up"
         )
-        assert result.returncode != 0
         assert not (compose_dir / MARKER).exists()
-        assert not (tmp_path / "docker-calls.log").exists(), (
-            "a deliberately removed overlay (enable_gcp_logging=false) must "
-            "disarm the gate without spending a docker run"
-        )
 
 
 class TestBootPathUsesTheSharedGate:
