@@ -14348,9 +14348,25 @@
     },
     "/admin/data-packages/new": {
       "get": {
-        "description": "Author a data package, in the same builder shell /agents and /skills use.\n\nA PAGE, not the drawer. The drawer is right where it is used \u2014 mid-sentence\non /admin/tables, assigning a table to a package that does not exist yet \u2014\nbecause it opens over the lens you are standing on and gives it back. A\nworkspace is the opposite: it is where you have gone to do the thing, and\nit should look like the other two places you go to do the thing.\n\nThe FORM is still the drawer component's; this route only gives it a page\nto render into (`mount`), so there is one implementation of a package's\nfields and grants rather than two that drift.",
+        "description": "Author a data package, in the same builder shell /agents and /skills use.\n\nA PAGE, not the drawer \u2014 and now the ONLY surface that writes a package.\nCreate was a page opened from the Library, edit was a drawer over whatever\nlens you were standing on, and the Library's own detail page opened a third\ncopy of the same form: three chromes for one object. The drawer keeps only\nthe case it was built for \u2014 mid-sentence on /admin/tables, assigning a\ntable to a package that does not exist yet \u2014 where losing the page you are\non is the whole cost.\n\nThe FORM is still the drawer component's; this route only gives it a page\nto render into (`mount`), so there is one implementation of a package's\nfields and grants rather than two that drift.",
         "operationId": "admin_package_builder_admin_data_packages_new_get",
         "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
           {
             "in": "header",
             "name": "authorization",
@@ -14467,6 +14483,22 @@
             "schema": {
               "title": "Pkg Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
             }
           },
           {
@@ -27119,7 +27151,7 @@
     },
     "/api/admin/registry": {
       "get": {
-        "description": "Get full table registry.\n\nEach table row is enriched with its `sync_state` counterpart (#754) so\nthe admin dashboard (`admin_sync.html`) and `agnes admin list-tables`\ncan explain a \"N total, 0 synced\" run without trawling scheduler logs:\n\n  - `last_sync_status`: 'ok' | 'error' | 'skipped' | 'pending' (never\n    synced). Mirrors `sync_state.status`, defaulted to 'pending' when\n    no sync_state row exists yet.\n  - `last_sync_error`: the persisted error/skip-reason string when\n    `last_sync_status` is 'error' or 'skipped'; None otherwise.\n  - `last_sync`: full ISO timestamp of the last successful sync, or\n    None if never synced. (`last_sync_display` below is the\n    pre-existing truncated \"YYYY-MM-DD HH:MM\" form, kept for backward\n    compatibility with any existing consumer.)\n  - `rows` / `file_size_bytes`: the last successful sync's row count /\n    parquet size, so the dashboard's \"Rows\" / \"Size\" columns aren't\n    silently blank for tables that DID sync.",
+        "description": "Get full table registry.\n\nEach table row is enriched with its `sync_state` counterpart (#754) so\nthe admin dashboard (`admin_sync.html`) and `agnes admin list-tables`\ncan explain a \"N total, 0 synced\" run without trawling scheduler logs:\n\n  - `last_sync_status`: 'ok' | 'error' | 'skipped' | 'pending' (never\n    synced). Mirrors `sync_state.status`, defaulted to 'pending' when\n    no sync_state row exists yet.\n  - `last_sync_error`: the persisted error/skip-reason string when\n    `last_sync_status` is 'error' or 'skipped'; None otherwise.\n  - `last_sync`: full ISO timestamp of the last successful sync, or\n    None if never synced. (`last_sync_display` below is the\n    pre-existing truncated \"YYYY-MM-DD HH:MM\" form, kept for backward\n    compatibility with any existing consumer.)\n  - `rows` / `file_size_bytes`: the last successful sync's row count /\n    parquet size, so the dashboard's \"Rows\" / \"Size\" columns aren't\n    silently blank for tables that DID sync.\n  - `packaged`: is this table in ANY data package. A table in no package\n    reaches nobody \u2014 the product's central distribution rule \u2014 so it is\n    the one condition worth filtering a registry by, and the package\n    builder's picker offers it as a toggle. One batched membership read,\n    like the sync_state join above; False for every row if that read\n    fails, since a filter that silently claims everything is unpackaged\n    is worse than one that offers nothing.",
         "operationId": "list_registry_api_admin_registry_get",
         "parameters": [
           {
