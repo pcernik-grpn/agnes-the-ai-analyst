@@ -4430,6 +4430,18 @@
             "description": "Files of one delta page pipelined at once for this run (1 = sequential).",
             "title": "Concurrency"
           },
+          "resync": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested.",
+            "title": "Resync"
+          },
           "timeout_s": {
             "anyOf": [
               {
@@ -31688,7 +31700,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extract": {
       "post": {
-        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested: see ``connectors.sharepoint.crawler._apply_resync``.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
         "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
         "parameters": [
           {
