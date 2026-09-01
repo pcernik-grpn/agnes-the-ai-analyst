@@ -28,6 +28,8 @@ import os
 from collections.abc import Callable, MutableMapping
 from typing import Any
 
+import pydantic_core
+
 DEFAULT_MAX_OUTPUT_CHARS = 100_000
 MAX_OUTPUT_CHARS_ENV = "AGNES_MCP_MAX_OUTPUT_CHARS"
 
@@ -183,14 +185,16 @@ def wire_size(payload: Any) -> int:
     """Characters FastMCP puts on the wire for a dict tool result.
 
     FastMCP serializes a non-string return value with
-    ``pydantic_core.to_json(..., indent=2)`` — pretty-printed, unicode kept
-    as-is — and that text is what an MCP client measures against its
-    tool-result limit. ``ensure_output_size`` measures the compact form (its
-    cap is an order of magnitude looser, so the difference never mattered
-    there); this is the faithful measure, for the place where the point is
-    fitting a client's budget rather than bounding a pathological payload.
+    ``pydantic_core.to_json(result, fallback=str, indent=2)`` — pretty-printed,
+    unicode kept as-is — and that text is what an MCP client measures against
+    its tool-result limit. This calls the same serializer with the same
+    arguments rather than approximating it with ``json.dumps`` (the two differ
+    on floats, datetimes and key ordering, and an approximation that ran
+    short would let an oversized result through — Copilot review on #2046).
+    ``ensure_output_size`` measures the compact ``json.dumps`` form; its cap
+    is an order of magnitude looser, so the difference never mattered there.
     """
-    return len(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    return len(pydantic_core.to_json(payload, fallback=str, indent=2).decode("utf-8"))
 
 
 def _shorten(value: str, cap: int) -> str:
@@ -252,9 +256,14 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
     A response that already fits is returned untouched — the same object.
     Otherwise every prose field is cut to the LARGEST common cap at which the
     serialized response (:func:`wire_size` — what the client actually
-    measures) fits, found by binary search between :data:`SEARCH_TEXT_FLOOR`
-    and the longest field present — so the budget is spent on text, not
-    left idle by a coarse cut. If even the floor does not fit, hits are
+    measures) fits — so the budget is spent on text, not left idle by a
+    coarse cut. Size is monotonic in the cap only BETWEEN the distinct field
+    lengths: the moment the cap reaches a field's length that field comes
+    back whole and sheds its mark and its ``truncated_fields`` entry, so the
+    size can step DOWN as the cap goes up (Copilot review on #2046). The
+    search therefore walks those intervals from the longest down, and
+    binary-searches only inside the first one whose start fits, where the
+    monotonicity holds exactly. If even the floor does not fit, hits are
     dropped from the tail, i.e. lowest-ranked first (results arrive
     ranked). Nothing is cut silently: every shortened hit
     carries ``truncated: true`` and ``truncated_fields``, its text ends in
@@ -281,15 +290,22 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
     def _fits(candidate: dict) -> bool:
         return wire_size(candidate) <= effective
 
-    # Largest cap that fits. Size is monotonic in the cap (a bigger cap only
-    # ever keeps more text), so a binary search over [floor, longest] finds
-    # it in a dozen serializations of a payload this size.
-    longest = max(
-        (len(h[f]) for h in hits if isinstance(h, dict) for f in SEARCH_TEXT_FIELDS if isinstance(h.get(f), str)),
-        default=0,
+    # Largest cap that fits. Within an interval between two consecutive
+    # distinct field lengths the set of shortened fields is fixed, so the
+    # size is monotone non-decreasing in the cap (a longer prefix, rstrip
+    # included, is never shorter) and a binary search is exact. At a
+    # boundary a field comes back whole and the size can drop, so the
+    # intervals are tried from the longest down: the first whose START fits
+    # contains the global maximum. The top interval — cap at or above the
+    # longest field — is the untouched payload, already known not to fit.
+    lengths = sorted(
+        {len(h[f]) for h in hits if isinstance(h, dict) for f in SEARCH_TEXT_FIELDS if isinstance(h.get(f), str)}
     )
-    lo, hi = SEARCH_TEXT_FLOOR, max(SEARCH_TEXT_FLOOR, longest)
-    if _fits(_candidate(hits, lo)):
+    bounds = [SEARCH_TEXT_FLOOR] + [n for n in lengths if n > SEARCH_TEXT_FLOOR]
+    for j in range(len(bounds) - 2, -1, -1):
+        lo, hi = bounds[j], bounds[j + 1] - 1
+        if not _fits(_candidate(hits, lo)):
+            continue
         while lo < hi:
             mid = (lo + hi + 1) // 2
             if _fits(_candidate(hits, mid)):

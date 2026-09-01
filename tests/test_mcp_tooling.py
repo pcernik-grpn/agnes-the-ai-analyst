@@ -255,16 +255,27 @@ class TestSearchBudget:
         monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "lots")
         assert search_max_chars() == DEFAULT_SEARCH_MAX_CHARS
 
-    def test_wire_size_matches_fastmcp_serialization(self):
-        """FastMCP puts ``pydantic_core.to_json(result, indent=2)`` on the wire;
-        the budget must be measured against THAT text, not the compact form —
-        and unicode must not be escaped, or a Czech chunk looks six times bigger
-        than what the client actually receives."""
-        import pydantic_core
+    def test_wire_size_is_the_text_fastmcp_actually_emits(self):
+        """The budget must be measured against the text the client receives —
+        FastMCP's own content conversion — not an approximation of it. Pinned
+        against FastMCP's converter itself, so a change of serializer there
+        fails here rather than silently letting oversized results through."""
+        from datetime import date, datetime
+
+        from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
 
         payload = _incident_payload(2)
-        assert wire_size(payload) == len(pydantic_core.to_json(payload, fallback=str, indent=2).decode())
-        assert wire_size(payload) < len(json.dumps(payload, indent=2))  # ensure_ascii would inflate
+        # Types where json.dumps(default=str) and pydantic_core.to_json disagree.
+        payload["results"][0]["score"] = 1.0
+        payload["results"][0]["indexed_at"] = datetime(2026, 9, 1, 12, 30)
+        payload["results"][1]["document_date"] = date(2026, 9, 1)
+        payload["ratio"] = 0.1 + 0.2
+        blocks = _convert_to_content(payload)
+        assert len(blocks) == 1 and blocks[0].type == "text"
+        assert wire_size(payload) == len(blocks[0].text)
+        # Unicode is not escaped on the wire — measuring the escaped form would
+        # make a Czech chunk look six times bigger than it is.
+        assert wire_size(payload) < len(json.dumps(payload, indent=2, default=str))
 
 
 class TestCompactSearchResults:
@@ -383,6 +394,37 @@ class TestCompactSearchResults:
         a = compact_search_results(payload, "knowledge_search", budget=6_000)
         b = compact_search_results(payload, "knowledge_search", budget=6_000)
         assert a == b
+
+    def test_mixed_lengths_find_the_true_largest_cap(self):
+        """Size is not monotonic in the cap across a field-length boundary: at
+        cap == len(field) the field comes back whole and sheds its mark and
+        its `truncated_fields` entry, so the size can DROP as the cap grows.
+        A plain binary search over [floor, longest] can land below the true
+        maximum (Copilot review on #2046). Brute-force every cap and require
+        the search to use the budget as well as the best cap does — for
+        several budgets, so the optimum falls in different intervals."""
+        from src.mcp_tooling import _apply_cap, _with_results
+
+        hits = [_chunk(0, 3_000), _chunk(1, 1_200), _chunk(2, 700), _chunk(3, 450)]
+        payload = {"query": "kůň", "results": hits, "retrieval": "hybrid"}
+
+        def size_at(cap: int, budget: int) -> int:
+            return wire_size(_with_results(payload, "knowledge_search", _apply_cap(hits, cap), total=4, budget=budget))
+
+        floor_size = size_at(SEARCH_TEXT_FLOOR, 9_999)  # everything at the floor fits from here up
+        # The budgets with teeth are the step-downs themselves: a budget equal
+        # to the size AT a field's length is met by a cap of exactly that
+        # length, but the size one below it is ~70 chars larger, so a plain
+        # binary search that probes there concludes "does not fit" and ends
+        # up short (measured: budget 3724 → cap 430 / size 3722 instead of the
+        # optimum 3724). The spread-out budgets then cover the ordinary case.
+        boundaries = [size_at(length, 9_999) for length in (450, 700, 1_200)]
+        for budget in boundaries + [floor_size + d for d in (300, 900, 1_700, 2_500, 3_100)]:
+            out = compact_search_results(payload, "knowledge_search", budget=budget)
+            assert wire_size(out) <= budget
+            assert len(out["results"]) == 4, budget  # shortened, never dropped, at these budgets
+            best_size = max(s for s in (size_at(c, budget) for c in range(SEARCH_TEXT_FLOOR, 3_000)) if s <= budget)
+            assert wire_size(out) == best_size, (budget, wire_size(out), best_size)
 
     def test_cuts_as_little_as_the_budget_requires(self):
         """The cap is the LARGEST that fits, not the first power-of-two below
