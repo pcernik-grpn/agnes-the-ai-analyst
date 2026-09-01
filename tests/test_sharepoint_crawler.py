@@ -737,6 +737,105 @@ class TestConversionCrashIsolation:
         assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
 
 
+class TestConvertProcessPoolRecycling:
+    """`_ConvertProcessPool` recycling — the OOM guard for a crash survivor
+    that just keeps running: markitdown/pypdfium2 hold onto memory per
+    document, so a slot that never recycles grows without bound over a
+    large crawl. Observed on a live deployment: ~8.4 GiB across 6 slots
+    (~22 documents each) before the container's memory cgroup started
+    SIGKILLing whichever child allocated next, indiscriminately — including
+    files nowhere near a gigabyte.
+
+    Drives `_ConvertProcessPool` directly (not through a full crawl), the
+    same way `TestActivityBookkeeping` drives `CrawlStats` directly — the
+    mechanism under test is a pool method, not the whole pipeline.
+    """
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_a_slot_is_recycled_after_its_document_budget(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=3, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            for _ in range(3):
+                outcome = pool.convert(0, f, "text/plain")
+                assert outcome.ok
+            # The 3rd conversion crossed the budget and swapped in the
+            # pre-forked SPARE — a genuinely different process, promoted
+            # without this (the test's own, multi-threaded pytest) thread
+            # ever calling fork().
+            assert pool._procs[0].pid != first_pid
+            # ...and the slot keeps converting normally afterwards, on a
+            # fresh document budget.
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_a_slot_is_recycled_when_its_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            # Inflate THIS (child) process's RSS on purpose, deterministically
+            # — the point of testing the trigger in isolation, rather than
+            # waiting on a real multi-hundred-document crawl to grow one
+            # organically.
+            _hog = bytearray(20 * 1024 * 1024)  # noqa: F841 — the allocation is the point
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # A document budget nothing in this test could reach, so only the
+        # RSS trigger can plausibly be what recycles the slot.
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1000, recycle_rss_bytes=5 * 1024 * 1024)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+            assert pool._procs[0].pid != first_pid
+        finally:
+            pool.shutdown()
+
+    def test_recycling_does_not_regress_crash_isolation(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == b"CRASH-ME":
+                os.kill(os.getpid(), signal.SIGABRT)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=2, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            f_crash = self._write(tmp_path, "bad.txt", b"CRASH-ME")
+
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 1/2
+            pid_before_recycle = pool._procs[0].pid
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 2/2 -> recycles
+            assert pool._procs[0].pid != pid_before_recycle, "the slot should now be the pre-forked spare"
+
+            # The RECYCLED (spare-promoted) process crashes on this file —
+            # isolation must still catch it exactly like before recycling
+            # ever existed: this file counts as convert_failed, the parent
+            # survives, and the pool names the real signal.
+            with pytest.raises(crawler._ConvertCrashed) as exc_info:
+                pool.convert(0, f_crash, "text/plain")
+            assert exc_info.value.signal_name == "SIGABRT"
+
+            # And the pool recovers at the next safe point, same as any
+            # other crash.
+            pool.repair()
+            assert pool.convert(0, f_ok, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+
 # --------------------------------------------------------------------------
 # Oversize accounting
 # --------------------------------------------------------------------------
