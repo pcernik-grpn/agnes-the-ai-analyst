@@ -124,6 +124,39 @@ class TestAdoptLegacyOutputDir:
         assert adopt_legacy_output_dir(source["name"], target) is False
         assert (target / "extract.duckdb").read_bytes() == b"payload"
 
+    @pytest.mark.parametrize(
+        "hostile_name,make_it_exist",
+        [
+            ("", "."),
+            ("..", ".."),
+            ("sub/dir", "sub/dir"),
+            ("../sibling", "../sibling"),
+        ],
+        ids=["root-itself", "parent", "nested", "traversal"],
+    )
+    def test_a_name_that_escapes_the_extracts_root_is_refused(
+        self, hostile_name, make_it_exist, tmp_path, monkeypatch
+    ):
+        """``source_name`` is admin text becoming a path. Only a DIRECT child
+        of the extracts root may be adopted.
+
+        Each candidate is made to exist first, so ``is_dir()`` cannot be what
+        refuses it — the containment check has to be, or the assertion proves
+        nothing.
+        """
+        monkeypatch.setenv("AGNES_DATA_DIR", str(tmp_path))
+        extracts = tmp_path / "extracts"
+        extracts.mkdir()
+        (extracts / make_it_exist).mkdir(parents=True, exist_ok=True)
+        (extracts / "sentinel").write_text("untouched")
+
+        target = output_dir_for_source({"id": DERIVED_ID, "name": DERIVED_NAME})
+        assert adopt_legacy_output_dir(hostile_name, target) is False
+
+        assert (extracts / make_it_exist).is_dir()
+        assert (extracts / "sentinel").read_text() == "untouched"
+        assert not target.exists()
+
     def test_no_legacy_directory_is_a_no_op(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AGNES_DATA_DIR", str(tmp_path))
         target = output_dir_for_source({"id": DERIVED_ID, "name": DERIVED_NAME})
