@@ -236,13 +236,13 @@ writes that field, there is no drift to reconcile and no need to cross-check
 
 ### CHANGELOG merge hazards
 
-**This section describes the failure mode the dedicated cut PR (above) was
-built to eliminate.** It should now be rare — feature PRs never rename
-`[Unreleased]` or bump the version, so a long-lived feature branch merging
-`origin/main` only ever picks up a rename on main's side, not a competing
-one from its own branch. Kept for the residual manual-cut path (the
-"Emergency path when Actions dispatch isn't available" case above) and as a
-diagnostic if an old habit resurfaces.
+**The dedicated cut PR (above) eliminated failure mode 2 below, not failure
+mode 1.** Feature PRs never rename `[Unreleased]` or bump the version, so two
+branches can no longer claim the same version number — that is the collision
+class, and it is gone. Failure mode 1 is a different animal and is *not* rare:
+it needs only a merge, and on 2026-09-01 it happened four times in one day,
+once in a ~1160-line merge, each caught by hand. That is what the automated
+backstop under mode 1 exists for (#1918).
 
 Merging `origin/main` into a long-lived feature branch touches `CHANGELOG.md`
 on both sides almost every time — main keeps cutting releases while your
