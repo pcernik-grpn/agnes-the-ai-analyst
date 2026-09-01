@@ -1490,3 +1490,89 @@ class TestTheWrongBucketIsNeverBlank:
         assert "onclick" not in tpl
         assert "addEventListener('click'" in tpl
 
+
+class TestTheViewRidesTheUrl:
+    """These tabs used to be real links, so the address named the tab you were
+    on, Back returned to the previous one and a copied link opened where you
+    were. Turning them into client-side buckets took all three away silently:
+    you could click Glossary and hand someone a link that opened on Metrics."""
+
+    def test_the_tab_and_query_are_written_back_to_the_url(self):
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        fn = tpl.split("function syncUrl()", 1)[1].split("\n    }", 1)[0]
+        assert "history.pushState" in fn and "history.replaceState" in fn, (
+            "push for the tab, replace for the query"
+        )
+        assert "if (tab !== 'models') p.set('tab', tab)" in fn, (
+            "the default tab keeps the bare URL — one canonical address"
+        )
+        assert "if (q) p.set('q', q)" in fn
+
+    def test_switching_a_tab_pushes_and_typing_replaces(self):
+        """pushState for the tab, per /admin/access's note on the same move:
+        switching view is exactly what Back should undo. replaceState for the
+        query, or a search would bury the page in history one keystroke at a
+        time."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        fn = tpl.split("function syncUrl()", 1)[1].split("\n    }", 1)[0]
+        assert "if (tab !== urlTab) {" in fn
+        assert fn.index("pushState") < fn.index("} else {") < fn.index("replaceState")
+
+    def test_back_restores_the_tab(self):
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert "addEventListener('popstate'" in tpl
+
+
+class TestARowSaysWhereItCameFrom:
+    """You could narrow by Model and still not see the answer without opening
+    something — and the pairs that share a display name (the same concept
+    defined once in a document and once by hand, a real state) had nothing on
+    the row to tell them apart."""
+
+    def test_a_metric_row_states_its_model_like_a_glossary_row_does(self, seeded_app):
+        _make_metric()
+        body = seeded_app["client"].get(
+            "/semantic-layer?tab=all_metrics", headers=_auth(seeded_app["admin_token"])
+        ).text
+        row = body.split('id="metrics-list"', 1)[1].split("</button>", 1)[0]
+        assert 'class="sl-row__prov"' in row, "the metric row hid what the glossary row states"
+        assert "Defined directly" in row
+
+
+class TestTheAnswerIsAnnounced:
+    """A screen-reader user types into the search box and the only thing that
+    changes is a number and a state neither of which was announced."""
+
+    def test_the_count_and_the_empty_state_are_live_regions(self):
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert '<div class="sl-countline" aria-live="polite">' in tpl
+        assert 'id="sl-elsewhere" aria-live="polite"' in tpl
+
+    def test_a_row_says_whether_it_is_open(self):
+        """It is a real button toggling real content; without this the click
+        appears to do nothing."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert tpl.count('class="sl-row" aria-expanded="false"') == 2, "both row kinds"
+        assert "btn.setAttribute('aria-expanded'" in tpl
+        # …and a row the filter closed underneath must stop claiming it is open.
+        assert "b.setAttribute('aria-expanded', 'false')" in tpl
+
+    def test_the_tab_strip_scrolls_rather_than_clipping_on_a_phone(self):
+        """Three tabs with counts do not fit 375px."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        block = tpl.split("@media (max-width: 560px) {", 1)[1].split("}", 1)[0]
+        assert "overflow-x: auto" in block
+        assert "padding-right" in block, "a sliver of the next tab is the only cue it scrolls"
+

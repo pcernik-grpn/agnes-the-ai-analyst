@@ -93,7 +93,11 @@
   </button>
   {% endfor %}
 </div>
-<div class="sl-countline"><span id="sl-count">{{ total }} item{{ '' if total == 1 else 's' }}</span></div>
+{# `aria-live`: the count and the state below it ARE the answer to what the
+   reader just typed, and without this a screen-reader user types into the box
+   and hears nothing at all. `polite`, so it waits for a pause instead of
+   interrupting every keystroke. #}
+<div class="sl-countline" aria-live="polite"><span id="sl-count">{{ total }} item{{ '' if total == 1 else 's' }}</span></div>
 {% endmacro %}
 
 {% macro source_badge(source) -%}
@@ -194,6 +198,21 @@
    back" (tabs, count, rows). Bigger than the gaps inside either group, so the
    eye finds the two zones without reading them. */
 .sl-tabs { margin: 20px 0 0; }
+/* Three tabs with counts do not fit 375px, so the strip scrolls — and a strip
+   that scrolls with its last tab cut flush at the edge looks clipped rather
+   than scrollable. The padding leaves a sliver of the next tab showing, which
+   is the cue; `-webkit-overflow-scrolling` keeps it from feeling stuck on iOS.
+   `scrollbar-width: none` because the bar is 3 items long and a scrollbar under
+   it would read as a second rule beneath the tab underline. */
+@media (max-width: 560px) {
+    .sl-tabs {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        padding-right: 24px;
+    }
+    .sl-tabs::-webkit-scrollbar { display: none; }
+}
 .sl-countline {
     margin: 14px 0 10px;
     font-size: 12.5px;
@@ -529,13 +548,14 @@
              data-model="{{ m.facet_model }}"
              data-domain="{{ m.facet_domain }}"
              data-source="{{ m.facet_source }}">
-          <button type="button" class="sl-row">
+          <button type="button" class="sl-row" aria-expanded="false">
             <span class="sl-row__dot"></span>
             <div class="sl-row__main">
               <div class="sl-row__name">{{ m.display_name or m.name }}</div>
               {% if m.description_text %}<div class="sl-row__desc">{{ m.description_text }}</div>{% endif %}
             </div>
             <div class="sl-row__right">
+              <span class="sl-row__prov">{{ m.defined_in_label }}</span>
               {{ source_badge(m.source) }}
               {% if m.tables %}<span class="badge">JOIN</span>{% endif %}
               <span class="sl-row__chev">›</span>
@@ -613,7 +633,7 @@
              data-model="{{ t.facet_model }}"
              data-source="{{ t.facet_source }}"
              {% if t.has_more %}data-has-more="1"{% endif %}>
-          <button type="button" class="sl-row">
+          <button type="button" class="sl-row" aria-expanded="false">
             <span class="sl-row__letter" aria-hidden="true">{{ t.letter }}</span>
             <div class="sl-row__main">
               <div class="sl-row__name">{{ t.term }}</div>
@@ -672,7 +692,7 @@
    matches — the state a search across three registries creates constantly, and
    the one where a blank page is a lie. #}
 <p class="sl-empty" id="sl-noresults" hidden>Nothing matches that search.</p>
-<div class="sl-elsewhere" id="sl-elsewhere" hidden>
+<div class="sl-elsewhere" id="sl-elsewhere" aria-live="polite" hidden>
   <p class="sl-elsewhere__lede">Nothing here matches — but <span data-elsewhere-n></span>.</p>
   <div class="sl-elsewhere__jumps" data-elsewhere-jumps></div>
 </div>
@@ -712,6 +732,10 @@
         if (btn.closest('.sl-item.is-flat')) return;
         const item = btn.closest('.sl-item') || btn;
         item.classList.toggle('is-open');
+        // The row says whether its panel is open. It is a real <button> that
+        // toggles real content, and a screen reader had no way to know the
+        // click had done anything.
+        btn.setAttribute('aria-expanded', item.classList.contains('is-open') ? 'true' : 'false');
     });
 
     // A term row is worth opening only if it holds something the closed row
@@ -833,13 +857,63 @@
                 showActiveBucket();
                 refreshTabCounts();
                 syncBucketState();
+                syncUrl();
                 document.querySelectorAll(ROWS + '.is-open').forEach(r => {
-                    if (r.hidden) r.classList.remove('is-open');
+                    if (!r.hidden) return;
+                    r.classList.remove('is-open');
+                    const b = r.querySelector('.sl-row');
+                    if (b) b.setAttribute('aria-expanded', 'false');
                 });
                 trimRedundantDescriptions();
             },
         });
     }
+
+    // ── The view rides the URL ───────────────────────────────────────────
+    //    These tabs used to be real links, so the address bar named the tab you
+    //    were on, Back returned to the previous one and a copied link opened
+    //    where you were. Turning them into client-side buckets silently took
+    //    all three away: you could click Glossary and hand someone a link that
+    //    opened on Metrics.
+    //
+    //    pushState for the TAB, following /admin/access's note on the same
+    //    move — switching view is exactly what Back should undo, and
+    //    replaceState there "walked you out of the page". replaceState for the
+    //    QUERY, because pushing per keystroke would bury the page in history.
+    let urlTab = new URLSearchParams(location.search).get('tab') || 'models';
+
+    function syncUrl() {
+        const active = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
+        const tab = (active && active.getAttribute('data-own')) || 'models';
+        const q = ((document.getElementById('sl-search') || {}).value || '').trim();
+        const p = new URLSearchParams();
+        // The default tab keeps the BARE URL — one canonical address for the
+        // page, so a link to it and a click on its own tab agree.
+        if (tab !== 'models') p.set('tab', tab);
+        if (q) p.set('q', q);
+        const url = p.toString() ? location.pathname + '?' + p : location.pathname;
+        if (tab !== urlTab) {
+            history.pushState({ tab: tab }, '', url);
+            urlTab = tab;
+        } else {
+            history.replaceState({ tab: tab }, '', url);
+        }
+    }
+
+    // Back/Forward across those pushes. The tab is the only thing restored —
+    // the engine re-reads the box itself when we dispatch `input`.
+    window.addEventListener('popstate', () => {
+        const p = new URLSearchParams(location.search);
+        const tab = p.get('tab') || 'models';
+        urlTab = tab;
+        const btn = document.querySelector('#sl-tabs [data-own="' + tab + '"]');
+        if (btn && !btn.classList.contains('is-active')) btn.click();
+        const box = document.getElementById('sl-search');
+        if (box && box.value !== (p.get('q') || '')) {
+            box.value = p.get('q') || '';
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    });
 
     // Only the active bucket's block is on screen. The engine hides individual
     // ROWS; the wrappers are ours, or all three lists would stack.

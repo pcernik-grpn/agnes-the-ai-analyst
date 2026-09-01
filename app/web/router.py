@@ -4811,6 +4811,14 @@ async def semantic_layer_list(
         for m in rendered:
             slug = metric_model.get(str(m.get("id") or ""))
             m["facet_model"] = slug or _DIRECT_KEY
+            #: Stated on the ROW, not only filterable. The glossary rows beside
+            #: these have carried it since they were built; a metric row that
+            #: hid it meant you could narrow by Model and still not see the
+            #: answer without opening something. It also separates the pairs
+            #: that share a display name — the same concept defined once in a
+            #: document and once by hand is a real state, and the row was giving
+            #: a reader nothing to tell them apart with.
+            m["defined_in_label"] = model_titles.get(slug, "") if slug else _DIRECT_LABEL
             m["facet_domain"] = "" if slug else str(m.get("category") or "")
             m["facet_source"] = str(m.get("source") or "manual")
 
