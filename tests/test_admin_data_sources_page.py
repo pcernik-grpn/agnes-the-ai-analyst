@@ -1975,6 +1975,26 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
     # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
 
+    def test_run_options_carry_a_force_reprocess_checkbox_naming_the_document_count(self):
+        """The operator control that ignores the delta cursor entirely — a
+        checkbox on the run-options row, with one sentence naming the cost
+        (re-download/re-convert/re-run-LLM the WHOLE corpus, sized with the
+        card's own known document count, 12 per `_FILE_SOURCE`)."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert "Re-process everything (ignore the delta cursor)" in html
+        assert "all 12 documents" in html
+        assert "not just what changed" in html
+
+    def test_force_reprocess_help_falls_back_when_the_document_count_is_unknown(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["crawl"] = {}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert "every document" in html
+
     def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):
         """The button never disappears — even on an older/degraded cell
         shape (the fixture above carries no `schedule.in_agnes` at all) it

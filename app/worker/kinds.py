@@ -1240,6 +1240,15 @@ def _run_corpus_extraction(payload: dict) -> dict:
         not re-downloaded). The supported recovery path for a connection
         whose delta cursor ran past documents it never actually ingested —
         see ``connectors.sharepoint.crawler._apply_resync``.
+      - ``force_reprocess`` (optional, truthy) — ignores BOTH the persisted
+        deltaLinks and cTags for this one run, so every item is
+        re-downloaded, re-converted and re-ingested even when it looks
+        unchanged. The operator control for "re-process everything" — e.g.
+        a converter or anonymizer setting changed and the content on disk
+        did not. Unlike ``resync``, never written to the state file up
+        front: a run interrupted mid-way leaves the connection exactly as
+        resumable as it was before — see
+        ``connectors.sharepoint.crawler._crawl_drive``.
 
     Returns the crawl report (the same dict persisted as ``last_run`` in the
     connection's crawl state, so the job result and the state file can never
