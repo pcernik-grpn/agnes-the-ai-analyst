@@ -4077,6 +4077,23 @@
         "title": "DetachRequest",
         "type": "object"
       },
+      "DetectionDryRunRequest": {
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          }
+        },
+        "title": "DetectionDryRunRequest",
+        "type": "object"
+      },
       "DisablePluginRequest": {
         "description": "Optional body of the disable endpoint.\n\n``revoke_grants=True`` turns the disable into a one-action retirement:\nevery ``marketplace_plugin`` grant on the plugin is deleted in the same\ncall. Without it (or with no body at all \u2014 the pre-existing call shape)\ngrants are left intact, so a later re-enable restores the plugin for the\nsame groups.",
         "properties": {
@@ -48895,6 +48912,151 @@
           }
         },
         "summary": "Admin Resolve Contradiction",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/api/memory/admin/detection-dry-run": {
+      "post": {
+        "description": "Preview the transcript detector with the CURRENT saved policy (issue\n#1971 Part 4) \u2014 writes NOTHING to ``knowledge_items``. A \"Dry run\"\nbutton in the admin panel calls this and shows the result inline.\n\nNever fails on a DuckDB-backed instance even though the observability\nrow it also tries to record is Postgres-only: recording goes through\n``src.memory_detection_logging.record_detection_run``, which swallows\nthat failure (and any other) into one warning log line \u2014 this endpoint\nalways returns the preview, regardless of whether the run-log write\nsucceeded.",
+        "operationId": "admin_detection_dry_run_api_memory_admin_detection_dry_run_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/DetectionDryRunRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Payload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Detection Dry Run",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/api/memory/admin/detection-runs": {
+      "get": {
+        "description": "Recent corporate-memory detection runs (issue #1971 Part 3) \u2014 the\nadmin panel's \"How detection works\" observability list, newest first.\n\nPG-only: ``memory_detection_runs_repo()`` raises\n``RequiresPostgresBackend`` on a DuckDB-backed instance, translated to a\ntyped ``501`` by the app-wide handler in ``app/main.py`` \u2014 no bespoke\ntry/except needed here. The run PATHS themselves (the verification\nprocessor, the collector wrapper) never fail this way: they write\nthrough ``src.memory_detection_logging.record_detection_run``, which\ncatches this (and any other error) and degrades to one warning log line.",
+        "operationId": "admin_detection_runs_api_memory_admin_detection_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Per Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Detection Runs",
         "tags": [
           "memory"
         ]

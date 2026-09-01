@@ -2835,6 +2835,8 @@ interactive OAuth browser flow. The token is returned once and must be saved by 
 - /api/memory/admin/bulk-update
 - /api/memory/admin/contradictions
 - /api/memory/admin/contradictions/{contradiction_id}/resolve
+- /api/memory/admin/detection-dry-run
+- /api/memory/admin/detection-runs
 - /api/memory/admin/duplicate-candidates
 - /api/memory/admin/duplicate-candidates/resolve
 - /api/memory/admin/edit

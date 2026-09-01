@@ -44,6 +44,7 @@ from src.models.knowledge import (
     VerificationEvidence,
 )
 from src.models.knowledge_digests import KnowledgeDigest
+from src.models.memory_detection_runs import MemoryDetectionRun
 from src.models.lookup import (
     BqMetadataCache,
     ColumnMetadata,
@@ -165,6 +166,7 @@ __all__ = [
     "MCPUserSecret",
     "MarketplacePlugin",
     "MarketplaceRegistry",
+    "MemoryDetectionRun",
     "MemoryDomain",
     "MemoryDomainSuggestion",
     "MetricDefinition",

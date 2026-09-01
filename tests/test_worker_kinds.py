@@ -469,10 +469,92 @@ class TestCorporateMemoryHandler:
             "services.corporate_memory.collector.collect_all",
             lambda dry_run=False: calls.append(dry_run) or {},
         )
+        monkeypatch.setattr("src.memory_detection_logging.record_detection_run", lambda **kwargs: None)
 
         JOB_KINDS["corporate-memory"].handler({})
 
         assert calls == [False]
+
+    def test_records_a_detection_run_from_the_collector_stats(self, monkeypatch):
+        """issue #1971 Part 3: the scheduled collector wrapper used to
+        discard collect_all()'s return value entirely. Now it must record a
+        memory_detection_runs row from those stats."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr(
+            "services.corporate_memory.collector.collect_all",
+            lambda dry_run=False: {
+                "users_scanned": 4,
+                "items_extracted": 6,
+                "items_filtered": 2,
+                "items_db_inserted": 3,
+                "errors": [],
+            },
+        )
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})
+
+        assert len(recorded) == 1
+        call = recorded[0]
+        assert call["source"] == "claude_local_md"
+        assert call["sessions_scanned"] == 4
+        assert call["items_proposed"] == 6
+        assert call["items_filtered"] == 2
+        assert call["items_inserted"] == 3
+        assert call["items_routed_side_domain"] == 0
+        assert call["dry_run"] is False
+        assert call["error"] is None
+        assert call["started_at"] is not None
+        assert call["finished_at"] is not None
+
+    def test_never_raises_when_collect_all_returns_an_empty_dict(self, monkeypatch):
+        """The pre-existing mock in test_delegates_to_collect_all returns
+        `{}` — the handler must degrade gracefully, never crash on a
+        missing key."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr("services.corporate_memory.collector.collect_all", lambda dry_run=False: {})
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})  # must not raise
+
+        assert recorded[0]["sessions_scanned"] == 0
+        assert recorded[0]["error"] is None
+
+    def test_records_errors_from_the_stats_dict(self, monkeypatch):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr(
+            "services.corporate_memory.collector.collect_all",
+            lambda dry_run=False: {"errors": ["LLM error: LLMTimeoutError"]},
+        )
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})
+
+        assert recorded[0]["error"] == "LLM error: LLMTimeoutError"
 
 
 class TestJiraRefreshHandler:

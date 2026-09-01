@@ -1314,6 +1314,18 @@ _EXEMPT: dict[str, str] = {
         "one run's stored report/skip list for the source card's run drawer — admin "
         "display primitive, no analyst CLI/MCP analogue"
     ),
+    # issue #1971 Part 3/4 — corporate-memory detection observability. Same
+    # exemption class as the SharePoint extraction run-history rows above:
+    # an admin panel's own data (run counters, a policy fingerprint) and an
+    # admin diagnostic trigger, neither an analyst query surface.
+    "/api/memory/admin/detection-runs": (
+        "run history for the memory-curator detection panel — admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/memory/admin/detection-dry-run": (
+        "admin-triggered dry run of the detection pipeline that writes nothing to "
+        "knowledge_items — admin maintenance/diagnostic op, mirrors the "
+        "run-corporate-memory exemption; no analyst CLI/MCP analogue"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"

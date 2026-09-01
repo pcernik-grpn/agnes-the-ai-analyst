@@ -3524,6 +3524,20 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}",
+    # Corporate-memory detection observability (issue #1971 Part 3/4) — same
+    # shape as the extraction-observability trio above: read-only run
+    # history backed by a PG-only table (`memory_detection_runs`), so its
+    # per-backend behaviour IS the point and is asserted directly (200 +
+    # shape on PG, typed 501 on DuckDB, 403 for a non-admin) by
+    # tests/test_memory_detection_runs_api.py (DuckDB) and
+    # tests/db_pg/test_memory_detection_runs_api_pg.py (PG); not duplicated
+    # in this generic smoke sweep. The dry-run trigger writes nothing to
+    # knowledge_items and answers identically on both backends by
+    # construction (its optional run-log write degrades to a warning on
+    # DuckDB rather than changing the response), covered by
+    # tests/test_memory_detection_dry_run.py.
+    "GET /api/memory/admin/detection-runs",
+    "POST /api/memory/admin/detection-dry-run",
     # The config read-out touches no run rows at all (it reads instance
     # config + the switch registry + the connection's own scopes), so it
     # answers identically on both backends by construction; covered by
