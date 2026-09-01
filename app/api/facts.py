@@ -525,9 +525,9 @@ def _refuse_source_acl_excluded_documents(body: "FactsIngestRequest") -> None:
     cannot land claims for content Agnes would have refused to store.
 
     A no-op for every ``documents[]`` row whose ``corpus_id`` is not a
-    SharePoint mirrored-scope/active-zone collection (``acl_mirroring`` off,
-    or a plain collection) — :func:`source_acl_index_for_collection` returns
-    ``None`` and the row is skipped.
+    SharePoint mirrored-scope/active-zone collection (the ``sharepoint``
+    switch off, or a plain collection) — :func:`source_acl_index_for_collection`
+    returns ``None`` and the row is skipped.
     """
     from connectors.sharepoint.ingest_gate import source_acl_index_for_collection, source_acl_refusal
 

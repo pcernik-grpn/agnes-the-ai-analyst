@@ -32,6 +32,16 @@ CORPUS_ID = "col_test"
 BASE = "/api/admin/sharepoint/connections"
 
 
+def _producer_auth(conn_id: str, collection_id: str) -> dict:
+    """Doc-sync uploads ride the producer's scoped credential — the scope-
+    confirmed collection refuses interactive uploads with a typed 409
+    (`collection_source_managed`), and the crawler is these tests' real
+    caller anyway."""
+    from app.auth.producer_token import mint_producer_token
+
+    return _auth(mint_producer_token(connection_id=conn_id, collection_ids=[collection_id], ttl_seconds=3600))
+
+
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -265,6 +275,7 @@ def _create_connection(client, token, *, name="corp-sharepoint"):
 
 def test_changes_404_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     r = client.get(f"{BASE}/does-not-exist/changes", headers=_auth(token))
     assert r.status_code == 404
     assert r.json()["detail"] == "connection_not_found"
@@ -272,6 +283,7 @@ def test_changes_404_for_unknown_connection(tmp_path, monkeypatch, pg_engine):
 
 def test_changes_empty_page_when_no_scopes_confirmed(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     r = client.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
     assert r.status_code == 200
@@ -284,6 +296,7 @@ def test_full_fixture_added_updated_renamed_deleted(tmp_path, monkeypatch, pg_en
     import io
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
 
     scope = client.post(
@@ -294,7 +307,7 @@ def test_full_fixture_added_updated_renamed_deleted(tmp_path, monkeypatch, pg_en
     assert scope.status_code == 201, scope.text
     collection_id = scope.json()["collection_id"]
 
-    upload_kwargs = dict(headers=_auth(token))
+    upload_kwargs = dict(headers=_producer_auth(conn_id, collection_id))
 
     # 1. added
     r1 = client.post(
@@ -354,6 +367,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
     import io
 
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     scope = client.post(
         f"{BASE}/{conn_id}/scopes",
@@ -367,7 +381,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
             f"/api/collections/{collection_id}/files",
             files=[("files", (f"f{i}.md", io.BytesIO(f"content-{i}".encode()), "text/markdown"))],
             data={"paths": f"docs/f{i}.md"},
-            headers=_auth(token),
+            headers=_producer_auth(conn_id, collection_id),
         )
         assert r.status_code == 201, r.text
 
@@ -391,6 +405,7 @@ def test_changes_limit_and_cursor_paginate_the_http_endpoint(tmp_path, monkeypat
 
 def test_malformed_cursor_is_typed_400(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     conn_id = _create_connection(client, token)
     r = client.get(f"{BASE}/{conn_id}/changes", params={"cursor": "garbage"}, headers=_auth(token))
     assert r.status_code == 400

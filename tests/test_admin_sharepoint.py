@@ -5,6 +5,17 @@ error (surface absence rather than fail, per spec) vs. a real Graph browse
 with the Graph transport mocked, scope->collection creation idempotency
 (re-confirming a scope reuses the same collection), the no-group ("indexed
 but invisible") warning, and the producer-handoff corpus-map endpoint.
+
+2026-09-01: the whole router is gated by the single ``sharepoint`` switch
+(``app/api/admin_sharepoint.py``'s module-level ``_require_sharepoint_enabled``
+dependency, 409 ``feature_disabled`` when off) — see ``TestSharePointGate``
+below for that gate itself. The module-level ``_sharepoint_enabled_by_default``
+fixture turns the switch ON for every OTHER test in this file via
+``AGNES_SHAREPOINT_ENABLED`` so the rest of the suite exercises the routes'
+own behavior, not the gate; a class that needs to control the switch itself
+(``TestAclSyncTrigger``, ``TestSubtreeSweepTrigger``, ``TestExtractionTrigger``,
+``TestExtractionRunDue``) clears the env var in its own autouse fixture and
+drives the flag through the mocked ``get_value`` config instead.
 """
 
 from __future__ import annotations
@@ -19,6 +30,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 BASE = "/api/admin/sharepoint/connections"
+
+
+@pytest.fixture(autouse=True)
+def _sharepoint_enabled_by_default(monkeypatch):
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
 
 
 def _auth(token: str) -> dict:
@@ -1563,10 +1579,6 @@ class TestAclSyncTrigger:
 
     ACL_SYNC = "{base}/{cid}/acl-sync"
 
-    @pytest.fixture(autouse=True)
-    def _clear_acl_mirroring_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
             self.ACL_SYNC.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
@@ -1577,14 +1589,22 @@ class TestAclSyncTrigger:
         r = seeded_app["client"].post(self.ACL_SYNC.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+    def test_409_when_flag_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface before any
+        per-route work — including the connection lookup — so an unknown
+        connection id gets the same 409 as a real one. Clears the
+        module-level `_sharepoint_enabled_by_default` env override so the
+        mocked `get_value` config is what actually decides."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         r = seeded_app["client"].post(
             self.ACL_SYNC.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
-        assert r.status_code == 404
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-flag-off")
@@ -1593,7 +1613,7 @@ class TestAclSyncTrigger:
         assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-happy")
         r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1608,7 +1628,7 @@ class TestAclSyncTrigger:
         assert job["payload_json"] == {"connection_id": conn_id}
 
     def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-dup")
         first = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1627,10 +1647,6 @@ class TestSubtreeSweepTrigger:
 
     SWEEP = "{base}/{cid}/subtree-sweep"
 
-    @pytest.fixture(autouse=True)
-    def _clear_acl_mirroring_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
             self.SWEEP.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
@@ -1641,14 +1657,17 @@ class TestSubtreeSweepTrigger:
         r = seeded_app["client"].post(self.SWEEP.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+    def test_409_when_flag_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         r = seeded_app["client"].post(
             self.SWEEP.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
-        assert r.status_code == 404
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-flag-off")
@@ -1657,7 +1676,7 @@ class TestSubtreeSweepTrigger:
         assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-happy")
         r = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1672,7 +1691,7 @@ class TestSubtreeSweepTrigger:
         assert job["payload_json"] == {"connection_id": conn_id}
 
     def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-dup")
         first = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1686,7 +1705,7 @@ class TestSubtreeSweepTrigger:
         """A sweep trigger and an acl-sync trigger for the SAME connection
         must never dedup against each other — they are different job kinds
         with different idempotency-key prefixes."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-vs-acl-sync")
         sweep = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -2064,11 +2083,11 @@ def _config_get_value(config: dict):
 
 
 _ENABLED_EXTRACTION_CONFIG = {
+    "sharepoint": {"enabled": True},
     "extraction": {
-        "enabled": True,
         "producer": {"command": "python -m fake_producer"},
         "timeout_s": 60,
-    }
+    },
 }
 
 
@@ -2080,12 +2099,14 @@ class TestExtractionTrigger:
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        # AGNES_EXTRACTION_ENABLED / AGNES_EXTRACTION_PRODUCER_COMMAND /
-        # AGNES_EXTRACTION_PRODUCER_MODULE all win over the mocked
-        # get_value config — clear them so each test's fake config is what
-        # actually decides, except the one test below that sets one on
-        # purpose.
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        # AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE
+        # win over the mocked get_value config — clear them so each test's
+        # fake config is what actually decides, except the one test below
+        # that sets one on purpose. AGNES_SHAREPOINT_ENABLED is left alone
+        # (module-level `_sharepoint_enabled_by_default` keeps it ON) so
+        # test_requires_admin/test_requires_auth still reach the per-route
+        # auth dependency; the two tests below that need it OFF clear it
+        # themselves.
         monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
         monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
 
@@ -2099,25 +2120,40 @@ class TestExtractionTrigger:
         r = seeded_app["client"].post(self.EXTRACT.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_before_any_work(self, seeded_app, monkeypatch):
-        """404 fires even with extraction fully disabled — connection
-        existence is checked BEFORE the feature-usable gate."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+    def test_404_for_unknown_connection_before_extraction_readiness(self, seeded_app, monkeypatch):
+        """404 fires even with NO producer configured — connection
+        existence is checked BEFORE the extraction-readiness gate. Requires
+        the sharepoint switch itself ON (the router-level gate runs first
+        and unconditionally, so an unknown connection with the WHOLE
+        connector off gets 409, not 404 — see the sibling test below)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         r = seeded_app["client"].post(
             self.EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
         assert r.status_code == 404
 
-    def test_refuses_when_extraction_disabled(self, seeded_app, monkeypatch):
+    def test_409_when_sharepoint_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface before any
+        per-route work — including the connection lookup."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_refuses_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-disabled")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "extraction_disabled"
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_refuses_when_no_producer_configured(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-producer")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -2128,7 +2164,7 @@ class TestExtractionTrigger:
         """A deployment that activates extraction purely via env (the
         Terraform-rendered ``/opt/agnes/.env`` case) needs no
         ``extraction.producer`` block in ``instance.yaml`` at all."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-env-producer")
@@ -2187,25 +2223,36 @@ class TestExtractionRunDue:
 
     RUN_DUE = "/api/admin/sharepoint/extraction/run-due"
 
-    @pytest.fixture(autouse=True)
-    def _clear_extraction_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(self.RUN_DUE, headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 403
 
-    def test_noop_when_extraction_disabled(self, seeded_app, monkeypatch):
-        config = {
-            "extraction": {
-                **_ENABLED_EXTRACTION_CONFIG["extraction"],
-                "enabled": False,
-                "schedule": "every 15m",
-            }
-        }
+    def test_409_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface (409
+        feature_disabled) before this route's own body — including its
+        usually-graceful "not usable yet" no-op — ever runs. The scheduler
+        (which polls this endpoint unconditionally once a schedule is
+        configured) tolerates a non-2xx status by logging and moving on
+        (`services/scheduler/__main__.py`'s dispatch loop), so this is a
+        louder signal than the old no-op, not a functional break."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         _create_connection(c, seeded_app["admin_token"], name="due-off")
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_noop_when_no_producer_configured(self, seeded_app, monkeypatch):
+        """Sharepoint itself ON (router-level gate passes), but no producer
+        configured — the route's OWN readiness no-op still applies, a clean
+        200 rather than an error, since this endpoint fires unconditionally
+        on its own cadence once a schedule is configured."""
+        config = {"sharepoint": {"enabled": True}, "extraction": {"schedule": "every 15m"}}
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        _create_connection(c, seeded_app["admin_token"], name="due-no-producer")
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["count"] == 0
@@ -2220,7 +2267,10 @@ class TestExtractionRunDue:
         assert r.json()["count"] == 0
 
     def test_dispatches_a_connection_never_run_before(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="due-never-run")
@@ -2234,7 +2284,10 @@ class TestExtractionRunDue:
         assert any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
 
     def test_skips_a_connection_not_due_yet(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="due-not-yet")
@@ -2246,7 +2299,10 @@ class TestExtractionRunDue:
         assert second.json()["dispatched"] == []
 
     def test_ignores_non_sharepoint_connections(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         c.post(

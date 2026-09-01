@@ -32,7 +32,7 @@ def acl_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("AGNES_DB_URL", raising=False)
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "unused-because-get-app-token-is-faked")
 
     from src.db import close_system_db, get_system_db
@@ -454,14 +454,14 @@ class TestStalenessSuspension:
 
 class TestFeatureFlagOff:
     def test_flag_off_is_a_clean_noop(self, acl_env, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "false")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "false")
         conn_id = _make_connection()
         col_id = _make_collection("Flag Off Col")
         _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_id, access_mode="mirrored")
 
         result = acl_sync.run_acl_sync({"connection_id": conn_id})
 
-        assert result == {"skipped": "acl_mirroring disabled"}
+        assert result == {"skipped": "sharepoint disabled"}
         assert _grants_for_collection(col_id) == []
         assert _group_by_name("entra:g-1") is None
 

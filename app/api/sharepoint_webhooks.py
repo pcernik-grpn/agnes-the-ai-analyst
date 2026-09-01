@@ -38,12 +38,12 @@ Two request shapes, both ``POST`` to the same route (Graph's own contract):
   very first job of a burst, never rewritten by a later dedup hit, which is
   exactly the debounce this route wants.
 
-Feature-gated by ``extraction_webhook.enabled`` (default OFF) via
-:func:`app.auth.access.require_extraction_webhook_enabled` — the whole
-router 404s when off, same "surface doesn't exist" posture as
-``app/api/facts.py``. This is deliberately the ONLY gate: Graph is the
-caller, so there is no session/PAT to require, and admission control is the
-per-notification ``clientState`` check above, not a ``Depends`` chain.
+Feature-gated by the single ``sharepoint`` switch (default OFF) via
+:func:`app.auth.access.require_sharepoint_enabled` — the whole router 404s
+when off, same "surface doesn't exist" posture as ``app/api/facts.py``. This
+is deliberately the ONLY gate: Graph is the caller, so there is no
+session/PAT to require, and admission control is the per-notification
+``clientState`` check above, not a ``Depends`` chain.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from app.auth.access import require_extraction_webhook_enabled
+from app.auth.access import require_sharepoint_enabled
 from src.audit_helpers import log_safe
 from src.repositories import source_connections_repo
 
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/api/webhooks",
     tags=["sharepoint-webhooks"],
-    dependencies=[Depends(require_extraction_webhook_enabled)],
+    dependencies=[Depends(require_sharepoint_enabled)],
 )
 
 #: Real Graph delivery payloads are small JSON documents (a handful of
@@ -192,7 +192,7 @@ def _dispatch_extraction(connection_id: str, row: Dict[str, Any], *, verified_co
     manual admin trigger uses, plus a short debounce
     (:data:`_WEBHOOK_DEBOUNCE_SECONDS`) so a burst of notifications
     coalesces onto one run. Silently skips the enqueue when the feature
-    isn't usable yet (``extraction.enabled`` off, or no producer
+    isn't usable yet (``sharepoint.enabled`` off, or no producer
     configured) — same readiness gate the manual trigger checks BEFORE
     enqueueing, so a webhook burst never pollutes the queue with jobs
     doomed to fail (`app/worker/kinds.py::_run_corpus_extraction` would

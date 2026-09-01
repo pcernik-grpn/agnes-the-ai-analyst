@@ -749,8 +749,9 @@ same way the admin UI does (`connectors.sharepoint.settings
 .resolve_sharepoint_settings`, vault-first then the server's
 `SHAREPOINT_CERT_PRIVATE_KEY` env var) and shells out to the
 operator-configured `extraction.producer.command`/`.module`
-(`instance.yaml`, off by default via `extraction.enabled` — a registered
-switch, `AGNES_EXTRACTION_ENABLED`) under a bounded timeout, with the
+(`instance.yaml`, off by default alongside the rest of the SharePoint
+connector via the `sharepoint` switch, `AGNES_SHAREPOINT_ENABLED`) under a
+bounded timeout, with the
 resolved credentials reaching the subprocess only via its child
 environment — never argv, never logged. That child env is a curated
 non-secret allowlist (`PATH`, locale/timezone/tempdir/TLS/proxy vars) plus
@@ -760,7 +761,7 @@ parent environment, so no other instance secret (vault key, LLM API key,
 DB DSN, ...) reaches an external, admin-configurable binary. The producer
 itself (the operator's own producer, adopted per spec §7.1) is not
 vendored into this repo. Off by default and additive: an instance that
-never sets `extraction.enabled`/`AGNES_WORKER_LANES` is unaffected.
+never sets `sharepoint.enabled`/`AGNES_WORKER_LANES` is unaffected.
 
 Deployment: the `worker` Dockerfile build target (an extension point,
 `EXTRACTION_PRODUCER_INSTALL` build-arg, for bundling a producer's runtime

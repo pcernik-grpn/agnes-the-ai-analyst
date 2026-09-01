@@ -574,26 +574,26 @@ class TestCorpusExtractionHandler:
     """``corpus-extraction`` (spec §7.5 / §16 step 7) — the producer-
     invocation seam. No test here launches a real subprocess
     (``subprocess.run`` is monkeypatched) or touches a real vault — these
-    cover only the handler's OWN responsibilities: the ``extraction.enabled``
+    cover only the handler's OWN responsibilities: the ``sharepoint.enabled``
     / producer-config gate, credential resolution through the EXISTING
     SharePoint settings resolver, secrets landing in the child env (never
     argv), and timeout/failure handling."""
 
     _ENABLED_CONFIG = {
+        "sharepoint": {"enabled": True},
         "extraction": {
-            "enabled": True,
             "producer": {"command": "python -m fake_producer"},
             "timeout_s": 60,
-        }
+        },
     }
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        """The `extraction` switch's env var (`AGNES_EXTRACTION_ENABLED`)
+        """The `sharepoint` switch's env var (`AGNES_SHAREPOINT_ENABLED`)
         wins over the mocked `get_value` config in every test here — clear
         it so each test's `_config_get_value` fake is what actually decides
         the gate, not whatever happens to be in the runner's shell env."""
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
 
     def _register(self):
         from app.worker.kinds import register_all_kinds
@@ -606,11 +606,11 @@ class TestCorpusExtractionHandler:
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         handler = self._register()
 
-        with pytest.raises(RuntimeError, match="extraction.enabled"):
+        with pytest.raises(RuntimeError, match="sharepoint.enabled"):
             handler({"connection_id": "conn1"})
 
     def test_missing_producer_config_raises(self, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         handler = self._register()
 
         with pytest.raises(RuntimeError, match="no producer configured"):
@@ -814,14 +814,14 @@ class TestCorpusExtractionHandler:
             "app.instance_config.get_value",
             _config_get_value(
                 {
+                    "sharepoint": {"enabled": True},
                     "extraction": {
-                        "enabled": True,
                         "producer": {
                             "command": "python -m fake_producer",
                             "env_passthrough": ["MY_CUSTOM_PRODUCER_VAR"],
                         },
                         "timeout_s": 60,
-                    }
+                    },
                 }
             ),
         )
@@ -853,7 +853,10 @@ class TestCorpusExtractionHandler:
         monkeypatch.setattr(
             "app.instance_config.get_value",
             _config_get_value(
-                {"extraction": {"enabled": True, "producer": {"module": "fake_producer.run"}, "timeout_s": 30}}
+                {
+                    "sharepoint": {"enabled": True},
+                    "extraction": {"producer": {"module": "fake_producer.run"}, "timeout_s": 30},
+                }
             ),
         )
         self._stub_connection_and_settings(monkeypatch)
@@ -1027,12 +1030,12 @@ class TestCorpusExtractionHandler:
             "app.instance_config.get_value",
             _config_get_value(
                 {
+                    "sharepoint": {"enabled": True},
                     "extraction": {
-                        "enabled": True,
                         "producer": {"command": "python -m fake_producer"},
                         "timeout_s": 60,
                         "anonymization": {"hmac_key_env": "SOME_UNRELATED_SECRET"},
-                    }
+                    },
                 }
             ),
         )
@@ -1057,12 +1060,12 @@ class TestCorpusExtractionHandler:
             "app.instance_config.get_value",
             _config_get_value(
                 {
+                    "sharepoint": {"enabled": True},
                     "extraction": {
-                        "enabled": True,
                         "producer": {"command": "python -m fake_producer"},
                         "timeout_s": 60,
                         "anonymization": {"hmac_key_env": "SHAREPOINT_CERT_PRIVATE_KEY"},
-                    }
+                    },
                 }
             ),
         )

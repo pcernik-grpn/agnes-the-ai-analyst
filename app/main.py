@@ -2845,7 +2845,14 @@ def create_app() -> FastAPI:
         from app.instance_config import (
             get_guardrails_enabled,
             get_guardrails_llm_provider_ready,
+            warn_retired_sharepoint_flags,
         )
+
+        # One line per retired SharePoint switch still set in this instance's
+        # config. Nothing reads those keys since they collapsed into
+        # `sharepoint.enabled`, so without this an upgrade turns the connector
+        # off silently — see warn_retired_sharepoint_flags.
+        warn_retired_sharepoint_flags()
 
         if get_guardrails_enabled() and not get_guardrails_llm_provider_ready():
             logger.warning("=" * 60)
@@ -3505,7 +3512,7 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health/detailed",
         "/api/version",
         # Microsoft Graph change-notification receiver — Graph is the only
-        # caller, gated by extraction_webhook.enabled (404 when off), never
+        # caller, gated by the sharepoint switch (404 when off), never
         # a session/PAT (see app/api/sharepoint_webhooks.py). It can never
         # answer 401/403.
         "/api/webhooks/sharepoint/{connection_id}",

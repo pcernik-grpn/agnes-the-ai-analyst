@@ -31,10 +31,10 @@ Matching semantics (locked, do not relax):
   stable-id-matched either (only ``kind=="file"`` entries carry one).
 
 The gate is a strict no-op — :func:`source_acl_index_for_collection` returns
-``None`` — unless BOTH ``acl_mirroring.enabled`` is on AND the collection is
-actually one of a SharePoint connection's mirrored-scope or active-zone
-collections. Pure, uncached functions: both call sites are request-scoped and
-a config read is one repo call.
+``None`` — unless BOTH the single ``sharepoint`` switch is on AND the
+collection is actually one of a SharePoint connection's mirrored-scope or
+active-zone collections. Pure, uncached functions: both call sites are
+request-scoped and a config read is one repo call.
 """
 
 from __future__ import annotations
@@ -88,14 +88,14 @@ def _scope_exclusions(scope: Dict[str, Any], *, under: Optional[str] = None) -> 
 
 def source_acl_index_for_collection(collection_id: str) -> Optional[SourceAclIndex]:
     """Build the ACL index for ``collection_id``, or ``None`` when the gate
-    does not apply — ``acl_mirroring`` is off, or the collection is not one
-    of a SharePoint connection's mirrored-scope or ACTIVE-zone collections
-    (a plain admin-created collection, a manual-mode scope, or a DISSOLVED
-    zone's collection — the sweep's own retroactive cleanup owns that case,
-    not this gate)."""
+    does not apply — the ``sharepoint`` switch is off, or the collection is
+    not one of a SharePoint connection's mirrored-scope or ACTIVE-zone
+    collections (a plain admin-created collection, a manual-mode scope, or a
+    DISSOLVED zone's collection — the sweep's own retroactive cleanup owns
+    that case, not this gate)."""
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
         return None
 
     for connection in source_connections_repo().list(source_type="sharepoint"):

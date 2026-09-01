@@ -115,8 +115,11 @@ def can_access_table(
          (session JWT, scheduler, local-dev) never carry the key and read
          as ``'all'`` — see ``_credential_surface``.
       3. **Stack-gated**: the table must belong to at least one data
-         package in the user's stack — auto-membership: required ∪
-         available, no subscription needed (``StackResolver.stack``).
+         package in the user's stack (``StackResolver.stack``, whose
+         formula forks on ``features.stack_auto_membership`` — default ON
+         since Wave 0, 2026-08: auto-membership, required ∪ available, no
+         subscription needed; explicit classic opt-out: required ∪
+         subscribed-available).
          Per-table resource_grants alone NO LONGER grant analyst visibility — the
          unified-stack design routes all analyst access through data
          packages. Admins manage access by adding tables to a package +
@@ -272,9 +275,10 @@ def get_accessible_tables(
     Stack-gated for analysts: the set is
       * tables belonging to data packages in the user's stack
         (``StackResolver.stack``, whose formula forks on
-        ``features.stack_auto_membership`` — classic default: required ∪
-        subscribed-available; auto: every grant on the caller's groups,
-        regardless of subscription). This is the query-authorization
+        ``features.stack_auto_membership`` — auto-membership, the default
+        since Wave 0: every grant on the caller's groups, regardless of
+        subscription; explicit classic opt-out: required ∪
+        subscribed-available). This is the query-authorization
         boundary; a local parquet copy is a separate, narrower concern
         handled by the manifest's per-table ``server_only`` overlay
         (`agnes pull` skip), not by this function.
