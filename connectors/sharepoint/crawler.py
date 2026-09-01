@@ -41,6 +41,17 @@ outlives its access token, meets 429/503, and gets killed mid-pass):
   — a crash costs re-work, never coverage. Re-ingesting an already-ingested
   item is a no-op: the ingest path matches on ``(collection, stable_id)``
   and an unchanged sha256 against an indexed row skips re-chunking.
+* **A per-item failure never advances past itself.** A page that finishes
+  cleanly still writes its deltaLink even when one of ITS rows failed to
+  download/convert/anonymize/ingest — that is correct, the alternative pins
+  the whole drive on one bad file. What is NOT correct is forgetting the
+  failure: Graph's delta feed only re-offers an item when it CHANGES, so an
+  item nobody touches again would otherwise never come back around. Every
+  such failure is recorded in the state file's ``failed_items`` and replayed
+  from there on every future run, independent of what delta reports, until
+  it either succeeds (the entry is cleared) or exhausts
+  :data:`_MAX_ITEM_RETRY_ATTEMPTS` (recorded as given-up — still visible in
+  the state file and the run report, never silently dropped).
 * **Oversize accounting.** A file over the size cap is skipped, counted, and
   its bytes reported — "we indexed the corpus" and "we indexed the small
   half of it" must never look the same in the report. Every other refusal
@@ -153,6 +164,13 @@ _OVERSIZE_SAMPLE = 20
 _RECENT_ACTIVITY_SAMPLE = 5
 #: Delta page size asked of Graph — also the state-checkpoint granularity.
 _DELTA_PAGE_SIZE = 200
+#: How many passes a single item is retried through the failure queue (see
+#: the module docstring's "a per-item failure never advances past itself")
+#: before it is given up on. Bounds the cost of a permanently-broken file
+#: (a corrupt document that will never convert) at a handful of retries per
+#: run rather than forever; crossing it is recorded, never silent — see
+#: :func:`_note_retry`.
+_MAX_ITEM_RETRY_ATTEMPTS = 5
 #: Streaming download chunk.
 _DOWNLOAD_CHUNK = 1 << 20
 
@@ -409,6 +427,10 @@ def load_state(connection_id: str) -> Dict[str, Any]:
             )
     state.setdefault("delta_links", {})
     state.setdefault("ctags", {})
+    #: ``stable_id -> {state_key, path, item, attempts, ..., given_up}`` —
+    #: see the module docstring's "a per-item failure never advances past
+    #: itself" and :func:`_note_retry` / :func:`_retry_failed_items`.
+    state.setdefault("failed_items", {})
     return state
 
 
@@ -588,6 +610,28 @@ def _skip_total(stats: "CrawlStats") -> int:
     )
 
 
+def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The STANDING view of the item-failure queue, read straight from the
+    state file rather than this run's own counters — so an operator sees
+    "3 documents are stuck" on every report from here on, not only on the
+    run where the third one crossed the retry bound.
+
+    ``pending`` still gets retried every run; ``given_up`` stopped being
+    retried after :data:`_MAX_ITEM_RETRY_ATTEMPTS` failures and needs a
+    human (fix the file, or force a ``resync`` — see :func:`_apply_resync`).
+    """
+    failed_items = state.get("failed_items") or {}
+    given_up = [entry for entry in failed_items.values() if isinstance(entry, dict) and entry.get("given_up")]
+    pending = len(failed_items) - len(given_up)
+    return {
+        "pending": pending,
+        "given_up": len(given_up),
+        "given_up_sample": [
+            {"path": entry.get("path"), "attempts": entry.get("attempts")} for entry in given_up[:_OVERSIZE_SAMPLE]
+        ],
+    }
+
+
 def _record_status_for(exc: BaseException) -> str:
     """Severity-first outcome for a crawl that raised.
 
@@ -646,6 +690,13 @@ class CrawlStats:
     retry_wait_s: float = 0.0
     token_refreshes: int = 0
     delta_resyncs: int = 0
+    #: Items replayed from a PRIOR run's failure queue that succeeded this
+    #: time (cleared from ``failed_items``) / that hit :data:`_MAX_ITEM_
+    #: RETRY_ATTEMPTS` and were given up on THIS run. Not the same axis as
+    #: ``errors`` above — a fresh failure this run is counted there; these
+    #: two are about the queue of PAST failures. See :func:`_note_retry`.
+    item_retry_recovered: int = 0
+    item_retry_given_up: int = 0
     scopes: int = 0
     drives: int = 0
     downloads: int = 0
@@ -854,6 +905,13 @@ class CrawlStats:
             "retry_wait_s": round(self.retry_wait_s, 1),
             "token_refreshes": self.token_refreshes,
             "delta_resyncs": self.delta_resyncs,
+            # The item-failure queue THIS run touched — how many prior
+            # failures finally landed, and how many just crossed the retry
+            # bound. `retry_backlog` (below, added by the caller once the
+            # state file is final) is the standing count an operator reads
+            # to know whether anything is still stuck.
+            "item_retry_recovered": self.item_retry_recovered,
+            "item_retry_given_up": self.item_retry_given_up,
             # What the pool was ALLOWED to do, what the tenant let it do, and
             # what it actually did. `max_in_flight` below `effective_max`
             # means something other than the knob bounded the run; a non-zero
@@ -1737,6 +1795,66 @@ def _prepare_document(
     return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256)
 
 
+def _note_retry(
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    stable_id: str,
+    *,
+    target: DriveTarget,
+    item: Dict[str, Any],
+    path: str,
+) -> None:
+    """Record one failed pass over ``stable_id`` so it is retried on a
+    future run regardless of what the delta feed offers next — see the
+    module docstring's "a per-item failure never advances past itself".
+
+    Stores the item dict AS SEEN at failure time (not a fresh Graph
+    fetch): it already carries everything :func:`_process_item` needs to
+    retry — id, name, parentReference, size, mimeType, cTag — so a retry
+    costs one extra download attempt, not a second round-trip through the
+    delta/metadata API. Idempotent to call again on a repeat failure: the
+    attempt counter accumulates across runs (and across a same-run retry
+    replay landing on the same item twice), it is never reset except by a
+    success (:func:`_clear_retry`) or an operator-requested resync.
+    """
+    with _state_lock:
+        failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
+        entry = failed_items.get(stable_id)
+        if not isinstance(entry, dict):
+            entry = {"first_failed_at": _now_iso()}
+        entry["state_key"] = target.state_key
+        entry["item"] = item
+        entry["path"] = path
+        entry["last_failed_at"] = _now_iso()
+        attempts = int(entry.get("attempts", 0)) + 1
+        entry["attempts"] = attempts
+        just_exhausted = attempts >= _MAX_ITEM_RETRY_ATTEMPTS and not entry.get("given_up")
+        if just_exhausted:
+            entry["given_up"] = True
+        failed_items[stable_id] = entry
+    if just_exhausted:
+        stats.add(item_retry_given_up=1)
+        logger.warning(
+            "sharepoint crawl: giving up on %s after %d failed attempts — it stays out of the "
+            "collection until an operator intervenes (fix the file, or run a resync); the state "
+            "file and the run report keep the record",
+            path,
+            attempts,
+        )
+
+
+def _clear_retry(state: Dict[str, Any], stable_id: str) -> bool:
+    """Drop ``stable_id`` from the failure queue — it just ingested cleanly,
+    however it got here (a normal delta row or a queued retry). Returns
+    whether it was actually IN the queue, so a caller can tell "this was a
+    prior failure that just recovered" from "this item never failed"."""
+    with _state_lock:
+        failed_items = state.get("failed_items")
+        if not failed_items:
+            return False
+        return failed_items.pop(stable_id, None) is not None
+
+
 async def _process_item(
     item: Dict[str, Any],
     *,
@@ -1830,6 +1948,7 @@ async def _process_item(
             stats.add(errors=1)
             outcome_label = "download_failed"
             logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
         try:
@@ -1850,14 +1969,19 @@ async def _process_item(
         if prepared.outcome == "convert_failed":
             stats.add(convert_failed=1, errors=1)
             outcome_label = "convert_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
         if prepared.outcome == "convert_empty":
+            # Not a failure to retry: the document converted fine and
+            # genuinely has no text. Unlike the other three outcomes here,
+            # running it through the pipeline again cannot change the answer.
             stats.add(convert_failed=1)
             outcome_label = "convert_empty"
             return
         if prepared.outcome == "anonymize_failed":
             stats.add(anonymize_failed=1)
             outcome_label = "anonymize_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
         try:
@@ -1875,6 +1999,7 @@ async def _process_item(
             stats.add(errors=1)
             outcome_label = "ingest_failed"
             logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
         outcome_label = "new" if was_new else "changed"
@@ -1891,6 +2016,10 @@ async def _process_item(
         if ctag:
             with _state_lock:
                 ctags[stable_id] = ctag
+        # However it got here — a normal delta row or a queued retry — it
+        # just ingested cleanly, so it owes the failure queue nothing more.
+        if _clear_retry(state, stable_id):
+            stats.add(item_retry_recovered=1)
     finally:
         stats.exit_item_activity(activity_token, path, outcome_label)
 
@@ -2170,6 +2299,78 @@ def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+async def _retry_failed_items(
+    target: DriveTarget,
+    *,
+    ctx: _ScopeContext,
+    transport: GraphTransport,
+    ingestor: _Ingestor,
+    connection_id: str,
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    max_file_mb: int,
+    anonymization_key: Optional[bytes],
+    detector: Any,
+    deadline: Optional[_Deadline],
+    recorder: Optional["_RunRecorder"],
+) -> None:
+    """Replay every item THIS drive previously failed on, before asking
+    Graph for what changed.
+
+    This is the other half of the fix: Graph's delta feed only re-offers an
+    item when it CHANGES, so a file that failed to download/convert/
+    anonymize/ingest — and nobody has touched since — would otherwise never
+    be handed to us again once its page's deltaLink moves past it. Each
+    entry in ``failed_items`` carries the item dict as last seen, which is
+    everything :func:`_process_item` needs to try it again; success clears
+    the entry (:func:`_clear_retry`), a repeat failure bumps ``attempts``
+    (:func:`_note_retry`) and re-queues it, and an item already at
+    :data:`_MAX_ITEM_RETRY_ATTEMPTS` is skipped here — it stays recorded,
+    just not retried every run.
+
+    Sequential and outside the page/concurrency machinery on purpose: the
+    backlog is normally tiny (persistently-failing files, not a fresh
+    page), and giving it its own governor/pool would buy nothing but risk
+    for a path this rarely used.
+    """
+    failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
+    pending = [
+        (stable_id, entry)
+        for stable_id, entry in failed_items.items()
+        if entry.get("state_key") == target.state_key
+        and isinstance(entry.get("item"), dict)
+        and not entry.get("given_up")
+    ]
+    if not pending:
+        return
+    for _stable_id, entry in pending:
+        if deadline is not None:
+            deadline.check()
+        stats.add(items_seen=1)
+        stats.enter_item()
+        started = time.monotonic()
+        try:
+            await _process_item(
+                entry["item"],
+                target=target,
+                ctx=ctx,
+                transport=transport,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=max_file_mb,
+                anonymization_key=anonymization_key,
+                detector=detector,
+            )
+        finally:
+            stats.exit_item(time.monotonic() - started)
+        stats.add(items_done=1)
+    with _state_lock:
+        save_state(connection_id, state)
+    if recorder is not None:
+        recorder.checkpoint(stats)
+
+
 async def _crawl_drive(
     target: DriveTarget,
     *,
@@ -2209,6 +2410,23 @@ async def _crawl_drive(
     url: Optional[str] = delta_links.get(target.state_key) or base
     resynced = False
     stats.add(drives=1)
+    # Retry this drive's OWN backlog first — see `_retry_failed_items`. It
+    # runs before the first delta fetch so a resume that starts with a
+    # 410 still gets the queued items a chance regardless.
+    await _retry_failed_items(
+        target,
+        ctx=ctx,
+        transport=transport,
+        ingestor=ingestor,
+        connection_id=connection_id,
+        state=state,
+        stats=stats,
+        max_file_mb=max_file_mb,
+        anonymization_key=anonymization_key,
+        detector=detector,
+        deadline=deadline,
+        recorder=recorder,
+    )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
     # pushing back too — and deliberately not reset by a 410 resync, so that
@@ -2657,6 +2875,7 @@ async def _run_crawl_async(
         interrupted_report = stats.report(max_file_mb=max_file_mb, interrupted=True, interrupted_reason=reason)
         interrupted_report["connection_id"] = connection_id
         interrupted_report["scope_errors"] = scope_errors
+        interrupted_report["retry_backlog"] = _retry_backlog_snapshot(state)
         state["last_run"] = interrupted_report
         save_state(connection_id, state)
         if reason != "error":
@@ -2694,6 +2913,7 @@ async def _run_crawl_async(
     report = stats.report(max_file_mb=max_file_mb)
     report["connection_id"] = connection_id
     report["scope_errors"] = scope_errors
+    report["retry_backlog"] = _retry_backlog_snapshot(state)
     # Both LLM stages' numbers ride in the SAME report and the SAME
     # `extraction_runs` row: one run, one set of counters. `ner_usage` and
     # `facts_usage` are promoted to the top level (next to the crawl's own
@@ -2737,6 +2957,27 @@ async def _run_crawl_async(
     return report
 
 
+def _apply_resync(connection_id: str) -> None:
+    """Force every drive of this connection to re-enumerate from scratch on
+    its next crawl — the supported alternative to hand-editing the crawl
+    state file on the data disk to recover a connection whose delta cursor
+    ran past documents it never actually ingested.
+
+    Drops ``delta_links`` (so the next pass starts every drive from a bare
+    ``/delta``, which Graph answers with the drive's full current listing)
+    and ``failed_items`` (a full re-walk offers every previously-failed item
+    to the normal delta pipeline again, so the queue's own bookkeeping —
+    including anything already given up on — would otherwise be stale).
+    ``ctags`` are kept: a resync should make Graph tell us about everything
+    again, not force re-downloading files whose content has not changed.
+    """
+    with _state_lock:
+        state = load_state(connection_id)
+        state["delta_links"] = {}
+        state["failed_items"] = {}
+        save_state(connection_id, state)
+
+
 def run_builtin_crawl(payload: dict) -> dict:
     """Entry point for the ``corpus-extraction`` job kind
     (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
@@ -2758,11 +2999,15 @@ def run_builtin_crawl(payload: dict) -> dict:
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of
     ``source_scope_id``s to narrow the run to; every confirmed scope
-    otherwise) and ``concurrency`` (this run's in-page item concurrency,
+    otherwise), ``concurrency`` (this run's in-page item concurrency,
     overriding ``extraction.crawler.concurrency``, clamped to
     ``[1, 16]`` — the same one-run override shape ``timeout_s`` has; the
-    report's ``concurrency`` block names the effective value and its source).
-    Credentials are resolved from the row, never from the payload.
+    report's ``concurrency`` block names the effective value and its source),
+    and ``resync`` (truthy — drops this connection's persisted deltaLinks
+    and item-failure queue before crawling, so every drive re-enumerates
+    from scratch; see :func:`_apply_resync`. The supported way to recover a
+    connection stuck believing it has nothing left to do). Credentials are
+    resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
@@ -2783,6 +3028,9 @@ def run_builtin_crawl(payload: dict) -> dict:
     connection = source_connections_repo().get(connection_id)
     if connection is None or connection.get("source_type") != "sharepoint":
         raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
+
+    if payload.get("resync"):
+        _apply_resync(str(connection_id))
 
     try:
         return asyncio.run(

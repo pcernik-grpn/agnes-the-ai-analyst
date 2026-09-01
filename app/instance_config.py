@@ -1545,6 +1545,9 @@ _DATA_APPS_ENV_DEFAULTS = {
     # image), fork-bomb ceiling on.
     "container_read_only": False,
     "container_pids_limit": 512,
+    # Mirrors `app/api/data_apps.py::_CONFIG_DEFAULTS` — deploy-time exposure
+    # scan mode (#1946): `warn` (default) / `block` / `off`.
+    "deploy_checks": "warn",
 }
 
 
@@ -2172,9 +2175,9 @@ def warn_retired_sharepoint_flags() -> list[str]:
     assert on the result instead of scraping the log.
     """
     warned: list[str] = []
-    new_switch_set = bool(os.environ.get("AGNES_SHAREPOINT_ENABLED")) or get_value(
-        "sharepoint", "enabled", default=None
-    ) is not None
+    new_switch_set = (
+        bool(os.environ.get("AGNES_SHAREPOINT_ENABLED")) or get_value("sharepoint", "enabled", default=None) is not None
+    )
     for env_var, path in _RETIRED_SHAREPOINT_FLAGS:
         if os.environ.get(env_var) is None and get_value(*path, default=None) is None:
             continue
