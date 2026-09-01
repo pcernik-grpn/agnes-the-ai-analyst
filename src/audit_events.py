@@ -1341,6 +1341,24 @@ CATALOG: dict[str, AuditEvent] = {
         "An admin previewed what the anonymizer would redact in a pasted sample "
         "(length and counts recorded; the sample text itself is never stored).",
     ),
+    # -- RBAC-reviewer finding on #1979: two policy-editor reads were
+    # declared `exempt:ui_support` despite returning content, the same class
+    # `access_policy.preview` / `access_policy.preview_groups` above are
+    # audited for. `GET .../policy/revisions` returns the full historical
+    # `policy_sql` body of every saved revision; `GET .../policy/columns`
+    # returns profiler-derived `samples` (real row values, cf.
+    # `catalog.sample`). Reclassified to real, cataloged reads — see
+    # `src/audit_posture.py` READ_POSTURE for the route mapping.
+    "access_policy.revisions_view": AuditEvent(
+        "access_policy.revisions_view",
+        "read",
+        "An admin read a table access policy's saved revision history.",
+    ),
+    "access_policy.columns_view": AuditEvent(
+        "access_policy.columns_view",
+        "read",
+        "An admin read a table's schema + sample values for the no-SQL policy builder.",
+    ),
 }
 
 

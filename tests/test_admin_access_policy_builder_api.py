@@ -166,6 +166,43 @@ class TestPolicyBuilderColumns:
         assert "mapping_tables" in body
         assert body["eligible"] is True
 
+    def test_columns_endpoint_writes_an_audit_row_without_the_sample_values(self, policy_builder_table_with_profile):
+        """RBAC-reviewer finding on #1979: `samples` are real (potentially
+        PII) row values, the same class of content `catalog.sample` is
+        audited for -- this route must leave a real audit row, and that
+        row's params must carry metadata only, never the sample values or
+        column names themselves."""
+        c = policy_builder_table_with_profile["client"]
+        token = policy_builder_table_with_profile["admin_token"]
+
+        resp = c.get(
+            "/api/admin/registry/policy_builder_invoices/policy/columns",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="access_policy.columns_view", resource="policy_builder_invoices")
+        rows = list(rows)
+        assert rows, "the columns read left no audit trail"
+
+        import json as _json
+
+        raw_params = rows[0]["params"]
+        params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert params["table_id"] == "policy_builder_invoices"
+        assert params["column_count"] == len(body["columns"])
+        assert params["samples_included"] is True
+        assert set(params.keys()) == {"table_id", "column_count", "samples_included"}
+
+        # None of the real sample values leak into the audit params, neither
+        # under a known key nor smuggled anywhere else.
+        for col in body["columns"]:
+            for sample in col["samples"]:
+                assert sample not in (raw_params if isinstance(raw_params, str) else _json.dumps(params))
+
     def test_columns_endpoint_without_a_profile_returns_empty_samples(self, policy_builder_table):
         """No profile has been saved yet — the endpoint must still answer
         200 with real column names/types, just no samples (never 500)."""

@@ -277,6 +277,50 @@ def test_a_restore_missing_its_note_is_refused_like_any_other_save(tmp_path, mon
     assert "policy_note_required" in refused.text
 
 
+def test_revisions_read_writes_an_audit_row_without_the_sql_bodies(tmp_path, monkeypatch, pg_engine):
+    """RBAC-reviewer finding on #1979: each listed revision carries the full
+    historical ``policy_sql`` body -- the same content ``.../policy/preview``
+    and ``.../preview-groups`` are already audited for. This route must leave
+    a real audit row (``access_policy.revisions_view``, not
+    ``exempt:ui_support``), and that row's params must carry metadata only,
+    never the SQL bodies or notes themselves."""
+    c, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    table_id = _register(c, token, name="rev_audit", server_only=True)
+    sentinel_sql = f"SELECT id /* SENTINEL_REV_AUDIT_1979 */ FROM {table_id}"
+
+    assert (
+        _put(
+            c,
+            token,
+            table_id,
+            {"access_policy_sql": sentinel_sql, "access_policy_note": "sensitive rationale"},
+        ).status_code
+        == 200
+    )
+
+    body = _revisions(c, token, table_id, limit=5)
+    assert body["count"] == 1
+
+    from src.repositories import audit_repo
+
+    rows, _ = audit_repo().query(action="access_policy.revisions_view", resource=table_id)
+    rows = list(rows)
+    assert rows, "the revisions read left no audit trail"
+
+    import json as _json
+
+    raw_params = rows[0]["params"]
+    params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+    assert params["table_id"] == table_id
+    assert params["count"] == 1
+    assert params["limit"] == 5
+    assert set(params.keys()) == {"table_id", "count", "limit"}
+
+    dumped = raw_params if isinstance(raw_params, str) else _json.dumps(params)
+    assert sentinel_sql not in dumped
+    assert "sensitive rationale" not in dumped
+
+
 def test_unregistering_a_table_drops_its_revisions(tmp_path, monkeypatch, pg_engine):
     """Table ids are derived from names, so re-registering the same name
     yields the same id — a new table must not inherit (and be able to

@@ -7611,12 +7611,26 @@ async def list_access_policy_revisions(
 
     repo = access_policy_revisions_repo()
     revisions = repo.list_for_table(table_id, limit=limit)
+    total_count = repo.count_for_table(table_id)
+
+    # RBAC-reviewer finding on #1979: each listed revision carries the full
+    # historical `policy_sql` body, the same content `.../policy/preview`
+    # and `.../preview-groups` are already audited for -- this must be a
+    # real, cataloged read, not `exempt:ui_support` (src/audit_posture.py).
+    # Metadata only: never the SQL bodies, notes, or mapping names.
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.revisions_view",
+        resource=table_id,
+        params={"table_id": table_id, "count": total_count, "limit": limit},
+    )
+
     return {
         "table_id": table_id,
         # `count` is the UNTRUNCATED total, so a panel showing ten of
         # thirty-four can say so instead of rendering a silent prefix that
         # reads as the whole history.
-        "count": repo.count_for_table(table_id),
+        "count": total_count,
         "limit": limit,
         "revisions": [
             {
@@ -7692,6 +7706,23 @@ async def policy_builder_columns(
         )
 
     mapping_tables = [r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")]
+
+    # RBAC-reviewer finding on #1979: `samples` are profiler-derived REAL row
+    # values (potentially PII -- the `pii` flag right above is why), the
+    # same class of content `GET /api/v2/sample/{table_id}` is audited for
+    # as `catalog.sample` -- this must be a real, cataloged read, not
+    # `exempt:ui_support` (src/audit_posture.py). Metadata only: never the
+    # sample values themselves.
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.columns_view",
+        resource=table_id,
+        params={
+            "table_id": table_id,
+            "column_count": len(columns),
+            "samples_included": any(col["samples"] for col in columns),
+        },
+    )
 
     return {
         "columns": columns,

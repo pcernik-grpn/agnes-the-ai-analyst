@@ -705,16 +705,21 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin --
     "GET /api/admin/discover-tables": "table_registry.discover_preview",
     "GET /api/admin/registry": "exempt:ui_support",
-    "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
-    # #1979 — the policy editor's history panel. Same category as
-    # `GET /api/admin/registry` above, which already hands the same admin
-    # the CURRENT `access_policy_sql` of every table: this is that same
-    # admin-authored configuration, one table at a time, over time. It is
-    # not data content, not a secret, not another user's data, and not the
-    # audit trail (the trail deliberately cannot carry these bodies — see
-    # `app/api/admin.py::_SECRET_FIELDS`). The WRITES it lists are all
-    # cataloged where they happen (`update_table`).
-    "GET /api/admin/registry/{table_id}/policy/revisions": "exempt:ui_support",
+    # RBAC-reviewer finding on #1979 (was `exempt:ui_support`): the response
+    # carries profiler-derived `samples` — real row values, potentially PII
+    # (the endpoint even has a `pii` flag per column) — the same class of
+    # content `GET /api/v2/sample/{table_id}` is audited for as
+    # `catalog.sample`. The handler writes its own row (`log_safe`), never
+    # the sample VALUES themselves — see `app/api/admin.py::
+    # policy_builder_columns`.
+    "GET /api/admin/registry/{table_id}/policy/columns": "access_policy.columns_view",
+    # RBAC-reviewer finding on #1979 (was `exempt:ui_support`): each listed
+    # revision carries the full historical `policy_sql` body — the same
+    # content `POST .../policy/preview` / `.../preview-groups` are already
+    # audited for. The handler writes its own row (`log_safe`), never the
+    # SQL bodies themselves — see `app/api/admin.py::
+    # list_access_policy_revisions`.
+    "GET /api/admin/registry/{table_id}/policy/revisions": "access_policy.revisions_view",
     "GET /api/admin/server-config": "server_config.read",
     "GET /api/admin/server-config/overlay": "server_config.read",
     # Same fold the /admin/data-sources template inlines at render time, for
