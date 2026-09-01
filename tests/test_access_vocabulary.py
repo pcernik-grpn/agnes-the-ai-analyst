@@ -161,17 +161,34 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         """A control that grants and cannot revoke is a one-way door.
 
         The tiered kinds — data package, memory domain, marketplace plugin —
-        used to render the Available/Required pair INSTEAD of a Revoke, so
-        those three could be granted from this page and never un-granted, in
-        either lens. An admin had to reach for the API to undo a click. The
-        cell carries both now, for every kind, which is also why there is a
-        single `controlCell` for the guard above to count.
+        once rendered the Available/Required pair INSTEAD of a Revoke, so those
+        three could be granted from this page and never un-granted. An admin
+        had to reach for the API to undo a click.
+
+        The two halves now live in two CELLS rather than one: the tier pair is
+        the "Access tier" column (`controlCell`) and the act is the "Manage"
+        column (`manageCell`), which is what the retired "What they will see"
+        column became. So this reads both, and additionally pins the ONE
+        deliberate exception: where Revoke is withheld — a grant another
+        surface re-asserts, which the API refuses to delete anyway — the cell
+        must hand over the way to the surface that CAN undo it. Withholding
+        the control silently would be the one-way door this guard exists to
+        prevent, just wearing a different face.
         """
         src = self._source()
-        start = src.index("const controlCell")
-        cell = src[start:start + 1800]
-        assert "data-revoke" in cell, "the shared control cell must carry Revoke"
-        assert "tierControl(" in cell, "…and the tier pair, so both live in one place"
+        tier_cell = src[src.index("const controlCell"):][:1800]
+        assert "tierControl(" in tier_cell, "the tier cell must carry the tier pair"
+
+        manage_cell = src[src.index("const manageCell"):][:1800]
+        assert "data-revoke" in manage_cell, "the manage cell must carry Revoke"
+        # No dead ends: every branch that returns without a Revoke returns a
+        # link instead. Both non-revocable branches key off `.href`.
+        assert manage_cell.count("data-revoke") >= 2, (
+            "Revoke must survive on the ordinary grant AND on a seeded default"
+        )
+        assert "href" in manage_cell, (
+            "a grant this page cannot revoke must still point at the surface that can"
+        )
 
     def test_simulate_speaks_the_person_s_words(self):
         src = self._source()
