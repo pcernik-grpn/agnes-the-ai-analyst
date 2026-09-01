@@ -399,3 +399,29 @@
     .tab-strip { flex-wrap: nowrap; overflow-x: auto; }
     .tab-strip__item, .tab-strip .fbar-seg__btn { flex: 0 0 auto; }
 }
+
+/* ── Page toolbar ────────────────────────────────────────────────────────
+   The row of controls under a page's head — a time-range selector, a pair of
+   sibling-page links, a primary verb. `base_page.html` wraps `{% block
+   toolbar %}` in it, so a page declares WHAT its controls are and never where
+   they sit or how far the content below them starts.
+
+   It exists because that block emitted its children bare into the flow, which
+   made the gap under it a property of whatever the page happened to put
+   there. Three pages wrapped their controls in a private div carrying
+   `margin: 0 0 var(--space-5)` (`.aov-bar`, `.slb-meta`, `.adopt-bar`); the
+   ones that emitted a control directly — Adoption's window selector, the
+   Audit-log links — got no gap at all and their first stat card sat flush
+   against the buttons (#1956 item 9).
+
+   `:not(:has(*))` rather than `:empty`: the block renders a newline even when
+   a page leaves it undefined, so the box is never truly empty and `:empty`
+   would leave 20px of dead air on every page without a toolbar. */
+.page-toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    margin: 0 0 var(--space-5);
+}
+.page-toolbar:not(:has(*)) { display: none; }

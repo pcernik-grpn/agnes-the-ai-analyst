@@ -25,6 +25,11 @@
 
   - The hero renders only when `page_hero_title` is set (`_page_hero.html`
     self-guards), so a page can omit it.
+  - `{% block toolbar %}` renders inside a `.page-toolbar` row (components.css)
+    which owns the gap down to the content. A page declares its controls and
+    nothing else — no private wrapper carrying its own `margin-bottom`. A
+    control that must span the row (a bar with its own `space-between`) takes
+    `flex: 1 1 auto`; anything else just sits in the row's gap.
   - `{% block page_prehead %}` is the ONE line above the heading. It exists for
     the way BACK off a detail page: a `.apg-back` link belongs on the page's
     first line, naming where it returns to, and every page that rendered it
@@ -40,6 +45,6 @@
 {% block content %}
 {% block page_prehead %}{% endblock %}
 {% include "_page_hero.html" %}
-{% block toolbar %}{% endblock %}
+<div class="page-toolbar">{% block toolbar %}{% endblock %}</div>
 {% block page %}{% endblock %}
 {% endblock %}
