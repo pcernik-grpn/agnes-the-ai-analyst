@@ -413,6 +413,22 @@ def _is_identifier_position(node: exp.Placeholder) -> bool:
     return False
 
 
+def variables_in_pattern_position(statement: exp.Expression) -> set[str]:
+    """Names of the ``$variable`` placeholders in ``statement`` that stand on
+    the PATTERN side of a LIKE-family or regex node -- rule 5's own question,
+    exported so the READ path can ask it too.
+
+    ``src/access_policy.py`` re-derives this from the stored policy text on
+    every resolve and refuses the table when a bound identity variable would
+    be matched as a pattern (§6.3). That is the same rule this module
+    enforces at save time; it lives here, in one implementation, so the two
+    can never drift into disagreeing about what "pattern position" means --
+    a drift that would make read-time defense in depth quietly cover less
+    than the save-time rule it is backing up.
+    """
+    return {p.name for p in statement.find_all(exp.Placeholder) if _is_pattern_position(p)}
+
+
 def _is_pattern_position(node: exp.Placeholder) -> bool:
     """True if ``node`` is anywhere inside the pattern (``expression``) side
     of a LIKE-family or regex node -- walking up the ancestor chain instead

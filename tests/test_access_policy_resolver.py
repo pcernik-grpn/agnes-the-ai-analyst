@@ -211,14 +211,72 @@ class TestSessionPrincipalUnresolvable:
             policied_relation("tbl_invoices", _session_principal())
 
 
-class TestPatternMetacharacterGroupRejected:
-    """(e) Defense in depth (§6.3): a group name containing a LIKE/ILIKE
-    wildcard is refused before it is ever bound, independent of whether
-    save-time validation on this specific policy body would have caught it."""
+class TestPatternPositionVariableRejected:
+    """(e) Defense in depth (§6.3), scoped to the position that makes a name
+    dangerous rather than to the shape of the name.
 
-    def test_percent_containing_group_raises_policy_error(self, policy_env):
+    No character class validates group or user names anywhere in Agnes, so a
+    ``$user_*`` value MATCHED AS A PATTERN (``owner LIKE $user_email``) could
+    widen a policy to everyone. Save-time validation already refuses that
+    body (``policy_var_in_pattern_position``); the resolver re-derives it
+    from the STORED text on every request, so a row that never went through
+    the validator is refused too -- for every caller, not only the one whose
+    name happens to carry a metacharacter.
+
+    The converse is the part #1979 got wrong: in a NON-pattern position a
+    bound parameter is a value on every engine (§6.2) and can never act as a
+    pattern, so a perfectly ordinary group name containing ``_`` or ``%``
+    (the pilot's ``sales_cz``; the design doc's own ``CC_A``/``CC_B``) binds
+    and filters normally instead of erroring out every read that user makes.
+    """
+
+    def test_metacharacter_group_name_binds_in_a_value_position_policy(self, policy_env):
+        # `list_contains($user_groups, cost_center)` -- an equality
+        # comparison against a list element, not a pattern match.
+        result = policied_relation("tbl_invoices", policy_env["weird_user"])
+
+        assert result.policied is True
+        assert result.params["user_groups"] == ["R&D%"]
+
+    def test_underscore_group_name_binds_too(self, policy_env):
+        from src.db import get_system_db
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            UserRepository(conn).create(id="u_cz", email="cz@example.com", name="CZ")
+            gid = UserGroupsRepository(conn).create(name="sales_cz")["id"]
+            UserGroupMembersRepository(conn).add_member("u_cz", gid, source="admin")
+        finally:
+            conn.close()
+
+        result = policied_relation("tbl_invoices", {"id": "u_cz", "email": "cz@example.com"})
+
+        assert result.params["user_groups"] == ["sales_cz"]
+
+    def test_a_variable_in_pattern_position_is_refused_for_everyone(self, policy_env):
+        """A policy body the save-time validator would never have accepted --
+        written straight to the registry here, which is exactly the case this
+        read-time check exists for. Refused for a caller whose own name is
+        metacharacter-free, because the body is what is unsafe."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "tbl_invoices",
+                sql="SELECT * FROM invoices WHERE owner_email LIKE $user_email",
+                note="hand-edited, never validated",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
         with pytest.raises(PolicyError) as exc_info:
-            policied_relation("tbl_invoices", policy_env["weird_user"])
+            policied_relation("tbl_invoices", policy_env["solo_user"])
 
         assert exc_info.value.table_id == "tbl_invoices"
 
@@ -304,3 +362,14 @@ class TestUnknownTable:
             policied_relation("does-not-exist", policy_env["solo_user"])
 
         assert exc_info.value.table_id == "does-not-exist"
+
+    def test_the_unknown_case_has_its_own_subclass(self, policy_env):
+        """A name the registry does not know is the ONE resolution outcome
+        that is not a security refusal, so it gets a distinguishable
+        subclass -- what lets ``rewrite_sql`` swallow it without also
+        swallowing a refusal (#1979). Still a ``PolicyError``, so every
+        caller that catches only the base type is unchanged."""
+        from src.access_policy import PolicyUnknownTable
+
+        with pytest.raises(PolicyUnknownTable):
+            policied_relation("does-not-exist", policy_env["solo_user"])

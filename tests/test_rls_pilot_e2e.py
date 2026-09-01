@@ -49,32 +49,29 @@ materialized row's bytes, and the registry row is registered
 ACCESS behavior, not the Keboola transport (``tests/test_keboola_
 materialized_e2e.py`` covers that, and is skipped without live creds).
 
-ONE DELIBERATE DEVIATION FROM THE ISSUE, and it is a LEAK, not a
-convenience — read this before copying the pilot's group names anywhere.
-The issue spells the two groups ``sales_cz`` / ``sales_de``, with an
-underscore. ``src/access_policy.py::policied_relation`` refuses to bind a
-live group name containing a LIKE/SIMILAR-TO metacharacter (``%`` or
-``_``) and raises ``PolicyError`` — but ``rewrite_sql``, the AST rewrite
-behind ``POST /api/query`` and ``agnes query``, swallows ``PolicyError``
-from its per-name ``resolve(...)`` call as "this name is not a registered
-table" and leaves the reference UNSUBSTITUTED. The caller then reads the
-raw base view: HTTP 200, every row of the table, ``row_scope: null``. So
-the pilot exactly as written in #1979 does not fail closed on the surface
-it is meant to be used from — it silently serves the whole table to every
-member of ``sales_cz`` / ``sales_de``. (The ``table_id``-shaped surfaces
-that call ``policied_relation`` directly — ``/api/mcp/query-table/{id}``,
-``/api/v2/sample`` — do fail closed with ``500 policy_error``, and
-``/api/v2/scan`` lets the exception escape uncaught, so the three surfaces
-disagree.)
+THE LEAK THIS FILE FOUND, and its fix — read this before copying the
+pilot's group names anywhere. The issue spells the two groups ``sales_cz``
+/ ``sales_de``, with an underscore, and on the first cut of this feature
+that single character turned the policy OFF on ``POST /api/query``:
+``policied_relation`` refused to bind ANY live group name containing a
+LIKE/SIMILAR-TO metacharacter (``%`` or ``_``) and raised ``PolicyError``,
+while ``rewrite_sql`` — the AST rewrite behind ``POST /api/query`` and
+``agnes query`` — swallowed ``PolicyError`` from its per-name
+``resolve(...)`` call as "this name is not a registered table" and left the
+reference UNSUBSTITUTED. The caller then read the raw base view: HTTP 200,
+every row, ``row_scope: null``. Both halves are fixed:
+``PolicyUnknownTable`` now carries the benign "not in the registry" signal
+and is the only thing ``rewrite_sql`` swallows, so a refusal denies with a
+structured ``policy_error``; and the metacharacter refusal is scoped to a
+policy body that MATCHES an identity variable as a pattern, so an ordinary
+group named ``sales_cz`` binds as the value it is.
 
-The groups here are therefore spelled ``sales-cz`` / ``sales-de`` so the
-rest of the file exercises real enforcement; the literal,
-underscore-spelled configuration is pinned in
-``TestIssueLiteralGroupNamesUnderscore`` at the bottom (strict xfail), so
-whichever way that is fixed — narrowing the guard, escaping the bound
-values, or making ``rewrite_sql`` distinguish "unknown table" from
-"refused to bind" — flips the pin to XPASS and forces the pilot's own
-naming to be revisited.
+The bulk of this file keeps the ``sales-cz`` / ``sales-de`` spelling it was
+written with — nothing depends on the hyphen any more, and rewriting six
+classes of assertions would only churn the diff. The issue's LITERAL,
+underscore-spelled configuration is exercised end to end in
+``TestIssueLiteralGroupNamesUnderscore`` at the bottom, which is now a
+plain passing test (it was a strict xfail pinning the leak).
 """
 
 from __future__ import annotations
@@ -685,47 +682,46 @@ def literal_pilot(seeded_app, mock_extract_factory, monkeypatch):
 @pytest.mark.journey
 class TestIssueLiteralGroupNamesUnderscore:
     """#1979's pilot spells its groups ``sales_cz`` / ``sales_de``, and that
-    single underscore turns the policy OFF on ``POST /api/query``.
+    single underscore used to turn the policy OFF on ``POST /api/query``.
 
-    ``policied_relation`` refuses to bind any live group name containing a
-    LIKE/SIMILAR-TO metacharacter (``%``/``_``) -- defense in depth against
-    a group literally named ``%`` widening a LIKE-adjacent policy -- and
-    signals the refusal with ``PolicyError``. ``rewrite_sql`` catches
-    ``PolicyError`` around its per-name ``resolve(...)`` call to mean "this
-    identifier is not a registered table" (a CTE name, an
-    ``information_schema`` view) and ``continue``s, so a SECURITY refusal
-    lands in the same branch as a benign unknown name: the table reference
-    is never substituted and the caller reads the unfiltered base view --
-    HTTP 200, all six rows, ``row_scope: null``.
+    ``policied_relation`` refused to bind ANY live group name containing a
+    LIKE/SIMILAR-TO metacharacter (``%``/``_``) and signalled the refusal
+    with ``PolicyError``; ``rewrite_sql`` caught ``PolicyError`` around its
+    per-name ``resolve(...)`` call to mean "this identifier is not a
+    registered table" (a CTE name, an ``information_schema`` view) and
+    ``continue``d, so a SECURITY refusal landed in the same branch as a
+    benign unknown name: the reference was never substituted and the caller
+    read the unfiltered base view -- HTTP 200, all six rows,
+    ``row_scope: null``, while ``/api/mcp/query-table`` and
+    ``/api/v2/sample`` (which call ``policied_relation`` directly) fail-closed
+    with ``500 policy_error`` on the same configuration and ``/api/v2/scan``
+    let the exception escape uncaught. Four surfaces, three answers.
 
-    Measured on this branch for a member of ``sales_cz``:
-
-    ==============================  ==========================================
-    ``POST /api/query``             200, 6/6 rows, ``row_scope: null`` (LEAK)
-    ``POST /api/mcp/query-table``   500 ``policy_error`` (fail-closed)
-    ``GET /api/v2/sample/{id}``     500 ``policy_error`` (fail-closed)
-    ``POST /api/v2/scan``           uncaught ``PolicyError`` (500, unstructured)
-    ``GET /api/me/effective-access`` ``reason: "policy_error"``
-    ==============================  ==========================================
-
-    Asserted as the DESIRED behavior and marked strict-xfail rather than
-    pinning the leak: production code is out of scope for this test-only
-    change, and a strict pin turns XPASS into a failure the moment someone
-    fixes it, which is exactly when the pilot's naming needs revisiting.
+    Fixed on both axes, and this class is the end-to-end proof:
+    ``PolicyUnknownTable`` split the benign signal out of ``PolicyError`` so
+    only IT is swallowed, and the metacharacter refusal was narrowed to a
+    policy body that actually matches an identity variable as a PATTERN --
+    which this one (``list_contains($user_groups, 'sales_cz')``, an equality
+    comparison against a bound list) does not.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#1979 LEAK: an underscore in a live group name makes policied_relation raise "
-            "PolicyError, which rewrite_sql swallows as 'not a registered table' -- so "
-            "POST /api/query serves the whole unfiltered table (200, row_scope null) to every "
-            "member of 'sales_cz'. Fail-open, not fail-closed"
-        ),
-    )
     def test_a_member_of_sales_cz_sees_only_their_cz_slice(self, literal_pilot):
         c = literal_pilot["client"]
         r = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(literal_pilot["dana_token"]))
         assert r.status_code == 200, r.text
         assert _group_counts(r.json()) == {"CZ": 3}
         assert r.json()["row_scope"] is not None
+
+    def test_the_same_slice_on_the_mcp_per_table_surface(self, literal_pilot):
+        """The surface that already fail-closed must now agree with
+        ``/api/query`` on the ANSWER, not merely on refusing."""
+        c = literal_pilot["client"]
+        r = c.post(
+            "/api/mcp/query-table/orders",
+            json={"limit": 100},
+            headers=_auth(literal_pilot["dana_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert {row["country"] for row in body["rows"]} == {"CZ"}
+        assert body["row_scope"] is not None

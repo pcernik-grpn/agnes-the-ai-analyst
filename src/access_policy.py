@@ -63,17 +63,25 @@ from src.sql_ident import quote_ident
 # and bound" (every request, on text that passed the validator once).
 _KNOWN_VARIABLES = frozenset({"user_email", "user_id", "user_groups"})
 
-# SQL LIKE/ILIKE/SIMILAR-TO wildcard metacharacters. Group names are not
-# validated against any character class elsewhere in the system (§6.3) — a
-# Workspace-synced or admin-created group literally named ``%`` would
-# silently widen every ``list_contains($user_groups, ...)`` policy for every
-# member of it. The save-time validator (Task 3) already refuses to let an
-# identity variable stand in LIKE/ILIKE/SIMILAR TO pattern position for one
-# specific policy body; this is a second, independent check on the VALUE
-# about to be bound — defense in depth that does not depend on knowing every
-# way a policy (present or future) might turn out to depend on group-name
-# shape.
-_PATTERN_METACHARACTERS = ("%", "_")
+# §6.3 — a group (or user) name is not validated against any character class
+# anywhere else in the system, so one literally named ``%`` would silently
+# widen a policy that matched it as a LIKE/ILIKE/SIMILAR TO or regex PATTERN.
+# The refusal is scoped to exactly that: a policy body whose ``$user_*``
+# placeholder stands in a pattern position (`_pattern_position_variables`
+# below), re-derived from the STORED text on every request — defense in depth
+# that does not assume the save-time validator (Task 3) ever ran on this row.
+#
+# It is deliberately NOT scoped to the VALUE's shape. This guard used to
+# refuse any bound group name CONTAINING ``%`` or ``_``, which is both too
+# wide and too narrow: too wide because a bound parameter in a non-pattern
+# position (``list_contains($user_groups, cost_center)`` — an equality
+# comparison against a list element, the design doc's own idiom, and its own
+# example values ``CC_A``/``CC_B``) has value semantics only and can never act
+# as a pattern, so an ordinary group named ``sales_cz`` was refused for no
+# security gain (#1979); too narrow because it screened only ``$user_groups``,
+# leaving ``$user_email``/``$user_id`` unscreened in the very position that
+# makes a metacharacter dangerous. Refusing on the BODY covers all three
+# variables and every value.
 
 
 @dataclass(frozen=True)
@@ -121,6 +129,26 @@ class PolicyError(Exception):
     def __init__(self, table_id: str) -> None:
         self.table_id = table_id
         super().__init__(f"access policy for table {table_id!r} failed to resolve or execute")
+
+
+class PolicyUnknownTable(PolicyError):
+    """No registered table answers to this id-or-name (§5.3).
+
+    The ONE resolution outcome that is not a security refusal, and the only
+    one ``rewrite_sql`` may swallow: a CTE alias, an ``information_schema``
+    view, any ``exp.Table``-shaped name the registry has never heard of. Both
+    outcomes used to be a bare ``PolicyError``, so ``rewrite_sql``'s "not a
+    registered table, not my concern" ``continue`` also swallowed a genuine
+    REFUSAL — leaving the table unsubstituted and serving the raw base view
+    with a 200 (#1979: fail-open on the primary query surface, §17's exact
+    prohibition).
+
+    A ``PolicyError`` subclass on purpose: every existing
+    ``except PolicyError`` handler already maps an unknown table to the same
+    structured, fail-closed response it did before this type existed, so this
+    split narrows exactly one ``except`` (and its sibling in the
+    unparseable-SQL scan) and changes nothing else.
+    """
 
 
 def assert_unique_output_columns(column_names, table_id: str) -> None:
@@ -214,7 +242,19 @@ def policied_relation(table_id: str, principal, *, dialect: str = "duckdb") -> P
         return PoliciedRelation(relation_sql=base_view_sql, params={}, policied=False, table_id=resolved_id)
 
     user_id, user_email, live_groups = _resolve_identity(principal, table_id=resolved_id)
-    referenced = _referenced_variables(policy_sql, table_id=resolved_id)
+    referenced, pattern_positioned = _policy_variable_usage(policy_sql, table_id=resolved_id)
+
+    # §6.3 — an identity value may never be MATCHED AS A PATTERN: no
+    # character class validates group or user names anywhere in Agnes, so one
+    # named ``%`` would widen the match to everyone. Refuse the whole
+    # resolution (§17: every failure denies) rather than the offending value,
+    # because such a body is broken for every caller, not only the one whose
+    # name happens to carry a metacharacter today. Save-time validation
+    # (`policy_var_in_pattern_position`) already rejects this shape, so this
+    # only ever fires on a row that never went through it -- a hand-edited
+    # registry value, or one written by an older/other authoring path.
+    if pattern_positioned & referenced:
+        raise PolicyError(resolved_id)
 
     params: dict[str, Any] = {}
     if "user_email" in referenced:
@@ -222,11 +262,11 @@ def policied_relation(table_id: str, principal, *, dialect: str = "duckdb") -> P
     if "user_id" in referenced:
         params["user_id"] = user_id
     if "user_groups" in referenced:
-        groups = live_groups()
-        for name in groups:
-            if any(ch in name for ch in _PATTERN_METACHARACTERS):
-                raise PolicyError(resolved_id)
-        params["user_groups"] = groups
+        # Bound verbatim: a named parameter in a non-pattern position is a
+        # VALUE on every engine this resolver targets (§6.2 -- DuckDB `$name`,
+        # BigQuery `@name`, Databricks/Snowflake `:name`), never re-parsed as
+        # SQL text, so ``sales_cz`` or ``R&D%`` compares as itself.
+        params["user_groups"] = live_groups()
 
     if dialect == "bigquery":
         relation_sql = _transpile_policy_to_bigquery(policy_sql, table_id=resolved_id)
@@ -369,8 +409,11 @@ def _transpile_policy_to_snowflake(policy_sql: str, *, table_id: str) -> str:
 def _resolve_table_row(table_id: str) -> dict:
     """id-or-name lookup (§5.3) — ``id`` checked first (registry PK, exact
     match), then ``name`` (what master views and SQL ``FROM`` clauses name).
-    Neither resolving is treated the same as any other resolution failure:
-    ``PolicyError`` ("failed to resolve"), never a silent passthrough.
+    Neither resolving is still a refusal, never a silent passthrough — but a
+    DISTINGUISHABLE one: ``PolicyUnknownTable`` (a ``PolicyError`` subclass,
+    so every caller that only knows the base type is unaffected) says "this
+    name is not in the registry", which is the sole outcome ``rewrite_sql``
+    is allowed to treat as none of its business.
     """
     from src.repositories import table_registry_repo
 
@@ -379,7 +422,7 @@ def _resolve_table_row(table_id: str) -> dict:
     if row is None:
         row = repo.get_by_name(table_id)
     if row is None:
-        raise PolicyError(table_id)
+        raise PolicyUnknownTable(table_id)
     return row
 
 
@@ -456,23 +499,35 @@ def _live_groups(user_id: str | None) -> list[str]:
     return user_group_members_repo().list_group_names_for_user(user_id)
 
 
-def _referenced_variables(policy_sql: str, *, table_id: str) -> set[str]:
-    """Which of the three known variables ``policy_sql`` actually
-    references, so ``params`` only carries the keys the policy text uses.
+def _policy_variable_usage(policy_sql: str, *, table_id: str) -> tuple[set[str], set[str]]:
+    """``(referenced, pattern_positioned)`` for ``policy_sql``, from ONE parse.
+
+    ``referenced`` — which of the three known variables the policy text
+    actually references, so ``params`` only carries the keys it uses.
+
+    ``pattern_positioned`` — which of them stand on the PATTERN side of a
+    LIKE/ILIKE/SIMILAR TO or regex node (§6.3), the one position where the
+    shape of a group/user name changes what the policy matches. Computed with
+    ``src.access_policy_validate``'s own rule-5 helper rather than a second
+    definition of "pattern position": save time and read time must agree on
+    that question exactly, or one of them is wrong.
 
     The save-time validator (Task 3) already proved every ``$name`` in a
-    saved policy is one of ``_KNOWN_VARIABLES`` in value position —
-    re-parsing here (rather than a substring search over the raw text) is
-    what stays correct if that ever stops holding for a given row (a
-    hand-edited DB value, a future authoring path), and never mistakes a
-    variable *name* appearing inside a string literal or comment for a
-    reference.
+    saved policy is one of ``_KNOWN_VARIABLES`` in value position, and never
+    in pattern position — re-deriving both here (rather than a substring
+    search over the raw text) is what stays correct if that ever stops
+    holding for a given row (a hand-edited DB value, a future authoring
+    path), and never mistakes a variable *name* appearing inside a string
+    literal or comment for a reference.
     """
+    from src.access_policy_validate import variables_in_pattern_position
+
     try:
         statement = sqlglot.parse_one(policy_sql, read="duckdb")
     except Exception as exc:
         raise PolicyError(table_id) from exc
-    return {p.name for p in statement.find_all(exp.Placeholder) if p.name in _KNOWN_VARIABLES}
+    referenced = {p.name for p in statement.find_all(exp.Placeholder) if p.name in _KNOWN_VARIABLES}
+    return referenced, variables_in_pattern_position(statement)
 
 
 # ---------------------------------------------------------------------------
@@ -516,12 +571,14 @@ def _scan_unparseable_for_policied_table(sql: str, principal, resolve) -> str | 
     not parse).
 
     No AST is available, so there is no candidate-table list other than the
-    raw text itself. Every word-shaped token is a candidate; ``PolicyError``
-    -- ``_resolve_table_row``'s exact signal for "no such registered table"
-    -- is swallowed as "not a match" so a query that merely mentions
-    unregistered names keeps failing exactly as it did before this feature
-    existed. Any OTHER exception (an identity/mapping problem on a genuine
-    match) is a real, table-scoped failure and is not swallowed.
+    raw text itself. Every word-shaped token is a candidate;
+    ``PolicyUnknownTable`` -- ``_resolve_table_row``'s exact signal for "no
+    such registered table" -- is swallowed as "not a match" so a query that
+    merely mentions unregistered names keeps failing exactly as it did before
+    this feature existed. Any OTHER exception (an identity/mapping problem, a
+    refused policy body, on a genuine match) is a real, table-scoped failure
+    and is not swallowed -- swallowing it would return the caller's SQL
+    unchanged, i.e. run it against the unfiltered table (#1979).
     """
     seen: set[str] = set()
     for match in _IDENTIFIER_RE.finditer(sql):
@@ -532,7 +589,7 @@ def _scan_unparseable_for_policied_table(sql: str, principal, resolve) -> str | 
         seen.add(key)
         try:
             relation = resolve(word, principal)
-        except PolicyError:
+        except PolicyUnknownTable:
             continue
         if relation.policied:
             return relation.table_id
@@ -637,13 +694,22 @@ def rewrite_sql(
     for lower_name, original_name in candidate_names.items():
         try:
             relation = resolve(original_name, principal)
-        except PolicyError:
+        except PolicyUnknownTable:
             # A name that resolves to no registered table is not this
             # function's concern -- a CTE name, an information_schema
             # view, anything sqlglot modeled as `exp.Table` that the
             # registry has never heard of. Swallowing keeps every OTHER
             # query working; rule 5's allowlist is enforced upstream
             # (#1264, the registry gate), not here.
+            #
+            # ONLY that subclass. A plain `PolicyError` here is a REFUSAL
+            # on a table the registry does know -- a transpile failure, a
+            # policy body that no longer parses, an identity variable in
+            # pattern position -- and swallowing it left the reference
+            # unsubstituted, so the caller read the raw base view with a
+            # 200 (#1979). It propagates instead, and every caller of this
+            # function already maps `PolicyError` to a structured,
+            # table-scoped denial (§16/§17).
             continue
         if not relation.policied:
             continue

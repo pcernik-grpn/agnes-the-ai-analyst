@@ -6545,15 +6545,6 @@ class PolicyPreviewRequest(BaseModel):
     as_groups: Optional[List[str]] = None
 
 
-# Mirrors ``src.access_policy._PATTERN_METACHARACTERS`` (§6.3) — group names
-# are not validated against any character class elsewhere in the system, so
-# a wildcard-named ad-hoc group here would silently widen a LIKE-adjacent
-# policy the same way a Workspace-synced one would at live-enforcement time.
-# Duplicated rather than imported: that constant is private to the resolver
-# module, and this is the one OTHER place a caller-supplied string is bound
-# as a ``$user_groups`` value instead of being read live from the DB.
-_POLICY_PREVIEW_PATTERN_METACHARACTERS = ("%", "_")
-
 # The only three identity values a policy may reference (§6.2) — mirrors the
 # same closed set ``src/access_policy.py`` and
 # ``src/access_policy_validate.py`` each already check against.
@@ -6703,24 +6694,35 @@ def _sanitize_for_json(obj):
     return obj
 
 
-def _policy_preview_referenced_variables(sql: str) -> set:
-    """Which of the three known ``$name`` variables ``sql`` actually
-    references, so the bind dict only ever carries the keys the policy text
-    uses — DuckDB rejects a named parameter bound but never referenced
-    (§7.1 documents this exact failure mode for the BigQuery push-down; the
-    same strictness applies to a plain parameterized DuckDB query). Mirrors
-    the identical walk already duplicated in ``probe_policy``
-    (``src/access_policy_validate.py``) and ``_referenced_variables``
-    (``src/access_policy.py``) — each module computes its own because the
-    VALUES bound differ per caller (probe: throwaway sentinels; the live
-    resolver: the real caller's identity; here: the admin-chosen preview
-    persona).
+def _policy_preview_variable_usage(sql: str) -> tuple[set, set]:
+    """``(referenced, pattern_positioned)`` for a policy body about to be
+    previewed — the preview's own copy of what the live resolver computes
+    (``src/access_policy.py::_policy_variable_usage``).
+
+    ``referenced``: which of the three known ``$name`` variables ``sql``
+    actually references, so the bind dict only ever carries the keys the
+    policy text uses — DuckDB rejects a named parameter bound but never
+    referenced (§7.1 documents this exact failure mode for the BigQuery
+    push-down; the same strictness applies to a plain parameterized DuckDB
+    query). Mirrors the identical walk already duplicated in ``probe_policy``
+    (``src/access_policy_validate.py``) — each module computes its own
+    because the VALUES bound differ per caller (probe: throwaway sentinels;
+    the live resolver: the real caller's identity; here: the admin-chosen
+    preview persona).
+
+    ``pattern_positioned``: which of them are matched AS A PATTERN (§6.3),
+    the one shape the resolver refuses outright — delegated to
+    ``variables_in_pattern_position`` rather than re-implemented, so a
+    preview can never report a slice a live read would deny (or vice versa).
     """
     import sqlglot
     from sqlglot import exp
 
+    from src.access_policy_validate import variables_in_pattern_position
+
     statement = sqlglot.parse_one(sql, read="duckdb")
-    return {p.name for p in statement.find_all(exp.Placeholder) if p.name in _POLICY_PREVIEW_KNOWN_VARIABLES}
+    referenced = {p.name for p in statement.find_all(exp.Placeholder) if p.name in _POLICY_PREVIEW_KNOWN_VARIABLES}
+    return referenced, variables_in_pattern_position(statement)
 
 
 @router.post("/registry/{table_id}/policy/preview")
@@ -6811,15 +6813,6 @@ async def preview_table_policy(
         persona_user_id, persona_user_email = target["id"], target["email"]
         persona_groups = user_group_members_repo().list_group_names_for_user(persona_user_id)
     else:
-        for group_name in request.as_groups:
-            if any(ch in group_name for ch in _POLICY_PREVIEW_PATTERN_METACHARACTERS):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"policy_preview_unsafe_group_name: {group_name!r} contains a "
-                        "pattern metacharacter (%, _) and cannot be bound as a group name"
-                    ),
-                )
         persona_user_id, persona_user_email = None, None
         persona_groups = list(request.as_groups)
 
@@ -6845,12 +6838,33 @@ async def preview_table_policy(
                 columns.append({"name": probed_col["name"], "hidden": False})
 
         try:
-            referenced = _policy_preview_referenced_variables(policy_sql)
+            referenced, pattern_positioned = _policy_preview_variable_usage(policy_sql)
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
                 detail=f"policy_preview_failed: could not parse policy SQL: {exc}",
             ) from exc
+
+        # §6.3, mirrored from the LIVE resolver (`src/access_policy.py::
+        # policied_relation`) so the preview never renders a slice the
+        # product cannot actually serve: a body that MATCHES an identity
+        # variable as a LIKE/regex PATTERN is refused there for every
+        # caller, because no character class validates group or user names.
+        # A candidate `sql` was already rejected by `validate_policy_sql`
+        # above (rule 5) — this catches the STORED body nothing re-validates.
+        # The bound VALUES are deliberately not screened for `%`/`_`: in
+        # every other position a bound parameter is a value, so a group
+        # named `sales_cz` previews exactly as it reads.
+        if pattern_positioned & referenced:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "policy_var_in_pattern_position: this table's stored policy matches an "
+                    "identity variable as a LIKE/ILIKE/SIMILAR TO or regex pattern, which the "
+                    "policy resolver refuses to bind -- it can never be served to any caller; "
+                    "rewrite the policy to compare the variable as a value"
+                ),
+            )
 
         params: Dict[str, Any] = {}
         if "user_email" in referenced:
@@ -6858,29 +6872,6 @@ async def preview_table_policy(
         if "user_id" in referenced:
             params["user_id"] = persona_user_id
         if "user_groups" in referenced:
-            # An `as_groups` persona was already screened for pattern
-            # metacharacters up in the persona branch. An `as_user`
-            # persona's groups come from the DB, so nothing screened them
-            # — yet the LIVE resolver (`src/access_policy.py::
-            # policied_relation`) raises `PolicyError` for ANY bound group
-            # name carrying one. Without this check, a preview of a user
-            # in a group named e.g. `R&D%` renders a slice the product can
-            # never serve that user: the preview succeeds, every real read
-            # by them fails. Mirrored here exactly as the resolver does it
-            # — only when the policy actually binds `$user_groups`, since
-            # a policy that never references them serves that user fine.
-            for group_name in persona_groups:
-                if any(ch in group_name for ch in _POLICY_PREVIEW_PATTERN_METACHARACTERS):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"policy_preview_unsafe_live_group_name: {group_name!r} is a live "
-                            "group of this user and contains a pattern metacharacter (%, _), "
-                            "which the policy resolver refuses to bind -- this policy can "
-                            "never be served to this user as things stand; rename the group "
-                            "before relying on the preview"
-                        ),
-                    )
             params["user_groups"] = persona_groups
 
         try:

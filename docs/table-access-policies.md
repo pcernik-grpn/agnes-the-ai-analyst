@@ -55,7 +55,7 @@ Three bound values, and only these three — Agnes reads identity from your iden
 
 `$user_groups` is read through the same live path table-grain RBAC already uses (`get_accessible_tables` → `StackResolver`), so it never diverges from what that check just decided — group changes take effect on the next request, same as everywhere else in Agnes; there is no separate cache to invalidate.
 
-**A variable may only stand where a value stands.** `FROM $table`, `EXCLUDE ($col)`, or any table/column/alias-name position is rejected at save time — the admin fixes the query's *structure*; the caller only ever supplies *values*. Values bind as real DuckDB (and, on a remote table, BigQuery) named parameters — never string-interpolated — so a group literally named `Robert'); DROP TABLE users;--` is just an inert list element. The one value-position exception: identity variables are also rejected as the *pattern* side of `LIKE` / `ILIKE` / `SIMILAR TO` or a regex function (`owner LIKE $user_email` would let a group or user literally named `%` — no character class validates group names elsewhere in Agnes — silently widen the match to everyone).
+**A variable may only stand where a value stands.** `FROM $table`, `EXCLUDE ($col)`, or any table/column/alias-name position is rejected at save time — the admin fixes the query's *structure*; the caller only ever supplies *values*. Values bind as real DuckDB (and, on a remote table, BigQuery) named parameters — never string-interpolated — so a group literally named `Robert'); DROP TABLE users;--` is just an inert list element. The one value-position exception: identity variables are also rejected as the *pattern* side of `LIKE` / `ILIKE` / `SIMILAR TO` or a regex function (`owner LIKE $user_email` would let a group or user literally named `%` — no character class validates group names elsewhere in Agnes — silently widen the match to everyone). The resolver re-derives that same check from the stored policy text on every read, so a body that reaches the registry without passing save-time validation (a hand-edited row) is refused live rather than bound; a `%`/`_` in a group name is otherwise harmless and binds as itself, because in every other position a bound parameter is a value, never a pattern — `sales_cz` and `CC_A` are ordinary group names.
 
 ### Row filtering
 
@@ -225,7 +225,7 @@ Every policy-related rejection is a structured `reason`-keyed detail (never a ra
 |---|---|---|
 | `policy_name_collision` | 400, query surfaces | your query's own CTE/subquery alias is spelled identically to a policied table — rename it |
 | `policy_identity_unresolvable` | 403, query surfaces | no single identity to bind (a co-drive session with several participants) — open the table in a solo session |
-| `policy_error` | 500, query surfaces | the policy failed to resolve or execute — never falls back to the unfiltered table |
+| `policy_error` | 500, every read surface (`/api/v2/scan` included) | the policy failed to resolve or execute — never falls back to the unfiltered table, on any surface: a refusal that reached the SQL rewrite used to be swallowed as "not a registered table" and served the raw view with a 200 (#1979), which is why the resolver now signals "unknown table" with its own distinct type |
 | `policy_mapping_empty` | 500, `POST /api/query` only | a `policy_mapping` table the policy joins has zero (or never-synced) rows — named alongside the policied table, same underlying check and wording as `GET /api/me/effective-access`'s `reason: "mapping_empty"` (`src.access_policy.raise_if_policy_mapping_empty`, the one implementation both call) |
 | `access_policies_disabled` | 422, admin write | attaching a policy while `access_policies.enabled` is off |
 | `access_policy_requires_undistributed` | 422, admin write | the table is not `remote`/`server_only` |
@@ -235,8 +235,7 @@ Every policy-related rejection is a structured `reason`-keyed detail (never a ra
 | `dbx_path_policied` | 403, query surfaces | the same for `dbx."<catalog.schema>"."<table>"` and for a bare three-part Databricks path |
 | `kbc_path_policied` | 403, query surfaces | the same for `kbc."<bucket>"."<table>"` (#1492; the prefix also gained the registry gate `kbc_path_not_registered` and the grant gate `kbc_path_access_denied` the other three already had) |
 | `policy_note_required` | 422, admin write | `access_policy_sql` is set without `access_policy_note` |
-| `policy_preview_unsafe_group_name` | 422, admin preview | an `as_groups` name carries a pattern metacharacter (`%`, `_`) |
-| `policy_preview_unsafe_live_group_name` | 422, admin preview | the `as_user` persona's own live group name carries one — the resolver would refuse to bind it, so this policy could never be served to that user |
+| `policy_var_in_pattern_position` | 422, admin write and preview | an identity variable stands on the *pattern* side of `LIKE` / `ILIKE` / `SIMILAR TO` or a regex function — rejected at save time, and refused again by the resolver (and so by the preview) if a stored body carries the shape anyway |
 
 ## Snapshots and staleness
 

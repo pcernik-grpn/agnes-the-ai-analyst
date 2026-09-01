@@ -19,6 +19,7 @@ from src.access_policy import (
     PoliciedRelation,
     PolicyError,
     PolicyNameCollision,
+    PolicyUnknownTable,
     policied_relation,
     rewrite_sql,
 )
@@ -56,7 +57,7 @@ def fake_resolver_policying(target_name: str, *, relation_sql: str = POLICY_SQL,
 
 def resolver_raising_for_unknown(target_name: str):
     """Like :func:`fake_resolver_policying`, but any OTHER name raises
-    ``PolicyError`` instead of a passthrough -- the shape a REAL
+    ``PolicyUnknownTable`` instead of a passthrough -- the shape a REAL
     ``policied_relation`` call takes for a name that is not a registered
     table id or name at all (``_resolve_table_row``'s "neither resolving").
     """
@@ -66,7 +67,7 @@ def resolver_raising_for_unknown(target_name: str):
             return PoliciedRelation(
                 relation_sql=POLICY_SQL, params={"user_groups": ["Finance"]}, policied=True, table_id=target_name
             )
-        raise PolicyError(name)
+        raise PolicyUnknownTable(name)
 
     return _resolve
 
@@ -283,3 +284,61 @@ class TestDefaultResolverIsPoliciedRelation:
 
     def test_default_resolve_parameter_is_policied_relation(self):
         assert inspect.signature(rewrite_sql).parameters["resolve"].default is policied_relation
+
+
+class TestSecurityRefusalIsNeverSwallowed:
+    """#1979's fail-OPEN bug: ``resolve`` has TWO failure modes and only one
+    of them is "not this function's concern".
+
+    ``policied_relation`` signals "no registered table answers to this name"
+    with ``PolicyUnknownTable`` -- a CTE alias, an ``information_schema``
+    view -- and every OTHER resolution failure (a transpile error, an
+    identity variable in pattern position, a policy body that no longer
+    parses) with a plain ``PolicyError``. Swallowing the second kind leaves
+    the table reference UNSUBSTITUTED, so the caller reads the raw base view
+    with a 200: a policy refusal turned into a policy bypass, on the primary
+    query surface. Only the ``PolicyUnknownTable`` arm may be swallowed.
+    """
+
+    @staticmethod
+    def _refusing_resolver(name: str, principal) -> PoliciedRelation:
+        """``invoices`` is registered and policied but REFUSED; every other
+        name is genuinely unregistered."""
+        if name.lower() == "invoices":
+            raise PolicyError("tbl_invoices")
+        raise PolicyUnknownTable(name)
+
+    def test_unknown_table_is_a_policy_error_subclass(self):
+        # So every existing `except PolicyError` handler (which maps to a
+        # structured, fail-closed response) keeps behaving exactly as before.
+        assert issubclass(PolicyUnknownTable, PolicyError)
+
+    def test_a_refusal_on_a_policied_table_propagates(self):
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql("SELECT * FROM invoices, dim", SOLO_USER, resolve=self._refusing_resolver)
+        assert not isinstance(exc_info.value, PolicyUnknownTable)
+        assert exc_info.value.table_id == "tbl_invoices"
+
+    def test_a_refusal_propagates_from_the_unparseable_scan_too(self):
+        # Rule 3's best-effort token scan swallowed the same conflated type,
+        # so an unparseable statement naming a REFUSED table returned
+        # unchanged -- and then ran, unfiltered.
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql("SELECT * FROM invoices SAMPLE 50%", SOLO_USER, resolve=self._refusing_resolver)
+        assert exc_info.value.table_id == "tbl_invoices"
+
+    def test_an_unknown_name_is_still_swallowed(self):
+        sql = "SELECT * FROM information_schema.tables t"
+        out, params, ids = rewrite_sql(sql, SOLO_USER, resolve=self._refusing_resolver)
+        assert out == sql
+        assert params == {}
+        assert ids == []
+
+    def test_a_cte_alias_that_is_not_a_registered_table_still_resolves_benignly(self):
+        # The commonest analyst idiom: every name in it -- the CTE alias and
+        # the real table -- goes through `resolve`, and only the unregistered
+        # one may be swallowed.
+        sql = "WITH recent AS (SELECT * FROM dim) SELECT * FROM recent"
+        out, params, ids = rewrite_sql(sql, SOLO_USER, resolve=resolver_raising_for_unknown("invoices"))
+        assert out == sql
+        assert ids == []

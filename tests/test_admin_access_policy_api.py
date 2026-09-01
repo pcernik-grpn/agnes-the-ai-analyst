@@ -513,14 +513,19 @@ class TestPolicyPreview:
         assert resp.status_code == 200, resp.text
         assert resp.json()["rows_visible"] == 2
 
-    def test_preview_as_a_user_in_a_wildcard_named_group_is_refused(self, policied_invoices_for_preview):
-        """`as_groups` is checked for `%`/`_` because a wildcard-named group
-        silently widens a LIKE-adjacent policy — but the LIVE resolver
-        (`src/access_policy.py`) raises `PolicyError` for ANY bound group
-        name carrying one, and the `as_user` branch bound a real user's
-        live group names unchecked. A user in a group named `R&D%` would
-        preview a slice the product can never actually serve: the preview
-        succeeds, every real read by that user fails."""
+    def test_preview_as_a_user_in_a_metacharacter_named_group_shows_their_real_slice(
+        self, policied_invoices_for_preview
+    ):
+        """#1979: the preview mirrors the LIVE resolver, and the resolver no
+        longer refuses a bound group name for containing `%`/`_`.
+
+        `list_contains($user_groups, unit)` compares the bound list's
+        elements as VALUES, so a group named `Finance_EU` (or `R&D%`) is
+        matched literally on a live read — a preview that 422-ed on the name
+        alone reported a restriction the product does not have. What IS still
+        refused is a policy body that matches an identity variable as a
+        pattern; that case is covered below.
+        """
         from src.db import get_system_db
         from src.repositories.user_group_members import UserGroupMembersRepository
         from src.repositories.user_groups import UserGroupsRepository
@@ -541,17 +546,51 @@ class TestPolicyPreview:
             json={"as_user": "wildcard@example.com"},
             headers=_auth(token),
         )
+        assert resp.status_code == 200, resp.text
+        # `R&D%` matches no `unit` value literally -- and, the point of the
+        # test, does not act as a wildcard either.
+        assert resp.json()["rows_visible"] == 0
+        assert resp.json()["rows_total"] == 3
+
+    def test_preview_of_a_stored_body_that_pattern_matches_an_identity_variable_is_refused(
+        self, policied_invoices_for_preview
+    ):
+        """The refusal that remains, and the one that matters: no character
+        class validates group/user names, so a body matching `$user_email`
+        as a LIKE pattern could widen to everyone. Save-time validation
+        rejects that shape; a STORED body (written straight to the registry
+        here, as a hand-edited row would be) is refused by the resolver on
+        every read, so the preview must refuse it too rather than render a
+        slice nobody can be served."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "preview_invoices",
+                sql="SELECT * FROM preview_invoices WHERE unit LIKE $user_email",
+                note="hand-edited, never validated",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        c = policied_invoices_for_preview["client"]
+        token = policied_invoices_for_preview["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
         assert resp.status_code == 422, resp.text
-        assert "policy_preview_unsafe_live_group_name" in resp.text
-        assert "R&D%" in resp.text
+        assert "policy_var_in_pattern_position" in resp.text
 
     def test_preview_as_a_wildcard_group_user_is_fine_when_the_policy_ignores_groups(
         self, policied_invoices_for_preview
     ):
-        """Mirrors the resolver exactly: it only rejects the name when the
-        policy actually binds `$user_groups`. A policy that never
-        references them serves that user fine live, so the preview must
-        not invent a rejection."""
+        """A policy that never references `$user_groups` was never affected
+        by group-name shape at all — kept as the control case."""
         from src.db import get_system_db
         from src.repositories.user_group_members import UserGroupMembersRepository
         from src.repositories.user_groups import UserGroupsRepository
