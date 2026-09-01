@@ -1332,6 +1332,54 @@ class TestFlatProjectionTabsFold:
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
         assert 'id="glossary-list"' in body
 
+    def test_all_glossary_tab_shows_a_source_filter_mirroring_the_metrics_ones(self, seeded_app):
+        """#1956 item 1: the metrics tab offers an "All / <bucket>" sidebar
+        filter (`sl-cat-nav`); the glossary tab had only the search box.
+        Glossary terms carry no per-model attribution the way a
+        document-projected metric's ``category`` does (see the router), so
+        this mirrors the SAME component bucketed by the term's own
+        ``source`` instead — real, stored provenance, not an invented one.
+        """
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+        glossary_repo().create(id="g2", term="MRR", definition="Monthly recurring revenue.", source="ossie_git")
+        glossary_repo().create(id="g3", term="NRR", definition="Net revenue retention.", source="ossie_git")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        assert 'class="sl-cat-nav" aria-label="Glossary sources"' in body
+
+        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
+        assert 'data-cat="__all__"' in nav
+        assert ">All<" in nav
+
+        # Every term counts under "All"...
+        assert ">3<" in nav.split('data-cat="__all__"', 1)[1].split("</button>", 1)[0]
+
+        # ...and each source is its OWN, narrower bucket — the property that
+        # makes clicking one actually narrow the list rather than just
+        # relabeling the same total.
+        git_bucket = nav.split('data-cat="ossie_git"', 1)[1].split("</button>", 1)[0]
+        assert ">Git<" in git_bucket
+        assert ">2<" in git_bucket
+        manual_bucket = nav.split('data-cat="manual"', 1)[1].split("</button>", 1)[0]
+        assert ">Native<" in manual_bucket
+        assert ">1<" in manual_bucket
+
+    def test_all_glossary_tab_source_filter_only_covers_present_sources(self, seeded_app):
+        """No bucket renders for a source no stored term carries — an empty
+        bucket a click could select but that would always narrow to nothing
+        is worse than no bucket at all."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
+        assert 'data-cat="manual"' in nav
+        assert 'data-cat="ossie_git"' not in nav
+        assert 'data-cat="keboola_metastore"' not in nav
+
     def test_the_metrics_tab_consumes_the_deep_links_q(self, seeded_app):
         _seed_metric("arr")
         body = self._get(seeded_app, "/semantic-layer?tab=all_metrics&q=arr").text

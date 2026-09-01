@@ -37,6 +37,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 - **An imported semantic model's Library row shows a description again.** The Library's "Semantic models" section rendered the stored row's `description` column, which every semantic-source sync wrote as empty — so an imported model showed only its slug as a subtitle even when its document carried a description, and the row couldn't be hand-repaired since `PUT /api/admin/semantic-models/{id}` refuses a source-owned model. The row now falls back to the document's own model-level description when the stored column is blank, and a freshly-synced model's row is written with that description from now on (closes #1955).
+- **The Glossary tab's sidebar can filter by source.** "All metrics" already offered an "All / model" filter; "All glossary" had only a search box above an empty sidebar. Glossary terms carry no per-model attribution the way a document-projected metric's category does, so the mirrored filter buckets by the term's own source (Native / Git / Keboola / …) instead — the same sidebar component, honestly labeled at the coarser granularity glossary rows actually carry (#1956).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the

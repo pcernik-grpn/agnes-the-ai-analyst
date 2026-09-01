@@ -4542,6 +4542,29 @@ async def semantic_layer_list(
             for cat, items in sorted(by_category.items())
         ]
 
+    # #1956 item 1: the metrics sidebar's "All / <model slugs>" filter reads
+    # `category`, which `src/semantic/projection.py` sets to the owning
+    # model's own name for every document-projected metric. `glossary_terms`
+    # has no equivalent per-model column — `project_document` stamps every
+    # term from a call with the SAME `(source, source_ref)` regardless of
+    # which of a multi-model document's models it came from (see
+    # `src/semantic/importer.py`'s module docstring, step 5), so a document
+    # declaring more than one model cannot be told apart here. `source` is
+    # the finest attribution a glossary row actually carries — the same
+    # provenance the term's own source badge already renders — so that is
+    # what this buckets by; true per-model glossary attribution is tracked
+    # as a #1956 follow-up, not invented here.
+    glossary_categories: list[dict] = []
+    if active_tab == "all_glossary":
+        by_source: dict[str, int] = {}
+        for t in glossary_repo().list(limit=500):
+            src = t.get("source") or "manual"
+            by_source[src] = by_source.get(src, 0) + 1
+        glossary_categories = [
+            {"key": src, "label": source_label(src), "count": n}
+            for src, n in sorted(by_source.items(), key=lambda kv: source_label(kv[0]))
+        ]
+
     tab_counts = {
         "models": len(models),
         "all_metrics": len(visible_metrics),
@@ -4567,6 +4590,7 @@ async def semantic_layer_list(
         metric_categories=metric_categories,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
+        glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 
