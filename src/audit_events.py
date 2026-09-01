@@ -1048,11 +1048,6 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a SharePoint connection's observed content-changes feed.",
     ),
-    "sharepoint_connection.corpus_map_read": AuditEvent(
-        "sharepoint_connection.corpus_map_read",
-        "read",
-        "The SharePoint connection's scope-to-collection corpus map was read.",
-    ),
     "sharepoint_connection.scopes_read": AuditEvent(
         "sharepoint_connection.scopes_read", "read", "An admin read a SharePoint connection's configured scopes."
     ),
@@ -1140,6 +1135,12 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_connection.extract",
         "mutation",
         "A document extraction was started for one SharePoint connection.",
+    ),
+    # -- Cooperative stop (owner-frustration fix, 2026-09-01) -----------------
+    "extraction.stop_requested": AuditEvent(
+        "extraction.stop_requested",
+        "mutation",
+        "An admin requested a running (or about-to-run) extraction crawl stop at its next quiescent point.",
     ),
     "run_sharepoint_extraction": AuditEvent(
         "run_sharepoint_extraction",

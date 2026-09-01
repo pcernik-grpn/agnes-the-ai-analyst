@@ -83,11 +83,6 @@ class TestThreeStepDrawer:
         assert "indexed but invisible" in body
         assert 'id="spw-share-rows"' in body
 
-    def test_step3_has_corpus_map_download(self, seeded_app):
-        body = _page(seeded_app)
-        assert 'id="spw-corpus-map-link"' in body
-        assert "corpus-map" in body
-
 
 class TestStep2MarkupTCRD240:
     """Step-2 page-shell markers for subfolder browsing (#1), the
@@ -603,7 +598,7 @@ class TestSavedSiteScopeVisibleOnReopen:
     cannot include it — under ``Sites.Selected`` discovery is 403-forbidden,
     and ``list_sites`` is first-page-only anyway. A site scope's
     ``source_scope_id`` IS the Graph site id ("host,siteCol,web" — the only
-    scope id with commas, see ``connectors/sharepoint/corpus_map._map_key``)
+    scope id with commas)
     and its ``display_path`` IS the site name, so the row is rebuildable
     from the scope alone. Regression: the row only rendered when live
     discovery happened to list it, so a reopened wizard showed
