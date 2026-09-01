@@ -609,6 +609,19 @@
            role="listbox" aria-label="Skills and commands">
         <ul id="chat-slash-menu-results" class="cloud-chat-slash-menu-results"></ul>
       </div>
+      {# Pasted attachments — a strip ABOVE the pill, inside the form.
+
+         It cannot live inside .cloud-chat-composer: that pill is a fixed-height
+         flex ROW (chat.css) whose geometry the send button is aligned against,
+         so a wrapping chip row inside it would break the concentric-circle
+         alignment. Above it, the strip is its own block in rail and spans both
+         grid columns in the default layout.
+
+         Empty and hidden until something is pasted; chat.js builds the chips
+         with createElement + textContent (file names are user-supplied strings,
+         never innerHTML). #}
+      <div id="chat-attachments" class="cloud-chat-attachments" hidden
+           aria-live="polite" aria-label="Attachments"></div>
       {# Agnes-branded placeholder + an inner .cloud-chat-composer wrapper
          so the green pill can live INSIDE the form while the form itself
          acts as the hero box's middle row in the dashboard empty state
@@ -646,7 +659,7 @@
               data-upload-action="media">
             <span class="cloud-chat-plus-menu-item-text">
               <span class="cloud-chat-plus-menu-item-label">Image / Document</span>
-              <span class="cloud-chat-plus-menu-item-hint">PDF, image, text &mdash; attach to your workspace</span>
+              <span class="cloud-chat-plus-menu-item-hint">PDF, image, text &mdash; or just paste a screenshot into the box</span>
             </span>
           </li>
         </ul>

@@ -753,6 +753,10 @@ Run `agnes pull` to refresh. Rules are pruned automatically when items are revok
 ## Directory Structure
 {% if is_sandbox %}
 - `outputs/` — deliverable files for the user (see "Files you produce" above)
+- `uploads/` — files the USER handed you: a pasted screenshot, an uploaded PDF
+  or spreadsheet. A message that says a file is attached names its path here —
+  open it (images included) before answering, and re-check the directory rather
+  than assuming a file is missing.
 - `user/snapshots/*.parquet` — ad-hoc snapshots from `agnes snapshot create`
 - `.claude/` — skills and settings (do not modify)
 

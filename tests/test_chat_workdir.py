@@ -267,6 +267,43 @@ def test_regular_session_symlinks_scaffolds(workdir_mgr: WorkdirManager):
     assert (link / "nodejs-dashboard" / "app.js").exists()
 
 
+class TestUploadsReachTheSession:
+    """A file the USER hands in — a pasted screenshot, a "+" menu upload —
+    lands in ``<workspace>/uploads/``. Unlinked, that directory has no path
+    the conversation can name: the workspace is mounted at its absolute host
+    path, which nothing in the sandbox knows, so the endpoint's own hint
+    ("available in your next chat session") was true of no reachable file.
+    """
+
+    def test_regular_session_symlinks_uploads(self, workdir_mgr: WorkdirManager):
+        workdir_mgr.ensure_user_workdir("u@x")
+        ws = workdir_mgr.user_workspace("u@x")
+        (ws / "uploads").mkdir(exist_ok=True)
+        (ws / "uploads" / "shot.png").write_bytes(b"\x89PNG")
+
+        sdir = workdir_mgr.prepare_session_dir("u@x", "chat_uploads")
+
+        link = sdir / "uploads"
+        assert link.is_symlink(), "uploads must be linked, not copied — a paste mid-session writes to the workspace"
+        assert (link / "shot.png").read_bytes() == b"\x89PNG"
+
+    def test_the_link_exists_before_the_first_upload(self, workdir_mgr: WorkdirManager):
+        """The link loop skips a target that does not exist. A workspace that
+        had never received an upload therefore got no link — and a screenshot
+        pasted mid-conversation landed where that session could not see it."""
+        workdir_mgr.ensure_user_workdir("u@x")
+        ws = workdir_mgr.user_workspace("u@x")
+        assert not (ws / "uploads").exists(), "premise: nothing uploaded yet"
+
+        sdir = workdir_mgr.prepare_session_dir("u@x", "chat_empty_uploads")
+
+        assert (sdir / "uploads").is_symlink()
+        # The live workspace directory, so a file written after the spawn is
+        # visible without a respawn.
+        (ws / "uploads" / "later.png").write_bytes(b"later")
+        assert (sdir / "uploads" / "later.png").read_bytes() == b"later"
+
+
 class TestTheFeaturePruneRunsOnEveryConvergence:
     """Devin Review on #1239, three threads with one root cause.
 
