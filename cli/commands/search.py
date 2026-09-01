@@ -75,7 +75,7 @@ def search(
     sources_line = (
         "sources: documents (local)"
         if body.get("source") == "local"
-        else "sources: documents + knowledge + catalog + metrics + glossary (server)"
+        else "sources: documents + knowledge + catalog + metrics + glossary + plugins (server)"
     )
     results = body.get("results", [])
     if not results:
@@ -100,6 +100,9 @@ def search(
             typer.echo(f"[{r.get('score')}] mtrc {label}: {(r.get('description') or '')[:110]}")
         elif t == "glossary":
             typer.echo(f"[{r.get('score')}] term {r.get('term')}: {(r.get('definition') or '')[:110]}")
+        elif t == "plugin":
+            label = r.get("display_name") or r.get("name") or r.get("id") or "?"
+            typer.echo(f"[{r.get('score')}] plug {label}: {(r.get('description') or '')[:110]}")
         else:
             typer.echo(f"[{r.get('score')}] tbl  {r.get('name')} — {r.get('pivot_hint')}")
     typer.echo(sources_line)

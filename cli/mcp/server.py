@@ -190,7 +190,8 @@ def knowledge_search(query: str, k: int = 10) -> dict:
 
     Fans out server-side over Collections chunks (hybrid lexical+vector),
     corporate-memory knowledge items (fulltext), and table catalog cards —
-    all RBAC-filtered. Results are typed ``chunk | knowledge | table``;
+    all RBAC-filtered. Results are typed
+    ``chunk | knowledge | table | metric | glossary | plugin``;
     a ``table`` hit means structured data: pivot to SQL via the ``query``
     tool with the hit's ``table_id`` instead of reading text chunks.
 
