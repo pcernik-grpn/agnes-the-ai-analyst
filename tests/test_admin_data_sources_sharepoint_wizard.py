@@ -597,6 +597,121 @@ class TestSharePointWizardStep2Behavior:
         assert result["skippedShown"] is False
 
 
+class TestSavedSiteScopeVisibleOnReopen:
+    """Reopening "Manage scopes" on a connection with a saved SITE scope
+    must show that site at the sites level even when the live listing
+    cannot include it — under ``Sites.Selected`` discovery is 403-forbidden,
+    and ``list_sites`` is first-page-only anyway. A site scope's
+    ``source_scope_id`` IS the Graph site id ("host,siteCol,web" — the only
+    scope id with commas, see ``connectors/sharepoint/corpus_map._map_key``)
+    and its ``display_path`` IS the site name, so the row is rebuildable
+    from the scope alone. Regression: the row only rendered when live
+    discovery happened to list it, so a reopened wizard showed
+    "Nothing here." with the saved site invisible."""
+
+    _SITE_SCOPE = (
+        '{ source_scope_id: "contoso.sharepoint.com,11111111-aaaa,22222222-bbbb",'
+        ' display_path: "My Site", anonymize: false,'
+        ' collection: { id: "c1", slug: "my-site", name: "My Site" }, group_ids: [] }'
+    )
+
+    def test_saved_site_renders_when_discovery_is_forbidden(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: false, status: 502, json: async () => ({
+                detail: { error: "sharepoint_discovery_forbidden",
+                          message: "Graph refused to list sites (HTTP 403)." } }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              html: document.getElementById("spw-tree").innerHTML,
+              errText: document.getElementById("spw-tree-error").textContent,
+            }));
+            """
+            % self._SITE_SCOPE
+        )
+        html = result["html"]
+        assert "My Site" in html, "the saved site must render at the sites level"
+        assert "checked" in html, "the saved site's checkbox must reflect its confirmed state"
+        assert "data-spw-drill" in html, "the rebuilt site row must stay navigable (id IS the site id)"
+        assert "my-site" in html, "the scope's collection badge must ride along"
+        # The discovery notice still shows — the row is real, the listing is
+        # still forbidden, both facts stand.
+        assert "403" in result["errText"]
+
+    def test_saved_site_merges_into_a_listing_that_omits_it(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: true, status: 200, json: async () => ({
+                level: "sites", items: [{ id: "other.sharepoint.com,x,y", name: "Other Site" }] }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+            % self._SITE_SCOPE
+        )
+        assert "Other Site" in result["html"]
+        assert "My Site" in result["html"]
+
+    def test_saved_site_already_listed_is_not_duplicated(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: true, status: 200, json: async () => ({
+                level: "sites",
+                items: [{ id: "contoso.sharepoint.com,11111111-aaaa,22222222-bbbb", name: "My Site" }] }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+            % self._SITE_SCOPE
+        )
+        assert result["html"].count("data-spw-item=") == 1
+
+    def test_folder_scope_never_fabricates_a_site_row(self):
+        """A folder scope's id (a Graph item id, no commas) names no site —
+        the sites level must stay honestly empty rather than invent an
+        un-navigable row."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [
+                  { source_scope_id: "01ABCDEF123", display_path: "Site / Docs / X",
+                    anonymize: false, collection: null, group_ids: [] },
+                ] }) };
+              }
+              return { ok: false, status: 502, json: async () => ({
+                detail: { error: "sharepoint_discovery_forbidden",
+                          message: "Graph refused to list sites (HTTP 403)." } }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+        )
+        assert "01ABCDEF123" not in result["html"]
+        assert "data-spw-item=" not in result["html"]
+
+
 class TestUniquePermissionsBadgeUI:
     """ADVISORY-ONLY badge (Decision #2) rendered by the SHIPPED
     `spRenderTree` — present only for a bare `true`, absent for `false` AND
@@ -808,5 +923,7 @@ class TestClientSecretWizardOption:
         assert 'value="secret"' in body
         assert "Client secret" in body
         assert 'id="spw-client-secret"' in body
-        secret_tag = body.split('id="spw-client-secret"', 1)[0][-200:] + body.split('id="spw-client-secret"', 1)[1][:200]
+        secret_tag = (
+            body.split('id="spw-client-secret"', 1)[0][-200:] + body.split('id="spw-client-secret"', 1)[1][:200]
+        )
         assert 'type="password"' in secret_tag
