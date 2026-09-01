@@ -714,8 +714,20 @@ def _alias_canonicals(names: Iterable[str], *, kind: str) -> dict[str, str]:
       is what keeps "jan novák" and "petr novák" apart: two full names never
       merge on the surname alone.
 
+    The surname rule is also where an ambiguous bare surname has to be
+    refused rather than guessed at: when a bare form ("smith") inflects
+    against the surname of *more than one* full name that do not share a
+    first token ("john smith" **and** "mary smith"), it is impossible to say
+    which person it names, so it joins **neither** — it keeps its own group
+    (and its own pseudonym) instead of picking a side. Prefer a missed join
+    over a wrong one: merging "john smith" and "mary smith" into one
+    pseudonym would make two people look like one, which is a strictly worse
+    failure than the bare mention getting an unlinked pseudonym of its own.
+
     Grouping is transitive (union-find), so the outer pair of a chain need not
-    itself satisfy the rule.
+    itself satisfy the rule — except at the ambiguity check above, which looks
+    at the direct pairing, not the transitive closure, precisely so it can
+    catch a bridge before it is built.
 
     A group hashes under its whole-string longest common prefix when that is
     still ``ALIAS_MIN_PREFIX`` characters or more, otherwise (a group that
@@ -724,10 +736,8 @@ def _alias_canonicals(names: Iterable[str], *, kind: str) -> dict[str, str]:
     "Jan Novák ... Nováka" and a document spelling only "Nováka ... Novákovi"
     both canonicalize to "novák".
 
-    Known and accepted, in both directions:
+    Known and accepted:
 
-    * two genuinely different people who share a surname *and* are both
-      mentioned by bare surname merge into one pseudonym;
     * a document that only ever spells the full name ("Jan Novák", never an
       inflected bare surname) canonicalizes to "jan novák" and therefore does
       *not* join a document that only ever spells "Novákovi". Cross-document
@@ -769,14 +779,36 @@ def _alias_canonicals(names: Iterable[str], *, kind: str) -> dict[str, str]:
                     union(left, right)
 
     for bucket in stem_buckets.values():
+        # A bare surname can inflection-match more than one full name in the
+        # same bucket ("smith" against both "john smith" and "mary smith").
+        # Collect every full name each bare form matches BEFORE unioning
+        # anything, so the ambiguity check below sees the whole picture
+        # rather than unioning the first match and never getting a chance to
+        # notice the second.
+        bare_matches: dict[str, list[str]] = {}
         for index, left in enumerate(bucket):
             for right in bucket[index + 1 :]:
                 # Exactly one side must be a bare surname; two full names never
                 # merge on a shared surname alone.
                 if (" " in left) == (" " in right):
                     continue
-                if _inflection_pair(_stem(left), _stem(right)):
-                    union(left, right)
+                if not _inflection_pair(_stem(left), _stem(right)):
+                    continue
+                bare, full = (left, right) if " " not in left else (right, left)
+                bare_matches.setdefault(bare, []).append(full)
+
+        for bare, fulls in bare_matches.items():
+            # The full names one bare surname matches are the SAME person
+            # only when they agree on a first token — an inflected spelling
+            # of one full name never disagrees with itself there. Two (or
+            # more) different first tokens means two different people share
+            # this surname, and the bare mention cannot say which one it is:
+            # leave it — and them — unmerged rather than guess.
+            first_tokens = {full.split(" ", 1)[0] for full in fulls}
+            if len(first_tokens) > 1:
+                continue
+            for full in fulls:
+                union(bare, full)
 
     groups: dict[str, list[str]] = {}
     for name in unique:
@@ -964,8 +996,34 @@ def _is_reserved(word: str) -> bool:
     return word in _RESERVED_WORDS or bool(_PSEUDONYM_TOKEN_RE.match(word))
 
 
+#: Ordinary horizontal whitespace inside a name run: an ASCII space and the
+#: NBSP a word processor inserts between groups (the same separator set the
+#: phone/IBAN tiers use).
+_RUN_HORIZONTAL_WS = "  "
+
+
+def _is_run_gap(gap: str, *, extra: str = "") -> bool:
+    """True when ``gap`` only keeps a capitalized run visually apart — never
+    when it separates two runs on either side of a paragraph.
+
+    A single line break (plus surrounding horizontal whitespace) counts as
+    part of the run: PDF/DOCX→markdown conversion wraps lines constantly, so
+    a name split across one of those wraps ("Northwind\\nLogistics Holding
+    a.s.") is the ordinary case, not an edge case. TWO OR MORE line breaks is
+    a blank line — a genuine paragraph boundary in markdown — and is
+    deliberately NOT treated as part of a run: a capitalized word ending one
+    paragraph and one starting the next are not one name.
+
+    ``extra`` adds caller-specific characters to tolerate (the company pass
+    also allows a comma in the gap, e.g. "Acme, Inc.").
+    """
+    if gap.count("\n") > 1:
+        return False
+    return gap.strip(_RUN_HORIZONTAL_WS + "\n" + extra) == ""
+
+
 def _adjacent(text: str, left: _Word, right: _Word) -> bool:
-    """True when two words form one run — only spaces separate them.
+    """True when two words form one run — see :func:`_is_run_gap`.
 
     An abbreviating full stop is tolerated after an honorific or a
     single-letter initial ("Ing. Novák", "J. Novák"), and nowhere else:
@@ -975,10 +1033,10 @@ def _adjacent(text: str, left: _Word, right: _Word) -> bool:
     gap = text[left.end : right.start]
     if gap == "":
         return False
-    if gap.strip("  ") == "":
+    if _is_run_gap(gap):
         return True
     abbreviating = left.text.casefold() in _HONORIFICS or len(left.text) == 1
-    return abbreviating and gap.startswith(".") and gap[1:].strip("  ") == ""
+    return abbreviating and gap.startswith(".") and _is_run_gap(gap[1:])
 
 
 class RegexDetector:
@@ -1014,8 +1072,12 @@ class RegexDetector:
       capitalized word and are not detected.
     * **Companies whose legal form is not in the list**, or is written in a
       way the list does not cover.
-    * **Names split across markup** — bold/italic markers, a soft hyphen or a
-      line break inside a name break the run.
+    * **Names split across markup** — bold/italic markers or a soft hyphen
+      inside a name break the run. A *single* line break does not (see
+      :func:`_is_run_gap`) — PDF/DOCX→markdown conversion wraps lines
+      constantly, so tolerating one wrap is what keeps an ordinary wrapped
+      name from leaking half-redacted; a blank line (two or more breaks)
+      still ends the run, because that is a paragraph boundary.
     * **Identifiers that are not names but identify anyway**: addresses,
       account numbers in national (non-IBAN) format, case numbers, VAT ids,
       passport numbers. None are detected HERE. Phone numbers, IBANs and
@@ -1032,9 +1094,6 @@ class RegexDetector:
     * **Place, product, and organization names** written as two capitalized
       words become persons — "New York", "Prague Castle", "Data Apps".
     * **Title-Cased headings** become a person run.
-    * Two different people who share a surname and are both referred to by
-      bare surname collapse into one pseudonym (see
-      :func:`_alias_canonicals`).
 
     The interface exists so this can be replaced: any
     ``Callable[[str], list[Entity]]`` — an NER model, an LLM pass, a curated
@@ -1073,7 +1132,7 @@ class RegexDetector:
                     break
                 anchor = run[0] if run else None
                 gap_end = anchor.start if anchor else marker.start()
-                if text[word.end : gap_end].strip("  ,") != "":
+                if not _is_run_gap(text[word.end : gap_end], extra=","):
                     break
                 if not word.text[:1].isupper() or _is_reserved(word.text):
                     break

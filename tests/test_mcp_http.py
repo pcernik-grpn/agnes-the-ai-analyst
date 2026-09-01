@@ -330,6 +330,12 @@ class TestToolRegistration:
             # POST /api/collections/{cid}/files/{fid}/reingest +
             # `agnes collections reingest`.
             "collections_reingest",
+            # The one collection WRITE tool: editable metadata (name,
+            # description), owner-or-admin. Triple-surface with PATCH
+            # /api/collections/{id} + `agnes collections edit`. Create /
+            # upload / delete are deliberately absent from this transport —
+            # a rename is reversible and audited, a delete is neither.
+            "collection_update",
             # Fact graph over Collections — query surface (build order step
             # 6). Triple-surface with POST /api/facts/search, POST
             # /api/facts/neighbors, GET /api/facts/{subject_id}/claims, and

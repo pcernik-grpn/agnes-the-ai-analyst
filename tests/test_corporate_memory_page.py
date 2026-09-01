@@ -153,3 +153,36 @@ class TestDetectionExplanationPanel:
             assert "Currently disabled" in resp.text
         finally:
             ic._instance_config = None
+
+
+class TestReviewQueueBulkReject:
+    """#1957 follow-up: the Review Queue's "Reject Selected" control routes
+    through the dedicated ``POST /api/memory/admin/bulk-reject`` endpoint
+    (pending-only, per-id partial-failure reporting) instead of the generic
+    ``batchAction('reject')`` the All Items tab still uses."""
+
+    def test_reject_selected_button_calls_bulk_reject_endpoint(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/admin/corporate-memory", headers=_auth(token))
+        assert resp.status_code == 200
+        body = resp.text
+
+        assert 'id="batchRejectBtn"' in body
+        assert 'onclick="bulkRejectSelected()"' in body
+        assert "function bulkRejectSelected()" in body
+        assert "/api/memory/admin/bulk-reject" in body
+        # All Items tab's reject stays on the generic batch action — bulk-reject
+        # is a Review-Queue-only tightening, not a wholesale replacement.
+        assert 'id="batchRejectBtnAll" disabled onclick="batchAction(\'reject\')"' in body
+
+    def test_reject_selected_confirms_the_count(self, seeded_app):
+        """The count lands in a confirmModal() call, never a native confirm()
+        — tests/test_design_system_contract.py bans the latter (#497 §1)."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/admin/corporate-memory", headers=_auth(token))
+        assert resp.status_code == 200
+        assert "Reject ${ids.length} selected item" in resp.text
+        assert "await confirmModal({" in resp.text
+        assert "confirm(`Reject" not in resp.text

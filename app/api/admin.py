@@ -606,13 +606,11 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     pins (env-lock honesty) rather than whatever `instance.yaml` happens to
     hold underneath it.
 
-    Every reader resolves env-first (`app.worker.kinds
-    ._extraction_producer_argv` for the two leaves below; the connector's
-    `enabled` state itself lives on the separate `sharepoint` switch, not
-    here — see `app.switches.switch_value`), so a stale/absent yaml value
-    under an active pin would otherwise render a value the runtime does not
-    actually use — for a field the operator cannot act on here anyway, that
-    is worse than showing the truth.
+    Currently a no-op body: `_EXTRACTION_ENV_LOCKS` above is empty, since
+    the external-producer leaves it used to cover were removed along with
+    external-producer mode (the connector's `enabled` state lives on the
+    separate `sharepoint` switch — see `app.switches.switch_value`). Kept
+    as the mechanism a future locked `extraction.*` leaf slots back into.
     """
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):

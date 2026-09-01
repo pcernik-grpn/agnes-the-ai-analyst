@@ -121,11 +121,19 @@ OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 #: The crawl's own vocabulary is ``"timeout"`` | ``"stopped"`` |
 #: ``"throttled"`` | ``"error"`` | ``None``, classified in one place on its
 #: side (``_STOP_REASONS`` / ``_stop_reason()``): the named values are
-#: exactly the stops that leave consistent state on disk. ``"error"`` is
-#: deliberately absent from the set below, and an unknown reason claims
-#: nothing — a new stop has to be vouched for here explicitly before this
-#: surface will promise anything about it.
-RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped"})
+#: exactly the stops that leave consistent state on disk. ``"abandoned"``
+#: is the one member of this set the crawl process itself never sets — it
+#: is written by ``ExtractionRunsPgRepository.abandon_stale_running``, from
+#: an ENTIRELY different (later) process, when a NEW run for the same
+#: connection finds a still-``running`` row left behind by a worker that
+#: died outright (a native crash, a killed process) — resumable for the
+#: exact same reason a self-detected stop is: the per-item cTag write only
+#: ever happens after a durable ingest, so a dead run's persisted state is
+#: never ahead of what it actually finished. ``"error"`` is deliberately
+#: absent from the set below, and an unknown reason claims nothing — a new
+#: stop has to be vouched for here explicitly before this surface will
+#: promise anything about it.
+RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped", "abandoned"})
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -162,10 +170,13 @@ def _age_s(value: Any, *, now: Optional[datetime] = None) -> Optional[float]:
 def _job_status(job_id: Optional[str]) -> Optional[str]:
     """This run's job status, when the run knows its job id.
 
-    Best-effort by construction: nothing supplies ``job_id`` today (the
-    worker hands the crawl the job's payload, not its id), and a lookup
-    failure is a missing signal, not an error — the checkpoint-age fallback
-    below still answers.
+    Best-effort by construction: a run triggered outside the worker (a test,
+    a manual payload) may still have no ``job_id`` — the worker's own
+    dispatcher merges the claimed job's id in
+    (``app/worker/kinds.py::_payload_for_handler``), but nothing forces every
+    caller of ``run_builtin_crawl`` through it — and a lookup failure is a
+    missing signal, not an error: the checkpoint-age fallback below still
+    answers.
     """
     if not job_id:
         return None
@@ -444,6 +455,14 @@ async def extraction_run_detail(
     The skip list carries ``listed`` alongside ``total``: only oversize
     skips keep a path, so a run that refused 27 documents and can name 20 of
     them says exactly that instead of implying the list is the whole story.
+
+    The per-file error detail (download/convert/ingest failures — a path, a
+    reason, an upstream status code when known, and a message) lives at
+    ``report.errors_detail``, same ``{items, total, listed, truncated}``
+    envelope. It rides inside ``report`` rather than getting its own
+    top-level key or column because it is exactly as itemizable as the rest
+    of a run's numbers, never a separate concern — the source card's
+    error-count line fetches this endpoint on first expand to render it.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo

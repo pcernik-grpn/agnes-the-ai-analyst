@@ -144,3 +144,34 @@ class FileCorporaPgRepository:
                 sa.text("UPDATE file_corpora SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
                 {"id": corpus_id},
             )
+
+    #: Mirrors ``FileCorporaRepository._UPDATABLE`` — the only columns
+    #: :meth:`update` may write, and the allowlist that decides which
+    #: identifiers reach SQL.
+    _UPDATABLE = ("name", "slug", "description")
+
+    def update(self, corpus_id: str, **fields: Any) -> bool:
+        """Patch one live corpus's editable metadata. ``True`` if a row matched.
+
+        Presence-based semantics, an unknown column raising ``ValueError``, and
+        a slug collision raising (here: ``IntegrityError``) — see the DuckDB
+        sibling for the reasoning behind all three.
+        """
+        unknown = sorted(set(fields) - set(self._UPDATABLE))
+        if unknown:
+            raise ValueError(f"file_corpora.update: not an updatable column: {unknown}")
+        if not fields:
+            return False
+        cols = list(fields)
+        sets = ", ".join(f"{c} = :{c}" for c in cols)  # identifiers come from _UPDATABLE
+        params: Dict[str, Any] = {c: fields[c] for c in cols}
+        params["id"] = corpus_id
+        with self._engine.begin() as conn:
+            res = conn.execute(
+                sa.text(
+                    f"UPDATE file_corpora SET {sets}, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = :id AND deleted_at IS NULL"
+                ),
+                params,
+            )
+            return (res.rowcount or 0) > 0

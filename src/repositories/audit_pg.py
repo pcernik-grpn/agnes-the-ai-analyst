@@ -27,6 +27,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from src.audit_context import (
+    apply_view_as_attribution,
     auto_client_ip,
     auto_client_kind,
     auto_correlation_id,
@@ -132,6 +133,10 @@ class AuditPgRepository:
             correlation_id = auto_correlation_id()
         if client_kind is None:
             client_kind = auto_client_kind()
+        # Read-only view-as: the actor is the VIEWER, never the person whose
+        # surfaces they are looking at. Mirrors audit.py (DuckDB) verbatim —
+        # both call the one shared definition in src/audit_context.py.
+        user_id, params = apply_view_as_attribution(user_id, params)
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         with self._engine.begin() as conn:

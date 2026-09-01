@@ -799,9 +799,9 @@ def list_ingest_runs(
     priced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for
     why it is never a fabricated precise number). It covers EVERY run this
     instance has ever persisted, not just the ``limit``-bounded ``runs``
-    list above, and is instance-wide rather than per-connection (same
-    interim limitation as ``distinct_corpus_ids``'s "scope collections"
-    heuristic) — a per-connection split is a documented follow-up once a
-    real connection-to-collection mapping exists."""
+    list above, and is instance-wide rather than per-connection — see that
+    method's own docstring for why (an ingest run report carries no
+    connection id to split on, unlike ``_sharepoint_pipeline_cell``'s
+    crawl/extract/facts counts)."""
     repo = facts_ingest_runs_repo()
     return {"runs": repo.list_recent(limit=limit), "llm_usage_totals": repo.llm_usage_rollup()}
