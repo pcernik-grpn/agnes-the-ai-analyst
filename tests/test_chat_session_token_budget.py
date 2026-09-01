@@ -53,8 +53,11 @@ def _repo(*, session_tokens: int = 0, daily: tuple[int, int] = (0, 0)) -> MagicM
     return repo
 
 
-async def _enforce(cfg: ChatConfig, repo: MagicMock) -> list[dict]:
-    frames: list[dict] = []
+async def _enforce(cfg: ChatConfig, repo: MagicMock, frames: list[dict] | None = None) -> list[dict]:
+    """Run the gate with an ``on_limit`` that appends to ``frames``. Pass your
+    own list when the gate is expected to raise — the frame is broadcast
+    BEFORE the raise, and a returned value would never reach the caller."""
+    frames = [] if frames is None else frames
 
     async def _capture(frame: dict) -> None:
         frames.append(frame)
@@ -131,11 +134,12 @@ def test_the_refusal_frame_names_the_budget_and_the_next_step():
     cfg = ChatConfig(enabled=True, max_session_tokens=200_000, daily_anthropic_spend_usd=10**6)
     frames: list[dict] = []
     with pytest.raises(RuntimeError, match="max_session_tokens_exhausted"):
-        frames = asyncio.run(_enforce(cfg, _repo(session_tokens=438_679)))
-    # on_limit ran before the raise; collect it again through the helper the
-    # frame is built from so the assertion is on the shipped text.
-    msg = session_token_budget_message(438_679, 200_000)
-    assert frames == [] or frames[0]["message"] == msg
+        asyncio.run(_enforce(cfg, _repo(session_tokens=438_679), frames))
+    # The frame was broadcast before the raise — exactly one, with the
+    # shipped copy (the numbers are the ones from the bug report).
+    assert len(frames) == 1
+    msg = frames[0]["message"]
+    assert msg == session_token_budget_message(438_679, 200_000)
     assert "token budget" in msg
     assert "438,679" in msg and "200,000" in msg
     assert "new conversation" in msg

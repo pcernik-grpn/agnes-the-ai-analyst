@@ -51,9 +51,11 @@ class ChatConfig:
     idle_ttl_seconds: int = 30 * 60
     per_tool_call_seconds: int = 90
     per_session_bq_scan_bytes: int = 20 * 1024**3
-    # Two per-sender spend guardrails, both summed from ``chat_messages`` tokens
-    # (input + output + cache writes; cache reads excluded — the
-    # ``src.llm_pricing.budget_tokens`` definition). ``0`` disables either one.
+    # Two spend guardrails, both summed from ``chat_messages`` tokens (input +
+    # output + cache writes; cache reads excluded — the
+    # ``src.llm_pricing.budget_tokens`` definition): the daily cap is per
+    # SENDER, the token budget below is per CONVERSATION. ``0`` disables
+    # either one.
     daily_anthropic_spend_usd: float = 20.0
     max_session_seconds: int = 4 * 3600
     # CUMULATIVE tokens billed over a conversation's whole life, NOT the size of
