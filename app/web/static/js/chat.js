@@ -92,6 +92,13 @@ function renderMarkdownSafe(text) {
 
 let ws = null;
 let currentChatId = null;
+/** Bumped by every `openSession` call. A call whose generation is no longer
+ *  the newest one has been superseded — the user clicked another conversation,
+ *  or a submit re-opened this one — and must not paint into the transcript or
+ *  claim the global socket after its awaits resolve (#1973 review: the
+ *  deep-link restore now runs alongside the rest of boot, so a click landing
+ *  during it is an ordinary race rather than a rare one). */
+let _openGeneration = 0;
 let inFlightToolCalls = new Map();
 // Cards rendered by renderToolCallStart during the turn in progress. Collapsed
 // in one pass once the turn ends (see _collapseFinishedToolCalls) so the
@@ -173,16 +180,69 @@ const currentUserEmail = document.body.dataset.userEmail || "";
 // in an empty/error state, which is acceptable and RBAC-safe.)
 let _initialSessionId = (document.body.dataset.initialSession || "").trim() || null;
 
+/** The in-flight deep-link restore, or null when none was started. Set by
+ *  `_restoreInitialSessionEarly` and read by `_maybeOpenInitialSession` so the
+ *  two can never both open the same session (#1973). */
+let _initialRestorePromise = null;
+
+/** Start the deep-link restore IMMEDIATELY, before anything the boot awaits.
+ *
+ *  #1973: the restore used to wait for `loadSidebar()` (a network round-trip)
+ *  and then for a `requestAnimationFrame`, and only after that fetched history
+ *  and minted a ticket. For all of those seconds the page showed the
+ *  pre-conversation hero — "Ask Agnes anything" — with the `?session=` param
+ *  already stripped from the URL by `openSession`. That is indistinguishable
+ *  from being dropped into a new chat, and it is what the reporter saw. So:
+ *  the hero comes down synchronously here, the status line says what is
+ *  happening, and the fetches start now instead of after the sidebar.
+ *
+ *  The session id is deliberately NOT consumed: `_hadInitialSession` (the
+ *  `?agent=` race guard) is captured later in boot and must still see it. */
+function _restoreInitialSessionEarly() {
+  if (!_initialSessionId || currentChatId || _initialRestorePromise) return null;
+  // A deep link names a conversation that exists — never show the
+  // pre-conversation dashboard for it, not even for one frame.
+  hideCapabilities();
+  setStatus("Restoring conversation…", "info");
+  _initialRestorePromise = openSession(_initialSessionId, undefined, { restoring: true }).catch((err) => {
+    console.error("chat: deep-link restore failed", err);
+  });
+  return _initialRestorePromise;
+}
+
 /** Open the deep-linked session exactly once on boot. No-op if there's no
- *  deep link, if the user already opened a session, or after first use. */
+ *  deep link, if the user already opened a session, or after first use.
+ *  Retained as the late-boot fallback for the case where the early restore
+ *  above could not start (a session opened from a click in between). */
 function _maybeOpenInitialSession() {
+  if (_initialRestorePromise) {
+    _initialSessionId = null;          // the early restore owns it
+    return;
+  }
   if (!_initialSessionId || currentChatId) return;
   const id = _initialSessionId;
   _initialSessionId = null;            // consume once — refreshes can't re-fire
   requestAnimationFrame(() => {
     if (currentChatId) return;          // re-check: a click may have raced in
-    openSession(id);
+    openSession(id, undefined, { restoring: true });
   });
+}
+
+/** Re-read the open conversation's title/agent from the sidebar cache.
+ *
+ *  The early deep-link restore runs BEFORE `loadSidebar()` resolves, so it has
+ *  no cached row to read a title from and `_markConversationStarted` falls back
+ *  to "Untitled chat". Called once the cache is populated so the header ends up
+ *  saying what the conversation is actually called. */
+function _resyncOpenSessionMeta() {
+  if (!currentChatId) return;
+  const meta = _sessionsCache.find(s => s.id === currentChatId);
+  if (!meta) return;
+  if (meta.agent_id && !_currentAgentId) {
+    _currentAgentId = meta.agent_id;
+    _syncAgentPicker();
+  }
+  if (meta.title && _sessionHasTurns) setThreadTitle(meta.title);
 }
 
 // Promise that resolves on the first ``ready`` / ``runner_ready`` frame from
@@ -1808,8 +1868,13 @@ async function newChat(agentSlug) {
  * what openSession already does on first open, so this is just that
  * logic made callable a second time. */
 async function loadAndRenderHistory(chatId) {
+  // Whichever open (or `full_refresh`) we belong to. If another one starts
+  // while our fetch is in flight, the transcript below is no longer ours to
+  // draw — see `_openGeneration`.
+  const gen = _openGeneration;
   $("chat-messages").innerHTML = "";
   _endToolGroup();
+  clearThinkingPlaceholder();
   // Reset recall state for the chat being loaded up front, not after a
   // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
   // browsing the PREVIOUS conversation's prompts under the new chatId.
@@ -1820,9 +1885,13 @@ async function loadAndRenderHistory(chatId) {
   let history = [];
   try {
     history = await api(`/api/chat/sessions/${chatId}/messages`);
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
   } catch (err) {
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
     setStatus(`Could not load history: ${err.message}`, "warn");
-    return;
+    // #1973: the outcome is the caller's to act on — a RESTORE that cannot
+    // read its own history must show an error, not the empty-state hero.
+    return { ok: false, error: err.message, count: 0 };
   }
   if (history.length === 0) {
     // A conversation with an agent opens with that agent introducing itself —
@@ -1895,6 +1964,85 @@ async function loadAndRenderHistory(chatId) {
   for (const frame of pendingQuestionFrames.values()) {
     renderQuestionRequest(frame);
   }
+  // #1973: a freshly rendered transcript opens at its NEWEST message. A
+  // restored conversation used to open at the very top — for a long analysis
+  // that is a full scroll away from where the reader left off. Unconditional
+  // (not maybeScrollToBottom): this is a fresh render, so there is no reading
+  // position to protect, and the container's scrollTop is 0 either way.
+  if (history.length > 0) scrollToLatestMessage();
+  return { ok: true, error: null, count: history.length };
+}
+
+/** Put the newest message in view. Used after a full transcript render
+ *  (first open, deep-link restore, `full_refresh`) where `maybeScrollToBottom`
+ *  cannot help: it protects a reading position, and a fresh render has none. */
+function scrollToLatestMessage() {
+  const el = $("chat-messages");
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+  // Once more after layout settles — images, mermaid diagrams and code
+  // highlighting all change the height after the first paint.
+  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+}
+
+/** A deep-link restore that could not be completed (#1973).
+ *
+ *  The failure modes are all "this id is not openable by you": deleted,
+ *  archived, someone else's (the session-scoped endpoints answer 404 for all
+ *  three), or the backend is down. Whichever it is, the reader asked for a
+ *  specific conversation and must be told they are not in it — the pre-#1973
+ *  path set a status line nobody looks at, left the "Ask anything" hero up and
+ *  the `?session=` param already stripped, so it read as "the app quietly
+ *  started a new chat".
+ *
+ *  Leaves the page in a usable pre-conversation state: no session pointer, no
+ *  socket, the dashboard back, the dead id out of the URL so a reload does not
+ *  re-run the same failure. */
+function _renderRestoreFailure(detail) {
+  if (ws) { ws.close(); ws = null; }
+  currentChatId = null;
+  _syncSessionUrl(null);
+  markActiveSidebar(null);
+  _markConversationNotStarted();
+  clearThinkingPlaceholder();
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = true;
+  const host = $("chat-messages");
+  if (host) host.innerHTML = "";
+  showCapabilities();
+  renderSystemNote(
+    "That conversation could not be opened — it may have been deleted, or it " +
+      "belongs to someone else. Nothing was lost from it; this is a new chat." +
+      (detail ? ` (${detail})` : ""),
+    "error",
+  );
+  setStatus("Conversation could not be opened.", "error");
+  // Status banner AND toast: the report on #1973 was explicit that the silent
+  // fallback showed "no error, no toast", and the banner alone sits above a
+  // hero the reader is already looking past.
+  showToast("That conversation could not be opened.", "error", { durationMs: 6000 });
+}
+
+/** The transcript loaded but the socket could not be armed (#1973 review).
+ *
+ *  Deliberately non-destructive, and the difference from
+ *  `_renderRestoreFailure` is the whole point: there, the conversation could
+ *  not be READ, so there is nothing to keep and the id is probably dead. Here
+ *  it was read — the reader is looking at it — and only the WS ticket failed,
+ *  which is usually a blip. So the transcript, `currentChatId` and the
+ *  `?session=` URL all stay exactly as they are, and the message says how to
+ *  retry: both routes back (send a message, or reload this same URL) re-mint a
+ *  ticket for this same session. */
+function _renderResumeFailure(detail) {
+  clearThinkingPlaceholder();
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = true;
+  renderSystemNote(
+    "Could not reconnect to this conversation just now. Nothing is lost — " +
+      "send a message or reload the page to try again." + (detail ? ` (${detail})` : ""),
+    "warn",
+  );
+  setStatus(`Could not resume chat: ${detail}`, "error");
 }
 
 /** Open (or resume) a chat session.
@@ -1905,8 +2053,20 @@ async function loadAndRenderHistory(chatId) {
  * session each time, which used to be the path here and caused "click
  * on old chat shows old history but routes new messages to a brand-new
  * session" confusion.)
+ *
+ * ``opts.restoring`` marks a RESTORE — a `?session=` deep link, which is what
+ * a refresh of an open conversation is (#1973). Two things change: the
+ * `?session=` param is left alone (the pre-#1973 code cleared it on entry and
+ * only put it back once the history fetch confirmed turns, so a slow fetch
+ * looked exactly like being dropped into a new chat), and a restore that
+ * FAILS says so in the transcript instead of silently leaving the caller on
+ * the pre-conversation hero with a dead id in hand.
  */
-async function openSession(chatId, wsUrlOverride) {
+async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
+  // Claim this open. Every await below is followed by a check that we are
+  // still the newest one; a superseded call returns without touching the
+  // transcript, `currentChatId` or `ws`.
+  const openGen = ++_openGeneration;
   if (ws) { ws.close(); ws = null; }
   // The streaming pointers belong to the conversation being left: without
   // this, a pending 150 ms tick paints into a node the wipe below detaches,
@@ -1969,26 +2129,67 @@ async function openSession(chatId, wsUrlOverride) {
   // or genuinely empty one starts cleared and `_markConversationStarted`
   // (called from within loadAndRenderHistory) puts it back the moment the
   // fetch below confirms this session actually has messages.
-  _syncSessionUrl(_sessionHasTurns ? chatId : null);
+  // #1973: a restore keeps the param it was opened FROM. Clearing it here and
+  // restoring it a fetch later is what made a deep link look like a new chat
+  // (the address bar lost the id before anything had failed).
+  if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);
   _syncAgentPicker();
-  setStatus("");
+  if (!restoring) setStatus("");
 
   // Hydrate history. Show the capability/intro panel only when this
   // session has no messages yet — otherwise the chat-main area is a
   // blank rectangle and the user has no visual guidance about what
   // they can ask.
-  await loadAndRenderHistory(chatId);
+  const hydrated = await loadAndRenderHistory(chatId);
+  if (openGen !== _openGeneration) return;   // superseded while fetching
+  // A restore whose history fetch failed has nothing to show and no honest
+  // fallback: the id may be gone, archived, or someone else's. Say that,
+  // rather than dropping the reader on the "Ask anything" hero with the
+  // conversation they asked for silently missing (#1973).
+  if (restoring && !hydrated.ok) {
+    _renderRestoreFailure(hydrated.error);
+    return;
+  }
+  // The restore got its transcript — drop the "Restoring conversation…" line.
+  // (The in-flight-turn branch below sets its own, truer line.)
+  if (restoring) setStatus("");
 
   // Mint a fresh WS ticket for THIS chat_id (unless caller already has one).
   let wsUrl = wsUrlOverride;
+  let turnInFlight = false;
   if (!wsUrl) {
     try {
       const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
+      if (openGen !== _openGeneration) return; // superseded while minting
       wsUrl = t.ws_url;
+      // #1973: the server knows whether an answer is being written right now.
+      // Absent on an older server — falsy, i.e. today's behavior.
+      turnInFlight = !!(t && t.turn_in_flight);
     } catch (err) {
-      setStatus(`Could not resume chat: ${err.message}`, "error");
+      if (openGen !== _openGeneration) return;
+      // NOT `_renderRestoreFailure`, even while restoring: the transcript
+      // above loaded fine, so the session is real and readable and only the
+      // socket could not be armed — usually transient. Erasing a transcript
+      // we just proved good, and telling the reader the conversation may
+      // belong to someone else, would be wrong on both counts (#1973
+      // review). Keep the transcript, the id and the URL, and say it is
+      // retryable: sending a message re-mints a ticket via ensureWsReady,
+      // and so does a reload of this same URL.
+      _renderResumeFailure(err.message);
       return;
     }
+  }
+  // Paint the working state BEFORE the socket: attaching can take seconds
+  // (a paused sandbox has to resume), and for that whole window a reload
+  // mid-answer used to show no spinner, no Stop button and no status — the
+  // silence that invited the second reload behind the duplicated questions
+  // in #1973. The replayed turn frames land in this same bubble.
+  if (turnInFlight) {
+    setStatus("Reattaching to the answer in progress…", "info");
+    showThinkingPlaceholder();
+    _reattachPlaceholder = true;
+    const cancelBtn = $("cancel-btn");
+    if (cancelBtn) cancelBtn.hidden = false;
   }
 
   // Reconnect replay (wave-2F task 3): tell the server the highest seq we
@@ -2009,7 +2210,10 @@ async function openSession(chatId, wsUrlOverride) {
   // connecting state; for a paused session (~1–2 s resume) it tells the user
   // something is happening. The ready frame handler clears it — connected is
   // the normal state and gets no pill.
-  setStatus("Resuming session…", "info");
+  // Not while reattaching to a live answer — "Reattaching to the answer in
+  // progress…" is the truer line and it is already up (#1973).
+  if (!turnInFlight) setStatus("Resuming session…", "info");
+  if (openGen !== _openGeneration) return;   // last check before claiming `ws`
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -2097,6 +2301,19 @@ function handleFrame(frame) {
       // "Resuming session…" line instead; the status surfaces only when
       // something is wrong (warn/error) or in progress (info).
       setStatus("");
+      // #1973: the attach's own verdict on whether a turn is running. The
+      // ticket's flag is a pre-socket guess (and is always false on a replica
+      // with no ChatManager) — this corrects it, in both directions, but only
+      // for a placeholder the REATTACH painted: a submit's own placeholder is
+      // waiting for a message the server has not received yet.
+      if (_reattachPlaceholder && frame.turn_in_flight === false) {
+        clearThinkingPlaceholder();
+        $("cancel-btn").hidden = true;
+      } else if (frame.turn_in_flight === true && !thinkingEl) {
+        showThinkingPlaceholder();
+        _reattachPlaceholder = true;
+        $("cancel-btn").hidden = false;
+      }
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
@@ -2504,6 +2721,13 @@ function attachMessageActions(article, copyText) {
   bubble.appendChild(wrap);
 }
 
+/** Whether a persisted assistant row is a partial-save of an interrupted turn
+ *  — the `{interrupted: true, reason}` marker `ChatManager._partial_save`
+ *  stores in `tool_calls` ahead of whatever calls did run (#1973). */
+function _isInterruptedRow(m) {
+  return Array.isArray(m.tool_calls) && m.tool_calls.some(tc => tc && tc.interrupted === true);
+}
+
 /** A message from history.
  *
  *  An assistant turn is a SEQUENCE — prose, a tool call, more prose about what
@@ -2623,9 +2847,25 @@ function renderMessage(m) {
   // without them. It carries the WHOLE answer, not just this bubble's segment.
   attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""));
 
+  // #1973: an assistant row the server wrote for a turn that was CUT OFF
+  // (ChatManager._partial_save). A reload has to be able to tell "this is all
+  // Agnes managed to write" from a finished answer — and the case that used to
+  // persist nothing at all, a turn interrupted before its first token, now
+  // leaves a row whose whole content is this line.
+  if (m.role === "assistant" && _isInterruptedRow(m)) {
+    const note = document.createElement("div");
+    note.className = "cloud-chat-system-note is-warn";
+    note.setAttribute("role", "status");
+    note.textContent = (m.content || "").trim()
+      ? "This answer was interrupted before it finished."
+      : "This answer was interrupted before Agnes wrote anything — ask again to retry.";
+    nodes.push(note);
+  }
   // Runs of consecutive cards fold into groups here exactly as they do live,
   // so a reload renders the same compact trail the turn settled into rather
-  // than the wall it was built from.
+  // than the wall it was built from. Applied AFTER the interrupted-turn note
+  // is pushed, so the note lands where it belongs — outside the run, under it,
+  // which is also what its position in `nodes` already says.
   for (const node of _groupConsecutiveToolCards(nodes)) $("chat-messages").appendChild(node);
   if (m.role === "assistant") _markLatestAssistant(tailArticle);
   // Measured after insertion, and against the tail article only: the cards
@@ -2878,6 +3118,12 @@ function maybeScrollToBottom() {
 // the gap between "I sent a message" and "the agent has started".
 
 let thinkingEl = null;
+/** True while the placeholder on screen was painted by a REATTACH (#1973 —
+ *  openSession found `turn_in_flight` on the ticket) rather than by a submit.
+ *  Only such a placeholder may be taken down by the `ready` frame's own
+ *  verdict; a submit's placeholder must survive a `ready` that arrives before
+ *  the server has even received the message. */
+let _reattachPlaceholder = false;
 
 function showThinkingPlaceholder() {
   if (thinkingEl) return;
@@ -2893,6 +3139,9 @@ function showThinkingPlaceholder() {
 }
 
 function clearThinkingPlaceholder() {
+  // Whatever the placeholder was for, it is gone — so is any claim that a
+  // reattach owns it (#1973). Every terminal frame routes through here.
+  _reattachPlaceholder = false;
   if (!thinkingEl) return;
   thinkingEl.remove();
   thinkingEl = null;
@@ -4997,7 +5246,23 @@ async function ensureWsReady() {
   throw new Error("WebSocket did not open within 6 s");
 }
 
+/** An opaque id for one submit, so the server can make its ingress idempotent
+ *  (#1973: "refresh ... never persists a duplicate user message"). One id per
+ *  submitUserMessage call — a retry of the SAME submit reuses it and is
+ *  dropped server-side; a genuine re-ask gets a new one and is a new turn. */
+function _newSubmitId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (_) {
+    /* fall through to the arithmetic id below */
+  }
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 async function submitUserMessage(text) {
+  const submitId = _newSubmitId();
   // Attachments pasted into the composer (§5b) ride along with this turn. They
   // are TAKEN synchronously — the chips clear with the text, in the same tick,
   // so the composer empties as one thing — and settled further down, once the
@@ -5123,6 +5388,7 @@ async function submitUserMessage(text) {
   }
 
   showThinkingPlaceholder();
+  _reattachPlaceholder = false;   // this one belongs to the submit, not a reattach
   $("cancel-btn").hidden = false;
   // Arm the long-run nudge here — AFTER the onboarding takeover check, so a
   // turn that never reaches the model (gap resolver, "add X") doesn't start a
@@ -5155,7 +5421,7 @@ async function submitUserMessage(text) {
     onboardingNoteTurnEnded();
     return;
   }
-  ws.send(JSON.stringify({ type: "user_msg", text }));
+  ws.send(JSON.stringify({ type: "user_msg", text, client_msg_id: submitId }));
 }
 
 /** Publish the composer's REAL height as `--chat-composer-h` on the shell.
@@ -7392,8 +7658,16 @@ const ChatAttachments = (() => {
   autosizeComposer();
   // Composer agent picker. Not awaited: the fetch behind it must never delay
   // the composer becoming usable, and it degrades to the brand label on
-  // failure.
+  // failure. Called BEFORE the deep-link restore below so `_agentsLoaded` is
+  // the real fetch by the time the restore awaits it (an empty session's
+  // greeting is read from it) rather than the resolved placeholder.
   initAgentPicker();
+  // #1973: a `?session=` deep link (which is also what a refresh of an open
+  // conversation is) starts restoring HERE — before the sidebar fetch, before
+  // the dashboard wiring — so the pre-conversation hero never shows for a
+  // conversation that exists and the restore's own fetches are not queued
+  // behind anything. Not awaited: the rest of boot must not wait on it either.
+  _restoreInitialSessionEarly();
   // Rail pre-conversation Dashboard (no-op on topnav): greeting fix-up +
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact
@@ -7443,6 +7717,9 @@ const ChatAttachments = (() => {
     }
   }
   updateDashboardSuggestions(_sidebarOk ? _sessionsCache : null);
+  // The early deep-link restore ran before this cache existed — give the
+  // header the conversation's real title now that it does (#1973).
+  _resyncOpenSessionMeta();
   // Sidebar cache (_sessionsCache) is now populated so openSession can
   // resolve the title; fire the one-shot deep-link open. Captured BEFORE the
   // call: `_maybeOpenInitialSession` consumes `_initialSessionId` (nulls it)
