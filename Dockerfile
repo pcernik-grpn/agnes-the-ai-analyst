@@ -136,7 +136,13 @@ RUN uv build --wheel --out-dir /app/dist
 # that tag. Note the leading comma — the value is concatenated inside the
 # bracket list.
 ARG EXTRA_EXTRAS=""
-RUN uv pip install --system --no-cache ".[server,slack-socket,telegram${EXTRA_EXTRAS}]"
+# `extraction` is part of the DEFAULT image since the built-in SharePoint
+# pipeline became the only pipeline: its backends (markitdown, pypdfium2)
+# are megabytes, not the gigabytes that keep docling/embeddings opt-in, and
+# an image that can serve the connector but not convert a document would
+# turn every containerized deploy's first crawl into a typed refusal an
+# operator can do nothing about without a rebuild.
+RUN uv pip install --system --no-cache ".[server,slack-socket,telegram,extraction${EXTRA_EXTRAS}]"
 
 # Run as non-root user for container hardening (C13).
 # uid/gid pinned to 999 so host-side chown in startup-script.sh.tpl can match
@@ -173,11 +179,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-
 # not a different CMD here.
 #
 # The converter backends the lane needs (markitdown, pypdfium2) come from
-# the `extraction` optional extra — add it to the EXTRA_EXTRAS build-arg
-# above (`--build-arg EXTRA_EXTRAS=,extraction`) for an image that can
-# actually convert documents; without it `corpus-extraction` refuses up
-# front with a typed "not installed" error rather than crawling and then
-# failing on every file.
+# the `extraction` optional extra, which the default install above now
+# bakes in — every image built from this file can convert documents. The
+# typed "not installed" refusal (`409 extraction_dependencies_missing`)
+# remains for bare-metal installs that skipped the extra.
 FROM base AS worker
 
 EXPOSE 8000
