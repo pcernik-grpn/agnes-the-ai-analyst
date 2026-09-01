@@ -111,7 +111,13 @@ _RE_SLIDE_MEMBER = re.compile(r"^ppt/slides/slide(\d{1,4})\.xml$")
 #: boundary, then read attributes off the fragment that follows — never one
 #: pattern that has to span a whole element with ``.*?`` inside it.
 _RE_SHEET_TAG = re.compile(r"<(?:[\w.-]{1,32}:)?sheet[\s>]")
-_RE_REL_TAG = re.compile(r"<Relationship[\s>]")
+#: The OPC relationship part conventionally uses a default namespace, so the
+#: element is written unprefixed in every writer we have seen — but a prefixed
+#: form is legal XML, and matching only the bare name would silently skip
+#: relationship resolution and fall back to positional part names, labelling
+#: every tab with the wrong sheet's name on a reordered workbook. Prefixed
+#: like every other element pattern here, for the same reason.
+_RE_REL_TAG = re.compile(r"<(?:[\w.-]{1,32}:)?Relationship[\s>]")
 _RE_SST_ITEM = re.compile(r"<(?:[\w.-]{1,32}:)?si[\s>]")
 _RE_ROW = re.compile(r"<(?:[\w.-]{1,32}:)?row[\s>]")
 _RE_CELL = re.compile(r"<(?:[\w.-]{1,32}:)?c[\s>]")

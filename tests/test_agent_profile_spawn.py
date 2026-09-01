@@ -224,8 +224,12 @@ def test_build_profile_appends_file_delivery_rails(monkeypatch):
     # The refusal the issue quotes is what this rule exists to stop.
     assert "Never disclaim the handover" in md
     # ...and the mirror-image bug: an agent that knows a panel exists must not
-    # start promising buttons it cannot see.
+    # start promising buttons it cannot see. Only web chat draws the file
+    # beside the reply; Slack and an `api` session (`agnes chat`, the one-shot
+    # agent API) collect it their own way, so the rails may say where to WRITE
+    # and must not say how the reader will get it.
     assert "do not promise a download button" in md
+    assert "do not claim it is already in front of them" in md
     # Additive, never a replacement — the data rails still have to be there.
     assert agent_profile.DATA_ACCESS_RAILS in md
 

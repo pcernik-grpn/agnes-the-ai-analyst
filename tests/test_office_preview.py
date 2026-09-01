@@ -313,6 +313,29 @@ def test_a_workbook_with_no_rels_falls_back_to_the_conventional_part_names() -> 
     assert [(s.name, s.rows) for s in sheets] == [("Alpha", [["1"]]), ("Beta", [["2"]])]
 
 
+def test_a_namespace_prefixed_relationship_part_still_resolves_the_tab_names() -> None:
+    """The relationship element is conventionally unprefixed (the part uses a
+    default namespace), but a prefixed form is legal XML. Matching only the
+    bare name would drop to the positional fallback, which on a workbook whose
+    tabs are not in part order labels every sheet with the wrong name."""
+    rels = (
+        '<?xml version="1.0"?><r:Relationships xmlns:r="rel">'
+        '<r:Relationship Id="rId1" Type="t" Target="worksheets/sheet2.xml"/>'
+        '<r:Relationship Id="rId2" Type="t" Target="worksheets/sheet1.xml"/>'
+        "</r:Relationships>"
+    )
+    data = _zip(
+        {
+            "xl/workbook.xml": _workbook("Alpha", "Beta"),
+            "xl/_rels/workbook.xml.rels": rels,
+            "xl/worksheets/sheet1.xml": _sheet(_row(1, {"A": _num("beta-part")})),
+            "xl/worksheets/sheet2.xml": _sheet(_row(1, {"A": _num("alpha-part")})),
+        }
+    )
+    sheets, _ = xlsx_sheets(data)
+    assert [(s.name, s.rows) for s in sheets] == [("Alpha", [["alpha-part"]]), ("Beta", [["beta-part"]])]
+
+
 def test_an_empty_sheet_is_a_sheet_with_no_rows_not_a_dropped_tab() -> None:
     """An empty sheet is an answer — it tells the reader the agent made the
     tab and wrote nothing into it, which a missing tab would not."""

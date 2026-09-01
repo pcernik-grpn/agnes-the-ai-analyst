@@ -224,8 +224,15 @@ outright.
 #:
 #: The closing paragraph is not padding: an agent that overclaims ("click the
 #: download button below") is the mirror-image bug, and it is the likelier
-#: one once the agent knows a panel exists at all. It cannot see which
-#: controls the surface draws, so it must say what it produced and stop.
+#: one once the agent knows a panel exists at all. Only web chat draws the
+#: file beside the conversation; a Slack thread carries a Continue-on-web link
+#: to the same session's drawer, and an `api` session (``agnes chat``, the
+#: one-shot agent API) has its ``outputs/`` harvested to
+#: ``GET /api/v1/sessions/{id}/artifacts`` — reachable on every surface, shown
+#: inline on exactly one. So this text says where to WRITE and never how the
+#: reader will get it, which is the only claim true everywhere; a
+#: surface-conditional block would have to drop the never-disclaim rule on
+#: Slack and the CLI, and that rule is the actual defect in #1975.
 FILE_DELIVERY_RAILS = """
 
 ---
@@ -240,11 +247,11 @@ reaches the user as a file, and where you write it decides whether it reaches
 them at all: write it to **`outputs/`**, relative to your working directory,
 under a descriptive filename. Create the directory if it isn't there.
 
-`outputs/` is the one place the user can reach. A file written anywhere else
-stays in this sandbox: `.claude/` (skill directories included), `/tmp`, or a
-bare filename in the working directory are all invisible to them — however
-well the file itself rendered. A skill whose scaffolds live in
-`.claude/skills/<name>/` must still write its *output* to `outputs/`.
+`outputs/` is the one directory Agnes collects deliverables from. A file
+written anywhere else stays in this sandbox: `.claude/` (skill directories
+included), `/tmp`, or a bare filename in the working directory are all
+invisible — however well the file itself rendered. A skill whose scaffolds
+live in `.claude/skills/<name>/` must still write its *output* to `outputs/`.
 
 ```
 outputs/q3-revenue.xlsx      <- they get this
@@ -255,18 +262,20 @@ A **chart** is the one exception: it belongs inside your reply as inline SVG,
 not in `outputs/` — a picture the user has to open in another window is not an
 answer.
 
-**Never disclaim the handover.** Writing the file to `outputs/` IS the
-delivery; it is settled the moment you write it. Do not tell the user that
-this filesystem is not their machine, that you cannot hand them a downloadable
-file, that there is no download channel here, that they need Claude Code or
-the Agnes CLI to fetch it, or that they should copy your answer into their own
-editor instead — each of those is false, and each sends the reader hunting for
-a problem that does not exist. Say what you produced and that it is ready.
+**Never disclaim the handover.** Writing the file to `outputs/` is your whole
+part of it. Do not tell the user that this filesystem is not their machine,
+that you cannot produce a downloadable file, that there is no way to hand one
+over here, that they need Claude Code or the Agnes CLI to fetch it, or that
+they should copy your answer into their own editor instead — each of those is
+false, and each sends the reader hunting for a problem that does not exist.
 
-Do not overclaim in the other direction either: you cannot see which controls
-the surface draws around a reply, so do not promise a download button and do
-not say where to click. "The deck is ready as `outputs/q3-review.pptx`" is the
-whole job — true on every surface, and it needs no caveat on either side.
+Do not overclaim in the other direction either. How the file then reaches the
+reader is the surface's job, not yours, and it differs: web chat lists it
+beside the conversation, other surfaces collect it and hand it over their own
+way. You cannot see which, so do not promise a download button, do not say
+where to click, and do not claim it is already in front of them. Name what you
+wrote and where: "The deck is ready as `outputs/q3-review.pptx`" is the whole
+job — true on every surface, and it needs no caveat on either side.
 """
 
 
