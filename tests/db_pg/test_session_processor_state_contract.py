@@ -370,3 +370,122 @@ class TestScanUnprocessedFor:
 
     def test_missing_session_dir_returns_empty(self, repos, tmp_path):
         assert repos["repo"].scan_unprocessed_for("verification", tmp_path / "nope") == []
+
+
+# ---------------------------------------------------------------------------
+# processor-version invalidation
+# ---------------------------------------------------------------------------
+
+
+class TestProcessorVersionInvalidation:
+    """A processor that declares a ``version`` gets its bookkeeping invalidated
+    on a bump: rows written at an older version — or before versioning existed
+    at all — are dirty even when the file content (and therefore its md5) is
+    unchanged. This is the mechanism behind ``USAGE_PROCESSOR_VERSION``
+    backfills; before it existed, a bump only re-processed files whose
+    CONTENT also changed (live gap observed 2026-09-01: 111 files stuck at
+    processor_version 9 across 7+ hours of sweeps).
+    """
+
+    def test_same_version_and_hash_is_processed(self, repos):
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash="abc123",
+            version=3,
+        )
+        assert repos["repo"].is_processed("usage", "alice/a.jsonl", "abc123", version=3) is True
+
+    def test_version_bump_makes_row_dirty(self, repos):
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash="abc123",
+            version=3,
+        )
+        assert repos["repo"].is_processed("usage", "alice/a.jsonl", "abc123", version=4) is False
+
+    def test_legacy_unversioned_row_is_dirty_under_versioned_check(self, repos):
+        """Rows written before the processor declared a version have a bare
+        md5 stored; introducing a version must re-process them once."""
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash="abc123",
+        )
+        assert repos["repo"].is_processed("usage", "alice/a.jsonl", "abc123", version=3) is False
+
+    def test_versionless_processor_is_unaffected(self, repos):
+        """A processor without a version (verification) keeps today's exact
+        semantics — bare md5 stored and compared."""
+        repos["repo"].mark_processed(
+            processor_name="verification",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash="abc123",
+        )
+        assert repos["repo"].is_processed("verification", "alice/a.jsonl", "abc123") is True
+
+    def test_scan_surfaces_version_stale_row_despite_stable_mtime(self, repos, tmp_path):
+        """The load-bearing half of the fix: the mtime precheck skips an
+        untouched file before any hash is consulted, so the version comparison
+        must happen in the scan itself — otherwise a version-stale file never
+        even reaches the runner's ``is_processed`` check."""
+        sess = tmp_path / "sessions"
+        p = _write_session(sess, "alice", "a.jsonl", '{"x":1}\n')
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash=_md5(p),
+            version=3,
+        )
+        pa = _processed_at_utc(repos, "usage", "alice/a.jsonl")
+        _set_mtime(p, pa - timedelta(seconds=30))
+
+        assert repos["repo"].scan_unprocessed_for("usage", sess, version=3) == []
+        found = repos["repo"].scan_unprocessed_for("usage", sess, version=4)
+        assert [(u, f.name) for u, f in found] == [("alice", "a.jsonl")]
+
+    def test_scan_surfaces_legacy_row_when_version_introduced(self, repos, tmp_path):
+        sess = tmp_path / "sessions"
+        p = _write_session(sess, "alice", "a.jsonl", '{"x":1}\n')
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash=_md5(p),
+        )
+        pa = _processed_at_utc(repos, "usage", "alice/a.jsonl")
+        _set_mtime(p, pa - timedelta(seconds=30))
+
+        found = repos["repo"].scan_unprocessed_for("usage", sess, version=3)
+        assert [(u, f.name) for u, f in found] == [("alice", "a.jsonl")]
+
+    def test_scan_skew_window_compares_content_hash_not_version_prefix(self, repos, tmp_path):
+        """Inside the clock-skew window the stored hash is consulted; for a
+        versioned row the comparison must be against the md5 *inside* the
+        stored value — a whole-string compare would surface every versioned
+        row as churn."""
+        sess = tmp_path / "sessions"
+        p = _write_session(sess, "alice", "a.jsonl", '{"x":1}\n')
+        repos["repo"].mark_processed(
+            processor_name="usage",
+            session_file="alice/a.jsonl",
+            username="alice",
+            items_count=1,
+            file_hash=_md5(p),
+            version=3,
+        )
+        pa = _processed_at_utc(repos, "usage", "alice/a.jsonl")
+        _set_mtime(p, pa - timedelta(milliseconds=10))
+        assert repos["repo"].scan_unprocessed_for("usage", sess, version=3) == []

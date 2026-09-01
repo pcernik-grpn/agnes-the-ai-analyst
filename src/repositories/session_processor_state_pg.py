@@ -8,6 +8,7 @@ longer need the strip-tz step the DuckDB impl carries.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +18,11 @@ from sqlalchemy.engine import Engine
 # Mirrors ``src.repositories.session_processor_state._MTIME_SKEW_WINDOW``.
 _MTIME_SKEW_WINDOW = timedelta(milliseconds=50)
 
+# Mirrors ``src.repositories.session_processor_state._VERSIONED_HASH_RE`` —
+# a declared processor version is recorded inside the stored file_hash as
+# ``v<version>:<md5>`` so a bump invalidates the row without a schema change.
+_VERSIONED_HASH_RE = re.compile(r"^v(\d+):(.*)$")
+
 
 def _md5_file(path: Path) -> str:
     h = hashlib.md5()
@@ -24,6 +30,21 @@ def _md5_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _compose_versioned_hash(file_hash: str, version: int | None) -> str:
+    return file_hash if version is None else f"v{version}:{file_hash}"
+
+
+def _split_versioned_hash(stored: str | None) -> tuple[int | None, str | None]:
+    """``(version, content_hash)`` parsed from a stored file_hash value.
+    Legacy rows (bare md5) and NULLs come back as ``(None, stored)``."""
+    if not stored:
+        return None, stored
+    m = _VERSIONED_HASH_RE.match(stored)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, stored
 
 
 class SessionProcessorStatePgRepository:
@@ -35,7 +56,12 @@ class SessionProcessorStatePgRepository:
         processor_name: str,
         session_file: str,
         file_hash: str,
+        *,
+        version: int | None = None,
     ) -> bool:
+        """Mirrors the DuckDB sibling: hash mismatch OR processor-version
+        mismatch (incl. legacy rows written before the processor declared a
+        version) reads as unprocessed."""
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
@@ -46,7 +72,7 @@ class SessionProcessorStatePgRepository:
             ).first()
         if row is None:
             return False
-        return row[0] == file_hash
+        return row[0] == _compose_versioned_hash(file_hash, version)
 
     def mark_processed(
         self,
@@ -56,14 +82,21 @@ class SessionProcessorStatePgRepository:
         items_count: int,
         file_hash: str,
         read_at: datetime | None = None,
+        *,
+        version: int | None = None,
     ) -> None:
         """UPSERT — overwrites previous state row for (processor, session).
 
         *read_at* should be the moment the file hash was observed; when the
         processor runs for a long time or appends to the jsonl mid-run, this
         preserves the correct mtime/ordering relationship for the next scan.
+
+        *version*, when the processor declares one, is recorded inside the
+        stored hash so a later bump invalidates the row (see ``is_processed``
+        / ``scan_unprocessed_for``).
         """
         processed_at = read_at if read_at is not None else datetime.now(UTC)
+        stored_hash = _compose_versioned_hash(file_hash, version)
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(
@@ -82,7 +115,7 @@ class SessionProcessorStatePgRepository:
                     "u": username,
                     "now": processed_at,
                     "ic": items_count,
-                    "h": file_hash,
+                    "h": stored_hash,
                 },
             )
 
@@ -166,7 +199,12 @@ class SessionProcessorStatePgRepository:
         self,
         processor_name: str,
         session_dir: Path,
+        *,
+        version: int | None = None,
     ) -> list[tuple[str, Path]]:
+        """Mirrors the DuckDB sibling — see its docstring for why the
+        processor-version check must live in the scan, not only in
+        ``is_processed``."""
         results: list[tuple[str, Path]] = []
         if not session_dir.exists():
             return results
@@ -193,6 +231,12 @@ class SessionProcessorStatePgRepository:
                     results.append((username, jsonl_file))
                     continue
                 processed_at, stored_hash = known[key]
+                stored_version, stored_content_hash = _split_versioned_hash(stored_hash)
+                if version is not None and stored_version != version:
+                    # Row written at an older processor version (or before the
+                    # processor declared one) → dirty regardless of mtime.
+                    results.append((username, jsonl_file))
+                    continue
                 if processed_at is None:
                     results.append((username, jsonl_file))
                     continue
@@ -211,7 +255,7 @@ class SessionProcessorStatePgRepository:
                     continue
                 if (processed_at - mtime) <= _MTIME_SKEW_WINDOW:
                     try:
-                        if _md5_file(jsonl_file) != stored_hash:
+                        if _md5_file(jsonl_file) != stored_content_hash:
                             results.append((username, jsonl_file))
                     except OSError:
                         results.append((username, jsonl_file))
