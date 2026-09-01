@@ -92,6 +92,13 @@ function renderMarkdownSafe(text) {
 
 let ws = null;
 let currentChatId = null;
+/** Bumped by every `openSession` call. A call whose generation is no longer
+ *  the newest one has been superseded — the user clicked another conversation,
+ *  or a submit re-opened this one — and must not paint into the transcript or
+ *  claim the global socket after its awaits resolve (#1973 review: the
+ *  deep-link restore now runs alongside the rest of boot, so a click landing
+ *  during it is an ordinary race rather than a rare one). */
+let _openGeneration = 0;
 let inFlightToolCalls = new Map();
 // Cards rendered by renderToolCallStart during the turn in progress. Collapsed
 // in one pass once the turn ends (see _collapseFinishedToolCalls) so the
@@ -1824,6 +1831,10 @@ async function newChat(agentSlug) {
  * what openSession already does on first open, so this is just that
  * logic made callable a second time. */
 async function loadAndRenderHistory(chatId) {
+  // Whichever open (or `full_refresh`) we belong to. If another one starts
+  // while our fetch is in flight, the transcript below is no longer ours to
+  // draw — see `_openGeneration`.
+  const gen = _openGeneration;
   $("chat-messages").innerHTML = "";
   clearThinkingPlaceholder();
   // Reset recall state for the chat being loaded up front, not after a
@@ -1836,7 +1847,9 @@ async function loadAndRenderHistory(chatId) {
   let history = [];
   try {
     history = await api(`/api/chat/sessions/${chatId}/messages`);
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
   } catch (err) {
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
     setStatus(`Could not load history: ${err.message}`, "warn");
     // #1973: the outcome is the caller's to act on — a RESTORE that cannot
     // read its own history must show an error, not the empty-state hero.
@@ -1972,6 +1985,28 @@ function _renderRestoreFailure(detail) {
   showToast("That conversation could not be opened.", "error", { durationMs: 6000 });
 }
 
+/** The transcript loaded but the socket could not be armed (#1973 review).
+ *
+ *  Deliberately non-destructive, and the difference from
+ *  `_renderRestoreFailure` is the whole point: there, the conversation could
+ *  not be READ, so there is nothing to keep and the id is probably dead. Here
+ *  it was read — the reader is looking at it — and only the WS ticket failed,
+ *  which is usually a blip. So the transcript, `currentChatId` and the
+ *  `?session=` URL all stay exactly as they are, and the message says how to
+ *  retry: both routes back (send a message, or reload this same URL) re-mint a
+ *  ticket for this same session. */
+function _renderResumeFailure(detail) {
+  clearThinkingPlaceholder();
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = true;
+  renderSystemNote(
+    "Could not reconnect to this conversation just now. Nothing is lost — " +
+      "send a message or reload the page to try again." + (detail ? ` (${detail})` : ""),
+    "warn",
+  );
+  setStatus(`Could not resume chat: ${detail}`, "error");
+}
+
 /** Open (or resume) a chat session.
  *
  * For an existing ``chatId`` we POST ``/sessions/{id}/ticket`` to mint a
@@ -1990,6 +2025,10 @@ function _renderRestoreFailure(detail) {
  * the pre-conversation hero with a dead id in hand.
  */
 async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
+  // Claim this open. Every await below is followed by a check that we are
+  // still the newest one; a superseded call returns without touching the
+  // transcript, `currentChatId` or `ws`.
+  const openGen = ++_openGeneration;
   if (ws) { ws.close(); ws = null; }
   // The streaming pointers belong to the conversation being left: without
   // this, a pending 150 ms tick paints into a node the wipe below detaches,
@@ -2064,6 +2103,7 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // blank rectangle and the user has no visual guidance about what
   // they can ask.
   const hydrated = await loadAndRenderHistory(chatId);
+  if (openGen !== _openGeneration) return;   // superseded while fetching
   // A restore whose history fetch failed has nothing to show and no honest
   // fallback: the id may be gone, archived, or someone else's. Say that,
   // rather than dropping the reader on the "Ask anything" hero with the
@@ -2082,16 +2122,22 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   if (!wsUrl) {
     try {
       const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
+      if (openGen !== _openGeneration) return; // superseded while minting
       wsUrl = t.ws_url;
       // #1973: the server knows whether an answer is being written right now.
       // Absent on an older server — falsy, i.e. today's behavior.
       turnInFlight = !!(t && t.turn_in_flight);
     } catch (err) {
-      if (restoring) {
-        _renderRestoreFailure(err.message);
-        return;
-      }
-      setStatus(`Could not resume chat: ${err.message}`, "error");
+      if (openGen !== _openGeneration) return;
+      // NOT `_renderRestoreFailure`, even while restoring: the transcript
+      // above loaded fine, so the session is real and readable and only the
+      // socket could not be armed — usually transient. Erasing a transcript
+      // we just proved good, and telling the reader the conversation may
+      // belong to someone else, would be wrong on both counts (#1973
+      // review). Keep the transcript, the id and the URL, and say it is
+      // retryable: sending a message re-mints a ticket via ensureWsReady,
+      // and so does a reload of this same URL.
+      _renderResumeFailure(err.message);
       return;
     }
   }
@@ -2129,6 +2175,7 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // Not while reattaching to a live answer — "Reattaching to the answer in
   // progress…" is the truer line and it is already up (#1973).
   if (!turnInFlight) setStatus("Resuming session…", "info");
+  if (openGen !== _openGeneration) return;   // last check before claiming `ws`
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
   ws.onclose = () => {

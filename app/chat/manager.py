@@ -165,6 +165,80 @@ _SESSION_LOCKS_MAX_ENTRIES = 10_000
 # reconnect, a double submit), never thousands of messages later.
 _ACCEPTED_MSG_IDS_MAX_ENTRIES = 2_048
 
+# How long a ``client_msg_id`` claim is remembered in the coordination
+# backend (see ``claim_user_message``). A duplicate submit arrives within one
+# turn — a retry, a reconnect, a double submit — so this only has to outlive
+# the longest turn, not the conversation. Long enough that the window can
+# never be the reason a duplicate slips through; short enough that a
+# coordination backend does not accumulate claims for sessions long gone.
+_MSG_CLAIM_TTL_SEC = 3600
+
+# The one holder id every message claim is written under. This lease is used
+# as an atomic set-if-absent, not as a lease anybody renews or owns: the
+# question it answers is "has this submit already been accepted", so who
+# claimed it is not information any reader needs.
+_MSG_CLAIM_HOLDER = "accepted"
+
+
+def _msg_claim_key(chat_id: str, client_msg_id: str) -> str:
+    return f"chat-msg-claim:{chat_id}:{client_msg_id}"
+
+
+async def claim_user_message(chat_id: str, client_msg_id: Optional[str]) -> bool:
+    """Claim the right to PERSIST one submit. ``True`` = go ahead (#1973).
+
+    ``lease_acquire`` is an atomic set-if-absent on both backends (redis
+    ``SET NX PX``; the in-memory backend's own exclusive acquire), so exactly
+    one caller can ever win a given ``(chat_id, client_msg_id)`` — which is
+    what makes this correct where a check-then-act on a process-local set is
+    not: two coroutines racing the same submit (a client re-sending on a
+    reconnect while the original frame is still being processed), and two
+    replicas of a role-split deployment both reaching a persist path for it.
+
+    Callers MUST make the claim immediately before the persist and nowhere
+    earlier: a claim burned by a path that then raises (``SessionNotFound``
+    while a sandbox is still booting) would defeat the retry that exists for
+    exactly that case. Release it with ``release_user_message_claim`` if the
+    persist itself fails.
+
+    Fails OPEN — an unreachable coordination backend returns ``True``. A
+    duplicate question is a visible annoyance; a silently dropped question is
+    a lost one, and this guard is not the only thing standing between the
+    reported bug and the user (see ``ChatManager._accepted_msg_ids``).
+    """
+    if not client_msg_id:
+        return True
+    key = _msg_claim_key(chat_id, client_msg_id)
+    try:
+        return await asyncio.to_thread(
+            coordination().lease_acquire, key, _MSG_CLAIM_HOLDER, ttl_s=_MSG_CLAIM_TTL_SEC
+        )
+    except Exception:
+        logger.warning(
+            "message-claim backend unavailable for %s (client_msg_id=%s) — accepting the send",
+            chat_id,
+            client_msg_id,
+            exc_info=True,
+        )
+        return True
+
+
+async def release_user_message_claim(chat_id: str, client_msg_id: Optional[str]) -> None:
+    """Give a won claim back, for a persist that then failed.
+
+    Without this, an ``append_message`` that raises would leave the submit
+    claimed for the whole TTL and the client's retry would be dropped as a
+    duplicate of a message that was never stored.
+    """
+    if not client_msg_id:
+        return
+    try:
+        await asyncio.to_thread(
+            coordination().lease_release, _msg_claim_key(chat_id, client_msg_id), _MSG_CLAIM_HOLDER
+        )
+    except Exception:
+        logger.warning("could not release message claim for %s (client_msg_id=%s)", chat_id, client_msg_id)
+
 # Poll-fallback cadence for ChatManager._inbound_consumer_loop (wave-2F
 # task 4). The coordination-backend pub/sub notify (app.chat.inbound.
 # subscribe_notify) wakes the loop promptly in the common case; this is
@@ -3362,7 +3436,13 @@ class ChatManager:
         await self._replay_pending_approvals_to(live, sink)
 
     async def _forward_inbound_message(
-        self, chat_id: str, text: str, *, sender_email: Optional[str], slack_origin: Optional[dict] = None
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        sender_email: Optional[str],
+        slack_origin: Optional[dict] = None,
+        client_msg_id: Optional[str] = None,
     ) -> None:
         """Hand a user message to whichever gateway actually owns
         ``chat_id`` (wave-2F task 4) instead of delivering it locally.
@@ -3392,7 +3472,13 @@ class ChatManager:
         thin-producer path (wave-2F final review F1).
         """
         await produce_inbound_user_message(
-            self._repo, self._config, chat_id, text, sender_email=sender_email, slack_origin=slack_origin
+            self._repo,
+            self._config,
+            chat_id,
+            text,
+            sender_email=sender_email,
+            slack_origin=slack_origin,
+            client_msg_id=client_msg_id,
         )
 
     async def _inbound_consumer_loop(self, live: "LiveSession") -> None:
@@ -3578,19 +3664,21 @@ class ChatManager:
         gateway if this process doesn't host the session (wave-2F task 4).
 
         ``client_msg_id`` (#1973) makes one submit idempotent at this single
-        ingress: the id is recorded only once the message has actually been
-        ACCEPTED (persisted), and a later call carrying an id already accepted
-        is dropped whole — no second ``chat_messages`` row, no second turn.
-        The reported symptom was a session holding the same question twice
-        with no answer at all, and this closes it for every re-delivery of one
-        submit regardless of which path re-delivered it: the web WS route's
-        wait-for-runner retry, a client that re-sends after a dropped socket,
-        or a double submit. An id is NOT registered when this method raises
-        before the persist (``SessionNotFound`` while the sandbox is still
-        booting), so the retry that exists precisely for that case still
-        works. Process-local and bounded (see ``_accepted_msg_ids``): a
-        message forwarded to another gateway is deduped by the id recorded
-        here on the forwarding side, not across the coordination stream.
+        ingress: whoever wins the ATOMIC claim immediately before the persist
+        (``claim_user_message`` — a set-if-absent in the coordination backend,
+        so it holds across coroutines AND across replicas) writes the row; a
+        later call carrying an already-claimed id is dropped whole — no second
+        ``chat_messages`` row, no second turn. The reported symptom was a
+        session holding the same question twice with no answer at all, and
+        this closes it for every re-delivery of one submit regardless of which
+        path re-delivered it: the web WS route's wait-for-runner retry, a
+        client that re-sends after a dropped socket, a double submit, or a
+        forward to the owning gateway (the id rides that path too, and the
+        thin producer claims through the same helper). A claim is taken only
+        at the persist, never before, so a method that raises on the way there
+        (``SessionNotFound`` while the sandbox is still booting) leaves the
+        retry that exists for exactly that case working. ``_accepted_msg_ids``
+        is a process-local fast path in front of it, not the guard itself.
 
         ``slack_origin`` (``{"channel": ..., "thread_ts": ...}``) marks a
         message that entered via a Slack webhook on a replica that does NOT
@@ -3640,6 +3728,10 @@ class ChatManager:
         inside ``_resume_live``, never the reverse), matching ``attach()``'s
         existing order, so no new deadlock is introduced.
         """
+        # Fast path only: a duplicate this process already accepted is dropped
+        # before it can spawn a sandbox. The authoritative check is the atomic
+        # claim at the persist below — this one is a check-then-act and cannot
+        # be relied on alone.
         if client_msg_id and self._already_accepted(chat_id, client_msg_id):
             logger.info(
                 "dropping duplicate user_msg for %s (client_msg_id=%s already accepted)",
@@ -3677,8 +3769,17 @@ class ChatManager:
                     this_gw = routing.this_gateway_id()
                     owner = await asyncio.to_thread(routing.owner_of, chat_id)
                     if owner is not None and owner != this_gw:
+                        # The forwarded path persists inside
+                        # produce_inbound_user_message, which makes its own
+                        # claim — pass the id rather than claiming here, or the
+                        # two would fight over the same key and the message
+                        # would be dropped by its own forward.
                         await self._forward_inbound_message(
-                            chat_id, text, sender_email=sender_email, slack_origin=slack_origin
+                            chat_id,
+                            text,
+                            sender_email=sender_email,
+                            slack_origin=slack_origin,
+                            client_msg_id=client_msg_id,
                         )
                         self._note_accepted(chat_id, client_msg_id)
                         return
@@ -3702,12 +3803,28 @@ class ChatManager:
         # not the session owner — each co-driver has their own daily/rate window.
         sender = sender_email or live.user_email
         await self._enforce_sender_limits(sender, chat_id, live)
-        self._repo.append_message(
-            session_id=chat_id,
-            role="user",
-            content=text,
-            sender_email=sender_email or live.user_email,
-        )
+        # The one authoritative gate. Taken HERE — after the limit checks and
+        # every path that can still raise, immediately before the row is
+        # written — so it is never burned by a send that did not persist.
+        if not await claim_user_message(chat_id, client_msg_id):
+            logger.info(
+                "dropping duplicate user_msg for %s (client_msg_id=%s claimed elsewhere)",
+                chat_id,
+                client_msg_id,
+            )
+            return
+        try:
+            self._repo.append_message(
+                session_id=chat_id,
+                role="user",
+                content=text,
+                sender_email=sender_email or live.user_email,
+            )
+        except Exception:
+            # Hand the claim back: the row does not exist, so the client's
+            # retry must not be mistaken for a duplicate of it.
+            await release_user_message_claim(chat_id, client_msg_id)
+            raise
         self._note_accepted(chat_id, client_msg_id)
         # F2d (audit-full-coverage plan, Task 6): the manager's single user_msg
         # ingress point — every surface (web WS, Slack, agent runtime, headless)
@@ -4968,24 +5085,42 @@ async def produce_inbound_user_message(
     *,
     sender_email: Optional[str] = None,
     slack_origin: Optional[dict] = None,
+    client_msg_id: Optional[str] = None,
 ) -> None:
     """Thin-producer forward: enforce limits, persist the user message, emit
     telemetry, and publish to the ``chat-in:{chat_id}`` stream — the
     module-level implementation behind
     ``ChatManager._forward_inbound_message`` (see that method's docstring
     for the raise contract), callable from processes with no ChatManager.
+
+    ``client_msg_id`` (#1973) goes through the SAME atomic claim as the
+    direct-owner path, which is what makes the guard hold across a role-split
+    deployment: this function is the persist for a message that arrived on a
+    replica which does not host the session, so a claim made only in the
+    manager's process-local set would not have covered it.
     """
     session = repo.get_session(chat_id)
     if session is None:
         raise SessionNotFound(chat_id)
     sender = sender_email or session.user_email
     await enforce_sender_limits(repo, config, sender, chat_id)
-    repo.append_message(
-        session_id=chat_id,
-        role="user",
-        content=text,
-        sender_email=sender,
-    )
+    if not await claim_user_message(chat_id, client_msg_id):
+        logger.info(
+            "dropping duplicate inbound user_msg for %s (client_msg_id=%s claimed elsewhere)",
+            chat_id,
+            client_msg_id,
+        )
+        return
+    try:
+        repo.append_message(
+            session_id=chat_id,
+            role="user",
+            content=text,
+            sender_email=sender,
+        )
+    except Exception:
+        await release_user_message_claim(chat_id, client_msg_id)
+        raise
     # F2d (audit-full-coverage plan, Task 6): the thin-producer twin of
     # ChatManager.send_user_message's ingress write below — an api-role
     # replica with no local ChatManager (or a cross-gateway forward) reaches

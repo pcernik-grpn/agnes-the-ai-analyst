@@ -52,10 +52,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   sandbox keepalive now covers a turn whose client has disconnected, which is
   exactly the shape a mid-answer reload creates.
   One submit can no longer persist two questions: the `user_msg` frame carries
-  an opaque per-submit id, and the manager's single ingress records it only
-  once the message is actually persisted — so a re-delivery of one submit is
-  dropped whole, while the wait-for-a-booting-sandbox retry that needs to
-  re-enter still works and a genuine re-ask is still its own turn.
+  an opaque per-submit id, and the single ingress claims it atomically
+  (set-if-absent in the coordination backend) immediately before the row is
+  written — so a re-delivery of one submit is dropped whole even when two
+  coroutines or two replicas race it, while the wait-for-a-booting-sandbox
+  retry that needs to re-enter still works and a genuine re-ask is still its
+  own turn. The claim is handed back if the write itself fails, and an
+  unreachable coordination backend fails open: a duplicate question is an
+  annoyance, a dropped one is a loss.
   The client is told when an answer is in progress: `POST
   /sessions/{id}/ticket` reports `turn_in_flight`, and the `ready` frame
   carries the attaching process's own verdict so a stale guess is corrected in
@@ -63,6 +67,15 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   before the socket is up, instead of five to ten seconds of a page that looks
   idle — the silence that invited the second refresh behind the duplicated
   questions.
+  Concurrent opens can no longer clobber each other: `openSession` takes a
+  generation on entry and re-checks it after every await, so a slow open the
+  user has since navigated away from cannot paint into the conversation now on
+  screen or overwrite the live WebSocket. Pre-existing, but reachable by an
+  ordinary click now that a deep-link restore runs alongside the rest of boot.
+  A failed WS ticket for a conversation whose transcript already loaded is
+  reported as a retryable reconnect error that keeps the transcript, the id and
+  the URL — only a history fetch that fails is treated as an unopenable
+  session.
   A `?session=` deep link now takes the pre-conversation hero down
   synchronously and starts its fetches before the sidebar's, keeps the param it
   was opened from (it used to be stripped on entry and only restored a fetch
