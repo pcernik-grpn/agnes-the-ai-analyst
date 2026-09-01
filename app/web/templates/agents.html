@@ -2035,10 +2035,16 @@
        server's call, not ours — POST /api/v1/agents answers 404
        `template_not_found` through the store's own visibility gate. */
     var wantTemplate = params.get('template');
-    if (!openId && !wantNew && !wantTemplate) return false;
+    /* `?from_template=1` — the Library's Agent-templates band. Opens the
+       picker rather than creating anything: the caller said "start from a
+       template", not which one. `?template=<id>` remains the form that names
+       one, for any caller that already has it. */
+    var wantPicker = params.get('from_template');
+    if (!openId && !wantNew && !wantTemplate && !wantPicker) return false;
     params.delete('open');
     params.delete('new');
     params.delete('template');
+    params.delete('from_template');
     var qs = params.toString();
     try {
       history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
@@ -2048,6 +2054,7 @@
       return true;
     }
     if (wantTemplate) { createAgent(null, wantTemplate); return true; }
+    if (wantPicker) { openTemplatePicker(); return true; }
     if (wantNew) { createAgent(null); return true; }
     return false;
   }

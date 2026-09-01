@@ -3955,12 +3955,22 @@ async def library_page(
                 # built). Only this section supplies them; every other renders
                 # its band exactly as before.
                 "defs": definitions_footer if key == "semantic_model" else None,
-                # One link across to the OTHER half of the story. The band
-                # explains what a template is; this is where the agents built
-                # from them live. Same slot as `defs` — a band-level
-                # destination, not a row — because it is true of the section
-                # rather than of any item in it.
-                "band_link": ({"href": "/agents", "label": "Your agents"} if key == "agent" else None),
+                # One link across to the OTHER half of the story: the band
+                # explains what a template IS, and this is the one thing you do
+                # with it that does not happen here. It opens the builder's
+                # template picker directly, so the label is literally true
+                # rather than a signpost to a page you then have to work out.
+                #
+                # Band-level, not per row. A row already carries the act that
+                # belongs to it — adding the template to your agents — and a
+                # second link beside that one competed with it for a fixed
+                # 170px column while offering something true of every row in
+                # the band equally.
+                "band_link": (
+                    {"href": "/agents?from_template=1", "label": "Start from a template"}
+                    if key == "agent"
+                    else None
+                ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
