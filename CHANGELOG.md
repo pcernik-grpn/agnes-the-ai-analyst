@@ -44,6 +44,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Fixed
 - **An MCP source whose display name is not a SQL identifier no longer materializes into a directory the orchestrator refuses to attach.** The extractor wrote `extracts/<mcp_sources.name>/`, and `SyncOrchestrator` ATTACHes that directory under its own name as a bare alias — so the name had to satisfy the strict identifier rule. Only the admin CRUD path enforced that (`_require_safe_source_name`); a **derived** Keboola source bypasses it and is named `f"Keboola: {connection_name}"` by construction, colon and spaces included. Its extract was therefore written correctly, rejected at every rebuild, and never reached the catalog — visible only as a log line. The directory is now a SQL identity separate from the display one (`source_dir_name`): a name that is already safe is used verbatim, so no working instance moves a directory or orphans an extract, and only names that could never have been attached get a derived `mcp_<slug>_<8 hex of the source id>` form — digest of the id, not the name, because two names can sanitize alike and a shared directory would have them overwrite each other's `_meta`. A directory left behind under the raw unsafe name is adopted into the safe location on the next materialize run (never overwriting a newer extract, and realpath-contained so a name carrying `/` or `..` is refused rather than followed), which both preserves the rows already extracted and stops the per-rebuild rejection.
 - **The Ontology builder (`/admin/ontology`) could no longer load collections, blocking the whole authoring workflow.** `GET /api/collections` returns `{"items": [...]}`, not a bare array; the "Document sample" picker's fetch handler treated the response as an array, so a successful 200 was reported to the operator as "Could not load collections" — with no sample there was no dry-run, and no way to author an ontology through the UI at all. The same mistake was one call away in the per-collection files fetch (`{"files": [...]}`). Both now accept either shape, and a failure is logged to the console instead of being silently swallowed.
+- **An anonymize-marked SharePoint scope stored the real filename and
+  folder path unredacted.** Only the document body ever went through the
+  anonymizer; the source file name and its folder path — routinely the
+  single most re-identifying string in a document — were persisted and
+  served as-is (`/raw`, `/preview`, the chunk index, search, the
+  corpus-file listing). The built-in crawler now anonymizes the filename
+  and each path segment individually, under the same per-instance key and
+  detector as the body, before either is stored — the `/` separator
+  structure is kept so prefix matching and folder-scoped browsing keep
+  working over the anonymized tree. See `docs/anonymization.md` for what
+  this does and does not cover (a retroactive-cleanup gap in
+  `connectors/sharepoint/acl_sync.py` is tracked separately, #2011).
+- **A name split across a markdown line wrap was only half-redacted.** The
+  anonymizer's name-run detector treated a newline as a hard break, so
+  PDF/DOCX→markdown conversion — which wraps lines constantly — routinely
+  left the first half of a wrapped person or company name unredacted (e.g.
+  `"Northwind\nLogistics Holding a.s."` redacted only `"Logistics Holding
+  a.s."`). A single line break inside a name run is now treated like a
+  space; a blank line (a genuine paragraph boundary) still ends the run.
+- **Two different people sharing a surname could be merged into one
+  pseudonym.** A bare surname mention ("Smith") that inflection-matched
+  more than one full name in the same document ("John Smith" and "Mary
+  Smith") used to bridge them into a single `PERSON_<hmac>` token, silently
+  attributing both people's mentions to one identity. An ambiguous bare
+  surname now stays unlinked from either full name rather than guessing
+  which one it means.
 - **Marketplace plugin controls on `/admin/marketplaces` no longer read backwards.** The per-plugin toggle was labelled "Disabled" with checked meaning admin-disabled — an inverted control a reader could mistake for the plugin still being active while it flipped visibility off; it is now an "Enabled" toggle (checked = available to users), the same `admin_disabled` field underneath (#1956 item 14b). The "Mark as system" / "Unmark system" button gained a persistent help affordance explaining that "system" means mandatory for every user, since a bare hover tooltip on the button text was not discoverable enough (#1956 item 14a), and the DISABLED pill's tooltip now notes that a plugin marked `deprecated` upstream is auto-hidden again on every sync (#1956 item 14d).
 - **A crashed worker's `corpus-extraction`/`data-refresh`/`sharepoint-subtree-sweep` job is reclaimed in minutes, not up to an hour.** These jobs' leases used to be sized to their own expected DURATION (`extraction.timeout_s` plus a margin, 900s, 4h respectively) rather than to the worker heartbeat that already keeps a live run's lease renewed — so a worker killed mid-job (observed live: a native crash in a converter backend) left the job `status='running'` with a dead `leased_by` until that whole ceiling elapsed, unreachable by any operator action short of hand-editing the database. All three now share a small, heartbeat-cadence-derived lease (300s) that no longer tracks the job's own duration.
 - **The SharePoint card's run state stopped appearing half a minute after the card it belongs to.** The extraction block (the `Run` row, the `Configuration` row and the pipeline strip's live-crawl cell) is drawn by a poller that self-starts when the page's scripts parse — at which point the source cards, which arrive over `fetch`, do not exist yet. That first tick found no connection to ask about and armed nothing, so the scheduler fell through to the idle interval and the block appeared 30 s later; when a mutation's `loadConnections()` repainted the cards while that tick was in flight, a full minute. Every paint of the cards now redraws the block from what the poller already knows — free, so a rebuilt card gets its run row back in the same frame instead of blanking — and asks upstream only for a connection this page cannot already draw.
