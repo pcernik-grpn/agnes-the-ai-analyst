@@ -214,6 +214,40 @@ def test_dry_run_returns_structured_facts_edges_and_not_captured(ontology_client
     assert captured["schema_name"] == "ontology_dry_run"
 
 
+def test_dry_run_system_prompt_includes_relationship_description(ontology_client, monkeypatch):
+    """A relationship type's own description (section 3 of the builder) must
+    reach the dry-run prompt exactly like an entity type's description does
+    -- otherwise the only way to disambiguate two similarly-shaped edge
+    types is to mislabel one on an entity, which is the wrong place."""
+    corpus_id, file_id = _seed_document(ontology_client)
+
+    captured = {}
+
+    class _FakeExtractor:
+        def extract_json(self, prompt, max_tokens, json_schema, schema_name, system=None):
+            captured["system"] = system
+            return {"facts": [], "edges": [], "not_captured": []}
+
+    import app.api.ontology as ontology_mod
+
+    monkeypatch.setattr(ontology_mod, "_make_extractor", lambda: _FakeExtractor())
+
+    r = ontology_client["client"].post(
+        "/api/admin/ontology/dry-run",
+        json={
+            "node_types": {"client": {}, "sponsor": {}},
+            "edge_types": {
+                "owned_by": {"src": "client", "dst": "sponsor", "description": "who financially controls the client"}
+            },
+            "collection_id": corpus_id,
+            "file_id": file_id,
+        },
+        headers=_auth(ontology_client),
+    )
+    assert r.status_code == 200, r.text
+    assert "who financially controls the client" in captured["system"]
+
+
 def test_dry_run_empty_document_text_is_422(ontology_client, monkeypatch):
     corpus_id, file_id = _seed_document(ontology_client, text="")
     # add_many with empty text still creates a chunk row with blank text --
