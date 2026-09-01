@@ -1,7 +1,7 @@
 {% extends "base_page.html" %}
 {% import "macros/_state.html" as state %}
 
-{% block title %}{{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ model_name }} — Definitions — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <style>
@@ -133,7 +133,7 @@
 
 {% block page_prehead %}
 {# The arrow matches `.apg-back`, the way back every other page draws, and
-   is hidden from screen readers — "left arrow Semantic models" is not a
+   is hidden from screen readers — "left arrow Definitions" is not a
    label. The list page draws the same mark. #}
 <a class="slb-back" href="/semantic-layer"><span aria-hidden="true">&larr;</span> Definitions</a>
 {% endblock %}

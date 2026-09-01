@@ -116,6 +116,35 @@ def test_page_title_is_the_decided_name(seeded_app, path: str, name: str) -> Non
     assert _page_name(_render(seeded_app, path), path) == name
 
 
+def test_every_page_under_the_area_carries_its_name(seeded_app) -> None:
+    """A model's own page is INSIDE Definitions, so its <title> breadcrumb
+    names it. This is the half a rename forgets: the landing page changes and
+    the pages one click deeper keep the old word in the browser tab — which is
+    the one place a reader compares two of them side by side."""
+    from src.repositories import semantic_model_repo
+
+    semantic_model_repo().upsert(
+        id="manual/_/naming",
+        slug="naming",
+        name="naming",
+        description="Seeded so this guard runs instead of skipping.",
+        document="# fixture, not schema-authored",
+        document_json={"semantic_model": [{"name": "naming", "datasets": []}]},
+        spec_version="0.2.0.dev0",
+        content_hash="hash-naming",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+    title = re.search(
+        r"<title>(.*?)</title>", _render(seeded_app, "/semantic-layer/naming"), re.DOTALL
+    ).group(1)
+    assert "Definitions" in title, title
+    assert "Semantic models" not in title, title
+
+
 def test_health_page_door_points_at_semantic_models(seeded_app) -> None:
     """/admin/semantic-layer reports on the stored documents, so its "browse"
     link opens the documents — the same target /admin/semantic-sources uses,
