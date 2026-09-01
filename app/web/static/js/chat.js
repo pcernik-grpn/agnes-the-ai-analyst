@@ -2257,7 +2257,9 @@ function chatErrorCopy(raw, kind) {
       "Start a new conversation to keep going. An admin can raise the per-conversation budget.";
   }
   if (/daily_budget/i.test(both)) {
-    return "This instance has reached its daily spend cap. Try again tomorrow, or ask an admin to raise it.";
+    // Keyed on the SENDER (enforce_sender_limits sums the sender's own day),
+    // so it is "your" cap, not the instance's.
+    return "You've reached your daily spend cap on this instance. Try again tomorrow, or ask an admin to raise it.";
   }
   if (/rate_limit/i.test(both)) {
     return "You're sending messages faster than this instance allows. Wait a few minutes and try again.";
