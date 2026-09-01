@@ -446,6 +446,208 @@ class TestDeclarationMatchesConnector:
         assert declared <= cols, f"declared columns {declared - cols} missing from {sorted(cols)}"
 
 
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _attach_policy(table_id: str, sql: str, note: str = "row-level test policy") -> None:
+    """Attach a policy DIRECTLY via the repository, bypassing the admin
+    write-time interlock (`access_policy_requires_undistributed`) that
+    would otherwise force `server_only=True`/`query_mode='remote'` first --
+    the same shortcut `test_server_only_catalogue_table_keeps_its_binaries`
+    takes with a raw SQL UPDATE. This exercises the row-visibility check on
+    its own, independent of whichever tables the interlock currently
+    permits a policy on (K3: the gap this closes is not contingent on that
+    interlock holding for every present and future attachment source)."""
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).set_access_policy(table_id, sql=sql, note=note, updated_by="admin")
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def policied_jira_attachment_env(jira_attachment_env):
+    """Attach a row-filtering policy to the `attachments` catalogue table
+    that hides attachment id 101 from everyone except alice@example.com --
+    two non-admin users, both granted TABLE-level access, so any
+    difference in what they can download is attributable to the ROW
+    policy, not RBAC."""
+    from app.auth.jwt import create_access_token
+    from src.repositories.users import UserRepository
+
+    conn = get_system_db()
+    try:
+        users = UserRepository(conn)
+        users.create(id="u_alice", email="alice@example.com", name="Alice")
+        users.create(id="u_bob", email="bob@example.com", name="Bob")
+        from tests.conftest import grant_table_via_package
+
+        grant_table_via_package(conn, "attachments", "u_alice", group_name="att-alice")
+        grant_table_via_package(conn, "attachments", "u_bob", group_name="att-bob")
+    finally:
+        conn.close()
+
+    _attach_policy(
+        "attachments",
+        "SELECT * FROM attachments WHERE attachment_id != '101' OR $user_email = 'alice@example.com'",
+    )
+
+    return {
+        **jira_attachment_env,
+        "alice_token": create_access_token("u_alice", "alice@example.com"),
+        "bob_token": create_access_token("u_bob", "bob@example.com"),
+    }
+
+
+class TestRowLevelAccessPolicy:
+    """K3 -- table-level RBAC only answers "can this caller read the
+    catalogue table at all"; a table access policy narrows WHICH ROWS once
+    they can, and an attachment binary belongs to exactly one row."""
+
+    def test_user_the_policy_admits_downloads_the_row(self, policied_jira_attachment_env):
+        resp = policied_jira_attachment_env["client"].get(
+            "/api/attachments/jira/101/download", headers=_auth(policied_jira_attachment_env["alice_token"])
+        )
+        assert resp.status_code == 200
+        assert resp.content == policied_jira_attachment_env["payload"]
+
+    def test_user_the_policy_hides_the_row_from_is_blocked(self, policied_jira_attachment_env):
+        resp = policied_jira_attachment_env["client"].get(
+            "/api/attachments/jira/101/download", headers=_auth(policied_jira_attachment_env["bob_token"])
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "attachment_not_found"
+        row = _last_audit_row()
+        assert row is not None
+        assert row[0] == "u_bob"
+        assert row[3] == "error.404"
+
+    def test_hidden_row_is_indistinguishable_from_a_genuinely_missing_one(self, policied_jira_attachment_env):
+        c = policied_jira_attachment_env["client"]
+        bob = _auth(policied_jira_attachment_env["bob_token"])
+        hidden = c.get("/api/attachments/jira/101/download", headers=bob)
+        missing = c.get("/api/attachments/jira/999999/download", headers=bob)
+        assert hidden.status_code == missing.status_code == 404
+        assert hidden.json()["detail"]["code"] == missing.json()["detail"]["code"] == "attachment_not_found"
+
+    def test_admin_god_mode_still_bypasses_the_row_policy(self, policied_jira_attachment_env, admin_user):
+        resp = policied_jira_attachment_env["client"].get(
+            "/api/attachments/jira/101/download", headers=admin_user
+        )
+        assert resp.status_code == 200
+        assert resp.content == policied_jira_attachment_env["payload"]
+
+    def test_table_without_a_policy_is_unaffected(self, jira_attachment_env, analyst_user):
+        """Regression: a table that never had a policy attached must not
+        pay for (or be blocked by) the new check at all."""
+        _grant_table("analyst1", "attachments", "att-no-policy")
+        resp = jira_attachment_env["client"].get("/api/attachments/jira/101/download", headers=analyst_user)
+        assert resp.status_code == 200
+        assert resp.content == jira_attachment_env["payload"]
+
+    def test_a_policy_that_fails_to_execute_fails_closed(self, jira_attachment_env, analyst_user):
+        """A policy body referencing a column that does not exist is valid
+        SQL TEXT (sqlglot parses it fine) but fails at EXECUTION time --
+        this must block the download, never fall through to serving the
+        raw row because the policy could not be evaluated."""
+        _grant_table("analyst1", "attachments", "att-broken-policy")
+        _attach_policy(
+            "attachments",
+            "SELECT * FROM attachments WHERE definitely_not_a_real_column_xyz = 'x'",
+            note="broken policy for the fail-closed test",
+        )
+        resp = jira_attachment_env["client"].get("/api/attachments/jira/101/download", headers=analyst_user)
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "attachment_not_found"
+        assert jira_attachment_env["payload"] not in resp.content
+
+
+class TestRowVisibleUnderAccessPolicyUnit:
+    """Direct unit coverage of the resolver-facing helper, independent of
+    the HTTP plumbing above -- pins the fail-closed contract for identity
+    and resolution failures that are hard to trigger end to end."""
+
+    def _decl(self):
+        from src.attachment_sources import get_attachment_source
+
+        return get_attachment_source("jira")
+
+    def test_returns_true_without_querying_when_not_policied(self, monkeypatch):
+        import app.api.attachments as attachments_mod
+        from src.access_policy import PoliciedRelation
+
+        monkeypatch.setattr(
+            attachments_mod,
+            "policied_relation",
+            lambda table_id, user: PoliciedRelation(
+                relation_sql="SELECT * FROM attachments", params={}, policied=False, table_id=table_id
+            ),
+        )
+
+        def _boom():
+            raise AssertionError("must not open a connection for the non-policied case")
+
+        monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", _boom)
+        assert (
+            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
+            is True
+        )
+
+    def test_fails_closed_on_identity_unresolvable(self, monkeypatch):
+        import app.api.attachments as attachments_mod
+        from src.access_policy import PolicyIdentityUnresolvable
+
+        def _raise(table_id, user):
+            raise PolicyIdentityUnresolvable("no identity")
+
+        monkeypatch.setattr(attachments_mod, "policied_relation", _raise)
+        assert (
+            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
+            is False
+        )
+
+    def test_fails_closed_on_policy_error(self, monkeypatch):
+        import app.api.attachments as attachments_mod
+        from src.access_policy import PolicyError
+
+        def _raise(table_id, user):
+            raise PolicyError(table_id)
+
+        monkeypatch.setattr(attachments_mod, "policied_relation", _raise)
+        assert (
+            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
+            is False
+        )
+
+    def test_fails_closed_when_the_existence_query_raises(self, monkeypatch):
+        import app.api.attachments as attachments_mod
+        from src.access_policy import PoliciedRelation
+
+        monkeypatch.setattr(
+            attachments_mod,
+            "policied_relation",
+            lambda table_id, user: PoliciedRelation(
+                relation_sql="SELECT * FROM attachments", params={}, policied=True, table_id=table_id
+            ),
+        )
+
+        class _BoomConn:
+            def execute(self, sql, params=None):
+                raise RuntimeError("engine error")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", lambda: _BoomConn())
+        assert (
+            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
+            is False
+        )
+
+
 def test_registry_read_failure_fails_closed_not_open(jira_attachment_env, admin_user, monkeypatch):
     """Devin on #1297 — a transient registry read failure used to fall
     through with reg_row=None, silently skipping the `server_only` gate:

@@ -237,6 +237,21 @@ COVERED: frozenset[str] = frozenset(
         # shape as `src/access_policy.py::policied_from_sql` itself.
         "app/api/access.py::_table_access_diagnoses",
         "app/api/access.py::_count_through_relation",
+        # K3 (RLS review #1979) -- an attachment binary belongs to exactly
+        # one row of its catalogue table, and table-level RBAC
+        # (`can_access_table`) only answers "can this caller read the
+        # table at all", not "is this specific row in their policied
+        # slice". `download_attachment` now calls the same-file
+        # `_row_visible_under_access_policy` before any catalogue/
+        # filesystem work, which itself calls `policied_relation` directly
+        # (and, only for a policied table, runs a bound existence check
+        # through the resolved relation) -- mirroring the
+        # `_count_through_relation` shape above: operates on an
+        # already-resolved `PoliciedRelation`, executed against the SAME
+        # analytics connection the table's master view already lives on
+        # under its own registry name, no `policied_from_sql` wrap needed.
+        "app/api/attachments.py::download_attachment",
+        "app/api/attachments.py::_row_visible_under_access_policy",
     }
 )
 
@@ -408,22 +423,14 @@ EXEMPT: frozenset[str] = frozenset(
         # structurally, independent of RBAC. ────────────────────────────
         "app/api/data.py::check_access",
         "app/api/data.py::download_table",
-        # ── attachment binaries: the SAME server_only interlock as data.py's
-        # parquet route, one indirection removed. `_lookup_stored_path` reads
-        # `local_path` from the catalogue view, but its ONLY caller is
-        # `download_attachment`, which 403s a `server_only` table BEFORE the
-        # lookup runs (the "these bytes do not leave the server" gate at the
-        # `reg_row.get("server_only")` check, mirroring `_distribution_refusal`).
-        # A policy attaches only to `server_only=true` or `query_mode='remote'`
-        # (the Task 4 interlock): the former is refused before
-        # `_lookup_stored_path` is ever reached, and the latter can never be an
-        # attachment source — the declared sources
-        # (`src/attachment_sources.py::_SOURCES`) are a fixed dict whose only
-        # entry is Jira's local `attachments` table, so `get_attachment_source`
-        # returns None for a remote-policied table long before any catalogue
-        # read. Neither node can therefore reach a policied table's rows. ────
+        # `_lookup_stored_path` reads `local_path`/the filename column from
+        # the RAW catalogue view (never a policied one) -- it is not itself
+        # the row-visibility gate. By the time it runs, `download_attachment`
+        # (COVERED below) has already confirmed the row is visible in the
+        # caller's policied view via `_row_visible_under_access_policy`, so
+        # this lookup only ever runs for a row already cleared; it stays
+        # EXEMPT rather than duplicating that check.
         "app/api/attachments.py::_lookup_stored_path",
-        "app/api/attachments.py::download_attachment",
         # ── writes-only / not a registry-table read at all ──────────────
         # Scheduler/background sync job (POST /api/sync/trigger or the
         # cron tick) -- writes the RAW profile to storage (needed so the
