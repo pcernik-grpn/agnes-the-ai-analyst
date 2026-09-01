@@ -331,6 +331,43 @@ CHARGEABILITY_TABLES = [
 
 
 def test_one_document_yields_one_hit_not_one_per_chunk():
+    """When another source also matched, a document contributes ONE hit.
+
+    A table is in play here on purpose. Dedup is gated on "did anything else
+    match at all", the same question the name cap beside it asks, so a lone
+    document is deliberately left alone — see the test below.
+    """
+    from src.search.unified import unified_search
+
+    with (
+        patch("src.search.unified._chunk_search", _six_chunks_of_one_file),
+        patch("src.search.unified._knowledge_search", lambda q, **kw: []),
+        patch("src.search.unified._glossary_search", lambda q, limit=10: []),
+    ):
+        hits = unified_search(
+            "bi_chargeability",
+            corpus_ids=["c1"],
+            user_groups=None,
+            granted_domains=None,
+            tables=CHARGEABILITY_TABLES,
+            k=8,
+        )
+
+    chunks = [h for h in hits if h["type"] == "chunk"]
+    assert len(chunks) == 1, f"one document should contribute one hit, got {len(chunks)}"
+    # The surviving hit is the document's BEST passage, not an arbitrary one.
+    assert chunks[0]["chunk_id"] == "ch0"
+
+
+def test_a_lone_document_keeps_every_passage():
+    """Nothing else matched, so there is nothing the passages could crowd out.
+
+    This is the guarantee #1267 was written for — "what is in this file?"
+    deserves more than one passage of it when the file is the only answer in
+    the instance — and deduping unconditionally would silently take it back.
+    Dedup and the name cap are gated on the same condition precisely so this
+    case survives both.
+    """
     from src.search.unified import unified_search
 
     with (
@@ -348,9 +385,7 @@ def test_one_document_yields_one_hit_not_one_per_chunk():
         )
 
     chunks = [h for h in hits if h["type"] == "chunk"]
-    assert len(chunks) == 1, f"one document should contribute one hit, got {len(chunks)}"
-    # The surviving hit is the document's BEST passage, not an arbitrary one.
-    assert chunks[0]["chunk_id"] == "ch0"
+    assert len(chunks) > 1, f"a lone document was collapsed to {len(chunks)} hit(s)"
 
 
 def test_a_matching_table_is_not_crowded_out_by_one_documents_chunks():
