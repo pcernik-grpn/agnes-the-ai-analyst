@@ -200,6 +200,92 @@ class TestMandatoryNote:
         assert resp.status_code == 200, resp.text
 
 
+# ── #1979: the policy SQL body must never land in audit_log.params ─────
+#
+# `access_policy_sql` is already persisted verbatim on `table_registry`
+# (the durable record) and `access_policy_updated_at`/`_by` already say
+# who/when. The audit row is a WHO/WHEN/WHAT-CHANGED trail, not a second
+# copy of the content -- per the audit playbook's "content never enters
+# params" rule (docs: `.claude/skills/agnes-conventions/references/audit.md`).
+
+
+@pytest.mark.journey
+class TestPolicyAuditRedaction:
+    @staticmethod
+    def _sentinel_sql(table_name: str) -> str:
+        # `SELECT * FROM <self>` -- the policy validator (§14.6 live probe)
+        # requires a policy reference its own table, so the sentinel must be
+        # keyed on whatever name the calling test just registered.
+        return f"SELECT * /* SENTINEL_POLICY_BODY_1979 */ FROM {table_name}"
+
+    def test_update_table_audit_redacts_the_policy_sql(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="redact_policy_tbl", server_only=True)
+        sentinel_sql = self._sentinel_sql(table_id)
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": sentinel_sql,
+                "access_policy_note": "restrict rows to the caller's unit",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="update_table", resource=table_id)
+        assert rows, "update_table audit entry not found"
+        import json as _json
+
+        raw_params = rows[0]["params"]
+        params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+
+        # The policy body must not be recoverable from the row at all --
+        # neither under its own key nor smuggled anywhere else in params.
+        assert sentinel_sql not in (raw_params if isinstance(raw_params, str) else _json.dumps(params))
+        assert params["access_policy_sql"] != sentinel_sql
+
+        # But the audit trail must still show THAT the policy changed, by
+        # whom, and when -- `updated_fields` plus the repo's own
+        # access_policy_updated_at/_by (not audit params) carry that.
+        assert "access_policy_sql" in params["updated_fields"]
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get(table_id)
+        assert row["access_policy_sql"] == sentinel_sql
+        assert row["access_policy_updated_by"]
+        assert row["access_policy_updated_at"]
+
+    def test_update_table_audit_keeps_the_policy_note(self, seeded_app, monkeypatch):
+        """`access_policy_note` is a human "why", not a SQL content field --
+        it stays in params, same treatment as `description`."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="redact_note_stays_tbl", server_only=True)
+        sentinel_sql = self._sentinel_sql(table_id)
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": sentinel_sql,
+                "access_policy_note": "restrict rows to the caller's unit",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="update_table", resource=table_id)
+        import json as _json
+
+        raw_params = rows[0]["params"]
+        params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert params["access_policy_note"] == "restrict rows to the caller's unit"
+
+
 # ── Deliverable 2: POST /registry/{table_id}/policy/preview (§13.1) ────
 
 
@@ -368,6 +454,29 @@ class TestPolicyPreview:
 
         rows = _audit_rows(action="access_policy.preview", resource="preview_invoices")
         assert rows, "the preview left no audit trail -- §13.1 requires it be audited"
+
+    def test_preview_audit_redacts_the_candidate_sql(self, policied_invoices_for_preview):
+        """#1979 -- a candidate SQL body previewed before ever being saved
+        must not leak into audit params either."""
+        c = policied_invoices_for_preview["client"]
+        token = policied_invoices_for_preview["admin_token"]
+        sentinel_sql = "SELECT id, unit /* SENTINEL_CANDIDATE_1979 */ FROM preview_invoices"
+
+        resp = c.post(
+            "/api/admin/registry/preview_invoices/policy/preview",
+            json={"sql": sentinel_sql, "as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="access_policy.preview", resource="preview_invoices")
+        assert rows, "the preview left no audit trail -- §13.1 requires it be audited"
+        import json as _json
+
+        raw_params = rows[0]["params"]
+        params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert sentinel_sql not in (raw_params if isinstance(raw_params, str) else _json.dumps(params))
+        assert params["candidate_sql"] != sentinel_sql
 
     def test_preview_requires_admin(self, policied_invoices_for_preview):
         c = policied_invoices_for_preview["client"]

@@ -185,6 +185,22 @@ def test_access_policy_history_reads_the_existing_activity_endpoint(seeded_app):
     assert "action_prefix=update_table" in body
 
 
+def test_access_policy_history_cleared_detection_survives_audit_redaction(seeded_app):
+    """#1979 redacted ``access_policy_sql`` out of ``update_table`` audit
+    params (`app/api/admin.py::_SECRET_FIELDS`) — the value is now always
+    the literal string ``"***"`` (set) or ``"<empty>"`` (cleared/absent),
+    never ``null``/``""``. A JS falsiness check (``!params.access_policy_sql``)
+    would treat ``"<empty>"`` as truthy and misreport every clear as an
+    update, so the "cleared the policy" row must key off that literal
+    sentinel instead."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "params.access_policy_sql === '<empty>'" in body
+    assert "!params.access_policy_sql" not in body
+
+
 def test_builder_scaffold_renders_when_flag_on(seeded_app):
     """Task 4 (access-policy-builder-ux plan): the modal's default tab is a
     no-SQL Builder — a column-list mount fed by ``GET .../policy/columns``

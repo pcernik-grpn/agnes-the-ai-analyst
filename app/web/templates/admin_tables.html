@@ -6456,7 +6456,13 @@
                 var params = _apParseAuditParams(row) || {};
                 var who = row.user_email || row.user_name || row.user_id || 'unknown';
                 var when = String(row.timestamp || '').slice(0, 16).replace('T', ' ');
-                var cleared = ('access_policy_sql' in params) && !params.access_policy_sql;
+                // #1979: audit_log.params masks `access_policy_sql` (it's
+                // SQL content, never audit content — see
+                // `app/api/admin.py::_SECRET_FIELDS`), so the value here is
+                // always the literal '***' (set) or '<empty>' (cleared),
+                // never null/''. A falsiness check would treat '<empty>' as
+                // truthy and misreport every clear as an update.
+                var cleared = params.access_policy_sql === '<empty>';
                 var summary = cleared
                     ? 'cleared the policy'
                     : (params.access_policy_note ? escapeHtml(params.access_policy_note) : 'updated the policy (no note recorded)');

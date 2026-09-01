@@ -3380,9 +3380,11 @@ async def update_server_config(
 # table_registry (where it would later confuse the orchestrator scan).
 _VALID_SOURCE_TYPES: tuple[str, ...] = ("keboola", "bigquery", "jira", "local", "databricks", "snowflake")
 
-# Explicit allowlist of audit-payload keys whose values are credentials and
-# must be masked. Substring-scan + ad-hoc whitelist (the previous shape) is
-# fragile in two ways:
+# Explicit allowlist of audit-payload keys whose values must be masked
+# before they reach `audit_log.params` — credentials AND, per the audit
+# playbook's "content never enters params" rule, opaque content bodies
+# such as a table access policy's SQL text (#1979). Substring-scan +
+# ad-hoc whitelist (the previous shape) is fragile in two ways:
 #   1. False positive: legit fields like `primary_key` get masked because
 #      they contain "key" — we then need a whitelist exception, which has
 #      to be kept in sync as new fields are added.
@@ -3391,13 +3393,16 @@ _VALID_SOURCE_TYPES: tuple[str, ...] = ("keboola", "bigquery", "jira", "local", 
 #      and gets masked unnecessarily; conversely, a brand-new credential
 #      field that doesn't contain one of the patterns (`auth_material`,
 #      `bearer`) silently leaks.
-# Allowlist puts the burden on the developer adding a new secret-bearing
-# field: they must add the literal key name here, which forces a code-
-# review touch on the audit path. Audit the current Pydantic models
-# (RegisterTableRequest / UpdateTableRequest / ConfigureRequest /
-# ServerConfigUpdateRequest) when extending — the registry payloads don't
-# currently carry credentials, but ConfigureRequest does (`keboola_token`)
-# and could be routed through this sanitizer in the future.
+# Allowlist puts the burden on the developer adding a new secret- or
+# content-bearing field: they must add the literal key name here, which
+# forces a code-review touch on the audit path. Audit the current Pydantic
+# models (RegisterTableRequest / UpdateTableRequest / ConfigureRequest /
+# ServerConfigUpdateRequest / PolicyPreviewRequest) when extending —
+# ConfigureRequest carries Keboola creds (`keboola_token`), and
+# `access_policy_sql` / `candidate_sql` carry SQL bodies that are already
+# durably persisted on `table_registry` (or, for a preview candidate,
+# never persisted at all) — the audit row only needs to say THAT it
+# changed/was previewed, never the body itself.
 _SECRET_FIELDS: frozenset = frozenset(
     {
         # ConfigureRequest — POST /api/admin/configure carries Keboola creds.
@@ -3417,6 +3422,18 @@ _SECRET_FIELDS: frozenset = frozenset(
         # Marketplace PATs (private repos) — see src/marketplace.py.
         "marketplace_token",
         "marketplace_pat",
+        # #1979 — table access policy SQL bodies are content, not metadata.
+        # The full text is already on `table_registry.access_policy_sql`
+        # (`access_policy_updated_at`/`_by` cover who/when); `updated_fields`
+        # already tells the audit row THAT it changed. `access_policy_note`
+        # deliberately stays OUT of this set — it's the admin's own "why",
+        # documentation like `description`, not the policy body.
+        "access_policy_sql",
+        # PolicyPreviewRequest.sql — a candidate policy body previewed
+        # before (or instead of) ever being saved. Same rationale, and it
+        # never even reaches persistent storage, so redacting it here is
+        # the ONLY place it would otherwise be recoverable from.
+        "candidate_sql",
     }
 )
 
