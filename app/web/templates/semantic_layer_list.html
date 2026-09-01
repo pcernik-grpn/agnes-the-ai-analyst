@@ -440,7 +440,9 @@
    `base_page.html`'s hero variables — one shape, two hosts. #}
 <section class="page-header page-header--plain">
   <div class="page-header__main">
-    <div class="page-header__eyebrow">Library</div>
+    {# No eyebrow. It read "LIBRARY" directly under a back link that already
+       says "← Library" — the same word twice, two lines apart, one of them in
+       caps. The back link is the relation; the eyebrow was restating it. #}
     <h1 class="page-header__title">Definitions</h1>
     {# Said in the reader's terms, not the implementation's. The old subtitle
        ("the stored documents, and the flat metric and glossary registries

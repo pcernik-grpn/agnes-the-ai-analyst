@@ -1200,9 +1200,14 @@ class TestSemanticPageChrome:
 
         lst = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
         assert 'class="page-header page-header--plain"' in lst
-        assert 'class="page-header__eyebrow"' in lst
         assert 'class="page-header__title"' in lst
         assert 'class="sl-kicker"' not in lst, "the bespoke eyebrow is gone, not just unused"
+        # …and no eyebrow at all: it read "LIBRARY" directly under a back link
+        # already saying "← Library" — the same word twice, two lines apart,
+        # one of them in caps. The back link IS the relation.
+        assert 'class="page-header__eyebrow"' not in lst
+        det = Path("app/web/templates/semantic_layer_detail.html").read_text(encoding="utf-8")
+        assert "page_hero_eyebrow" not in det, "same on the model page, under '← Definitions'"
 
     def test_the_semantic_back_link_matches_every_other_way_back(self):
         """It diverged from `.apg-back` on weight, spacing and hover colour —
