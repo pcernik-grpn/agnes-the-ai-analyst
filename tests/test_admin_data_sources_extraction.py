@@ -63,6 +63,7 @@ _SIGNATURES = (
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
+    "function _extRenderInAgnesButton(connId, status) {",
     "function _extRender(connId) {",
     "function _extRunsHtml(body) {",
     "const EXT_ORIGIN_LABEL = {",
@@ -81,6 +82,7 @@ const _extState = {json.dumps(state or {})};
 const _elements = {{
   "ext-block-sp1": {{ hidden: true, innerHTML: "" }},
   "ext-crawl-live-sp1": {{ hidden: true, innerHTML: "" }},
+  "ext-inagnes-btn-sp1": {{ dataset: {{ extractionReady: "1" }}, disabled: false, title: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] }};
 
