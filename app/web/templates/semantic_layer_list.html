@@ -184,16 +184,24 @@
    under the same toolbar. */
 .sl-flat { display: flex; flex-direction: column; gap: 0; }
 .sl-fbar { margin: 0; }
-/* Chips clear of the bar that set them, count clear of the chips — the
-   Library's rhythm, so a reader moving between the two pages is not re-reading
-   a layout. */
-.sl-flat .fbar-chips { margin: 12px 0 0; justify-content: flex-start; }
+/* Chips clear of the bar that SET them: butted against it they read as a second
+   row of the control rather than as its result. Scoped to the page's own chip
+   row (not `.sl-flat`'s, which is inside a bucket) — the row lives above the
+   tabs now. */
+#sl-chips { margin: 10px 0 0; justify-content: flex-start; }
+#sl-chips[hidden] { display: none; }
+/* The break between "what I asked for" (search, filter, chips) and "what came
+   back" (tabs, count, rows). Bigger than the gaps inside either group, so the
+   eye finds the two zones without reading them. */
+.sl-tabs { margin: 20px 0 0; }
 .sl-countline {
-    margin: 16px 0 8px;
+    margin: 14px 0 10px;
     font-size: 12.5px;
     color: var(--ds-text-muted);
 }
-.sl-elsewhere { padding: 28px 4px; }
+/* No top padding: this sits directly under the count line, which already
+   spaced it, and the empty bucket above it renders nothing at all now. */
+.sl-elsewhere { padding: 2px 0 24px; }
 .sl-elsewhere[hidden] { display: none; }
 .sl-elsewhere__lede { margin: 0 0 10px; font-size: 13.5px; color: var(--ds-text-secondary); }
 .sl-elsewhere__jumps { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -214,6 +222,10 @@
     overflow: hidden;
     background: var(--ds-surface);
 }
+/* A list whose every row is filtered out is not an empty card — it is nothing.
+   Left to itself the bordered box collapsed to a 2px hairline under the count,
+   which reads as a rule the page did not mean to draw. */
+.sl-scroll.is-empty, .sl-grid.is-empty { display: none; }
 
 
 /* ── Metric rows ─────────────────────────────────────────────────────── */
@@ -820,7 +832,7 @@
             onApply: () => {
                 showActiveBucket();
                 refreshTabCounts();
-                syncElsewhere();
+                syncBucketState();
                 document.querySelectorAll(ROWS + '.is-open').forEach(r => {
                     if (r.hidden) r.classList.remove('is-open');
                 });
@@ -872,18 +884,52 @@
     // empty state uses, and the reason the cross-tab note is not needed here:
     // the tab badges already say where the matches are, so this only has to
     // handle the case where the reader is looking at the wrong one.
-    function syncElsewhere() {
-        const box = document.getElementById('sl-elsewhere');
-        if (!box) return;
+    // Everything that has to agree once the engine has filtered: the count,
+    // the empty bucket, and WHICH empty state is speaking. Run as one pass,
+    // after the engine, because all three read the same numbers and reading
+    // them at different moments is how they came to disagree on screen.
+    function syncBucketState() {
         const active = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
-        const here = active && Number(active.querySelector('[data-seg-count]').textContent || 0);
+        const tab = active && active.getAttribute('data-own');
+        const bucket = document.querySelector('.sl-bucket[data-bucket="' + tab + '"]');
+        const here = active ? Number(active.querySelector('[data-seg-count]').textContent || 0) : 0;
+
+        // The count describes what you are LOOKING at. The engine's own number
+        // counts every row it kept across all three buckets, which on a tab
+        // holding none of them said "2 of 35 items" over an empty list.
+        const total = document.querySelectorAll(
+            '.sl-bucket[data-bucket="' + tab + '"] .sl-item, ' +
+            '.sl-bucket[data-bucket="' + tab + '"] .fbar-card').length;
+        const countEl = document.getElementById('sl-count');
+        if (countEl) {
+            const noun = tab === 'models' ? 'model' : tab === 'all_metrics' ? 'metric' : 'term';
+            countEl.textContent = (here === total ? total : here + ' of ' + total)
+                + ' ' + noun + (total === 1 && here === total ? '' : 's');
+        }
+
+        // An emptied list renders nothing rather than an empty bordered card.
+        if (bucket) {
+            bucket.querySelectorAll('.sl-scroll, .sl-grid').forEach(l => {
+                l.classList.toggle('is-empty', here === 0);
+            });
+        }
+
+        // Two empty states, and only ever one of them. `sl-elsewhere` knows
+        // where the matches went, so it outranks the engine's generic
+        // "nothing matches" — which is also plainly wrong when another bucket
+        // has some, and both were firing at once.
+        const box = document.getElementById('sl-elsewhere');
+        const none = document.getElementById('sl-noresults');
         const others = [...document.querySelectorAll('#sl-tabs .fbar-seg__btn')]
             .filter(b => b !== active)
             .map(b => ({ btn: b, n: Number(b.querySelector('[data-seg-count]').textContent || 0),
                          label: b.querySelector('span').textContent.trim() }))
             .filter(o => o.n > 0);
-        box.hidden = here !== 0 || others.length === 0;
-        if (box.hidden) return;
+        const elsewhere = here === 0 && others.length > 0;
+        if (box) box.hidden = !elsewhere;
+        if (none) none.hidden = !(here === 0 && !elsewhere);
+        if (!elsewhere || !box) return;
+
         box.querySelector('[data-elsewhere-n]').textContent =
             others.map(o => o.n + ' in ' + o.label).join(' and ');
         const jumps = box.querySelector('[data-elsewhere-jumps]');
@@ -904,7 +950,8 @@
     }
 
     showActiveBucket();
-    syncElsewhere();
+    refreshTabCounts();
+    syncBucketState();
 
     // The return leg of the deep link: a metric's object page links back here
     // with `?tab=all_metrics&q=<name>`, and a glossary cross-reference to a

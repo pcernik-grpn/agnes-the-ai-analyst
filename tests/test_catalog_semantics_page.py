@@ -1461,9 +1461,12 @@ class TestTheWrongBucketIsNeverBlank:
         tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
         assert 'id="sl-noresults"' in tpl
         assert 'id="sl-elsewhere"' in tpl
-        fn = tpl.split("function syncElsewhere()", 1)[1].split("\n    }", 1)[0]
-        assert "here !== 0 || others.length === 0" in fn, (
+        fn = tpl.split("function syncBucketState()", 1)[1].split("\n    }", 1)[0]
+        assert "const elsewhere = here === 0 && others.length > 0;" in fn, (
             "shown only when THIS bucket is empty and another is not"
+        )
+        assert "none.hidden = !(here === 0 && !elsewhere)" in fn, (
+            "and only ever ONE of the two speaks — both were firing at once"
         )
 
     def test_the_jump_keeps_the_query(self):
@@ -1473,7 +1476,7 @@ class TestTheWrongBucketIsNeverBlank:
         from pathlib import Path
 
         tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
-        fn = tpl.split("function syncElsewhere()", 1)[1].split("\n    }", 1)[0]
+        fn = tpl.split("function syncBucketState()", 1)[1].split("\n    }", 1)[0]
         assert "o.btn.click()" in fn
         assert "href" not in fn, "a page load would drop the filters the reader set"
 
