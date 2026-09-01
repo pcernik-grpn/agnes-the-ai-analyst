@@ -1437,6 +1437,17 @@ _EXEMPT: dict[str, str] = {
         "browser as an attachment; CLI sessions already have the files "
         "locally, no MCP analogue"
     ),
+    "/api/chat/sessions/{chat_id}/files/preview": (
+        "web chat affordance — describes what the BROWSER should draw for one "
+        "session-workspace file (deck slides, document text, or a pointer at "
+        "the …/raw viewer); CLI sessions already have the files locally, no "
+        "MCP analogue"
+    ),
+    "/api/chat/sessions/{chat_id}/files/raw": (
+        "web chat affordance — streams image/PDF bytes INLINE for the preview "
+        "modal to draw; there is no JSON or MCP analogue of a byte stream, and "
+        "CLI sessions already have the files locally"
+    ),
     "/api/chat/sessions/{chat_id}/files/save-artefact": (
         "web chat affordance — saves one session-workspace file as the "
         "caller's private Library artefact (same bridge the chat composer "

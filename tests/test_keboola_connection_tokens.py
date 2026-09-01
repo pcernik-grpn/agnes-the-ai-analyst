@@ -71,6 +71,16 @@ def _patch_common(monkeypatch, tmp_path, table_configs):
         "list_local",
         lambda self, *a, **kw: table_configs,
     )
+    # `_run_sync` reads the whole registry too, to work out whether a pass
+    # accounts for every row `extract.duckdb` owns before it lets the extractor
+    # rebuild the file from scratch. Stubbing only `list_local` left that read
+    # hitting an empty registry, so a pass carrying every row in this fixture
+    # looked like it covered nothing and merged instead of running fresh.
+    monkeypatch.setattr(
+        TableRegistryRepository,
+        "list_all",
+        lambda self, *a, **kw: table_configs,
+    )
 
     from src import orchestrator as orch_mod
     from unittest.mock import MagicMock

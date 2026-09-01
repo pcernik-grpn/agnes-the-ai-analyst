@@ -1,14 +1,19 @@
 /* =====================================================================
  * file_preview.js — "what IS this file?" in a modal.
  *
- * One preview surface for both Library item pages: a row click on the
- * collection detail page, and the Preview action on a file's own detail
- * page. It asks the server what to show (GET …/files/{id}/preview) and
- * renders exactly the shape that comes back:
+ * One preview surface for every file the product shows: the Library's two
+ * item pages (a row click on the collection detail page, the Preview action
+ * on a file's own detail page) and the chat's session-files drawer. It asks
+ * the server what to show and renders exactly the shape that comes back:
  *
  *   image / pdf → the real bytes, drawn by the browser from `raw_url`
- *   text        → source (textual uploads) or the ingested text, in a <pre>
+ *   slides      → a deck's text, slide by slide (chat deliverables — a
+ *                 browser cannot draw a .pptx, so the server sends its words)
+ *   text        → source (textual uploads) or the extracted text, in a <pre>
  *   none        → the server's own sentence about why not, verbatim
+ *
+ * The endpoint differs per caller (`previewUrl`), the vocabulary does not:
+ * a new `kind` is added HERE once and both surfaces get it.
  *
  * The client deliberately does NOT decide which extensions are viewable —
  * that list is a security boundary (an uploaded .html must never be
@@ -19,9 +24,11 @@
  *
  * Usage:
  *   openFilePreview({
- *     collectionId, fileId,          // required
+ *     collectionId, fileId,          // Library: builds the collections URL
+ *     previewUrl,                    // …or pass the endpoint outright
  *     filename, fileType, sizeLabel, // header hints (optional)
  *     detailHref,                    // shows "Open file page" in the foot
+ *     downloadHref, downloadName,    // shows a Download action in the foot
  *   })
  * ===================================================================== */
 (function () {
@@ -90,6 +97,15 @@
       link.href = opts.detailHref;
       foot.appendChild(link);
     }
+    // The chat drawer opens this modal ON the deliverable, so "I've seen it,
+    // give me the file" has to be reachable without closing it first and
+    // hunting for the row again.
+    if (opts.downloadHref) {
+      var dl = el('a', 'btn btn-secondary', 'Download');
+      dl.href = opts.downloadHref;
+      dl.setAttribute('download', opts.downloadName || opts.filename || '');
+      foot.appendChild(dl);
+    }
     var done = el('button', 'btn btn-primary', 'Close');
     done.type = 'button';
     foot.appendChild(done);
@@ -135,7 +151,7 @@
 
     if (data.kind === 'image') {
       var img = el('img', 'fp-img');
-      img.alt = 'Preview of ' + (data.filename || 'the file');
+      img.alt = 'Preview of ' + (data.filename || data.name || opts.filename || 'the file');
       img.src = data.raw_url;
       img.addEventListener('error', function () {
         ui.body.textContent = '';
@@ -147,7 +163,7 @@
 
     if (data.kind === 'pdf') {
       var frame = el('iframe', 'fp-frame');
-      frame.title = 'Preview of ' + (data.filename || 'the file');
+      frame.title = 'Preview of ' + (data.filename || data.name || opts.filename || 'the file');
       // Safe without `sandbox`: the endpoint pins the response to
       // application/pdf + nosniff, so the body can never be interpreted as
       // HTML on our origin — and a fully sandboxed frame would also disable
@@ -157,10 +173,36 @@
       return;
     }
 
+    if (data.kind === 'slides') {
+      // A .pptx has no browser renderer, so the server sends the deck's
+      // words and this draws them as slide cards — enough to confirm the
+      // agent built the deck that was asked for before spending a download.
+      var deck = el('div', 'fp-slides');
+      (data.slides || []).forEach(function (s) {
+        var card = el('article', 'fp-slide');
+        card.appendChild(el('span', 'fp-slide__num', 'Slide ' + s.index));
+        if (s.title) card.appendChild(el('h4', 'fp-slide__title', s.title));
+        if (s.lines && s.lines.length) {
+          var ul = el('ul', 'fp-slide__lines');
+          s.lines.forEach(function (line) { ul.appendChild(el('li', null, line)); });
+          card.appendChild(ul);
+        }
+        if (!s.title && !(s.lines && s.lines.length)) {
+          card.appendChild(el('p', 'fp-slide__empty', 'No text on this slide.'));
+        }
+        deck.appendChild(card);
+      });
+      ui.body.appendChild(deck);
+      var deckNotes = ['Slide text only — not the rendered layout.'];
+      if (data.truncated) deckNotes.push('Showing the first slides.');
+      ui.note.textContent = deckNotes.join(' ');
+      return;
+    }
+
     if (data.kind === 'text') {
       ui.body.appendChild(el('pre', 'fp-text', data.text || ''));
       var notes = [];
-      if (data.source === 'extracted') notes.push('Text extracted during indexing — not the original layout.');
+      if (data.source === 'extracted') notes.push('Extracted text — not the original layout.');
       if (data.truncated) notes.push('Showing the beginning of the file.');
       ui.note.textContent = notes.join(' ');
       return;
@@ -171,7 +213,14 @@
 
   window.openFilePreview = function (opts) {
     opts = opts || {};
-    if (!opts.collectionId || !opts.fileId) return;
+    // Either an endpoint outright (the chat drawer) or the Library's pair.
+    var url = opts.previewUrl;
+    if (!url) {
+      if (!opts.collectionId || !opts.fileId) return;
+      url =
+        '/api/collections/' + encodeURIComponent(opts.collectionId) +
+        '/files/' + encodeURIComponent(opts.fileId) + '/preview';
+    }
     close(); // one preview at a time
 
     var ui = build(opts);
@@ -180,10 +229,6 @@
     document.body.appendChild(ui.backdrop);
     ui.closeBtn.focus();
     renderMeta(ui.meta, {}, opts);
-
-    var url =
-      '/api/collections/' + encodeURIComponent(opts.collectionId) +
-      '/files/' + encodeURIComponent(opts.fileId) + '/preview';
 
     fetch(url, { credentials: 'same-origin' })
       .then(function (r) {

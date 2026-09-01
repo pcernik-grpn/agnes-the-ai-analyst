@@ -48,6 +48,7 @@ from src.repositories import (
     agents_repo,
     audit_repo,
     resource_grants_repo,
+    users_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,7 @@ def _serialize(
     *,
     scope_rows: Optional[List[Dict[str, Any]]] = None,
     uid: Optional[str] = None,
+    owner_names: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Wire shape for one agent row.
 
@@ -263,7 +265,21 @@ def _serialize(
     out["plugins"] = plugins
     out["surfaces"] = _decode(row.get("surfaces"), {})
     if uid is not None:
-        out["mine"] = row.get("owner_user_id") == uid
+        mine = row.get("owner_user_id") == uid
+        out["mine"] = mine
+        # A row the caller does NOT own says whose it is, so the /agents page
+        # can label a shared card ("Owned by …") instead of rendering it
+        # indistinguishable from the caller's own — with a Delete button that
+        # can only ever 403 (`require_owner=True` below). Own rows carry no
+        # `owner_name`; the absence is what the page keys the label on.
+        # `owner_names` is the list route's batched `get_info_by_ids` read;
+        # single-row callers leave it None and resolve here.
+        if not mine and (owner_id := row.get("owner_user_id")):
+            if owner_names is None:
+                owner_names = users_repo().get_info_by_ids([owner_id])
+            info = owner_names.get(owner_id)
+            if info:
+                out["owner_name"] = info.get("name") or info.get("email")
     return out
 
 
@@ -514,8 +530,17 @@ async def list_agents(
     # would turn this listing into an N+1 (mirrors the retired `/agents`
     # builder router's own batched read, Devin Review on #1520).
     scope_by_agent = repo.get_scope_for_agents([r["id"] for r in rows]) if rows else {}
+    # ONE owner-name read for every shared row (`_serialize` would otherwise
+    # resolve each foreign owner one query at a time — same N+1 shape as the
+    # scope read above).
+    foreign_owner_ids = sorted(
+        {r["owner_user_id"] for r in rows if r.get("owner_user_id") and r["owner_user_id"] != uid}
+    )
+    owner_names = users_repo().get_info_by_ids(foreign_owner_ids) if foreign_owner_ids else {}
     return {
-        "data": [_serialize(r, scope_rows=scope_by_agent.get(r["id"], []), uid=uid) for r in rows],
+        "data": [
+            _serialize(r, scope_rows=scope_by_agent.get(r["id"], []), uid=uid, owner_names=owner_names) for r in rows
+        ],
         "has_more": False,
         "next_cursor": None,
     }

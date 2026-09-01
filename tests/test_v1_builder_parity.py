@@ -536,6 +536,70 @@ def test_v1_list_shared_with_me_visible_via_user_pat(env):
     assert created["id"] in ids
 
 
+def test_v1_list_shared_rows_carry_owner_name(env):
+    """A row the caller does not own says WHOSE it is (`owner_name`), so the
+    /agents page can label it instead of rendering it indistinguishable from
+    the caller's own agents — two identically-named "Default" cards, one of
+    them offering a Delete that can only ever 403 (the live confusion this
+    fixes). Own rows carry no `owner_name`: the caller knows themselves, and
+    the absence is what the page keys the label on."""
+    shared = (
+        env["client"]
+        .post(
+            "/api/v1/agents",
+            json={"name": "Shared Label", "slug": "shared-label-agent"},
+            headers=_auth(env["owner"]["token"]),
+        )
+        .json()
+    )
+    gid = _group_with_members("v1-parity-owner-label-grp", env["owner"]["id"], env["grantee"]["id"])
+    env["client"].put(
+        f"/api/sharing/agent/{shared['id']}", json={"group_ids": [gid]}, headers=_auth(env["owner"]["token"])
+    )
+    own = (
+        env["client"]
+        .post(
+            "/api/v1/agents",
+            json={"name": "My Own", "slug": "my-own-agent"},
+            headers=_auth(env["grantee"]["token"]),
+        )
+        .json()
+    )
+
+    rows = {
+        a["id"]: a for a in env["client"].get("/api/v1/agents", headers=_auth(env["grantee"]["token"])).json()["data"]
+    }
+    shared_row = rows[shared["id"]]
+    assert shared_row["mine"] is False
+    assert shared_row["owner_name"] == "Owner"  # users.name, email fallback
+    own_row = rows[own["id"]]
+    assert own_row["mine"] is True
+    assert "owner_name" not in own_row
+
+
+def test_v1_get_shared_agent_carries_owner_name(env):
+    """The single-row read resolves `owner_name` too (the list batches the
+    lookup; GET by id does its own) — the builder opens a shared agent
+    through this route and needs the same label."""
+    shared = (
+        env["client"]
+        .post(
+            "/api/v1/agents",
+            json={"name": "Shared Get", "slug": "shared-get-agent"},
+            headers=_auth(env["owner"]["token"]),
+        )
+        .json()
+    )
+    gid = _group_with_members("v1-parity-owner-get-grp", env["owner"]["id"], env["grantee"]["id"])
+    env["client"].put(
+        f"/api/sharing/agent/{shared['id']}", json={"group_ids": [gid]}, headers=_auth(env["owner"]["token"])
+    )
+
+    got = env["client"].get(f"/api/v1/agents/{shared['id']}", headers=_auth(env["grantee"]["token"])).json()
+    assert got["mine"] is False
+    assert got["owner_name"] == "Owner"
+
+
 # ---------------------------------------------------------------------------
 # PAT-vs-session gating matrix on the extended (mutation) fields — a plain
 # user PAT must stay denied on every mutation, builder-shaped payload or not.
