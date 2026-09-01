@@ -180,7 +180,7 @@ def direct_group_name(source_scope_id: str) -> str:
 
 def scope_rel_root(display_path: str) -> str:
     """Drive-relative prefix of a scope root, derived from the wizard
-    breadcrumb the same way ``corpus_map._map_key`` does: segments are
+    breadcrumb: segments are
     slash-split and stripped; segment[0] is the site, segment[1] the
     document library (both absent from drive-relative paths). ``"Site"`` or
     ``"Site/Documents"`` -> ``""``; ``"Site/Documents/Team/Sub"`` ->

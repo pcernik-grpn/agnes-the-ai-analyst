@@ -6,8 +6,7 @@ Every route on this router is gated FIRST by the module-level
 admin surface answers ``409 feature_disabled`` when the single ``sharepoint``
 switch (``app/switches.py``) is off, before any per-route auth even runs. On
 top of that, most individual routes are also gated by ``Depends(require_admin)``
-(a couple by ``Depends(require_admin_or_producer_connection(...))`` for the
-corpus-extraction producer's own callback reads — see those routes' own
+(see those routes' own
 docstrings).
 
 Surface:
@@ -39,24 +38,6 @@ Surface:
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
-  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the
-                                                                ``{"<site>"|"<site>/<folder path>":
-                                                                collection_id}`` mapping
-                                                                ``ship_to_agnes.py --corpus-map``
-                                                                consumes, in the producer
-                                                                resolver's own key shape. 409
-                                                                ``corpus_map_ambiguous`` rather
-                                                                than a best-guess map. Per-scope
-                                                                ``anonymize`` is NOT in this shape —
-                                                                a producer that needs it reads the
-                                                                sibling ``GET .../scopes`` endpoint
-                                                                instead (each row already carries
-                                                                ``anonymize``). Agnes's own
-                                                                ``corpus-extraction`` job handler
-                                                                (``app/worker/kinds.py``) builds an
-                                                                anonymize-scoped mapping the same
-                                                                way, for the same reason: this
-                                                                endpoint's contract does not move.
   GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
                                                                 (thumbprint, subject/issuer, expiry)
                                                                 derived at request time from the
@@ -150,12 +131,11 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.access import require_admin, require_admin_or_producer_connection
+from app.auth.access import require_admin
 from app.auth.public_url import public_base_url
-from app.auth.session_principal import ProducerPrincipal
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
-from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, active_zone_rows, zone_rows
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, zone_rows
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -169,7 +149,6 @@ from connectors.sharepoint.graph_client import (
     probe_unique_permissions,
     search_folders,
 )
-from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
     corpus_file_events_repo,
@@ -192,7 +171,7 @@ def _require_sharepoint_enabled() -> None:
     (``app/api/sharepoint_webhooks.py``'s ``require_sharepoint_enabled`` in
     ``app/auth/access.py``, which 404s because Graph is an unauthenticated
     caller that never had a route to discover), every route here already
-    requires admin (or a scoped producer credential) — a reachable,
+    requires admin — a reachable,
     authenticated caller being told a KNOWN feature is off is exactly what
     409 means elsewhere in this module (``extraction_disabled``,
     ``acl_sync_already_running``, ...).
@@ -1091,7 +1070,7 @@ async def search_tree(
 @router.get("/connections/{connection_id}/scopes")
 async def list_scopes(
     connection_id: str,
-    user=Depends(require_admin_or_producer_connection("{connection_id}")),
+    user: dict = Depends(require_admin),
 ):
     """The wizard's step-2/3 source of truth: every confirmed scope row,
     enriched with its collection and current group grants, plus this
@@ -1100,22 +1079,9 @@ async def list_scopes(
     rather than have it vanish the moment it dissolves; see :func:`_zone_out`
     for the exact projection).
 
-    Also the corpus-extraction producer's own callback read (TCRD-...):
-    a ``ProducerPrincipal`` scoped to THIS connection may call this too
-    (see ``require_admin_or_producer_connection``) — self-audited here
-    (``sharepoint_connection.scopes_read``, ``client_kind="producer"``)
-    since a restricted principal's identity is never stashed onto
-    ``request.state.user``, so the generic audit-fallback middleware would
-    otherwise see no attributable caller and write nothing at all.
     """
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
-    if isinstance(user, ProducerPrincipal):
-        log_safe(
-            action="sharepoint_connection.scopes_read",
-            resource=connection_id,
-            client_kind="producer",
-        )
     return {
         "items": [_scope_out(s, declared, row) for s in _scopes(row)],
         "zones": [_zone_out(z) for z in zone_rows(row)],
@@ -1425,55 +1391,6 @@ async def remove_scope(
     }
 
 
-@router.get("/connections/{connection_id}/corpus-map")
-async def corpus_map(
-    connection_id: str,
-    user=Depends(require_admin_or_producer_connection("{connection_id}")),
-):
-    """Scope→collection routing map (spec §13.2 / item 3). Keys are in the
-    crawl resolver's OWN shape — ``"<site display name>"`` or
-    ``"<site display name>/<drive-relative folder path>"`` — built by the
-    shared translation in ``connectors/sharepoint/corpus_map.py``, so this
-    endpoint and anything else reasoning about scope routing cannot drift.
-    The earlier flat ``{source_scope_id: collection_id}`` shape was
-    unusable for routing: the resolver matches keys against crawler rows'
-    site/path components, which a Graph scope id never equals.
-
-    Every ACTIVE permission zone (2026-08-31 plan, Task 3/7 —
-    ``connectors/sharepoint/acl_sync.py``'s ``config["acl_zones"]``) folds in
-    as an ADDITIONAL, NESTED key under its parent scope's own key (a zone's
-    ``display_path`` always extends its parent's) — see
-    ``connectors/sharepoint/corpus_map.py``'s module docstring for why the
-    producer's resolver MUST match these longest-prefix-first, and why a
-    resolver that gets that wrong still fails closed rather than leaking
-    zone content (the ingest gate, 2026-08-31 plan, Task 5). A DISSOLVED
-    zone is never mapped — its content re-homes to the parent scope.
-
-    ``409 corpus_map_ambiguous`` when the confirmed scopes/zones cannot form
-    an unambiguous map (e.g. a site scope plus a drive scope of the same
-    site) — never a best-guess map.
-
-    Deliberately does NOT carry ``anonymize`` — a caller that needs to know
-    WHICH scopes to anonymize reads ``GET .../scopes`` instead (each row
-    already carries ``anonymize``); the built-in crawl reads the same flag
-    off the scope rows directly."""
-    row = _sharepoint_connection_or_404(connection_id)
-    try:
-        mapping = producer_corpus_map(_scopes(row), active_zone_rows(row))
-    except CorpusMapError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "corpus_map_ambiguous", "message": str(exc)},
-        ) from exc
-    if isinstance(user, ProducerPrincipal):
-        log_safe(
-            action="sharepoint_connection.corpus_map_read",
-            resource=connection_id,
-            client_kind="producer",
-        )
-    return mapping
-
-
 @router.get("/connections/{connection_id}/certificate")
 async def certificate(
     connection_id: str,
@@ -1573,6 +1490,8 @@ class ExtractionRunOptions(BaseModel):
         le=86400,
         description="Hard ceiling for this one run, seconds (0 = unbounded).",
     )
+
+
 # --- Graph subscription lifecycle -------------------------------------------
 #
 # The secret-minting endpoint above is only half of what near-real-time
