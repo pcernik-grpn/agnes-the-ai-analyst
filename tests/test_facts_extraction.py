@@ -664,3 +664,59 @@ def test_the_seam_refuses_to_spend_tokens_when_the_facts_surface_is_off(monkeypa
 
 def test_fact_key_is_stable_regardless_of_key_order():
     assert _fact_key({"a": 1, "b": 2}) == _fact_key({"b": 2, "a": 1})
+
+
+class TestDeadlineExpiryIsCalledNotTruthinessTested:
+    """`_Deadline.expired` is a METHOD, not a property.
+
+    The pass used to gate on ``getattr(deadline, "expired", False)``, whose
+    value for a real deadline is the BOUND METHOD — always truthy. That
+    aborted the very first planning iteration of every fact-extraction pass
+    that was handed a deadline (i.e. every crawl-driven pass, since the
+    crawl always builds one) and reported it as ``interrupted: timeout``,
+    which reads as a plausible operator-facing outcome rather than a bug.
+    """
+
+    def test_a_live_deadline_is_not_expired(self):
+        from connectors.sharepoint.crawler import _Deadline
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        assert _deadline_expired(_Deadline(3600)) is False
+
+    def test_an_elapsed_deadline_is_expired(self):
+        from connectors.sharepoint.crawler import _Deadline
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        ticks = iter([0.0, 10.0])
+        deadline = _Deadline(1, clock=lambda: next(ticks))
+        assert _deadline_expired(deadline) is True
+
+    def test_a_disabled_deadline_is_never_expired(self):
+        from connectors.sharepoint.crawler import _Deadline
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        assert _deadline_expired(_Deadline(0)) is False
+
+    def test_no_deadline_is_not_expired(self):
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        assert _deadline_expired(None) is False
+
+    def test_a_stub_exposing_expired_as_a_plain_attribute_still_works(self):
+        """The defaulted getattr existed to tolerate substituted stubs; a
+        stub that exposes ``expired`` as a bool must keep working."""
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        class _Stub:
+            expired = False
+
+        class _ExpiredStub:
+            expired = True
+
+        assert _deadline_expired(_Stub()) is False
+        assert _deadline_expired(_ExpiredStub()) is True
+
+    def test_an_object_without_the_attribute_is_not_expired(self):
+        from connectors.sharepoint.facts_extraction import _deadline_expired
+
+        assert _deadline_expired(object()) is False
