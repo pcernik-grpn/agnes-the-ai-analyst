@@ -39,6 +39,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+
+- **Revoking a grant the Access page cannot revoke now says where the control lives.** Marking a plugin Required on `/admin/marketplaces` writes a grant to every group, and `DELETE /api/admin/grants/{id}` refuses to remove those (`409 cannot_revoke_system_grant`) so nobody punches a hole in a mandatory plugin. The refusal is correct; what reached the admin was not — the page never read the response body, so the toast said "Could not revoke: HTTP 409", a dead end with no statement of which surface owns the control. It now names Required and points at Marketplaces. This is the smallest literal instance of a broader problem written up in `docs/superpowers/specs/2026-09-01-access-surface-rethink.md`: ten surfaces write `resource_grants` and the table records who but not which surface, so a grant made by an automated fanout is indistinguishable from one an admin made by hand.
 - **The built-in SharePoint crawler can download files again.** Microsoft
   Graph answers a file's `GET .../content` with a redirect to a
   pre-authenticated URL on a different host rather than the bytes

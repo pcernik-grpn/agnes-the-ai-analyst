@@ -3581,11 +3581,36 @@
     grant.requirement = requirement;
   }
 
+  /* A grant this page did not make, and cannot unmake. Marking a plugin
+     "Required" on /admin/marketplaces writes a grant to EVERY group, and the
+     API then refuses to delete those (409 `cannot_revoke_system_grant`) so
+     nobody punches a hole in a mandatory plugin. The refusal is correct; what
+     reached the admin was not. This function threw `HTTP 409` without reading
+     the body, so the toast read "Could not revoke: HTTP 409" — a dead end with
+     no statement of which surface owns the control. That is the smallest, most
+     literal instance of the complaint in #1956 item 13: you cannot tell where
+     a thing is set.
+
+     Translated here rather than at the call sites: all three of them already
+     print `err.message`, so one honest message serves every path. The wider
+     fix — recording WHICH surface wrote each grant, so the page can say this
+     without a hardcoded case — is stage 1 of
+     docs/superpowers/specs/2026-09-01-access-surface-rethink.md. */
+  const GRANT_REFUSALS = {
+    cannot_revoke_system_grant:
+      "this plugin is marked Required, which grants it to every group. "
+      + "Turn Required off on Admin → Content → Marketplaces first, then revoke it here.",
+  };
+
   async function deleteGrant(grant) {
     const r = await fetch(`${GRANTS_API}/${encodeURIComponent(grant.id)}`, {
       method: "DELETE", credentials: "include",
     });
-    if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok && r.status !== 404) {
+      const body = await r.json().catch(() => ({}));
+      const code = typeof body.detail === "string" ? body.detail : "";
+      throw new Error(GRANT_REFUSALS[code] || code || `HTTP ${r.status}`);
+    }
     overview.grants = overview.grants.filter((g) => g.id !== grant.id);
   }
 
