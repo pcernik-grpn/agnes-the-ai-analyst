@@ -6470,14 +6470,24 @@ function spLoadTree() {
     .catch((e) => {
       spItems = [];
       document.getElementById("spw-tree").innerHTML = "";
+      // A site added by URL, and a saved site scope seeded from
+      // `spSeedManualSitesFromScopes`, are LOCAL state — neither is read
+      // back from Graph — so no listing failure is a reason to hide them.
+      // This rescue used to live inside the `sharepoint_discovery_forbidden`
+      // branch alone, which made it true only for Sites.Selected: a real
+      // instance failing with `sharepoint_cert_unresolved` still drew an
+      // empty Sites list beside a card reading "1 scope" (live run,
+      // 2026-09-01). Only at the sites level — deeper levels list drives
+      // and folders, where a site row would answer a different question
+      // than the breadcrumb asks. The error below still shows either way:
+      // the rows are real AND the rest of the tree is genuinely missing.
+      if (spCurrentLevel() === "sites") {
+        spMergeManualSites();
+        if (spItems.length) spRenderTree("sites");
+      }
       if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
         spTreeErr("No certificate configured yet — " + e.detail.message);
       } else if (e.detail && e.detail.error === "sharepoint_discovery_forbidden") {
-        // Sites.Selected: the listing is forbidden BY DESIGN, but sites
-        // already added by URL are real and stay browsable — render them
-        // and keep the by-URL field as the way forward.
-        spMergeManualSites();
-        if (spItems.length) spRenderTree("sites");
         spTreeErr(e.detail.message);
       } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
         spTreeErr("SharePoint did not answer: " + e.detail.message);
