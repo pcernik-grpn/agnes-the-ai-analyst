@@ -986,6 +986,13 @@
     white-space: nowrap;
   }
   .ax-inherit:hover { color: var(--ds-primary); text-decoration: underline; }
+  /* "Required plugin" — a grant this page reports but does not own. Muted,
+     because it is a statement of fact rather than a control. */
+  .ax-ctl--managed { display: inline-flex; align-items: center; gap: 8px; }
+  .ax-managed {
+    font-size: 12px; font-weight: 600; color: var(--ds-text-muted);
+    white-space: nowrap; cursor: help;
+  }
 
   .ax-add {
     display: flex; align-items: baseline; gap: 8px; width: 100%;
@@ -2940,6 +2947,22 @@
            <button type="button" class="fbar-seg__btn is-active" disabled>{{ words.tier_optional }}</button>
            <button type="button" class="fbar-seg__btn" disabled>{{ words.tier_automatic }}</button>
          </span>`;
+    /* A grant another surface owns. Marking a plugin Required on
+       /admin/marketplaces writes one to EVERY group, and the API then refuses
+       to delete them (409 `cannot_revoke_system_grant`). This page was still
+       drawing Revoke on all of them, and its confirm modal promised "You can
+       grant it again from this page" — a control that could not work, above a
+       sentence that was not true.
+
+       Same shape as the `via Everyone →` case a few lines down: state where it
+       is owned and send the admin there, rather than offer the act here. The
+       tier pair goes too — Optional/Automatic on a mandatory plugin is the
+       same false choice. (#1956 item 13.) */
+    if (o.managedBy) {
+      return `<span class="ax-ctl ax-ctl--managed">
+        <span class="ax-managed" data-tip="${esc(o.managedBy.reason || "")}">${esc(o.managedBy.label)}</span>
+        <a class="ax-inherit" href="${esc(o.managedBy.href)}">${esc(o.managedBy.surface)} →</a></span>`;
+    }
     return `<span class="ax-ctl">${tierPart}
       <button type="button" class="ax-revoke" data-revoke>Revoke</button>
       ${o.href ? `<a class="ax-own__edit" href="${o.href}">where it lives ↗</a>` : ""}</span>`;
@@ -3427,6 +3450,7 @@
               title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`
         : controlCell(t.type_key, tier, {
             href: owned && hrefFn ? hrefFn(i.resource_id) : "",
+            managedBy: grant.managed_by,
           });
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
@@ -4676,7 +4700,7 @@
         <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(titleOf(g))}</span></span>
         <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
-        <span class="ax-r__ctl">${controlCell(r.t.type_key, tier)}</span>
+        <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by })}</span>
         <span class="ax-r__rd">${readsLabelled(r.t.type_key, tier)}</span>
       </div>`;
     };

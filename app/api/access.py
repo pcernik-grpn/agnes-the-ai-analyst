@@ -260,6 +260,41 @@ async def access_overview(
             }
         )
 
+    # ── Grants this page did NOT make and cannot unmake ──────────────────
+    # `assigned_by` answers WHO, which is the half that was already here. It
+    # cannot answer WHERE: marking a plugin Required on /admin/marketplaces
+    # fans a grant out to every group, and each one records the admin who
+    # clicked as its author — so seven machine-written rows read exactly like
+    # seven rows an admin typed on this page, and the Revoke this page offers
+    # on them fails with 409 `cannot_revoke_system_grant`.
+    #
+    # One set lookup answers it for the case that exists today. This is
+    # deliberately NOT a general provenance column (that is stage 1 of
+    # docs/superpowers/specs/2026-09-01-access-surface-rethink.md, and needs a
+    # schema change): it is the one externally-owned grant kind the product
+    # currently has, named where the page can act on it.
+    try:
+        from src.repositories import marketplace_plugins_repo
+
+        _system_plugin_ids = {f"{mid}/{name}" for mid, name in marketplace_plugins_repo().list_system_keys()}
+    except Exception as e:  # a badge must never take the overview down
+        logger.warning("access-overview: could not resolve system plugins: %s", e)
+        _system_plugin_ids = set()
+
+    def _managed_by(resource_type: str, resource_id: str):
+        """The surface that owns this grant, when it is not this page."""
+        if resource_type == ResourceType.MARKETPLACE_PLUGIN.value and resource_id in _system_plugin_ids:
+            return {
+                "label": "Required plugin",
+                "surface": "Marketplaces",
+                "href": "/admin/marketplaces",
+                "reason": (
+                    "This plugin is marked Required, which grants it to every group. "
+                    "Turn Required off on Marketplaces to revoke it."
+                ),
+            }
+        return None
+
     grants = [
         {
             "id": r["id"],
@@ -281,6 +316,10 @@ async def access_overview(
             # made it. The two shapes are resolved client-side against the
             # user list; neither is assumed to be the other.
             "assigned_by": r.get("assigned_by"),
+            # `None` for an ordinary grant — the page renders those exactly as
+            # before. Non-null means: another surface owns this, do not offer a
+            # control here that will fail.
+            "managed_by": _managed_by(r["resource_type"], r["resource_id"]),
         }
         for r in grants_repo.list_all()
     ]

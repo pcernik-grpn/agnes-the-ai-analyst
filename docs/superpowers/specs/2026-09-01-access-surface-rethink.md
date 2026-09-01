@@ -39,23 +39,26 @@ and `/admin/groups/{id}` now 308 here.
 **That consolidation fixed the readers and never touched the writers.** Section 3
 is why that matters.
 
-## 2. The page is organised around the schema, not around tasks
+## 2. The three jobs — and the page does two of them well
 
-by-group, by-resource and by-person are three **pivots over one join**
-(`user_group_members` × `resource_grants`). A pivot answers *"what is currently
-true"*. It structurally cannot answer *"where do I change it"* — which is
-verbatim what the report says is missing.
+This section originally argued the page was "three pivots over one join" that
+could not answer *"where do I change it"*. **That was written from the code and
+it is wrong.** Walking the page on a seeded instance (5 real groups, grants of
+several types, a Required plugin) shows the opposite for two of the three jobs:
 
-Nobody arrives at this page wanting a pivot. They arrive with one of three jobs:
-
-| The job | The question | Where it is served today |
+| The job | The question | How it actually goes |
 |---|---|---|
-| **Grant** | "give the finance team the revenue package" | the workspace lens, if you already know which group |
-| **Audit a person** | "why can Jana see this?", "what will a new hire get?" | the **Simulate** lens — the best thing on the page, behind `?lens=simulate` |
-| **Audit a resource** | "who can reach this table?" | partly the right pane, partly a package's own Share panel |
+| **Grant** | "give Finance the revenue package" | **Works well.** By group → the group → Access → *"Add to this group"* opens a searchable drawer of everything grantable, grouped by family, with type chips. Three clicks and a search. |
+| **Audit a resource** | "who can reach this?" | **Works well.** By resource lists each resource with the groups and people that reach it, and even flags *"Granted to nobody: 1 cloud chat, 6 memory domains. Authored, then never handed to anyone."* |
+| **Audit a person** | "why can Jana see this?" | By person exists; the reach chain behind it is section 4. |
 
-Three verbs, not three tabs of a table. Note that Simulate already answers the
-hardest of the three and is the least discoverable thing on the surface.
+So the tabs are not the problem, and a re-frame around "three verbs" would be
+rebuilding something that already works. Corrected because the original claim
+would have sent the redesign in the wrong direction.
+
+The page also has **three tabs, not two lenses** — By group / By resource / By
+person, exactly as the report describes. The earlier draft said two, from
+reading the `?lens=` parameter rather than opening the page.
 
 ## 3. The actual cause: ten writers, no provenance
 
@@ -79,7 +82,7 @@ The table records `assigned_by` (an actor email) but **not which surface made th
 grant, or why**. A row written by an automated fanout is indistinguishable from
 one an admin created by hand.
 
-### The case that proves it
+### The case that proves it — observed, not inferred
 
 Marking a plugin **Required** on `/admin/marketplaces` loops
 `for group in user_groups_repo().list_all()` and writes a grant to *every group*
@@ -95,10 +98,32 @@ raise HTTPException(status_code=409, detail="cannot_revoke_system_grant")
 affordance for it. (Its `is_system` references are about system *groups* —
 `Admin`, `Everyone` — not system plugins.)
 
-So the admin's experience is: see a grant → try to revoke it → bare failure → no
-statement of which page owns the control. That is *"I cannot confidently answer
-where I set what"*, reproduced exactly, and no amount of re-laying-out the page
-fixes it.
+Walked on a seeded instance. Marking one plugin Required wrote a grant to all
+seven groups. In **By resource**, that plugin then expanded to seven rows, each
+reading:
+
+> `Analysts · 0 people · granted by dev`  ·  [Optional | Automatic]  ·  **Revoke**
+
+Three untruths in one row. `granted by dev` is the *actor* — me, on a different
+page — so seven machine-written rows are indistinguishable from seven an admin
+typed here. The tier pair offers a choice that does not exist on a mandatory
+plugin. And **Revoke** cannot work; its confirm modal even promised *"You can
+grant it again from this page."*
+
+Clicking it produced `Could not revoke: HTTP 409`.
+
+That is *"I cannot confidently answer where I set what"* reproduced exactly —
+and note that **no amount of re-laying-out the page fixes it**, because the page
+was not lying about its layout. It was lying about who owns the grant.
+
+### The sharpened diagnosis
+
+The page's model is sound. Its **truthfulness** is not: it renders every grant as
+though this page created it and this page can remove it. Where that is untrue it
+offers a control that fails and a sentence that is false.
+
+That is a much smaller and more fixable claim than "the mental model needs a
+rethink", and it is what the evidence actually supports.
 
 ## 4. A grant is not the whole answer anyway
 
@@ -120,9 +145,16 @@ behaviour. That is a documentation gap as much as a UI one.
 
 Deliberately bottom-up. Each stage is worth shipping alone.
 
-**0 — Explain the refusal.** Catch `cannot_revoke_system_grant` in the page and
-say which surface owns the control, with a link. Roughly an hour, independent of
-everything below, and it removes the single most infuriating dead end.
+**0 — Stop offering the control, and say who owns it. DONE, in this PR.**
+`/api/admin/access-overview` now returns `managed_by` per grant (non-null only
+where another surface owns it — today, a Required plugin). Those rows render
+`Required plugin · Marketplaces →` in place of the tier pair and Revoke, the
+same shape the existing `via Everyone →` case already uses. The 409 is still
+translated as a backstop for any path that reaches it.
+
+This is deliberately not a schema change: `is_system` is already derivable from
+`marketplace_plugins`, so the one externally-owned grant kind that exists today
+can be named without one.
 
 **1 — Fix the writers.** One chokepoint every grant creation goes through, plus a
 provenance column recording the surface and the reason. Invisible, unglamorous,
@@ -130,20 +162,19 @@ and it is what makes any UI built on top of this truthful. Under the A3 ratchet
 this is a Postgres-only column with clean DuckDB degradation
 (`RequiresPostgresBackend` → 501), not a new DuckDB migration step.
 
-**2 — Re-frame the page around the three verbs** of section 2. Simulate stops
-being a secondary lens and becomes a front door. This is the "rethink", and it is
-cheap *after* stage 1 because the page can finally say where each grant came
-from.
+**2 — Show provenance wherever a grant is listed**, once stage 1 exists: replace
+`granted by <actor>` with the surface and the rule. Explicitly **not** a re-frame
+of the tabs — section 2 retracts that. The tabs work; what they print does not.
 
 **3 — Write the reach chain down once**, as reference documentation, and link it
 from the page.
 
 ### What not to do
 
-**Do not start with the visual.** It reads as progress, it is the thing this
-surface already did once, and it leaves the reported question exactly as
-unanswerable as it is today. The four-editors consolidation was good work that
-did not stop the drift, because the drift comes from the writers.
+**Do not start with the visual, and do not re-frame the tabs.** Both read as
+progress. The four-editors consolidation was good work that did not stop the
+drift, because the drift comes from the writers — and the tabs, tested on a
+seeded instance, do their jobs. What fails is what the rows *say*.
 
 ## 6. Open questions
 
