@@ -53,8 +53,9 @@ tool → text), `table`, `fail`, `approval`, `error`, `markdown`. Full reference
 compose profile, knobs and fidelity limits:
 [`docs/kai-agent-local-dev.md`](../../../docs/kai-agent-local-dev.md).
 
-Note `title` stays `NULL` in local dev either way — auto-title calls Haiku
-directly and skips silently without `ANTHROPIC_API_KEY`. That is expected.
+Note that without `ANTHROPIC_API_KEY` the session title is a cut of your own
+first message — auto-title's model call is skipped and its deterministic
+fallback runs (TCRD-290). That is expected; a model-written title needs a key.
 
 ## Enable the onboarding rail panel
 

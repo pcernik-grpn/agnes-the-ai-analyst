@@ -2619,11 +2619,14 @@ class ChatManager:
                 self._record_turn_usage(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
-                # Auto-title: the first assistant_message in a session
-                # is the trigger to ask Haiku for a short title. We
-                # check the per-session flag (not just the persisted
-                # title) so two rapid-fire assistant frames during
-                # crash-respawn replay don't both fire the call.
+                # Auto-title backstop: the primary trigger is the first
+                # user message (``_deliver_local_user_message``); the first
+                # assistant_message re-arms it for a session whose title
+                # task never landed (a restart cancelled it mid-flight, or
+                # the user row was not yet visible when it ran). We check
+                # the per-session flag (not just the persisted title) so two
+                # rapid-fire assistant frames during crash-respawn replay
+                # don't both fire the call.
                 if not live.auto_title_started:
                     self._maybe_start_auto_title(live)
             elif ftype == "done":
@@ -2895,6 +2898,19 @@ class ChatManager:
         live.state = SessionState.ACTIVE
         # Track C7: a fresh turn gets its own one-delegation budget.
         live.delegated_this_turn = False
+        # Auto-title: the FIRST user message is the trigger (TCRD-290). Every
+        # path that delivers one funnels through here with the row already
+        # persisted — send_user_message and produce_inbound_user_message both
+        # append before delivering, the post-restart replay re-sends a row
+        # that already exists — so the title lands while the answer is still
+        # streaming, and a session whose turn is then refused, capped or lost
+        # to a restart is titled all the same. Never lets a scheduling error
+        # fail the send: the title is cosmetic, the message is not.
+        if not live.auto_title_started:
+            try:
+                self._maybe_start_auto_title(live)
+            except Exception:
+                logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
 
     async def deliver_approval_decision(
         self,
@@ -4163,13 +4179,15 @@ class ChatManager:
     def _maybe_start_auto_title(self, live: LiveSession) -> None:
         """Schedule a Haiku call to generate a session title if it
         doesn't have one yet. Idempotent per live session — sets
-        ``auto_title_started`` before returning so a second
-        ``assistant_message`` for the same session is a no-op.
+        ``auto_title_started`` before returning so the second trigger
+        (the first ``assistant_message``, after the first user message
+        already fired it) is a no-op.
 
         Best-effort: any failure is swallowed inside the task so the
         chat session never breaks because Haiku is down or
-        ``ANTHROPIC_API_KEY`` is missing. The task itself is appended
-        to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
+        ``ANTHROPIC_API_KEY`` is missing — the task falls back to a title
+        cut from the user's own message instead. The task itself is
+        appended to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
         """
         session = self._repo.get_session(live.chat_id)
         if session is None or session.title:
@@ -4183,30 +4201,46 @@ class ChatManager:
         live.tasks.append(task)
 
     async def _run_auto_title(self, live: LiveSession) -> None:
-        """Task body: fetch the first user message, call Haiku, persist
-        the title, broadcast a ``session_renamed`` frame.
+        """Task body: fetch the first user message, ask the model for a
+        title — falling back to a cut of the message itself when the model
+        path yields nothing — persist it, broadcast a ``session_renamed``
+        frame.
 
         All errors are caught and logged — title generation is a
         cosmetic enhancement, not a load-bearing piece of the chat
-        pipeline."""
-        from app.chat.auto_title import generate_title
+        pipeline. But "cosmetic" is not "optional": a session that has a
+        message always ends up with SOME title (TCRD-290)."""
+        from app.chat.auto_title import fallback_title, generate_title
 
         try:
             first_user = self._repo.get_first_user_message(live.chat_id)
             if not first_user:
-                # The runner emitted an assistant_message before any
-                # user_msg was persisted — shouldn't happen in normal
-                # flow, but bail cleanly if it does.
+                # Fired before any user_msg row was visible (shouldn't
+                # happen — every trigger path persists first). Re-arm so
+                # the next trigger for this session tries again instead of
+                # leaving it untitled for the rest of its live span.
+                live.auto_title_started = False
                 return
-            title = await generate_title(
-                first_user,
-                llm_auth=self._config.llm_auth,
-                llm_provider=getattr(self._config, "llm_provider", "anthropic"),
-                vertex=(
-                    getattr(self._config, "vertex_project_id", ""),
-                    getattr(self._config, "vertex_region", ""),
-                ),
-            )
+            title: Optional[str] = None
+            try:
+                title = await generate_title(
+                    first_user,
+                    llm_auth=self._config.llm_auth,
+                    llm_provider=getattr(self._config, "llm_provider", "anthropic"),
+                    vertex=(
+                        getattr(self._config, "vertex_project_id", ""),
+                        getattr(self._config, "vertex_region", ""),
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "auto-title model call crashed for %s; falling back to the first message",
+                    live.chat_id,
+                )
+            if not title:
+                title = fallback_title(first_user)
+                if title:
+                    logger.info("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
             if not title:
                 return
             self._repo.set_title(live.chat_id, title)
