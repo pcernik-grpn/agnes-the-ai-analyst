@@ -500,14 +500,12 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
         )
 
 
-# --- extraction.* admin-editable producer config (T3) -----------------------
+# --- extraction.* admin-editable config ------------------------------------
 #
-# Two leaves — `producer.command`, `producer.module` — carry a deploy-time
-# env override rendered by the Terraform customer-instance module
-# (`AGNES_EXTRACTION_PRODUCER_COMMAND` / `AGNES_EXTRACTION_PRODUCER_MODULE`
-# — see app/worker/kinds.py::_extraction_producer_argv). Every reader
-# already resolves env-first, so a web save under an active pin would be
-# accepted and then silently never read — worse than refusing outright.
+# The connector's on/off state lives on the `sharepoint` switch; the external
+# producer's keys were removed with external mode. No extraction leaf carries
+# a deploy-time env lock any more — the tuple below stays as the (empty)
+# mechanism so a future locked leaf slots back in.
 # `_path` is relative to the `extraction` section's OWN patch dict (i.e.
 # excludes the leading "extraction" segment), matching how
 # `_validate_extraction_section` and `_known_fields_resolved` both walk it.
@@ -517,15 +515,11 @@ def _validate_materialize_section(sections: Dict[str, Dict[str, Any]]) -> None:
 # (`app/switches.py`, section `sharepoint`, not `extraction`) — see
 # `docs/superpowers/specs/` for the flag-consolidation note. `extraction`
 # itself carries no switch of its own; it stays a `_STATIC_EDITABLE_SECTIONS`
-# entry purely for its remaining producer/schedule/timeout_s config.
-_EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("producer", "command"), "AGNES_EXTRACTION_PRODUCER_COMMAND"),
-    (("producer", "module"), "AGNES_EXTRACTION_PRODUCER_MODULE"),
-)
+# entry purely for its remaining schedule/timeout_s/crawler/anonymization config.
+_EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
-_EXTRACTION_ENV_PASSTHROUGH_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -579,29 +573,6 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 },
             )
 
-    producer = patch.get("producer")
-    if isinstance(producer, dict):
-        for key in ("command", "module"):
-            val = producer.get(key)
-            if val is not None and not isinstance(val, str):
-                raise HTTPException(status_code=422, detail=f"extraction.producer.{key} must be a string")
-        passthrough = producer.get("env_passthrough")
-        if passthrough is not None:
-            if not isinstance(passthrough, list) or not all(isinstance(v, str) for v in passthrough):
-                raise HTTPException(
-                    status_code=422,
-                    detail="extraction.producer.env_passthrough must be a list of strings",
-                )
-            bad = [v for v in passthrough if not _EXTRACTION_ENV_PASSTHROUGH_NAME_RE.match(v)]
-            if bad:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "extraction.producer.env_passthrough entries must be valid env var "
-                        f"NAMES matching ^[A-Z][A-Z0-9_]*$, got: {bad!r}"
-                    ),
-                )
-
     schedule = patch.get("schedule")
     if schedule is not None:
         if not isinstance(schedule, str):
@@ -646,17 +617,6 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):
         return
-
-    command_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_COMMAND")
-    module_env = os.environ.get("AGNES_EXTRACTION_PRODUCER_MODULE")
-    if command_env is not None or module_env is not None:
-        producer = extraction.get("producer")
-        producer = dict(producer) if isinstance(producer, dict) else {}
-        if command_env is not None:
-            producer["command"] = command_env
-        if module_env is not None:
-            producer["module"] = module_env
-        extraction["producer"] = producer
 
 
 def _apply_extraction_env_locks(fields: Dict[str, Any]) -> None:
@@ -779,7 +739,7 @@ _SECTION_BASELINE_EFFECT: dict[str, str] = {
     "facts": "live",  # both switches (enabled/visibility_mode) are read per-call — feature_enabled()/switch_value(), no cached object
     "sharepoint": "live",  # matches its switch — no other known key under this section
     "acl_sync": "live",  # matches both switches under it (guarantee_mode/max_stale_hours)
-    "extraction": "live",  # every leaf is read per call: app/worker/kinds.py's _extraction_producer_argv/_extraction_producer_env_passthrough/_extraction_timeout_seconds (producer.*/timeout_s), app/api/admin_sharepoint.py's _extraction_schedule_config (schedule) — none are cached at boot; the connector's own on/off state lives on the separate `sharepoint` section above
+    "extraction": "live",  # schedule/timeout_s (and the crawler/anonymization keys) are read per call; the on/off state lives on the `sharepoint` switch
     # --- restart: something under the section is built once at boot and
     # never rebuilt from a later save.
     "chat": "restart",  # app.state.chat_config is built once in create_app() (matches both switches under it)
@@ -1065,55 +1025,6 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         },
     },
     "extraction": {
-        "producer": {
-            "kind": "object",
-            "hint": (
-                "How to invoke the operator-supplied extraction producer (Agnes does not "
-                "ship one — see docs/DEPLOYMENT.md#multi-process). command wins over module "
-                "when both are set."
-            ),
-            "fields": {
-                "command": {
-                    "kind": "string",
-                    "default": "",
-                    "hint": (
-                        "Full command line for the producer entrypoint, e.g. "
-                        "'python -m your_producer.run'. This command is executed by the "
-                        "extraction worker process on the server. A Terraform-rendered "
-                        "deployment sets this via AGNES_EXTRACTION_PRODUCER_COMMAND, which "
-                        "always wins over this value — the field renders read-only when "
-                        "that env var is present."
-                    ),
-                },
-                "module": {
-                    "kind": "string",
-                    "default": "",
-                    "hint": (
-                        "python -m <module> shorthand for a producer the worker image "
-                        "installed as a package (EXTRACTION_PRODUCER_INSTALL build-arg). "
-                        "Ignored when command is set. A Terraform-rendered deployment sets "
-                        "this via AGNES_EXTRACTION_PRODUCER_MODULE, which always wins over "
-                        "this value — the field renders read-only when that env var is "
-                        "present."
-                    ),
-                },
-                "env_passthrough": {
-                    "kind": "array",
-                    "item_kind": "string",
-                    "default": [],
-                    "hint": (
-                        "Extra env var NAMES (e.g. HTTP_PROXY_EXTRA) to forward to the "
-                        "producer subprocess from this process's own environment, beyond "
-                        "the curated non-secret allowlist (PATH/locale/timezone/tempdir/TLS/"
-                        "proxy vars). Each entry must be a valid env var name "
-                        "(^[A-Z][A-Z0-9_]*$) — not a way back to forwarding the whole "
-                        "environment, and never a place for a secret name: the producer "
-                        "still never receives this instance's credentials just because a "
-                        "name happens to be listed here."
-                    ),
-                },
-            },
-        },
         "schedule": {
             "kind": "string",
             "default": "",
@@ -1131,10 +1042,55 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "kind": "int",
             "default": 3600,
             "hint": (
-                "Hard ceiling on one producer run, in seconds — the subprocess is killed at "
-                "this timeout and the job fails (no automatic retry). Must be between 60 and "
-                "86400 (24h)."
+                "Hard ceiling on one built-in crawl run, in seconds — at expiry the crawl "
+                "stops between files/pages, persists its state and the job fails; the next "
+                "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
+                "between 60 and 86400 (24h)."
             ),
+        },
+        "facts": {
+            "kind": "object",
+            "hint": (
+                "The LLM stage of the extraction pipeline — turn ingested documents into "
+                "knowledge-graph facts (connectors/sharepoint/facts_extraction.py). Runs "
+                "after a successful crawl, over the documents that crawl just indexed."
+            ),
+            "fields": {
+                "enabled": {
+                    "kind": "bool",
+                    "default": _flag_default_path(("extraction", "facts", "enabled"), False),
+                    "hint": (
+                        "OFF by default, and this is a COST decision: this is the only stage "
+                        "that spends model tokens per document — measured $0.011 for a typical "
+                        "~5k-token document on the default Haiku-class model, $0.020 when the "
+                        "corrective verbatim retry fires, roughly 3x that on Sonnet. Needs "
+                        "facts.enabled too: with the fact-graph surface off the pass is skipped "
+                        "rather than writing claims no endpoint would serve. Spreadsheets and "
+                        "CSVs are never sent to the model, and a re-run re-extracts only "
+                        "documents whose content, model, or effective prompt changed."
+                    ),
+                },
+                "concurrency": {
+                    "kind": "int",
+                    "default": 3,
+                    "hint": (
+                        "How many documents are extracted in parallel; clamped to [1, 16]. "
+                        "1 is exactly sequential — the knob buys wall clock, never a different "
+                        "result. Raise it to spend a large corpus's time budget on more "
+                        "concurrent calls; lower it when the model account's rate limit is the "
+                        "binding constraint."
+                    ),
+                },
+                "model": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Optional model override for this stage only — a tier name "
+                        "(haiku/sonnet/opus) or a concrete model id. Empty falls back to "
+                        "extraction.model, then Haiku."
+                    ),
+                },
+            },
         },
     },
     "features": {

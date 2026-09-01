@@ -109,14 +109,57 @@ def write_document(
     raise ValueError(f"unknown format: {fmt}")
 
 
+#: Fixed timestamp for everything an Office container would otherwise stamp
+#: with the wall clock — zip member mtimes and docProps dates. The same
+#: rationale as the PDF writer's epoch pin below: `doc_id` is a sha256 over
+#: the file's BYTES, so a wall-clock byte anywhere makes two same-seed runs
+#: disagree about every planted document's identity. 1980-01-01 because the
+#: zip format cannot represent anything earlier.
+_FIXED_ZIP_DATE = (1980, 1, 1, 0, 0, 0)
+
+
+def _normalize_office_zip(path: Path) -> None:
+    """Rewrite an Office container (a zip) deterministically: members in
+    sorted name order, every mtime pinned to :data:`_FIXED_ZIP_DATE`, and
+    the docProps timestamps pinned too — openpyxl re-stamps
+    ``dcterms:modified`` at save time no matter what the properties object
+    says, so pinning before save is not enough for every library."""
+    import io  # noqa: PLC0415
+    import re  # noqa: PLC0415
+    import zipfile  # noqa: PLC0415
+
+    with zipfile.ZipFile(path, "r") as src:
+        members = {info.filename: src.read(info.filename) for info in src.infolist()}
+    core = members.get("docProps/core.xml")
+    if core is not None:
+        members["docProps/core.xml"] = re.sub(
+            rb"(<dcterms:(?:created|modified)[^>]*>)[^<]*(</dcterms:(?:created|modified)>)",
+            rb"\g<1>1980-01-01T00:00:00Z\g<2>",
+            core,
+        )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+        for name in sorted(members):
+            info = zipfile.ZipInfo(name, date_time=_FIXED_ZIP_DATE)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            dst.writestr(info, members[name])
+    path.write_bytes(buf.getvalue())
+
+
 def _write_docx(path: Path, title: str, paragraphs: list[str]) -> None:
+    import datetime  # noqa: PLC0415
+
     import docx  # noqa: PLC0415
 
     doc = docx.Document()
     doc.add_heading(title, level=1)
     for p in paragraphs:
         doc.add_paragraph(p)
+    fixed = datetime.datetime(1980, 1, 1, tzinfo=datetime.timezone.utc)
+    doc.core_properties.created = fixed
+    doc.core_properties.modified = fixed
     doc.save(str(path))
+    _normalize_office_zip(path)
 
 
 def _write_pptx(path: Path, title: str, paragraphs: list[str]) -> None:
@@ -138,7 +181,13 @@ def _write_pptx(path: Path, title: str, paragraphs: list[str]) -> None:
         body.paragraphs[0].font.size = Pt(18)
     # Silence unused-import lints for Inches (kept for future slide sizing).
     _ = Inches
+    import datetime  # noqa: PLC0415
+
+    fixed = datetime.datetime(1980, 1, 1, tzinfo=datetime.timezone.utc)
+    prs.core_properties.created = fixed
+    prs.core_properties.modified = fixed
     prs.save(str(path))
+    _normalize_office_zip(path)
 
 
 def _write_xlsx(path: Path, title: str, paragraphs: list[str]) -> None:
@@ -153,7 +202,13 @@ def _write_xlsx(path: Path, title: str, paragraphs: list[str]) -> None:
     for i, p in enumerate(paragraphs):
         ws.cell(row=i + 3, column=1, value=i + 1)
         ws.cell(row=i + 3, column=2, value=p)
+    import datetime  # noqa: PLC0415
+
+    fixed = datetime.datetime(1980, 1, 1)
+    wb.properties.created = fixed
+    wb.properties.modified = fixed
     wb.save(str(path))
+    _normalize_office_zip(path)
 
 
 def write_scan_pdf(path: Path, planted_text: str, extra_lines: list[str] | None = None) -> None:

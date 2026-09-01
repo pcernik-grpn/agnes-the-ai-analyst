@@ -217,6 +217,12 @@ _DELETE_200_WITH_BODY_ALLOWLIST = frozenset(
         # fact only this write can report, not a follow-up read.
         # response_model=ScopeRemovalOut.
         "/api/admin/sharepoint/connections/{connection_id}/scopes",
+        # Graph subscription teardown is PARTIAL by nature: one subscription's
+        # DELETE can fail (Graph 5xx, a revoked permission) while the rest
+        # succeed, and a failed one's record is deliberately kept so a later
+        # call retries. An admin has to see WHICH, and a bodyless 204 cannot
+        # say. response_model=SubscriptionTeardownResult.
+        "/api/admin/sharepoint/connections/{connection_id}/subscriptions",
     }
 )
 

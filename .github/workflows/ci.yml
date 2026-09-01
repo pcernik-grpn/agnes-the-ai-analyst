@@ -73,7 +73,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server]"
+        run: uv pip install --system ".[dev,server,extraction]"
 
       - name: Run tests (shard ${{ matrix.group }}/8)
         # pytest-split shards the suite across 8 parallel jobs, balanced by
@@ -127,7 +127,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv pip install --system ".[dev,server]"
+        run: uv pip install --system ".[dev,server,extraction]"
 
       - name: Run Postgres contract tests (shard ${{ matrix.group }}/4)
         run: pytest tests/db_pg/ -v --tb=short -n auto --splits 4 --group ${{ matrix.group }}

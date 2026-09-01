@@ -354,6 +354,31 @@ class SystemSecretsRepository:
             hint="Treating as unset.",
         )
 
+    def insert_if_absent(self, name: str, value: str) -> bool:
+        """Store ``value`` under ``name`` ONLY if no row exists yet.
+
+        Returns ``True`` when this call created the row, ``False`` when one
+        was already there (whose value is left untouched). The write-once
+        sibling of :meth:`upsert`, for a secret that must never be silently
+        replaced — today ``src/anonymization_key.py``'s per-instance HMAC
+        key, where a second key orphans every pseudonym written under the
+        first.
+
+        Atomic in one statement (``ON CONFLICT … DO NOTHING RETURNING``), so
+        two processes racing to provision the same secret converge on one
+        stored value instead of clobbering each other. A read-then-write
+        emulation in the caller could not offer that.
+        """
+        token = encrypt_secret(value)
+        row = self.conn.execute(
+            """INSERT INTO system_secrets (name, secret_value_enc, updated_at)
+               VALUES (?, ?, current_timestamp)
+               ON CONFLICT (name) DO NOTHING
+               RETURNING name""",
+            [name, token],
+        ).fetchone()
+        return row is not None
+
     def delete(self, name: str) -> None:
         self.conn.execute("DELETE FROM system_secrets WHERE name = ?", [name])
 

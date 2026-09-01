@@ -789,3 +789,111 @@ async def list_group_transitive_members(access_token: str, group_id: str) -> Lis
         params={"$select": "id,mail,userPrincipalName", "$top": "999"},
     )
     return [r for r in rows if r.get("@odata.type") == "#microsoft.graph.user"]
+
+
+# ---------------------------------------------------------------------------
+# Change-notification subscriptions (Graph `/subscriptions`)
+#
+# The three write verbs `connectors/sharepoint/subscriptions.py` needs to own
+# a drive subscription's lifecycle inside Agnes. They live HERE, not in that
+# module, for the same reason every other Graph call does: one HTTP seam
+# (`_http_client`, monkeypatched by every test in this repo), one error type
+# (`SharePointGraphError`, carrying the upstream status so a caller can
+# classify 404-already-gone from a real outage), one place a future retry /
+# throttle policy has to land.
+#
+# Deliberately thin: no body construction, no expiry math, no state. What a
+# drive subscription's body must SAY is the lifecycle module's business (it
+# owns the receiver URL, the clientState secret and the renewal window);
+# what a Graph write LOOKS like is this module's.
+# ---------------------------------------------------------------------------
+
+#: Graph validates `notificationUrl` SYNCHRONOUSLY inside `POST
+#: /subscriptions` — it calls the receiver's handshake and waits for the echo
+#: before answering — so a create can legitimately take much longer than an
+#: ordinary read. Graph gives the receiver 10s; this is that plus headroom
+#: for two round trips, rather than the read timeout, which a slow-but-healthy
+#: handshake would trip.
+_SUBSCRIPTION_TIMEOUT_S = 40.0
+
+
+async def _graph_write(
+    access_token: str,
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    ok_statuses: Tuple[int, ...],
+    timeout: float = _GRAPH_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """One mutating Graph call. Returns the parsed JSON body (``{}`` for a
+    bodyless success such as ``204``); raises :class:`SharePointGraphError`
+    with ``status_code`` set on anything outside ``ok_statuses``.
+
+    A transport failure (connect error, timeout) is normalized to the same
+    error type with ``status_code=None`` — callers classify on the status,
+    and "no status" already means "never reached Graph"."""
+    try:
+        async with _http_client() as client:
+            resp = await client.request(
+                method,
+                f"{GRAPH_BASE}{path}",
+                json=json_body,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=timeout,
+            )
+    except httpx.HTTPError as exc:
+        # Never interpolate the exception's repr — httpx puts the full request
+        # URL in it, which for these calls is only ever a Graph path, but the
+        # message shape stays uniform with the non-200 branch below.
+        raise SharePointGraphError(f"Graph {method} {path} failed: {type(exc).__name__}") from exc
+    if resp.status_code not in ok_statuses:
+        logger.warning("sharepoint graph %s %s failed: HTTP %s %s", method, path, resp.status_code, resp.text[:500])
+        raise SharePointGraphError(
+            f"Graph {method} {path} failed: HTTP {resp.status_code}", status_code=resp.status_code
+        )
+    if not resp.content:
+        return {}
+    try:
+        body: Dict[str, Any] = resp.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+async def create_subscription(access_token: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """``POST /subscriptions`` — returns the created subscription object
+    (``id``, ``expirationDateTime``, ...).
+
+    Graph answers ``201`` only AFTER it has called ``body["notificationUrl"]``
+    with a ``validationToken`` and received the echo, so a failure here can
+    equally mean "the receiver is unreachable/disabled" as "the credential
+    lacks the subscription permission" — the caller reports the status
+    rather than guessing between them."""
+    return await _graph_write(
+        access_token, "POST", "/subscriptions", json_body=body, ok_statuses=(201,), timeout=_SUBSCRIPTION_TIMEOUT_S
+    )
+
+
+async def renew_subscription(access_token: str, subscription_id: str, expiration_iso: str) -> Dict[str, Any]:
+    """``PATCH /subscriptions/{id}`` with a new ``expirationDateTime`` —
+    the renewal verb. Returns the updated subscription object.
+
+    Sends ONLY the expiry: ``notificationUrl``/``resource``/``clientState``
+    are immutable properties of the subscription that was created, and
+    re-sending them is how a renewal accidentally becomes a re-validation."""
+    return await _graph_write(
+        access_token,
+        "PATCH",
+        f"/subscriptions/{subscription_id}",
+        json_body={"expirationDateTime": expiration_iso},
+        ok_statuses=(200,),
+    )
+
+
+async def delete_subscription(access_token: str, subscription_id: str) -> None:
+    """``DELETE /subscriptions/{id}``. A ``404`` propagates as a
+    :class:`SharePointGraphError` with ``status_code=404`` rather than being
+    swallowed here — "already gone" is a decision the lifecycle module makes
+    (it treats it as success), not a fact this transport should assume."""
+    await _graph_write(access_token, "DELETE", f"/subscriptions/{subscription_id}", ok_statuses=(204, 200))

@@ -995,10 +995,10 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 #      entire switch — no --profile plumbing through the startup/upgrade/
 #      applier scripts, all of which disagree about profile handling.
 #      docker-compose.prod.yml pins the service to the plain app image
-#      (source-less VMs can't `build:`), which silently bypasses the
-#      Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg — the re-pin to
+#      (source-less VMs can't `build:`), which is built without the
+#      `extraction` optional extra — the re-pin to
 #      $${AGNES_EXTRACTION_WORKER_IMAGE} (below, via .env) is what actually
-#      puts a producer on the lane's PATH.
+#      puts a document converter on the lane.
 #
 # The coordination declaration rides .env (AGNES_COORDINATION_BACKEND +
 # AGNES_REDIS_URL, written into the .env heredoc below) and NOT

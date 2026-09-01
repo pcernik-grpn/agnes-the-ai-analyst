@@ -168,8 +168,7 @@ def test_error_badges_from_the_last_run_report_are_categorized(tmp_path, monkeyp
     # same 3 queue items (1 rejected quote + 1 protocol error + 1 deferred)
     # — a dropped source_url is deliberately NOT in that count (the claim
     # itself still wrote, nothing is queued for retry over it).
-    assert fs["cost_estimate"]["placeholder"] is True
-    assert fs["cost_estimate"]["amount_usd"] > 0
+    assert fs["queue"]["items"] > 0
 
 
 def test_meaningfulness_floor_rejection_joins_the_rejected_quotes_badge(tmp_path, monkeypatch, pg_engine):

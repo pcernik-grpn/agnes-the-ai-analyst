@@ -1245,27 +1245,33 @@ sharepoint:
 # §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
 # collections-design.md).
 #
-# Agnes does NOT ship the producer (crawl/convert/anonymize/extract) — this
-# block only configures HOW to invoke whatever producer command the
-# deployment provides. The producer is a separate project of your own, adopted
-# per spec §7.1; it is never vendored into this repo. A plain `docker
-# compose up` (no `--target worker` build, no EXTRACTION_PRODUCER_INSTALL
-# build-arg) has nothing to invoke here — `corpus-extraction` fails clean
-# with a config error rather than a crash until a producer is configured.
+# The pipeline is BUILT IN (owner decision 2026-08-31 — one pipeline, no
+# dual modes): connectors/sharepoint/crawler.py crawls, converts and (where
+# a scope asks for it) anonymizes in-process, then ingests through the same
+# internal path a wizard upload takes. The former external-producer mode —
+# `extraction.producer.command`/`.module`/`.mode`/`.env_passthrough`, the
+# subprocess, its curated child env and its Admin-grade callback token — was
+# REMOVED with that decision; those keys are no longer read and an instance
+# that still sets them is simply ignoring dead config.
+#
+# The converter backends ship as an optional dependency extra: install
+# `agnes[extraction]` on whichever process runs the extraction lane, or
+# every document of a run fails with a typed "not installed" error. The
+# admin trigger refuses up front with `409 extraction_dependencies_missing`
+# rather than queueing a job that could not convert anything.
+#
+# SECURITY: credentials are NEVER configured here. The SharePoint tenant/
+# client id + certificate are resolved from the connection's own vault slot,
+# or the server's SHAREPOINT_CERT_PRIVATE_KEY env var — the SAME resolution
+# connectors/sharepoint/settings.py already does for the SharePoint admin
+# UI. Nothing is passed on a command line, because there is no command line.
 #
 # This block carries no switch of its own — the connector's on/off state
 # lives on `sharepoint.enabled` above. Its leaves ARE editable from
-# /admin/server-config (`producer.command`/`.module`/`.env_passthrough`,
-# `schedule`, `timeout_s`), reversing this section's original
-# deploy-time-only stance. `producer.command` and `producer.module` each
-# still honor their own deploy-time env var
-# (AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)
-# AHEAD of a value set here or via the panel — a Terraform-provisioned
-# instance shows those two leaves read-only in the panel ("set by
-# deployment (Terraform)") and a save touching one 409s
-# (`field_locked_by_deployment`) instead of persisting a value the running
-# process would never read. `schedule`/`timeout_s`/`env_passthrough` carry
-# no such override and are always plain writable instance data.
+# /admin/server-config (`schedule`, `timeout_s`), and none carries a
+# deploy-time env override anymore: the AGNES_EXTRACTION_PRODUCER_* locks
+# were removed together with the external producer mode (the built-in
+# in-process pipeline is the only pipeline).
 #
 # Flipping `sharepoint.enabled` above is NOT, by itself, enough to run the
 # extraction-worker compose service. That service sets AGNES_ROLE=worker
@@ -1278,10 +1284,8 @@ sharepoint:
 # boot the worker container.
 extraction:
   # How many `corpus-extraction` jobs the extraction lane runs at once
-  # (Stage 1 of Agnes-owned extraction parallelism — before this, the ONLY
-  # parallelism was inside the external producer's own `--workers` flag;
-  # this made multiple SharePoint CONNECTIONS extract strictly one-at-a-
-  # time). Different connections only — the per-connection idempotency key
+  # (Stage 1 of Agnes-owned extraction parallelism). Different connections
+  # only — the per-connection idempotency key
   # (app/api/admin_sharepoint.py::_extraction_idempotency_key) still
   # prevents two jobs for the SAME connection from ever coexisting,
   # unaffected by this setting. AGNES_EXTRACTION_CONCURRENCY (env) overrides
@@ -1291,132 +1295,234 @@ extraction:
   # out-of-[1, 8]-range values are clamped/defaulted with a logged warning,
   # never a crash.
   #
-  # SIZING: each slot is a FULL producer subprocess — its own crawl workers
-  # plus an LLM pass — not a lightweight thread. The `extraction-worker`
-  # compose service's default 4g/2cpu (AGNES_EXTRACTION_WORKER_MEM_LIMIT/
-  # _CPUS in docker-compose.yml) assumes exactly ONE concurrent producer
-  # run; raising `concurrency` without raising those two env vars in lock
-  # step risks OOM/CPU starvation under N concurrent producers.
+  # SIZING: each slot is a FULL in-process crawl — its own file pipeline
+  # (`crawler.concurrency` below) plus any LLM stages — and the two knobs
+  # MULTIPLY against the same tenant and the same container budget: two
+  # concurrent crawls at `crawler.concurrency: 6` is twelve files in
+  # flight. The `extraction-worker` compose service's default 4g/2cpu
+  # (AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS in docker-compose.yml)
+  # assumes ONE concurrent run.
   concurrency: 1
-  producer:
-    # Full command line for the producer entrypoint, e.g.:
-    #   command: "python -m your_producer.run"
-    # OR, when the worker image installed it as a package (see the
-    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
-    #   module: your_producer.run
-    # `command` wins when both are set. Either form MAY be a YAML list
-    # instead of a string, taken verbatim (no shell-splitting needed then).
-    #
-    # Both also have an env override — AGNES_EXTRACTION_PRODUCER_COMMAND /
-    # AGNES_EXTRACTION_PRODUCER_MODULE — which wins over the yaml value here,
-    # same env-overrides-instance.yaml posture as `sharepoint.enabled` above.
-    # This is what lets a deploy-time mechanism (e.g. a Terraform module rendering
-    # /opt/agnes/.env) activate the producer without an applier-owned edit
-    # of this file on the VM's data disk. Unlike the yaml key, the env
-    # override for `command` is ALWAYS a plain string split with
-    # `shlex.split` — a YAML/JSON list is not supported via env.
-    command: ""
-    module: ""
-    # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
-    # from this process's own environment, beyond the curated non-secret
-    # allowlist below (PATH/locale/timezone/tempdir/TLS/proxy vars). Empty
-    # by default. Only the NAMES listed here are copied — this is not a way
-    # back to forwarding the whole environment.
-    env_passthrough: []
   # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
   # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
   # driving a scheduler row (`extraction-run-due`, see
   # services/scheduler/__main__.py) that fires `POST /api/admin/sharepoint/
   # extraction/run-due`. That sweep applies this SAME cadence independently
   # to each SharePoint connection's own last-run stamp, enqueueing the
-  # existing `corpus-extraction` job kind for whichever connections are due
-  # — not a per-connection schedule, one clock applied to every connection.
+  # `corpus-extraction` job for whichever connections are due — not a
+  # per-connection schedule, one clock applied to every connection.
   # Empty (the default) disables the sweep entirely — no scheduler row is
   # registered — same "off unless explicitly turned on" posture as
   # `sharepoint.enabled` above. An admin can still trigger a one-off run at
   # any time via `POST /api/admin/sharepoint/connections/{id}/extract`
   # regardless of this setting (subject to the same
-  # sharepoint.enabled/producer-configured gate).
+  # sharepoint.enabled + installed-dependencies gate).
   # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
   schedule: ""
-  # Hard ceiling on one producer run, in seconds — the subprocess is killed
-  # at this timeout and the job fails (no automatic retry: a failed
-  # producer run usually needs an operator to look at it).
+  # Wall-clock bound on ONE extraction run, in seconds. This is the only
+  # stop mechanism there is — there is no cancel button and (since the
+  # external producer was removed) no subprocess to kill — so it is
+  # enforced inside the crawl: the deadline is checked between files and
+  # between delta pages, and on expiry the run persists its state, reports
+  # `interrupted_reason: "timeout"` and fails the job. Nothing is lost: the
+  # next run resumes from the persisted deltaLinks and cTags. (An exhausted
+  # 429 budget stops a run the same way, as `"throttled"`.) The job's own
+  # lease is derived from this value plus a margin. 0 = unbounded (a
+  # deliberate choice for an operator who would rather a first full crawl
+  # of a large estate finish than restart).
   timeout_s: 3600
-  # SECURITY: credentials are NEVER configured here. The producer's
-  # SharePoint tenant/client id + certificate are resolved from the
-  # connection's own vault slot, or the server's SHAREPOINT_CERT_PRIVATE_KEY
-  # env var — the SAME resolution connectors/sharepoint/settings.py already
-  # does for the SharePoint admin UI. They reach the producer ONLY via its
-  # child process environment (AGNES_SHAREPOINT_TENANT_ID / _CLIENT_ID /
-  # _PRIVATE_KEY / AGNES_EXTRACTION_CORPUS_ID), never on argv, never logged.
-  # That child env is NOT this server's full environment — `producer` names
-  # an EXTERNAL, admin-configurable binary, so it gets only a curated
-  # non-secret allowlist (+ any `env_passthrough` above) plus the four vars
-  # named above. No other instance secret (vault key, LLM API key, DB DSN,
-  # OAuth client secrets, ...) is ever forwarded to it.
-  #
+  # Built-in crawler tuning.
+  crawler:
+    # Per-file size cap in MB; larger files are skipped AND counted in the
+    # run report's `skipped_oversize` block so a corpus of large files is
+    # visible, never silently dropped. 0 = unlimited (streamed download).
+    max_file_mb: 50
+    # How many files of ONE delta page the crawl pipelines (download ->
+    # convert -> anonymize -> ingest) at a time. The page boundary is
+    # unchanged: a drive's deltaLink is still persisted only after every row
+    # of that page has been handled, and each file's cTag only after its own
+    # ingest — so resume semantics are identical at any value. Raise it if a
+    # run report shows `max_in_flight` pinned at this number with few
+    # `http_429`s; lower it if the tenant is throttling. 1 = fully
+    # sequential (the pre-parallel behaviour). Clamped to 1..32. If the
+    # tenant throttles hard the crawl halves its own in-flight target per
+    # page (floor 1) and climbs back by 1 per clean page, reporting
+    # `concurrency.downshifts` / `.floor_hit` so the pushback is visible.
+    # Plain instance data in the admin-editable `extraction` section (read
+    # via get_value, not a registered switch), so it shows up in the admin
+    # extraction drawer with a config origin; a single run can override it
+    # with the `corpus-extraction` job payload's `concurrency` (max 16).
+    # NOT the same knob as `extraction.concurrency`, which sizes the
+    # worker's extraction LANE (how many crawl JOBS run at once). The two
+    # multiply: two concurrent crawls at 6 = twelve files in flight against
+    # the same tenant.
+    concurrency: 6
+  # The LLM stage — turn ingested documents into knowledge-graph facts
+  # (connectors/sharepoint/facts_extraction.py). Runs after a successful
+  # crawl, over the documents that crawl just ingested and indexed.
+  facts:
+    # OFF by default, and this is a COST decision, not a capability one:
+    # this is the only stage that spends model tokens per document.
+    # Measured against the shipped prompt + a 22-type ontology: $0.011 for a
+    # typical ~5k-token document on the default Haiku-class model, $0.020
+    # when the corrective verbatim retry fires, ~$0.045 for a 30k-token
+    # one — so a 10,000-document corpus is a $110-200 first pass. Sonnet is
+    # roughly 3x those figures. Re-runs are far cheaper: a document
+    # is re-extracted only when its content, the model, or the effective
+    # prompt changed, and the prompt + ontology prefix is cached.
+    # Spreadsheets and CSVs are never sent to the model at all.
+    # Needs `facts.enabled` (the fact-graph surface) as well — with that
+    # off, the pass is skipped rather than writing claims nothing can read.
+    # AGNES_EXTRACTION_FACTS_ENABLED overrides this at the environment level.
+    enabled: false
+    # How many documents are extracted in parallel; clamped to [1, 16].
+    # 1 is exactly sequential. Raise it to spend the wall-clock budget of a
+    # large corpus on more concurrent calls rather than a longer run, and
+    # lower it if the model account's rate limit is the binding constraint.
+    concurrency: 3
+    # OPTIONAL model override for this stage only (a full-corpus pass is
+    # the one place an operator may want a different tier from the
+    # anonymizer's). Accepts a tier name (haiku/sonnet/opus) or a concrete
+    # model id. Empty falls back to `extraction.model`, then Haiku.
+    model: ""
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
-  # scopes must be pseudonymized by the producer before upload. When at
-  # least one confirmed scope on a connection is anonymize=true, the
-  # producer subprocess ALSO receives AGNES_EXTRACTION_ANONYMIZE_SCOPES (a
-  # JSON object, {source_scope_id: collection_id}, covering only the
-  # anonymize-marked scopes) and AGNES_ANONYMIZATION_HMAC_KEY (this
-  # instance's per-instance pseudonym key — different instances must use
-  # different keys, or the same person pseudonymizes identically across
-  # tenants). Neither var is set when no scope is anonymize-marked.
-  #
-  # Producer callback credential: the producer calls BACK into Agnes's own
-  # REST API (corpus-map, scopes, the collections upload, POST
-  # /api/facts/ingest, GET /api/facts/corrections) to do its actual work,
-  # so the child env ALSO carries AGNES_API_URL (this instance's own base
-  # URL — resolved from SERVER_URL, falling back to AGNES_INTERNAL_URL,
-  # then to this process's own loopback) and AGNES_API_TOKEN — a
-  # short-lived, PRODUCER-SCOPED JWT (`app/auth/producer_token.py`) minted
-  # fresh for this run, naming only THIS connection and its own confirmed
-  # scope collections. On a role-split `extraction-worker` container
-  # (AGNES_ROLE=worker, a SEPARATE container from `app` — see the
-  # `extraction-worker` service in docker-compose.yml) that loopback
-  # fallback would be the WORKER's own address, not the instance's real
-  # callback surface — so on that topology the job refuses cleanly instead
-  # ("neither SERVER_URL nor AGNES_INTERNAL_URL configured") unless one of
-  # the two is set explicitly. A single-container ("all-in-one") deployment
-  # is unaffected: there, the producer's parent process IS the app, so the
-  # loopback fallback is correct and no explicit configuration is required.
-  # The token resolves to a RESTRICTED principal — never a real user, never
-  # Admin — accepted on only the small, fixed set of endpoints named above;
-  # every other endpoint 403s it. This replaces an earlier design that
-  # forwarded the scheduler shared secret here (a genuine over-grant: that
-  # secret resolves to a synthetic Admin-group user, god-mode on every RBAC
-  # check) — SCHEDULER_API_TOKEN is unrelated to this token and does not
-  # need to be configured for extraction to work.
+  # scopes are pseudonymized before they are ingested. The crawl fails
+  # CLOSED for those scopes: a document that cannot be anonymized is
+  # counted in the run report and dropped, never ingested raw.
   anonymization:
-    # Name of the env var holding the per-instance HMAC key — checked
+    # OPTIONAL — leave empty unless you want to mint the key yourself.
+    # With this empty and no AGNES_ANONYMIZATION_HMAC_KEY in the
+    # environment, Agnes generates this instance's HMAC key on first use
+    # and stores it encrypted in its own vault (needs AGNES_VAULT_KEY set;
+    # see docs/anonymization.md). That key is WRITE-ONCE and never rotated
+    # automatically — a second key orphans every pseudonym already written.
+    # Set this only to name the env var holding an operator-minted key,
+    # which then takes precedence over the stored one. The name is checked
     # against ITS OWN allowlist before the value is read (the name here is
     # admin-writable config, so an unlisted name is refused rather than
-    # silently read). This is a SEPARATE, narrower allowlist from the
-    # SharePoint certificate's above (AGNES_REMOTE_ATTACH_TOKEN_ENVS) —
+    # silently read). That is a SEPARATE, narrower allowlist from the
+    # SharePoint certificate's (AGNES_REMOTE_ATTACH_TOKEN_ENVS) —
     # deliberately, so this key can never be referenced as a `token_env` on
     # a connector-written `_remote_attach` row (see
     # src/orchestrator_security.py's `_PRODUCER_KEY_ENVS`). Empty (or the
-    # default name itself) uses AGNES_ANONYMIZATION_HMAC_KEY; any other
-    # name is refused. A connection with an anonymize-marked scope and no
-    # resolvable key fails the extraction job clean rather than running the
-    # producer without a key.
+    # default name itself) means AGNES_ANONYMIZATION_HMAC_KEY; any other
+    # name is refused. Different instances MUST use different keys, or the
+    # same person pseudonymizes identically across tenants. A connection
+    # with an anonymize-marked scope and no resolvable key (no env key and
+    # no usable vault) still fails the extraction job clean rather than
+    # running without a key.
     hmac_key_env: ""
+    # Which entity detector the anonymize pass uses.
+    #
+    #   regex (default) — the deterministic tier (src/anonymization.py):
+    #     emails, URLs, and pattern-matched person/company names. Free, and
+    #     it runs over every document of every crawl.
+    #   llm             — regex UNION an LLM reader (src/anonymization_ner.py,
+    #     using this instance's existing model credentials). Catches the
+    #     names a pattern cannot, hallucination-filtered to verbatim spans,
+    #     and fails LOUDLY: a document whose LLM pass is unavailable is
+    #     counted and dropped rather than ingested with a redaction that
+    #     quietly degraded to regex-only.
+    #
+    # `regex` is the default as a COST decision, not a legacy one: the LLM
+    # tier sends every crawled document to the model, on the order of
+    # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
+    # the recall is worth that per-corpus bill.
+    detector: "regex"
+    # Deterministic identifier tiers — the shapes a *name* detector cannot
+    # find, because they are not names: they are decided from characters
+    # alone. Each runs before entity substitution and each is individually
+    # toggleable here. ALL THREE DEFAULT TO ON, and the default is the
+    # recommendation: they cost nothing per document (no model, no network),
+    # they are exact by construction, and each guards an identifier whose
+    # disclosure is more severe than a name's. Turn one off only for a
+    # corpus where that shape is noise rather than identity.
+    #
+    #   phones       — international (+CC / 00CC, 8-15 digits) and the Czech
+    #                  3-3-3 grouping ("776 041 900"). A BARE nine-digit run
+    #                  is deliberately not matched: it is an order or
+    #                  account number at least as often as a phone.
+    #   ibans        — validated with the ISO 13616 mod-97 checksum, so an
+    #                  IBAN-shaped product code is not redacted (and, the
+    #                  other way round, a typo'd or OCR-mangled account
+    #                  number is not either).
+    #   national_ids — Czech birth number (rodné číslo), both "760419/0341"
+    #                  and the slash-less ten-digit form; the date field and
+    #                  the mod-11 check must both pass.
+    #
+    # Pseudonyms are PHONE_<hmac> / IBAN_<hmac> / ID_<hmac>, under the same
+    # per-instance key as PERSON_/COMPANY_/EMAIL_.
+    detect:
+      phones: true
+      ibans: true
+      national_ids: true
+    # The operator's OWN vocabulary — a project codename, an internal system
+    # name, a partner, a site — redacted as TERM_<hmac>. Nothing else can
+    # know these, which is why the list exists.
+    #
+    # Entries are LITERAL text, matched case-insensitively and on word
+    # boundaries. A '.' is a dot, not "any character". One trailing '*' is
+    # allowed and means "followed by more word characters" ("ACME-*" catches
+    # "ACME-1234"). REGULAR EXPRESSIONS ARE REFUSED — a pattern from config
+    # runs over every document of every crawl, where one badly written
+    # quantifier is a denial of service — and an entry carrying regex
+    # metacharacters is rejected by name, not silently ignored.
+    #
+    # An unusable entry FAILS rather than being skipped: the crawl counts
+    # the document in `anonymize_failed` and drops it, and the preview panel
+    # in the extraction config drawer answers 400 naming the bad entry.
+    # Silently dropping a term an operator added would leave them believing
+    # something is redacted that is not.
+    #
+    # Test yours before a crawl: /admin/data-sources -> the source card's
+    # config drawer -> "Preview redaction".
+    custom_terms: []
+    #   - "Projekt Fénix"
+    #   - "ACME-*"
+  # Scan transcription (OCR) for PDFs with no usable text layer.
+  #
+  # A scanned or photographed PDF converts to nothing today: the text route
+  # finds no glyphs, the document is reported as empty and it is lost to
+  # search and to the fact graph. With this on, those pages are rendered to
+  # bitmaps (pypdfium2, the same permissive engine the text route uses) and
+  # transcribed by this instance's existing vision model, and the document
+  # comes back with engine "ocr". Only a genuinely empty text layer takes
+  # this route — a normal PDF never pays for it.
+  #
+  # OFF by default as a COST decision: transcription is per PAGE, roughly
+  # $0.2-0.5 per document at the default Haiku-class model (~50 pages), so a
+  # crawl of a thousand scans is a bill to opt into deliberately. With it
+  # off nothing is rendered and no model is contacted — behaviour is exactly
+  # as it was before the feature existed.
+  scan_ocr:
+    enabled: false
+    # Model for the transcription. Falls back to `extraction.model`, then to
+    # the AGNES_VISION_MODEL env var, then to a Haiku-class default. Accepts
+    # a tier name (`haiku`/`sonnet`/`opus`) or a concrete claude-* id. It
+    # must be vision-capable; a model that is not fails every page, which
+    # fails the document loudly rather than emptying it.
+    model: ""
+    # Pages transcribed per document. A 500-page scan must not burn the
+    # budget silently: past this cap the first N pages are transcribed and a
+    # truncation marker naming the cap is appended to the markdown. Clamped
+    # to a hard 200-page ceiling in code, so a typo cannot turn one document
+    # into a four-figure invoice.
+    max_pages: 50
+    # Pages transcribed in parallel; clamped to [1, 8], 1 = one at a time.
+    concurrency: 3
 
 
 # Microsoft Graph change-notification receiver for SharePoint connections —
 # POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
 # drive push near-real-time notifications instead of Agnes waiting for
 # extraction.schedule above. Gated by `sharepoint.enabled` above (404 when
-# off) — no separate flag; a notification it accepts still needs a
-# configured producer + a worker polling the `extraction` lane to actually
-# run the resulting `corpus-extraction` job. Agnes never creates, renews, or
-# deletes the Graph subscription itself; an operator runs the producer's own
-# `subscriptions.py create --url <webhook_url>` against the URL + secret
-# `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
+# off) — no separate flag; a notification it accepts still needs a worker
+# polling the `extraction` lane to actually run the resulting
+# `corpus-extraction` job. Agnes owns the Graph subscription lifecycle
+# itself (create/renew/delete) — see the SUBSCRIPTIONS section near the end
+# of this file; the secret every subscription is signed with is minted by
+# `POST /api/admin/sharepoint/connections/{connection_id}/webhook`.
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
@@ -1574,3 +1680,54 @@ studio:
 #   # Per-field env overrides (win over the yaml values above):
 #   # AGNES_DISTRIBUTION_OBJECT_STORE_BUCKET, _ENDPOINT_URL, _REGION, _PREFIX,
 #   # _ACCESS_KEY_ENV, _SECRET_KEY_ENV
+
+
+# --- SharePoint Graph change-notification SUBSCRIPTIONS ---------------------
+# (Lifecycle for the webhook receiver described earlier in this file. Both
+# receiver and lifecycle ride the single `sharepoint.enabled` switch — there
+# is no separate webhook flag anymore — so everything this lifecycle reads
+# beyond that is an ENVIRONMENT variable, listed below.)
+#
+# The receiver route (`POST /api/webhooks/sharepoint/{connection_id}`) answers
+# Graph's calls; something still has to tell Graph to make them. Agnes now
+# owns that too: `connectors/sharepoint/subscriptions.py`, reached by
+#
+#   POST   /api/admin/sharepoint/connections/{id}/subscriptions/ensure
+#   DELETE /api/admin/sharepoint/connections/{id}/subscriptions
+#   POST   /api/admin/sharepoint/subscriptions/run-due   (scheduler-driven)
+#
+# `ensure` is idempotent: one Graph subscription per DISTINCT drive named by a
+# confirmed scope, created when missing, renewed when near expiry, left alone
+# when healthy, deleted when its drive leaves scope. State is recorded on the
+# connection row (`config.webhook_subscriptions`) — never a new table, never
+# the secret itself.
+#
+# Order of operations for an operator turning this on:
+#   1. sharepoint.enabled: true  (above, or AGNES_SHAREPOINT_ENABLED)
+#   2. POST /api/admin/sharepoint/connections/{id}/webhook   -> mints the
+#      clientState secret every subscription is signed with
+#   3. AGNES_BASE_URL (or SERVER_URL) must name this instance's PUBLIC https
+#      origin — Graph validates the notification URL synchronously while
+#      creating the subscription, by calling the receiver's handshake, so a
+#      localhost/internal origin is refused up front (409
+#      public_url_not_configured) rather than failing opaquely inside Graph.
+#   4. POST .../subscriptions/ensure for each connection.
+# Re-minting the secret in step 2 later does NOT rewrite live subscriptions
+# (Graph treats clientState as immutable) — re-run `ensure`, which detects the
+# rotation and re-creates them.
+#
+# Environment knobs (all optional; the defaults are what the expiry math
+# needs, not preferences):
+#   AGNES_SP_SUBSCRIPTION_DAYS=25
+#       Requested subscription lifetime. Graph's ceiling for a drive
+#       subscription is 30 days; values above it are clamped.
+#   AGNES_SP_SUBSCRIPTION_RENEW_WITHIN_HOURS=72
+#       Renew anything expiring inside this window. With a daily sweep this
+#       means three consecutive missed runs are survivable.
+#   SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE="daily 04:30"
+#       Cadence of the `sharepoint-subscriptions-renew` scheduler row
+#       (services/scheduler). The row exists whenever the receiver is
+#       enabled — unlike `extraction.schedule` there is nothing to opt into,
+#       since a renewal sweep that never runs costs the subscriptions
+#       themselves. An unparseable value falls back to the default rather
+#       than disabling the sweep.
