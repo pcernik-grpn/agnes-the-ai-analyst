@@ -5,7 +5,9 @@ calls setup_logging(__name__) once. Library modules just do
 `logger = logging.getLogger(__name__)` — they NEVER call setup_logging.
 
 Dev (DEBUG=1): rich.logging.RichHandler with color, tracebacks, links.
-Prod: stdlib StreamHandler with JSON formatter to stderr.
+Prod: stdlib StreamHandler with a JSON formatter to stderr — one object
+per line, keyed `severity`/`message`/`time` so a log collector can promote it
+to a structured entry instead of a string.
 """
 
 from __future__ import annotations
@@ -160,23 +162,75 @@ def _derive_slug(service: str | None) -> str:
     return "app"
 
 
+#: LogRecord attributes the stdlib sets itself, plus the two `_RequestIdFilter`
+#: injects — everything else on a record came from a caller's ``extra={...}``
+#: and is promoted to a real field.
+_RESERVED_RECORD_ATTRS = frozenset(
+    {
+        "args",
+        "asctime",
+        "created",
+        "exc_info",
+        "exc_text",
+        "filename",
+        "funcName",
+        "levelname",
+        "levelno",
+        "lineno",
+        "module",
+        "msecs",
+        "msg",
+        "name",
+        "pathname",
+        "process",
+        "processName",
+        "relativeCreated",
+        "stack_info",
+        "taskName",
+        "thread",
+        "threadName",
+        # injected by _RequestIdFilter for the dev/rich format string
+        "replica",
+        "request_id",
+    }
+)
+
+
 class _JSONFormatter(logging.Formatter):
+    """One JSON object per line, named the way a log collector reads them.
+
+    ``severity`` / ``message`` / ``time`` rather than this project's older
+    ``lvl`` / ``msg`` / ``ts``: a collector that promotes a JSON line to a
+    structured entry looks for the former (Cloud Logging's Ops Agent among
+    them), and under the latter every line arrives at its default severity
+    with the whole payload as one opaque string — the same as having no
+    levels at all.
+    """
+
     def __init__(self, service: str) -> None:
         super().__init__()
         self.service = service
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, object] = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "lvl": record.levelname,
+            "time": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "severity": record.levelname,
             "logger": record.name,
             "service": self.service,
             "replica": _replica_id_safe(),
-            "msg": record.getMessage(),
+            "message": record.getMessage(),
         }
         rid = request_id_var.get()
         if rid:
             payload["request_id"] = rid
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
+        # `extra={...}` lands as attributes on the record; promote them so a
+        # caller's numbers stay filterable instead of being stringified into
+        # the message. Core fields win — an extra must not be able to relabel
+        # its own line's severity or service.
+        for key, value in record.__dict__.items():
+            if key in _RESERVED_RECORD_ATTRS or key.startswith("_") or key in payload:
+                continue
+            payload[key] = value
         return json.dumps(payload, default=str)
