@@ -17,7 +17,7 @@ memberships (:mod:`src.repositories.user_group_members`
 (:mod:`src.repositories.resource_grants`) — one worker job kind
 (``sharepoint-acl-sync``, ``app/worker/kinds.py``), enqueued nightly by
 ``services/scheduler/__main__.py`` and on demand by an admin "sync now"
-action (spec §5.1). Entirely behind ``acl_mirroring.enabled`` (default off);
+action (spec §5.1). Entirely behind the single ``sharepoint`` switch (default off);
 see :func:`run_acl_sync`'s own docstring for the sync lifecycle.
 
 **Gap closed (2026-08-30 plan, Task 5):** a confirmed scope row
@@ -69,9 +69,10 @@ changing its detection-only mandate at the folder level:
 1. The walk now probes **files** too, not just folders — a file with
    unique permissions is excluded (``kind="file"``, fail-closed, never
    mirrored per-file — see :func:`_walk_subtree_sweep`).
-2. Behind the ``acl_zones`` switch (default off), a broken-inheritance
-   FOLDER is no longer merely excluded — it is promoted to its own
-   **permission zone**: a fresh, grant-less collection
+2. A broken-inheritance FOLDER is no longer merely excluded — it is ALWAYS
+   promoted to its own **permission zone** (whenever the connector itself
+   is on — there is no separate opt-in switch for this anymore, see
+   :func:`_walk_subtree_sweep`'s own docstring): a fresh, grant-less collection
    (:func:`_create_zone_collection`) that :func:`_sync_connection` (Task 4)
    mirrors an ACL into exactly like a normal scope, and the walk
    *descends* into it instead of stopping (:func:`_reconcile_zones`); a
@@ -398,15 +399,15 @@ def run_acl_sync(payload: dict) -> dict:
 
     Returns ``{"connections": N, "scopes": M, "matched": X, "unmatched": Y,
     "errors": [...]}`` (aggregated across every connection processed), or
-    ``{"skipped": "acl_mirroring disabled"}`` when the feature flag is off —
+    ``{"skipped": "sharepoint disabled"}`` when the feature flag is off —
     the scheduler enqueues this kind unconditionally, so the no-op has to be
     cheap and harmless, same posture as ``ducklake-maintenance``
     (``app/worker/kinds.py``).
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        return {"skipped": "acl_mirroring disabled"}
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        return {"skipped": "sharepoint disabled"}
 
     return asyncio.run(_run_acl_sync_async(payload))
 
@@ -911,7 +912,6 @@ async def _walk_subtree_sweep(
     root_path: str,
     *,
     rel_root: str = "",
-    zones_enabled: bool = False,
     known_zone_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> Dict[str, Any]:
     """Breadth-first walk of one scope's folder tree, probing
@@ -928,12 +928,13 @@ async def _walk_subtree_sweep(
     * a FOLDER with flag ``None`` (unknown — the probe's own honest answer
       when the signal could not be read) is excluded (``kind="folder"``),
       never descended — fail-closed, same as a confirmed break;
-    * a FOLDER with flag ``True`` and ``zones_enabled``: becomes a
-      **permission zone candidate** (``zone_candidates``) and the walk
-      DESCENDS into it — nested breaks become further candidates, unlike
-      the exclude-and-stop path;
-    * a FOLDER with flag ``True`` and NOT ``zones_enabled``: excluded
-      (``kind="folder"``), never descended — the pre-Task-3 behavior;
+    * a FOLDER with flag ``True``: ALWAYS becomes a **permission zone
+      candidate** (``zone_candidates``) and the walk DESCENDS into it —
+      nested breaks become further candidates, unlike the exclude-and-stop
+      path. There is no separate opt-in switch for this anymore (2026-09-01:
+      the four SharePoint feature flags collapsed into the single
+      ``sharepoint`` switch) — whenever the connector itself is on, a
+      confirmed break is always promoted to a zone, never merely excluded;
     * a FOLDER with flag ``False``: inheritance intact, the walk descends
       normally; if its id is in ``known_zone_ids`` (an ACTIVE zone from a
       PRIOR run rooted here), it is recorded in ``relinked_zone_ids`` — its
@@ -1015,26 +1016,17 @@ async def _walk_subtree_sweep(
                 continue  # never descend into an unknown-signal subtree
 
             if flag is True:
-                if zones_enabled:
-                    zone_candidates.append(
-                        {
-                            "zone_item_id": child["id"],
-                            "name": child["name"],
-                            "path": child_path,
-                            "rel_path": child_rel_path,
-                        }
-                    )
-                    queue.append((child["id"], child_path, child_rel_path))
-                else:
-                    excluded.append(
-                        {
-                            "item_id": child["id"],
-                            "path": child_path,
-                            "rel_path": child_rel_path,
-                            "kind": "folder",
-                            "detected_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    )
+                # ALWAYS a zone candidate — see this function's own docstring
+                # (no separate zones-opt-in switch anymore).
+                zone_candidates.append(
+                    {
+                        "zone_item_id": child["id"],
+                        "name": child["name"],
+                        "path": child_path,
+                        "rel_path": child_rel_path,
+                    }
+                )
+                queue.append((child["id"], child_path, child_rel_path))
                 continue
 
             # flag is False -> inheritance intact, descend normally.
@@ -1056,7 +1048,6 @@ async def _sweep_scope(
     token: str,
     scope: Dict[str, Any],
     *,
-    zones_enabled: bool = False,
     known_zone_ids: "frozenset[str] | set[str]" = frozenset(),
 ) -> Dict[str, Any]:
     """Sweep one mirrored scope. Returns ``{"source_scope_id",
@@ -1095,7 +1086,6 @@ async def _sweep_scope(
             source_scope_id,
             root_path,
             rel_root=rel_root,
-            zones_enabled=zones_enabled,
             known_zone_ids=known_zone_ids,
         )
     except SharePointGraphError as exc:
@@ -1203,13 +1193,10 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     under an excluded subtree/file or an active zone, and fully retires any
     zone dissolved this (or a prior, incompletely-torn-down) run. See
     :func:`run_subtree_sweep` for the full contract."""
-    from app.switches import switch_value
-
     connection_id = connection["id"]
     scopes = _mirrored_scopes(connection)
     t0 = time.monotonic()
 
-    zones_enabled = bool(switch_value("acl_zones"))
     existing_zones = zone_rows(connection)
     known_zone_ids_by_scope: Dict[str, set] = {}
     for z in existing_zones:
@@ -1237,7 +1224,7 @@ async def _sweep_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
     if token is not None:
         for scope in scopes:
             known_ids = known_zone_ids_by_scope.get(scope.get("source_scope_id"), set())
-            report = await _sweep_scope(token, scope, zones_enabled=zones_enabled, known_zone_ids=known_ids)
+            report = await _sweep_scope(token, scope, known_zone_ids=known_ids)
             requests_total += report["requests"]
             unknown_total += report["unknown_probes"]
             truncated_any = truncated_any or report["truncated"]
@@ -1517,22 +1504,23 @@ def run_subtree_sweep(payload: dict) -> dict:
     a second scheduling mechanism.
 
     Detection AND, since Task 3/6, three further actions: (1) probes files
-    as well as folders; (2) behind the ``acl_zones`` switch, promotes a
-    broken-inheritance folder to its own permission zone (mirrored by
-    :func:`run_acl_sync`) instead of excluding it outright, and dissolves a
-    zone whose root re-links inheritance; (3) retroactively purges
-    already-ingested content that now falls under an exclusion or an active
-    zone, and fully retires a dissolved zone's collection. Each mirrored
-    scope's ``excluded_subtrees`` (``{item_id, path, rel_path, kind,
-    detected_at}`` per detected root/file) and the connection's
-    ``acl_zones`` are consumed by the built-in crawler
-    (``connectors/sharepoint/crawler.py`` — exclusions honored in-process
-    today; zone-aware routing lands with TCRD-284) and enforced
-    server-side at ingest time regardless (Task 5's gate).
+    as well as folders; (2) ALWAYS promotes a broken-inheritance folder to
+    its own permission zone (mirrored by :func:`run_acl_sync`) instead of
+    excluding it outright — no separate opt-in switch, see
+    :func:`_walk_subtree_sweep`'s own docstring — and dissolves a zone whose
+    root re-links inheritance; (3) retroactively purges already-ingested
+    content that now falls under an exclusion or an active zone, and fully
+    retires a dissolved zone's collection. Each mirrored scope's
+    ``excluded_subtrees`` (``{item_id, path, rel_path, kind, detected_at}``
+    per detected root/file) and the connection's ``acl_zones`` are handed to
+    the external producer via ``app/worker/kinds.py::_run_corpus_extraction``'s
+    ``AGNES_SP_EXCLUDED_SUBTREE_IDS`` env var / corpus map (2026-08-31 plan,
+    Task 7) — HONORING them on the crawl side stays external-producer work;
+    Agnes now also enforces them server-side at ingest time (Task 5).
 
-    Feature-gated by ``acl_mirroring.enabled`` (same flag as
+    Feature-gated by the single ``sharepoint`` switch (same flag as
     :func:`run_acl_sync`) — disabled instance returns ``{"skipped":
-    "acl_mirroring disabled"}``, harmless for the scheduler's unconditional
+    "sharepoint disabled"}``, harmless for the scheduler's unconditional
     daily enqueue.
 
     Returns ``{"connections": N, "scopes": M, "excluded": X, "skipped_not_due":
@@ -1540,8 +1528,8 @@ def run_subtree_sweep(payload: dict) -> dict:
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        return {"skipped": "acl_mirroring disabled"}
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        return {"skipped": "sharepoint disabled"}
 
     return asyncio.run(_run_subtree_sweep_async(payload))
 

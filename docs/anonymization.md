@@ -80,6 +80,35 @@ deployments:
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
+## Provisioning the key on a deployment
+
+The value is a single line, so any env-delivery mechanism works. On a VM
+managed by the bundled Terraform module
+(`infra/modules/customer-instance`), store it in your cloud's secret
+manager and map it through `runtime_secret_env`:
+
+```hcl
+runtime_secret_env = {
+  AGNES_ANONYMIZATION_HMAC_KEY = "<your-secret-name>"
+}
+```
+
+The startup script reads the secret into `/opt/agnes/.env` at boot. On an
+already-running VM a newly added mapping lands **only on the next VM
+recreate** (startup metadata is frozen by design) — plan it together with
+enabling the extraction worker so production restarts once, not twice.
+
+**Never rotate this key, and do not lose it.** Pseudonyms are
+`hmac(key, entity)`: a new key gives every already-known person and company
+a brand-new token, so facts extracted after the change no longer join to
+facts extracted before it — one real entity silently becomes two subjects,
+and there is no re-keying tool. The rotate-on-schedule hygiene that
+credentials deserve actively damages this value; it is closer to data than
+to a credential (it never appears in output, logs, or error messages, so
+use does not wear it out). If it is ever truly compromised, rotating it is
+a *reset*: plan to re-run extraction over the full corpus so the graph is
+rebuilt in the new token space.
+
 A connection with an anonymize-marked scope and no resolvable key fails the
 `corpus-extraction` job cleanly (a named error, not a silent run without a
 key) — set the variable, or unmark the scope in the connect wizard.

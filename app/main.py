@@ -1165,10 +1165,22 @@ async def lifespan(app):
     # catalog` on every fresh install. Idempotent — re-applies canonical
     # name + description on every boot so operators can't drift them
     # away from the seed.
+    #
+    # Then seed the `agnes-usage` data package that carries those tables,
+    # so an admin can grant who may query usage data at all. The two run
+    # in this order because the package's table junction has an FK onto
+    # `table_registry`; the returned set is the ids registered for the
+    # FIRST time, which is what makes package membership add-once (a
+    # member an admin removed is never written back). Both are
+    # self-contained and never fatal — see their docstrings.
     try:
-        from connectors.internal.registry import ensure_internal_tables_registered
+        from connectors.internal.registry import (
+            ensure_internal_package_seeded,
+            ensure_internal_tables_registered,
+        )
 
-        ensure_internal_tables_registered()
+        newly_registered_internal = ensure_internal_tables_registered()
+        ensure_internal_package_seeded(newly_registered=newly_registered_internal)
     except Exception:
         logger.exception("internal data-source seed failed; continuing")
 
@@ -2834,7 +2846,14 @@ def create_app() -> FastAPI:
         from app.instance_config import (
             get_guardrails_enabled,
             get_guardrails_llm_provider_ready,
+            warn_retired_sharepoint_flags,
         )
+
+        # One line per retired SharePoint switch still set in this instance's
+        # config. Nothing reads those keys since they collapsed into
+        # `sharepoint.enabled`, so without this an upgrade turns the connector
+        # off silently — see warn_retired_sharepoint_flags.
+        warn_retired_sharepoint_flags()
 
         if get_guardrails_enabled() and not get_guardrails_llm_provider_ready():
             logger.warning("=" * 60)
@@ -3495,7 +3514,7 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health/detailed",
         "/api/version",
         # Microsoft Graph change-notification receiver — Graph is the only
-        # caller, gated by extraction_webhook.enabled (404 when off), never
+        # caller, gated by the sharepoint switch (404 when off), never
         # a session/PAT (see app/api/sharepoint_webhooks.py). It can never
         # answer 401/403.
         "/api/webhooks/sharepoint/{connection_id}",

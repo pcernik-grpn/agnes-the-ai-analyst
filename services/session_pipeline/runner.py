@@ -82,6 +82,7 @@ def resolve_user_id(username: str) -> str | None:
 
 DEFAULT_SESSION_DATA_DIR = Path(os.environ.get("SESSION_DATA_DIR", "/data/user_sessions"))
 
+
 # Wall-clock budget (seconds) for the *whole tick* — the cross-session loop
 # in run_processor(), not any single session. Incident 2026-07-20: the
 # "usage" processor is explicitly exempted from max_sessions_per_run (see
@@ -396,3 +397,105 @@ def run_processor(
         stats["items_extracted"],
     )
     return stats
+
+
+def _resolve_session_path(dir_name: str, filename: str) -> Path | None:
+    """``<session root>/<dir_name>/<filename>``, or ``None`` if there is no
+    such file inside a session root.
+
+    Two roots are tried because two settings can disagree: the pipeline reads
+    ``$SESSION_DATA_DIR`` (default ``/data/user_sessions``) while
+    ``POST /api/upload/sessions`` writes to ``${DATA_DIR}/user_sessions``.
+    They are the same directory in a normal deployment; where they are not,
+    the one-shot caller must still find the file it just wrote.
+
+    ``dir_name`` and ``filename`` arrive from an HTTP handler, so the
+    resolved path is realpath-contained in its root: a traversing component
+    resolves outside and is refused rather than reaching an arbitrary file.
+    """
+    roots = [
+        Path(os.environ.get("SESSION_DATA_DIR", "/data/user_sessions")),
+        Path(os.environ.get("DATA_DIR", "/data")) / "user_sessions",
+    ]
+    for root in roots:
+        candidate = (root / dir_name / filename).resolve()
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError:
+            logger.warning("Refusing session path outside %s: %s/%s", root, dir_name, filename)
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def process_single_session(dir_name: str, filename: str) -> bool:
+    """Run the usage processor over exactly one session file. Never raises.
+
+    The event-driven half of usage ingest: ``POST /api/upload/sessions``
+    schedules this right after a successful write, so a session's tokens show
+    up in seconds instead of on the next ten-minute sweep. The sweep stays as
+    the catch-up path — for collector-ingested files, and for one-shots that
+    return ``False`` here.
+
+    Identity resolution and ``session_processor_state`` bookkeeping are the
+    sweep's, deliberately: the same ``session_key`` (``<dir>/<file>``), the
+    same canonical username, the same hash ledger. That is what makes the two
+    paths idempotent with respect to each other — whichever runs second sees
+    the file as already processed and does nothing.
+
+    Returns True when the file is processed (or was already current for this
+    processor), False otherwise. It runs as a fire-and-forget background
+    task, where a raised exception would be reported to nobody and could take
+    the caller's task group down with it, so every failure is logged and
+    converted to False for the caller to act on if it wants to.
+    """
+    session_key = f"{dir_name}/{filename}"
+    try:
+        from services.session_processors.usage import UsageProcessor
+
+        path = _resolve_session_path(dir_name, filename)
+        if path is None:
+            logger.warning("One-shot usage processing: no session file for %s", session_key)
+            return False
+
+        read_at = datetime.now(UTC)
+        file_hash = compute_file_hash(path)
+
+        state = session_processor_state_repo()
+        if state.is_processed(UsageProcessor.name, session_key, file_hash):
+            return True
+
+        resolved_uid, resolved_email = resolve_user_identity(dir_name)
+        canonical_username = resolved_email or dir_name
+
+        # No connection: the usage processor reads and writes exclusively
+        # through the repository factory and never touches the ``conn``
+        # argument the SessionProcessor protocol hands it. Opening the system
+        # DuckDB here would be both pointless and, on a Postgres instance,
+        # forbidden — the admin trigger passes None there for the same reason.
+        result = UsageProcessor().process_session(
+            path,
+            canonical_username,
+            session_key,
+            None,  # type: ignore[arg-type]
+            user_id=resolved_uid,
+        )
+        if not isinstance(result, ProcessorResult):
+            result = ProcessorResult(items_count=0)
+
+        state.mark_processed(
+            processor_name=UsageProcessor.name,
+            session_file=session_key,
+            username=canonical_username,
+            items_count=result.items_count,
+            file_hash=file_hash,
+            read_at=read_at,
+        )
+        logger.info("One-shot usage processing: %s (%d items)", session_key, result.items_count)
+        return True
+    except Exception:
+        # No state row is written on failure, so the sweep retries this file
+        # on its next tick exactly as it would after a failed sweep attempt.
+        logger.exception("One-shot usage processing failed for %s", session_key)
+        return False

@@ -107,6 +107,31 @@ class TestMessagesToTurns:
             "content": "42000",
         }
 
+    def test_usage_carries_cache_token_halves_when_recorded(self):
+        """Postgres rows record the prompt-cache halves (migration 0092);
+        the export must forward them in the Anthropic usage shape or the
+        transcript viewer's token line under-reports a cache-heavy chat
+        session by exactly the dominant term. The sibling test above pins
+        the other side: rows without them (frozen DuckDB backend) omit the
+        keys rather than exporting a fake measured zero."""
+        m = _msg(
+            id="msg_a_cache",
+            role="assistant",
+            content="hi",
+            tokens_in=10,
+            tokens_out=5,
+            cache_read_tokens=300,
+            cache_creation_tokens=40,
+            parts=[{"type": "text", "text": "hi"}],
+        )
+        turns = messages_to_turns("chat_abc", [m])
+        assert turns[0]["message"]["usage"] == {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 40,
+        }
+
     def test_tool_still_running_gets_no_result_turn(self):
         m = _msg(
             id="msg_a2",

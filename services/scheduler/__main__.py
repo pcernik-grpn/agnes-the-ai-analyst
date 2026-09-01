@@ -538,13 +538,13 @@ _ENQUEUE_BODIES: dict[str, dict[str, str]] = {
     "jira-org-refresh": {"kind": "jira-org-refresh", "idempotency_key": "jira-org-refresh"},
     # 2026-08-30 plan, Task 4: SharePoint ACL mirroring's nightly sweep. The
     # handler (connectors/sharepoint/acl_sync.py::run_acl_sync) no-ops when
-    # acl_mirroring.enabled is false, so this row is harmless on an instance
+    # the sharepoint switch is false, so this row is harmless on an instance
     # that hasn't turned the feature on — same posture as
     # ducklake-maintenance/jira-org-refresh above.
     "sharepoint-acl": {"kind": "sharepoint-acl-sync", "idempotency_key": "sharepoint-acl-sync"},
     # 2026-08-30 plan, Task 7: broken-inheritance subtree sweep. The handler
     # (connectors/sharepoint/acl_sync.py::run_subtree_sweep) no-ops when
-    # acl_mirroring.enabled is false, same harmless-unconditional-enqueue
+    # the sharepoint switch is false, same harmless-unconditional-enqueue
     # posture as sharepoint-acl above.
     "sharepoint-subtree-sweep": {
         "kind": "sharepoint-subtree-sweep",
@@ -734,7 +734,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # after they are revoked upstream. `_acl_sync_schedule()` resolves
         # `every Nh` from the `acl_sync.interval_hours` switch (default 4h;
         # `AGNES_ACL_SYNC_INTERVAL_HOURS` overrides). The handler no-ops when
-        # acl_mirroring.enabled is false, so this row is harmless on an
+        # the sharepoint switch is false, so this row is harmless on an
         # instance that hasn't turned the feature on.
         (
             "sharepoint-acl",
@@ -753,7 +753,7 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
         # store-blocked-purge 04:00, ducklake-maintenance 04:30, jira-org-
         # refresh/store-lint-audit 05:00, audit-prune 05:30, retention-prune
         # 05:45) so none of them fire on the same tick. The handler no-ops
-        # when acl_mirroring.enabled is false (same posture as sharepoint-acl
+        # when the sharepoint switch is false (same posture as sharepoint-acl
         # above); each connection additionally self-guards against a
         # restart-refire via its own acl_sweep_last_full/
         # acl_sync.sweep_interval_days check (connectors/sharepoint/

@@ -1,9 +1,11 @@
 """SQLAlchemy models for the telemetry + observability cluster:
 session_processor_state, user_observability_views, usage_events,
 usage_session_summary, usage_tool_daily, usage_marketplace_item_daily,
-usage_marketplace_item_window.
+usage_marketplace_item_window, usage_turns.
 
-Mirrors src/db.py:200-208, 2885-2892, 721-789, 795-839.
+Mirrors src/db.py:200-208, 2885-2892, 721-789, 795-839 — except
+``usage_turns``, which is POSTGRES-ONLY (A3 PG-first ratchet) and therefore
+has no ``src/db.py`` counterpart to mirror at all.
 """
 
 from __future__ import annotations
@@ -147,6 +149,68 @@ class UsageSessionSummary(Base):
     # (INCIDENT 2026-07-20), so the indexes were removed — updating an
     # unindexed column is safe. Do not re-add them. session_file remains
     # the sole PRIMARY KEY.
+
+
+class UsageTurn(Base):
+    """One assistant turn's token usage — the grain ``usage_session_summary``
+    does not have.
+
+    POSTGRES-ONLY (A3 PG-first ratchet — ``CLAUDE.md`` -> "Dual-backend
+    discipline"): the table landed after the DuckDB app-state backend was
+    frozen, so there is deliberately no ``src/db.py`` step and no DuckDB
+    repository sibling. See ``migrations/versions/0094_usage_turns.py``.
+
+    Why a row per turn rather than more columns on the session summary: a
+    session's cost is not a single number once prompt caching is in play —
+    the same session mixes models and mixes cheap cached re-reads with full
+    priced input, and both the per-model and the cache split are only
+    recoverable if they are stored at the grain they occur at. The summary
+    stays the fast path for "how much in total"; this is the table any
+    per-model or cache-aware breakdown reads.
+
+    ``(session_file, turn_uuid)`` is UNIQUE because both writers are
+    replay-safe by construction rather than by bookkeeping: the usage
+    processor re-walks a whole session file whenever its hash changes, and
+    the chat manager may retry a persist. The unique key turns "insert what
+    you found" into an idempotent operation, so a re-process can never
+    double-count a user's tokens.
+    """
+
+    __tablename__ = "usage_turns"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    session_file: Mapped[str] = mapped_column(String, nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: ``users.id`` — NULL when the writer could not resolve one (a chat
+    #: participant with no account row, a pre-v45 upload). Self-scoped reads
+    #: filter on this column, so a NULL row is instance-wide-only by design.
+    user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: Where the turn happened: ``claude_code`` for uploaded session files,
+    #: otherwise the value ``chat_sessions.surface`` holds (``web``,
+    #: ``slack_dm``, ``slack_thread``, ``telegram``, …).
+    surface: Mapped[str] = mapped_column(String, server_default=text("'claude_code'"), nullable=False)
+    turn_uuid: Mapped[str] = mapped_column(String, nullable=False)
+    parent_uuid: Mapped[str | None] = mapped_column(String, nullable=True)
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
+    cache_read_tokens: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
+    cache_creation_tokens: Mapped[int] = mapped_column(BigInteger, server_default=text("0"), nullable=False)
+    #: When the turn happened (the jsonl event timestamp / chat write time).
+    #: Nullable: a turn whose source carries no timestamp is still worth
+    #: counting all-time, it just cannot take part in a windowed read.
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processor_version: Mapped[int] = mapped_column(Integer, server_default=text("0"), nullable=False)
+    extracted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("session_file", "turn_uuid", name="uq_usage_turns_file_turn"),
+        Index("idx_usage_turns_user_time", "user_id", "occurred_at"),
+    )
 
 
 class UsageToolDaily(Base):

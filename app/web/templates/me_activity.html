@@ -180,6 +180,23 @@
     <section class="stats-panel" id="panel-tokens" role="tabpanel" aria-labelledby="tab-tokens">
         <div class="stats-loading" data-state="loading">Loading token usage…</div>
         <div data-state="ready" hidden>
+            {# Empty state, rendered server-side because the one fact that makes
+               it useful — whether this account ever pushed a session HERE — is
+               not in the tokens API. "Zero tokens" reads as a bug until the page
+               says whether the server ever received anything; the most common
+               cause is a workspace pointed at a different instance. #}
+            <p class="act-note" data-tok-empty hidden>
+                {% if last_session_upload_at %}
+                No token usage has been recorded for your account yet. Your most recent
+                session upload to this server was <strong>{{ last_session_upload_at }}</strong> —
+                tokens appear once the usage processor has read it.
+                {% else %}
+                <strong>No sessions have been uploaded to this server yet.</strong>
+                Run <code>agnes push</code> from your workspace (the Claude Code session-end
+                hook does it for you), and check that the workspace points at this server if
+                you expected to see history here.
+                {% endif %}
+            </p>
             {# Three cards where there used to be one panel with two
                inline-styled uppercase <h3>s: the totals + trend, the per-model
                split, and the heaviest sessions are three different questions.
@@ -217,8 +234,13 @@
                         <span class="dsec-ico">{{ ico.icon('sparkle', 14) }}</span>
                         <div class="dsec-grow">
                             <h3>By model</h3>
-                            <div class="dsec-sub">Which models did the work, and what each cost in tokens.</div>
+                            <div class="dsec-sub">Which models did the work, what each cost in tokens, and what that is worth in dollars.</div>
                         </div>
+                        {# The headline answer lives in the head so it survives the
+                           section being collapsed — same rule as the Sync tab's
+                           "Last pull". It is the sum of the Cost column below,
+                           never a separately-computed figure. #}
+                        <span class="dsec-sum">Cost <span data-tok-cost>—</span></span>
                         <span class="dsec-chev">{{ ico.icon('chevron', 16) }}</span>
                     </div>
                 </summary>
@@ -229,10 +251,18 @@
                                 <th>Model</th><th class="num">Sessions</th>
                                 <th class="num">Input</th><th class="num">Output</th>
                                 <th class="num">Cache R/W</th><th class="num">Total</th>
+                                <th class="num">Cost</th>
                             </tr></thead>
                             <tbody data-tok-model></tbody>
                         </table>
                     </div>
+                    {# Prices are list rates for the model, applied to stored token
+                       counts at render time — an estimate, not an invoice. #}
+                    <p class="act-note">
+                        Cost is computed from the tokens above at this instance's configured
+                        model rates (cached reads priced separately from fresh input). It is an
+                        estimate for comparing sessions, not a bill.
+                    </p>
                 </div>
             </details>
 
@@ -254,6 +284,7 @@
                                 <th>Started</th><th>Model</th>
                                 <th class="num">Input</th><th class="num">Output</th>
                                 <th class="num">Cache</th><th class="num">Total</th>
+                                <th class="num">Cost</th>
                             </tr></thead>
                             <tbody data-tok-top></tbody>
                         </table>
@@ -344,6 +375,17 @@
         return String(n);
     }
 
+    // Cost is an estimate down to the microdollar; rendering it at cent
+    // precision would print "$0.00" for a whole tab's worth of cheap sessions,
+    // so anything under a cent says so explicitly instead of rounding to zero.
+    // `null` means "could not be computed", which is not the same as free.
+    function fmtUsd(v) {
+        if (v == null) return '—';
+        if (v === 0) return '$0.00';
+        if (v < 0.01) return '<$0.01';
+        return '$' + v.toFixed(2);
+    }
+
     function fmtRelative(iso) {
         if (!iso) return 'never';
         const then = new Date(iso);
@@ -414,7 +456,7 @@
                     <td>${fmtTimestamp(r.started_at)}</td>
                     <td>${r.primary_model || '<em style="color:var(--ds-text-muted);">unprocessed</em>'}</td>
                     <td class="num">${fmtNum(r.user_messages)}</td>
-                    <td class="num">${fmtNum(r.tool_calls)}</td>
+                    <td class="num" title="${(r.tool_calls || 0)} native · ${(r.mcp_calls || 0)} MCP · ${(r.subagent_dispatches || 0)} subagent">${fmtNum((r.tool_calls || 0) + (r.mcp_calls || 0) + (r.subagent_dispatches || 0))}</td>
                     <td class="num">${fmtNum(r.tokens_total)}</td>
                     <td>${pipelineBadge(r.pipeline_status)}</td>
                     <td class="num">${r.items_extracted != null ? r.items_extracted : 0}</td>
@@ -451,6 +493,13 @@
                 panel.querySelector(`[data-tok-total="${key}"]`).textContent =
                     fmtNum(data.totals[key]);
             }
+            panel.querySelector('[data-tok-cost]').textContent = fmtUsd(data.totals.cost_usd);
+
+            // The server-rendered hint explains an empty tab (nothing uploaded
+            // here yet, or uploaded but not processed); show it only when there
+            // is genuinely nothing to explain away.
+            const emptyHint = panel.querySelector('[data-tok-empty]');
+            if (emptyHint) emptyHint.hidden = (data.totals.sessions || 0) > 0;
 
             const chart = panel.querySelector('[data-tok-chart]');
             chart.innerHTML = '';
@@ -473,17 +522,22 @@
             const modelTbody = panel.querySelector('[data-tok-model]');
             modelTbody.innerHTML = '';
             if (data.by_model.length === 0) {
-                modelTbody.innerHTML = '<tr><td colspan="6" class="stats-empty">No token data yet.</td></tr>';
+                modelTbody.innerHTML = '<tr><td colspan="7" class="stats-empty">No token data yet.</td></tr>';
             }
             for (const m of data.by_model) {
                 const tr = document.createElement('tr');
+                // `sessions` is null when the split came from per-turn records
+                // (finer attribution than a session's modal model); `turns` then
+                // carries the count instead.
+                const grainCount = m.sessions != null ? m.sessions : m.turns;
                 tr.innerHTML = `
-                    <td>${m.model}</td>
-                    <td class="num">${fmtNum(m.sessions)}</td>
+                    <td>${escapeHtml(m.model)}</td>
+                    <td class="num">${fmtNum(grainCount)}</td>
                     <td class="num">${fmtNum(m.input)}</td>
                     <td class="num">${fmtNum(m.output)}</td>
                     <td class="num">${fmtNum(m.cache_read + m.cache_creation)}</td>
                     <td class="num"><strong>${fmtNum(m.total)}</strong></td>
+                    <td class="num">${fmtUsd(m.cost_usd)}</td>
                 `;
                 modelTbody.appendChild(tr);
             }
@@ -491,17 +545,18 @@
             const topTbody = panel.querySelector('[data-tok-top]');
             topTbody.innerHTML = '';
             if (data.top_sessions.length === 0) {
-                topTbody.innerHTML = '<tr><td colspan="6" class="stats-empty">No sessions yet.</td></tr>';
+                topTbody.innerHTML = '<tr><td colspan="7" class="stats-empty">No sessions yet.</td></tr>';
             }
             for (const s of data.top_sessions) {
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td>${fmtTimestamp(s.started_at)}</td>
-                    <td>${s.primary_model || ''}</td>
+                    <td>${escapeHtml(s.primary_model || '')}</td>
                     <td class="num">${fmtNum(s.input)}</td>
                     <td class="num">${fmtNum(s.output)}</td>
                     <td class="num">${fmtNum(s.cache_read + s.cache_creation)}</td>
                     <td class="num"><strong>${fmtNum(s.total)}</strong></td>
+                    <td class="num">${fmtUsd(s.cost_usd)}</td>
                 `;
                 topTbody.appendChild(tr);
             }

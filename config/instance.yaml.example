@@ -1217,14 +1217,33 @@ facts:
   single_valued_edges: ["owned_by", "for_client"]
 
 
-# --- Document extraction (optional, off by default) ---
-# Runs document extraction (crawl -> convert -> anonymize -> ingest) as its
-# OWN worker lane, driven by the `corpus-extraction` job kind
-# (app/worker/kinds.py) — its own process when run via the
-# `extraction-worker` compose service, so a corpus re-extraction never
-# competes with, or blocks, ordinary table syncs (spec §7.5 "Extraction
-# inside Agnes", §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-
-# over-collections-design.md).
+# --- SharePoint connector (optional, off by default) ---
+# ONE switch for the WHOLE SharePoint connector (2026-09-01 flag
+# consolidation): the connect wizard and every /api/admin/sharepoint/*
+# admin route (409 feature_disabled when off), document crawling/
+# extraction (the `extraction:` block below — the corpus-extraction job,
+# the extraction.schedule sweep, the Graph change-notification receiver at
+# POST /api/webhooks/sharepoint/{connection_id}, 404 when off), and
+# source-ACL mirroring (the `acl_sync:` block below — permission zones,
+# always on whenever the connector is on, and the fact/upload ingest
+# gate). Per-scope choices (access_mode='mirrored', anonymize) stay in the
+# connect wizard regardless of this switch.
+#
+# `sharepoint.enabled` is a registered switch (app/switches.py) — set it
+# here, or via AGNES_SHAREPOINT_ENABLED (see docs/feature-flags.md).
+sharepoint:
+  enabled: false
+
+
+# --- Document extraction worker lane (optional, gated by sharepoint.enabled above) ---
+# Runs document extraction (crawl -> convert -> anonymize -> extract ->
+# ingest against POST /api/facts/ingest) as its OWN worker lane, driven by
+# the `corpus-extraction` job kind (app/worker/kinds.py) — its own process
+# when run via the `extraction-worker` compose service / the Dockerfile's
+# `worker` build target, so a corpus re-extraction never competes with, or
+# blocks, ordinary table syncs (spec §7.5 "Extraction inside Agnes (later)",
+# §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
+# collections-design.md).
 #
 # The pipeline is BUILT IN (owner decision 2026-08-31 — one pipeline, no
 # dual modes): connectors/sharepoint/crawler.py crawls, converts and (where
@@ -1247,14 +1266,21 @@ facts:
 # connectors/sharepoint/settings.py already does for the SharePoint admin
 # UI. Nothing is passed on a command line, because there is no command line.
 #
-# `extraction.enabled` is a registered switch (app/switches.py) — set it
-# here, or via AGNES_EXTRACTION_ENABLED (see docs/feature-flags.md). It is
-# NOT editable from /admin/server-config (locked: requires the
-# extraction-worker deployment) — this is operator/deploy-time config, not
-# a runtime toggle. The rest of this block (`schedule`, `timeout_s`,
-# `crawler`, `anonymization`) is plain instance data, read via get_value.
+# This block carries no switch of its own — the connector's on/off state
+# lives on `sharepoint.enabled` above. Its leaves ARE editable from
+# /admin/server-config (`producer.command`/`.module`/`.env_passthrough`,
+# `schedule`, `timeout_s`), reversing this section's original
+# deploy-time-only stance. `producer.command` and `producer.module` each
+# still honor their own deploy-time env var
+# (AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)
+# AHEAD of a value set here or via the panel — a Terraform-provisioned
+# instance shows those two leaves read-only in the panel ("set by
+# deployment (Terraform)") and a save touching one 409s
+# (`field_locked_by_deployment`) instead of persisting a value the running
+# process would never read. `schedule`/`timeout_s`/`env_passthrough` carry
+# no such override and are always plain writable instance data.
 #
-# Flipping `enabled` here is NOT, by itself, enough to run the
+# Flipping `sharepoint.enabled` above is NOT, by itself, enough to run the
 # extraction-worker compose service. That service sets AGNES_ROLE=worker
 # (a role split), which makes the deployment multi-process — see
 # `deployment.role` and `coordination.backend` above, and
@@ -1264,7 +1290,52 @@ facts:
 # Without those, `app/startup_guards.py::validate_deployment` refuses to
 # boot the worker container.
 extraction:
-  enabled: false
+  # How many `corpus-extraction` jobs the extraction lane runs at once
+  # (Stage 1 of Agnes-owned extraction parallelism — before this, the ONLY
+  # parallelism was inside the external producer's own `--workers` flag;
+  # this made multiple SharePoint CONNECTIONS extract strictly one-at-a-
+  # time). Different connections only — the per-connection idempotency key
+  # (app/api/admin_sharepoint.py::_extraction_idempotency_key) still
+  # prevents two jobs for the SAME connection from ever coexisting,
+  # unaffected by this setting. AGNES_EXTRACTION_CONCURRENCY (env) overrides
+  # this at runtime; either way it is resolved ONCE when the worker process
+  # starts (app/worker/runtime.py::_extraction_concurrency) — changing it
+  # needs a worker restart, not just an admin-panel edit. Invalid or
+  # out-of-[1, 8]-range values are clamped/defaulted with a logged warning,
+  # never a crash.
+  #
+  # SIZING: each slot is a FULL producer subprocess — its own crawl workers
+  # plus an LLM pass — not a lightweight thread. The `extraction-worker`
+  # compose service's default 4g/2cpu (AGNES_EXTRACTION_WORKER_MEM_LIMIT/
+  # _CPUS in docker-compose.yml) assumes exactly ONE concurrent producer
+  # run; raising `concurrency` without raising those two env vars in lock
+  # step risks OOM/CPU starvation under N concurrent producers.
+  concurrency: 1
+  producer:
+    # Full command line for the producer entrypoint, e.g.:
+    #   command: "python -m your_producer.run"
+    # OR, when the worker image installed it as a package (see the
+    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
+    #   module: your_producer.run
+    # `command` wins when both are set. Either form MAY be a YAML list
+    # instead of a string, taken verbatim (no shell-splitting needed then).
+    #
+    # Both also have an env override — AGNES_EXTRACTION_PRODUCER_COMMAND /
+    # AGNES_EXTRACTION_PRODUCER_MODULE — which wins over the yaml value here,
+    # same env-overrides-instance.yaml posture as `sharepoint.enabled` above.
+    # This is what lets a deploy-time mechanism (e.g. a Terraform module rendering
+    # /opt/agnes/.env) activate the producer without an applier-owned edit
+    # of this file on the VM's data disk. Unlike the yaml key, the env
+    # override for `command` is ALWAYS a plain string split with
+    # `shlex.split` — a YAML/JSON list is not supported via env.
+    command: ""
+    module: ""
+    # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
+    # from this process's own environment, beyond the curated non-secret
+    # allowlist below (PATH/locale/timezone/tempdir/TLS/proxy vars). Empty
+    # by default. Only the NAMES listed here are copied — this is not a way
+    # back to forwarding the whole environment.
+    env_passthrough: []
   # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
   # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
   # driving a scheduler row (`extraction-run-due`, see
@@ -1275,9 +1346,10 @@ extraction:
   # per-connection schedule, one clock applied to every connection.
   # Empty (the default) disables the sweep entirely — no scheduler row is
   # registered — same "off unless explicitly turned on" posture as
-  # `enabled` above. An admin can still trigger a one-off run at any time
-  # via `POST /api/admin/sharepoint/connections/{id}/extract` regardless of
-  # this setting (subject to the same readiness gate).
+  # `sharepoint.enabled` above. An admin can still trigger a one-off run at
+  # any time via `POST /api/admin/sharepoint/connections/{id}/extract`
+  # regardless of this setting (subject to the same
+  # sharepoint.enabled/producer-configured gate).
   # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
   schedule: ""
   # Wall-clock bound on ONE extraction run, in seconds. This is the only
@@ -1340,21 +1412,13 @@ extraction:
 # Microsoft Graph change-notification receiver for SharePoint connections —
 # POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
 # drive push near-real-time notifications instead of Agnes waiting for
-# extraction.schedule above. A SEPARATE top-level section from `extraction:`
-# on purpose (see app/switches.py's `extraction_webhook_enabled` entry): that
-# section's own `enabled` flag is deployment-locked (needs a worker lane +
-# producer), while this one is a plain, always-editable route gate.
-#
-# Off by default: the whole route answers 404 when off. Gates the RECEIVER
-# route only — a notification it accepts still needs `extraction.enabled` +
-# a configured producer + a worker polling the `extraction` lane to actually
+# extraction.schedule above. Gated by `sharepoint.enabled` above (404 when
+# off) — no separate flag; a notification it accepts still needs a
+# configured producer + a worker polling the `extraction` lane to actually
 # run the resulting `corpus-extraction` job. Agnes never creates, renews, or
 # deletes the Graph subscription itself; an operator runs the producer's own
 # `subscriptions.py create --url <webhook_url>` against the URL + secret
 # `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
-# AGNES_EXTRACTION_WEBHOOK_ENABLED overrides this at the environment level.
-extraction_webhook:
-  enabled: false
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
@@ -1372,23 +1436,21 @@ studio:
   enabled: false
 
 
-# --- SharePoint ACL mirroring (optional, off by default) ---
+# --- SharePoint ACL mirroring (optional, gated by sharepoint.enabled above) ---
 # Mirrors source-system (SharePoint) permissions into Agnes — groups,
 # memberships, collection grants, broken-inheritance exclusions and
 # index-time audience variants — as a third source-segregated sync writer
 # (the same pattern as the Google-nightly group sync). See
 # docs/superpowers/specs/2026-08-28-sharepoint-acl-mirroring-design.md.
 #
-# `acl_mirroring.enabled` / `acl_sync.guarantee_mode` / `acl_sync.
-# max_stale_hours` are registered switches (app/switches.py) — set them
-# here, via the settings panel, or their env vars (see
-# docs/feature-flags.md), not by hand-editing some other key.
-# acl_mirroring:
-#   # Gates the sharepoint-acl-sync job, per-scope access_mode='mirrored',
-#   # and the admin sync-now endpoint. OFF by default — turning it on
-#   # changes nothing until a scope opts into mirroring. Env override:
-#   # AGNES_ACL_MIRRORING_ENABLED.
-#   enabled: false
+# This block carries no switch of its own — the connector's on/off state
+# lives on `sharepoint.enabled` above (gates the sharepoint-acl-sync job,
+# per-scope access_mode='mirrored', and the admin sync-now endpoint; OFF by
+# default — turning it on changes nothing until a scope opts into
+# mirroring). `acl_sync.guarantee_mode` / `acl_sync.max_stale_hours` below
+# ARE registered switches (app/switches.py) — set them here, via the
+# settings panel, or their env vars (see docs/feature-flags.md), not by
+# hand-editing some other key.
 #
 # acl_sync:
 #   # Cross-audience-leak posture (design Q7). must_not (default): fail

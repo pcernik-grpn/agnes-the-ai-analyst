@@ -17,20 +17,23 @@ from fastapi import APIRouter, Depends, Query
 
 from app.auth.access import require_admin
 from app.api.activity import _should_audit
+from app.services import usage_stats
 
 from src.repositories import (
     audit_repo,
     usage_repo,
+    users_repo,
 )
+
 router = APIRouter(prefix="/api/admin/telemetry", tags=["admin-telemetry"])
 logger = logging.getLogger(__name__)
 
 _GROUP_BY_COLUMNS = {
-    "day":       ("CAST(occurred_at AS DATE)", "day"),
-    "username":  ("username", "username"),
+    "day": ("CAST(occurred_at AS DATE)", "day"),
+    "username": ("username", "username"),
     "tool_name": ("tool_name", "tool_name"),
-    "source":    ("source", "source"),
-    "ref_id":    ("ref_id", "ref_id"),
+    "source": ("source", "source"),
+    "ref_id": ("ref_id", "ref_id"),
 }
 
 
@@ -68,7 +71,7 @@ def usage_summary(
     dau_dict = repo.summary_dau(dau_start)
     dau_series = []
     for i in range(30):
-        d = (dau_start + timedelta(days=i))
+        d = dau_start + timedelta(days=i)
         dau_series.append({"day": d.isoformat(), "active_users": dau_dict.get(d, 0)})
     dau_avg = sum(s["active_users"] for s in dau_series) / 30 if dau_series else 0
 
@@ -120,9 +123,9 @@ def usage_facets(
     facets = usage_repo().telemetry_facets(since)
     return {
         "window_minutes": since_minutes,
-        "users":       facets["users"],
-        "tools":       facets["tools"],
-        "sources":     facets["sources"],
+        "users": facets["users"],
+        "tools": facets["tools"],
+        "sources": facets["sources"],
         "event_types": facets["event_types"],
     }
 
@@ -138,28 +141,72 @@ def usage_kpis(
     q: Optional[str] = None,
     _user: dict = Depends(require_admin),
 ):
-    """Four headline numbers, scoped to the same filters as /query.
+    """Four headline numbers, scoped to the same filters as /query — plus what
+    the window cost.
 
     The cards on /admin/usage echo these as clickable quick-filters, so the
     server applies the same WHERE the table will see — otherwise the cards
     and the table tell different stories at the same time.
+
+    ``cost_usd`` is the one figure here NOT read from ``usage_events``: token
+    counts live on session summaries, so it comes from the shared read model
+    (``app.services.usage_stats``) over the same user and window, rounded up to
+    whole days. The narrower event filters (tool/source/event_type/only_errors)
+    do not apply to it — it prices everything the selected user spent in the
+    window, which is the same number /me/activity and the adoption drill-down
+    report for them. It is ``null`` when it cannot be computed rather than a
+    zero that would read as "free": an unresolvable ``username``, or an
+    instance-wide read on a backend without the Postgres-only ``usage_turns``
+    table.
     """
     since = _usage_window_cutoff(since_minutes)
-    k = usage_repo().telemetry_kpis({
-        "since": since, "username": username, "tool_name": tool_name,
-        "source": source, "event_type": event_type,
-        "only_errors": only_errors, "q": q,
-    })
+    k = usage_repo().telemetry_kpis(
+        {
+            "since": since,
+            "username": username,
+            "tool_name": tool_name,
+            "source": source,
+            "event_type": event_type,
+            "only_errors": only_errors,
+            "q": q,
+        }
+    )
     total = k["events_total"]
     error_rate = (k["errors"] / total) if total else 0.0
     return {
         "window_minutes": since_minutes,
-        "events_total":   total,
+        "events_total": total,
         "distinct_users": k["distinct_users"],
         "distinct_tools": k["distinct_tools"],
-        "errors":         k["errors"],
-        "error_rate":     round(error_rate, 4),
+        "errors": k["errors"],
+        "error_rate": round(error_rate, 4),
+        "cost_usd": _window_cost(username, since_minutes),
     }
+
+
+def _window_cost(username: Optional[str], since_minutes: int) -> Optional[float]:
+    """USD spent in the window by the filtered user (all users when the filter
+    is absent), or ``None`` when the scope cannot be resolved.
+
+    A ``username`` filter carries whatever ``usage_events.username`` holds — the
+    email since the v60 canonicalization, its local-part on older rows — while
+    the usage read model keys on ``users.id``. Resolving it here (exact email
+    first, then local-part) is what lets one KPI card and the adoption
+    drill-down agree about one person. An unresolvable filter yields ``None``:
+    silently widening to the instance would put every user's spend on a card
+    that says it is showing one.
+    """
+    days = max(1, -(-since_minutes // 1440))  # ceil, so a sub-day window still reads a day
+    if username is None:
+        return usage_stats.cost_usd_for_user(None, days)
+    try:
+        target = users_repo().get_by_email_ci(username) or users_repo().get_by_email_prefix(username)
+    except Exception:  # pragma: no cover - defensive, a KPI card must not 500
+        logger.exception("could not resolve username %r for cost attribution", username)
+        return None
+    if not target or not target.get("id"):
+        return None
+    return usage_stats.cost_usd_for_user(target["id"], days)
 
 
 @router.get("/query")
@@ -196,9 +243,13 @@ def usage_query(
 
     return usage_repo().usage_query(
         {
-            "since": since, "username": username, "tool_name": tool_name,
-            "source": source, "event_type": event_type,
-            "only_errors": only_errors, "q": q,
+            "since": since,
+            "username": username,
+            "tool_name": tool_name,
+            "source": source,
+            "event_type": event_type,
+            "only_errors": only_errors,
+            "q": q,
         },
         group_by=group_by,
         sort_col=sort_col,

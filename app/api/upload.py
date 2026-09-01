@@ -10,7 +10,7 @@ import uuid
 import zlib
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.auth.dependencies import get_current_user
@@ -18,6 +18,7 @@ from app.auth.rate_limit import limiter as _rate_limiter
 from app.utils import get_data_dir as _get_data_dir
 from app.utils import local_md_filename as _local_md_filename
 from app.utils import uploaded_local_md_dir as _uploaded_local_md_dir
+from services.session_pipeline.runner import process_single_session
 from src.audit_helpers import client_kind_from_user, log_safe
 
 from src.repositories import (
@@ -132,10 +133,17 @@ async def _stream_to_temp_gunzip(file: UploadFile) -> tuple[tempfile.NamedTempor
 
 @router.post("/sessions")
 async def upload_session(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
-    """Upload a Claude session transcript (JSONL)."""
+    """Upload a Claude session transcript (JSONL).
+
+    The stored file is handed to the usage processor immediately (background
+    task), so its tokens show up in usage data seconds after the push instead
+    of on the next ten-minute sweep. The sweep stays as the catch-up path for
+    collector-ingested files and for one-shots that fail here.
+    """
     user_id = user["id"]
 
     if not _FILENAME_RE.match(file.filename or ""):
@@ -185,6 +193,13 @@ async def upload_session(
         )
     except Exception:
         logger.exception("audit_log write failed for session.upload; continuing")
+
+    # Realtime usage ingest. Scheduled rather than awaited so the uploader
+    # never waits on (or fails because of) telemetry: the one-shot returns
+    # False instead of raising, and the ten-minute sweep re-reads any file it
+    # could not process. Re-processing is a no-op either way — both paths
+    # share the `session_processor_state` hash ledger.
+    background.add_task(process_single_session, user_id, filename)
 
     return {"status": "ok", "filename": filename, "size": size}
 

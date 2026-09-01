@@ -1365,8 +1365,11 @@ AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
 # instance.yaml — the SAME env-overrides-yaml posture as
 # AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
 # what makes this flag alone activate the lane end to end, with no
-# applier-owned instance.yaml edit on the VM's data disk.
-AGNES_EXTRACTION_ENABLED=1
+# applier-owned instance.yaml edit on the VM's data disk. The whole
+# SharePoint connector — not just extraction — shares the ONE `sharepoint`
+# switch (2026-09-01 flag consolidation), so this line also turns on the
+# connect wizard, admin routes, and ACL mirroring on this VM.
+AGNES_SHAREPOINT_ENABLED=1
 AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE

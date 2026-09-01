@@ -211,6 +211,12 @@ _DELETE_200_WITH_BODY_ALLOWLIST = frozenset(
         # model's current `package_ids` so the CLI/UI can redraw without a
         # follow-up GET. response_model=SemanticModelPackageIds.
         "/api/admin/semantic-models/{slug}/packages/{package_id}",
+        # Untick tells the wizard whether the scope's collection was kept
+        # (it holds indexed files → the admin is pointed at the Library for
+        # the deliberate delete) or tidied away because it was empty — a
+        # fact only this write can report, not a follow-up read.
+        # response_model=ScopeRemovalOut.
+        "/api/admin/sharepoint/connections/{connection_id}/scopes",
     }
 )
 
@@ -336,7 +342,7 @@ _PUBLIC_API_PATHS = frozenset(
         "/api/health/detailed",
         "/api/version",
         # Microsoft Graph change-notification receiver — Graph is the only
-        # caller; gated by extraction_webhook.enabled (404 when off), never
+        # caller; gated by the sharepoint switch (404 when off), never
         # a session/PAT (app/api/sharepoint_webhooks.py). Mirrors app/main.py's
         # own _PUBLIC_API_PATHS.
         "/api/webhooks/sharepoint/{connection_id}",

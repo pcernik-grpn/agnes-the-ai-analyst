@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from src.remote_engines import strip_one_trailing_semicolon
@@ -64,6 +64,11 @@ class InternalTable:
     display_name: str
     description: str
     legacy_username_column: str | None = None  # backward-compat OR fallback
+    # Per-column descriptions served by /api/v2/schema (and therefore
+    # `agnes schema`). This text is the ONLY column documentation an LLM
+    # gets before writing SQL against the table — keep it factual and
+    # disambiguating, not decorative.
+    column_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 INTERNAL_TABLES: tuple[InternalTable, ...] = (
@@ -73,8 +78,40 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
         filter_column="user_id",
         filter_kind="user_id",
         display_name="Agnes sessions",
-        description="Claude Code sessions. Also available locally for analysis.",
+        description=(
+            "One row per Claude Code or chat session with activity counters and "
+            "summed token usage. You see your own sessions only (admins see all). "
+            "Server-side only — query with `agnes query`; there is no local copy."
+        ),
         legacy_username_column="username",
+        column_descriptions={
+            "session_file": "Storage key of the session transcript (`<dir>/<file>.jsonl`; chat sessions use `chat-<id>.jsonl`). Joins to agnes_turns.session_file by basename.",
+            "session_id": "The session's UUID as assigned by Claude Code / the chat runtime.",
+            "username": "Display identity — the user's full email (legacy rows may carry other key forms). For joins and filters prefer user_id.",
+            "user_id": "Canonical owner key (users.id). The row-level filter and all dashboards key on this.",
+            "started_at": "Timestamp of the first event in the session.",
+            "ended_at": "Timestamp of the last event in the session.",
+            "active_seconds": "Seconds with actual activity (gaps between events capped), i.e. hands-on time.",
+            "wall_seconds": "ended_at minus started_at — elapsed wall-clock time including idle gaps.",
+            "user_messages": "Count of user prompts in the session.",
+            "assistant_messages": "Count of assistant turns.",
+            "tool_calls": "Total tool invocations.",
+            "tool_errors": "Tool invocations that returned an error.",
+            "skill_invocations": "Skill (slash-command package) invocations.",
+            "subagent_dispatches": "Sub-agent (Task tool) dispatches.",
+            "mcp_calls": "MCP tool calls.",
+            "slash_commands": "Slash-command invocations.",
+            "distinct_tools": "Number of distinct tools used.",
+            "distinct_skills": "Number of distinct skills used.",
+            "primary_model": "Model that served most of the session's turns.",
+            "input_tokens": "Summed uncached input tokens across assistant turns (excludes cache reads/writes).",
+            "output_tokens": "Summed output tokens across assistant turns.",
+            "cache_read_tokens": "Summed prompt-cache READ tokens (input served from cache; billed far below input_tokens).",
+            "cache_creation_tokens": "Summed prompt-cache WRITE tokens (input written into cache; billed above input_tokens).",
+            "processor_version": "Version of the usage processor that produced this row (bumps trigger reprocessing).",
+            "extracted_at": "When the usage processor last (re)computed this row.",
+            "uploaded_at": "When the session file arrived on the server (upload or collector).",
+        },
     ),
     InternalTable(
         registry_id="agnes_telemetry",
@@ -82,8 +119,35 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
         filter_column="user_id",
         filter_kind="user_id",
         display_name="Agnes telemetry events",
-        description="Tool and skill invocations from Claude Code. Also available locally for analysis.",
+        description=(
+            "One row per tool/skill/sub-agent/MCP/slash-command event from your own "
+            "sessions (admins see all users). No token columns — token usage lives "
+            "in agnes_sessions (per session) and agnes_turns (per turn). Server-side "
+            "only; query with `agnes query`."
+        ),
         legacy_username_column="username",
+        column_descriptions={
+            "session_file": "Storage key of the originating session; join to agnes_sessions.session_file.",
+            "session_id": "UUID of the originating session.",
+            "username": "Display identity (full email). Prefer user_id for joins and filters.",
+            "user_id": "Canonical owner key (users.id); the row-level filter keys on this.",
+            "event_uuid": "UUID of the transcript event this row was extracted from.",
+            "parent_uuid": "UUID of the parent transcript event (threading).",
+            "event_type": "Kind of event: tool_use, slash_command, subagent, mcp_call, chat.message, …",
+            "tool_name": "Tool invoked, when event_type is a tool use.",
+            "skill_name": "Skill invoked, when applicable.",
+            "subagent_type": "Sub-agent type, when the event is a Task dispatch.",
+            "command_name": "Slash command, when applicable.",
+            "is_error": "True when the invocation returned an error.",
+            "source": "Where the invoked item came from: curated | flea | builtin | server.",
+            "ref_id": "Marketplace/item reference for the invoked tool or skill, when known.",
+            "model": "Model active at the time of the event, when known.",
+            "cwd": "Working directory of the session at event time.",
+            "occurred_at": "Event timestamp.",
+            "friction_tags": "JSON list of detected friction signals for the event (e.g. retries), when any.",
+            "processor_version": "Version of the usage processor that produced this row.",
+            "extracted_at": "When the usage processor last (re)computed this row.",
+        },
     ),
     InternalTable(
         registry_id="agnes_audit",
@@ -91,7 +155,62 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
         filter_column="user_id",
         filter_kind="user_id",
         display_name="Agnes audit log",
-        description="Server-side actions performed against Agnes. Also available locally for analysis.",
+        description=(
+            "Server-side audit trail of your own actions against this Agnes "
+            "instance — API calls, queries, syncs, admin operations (admins see "
+            "all users). Server-side only; query with `agnes query`."
+        ),
+        column_descriptions={
+            "timestamp": "When the action happened.",
+            "user_id": "Who performed it (users.id); the row-level filter keys on this.",
+            "action": "Dotted action name from the audit catalog (e.g. query.local, session.upload).",
+            "resource": "Entity the action touched (e.g. table:<id>, data_package:<id>), when any.",
+            "params": "JSON parameters recorded for the action (sanitized).",
+            "result": "Outcome: success, denied, error, …",
+            "duration_ms": "Server-side duration of the action in milliseconds, when measured.",
+            "params_before": "JSON snapshot of the previous state for mutating actions, when recorded.",
+            "client_ip": "Caller IP as derived from trusted proxy hops.",
+            "client_kind": "Kind of caller credential: web session, PAT, scheduler, …",
+            "correlation_id": "Request correlation id for joining related audit rows.",
+        },
+    ),
+    # Postgres-only: `usage_turns` landed after the A3 freeze (Alembic
+    # revision 0094, no `src/db.py` ladder step), so it exists on the
+    # Postgres app-state backend alone. The tuple is static — the derived
+    # constants below are built at import time — and the BACKEND decides
+    # whether the id is registered, in
+    # `connectors.internal.registry.ensure_internal_tables_registered`. No
+    # `legacy_username_column`: `usage_turns` has no `username` column, so
+    # the OR fallback the older tables carry would be a Binder error here.
+    InternalTable(
+        registry_id="agnes_turns",
+        source_table="usage_turns",
+        filter_column="user_id",
+        filter_kind="user_id",
+        display_name="Agnes turns",
+        description=(
+            "One row per assistant turn with its exact token usage incl. prompt "
+            "cache, across Claude Code and every chat surface — your own rows only "
+            "(admins see all). The finest token granularity available; sums roll up "
+            "to agnes_sessions. Postgres-backed instances only. Server-side only; "
+            "query with `agnes query`."
+        ),
+        column_descriptions={
+            "session_file": "Basename key of the owning session (`<file>.jsonl`; chat turns use `chat-<id>.jsonl`). Join to agnes_sessions.session_file by basename.",
+            "session_id": "UUID of the owning session.",
+            "user_id": "Canonical owner key (users.id); the row-level filter keys on this.",
+            "surface": "Where the turn happened: claude_code, web, slack_dm, slack_thread, telegram, …",
+            "turn_uuid": "Unique id of the turn within its session file (idempotency key with session_file).",
+            "parent_uuid": "UUID of the parent transcript event, when known.",
+            "model": "Model that served this turn.",
+            "input_tokens": "Uncached input tokens for this turn.",
+            "output_tokens": "Output tokens for this turn.",
+            "cache_read_tokens": "Prompt-cache READ tokens (input served from cache; billed far below input_tokens).",
+            "cache_creation_tokens": "Prompt-cache WRITE tokens (input written into cache; billed above input_tokens).",
+            "occurred_at": "Turn timestamp.",
+            "processor_version": "Usage-processor version for processor-written rows (0 for live chat writes).",
+            "extracted_at": "When the row was written.",
+        },
     ),
 )
 

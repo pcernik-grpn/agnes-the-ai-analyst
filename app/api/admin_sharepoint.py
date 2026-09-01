@@ -1,7 +1,16 @@
 """Admin REST API for the SharePoint file-source connect wizard (spec
 2026-08-27 §13.2 — "Connect wizard (file source): three steps").
 
-Surface (all gated by ``Depends(require_admin)``):
+Every route on this router is gated FIRST by the module-level
+``dependencies=[Depends(_require_sharepoint_enabled)]`` — the whole SharePoint
+admin surface answers ``409 feature_disabled`` when the single ``sharepoint``
+switch (``app/switches.py``) is off, before any per-route auth even runs. On
+top of that, most individual routes are also gated by ``Depends(require_admin)``
+(a couple by ``Depends(require_admin_or_producer_connection(...))`` for the
+corpus-extraction producer's own callback reads — see those routes' own
+docstrings).
+
+Surface:
 
   GET    /api/admin/sharepoint/connections/{id}/tree        — one level of the live
                                                                 Graph folder tree
@@ -87,20 +96,22 @@ Surface (all gated by ``Depends(require_admin)``):
                                                                 (``connectors/sharepoint/
                                                                 acl_sync.py::run_acl_sync``). Same
                                                                 enqueue/dedup mechanics as
-                                                                ``.../extract`` above; refuses with
-                                                                ``409 feature_disabled`` when
-                                                                ``acl_mirroring.enabled`` is off.
+                                                                ``.../extract`` above; the
+                                                                router-level ``sharepoint.enabled``
+                                                                gate already refuses with ``409
+                                                                feature_disabled`` when the
+                                                                connector is off.
   POST   /api/admin/sharepoint/connections/{id}/subtree-sweep  — admin "re-check subtrees now"
                                                                 trigger (2026-08-31 plan, Task 8)
                                                                 for the ``sharepoint-subtree-sweep``
                                                                 job (``connectors/sharepoint/
                                                                 acl_sync.py::run_subtree_sweep``).
-                                                                Identical enqueue/dedup/flag-gate
-                                                                mechanics to ``.../acl-sync``
-                                                                above — the explicit-connection
-                                                                payload bypasses the job's own
-                                                                per-connection due-guard, so this
-                                                                is always a real, immediate sweep.
+                                                                Identical enqueue/dedup mechanics
+                                                                to ``.../acl-sync`` above — the
+                                                                explicit-connection payload bypasses
+                                                                the job's own per-connection
+                                                                due-guard, so this is always a real,
+                                                                immediate sweep.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -119,7 +130,11 @@ Idempotency: confirming the SAME ``source_scope_id`` twice reuses the
 existing row's ``collection_id`` rather than creating a second collection —
 the storage anchor is the source scope id, not the display path (§6's
 "stored by source folder/drive id, not by path" principle, applied to the
-wizard's own bookkeeping as well as the eventual document anchor).
+wizard's own bookkeeping as well as the eventual document anchor). The same
+anchor survives an untick: :func:`remove_scope` tombstones the scope's
+collection under ``config.retired_scope_collections`` so a later re-tick
+re-adopts it (see :func:`_readopted_scope_collection_id`) instead of
+minting a duplicate.
 """
 
 from __future__ import annotations
@@ -158,6 +173,7 @@ from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
     corpus_file_events_repo,
+    corpus_files_repo,
     file_corpora_repo,
     resource_grants_repo,
     source_connections_repo,
@@ -166,7 +182,38 @@ from src.repositories import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
+
+def _require_sharepoint_enabled() -> None:
+    """Router-level dependency: refuse the whole SharePoint admin surface
+    with a typed ``409 feature_disabled`` when the ``sharepoint`` switch
+    (``app/switches.py``) is off.
+
+    ``409``, not ``404``: unlike the anonymous Graph webhook receiver
+    (``app/api/sharepoint_webhooks.py``'s ``require_sharepoint_enabled`` in
+    ``app/auth/access.py``, which 404s because Graph is an unauthenticated
+    caller that never had a route to discover), every route here already
+    requires admin (or a scoped producer credential) — a reachable,
+    authenticated caller being told a KNOWN feature is off is exactly what
+    409 means elsewhere in this module (``extraction_disabled``,
+    ``acl_sync_already_running``, ...).
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "feature_disabled",
+                "message": "sharepoint.enabled is false — enable it in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
+            },
+        )
+
+
+router = APIRouter(
+    prefix="/api/admin/sharepoint",
+    tags=["admin"],
+    dependencies=[Depends(_require_sharepoint_enabled)],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +283,24 @@ class ConfirmScopeBody(BaseModel):
     audience_classes: Optional[List[AudienceClassIn]] = None
 
 
+class ScopeCollectionRef(BaseModel):
+    """The collection a scope maps to — same trio ``_scope_out`` projects."""
+
+    id: str
+    slug: str
+    name: str
+
+
+class ScopeRemovalOut(BaseModel):
+    """What untick did to the scope's collection (see :func:`remove_scope`):
+    ``collection_kept=True`` carries the kept collection's ref so the wizard
+    can point the admin at the Library for the deliberate delete; ``False``
+    means it was empty and tidied away (or already gone)."""
+
+    collection_kept: bool
+    collection: Optional[ScopeCollectionRef] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -269,7 +334,11 @@ class ConfirmScopeBody(BaseModel):
 #: (2026-08-29, same day, TCRD-226) both did before this ratchet existed.
 #: ``webhook_secret`` is the third instance of this same class — added
 #: here in the same change that introduces the writer, not after.
-SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret")
+#: ``retired_scope_collections`` (2026-08-31) is the fourth: the
+#: untick tombstones :func:`remove_scope` writes so :func:`confirm_scope`
+#: can re-adopt a scope's previous collection on re-tick instead of minting
+#: a duplicate.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret", "retired_scope_collections")
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -622,6 +691,43 @@ def _create_scope_collection(*, connection_name: str, display_path: str, source_
         return repo.create(name=name, slug=f"{slug}-{suffix}", description=description, created_by=created_by)
 
 
+def _readopted_scope_collection_id(tombstone: Any) -> Optional[str]:
+    """The collection a re-ticked scope should re-adopt, or ``None`` to mint.
+
+    ``tombstone`` is :func:`remove_scope`'s ``retired_scope_collections``
+    entry for this scope — ``{"collection_id": ..., "auto_deleted": bool}``,
+    the provenance that keys re-adoption on ``(connection, source_scope_id)``
+    rather than on slug/name text (both derive from the mutable
+    ``display_path``, so matching on them would fork on any rename).
+
+    Two branches, deliberately asymmetric:
+
+    * ``auto_deleted=True`` — :func:`remove_scope` itself soft-deleted the
+      empty collection on untick, so re-tick RESTORES it: nothing but the
+      wizard ever touched it, and its slug still holds the UNIQUE slot any
+      replacement would collide with (``_create_scope_collection``'s
+      deterministic suffix absorbs only one collision, so mint-instead
+      500s by the second untick/re-tick cycle).
+    * ``auto_deleted=False`` — the collection was KEPT (it had files); it is
+      re-adopted only while still live. An admin's deliberate Library delete
+      in between is respected — a background flow never resurrects it.
+    """
+    if not isinstance(tombstone, dict):
+        return None
+    collection_id = tombstone.get("collection_id")
+    if not collection_id:
+        return None
+    repo = file_corpora_repo()
+    if tombstone.get("auto_deleted"):
+        husk = repo.get(collection_id, include_deleted=True)
+        if husk is None:
+            return None
+        if husk.get("deleted_at") is not None:
+            repo.restore(collection_id)
+        return collection_id
+    return collection_id if repo.get(collection_id) is not None else None
+
+
 def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     """Whether the ``corpus-extraction`` job kind can actually run right now,
     read here so an admin (or the scheduled sweep below) finds out BEFORE a
@@ -638,10 +744,10 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     deliberately importable WITHOUT the extra (its backends are imported
     lazily), so the probe has to reach past it to the backends themselves.
 
-    Both gates already honor a deploy-time env override ahead of
-    ``instance.yaml`` — ``AGNES_EXTRACTION_ENABLED`` (via
-    ``feature_enabled`` below) and ``AGNES_EXTRACTION_PRODUCER_COMMAND`` /
-    ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
+    The first gate already honors a deploy-time env override ahead of
+    ``instance.yaml`` — ``AGNES_SHAREPOINT_ENABLED`` (via ``feature_enabled``
+    below) — and the producer gate honors ``AGNES_EXTRACTION_PRODUCER_COMMAND``
+    / ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
     :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
     this function and the handler it mirrors see the identical truth
     regardless of which source (env or yaml) an instance configures
@@ -652,10 +758,10 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
         return False, {
             "error": "extraction_disabled",
-            "message": "extraction.enabled is false — enable it in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
+            "message": "sharepoint.enabled is false — enable it in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
         }
 
     try:
@@ -715,7 +821,7 @@ def _extraction_schedule_config() -> Optional[str]:
     in ``instance.yaml``'s ``extraction:`` block) — applied independently to
     each SharePoint connection's own ``last_run_at`` by
     :func:`_dispatch_extraction_if_due`. Off by default: absent/empty means
-    no scheduled sweep (mirrors ``extraction.enabled``'s own default)."""
+    no scheduled sweep (mirrors ``sharepoint.enabled``'s own default)."""
     from app.instance_config import get_value
 
     raw = get_value("extraction", "schedule", default="")
@@ -1027,8 +1133,12 @@ async def confirm_scope(
 ):
     """Confirm one selected site/library/folder as a scope.
 
-    Creates its collection on first confirmation; re-confirming the same
-    ``source_scope_id`` reuses that same collection (idempotent) and updates
+    Creates its collection on first confirmation — unless the same
+    ``source_scope_id`` was unticked earlier on this connection, in which
+    case its previous collection is re-adopted via :func:`remove_scope`'s
+    tombstone (see :func:`_readopted_scope_collection_id`) rather than a
+    duplicate minted. Re-confirming a LIVE scope (same
+    ``source_scope_id``) reuses that same collection (idempotent) and updates
     ``display_path``/``anonymize``/``access_mode``/``drive_id`` in place — a
     rename or move in the source does not fork a second collection (§6
     applied to the wizard's own bookkeeping). ``group_ids``, **if the field
@@ -1127,6 +1237,12 @@ async def confirm_scope(
     previous_access_mode = (existing or {}).get("access_mode") or "manual"
     previous_override = bool((existing or {}).get("include_excluded_subtrees"))
 
+    # Untick tombstone for this scope, if any (see :func:`remove_scope`) —
+    # popped unconditionally: once this confirm lands, the scope row itself
+    # is the bookkeeping again and a stale tombstone would only mislead.
+    retired = dict((row.get("config") or {}).get("retired_scope_collections") or {})
+    tombstone = retired.pop(body.source_scope_id, None)
+
     if existing is not None:
         collection_id = existing["collection_id"]
         existing["display_path"] = body.display_path
@@ -1135,12 +1251,18 @@ async def confirm_scope(
         existing["drive_id"] = body.drive_id
         existing["include_excluded_subtrees"] = body.include_excluded_subtrees
     else:
-        collection_id = _create_scope_collection(
-            connection_name=row.get("name") or connection_id,
-            display_path=body.display_path,
-            source_scope_id=body.source_scope_id,
-            created_by=user.get("id"),
-        )
+        # Re-adopt before minting: unticking and re-ticking the SAME folder
+        # must map back to the scope's previous collection, never fork a
+        # slug-suffixed duplicate (the pre-2026-08-31 behavior, which left
+        # an orphaned 0-file collection next to its re-tick twin).
+        collection_id = _readopted_scope_collection_id(tombstone)
+        if collection_id is None:
+            collection_id = _create_scope_collection(
+                connection_name=row.get("name") or connection_id,
+                display_path=body.display_path,
+                source_scope_id=body.source_scope_id,
+                created_by=user.get("id"),
+            )
         scopes.append(
             {
                 "source_scope_id": body.source_scope_id,
@@ -1170,6 +1292,8 @@ async def confirm_scope(
     # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
     # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": scopes}
+    if tombstone is not None:
+        new_config["retired_scope_collections"] = retired
     source_connections_repo().update(connection_id, config=new_config)
 
     # Audit the override TRANSITION only (false -> true) — never on a
@@ -1228,17 +1352,31 @@ async def confirm_scope(
     return _scope_out(updated_row, connection=row)
 
 
-@router.delete("/connections/{connection_id}/scopes", status_code=204)
+@router.delete("/connections/{connection_id}/scopes", response_model=ScopeRemovalOut)
 async def remove_scope(
     connection_id: str,
     source_scope_id: str,
     _user: dict = Depends(require_admin),
 ):
     """Unselect a scope — an explicit exclusion (spec §13.2: "unselected rows
-    are explicit exclusions"). Removes the wizard's own bookkeeping row only;
-    any collection already created for it is left alone (deleting a
-    collection is a separate, deliberate operation, not a side effect of
-    unchecking a wizard row).
+    are explicit exclusions"). Removes the wizard's own bookkeeping row; what
+    happens to the scope's collection depends on whether it holds data:
+
+    * **Empty (0 files)** — soft-deleted. Deleting a collection stays a
+      separate, deliberate operation where DATA is at stake, but an empty
+      scope collection has none, and keeping it is exactly what bred
+      orphaned 0-file collections (observed live 2026-08-31). The response
+      says ``collection_kept: false``.
+    * **Has files** — kept, and the response says so (``collection_kept:
+      true`` + the collection ref) so the wizard can tell the admin where to
+      delete it deliberately (the Library).
+
+    Either way a tombstone (``config.retired_scope_collections``, keyed by
+    ``source_scope_id``) records which collection this scope owned, so a
+    later re-tick of the same folder re-adopts it — restoring the
+    auto-deleted empty one, re-attaching to the kept one — instead of
+    minting a slug-suffixed duplicate (see
+    :func:`_readopted_scope_collection_id`).
 
     Its ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that
     collection do NOT survive, though (2026-08-31 plan, Task 8): with the
@@ -1247,7 +1385,9 @@ async def remove_scope(
     from a deliberate, still-maintained grant to anyone reading ``/admin/
     access``. Same removal loop :func:`confirm_scope` uses for its own
     ``mirrored`` -> ``manual`` transition; an admin-assigned grant on the
-    same collection is untouched either way.
+    same collection is untouched either way (on the kept collection it keeps
+    working; on the soft-deleted one it resurrects with it on re-tick, so
+    the share state round-trips the untick like everything else).
     """
     row = _sharepoint_connection_or_404(connection_id)
     scopes = _scopes(row)
@@ -1255,17 +1395,37 @@ async def remove_scope(
     if removed is None:
         raise HTTPException(status_code=404, detail="scope_not_found")
     remaining = [s for s in scopes if s.get("source_scope_id") != source_scope_id]
+
+    collection_id = removed.get("collection_id")
+    collection = file_corpora_repo().get(collection_id) if collection_id else None
+    kept = False
+    if collection is not None:
+        if corpus_files_repo().list_for_corpus(collection_id):
+            kept = True
+        else:
+            file_corpora_repo().soft_delete(collection_id)
+
     # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
     # adding a new key here rather than editing this one.
     new_config = {**(row.get("config") or {}), "scopes": remaining}
+    if collection is not None:
+        retired = dict((row.get("config") or {}).get("retired_scope_collections") or {})
+        retired[source_scope_id] = {"collection_id": collection_id, "auto_deleted": not kept}
+        new_config["retired_scope_collections"] = retired
     source_connections_repo().update(connection_id, config=new_config)
 
-    collection_id = removed.get("collection_id")
     if collection_id:
         grants = resource_grants_repo()
         for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
             if grant.get("resource_id") == collection_id and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
                 grants.delete(grant["id"])
+
+    return {
+        "collection_kept": kept,
+        "collection": (
+            {"id": collection["id"], "slug": collection["slug"], "name": collection["name"]} if kept else None
+        ),
+    }
 
 
 @router.get("/connections/{connection_id}/corpus-map")
@@ -1463,24 +1623,17 @@ async def trigger_acl_sync(
     ``{"connection_id": connection_id}``, the SAME mechanics as
     :func:`trigger_extraction`.
 
-    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
-    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
-    .enabled`` is off — the job handler itself would just no-op (spec §5.1
-    "the scheduler enqueues this kind unconditionally"), but a manual
-    trigger should tell the admin why nothing happened rather than return a
-    202 for a run that will do nothing.
+    404 on an unknown/non-sharepoint connection BEFORE any other work. The
+    router-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``
+    above) already refuses the whole surface with ``409 feature_disabled``
+    when the connector is off, so there is no separate per-route check here.
 
     Deduped on a STABLE per-connection idempotency key
     (:func:`_acl_sync_idempotency_key`) — a second trigger while one is
     already queued/running for this connection gets ``409
     acl_sync_already_running`` instead of a second job.
     """
-    from app.instance_config import feature_enabled
-
     _sharepoint_connection_or_404(connection_id)
-
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
 
     from src.repositories import jobs_repo
 
@@ -1523,24 +1676,17 @@ async def trigger_subtree_sweep(
     (:func:`connectors.sharepoint.acl_sync._sweep_due`), so this always
     triggers a real sweep, never a same-day no-op.
 
-    404 on an unknown/non-sharepoint connection BEFORE any other work. Then
-    refuses cleanly with ``409 feature_disabled`` when ``acl_mirroring
-    .enabled`` is off — same reasoning as :func:`trigger_acl_sync`: the job
-    handler itself would just no-op, but a manual trigger should tell the
-    admin why nothing happened rather than return a 202 for a run that will
-    do nothing.
+    404 on an unknown/non-sharepoint connection BEFORE any other work. The
+    router-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``
+    above) already refuses the whole surface with ``409 feature_disabled``
+    when the connector is off, so there is no separate per-route check here.
 
     Deduped on a STABLE per-connection idempotency key
     (:func:`_sweep_idempotency_key`) — a second trigger while one is already
     queued/running for this connection gets ``409 sweep_already_running``
     instead of a second job.
     """
-    from app.instance_config import feature_enabled
-
     _sharepoint_connection_or_404(connection_id)
-
-    if not feature_enabled("acl_mirroring", "enabled", env_var="AGNES_ACL_MIRRORING_ENABLED", default=False):
-        raise HTTPException(status_code=409, detail={"error": "feature_disabled"})
 
     from src.repositories import jobs_repo
 
@@ -1573,7 +1719,7 @@ async def run_due_extraction(
     Scheduler row: ``extraction-run-due`` in
     ``services/scheduler/__main__.py``, registered only when
     ``extraction.schedule`` is configured (absent/empty = off, same
-    default posture as ``extraction.enabled``).
+    default posture as ``sharepoint.enabled``).
 
     A clean, typed no-op (never an error) when the feature isn't usable —
     ``extraction.enabled`` is false, the ``extraction`` extra is missing, or

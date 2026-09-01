@@ -111,7 +111,7 @@ distribution mirror, and the api-role write conversions) map onto:
   SAME resolution path the SharePoint admin UI uses — and no secret is
   ever put on argv, because there is no argv.
   Registered UNCONDITIONALLY (its own no-op guard on
-  ``extraction.enabled`` makes an accidental claim on a process that
+  ``sharepoint.enabled`` makes an accidental claim on a process that
   never opted into the ``extraction`` lane harmless, mirroring
   ``webhook-deliver``'s posture above) but only ever CLAIMED by a lane
   slot that opted into ``AGNES_WORKER_LANES=extraction`` — see
@@ -125,7 +125,7 @@ distribution mirror, and the api-role write conversions) map onto:
   must_not/should_not staleness fork) lives entirely in
   ``connectors.sharepoint.acl_sync.run_acl_sync`` — this kind's handler is a
   thin delegate, same posture as every OTHER kind here. Registered
-  UNCONDITIONALLY: ``run_acl_sync``'s own ``acl_mirroring.enabled`` gate
+  UNCONDITIONALLY: ``run_acl_sync``'s own ``sharepoint.enabled`` gate
   makes an accidental/scheduled claim on an instance that hasn't turned the
   feature on harmless, identical to ``ducklake-maintenance``'s and
   ``corpus-extraction``'s no-op postures above.
@@ -138,7 +138,7 @@ distribution mirror, and the api-role write conversions) map onto:
   NO automatic retry, same "an operator looks at a failed multi-hour run"
   rationale as ``corpus-extraction`` above. The walk/probe/persist body
   lives entirely in ``connectors.sharepoint.acl_sync.run_subtree_sweep``
-  (own ``acl_mirroring.enabled`` gate, own per-connection cadence
+  (own ``sharepoint.enabled`` gate, own per-connection cadence
   self-guard) — this kind's handler is a thin delegate. Registered
   UNCONDITIONALLY, same no-op posture as ``sharepoint-acl-sync`` above. Its
   output (each mirrored scope's ``excluded_subtrees``) is read straight off
@@ -1268,8 +1268,8 @@ def _run_corpus_extraction(payload: dict) -> dict:
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False):
-        raise RuntimeError("corpus-extraction: extraction.enabled is false — refusing to run")
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction: sharepoint.enabled is false — refusing to run")
 
     from connectors.sharepoint.crawler import run_builtin_crawl
 

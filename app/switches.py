@@ -703,9 +703,9 @@ SWITCHES: tuple[Switch, ...] = (
         ),
     ),
     Switch(
-        name="extraction",
-        config_keys=("extraction", "enabled"),
-        env_var="AGNES_EXTRACTION_ENABLED",
+        name="sharepoint",
+        config_keys=("sharepoint", "enabled"),
+        env_var="AGNES_SHAREPOINT_ENABLED",
         kind="bool",
         default=False,
         effect="live",
@@ -713,58 +713,10 @@ SWITCHES: tuple[Switch, ...] = (
         editable=True,
         lock_reason="",
         description=(
-            "Document extraction (spec §7.5 'Extraction inside Agnes') as its own worker "
-            "lane — gates the `corpus-extraction` job kind's handler, which runs the "
-            "built-in crawl -> convert -> anonymize -> ingest pipeline "
-            "(connectors/sharepoint/crawler.py) in-process. Off by default."
-        ),
-    ),
-    Switch(
-        name="extraction_webhook_enabled",
-        # A SIBLING top-level section, not `extraction.webhook_enabled`:
-        # `extraction.enabled` above is LOCKED (editable=False, a genuine
-        # deploy-time infra dependency), and `test_no_section_mixes_
-        # editable_and_locked_switches` refuses one section holding both an
-        # editable and a locked switch — this one has no such dependency
-        # (it gates a plain route, not a worker-lane feature), so it earns
-        # its own always-editable section rather than forcing `extraction`
-        # itself editable (which would misrepresent `enabled`'s own lock).
-        config_keys=("extraction_webhook", "enabled"),
-        env_var="AGNES_EXTRACTION_WEBHOOK_ENABLED",
-        kind="bool",
-        default=False,
-        effect="live",
-        category="product",
-        editable=True,
-        description=(
-            "Microsoft Graph change-notification receiver for SharePoint connections "
-            "(`POST /api/webhooks/sharepoint/{connection_id}`) — lets a subscribed "
-            "Graph drive push near-real-time notifications instead of Agnes waiting for "
-            "`extraction.schedule`'s clock. Off by default: the whole route answers 404 "
-            "when this is off, same posture as `facts`. Gates the RECEIVER route only —"
-            " a notification it accepts still enqueues the same `corpus-extraction` job "
-            "kind `extraction.enabled` (+ a configured producer + a worker polling the "
-            "`extraction` lane) actually runs, so turning this on without that is a "
-            "receiver that accepts Graph's calls but never sees a run succeed. The "
-            "Graph subscription itself (create/renew/delete) is NOT managed by Agnes — "
-            "an operator runs the producer's own `subscriptions.py create --url "
-            "<receiver_url>` against the URL and secret `POST /api/admin/sharepoint/"
-            "connections/{connection_id}/webhook` (re)generates."
-        ),
-    ),
-    Switch(
-        name="acl_mirroring",
-        config_keys=("acl_mirroring", "enabled"),
-        env_var="AGNES_ACL_MIRRORING_ENABLED",
-        kind="bool",
-        default=False,
-        effect="live",
-        category="product",
-        editable=True,
-        description=(
-            "SharePoint ACL mirroring: the sharepoint-acl-sync job, per-scope "
-            "access_mode='mirrored', and the admin sync-now endpoint. OFF by default — "
-            "turning it on changes nothing until a scope opts into mirroring."
+            "The whole SharePoint connector: connect wizard and admin routes, "
+            "document crawling/extraction (schedule, jobs, change webhooks), and "
+            "source-ACL mirroring including permission zones and the ingest gate. "
+            "One flag; per-scope choices (mirrored access, anonymize) stay in the wizard."
         ),
     ),
     Switch(
@@ -814,21 +766,6 @@ SWITCHES: tuple[Switch, ...] = (
             "Hours between SharePoint ACL sync runs (scope + zone root permission "
             "re-reads). The source-side revocation window is at most this long. "
             "Read by the scheduler sidecar at startup."
-        ),
-    ),
-    Switch(
-        name="acl_zones",
-        config_keys=("acl_sync", "zones_enabled"),
-        env_var="AGNES_ACL_ZONES_ENABLED",
-        kind="bool",
-        default=False,
-        effect="live",
-        category="product",
-        editable=True,
-        description=(
-            "Promote broken-inheritance SharePoint subtrees to their own "
-            "collections with their own mirrored ACLs (permission zones) instead "
-            "of excluding them from the crawl entirely. Requires acl_mirroring."
         ),
     ),
     Switch(

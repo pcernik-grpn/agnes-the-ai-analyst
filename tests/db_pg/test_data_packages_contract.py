@@ -141,6 +141,43 @@ def test_get_by_slug_filters_soft_deleted(repo):
     assert repo.get_by_slug("ghost") is None
 
 
+def test_get_by_slug_include_deleted_finds_soft_deleted(repo):
+    """Both engines must expose the soft-deleted row on the explicit opt-in.
+
+    The ``agnes-usage`` seeder depends on this: the slug is UNIQUE across live
+    AND deleted rows, so it needs a lookup that spans both to tell "never
+    created" (create it) from "an admin deleted it" (leave it deleted).
+    """
+    pkg_id = repo.create(
+        name="X",
+        slug="ghost",
+        description=None,
+        icon=None,
+        color=None,
+        created_by="u",
+    )
+    repo.delete(pkg_id)
+
+    found = repo.get_by_slug("ghost", include_deleted=True)
+    assert found is not None
+    assert found["id"] == pkg_id
+    assert found["slug"] == "ghost"
+    # Still None for a slug that never existed, deleted-inclusive or not.
+    assert repo.get_by_slug("never-existed", include_deleted=True) is None
+
+
+def test_get_by_slug_include_deleted_still_finds_live_rows(repo):
+    pkg_id = repo.create(
+        name="X",
+        slug="alive",
+        description=None,
+        icon=None,
+        color=None,
+        created_by="u",
+    )
+    assert repo.get_by_slug("alive", include_deleted=True)["id"] == pkg_id
+
+
 def test_delete_filters_out_of_default_list(repo):
     pkg_id = repo.create(
         name="X",

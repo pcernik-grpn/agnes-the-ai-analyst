@@ -64,11 +64,18 @@ _GROUP_BY_COLUMNS = {
     "ref_id": ("ref_id", "ref_id"),
 }
 
+# Any surface reporting "tool calls" to a user means ALL agent-initiated
+# calls — native tool_use + MCP tools + subagent dispatches — matching
+# `tool_errors`, which counts `is_error` across every kind. (Slash commands
+# are user-typed, not tool calls.) COALESCE guards rows that predate the
+# columns. Mirrors the DuckDB sibling's `_CALLS_SUM`.
+_CALLS_SUM = "COALESCE(tool_calls, 0) + COALESCE(mcp_calls, 0) + COALESCE(subagent_dispatches, 0)"
+
 _SESSION_SORT_KEYS = {
     "started_at": "started_at",
     "uploaded_at": "uploaded_at",
     "ended_at": "ended_at",
-    "tool_calls": "tool_calls",
+    "tool_calls": f"({_CALLS_SUM})",
     "tool_errors": "tool_errors",
     "active_seconds": "active_seconds",
     "username": "username",
@@ -647,7 +654,7 @@ class UsagePgRepository:
                     f"""SELECT COUNT(*),
                               COUNT(DISTINCT username),
                               SUM(CASE WHEN tool_errors > 0 THEN 1 ELSE 0 END),
-                              SUM(tool_calls),
+                              SUM({_CALLS_SUM}),
                               SUM(tool_errors)
                        FROM usage_session_summary WHERE {where_sql}"""
                 ),
@@ -709,20 +716,28 @@ class UsagePgRepository:
             "assistant_messages",
             "tool_calls",
             "tool_errors",
+            # Call-kind breakdown: the detail header totals these with
+            # tool_calls so "Errors" is never bigger than "Tool calls".
+            "mcp_calls",
+            "subagent_dispatches",
             "primary_model",
             # TCRD-222 — stored since v44, projected at last.
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
             "cache_creation_tokens",
+            # Resolved users.id (v45) — mirrors the DuckDB sibling: the
+            # transcript viewer links into /admin/activity?user_id=….
+            "user_id",
         )
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
                     "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
                     "user_messages, assistant_messages, tool_calls, tool_errors, "
+                    "mcp_calls, subagent_dispatches, "
                     "primary_model, input_tokens, output_tokens, cache_read_tokens, "
-                    "cache_creation_tokens FROM usage_session_summary WHERE session_file = :sf"
+                    "cache_creation_tokens, user_id FROM usage_session_summary WHERE session_file = :sf"
                 ),
                 {"sf": session_file},
             ).fetchone()
@@ -731,7 +746,7 @@ class UsagePgRepository:
         return dict(zip(_KEYS, row))
 
     def list_sessions_for_user_admin(self, *, user_id: str, username: str) -> List[dict]:
-        """PG mirror of UsageRepository.list_sessions_for_user_admin (9 cols)."""
+        """PG mirror of UsageRepository.list_sessions_for_user_admin (11 cols)."""
         cols = [
             "session_file",
             "session_id",
@@ -741,6 +756,8 @@ class UsagePgRepository:
             "wall_seconds",
             "tool_calls",
             "tool_errors",
+            "mcp_calls",
+            "subagent_dispatches",
             "primary_model",
         ]
         with self._engine.connect() as conn:
@@ -750,7 +767,8 @@ class UsagePgRepository:
                     SELECT
                         session_file, session_id, started_at, ended_at,
                         active_seconds, wall_seconds,
-                        tool_calls, tool_errors, primary_model
+                        tool_calls, tool_errors, mcp_calls, subagent_dispatches,
+                        primary_model
                     FROM usage_session_summary
                     WHERE user_id = :uid OR username = :uname
                     ORDER BY started_at DESC NULLS LAST
@@ -760,8 +778,10 @@ class UsagePgRepository:
             ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
-    def list_sessions_for_user_self(self, username: str) -> list[dict]:
-        """PG mirror of UsageRepository.list_sessions_for_user_self (14 cols)."""
+    def list_sessions_for_user_self(self, user_id: str) -> list[dict]:
+        """PG mirror of UsageRepository.list_sessions_for_user_self (16 cols).
+        Filters on ``user_id``; rows without one (pre-v45) stay out of
+        self-views, same as DuckDB."""
         cols = [
             "session_file",
             "session_id",
@@ -772,6 +792,8 @@ class UsagePgRepository:
             "user_messages",
             "tool_calls",
             "tool_errors",
+            "mcp_calls",
+            "subagent_dispatches",
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
@@ -786,23 +808,25 @@ class UsagePgRepository:
                         session_file, session_id, started_at, ended_at,
                         active_seconds, wall_seconds,
                         user_messages, tool_calls, tool_errors,
+                        mcp_calls, subagent_dispatches,
                         input_tokens, output_tokens,
                         cache_read_tokens, cache_creation_tokens,
                         primary_model
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     ORDER BY started_at DESC NULLS LAST
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
 
     # ------------------------------------------------------------------
     # per-user token breakdown reads (Postgres).  Mirrors UsageRepository.
+    # Keyed on ``user_id`` (see list_sessions_for_user_self).
     # ------------------------------------------------------------------
 
-    def tokens_daily_series(self, username: str, days: int) -> list[dict]:
+    def tokens_daily_series(self, user_id: str, days: int) -> list[dict]:
         # PARITY: PG interval window mirrors delete_older_than's dialect.
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -816,13 +840,13 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                         COUNT(*) AS sessions
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                       AND started_at >= (CURRENT_TIMESTAMP - (:days * INTERVAL '1 day'))
                     GROUP BY 1
                     ORDER BY 1
                     """
                 ),
-                {"uname": username, "days": days},
+                {"uid": user_id, "days": days},
             ).fetchall()
         return [
             {
@@ -837,7 +861,7 @@ class UsagePgRepository:
             for (d, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_by_model(self, username: str) -> list[dict]:
+    def tokens_by_model(self, user_id: str) -> list[dict]:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
@@ -850,7 +874,7 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation,
                         COUNT(*) AS sessions
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     GROUP BY 1
                     ORDER BY (
                         COALESCE(SUM(input_tokens), 0)
@@ -860,7 +884,7 @@ class UsagePgRepository:
                     ) DESC
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchall()
         return [
             {
@@ -875,7 +899,7 @@ class UsagePgRepository:
             for (m, i, o, cr, cc, s) in rows
         ]
 
-    def tokens_top_sessions(self, username: str, limit: int = 10) -> list[dict]:
+    def tokens_top_sessions(self, user_id: str, limit: int = 10) -> list[dict]:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
@@ -888,12 +912,12 @@ class UsagePgRepository:
                          + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0))
                         AS tokens_total
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     ORDER BY tokens_total DESC
                     LIMIT :lim
                     """
                 ),
-                {"uname": username, "lim": limit},
+                {"uid": user_id, "lim": limit},
             ).fetchall()
         return [
             {
@@ -910,7 +934,7 @@ class UsagePgRepository:
             for (sf, sid, st, pm, i, o, cr, cc, tt) in rows
         ]
 
-    def tokens_totals(self, username: str) -> dict:
+    def tokens_totals(self, user_id: str) -> dict:
         with self._engine.connect() as conn:
             row = conn.execute(
                 sa.text(
@@ -922,10 +946,10 @@ class UsagePgRepository:
                         COALESCE(SUM(cache_creation_tokens), 0),
                         COUNT(*)
                     FROM usage_session_summary
-                    WHERE username = :uname
+                    WHERE user_id = :uid
                     """
                 ),
-                {"uname": username},
+                {"uid": user_id},
             ).fetchone()
         ti, to, tcr, tcc, tses = row or (0, 0, 0, 0, 0)
         return {
@@ -969,7 +993,7 @@ class UsagePgRepository:
                                COALESCE(SUM(user_messages), 0),
                                COALESCE(SUM(skill_invocations), 0),
                                COALESCE(SUM({self._TOKEN_SUM}), 0),
-                               COALESCE(SUM(tool_calls), 0),
+                               COALESCE(SUM({_CALLS_SUM}), 0),
                                COALESCE(SUM(tool_errors), 0),
                                COUNT(DISTINCT COALESCE(user_id, username))
                           FROM usage_session_summary
@@ -1008,7 +1032,7 @@ class UsagePgRepository:
                                COUNT(*),
                                COALESCE(SUM(user_messages), 0),
                                COALESCE(SUM({self._TOKEN_SUM}), 0),
-                               COALESCE(SUM(tool_calls), 0)
+                               COALESCE(SUM({_CALLS_SUM}), 0)
                           FROM usage_session_summary
                           WHERE CAST((started_at AT TIME ZONE 'UTC') AS DATE) >= :sd
                             AND {self.REAL_SESSION_PREDICATE}
@@ -1105,7 +1129,7 @@ class UsagePgRepository:
                                COUNT(*),
                                COALESCE(SUM(user_messages), 0),
                                COALESCE(SUM({self._TOKEN_SUM}), 0),
-                               COALESCE(SUM(tool_calls), 0),
+                               COALESCE(SUM({_CALLS_SUM}), 0),
                                COALESCE(SUM(tool_errors), 0),
                                MAX(ended_at)
                           FROM usage_session_summary
@@ -1166,7 +1190,7 @@ class UsagePgRepository:
                                COUNT(*),
                                COALESCE(SUM(user_messages), 0),
                                COALESCE(SUM({self._TOKEN_SUM}), 0),
-                               COALESCE(SUM(tool_calls), 0)
+                               COALESCE(SUM({_CALLS_SUM}), 0)
                           FROM usage_session_summary
                           WHERE CAST((started_at AT TIME ZONE 'UTC') AS DATE) >= :sd
                             AND (user_id = :uid OR username = :uname)

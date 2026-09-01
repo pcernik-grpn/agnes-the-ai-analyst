@@ -27,7 +27,7 @@ def sweep_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("AGNES_DB_URL", raising=False)
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "unused-because-get-app-token-is-faked")
 
     from src.db import close_system_db, get_system_db
@@ -126,9 +126,10 @@ def _audit_count(action: "str | None" = None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# graph fakes — a fixed tree: root -> A(unique), B(clean); B -> C(unique).
-# A's children must NEVER be listed/probed (the whole point of "exclude,
-# never descend").
+# graph fakes — a fixed tree: root -> A(broken), B(clean); B -> C(broken).
+# A broken-inheritance FOLDER is ALWAYS promoted to its own permission zone
+# now (no separate opt-in switch — 2026-09-01 flag consolidation) and the
+# walk descends into it; A and C have no children of their own.
 # ---------------------------------------------------------------------------
 
 
@@ -145,10 +146,8 @@ def _tree_fakes():
             ]
         if item_id == "B":
             return [{"id": "C", "name": "C", "is_folder": True, "child_count": 0}]
-        if item_id == "C":
-            return []
-        if item_id == "A":
-            pytest.fail("A/child must never be probed — A was already excluded as broken-inheritance")
+        if item_id in ("A", "C"):
+            return []  # zone roots, both childless
         raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
 
     async def fake_probe(token, drive_id, item_ids):
@@ -164,7 +163,7 @@ def _tree_fakes():
 
 
 class TestBrokenInheritanceWalk:
-    def test_excludes_subtree_roots_and_never_descends_into_them(self, sweep_env, monkeypatch):
+    def test_broken_inheritance_folders_become_zones_and_are_descended_into(self, sweep_env, monkeypatch):
         conn_id = _make_connection()
         col_id = _make_collection("Sweep Col")
         _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
@@ -178,20 +177,26 @@ class TestBrokenInheritanceWalk:
 
         assert result["connections"] == 1
         assert result["scopes"] == 1
-        assert result["excluded"] == 2
+        assert result["excluded"] == 0, "broken-inheritance folders zone instead of exclude"
         assert result["errors"] == []
 
         scope = _connection_scope(conn_id, "root")
-        paths = {(item["item_id"], item["path"]) for item in scope["excluded_subtrees"]}
-        assert paths == {("A", "Root/A"), ("C", "Root/B/C")}
-        assert all("detected_at" in item for item in scope["excluded_subtrees"])
+        assert scope["excluded_subtrees"] == []
+
+        zones = _zones(conn_id)
+        zone_ids = {(z["zone_item_id"], z["rel_path"]) for z in zones}
+        assert zone_ids == {("A", "A"), ("C", "B/C")}
+        assert all(z["status"] == "active" for z in zones)
 
         last_run = _last_run(conn_id)
         assert last_run["ok"] is True
-        assert last_run["excluded"] == 2
-        # One "list children" call each for root and B, plus one $batch probe
-        # call each for [A, B] and for [C] — never for A's own children.
-        assert last_run["requests"] == 4
+        assert last_run["excluded"] == 0
+        # One "list children" call each for root, A, B, C (4), plus one
+        # $batch probe call each for [A, B] and for [C] (2) — A and C are
+        # zone roots and are descended into, so they DO get list-children
+        # calls, just against empty result sets (no probe call follows an
+        # empty children list).
+        assert last_run["requests"] == 6
         assert last_run["truncated"] is False
 
         from src.repositories import source_connections_repo
@@ -271,9 +276,9 @@ class TestGraphErrorFailClosed:
 
 class TestFeatureFlagOff:
     def test_returns_skipped_when_disabled(self, sweep_env, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "false")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "false")
         result = acl_sync.run_subtree_sweep({"connection_id": CONN_ID})
-        assert result == {"skipped": "acl_mirroring disabled"}
+        assert result == {"skipped": "sharepoint disabled"}
 
 
 class TestSweepDueSelfGuard:
@@ -407,8 +412,7 @@ class TestFileProbing:
 
 
 class TestPermissionZones:
-    def test_folder_break_becomes_zone_when_switch_on(self, sweep_env, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "true")
+    def test_folder_break_becomes_zone(self, sweep_env, monkeypatch):
         conn_id = _make_connection()
         col_id = _make_collection("Zone Parent Col")
         _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
@@ -505,7 +509,6 @@ class TestPermissionZones:
         assert _audit_count("sharepoint_acl.zone_dissolved") == 1
 
     def test_unknown_probe_never_creates_zone(self, sweep_env, monkeypatch):
-        monkeypatch.setenv("AGNES_ACL_ZONES_ENABLED", "true")
         conn_id = _make_connection()
         col_id = _make_collection("Zone Unknown Col")
         _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
@@ -532,6 +535,10 @@ class TestPermissionZones:
         assert _zones(conn_id) == []
 
     def test_rel_path_is_drive_relative(self, sweep_env, monkeypatch):
+        """rel_path computation (`scope_rel_root`) on an EXCLUDED entry —
+        a FILE, since a broken-inheritance FOLDER now zones instead of
+        excluding (see `TestPermissionZones`'s own rel_path coverage for
+        the zone-candidate path)."""
         conn_id = _make_connection()
         col_id = _make_collection("Rel Path Col")
         _add_scope(
@@ -545,7 +552,7 @@ class TestPermissionZones:
 
         async def fake_children(token, drive_id, item_id):
             if item_id == "root2":
-                return [{"id": "Sub", "name": "Sub", "is_folder": True, "child_count": 0}]
+                return [{"id": "Sub", "name": "Sub.docx", "is_folder": False, "child_count": 0}]
             raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
 
         async def fake_probe(token, drive_id, item_ids):
@@ -560,8 +567,9 @@ class TestPermissionZones:
         scope = _connection_scope(conn_id, "root2")
         entry = scope["excluded_subtrees"][0]
         assert entry["item_id"] == "Sub"
-        assert entry["rel_path"] == "Team/Sub"
-        assert entry["path"] == "Site/Documents/Team/Sub"
+        assert entry["kind"] == "file"
+        assert entry["rel_path"] == "Team/Sub.docx"
+        assert entry["path"] == "Site/Documents/Team/Sub.docx"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +601,10 @@ def _corpus_file_paths(collection_id: str) -> set:
 
 class TestRetroactiveCleanup:
     def test_excluded_folder_purges_matching_files_keeps_the_rest(self, sweep_env, monkeypatch):
+        """A broken-inheritance folder promotes to a permission zone now
+        (not a plain exclusion — see `TestPermissionZones`), but the
+        retroactive purge still fires: `_cleanup_connection_content`
+        matches on ACTIVE ZONE prefixes too, not just excluded ones."""
         conn_id = _make_connection()
         col_id = _make_collection("Cleanup Col")
         _add_scope(conn_id, source_scope_id="root", collection_id=col_id, display_path="Root")
@@ -605,10 +617,12 @@ class TestRetroactiveCleanup:
         async def fake_children(token, drive_id, item_id):
             if item_id == "root":
                 return [{"id": "Secret", "name": "Secret", "is_folder": True, "child_count": 0}]
-            raise AssertionError(f"Secret must never be probed further: {item_id!r}")
+            if item_id == "Secret":
+                return []  # the zone root itself, childless
+            raise AssertionError(f"unexpected list_item_children call for item_id={item_id!r}")
 
         async def fake_probe(token, drive_id, item_ids):
-            return {i: True for i in item_ids}  # broken inheritance -> excluded (zones off)
+            return {i: True for i in item_ids}  # broken inheritance -> becomes a permission zone
 
         monkeypatch.setattr(graph_client, "list_item_children", fake_children)
         monkeypatch.setattr(graph_client, "probe_unique_permissions", fake_probe)

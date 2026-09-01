@@ -18,6 +18,7 @@ Covered endpoints:
 Seeds go through the factory (``usage_repo()`` / ``audit_repo()``) so the
 write lands on whichever backend the parametrized fixture selected.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -85,6 +86,8 @@ def _seed_summary(repo, session_file: str, username: str, **over) -> None:
         "assistant_messages": 5,
         "tool_calls": over.get("tool_calls", 10),
         "tool_errors": over.get("tool_errors", 0),
+        "mcp_calls": over.get("mcp_calls", 0),
+        "subagent_dispatches": over.get("subagent_dispatches", 0),
         "primary_model": over.get("primary_model", "claude-x"),
     }
     repo.upsert_summary(summary, processor_version=1)
@@ -98,6 +101,7 @@ def _h(token: str) -> dict:
 # /api/admin/telemetry/summary
 # ---------------------------------------------------------------------------
 
+
 def test_telemetry_summary(seeded_app_both):
     from src.repositories import usage_repo, audit_repo
 
@@ -105,8 +109,11 @@ def test_telemetry_summary(seeded_app_both):
     # Seed audit durations so slow_actions has >= 5 samples for one action.
     for _ in range(6):
         audit_repo().log(
-            user_id="admin1", action="data.export",
-            result="success", duration_ms=120, client_kind="web",
+            user_id="admin1",
+            action="data.export",
+            result="success",
+            duration_ms=120,
+            client_kind="web",
         )
 
     client = seeded_app_both["client"]
@@ -150,6 +157,7 @@ def test_telemetry_summary_forbids_non_admin(seeded_app_both):
 # /api/admin/telemetry/facets
 # ---------------------------------------------------------------------------
 
+
 def test_telemetry_facets(seeded_app_both):
     from src.repositories import usage_repo
 
@@ -170,6 +178,7 @@ def test_telemetry_facets(seeded_app_both):
 # ---------------------------------------------------------------------------
 # /api/admin/telemetry/kpis
 # ---------------------------------------------------------------------------
+
 
 def test_telemetry_kpis(seeded_app_both):
     from src.repositories import usage_repo
@@ -207,6 +216,7 @@ def test_telemetry_kpis_filtered_by_tool(seeded_app_both):
 # ---------------------------------------------------------------------------
 # /api/admin/telemetry/query  (grouped)
 # ---------------------------------------------------------------------------
+
 
 def test_telemetry_query_grouped_by_tool(seeded_app_both):
     from src.repositories import usage_repo
@@ -269,11 +279,20 @@ def test_telemetry_query_ungrouped_filter(seeded_app_both):
 # /api/admin/sessions/list  +  /kpis  +  /facets
 # ---------------------------------------------------------------------------
 
+
 def test_sessions_list(seeded_app_both):
     from src.repositories import usage_repo
 
     repo = usage_repo()
-    _seed_summary(repo, "alice@test.com/s1.jsonl", "alice@test.com", tool_calls=10, tool_errors=2)
+    _seed_summary(
+        repo,
+        "alice@test.com/s1.jsonl",
+        "alice@test.com",
+        tool_calls=10,
+        tool_errors=2,
+        mcp_calls=7,
+        subagent_dispatches=1,
+    )
     _seed_summary(repo, "bob@test.com/s2.jsonl", "bob@test.com", tool_calls=4, tool_errors=0)
 
     client = seeded_app_both["client"]
@@ -287,6 +306,9 @@ def test_sessions_list(seeded_app_both):
     by_user = {row["username"]: row for row in body["rows"]}
     assert by_user["alice@test.com"]["tool_calls"] == 10
     assert by_user["alice@test.com"]["tool_errors"] == 2
+    # The list rows carry the call breakdown so the UI can total them.
+    assert by_user["alice@test.com"]["mcp_calls"] == 7
+    assert by_user["alice@test.com"]["subagent_dispatches"] == 1
     # session_dir derived from the "<dir>/<file>" session_file shape.
     assert by_user["alice@test.com"]["session_dir"] == "alice@test.com"
 
@@ -313,7 +335,15 @@ def test_sessions_kpis(seeded_app_both):
     from src.repositories import usage_repo
 
     repo = usage_repo()
-    _seed_summary(repo, "alice@test.com/s1.jsonl", "alice@test.com", tool_calls=10, tool_errors=2)
+    _seed_summary(
+        repo,
+        "alice@test.com/s1.jsonl",
+        "alice@test.com",
+        tool_calls=10,
+        tool_errors=2,
+        mcp_calls=3,
+        subagent_dispatches=1,
+    )
     _seed_summary(repo, "bob@test.com/s2.jsonl", "bob@test.com", tool_calls=4, tool_errors=0)
 
     client = seeded_app_both["client"]
@@ -326,19 +356,18 @@ def test_sessions_kpis(seeded_app_both):
     assert body["sessions_total"] == 2
     assert body["distinct_users"] == 2
     assert body["error_sessions"] == 1
-    assert body["tool_calls_total"] == 14
+    # Total counts ALL calls: 10 native + 3 MCP + 1 subagent + 4 native.
+    assert body["tool_calls_total"] == 18
     assert body["tool_errors_total"] == 2
-    assert round(body["tool_error_rate"], 4) == round(2 / 14, 4)
+    assert round(body["tool_error_rate"], 4) == round(2 / 18, 4)
 
 
 def test_sessions_facets(seeded_app_both):
     from src.repositories import usage_repo
 
     repo = usage_repo()
-    _seed_summary(repo, "alice@test.com/s1.jsonl", "alice@test.com",
-                  primary_model="claude-sonnet")
-    _seed_summary(repo, "bob@test.com/s2.jsonl", "bob@test.com",
-                  primary_model="claude-haiku")
+    _seed_summary(repo, "alice@test.com/s1.jsonl", "alice@test.com", primary_model="claude-sonnet")
+    _seed_summary(repo, "bob@test.com/s2.jsonl", "bob@test.com", primary_model="claude-haiku")
 
     client = seeded_app_both["client"]
     r = client.get(

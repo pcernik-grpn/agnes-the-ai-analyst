@@ -5,15 +5,18 @@ Scope: ``DATA_PACKAGE`` + ``MEMORY_DOMAIN`` resource types, plus a
 plugins keep their own resolver in ``src/marketplace_filter.py`` per
 design D1.
 
-Auto-membership model: stack membership is a pure function of RBAC grants,
-not of any per-user opt-in. Every resource granted to one of the caller's
-groups — ``required`` or ``available`` — is automatically part of the
-caller's stack (visible, authorized for server-side query). This replaced
-an earlier opt-in "subscribe to add" model where an ``available`` grant
-stayed invisible until the user explicitly subscribed.
+Membership resolves in one of two modes, forked on
+``features.stack_auto_membership`` (``app.instance_config.
+get_stack_auto_membership``; default ON since Wave 0, 2026-08 — the
+``redesign`` experience preset, now the only one, implies it; an explicit
+``false`` is a fully-supported classic opt-out and always wins).
 
-``user_stack_subscriptions`` survives unchanged (same table, same columns)
-but its MEANING is reinterpreted: a row no longer controls stack
+Auto-membership (the default): stack membership is a pure function of
+RBAC grants, not of any per-user opt-in. Every resource granted to one of
+the caller's groups — ``required`` or ``available`` — is automatically
+part of the caller's stack (visible, authorized for server-side query).
+``user_stack_subscriptions`` survives unchanged (same table, same
+columns) but its MEANING is reinterpreted: a row no longer controls stack
 membership/visibility — it controls whether the resource is additionally
 **materialized** (kept as a local copy `agnes pull` downloads to disk).
 ``required`` resources are always materialized (no opt-out); ``available``
@@ -22,16 +25,20 @@ resources are materialized only once subscribed. Server-side query
 anything in the stack regardless of materialization — a local copy is a
 convenience, not a precondition for access.
 
+Classic (the explicit opt-out — the pre-redesign "subscribe to add"
+model): an ``available`` grant stays out of the stack until the user
+subscribes; every member is materialized.
+
 Resolution algorithm:
 
     groups          := user_group_members(user_id).group_id
     grants          := resource_grants WHERE group_id IN groups AND resource_type = T
     required_ids    := {g.resource_id | g in grants if g.requirement = 'required'}
     available_ids   := {g.resource_id | g in grants if g.requirement = 'available'}
-    # auto-membership mode (features.stack_auto_membership, opt-in):
+    # auto-membership mode (features.stack_auto_membership on — the default):
     effective_ids   := required_ids ∪ available_ids                # stack() / in_stack
     materialized_ids := required_ids ∪ (subscribed_ids ∩ available_ids)  # local download
-    # classic mode (the default — the pre-redesign subscribe model):
+    # classic mode (explicit opt-out — the pre-redesign subscribe model):
     effective_ids   := required_ids ∪ (subscribed_ids ∩ available_ids)   # membership
     materialized_ids := effective_ids                                    # members are local
     return fetch_entries(T, effective_ids)  # each entry.materialized = id in materialized_ids
@@ -100,13 +107,14 @@ class ResourceEntry:
     """One row in the browse/stack response.
 
     ``requirement`` reflects the effective requirement after the OR-across-
-    grants rule. ``in_stack`` is True iff the resource is granted to one of
-    the caller's groups at all (auto-membership — ``required`` and
-    ``available`` both count, no subscription needed). ``materialized`` is
-    True iff the resource is ALSO kept as a local copy (`agnes pull`
-    downloads its parquet / bundle): always True for ``required``, and for
-    ``available`` only once the user has subscribed via
-    ``POST /api/stack/subscribe``.
+    grants rule. ``in_stack`` is True iff the resource is in the caller's
+    effective stack — under auto-membership (the default) that is every
+    grant on the caller's groups (``required`` and ``available`` both
+    count, no subscription needed); under the classic opt-out it means
+    required-or-subscribed. ``materialized`` is True iff the resource is
+    ALSO kept as a local copy (`agnes pull` downloads its parquet /
+    bundle): always True for ``required``, and for ``available`` only once
+    the user has subscribed via ``POST /api/stack/subscribe``.
     """
 
     id: str
@@ -306,11 +314,13 @@ class StackResolver:
     # -- Public API --------------------------------------------------------
 
     def stack(self, user_id_or_principal, resource_type: ResourceType) -> List[ResourceEntry]:
-        """The user's effective stack — auto-membership: required ∪ available,
-        every grant on the caller's groups, no subscription needed to be
-        visible/authorized. ``entry.materialized`` additionally flags which
-        of those are kept as a local copy (required always; available only
-        once subscribed). Admin (god-mode) ALSO surfaces raw subscriptions
+        """The user's effective stack. Under auto-membership (the default):
+        required ∪ available — every grant on the caller's groups, no
+        subscription needed to be visible/authorized. Under the classic
+        opt-out: required ∪ (subscribed ∩ available). ``entry.materialized``
+        additionally flags which of those are kept as a local copy (required
+        always; available only once subscribed). Admin (god-mode) ALSO
+        surfaces raw subscriptions
         with no backing grant at all — admins legitimately POST
         /api/stack/subscribe without first granting themselves a group, and
         those self-served resources must still show up (materialized) even
@@ -352,8 +362,9 @@ class StackResolver:
             # subscriptions that have no backing grant (self-serve local copy).
             effective_ids = required_ids | available_ids | materialized_ids
         else:
-            # Classic subscribe model (spec 2026-08-07-default-chrome-ux-parity,
-            # the default): membership is required ∪ (subscribed ∩ available) —
+            # Classic subscribe model (spec 2026-08-07-default-chrome-ux-parity;
+            # the explicit opt-out — auto has been the default since Wave 0):
+            # membership is required ∪ (subscribed ∩ available) —
             # the pre-redesign formula verbatim. Admin god-mode still surfaces
             # raw self-served subscriptions via materialized_ids above. Every
             # member is local, so the materialized flag below stays truthful.
@@ -385,10 +396,11 @@ class StackResolver:
 
         auto = get_stack_auto_membership()
         for e in entries:
-            # Auto-membership: every grant IS a membership; `materialized`
-            # drives the Download/Remove-local-copy affordance. Classic (the
-            # default): an unsubscribed available grant reads as ADDABLE
-            # (in_stack=False) — the pre-redesign add-to-stack affordance.
+            # Auto-membership (the default): every grant IS a membership;
+            # `materialized` drives the Download/Remove-local-copy affordance.
+            # Classic (the explicit opt-out): an unsubscribed available grant
+            # reads as ADDABLE (in_stack=False) — the pre-redesign
+            # add-to-stack affordance.
             e.materialized = e.id in required_ids or e.id in subscribed_ids
             e.in_stack = True if auto else e.materialized
             if e.status in UNDELIVERABLE_STATUSES:
@@ -407,8 +419,9 @@ class StackResolver:
         (required)" footer button so the admin sees what regular users
         in those groups see, and the macro doesn't render an actionable
         Remove button that the API would 400 on. ``in_stack`` is
-        mode-dependent like :meth:`browse`: classic (default) is the
-        pre-redesign formula — required or subscribed; auto-membership
+        mode-dependent like :meth:`browse`: classic (the explicit opt-out)
+        is the pre-redesign formula — required or subscribed;
+        auto-membership (the default)
         additionally counts the admin's own ``available`` grants (plus
         raw subscriptions — mirrors :meth:`stack`'s admin god-mode),
         with ``materialized`` reflecting only required-or-subscribed.
@@ -460,11 +473,12 @@ class StackResolver:
         resource_type: ResourceType,
         resource_id: str,
     ) -> None:
-        """Subscribe the user to an ``available`` resource — i.e. request a
-        LOCAL DOWNLOAD (materialization). The resource is already in the
-        user's stack the moment it's granted (auto-membership); this call
-        does not change that, it only flips ``entry.materialized`` so
-        `agnes pull` fetches a local copy.
+        """Subscribe the user to an ``available`` resource. Under
+        auto-membership (the default) this is a request for a LOCAL
+        DOWNLOAD (materialization): the resource is already in the user's
+        stack the moment it's granted, so this call only flips
+        ``entry.materialized`` so `agnes pull` fetches a local copy. Under
+        the classic opt-out the subscription IS the stack membership.
 
         Raises HTTP 400 if the resource is already ``required`` — clients
         shouldn't try to subscribe to a required resource (it's always

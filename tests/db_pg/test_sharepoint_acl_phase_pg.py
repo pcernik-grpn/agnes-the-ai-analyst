@@ -40,9 +40,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def pg_env(tmp_path, monkeypatch, pg_engine):
-    """Alembic-upgraded Postgres wired as the active backend, ACL mirroring
-    on (mirrors ``test_facts_audience.py``'s own ``pg_env`` + ``test_
-    sharepoint_acl_sync.py``'s ``acl_env`` knobs)."""
+    """Alembic-upgraded Postgres wired as the active backend, the
+    ``sharepoint`` switch on (mirrors ``test_facts_audience.py``'s own
+    ``pg_env`` + ``test_sharepoint_acl_sync.py``'s ``acl_env`` knobs)."""
     from alembic import command
     from alembic.config import Config
 
@@ -53,7 +53,7 @@ def pg_env(tmp_path, monkeypatch, pg_engine):
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "unused-because-get-app-token-is-faked")
 
     import src.db_pg as db_pg

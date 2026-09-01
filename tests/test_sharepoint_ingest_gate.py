@@ -93,15 +93,15 @@ def _add_zone(
 
 @pytest.fixture
 def gate_env(tmp_path, monkeypatch):
-    """Fresh system.duckdb under a tmp DATA_DIR, ``acl_mirroring`` on, one
-    mirrored scope (``col_parent``) carrying a folder exclusion (``Secret``)
-    and a file exclusion (``open/f.docx``), and one active permission zone
-    (``col_zone``, rel_path ``Legal``) rooted under that same scope. Mirrors
-    the plan's Task 5 Step 1 fixture exactly."""
+    """Fresh system.duckdb under a tmp DATA_DIR, the ``sharepoint`` switch
+    on, one mirrored scope (``col_parent``) carrying a folder exclusion
+    (``Secret``) and a file exclusion (``open/f.docx``), and one active
+    permission zone (``col_zone``, rel_path ``Legal``) rooted under that
+    same scope. Mirrors the plan's Task 5 Step 1 fixture exactly."""
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("AGNES_DB_URL", raising=False)
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "true")
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
 
     from src.db import close_system_db, get_system_db
 
@@ -170,8 +170,8 @@ def test_non_sharepoint_collection_is_untouched(gate_env):
     assert source_acl_index_for_collection("col_unrelated") is None
 
 
-def test_index_is_none_when_acl_mirroring_disabled(gate_env, monkeypatch):
-    monkeypatch.setenv("AGNES_ACL_MIRRORING_ENABLED", "false")
+def test_index_is_none_when_sharepoint_disabled(gate_env, monkeypatch):
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "false")
     assert source_acl_index_for_collection("col_parent") is None
 
 

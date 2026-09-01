@@ -320,9 +320,11 @@ def test_signed_url_never_for_internal_rbac_tables(tmp_path, monkeypatch):
     `_apply_signed_url` must not hand out a signed_url for it — that would
     serve every user's rows to whoever holds the URL, bypassing the
     row-level filter entirely. Defense-in-depth: reuses
-    `connectors.internal.access.is_internal_table`, the same predicate
-    `src.rbac.get_accessible_tables` uses to grant blanket table-level
-    access before scoping rows."""
+    `connectors.internal.access.is_internal_table`. Note the caller here is
+    an ADMIN, for whom `get_accessible_tables` returns the "all" sentinel —
+    so this guard, not the table gate, is what keeps the signed URL away
+    (and it stays load-bearing now that internal tables are packageable and
+    can legitimately reach a manifest)."""
     db_module = _reload_db_module(monkeypatch, tmp_path)
     from app.api.sync import _build_manifest_for_user
     from src.distribution import write_mirror_index

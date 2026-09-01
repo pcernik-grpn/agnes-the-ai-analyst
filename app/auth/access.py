@@ -267,22 +267,19 @@ def can_access(
     logged (deduplicated) via :func:`_note_god_mode_hit` — observability
     only, the decision is unchanged.
 
-    Internal data-source tables (``agnes_sessions``/``_usage``/``_audit``) are
-    implicitly granted to every authenticated user. Security there is
-    row-level (the per-request view filters to the caller's rows) and
-    enforced in the query path; the table-grain gate just waves them
-    through so they appear in /catalog and /api/v2/catalog for analysts,
-    not just admins.
+    Internal data-source tables (``agnes_sessions``/``agnes_telemetry``/
+    ``agnes_audit``) used to be waved through here for every authenticated
+    user. They are not any more: they belong to the seeded ``agnes-usage``
+    data package and resolve through the standard path like any other
+    resource, so an admin controls who may query usage data (design
+    ``docs/superpowers/specs/2026-08-31-usage-package-and-per-turn-tokens-
+    design.md`` §2, **BREAKING**). The row-level filter in
+    ``connectors/internal/access.py`` is unchanged — it decides which rows,
+    never whether the table is visible.
 
     ``conn`` honored when explicitly passed (test isolation); falls back
     to the global factory otherwise.
     """
-    if resource_type == "table":
-        from connectors.internal.access import is_internal_table
-
-        if is_internal_table(resource_id):
-            return True
-
     group_ids = _user_group_ids(user_id, conn=conn)
     admin_id = _get_group_id_by_name(SYSTEM_ADMIN_GROUP, conn=conn)
     if admin_id is not None and admin_id in group_ids:
@@ -321,9 +318,10 @@ def _allowed_ids_for_user(
 ) -> frozenset[str]:
     """Set of resource_ids the user is granted for ``resource_type``.
 
-    Deliberately does NOT apply the Admin god-mode short-circuit and does
-    NOT add internal-table implicit grants — it reports only what was
-    explicitly granted to a group the user belongs to. This is the single
+    Deliberately does NOT apply the Admin god-mode short-circuit — it
+    reports only what was explicitly granted to a group the user belongs
+    to. (There is no internal-table carve-out left to skip either: those
+    tables are ordinary members of the ``agnes-usage`` package.) This is the single
     no-short-circuit grant primitive that both ``can_access`` (union/admin
     path) and ``compute_grant_intersection`` build on, so an admin-leak
     cannot reappear by drift.
@@ -417,8 +415,8 @@ def has_explicit_grant(
     for ``(resource_type, resource_id)``.
 
     Unlike :func:`can_access`, this does **not** short-circuit for the Admin
-    god-mode group and does **not** apply internal-table implicit grants — it
-    reports only what was explicitly granted to a group the user belongs to.
+    god-mode group — it reports only what was explicitly granted to a group
+    the user belongs to.
 
     Use it for UI affordances that should reflect actual rollout state rather
     than *effective* access: e.g. hiding the cloud-chat nav link until chat is
@@ -699,9 +697,8 @@ def require_facts_enabled() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="facts_disabled")
 
 
-def require_extraction_webhook_enabled() -> None:
-    """Dependency: 404 the whole request when ``extraction_webhook.enabled``
-    is off.
+def require_sharepoint_enabled() -> None:
+    """Dependency: 404 the whole request when the ``sharepoint`` switch is off.
 
     Mounted as a router-level ``dependencies=[...]`` entry on
     ``app/api/sharepoint_webhooks.py``'s router — same "close the whole
@@ -712,16 +709,18 @@ def require_extraction_webhook_enabled() -> None:
     ``clientState`` is verified inside the handler body, never a
     ``Depends`` chain).
 
-    ``extraction_webhook`` is its OWN top-level config section, deliberately
-    NOT nested under ``extraction`` — see the ``Switch`` entry's own comment
-    in ``app/switches.py`` for why (mixing this always-editable switch into
-    the locked ``extraction`` section would trip
-    ``test_no_section_mixes_editable_and_locked_switches``).
+    The single ``sharepoint`` switch (``app/switches.py``) also gates the
+    admin-facing half of the connector — ``app/api/admin_sharepoint.py``'s
+    own router-level dependency, ``_require_sharepoint_enabled`` — but that
+    one answers ``409`` instead of ``404``, because every route on THAT
+    router already requires an authenticated admin (or a scoped producer
+    credential): a reachable, authenticated caller being told a known
+    feature is off is a 409, not a "this route does not exist" 404.
     """
     from app.instance_config import feature_enabled
 
-    if not feature_enabled("extraction_webhook", "enabled", env_var="AGNES_EXTRACTION_WEBHOOK_ENABLED", default=False):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="extraction_webhook_disabled")
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sharepoint_disabled")
 
 
 def access_denied_detail(resource_type: ResourceType, resource_id: str) -> str:

@@ -588,11 +588,11 @@ class TestCorpusExtractionHandler:
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        """The `extraction` switch's env var (`AGNES_EXTRACTION_ENABLED`)
+        """The `sharepoint` switch's env var (`AGNES_SHAREPOINT_ENABLED`)
         wins over the mocked `get_value` config in every test here — clear
         it so each test's `_config_get_value` fake is what actually decides
         the gate, not whatever happens to be in the runner's shell env."""
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
 
     def _register(self):
         from app.worker.kinds import register_all_kinds
@@ -621,7 +621,7 @@ class TestCorpusExtractionHandler:
         calls = self._stub_crawl(monkeypatch)
         handler = self._register()
 
-        with pytest.raises(RuntimeError, match="extraction.enabled"):
+        with pytest.raises(RuntimeError, match="sharepoint.enabled"):
             handler({"connection_id": "conn1"})
         # The gate fires BEFORE the crawl — an instance that never turned the
         # feature on never reaches Graph, a vault, or a collection write.

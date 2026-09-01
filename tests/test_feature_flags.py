@@ -115,14 +115,11 @@ class TestFeatureFlagsRegistry:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
-            "extraction",
-            "extraction_webhook_enabled",
-            "acl_mirroring",
+            "sharepoint",
             "acl_guarantee_mode",
             "acl_max_stale_hours",
             "acl_sweep_interval_days",
             "acl_sync_interval_hours",
-            "acl_zones",
         }
 
     def test_every_entry_resolves(self, monkeypatch):
@@ -331,14 +328,11 @@ class TestServerConfigFeatureFlagsInventory:
             "kai_broker_mcp_enabled",
             "facts",
             "facts_visibility_mode",
-            "extraction",
-            "extraction_webhook_enabled",
-            "acl_mirroring",
+            "sharepoint",
             "acl_guarantee_mode",
             "acl_max_stale_hours",
             "acl_sweep_interval_days",
             "acl_sync_interval_hours",
-            "acl_zones",
         }
         # The experience preset leads as a string-valued informational row.
         assert flags[0]["name"] == "instance.experience"

@@ -391,9 +391,11 @@ class TestDownloadFile:
 
     def test_sliced_concat_in_order(self, tmp_path):
         # isSliced=True: detail.url points at a JSON manifest of slice URLs.
-        # Simulate two slices: slice 0 (header + rows), slice 1 (more rows,
-        # NO header per Storage API contract). We just concatenate bytes —
-        # the contract test is "every slice's bytes appear in dest, in order".
+        # Real contract (#1916): Storage API puts a header in NO slice, ever
+        # — both slices below are pure data. `_download_sliced` must fetch
+        # the table's declared columns and synthesize the header itself, or
+        # `pd.read_csv`'s default `header=0` would read slice 0's first data
+        # row as the column names.
         sess = MagicMock()
 
         manifest_resp = MagicMock()
@@ -408,7 +410,7 @@ class TestDownloadFile:
         slice0 = MagicMock()
         slice0.__enter__ = MagicMock(return_value=slice0)
         slice0.__exit__ = MagicMock(return_value=False)
-        slice0.iter_content.return_value = [b"col\n", b"a\n"]
+        slice0.iter_content.return_value = [b"a\n"]
         slice0.raise_for_status = MagicMock()
 
         slice1 = MagicMock()
@@ -417,7 +419,11 @@ class TestDownloadFile:
         slice1.iter_content.return_value = [b"b\n"]
         slice1.raise_for_status = MagicMock()
 
-        sess.get.side_effect = [manifest_resp, slice0, slice1]
+        detail_resp = _mock_response(200, {"columns": ["col"]})
+
+        # Call order: manifest, then the table-detail lookup that supplies
+        # the synthesized header, then the (headerless) slices.
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0, slice1]
 
         c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
         dest = tmp_path / "out.csv"
@@ -428,17 +434,20 @@ class TestDownloadFile:
                 "isSliced": True,
             },
             dest,
+            table_id="in.c-main.t",
         )
 
-        assert dest.read_bytes() == b"col\na\nb\n"
+        assert dest.read_bytes() == b"col\r\na\nb\n"
 
     def test_sliced_concat_reorders_out_of_order_manifest(self, tmp_path):
         # Regression test (2026-07-15): a real garbled-header parquet was
         # traced to _download_sliced trusting the manifest's raw `entries`
         # array order. This manifest lists slice 1 BEFORE slice 0 (Keboola's
         # real numbered-filename convention, e.g. `export_0_0_0.csv`) — the
-        # client must still download and concatenate the header slice
-        # (index 0) first.
+        # client must still download and concatenate slice 0 first so the
+        # ROWS land in the right order. Neither slice carries a header
+        # (#1916's real contract — see `_download_sliced`); the header line
+        # comes from the table-detail lookup, not from either slice.
         sess = MagicMock()
 
         manifest_resp = MagicMock()
@@ -453,7 +462,7 @@ class TestDownloadFile:
         slice0 = MagicMock()
         slice0.__enter__ = MagicMock(return_value=slice0)
         slice0.__exit__ = MagicMock(return_value=False)
-        slice0.iter_content.return_value = [b"col\n", b"a\n"]
+        slice0.iter_content.return_value = [b"a\n"]
         slice0.raise_for_status = MagicMock()
 
         slice1 = MagicMock()
@@ -462,11 +471,14 @@ class TestDownloadFile:
         slice1.iter_content.return_value = [b"b\n"]
         slice1.raise_for_status = MagicMock()
 
-        # side_effect is the actual call order the client makes: manifest
-        # first, then whichever slice URL it requests first. After the fix
-        # that must be export_0_0_0.csv (the header slice) despite it being
-        # SECOND in the manifest's entries array.
-        sess.get.side_effect = [manifest_resp, slice0, slice1]
+        detail_resp = _mock_response(200, {"columns": ["col"]})
+
+        # side_effect is the actual call order the client makes: manifest,
+        # then the table-detail lookup for the header, then whichever slice
+        # URL it requests first. After the fix that must be
+        # export_0_0_0.csv despite it being SECOND in the manifest's
+        # entries array.
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0, slice1]
 
         c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
         dest = tmp_path / "out.csv"
@@ -477,15 +489,204 @@ class TestDownloadFile:
                 "isSliced": True,
             },
             dest,
+            table_id="in.c-main.t",
         )
 
-        assert dest.read_bytes() == b"col\na\nb\n"
+        # Header exactly once, at the top, followed by ALL data rows in the
+        # corrected (not manifest) order — none swallowed as a header.
+        assert dest.read_bytes() == b"col\r\na\nb\n"
         requested_urls = [call.args[0] for call in sess.get.call_args_list]
         assert requested_urls == [
             "https://signed/manifest.json",
+            "https://kbc/v2/storage/tables/in.c-main.t",
             "https://signed/export_0_0_0.csv",
             "https://signed/export_0_0_1.csv",
         ]
+
+
+# ---- sliced CSV header synthesis (#1916) -----------------------------------
+#
+# Storage API never puts a header in any slice of a sliced export (verified
+# against Keboola's own `kbcstorage` SDK, which synthesizes it from the
+# table's declared columns rather than trusting the data — see
+# `_download_sliced`'s docstring). `TestDownloadFile.test_sliced_concat_*`
+# above cover the happy path (declared-columns lookup, ordering); this class
+# covers the `export_filter.columns` override, RFC-4180 escaping of an
+# unusual column name, and the "cannot resolve columns" fallback, which
+# must degrade to the pre-fix raw concatenation rather than fail the sync.
+
+
+class TestSlicedCsvHeaderSynthesis:
+    def test_uses_requested_columns_from_export_filter_and_skips_table_detail_lookup(self, tmp_path):
+        """A `columns` projection must win over the table's full declared
+        schema for the synthesized header too — matching a non-empty
+        projected export, which also carries only the requested columns.
+        It must also make the table-detail lookup unnecessary: the
+        requested list is already authoritative, so no extra API call."""
+        sess = MagicMock()
+
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {"entries": [{"url": "https://signed/slice-0"}]}
+        manifest_resp.raise_for_status = MagicMock()
+
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"7,ACME\n"]
+        slice0.raise_for_status = MagicMock()
+
+        sess.get.side_effect = [manifest_resp, slice0]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        dest = tmp_path / "out.csv"
+        c.download_file(
+            {
+                "url": "https://signed/manifest.json",
+                "name": "sliced",
+                "isSliced": True,
+            },
+            dest,
+            table_id="in.c-main.t",
+            export_filter=ExportFilter(columns=["id", "name"]),
+        )
+
+        assert dest.read_bytes() == b"id,name\r\n7,ACME\n"
+        assert sess.get.call_count == 2  # manifest + the slice, no table-detail GET
+
+    def test_escapes_column_names_containing_commas_and_quotes(self, tmp_path):
+        """The header line is built with `csv.writer`, not an f-string join
+        — a declared column name carrying a comma or an embedded quote must
+        come out correctly escaped (RFC-4180: quote the field, double the
+        embedded quote), matching the dialect the downstream CSV readers
+        (`pd.read_csv`, DuckDB's `read_csv` with `quote='"', escape='"'`)
+        expect."""
+        sess = MagicMock()
+
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {"entries": [{"url": "https://signed/slice-0"}]}
+        manifest_resp.raise_for_status = MagicMock()
+
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"19,x\n"]
+        slice0.raise_for_status = MagicMock()
+
+        # A comma AND an embedded quote in one declared column name —
+        # exactly the shape `csv.writer(quoting=QUOTE_MINIMAL)` must escape.
+        detail_resp = _mock_response(200, {"columns": ["id", 'Region, "EU"']})
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        dest = tmp_path / "out.csv"
+        c.download_file(
+            {"url": "https://signed/manifest.json", "name": "sliced", "isSliced": True},
+            dest,
+            table_id="in.c-main.t",
+        )
+
+        assert dest.read_bytes() == b'id,"Region, ""EU"""\r\n19,x\n'
+
+    def test_falls_back_to_raw_concat_when_table_detail_lookup_fails(self, tmp_path, caplog):
+        """A broken table-detail lookup (e.g. a 403) must not fail the whole
+        sync — the pre-fix raw, header-less concatenation is the fallback,
+        and it is logged loudly (naming the table) rather than silently."""
+        sess = MagicMock()
+
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {
+            "entries": [
+                {"url": "https://signed/slice-0"},
+                {"url": "https://signed/slice-1"},
+            ]
+        }
+        manifest_resp.raise_for_status = MagicMock()
+
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"a\n"]
+        slice0.raise_for_status = MagicMock()
+
+        slice1 = MagicMock()
+        slice1.__enter__ = MagicMock(return_value=slice1)
+        slice1.__exit__ = MagicMock(return_value=False)
+        slice1.iter_content.return_value = [b"b\n"]
+        slice1.raise_for_status = MagicMock()
+
+        detail_resp = _mock_response(403, {"error": "forbidden"})
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0, slice1]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        dest = tmp_path / "out.csv"
+        with caplog.at_level("WARNING", logger="connectors.keboola.storage_api"):
+            c.download_file(
+                {"url": "https://signed/manifest.json", "name": "sliced", "isSliced": True},
+                dest,
+                table_id="in.c-main.t",
+            )
+
+        # No exception, no header — exactly the pre-fix raw concatenation.
+        assert dest.read_bytes() == b"a\nb\n"
+        assert any("in.c-main.t" in r.message and "table detail lookup failed" in r.message for r in caplog.records)
+
+    def test_falls_back_to_raw_concat_when_table_detail_has_no_columns(self, tmp_path, caplog):
+        """The table detail resolved fine but carries no `columns` field —
+        still not fatal, still logged loudly, still the raw concatenation."""
+        sess = MagicMock()
+
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {"entries": [{"url": "https://signed/slice-0"}]}
+        manifest_resp.raise_for_status = MagicMock()
+
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"a\n"]
+        slice0.raise_for_status = MagicMock()
+
+        detail_resp = _mock_response(200, {"rowsCount": 5})  # no "columns" key
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        dest = tmp_path / "out.csv"
+        with caplog.at_level("WARNING", logger="connectors.keboola.storage_api"):
+            c.download_file(
+                {"url": "https://signed/manifest.json", "name": "sliced", "isSliced": True},
+                dest,
+                table_id="in.c-main.t",
+            )
+
+        assert dest.read_bytes() == b"a\n"
+        assert any("no declared columns available" in r.message for r in caplog.records)
+
+    def test_falls_back_to_raw_concat_without_table_id(self, tmp_path):
+        """Callers that cannot name the table (no `table_id` threaded
+        through, same as the pre-fix signature default) keep the pre-fix
+        behaviour — no header, no table-detail lookup attempted."""
+        sess = MagicMock()
+
+        manifest_resp = MagicMock()
+        manifest_resp.json.return_value = {"entries": [{"url": "https://signed/slice-0"}]}
+        manifest_resp.raise_for_status = MagicMock()
+
+        slice0 = MagicMock()
+        slice0.__enter__ = MagicMock(return_value=slice0)
+        slice0.__exit__ = MagicMock(return_value=False)
+        slice0.iter_content.return_value = [b"a\n"]
+        slice0.raise_for_status = MagicMock()
+
+        sess.get.side_effect = [manifest_resp, slice0]
+
+        c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
+        dest = tmp_path / "out.csv"
+        c.download_file(
+            {"url": "https://signed/manifest.json", "name": "sliced", "isSliced": True},
+            dest,
+        )  # no table_id
+
+        assert dest.read_bytes() == b"a\n"
+        assert sess.get.call_count == 2  # manifest + slice only, no table-detail GET
 
 
 class TestSliceSortKey:
@@ -512,8 +713,8 @@ class TestSliceSortKey:
     def test_presigned_query_string_digits_do_not_perturb_order(self):
         # Real S3/Azure signed URLs carry digit-heavy query strings
         # (signatures, expiry epochs) that vary per slice. Only the path's
-        # slice index must drive the sort — the header slice (index 0) must
-        # come first even when the query string of a later slice sorts lower.
+        # slice index must drive the sort — slice 0 must come first even
+        # when the query string of a later slice sorts lower.
         urls = [
             "https://s3.example.com/b/export_0_0_1.csv?X-Amz-Expires=3600&X-Amz-Signature=000aaa",
             "https://s3.example.com/b/export_0_0_0.csv?X-Amz-Expires=3600&X-Amz-Signature=999zzz",
@@ -589,10 +790,12 @@ class TestSlicedGcpDownload:
         }
         manifest_resp.raise_for_status = MagicMock()
 
+        # Neither slice carries a header (#1916's real contract) — both are
+        # pure data, gs:// scheme included.
         slice0 = MagicMock()
         slice0.__enter__ = MagicMock(return_value=slice0)
         slice0.__exit__ = MagicMock(return_value=False)
-        slice0.iter_content.return_value = [b"col\n", b"a\n"]
+        slice0.iter_content.return_value = [b"a\n"]
         slice0.raise_for_status = MagicMock()
 
         slice1 = MagicMock()
@@ -601,7 +804,12 @@ class TestSlicedGcpDownload:
         slice1.iter_content.return_value = [b"b\n"]
         slice1.raise_for_status = MagicMock()
 
-        sess.get.side_effect = [manifest_resp, slice0, slice1]
+        detail_resp = _mock_response(200, {"columns": ["col"]})
+
+        # The table-detail lookup for the synthesized header is a plain
+        # Storage API call, not a slice fetch — it must NOT go through the
+        # gs:// rewrite / bearer-token machinery the slices below do.
+        sess.get.side_effect = [manifest_resp, detail_resp, slice0, slice1]
 
         c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
         dest = tmp_path / "out.csv"
@@ -613,14 +821,17 @@ class TestSlicedGcpDownload:
                 "gcsCredentials": {"access_token": "gcs-bearer-tok"},
             },
             dest,
+            table_id="in.c-main.t",
         )
 
-        # Header kept from slice 0 only, concat order preserved.
-        assert dest.read_bytes() == b"col\na\nb\n"
+        # Header synthesized from the table detail, concat order preserved.
+        assert dest.read_bytes() == b"col\r\na\nb\n"
 
-        assert sess.get.call_count == 3
-        slice0_call = sess.get.call_args_list[1]
-        slice1_call = sess.get.call_args_list[2]
+        assert sess.get.call_count == 4
+        detail_call = sess.get.call_args_list[1]
+        slice0_call = sess.get.call_args_list[2]
+        slice1_call = sess.get.call_args_list[3]
+        assert detail_call.args[0] == "https://kbc/v2/storage/tables/in.c-main.t"
         assert slice0_call.args[0] == "https://storage.googleapis.com/storage/v1/b/bkt/o/exp%2Fslice-0?alt=media"
         assert slice0_call.kwargs["headers"] == {"Authorization": "Bearer gcs-bearer-tok"}
         assert slice1_call.args[0] == "https://storage.googleapis.com/storage/v1/b/bkt/o/exp%2Fslice-1?alt=media"
@@ -1304,10 +1515,12 @@ class TestEmptySlicedExport:
     # -- branch 1: rowsCount == 0 → success, empty artifact with schema ------
 
     def test_csv_site_zero_rows_writes_header_only_export(self, tmp_path):
-        """Storage API puts the CSV header in slice 0 and data in slices
-        0..n, so "header, no data rows" IS the empty table's export. DuckDB
-        must read it back as the declared columns with zero rows — that is
-        what makes the downstream master view resolve."""
+        """Storage API never puts a header in any slice (see
+        `_download_sliced`), so "synthesized header, no data rows" IS the
+        empty table's export — the same shape as the non-empty case's
+        synthesized header. DuckDB must read it back as the declared
+        columns with zero rows — that is what makes the downstream master
+        view resolve."""
         sess = _empty_manifest_session({"rowsCount": 0, "columns": ["id", "answer_text"]})
         c = KeboolaStorageClient(url="https://kbc", token="t", session=sess)
 

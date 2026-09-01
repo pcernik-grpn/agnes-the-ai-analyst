@@ -312,6 +312,19 @@ def _assert_names_the_file_handover_channel(md: str) -> None:
         "the agent must be told NOT to promise a download control — whether the surface "
         "shows one is provider- and deployment-dependent, and it cannot see that from inside"
     )
+    # The overclaim above is one of two symmetric failures, and only the
+    # second one has actually been observed in a real conversation: asked for
+    # a deck, the agent opened with "this sandbox's filesystem isn't your
+    # local machine, so I can't hand you a downloadable file directly", built
+    # the .pptx anyway, and closed by telling the reader to pull it with the
+    # Agnes CLI. Every clause of that was false — the drawer had the file.
+    # A prompt that forbids promising a button while staying silent on
+    # denying the handover leaves the model's "sandboxes are isolated" prior
+    # to fill the gap, which is exactly what happened.
+    assert "Never disclaim the handover" in md, (
+        "the agent must be told the handover is REAL — writing to outputs/ IS the delivery, "
+        "and it must not claim the sandbox prevents it or send the reader to the CLI"
+    )
 
 
 def test_the_workspace_prompt_names_the_file_handover_channel():

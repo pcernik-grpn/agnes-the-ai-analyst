@@ -14,6 +14,7 @@ import io
 import hashlib
 import hmac
 import json
+import socket
 import threading
 import time
 from unittest import mock
@@ -624,6 +625,12 @@ def test_the_tool_ticket_is_confined_to_the_kai_route(seeded_app, kai_env, monke
     from src.repositories import ticket_repo
 
     monkeypatch.setenv("KAI_BROKER_MCP_ENABLED", "1")
+    # Step 3 proves the handler reaches the upstream CONNECTION by expecting the
+    # dial itself to fail — but the default upstream (localhost:8000) is a port
+    # a dev's unrelated local stack may well be serving, which turns the
+    # expected TransportError into a real answer. Pin an address nothing can
+    # accept on (port 9, discard) so "no MCP server" is true by construction.
+    monkeypatch.setenv("AGNES_MCP_INTERNAL_URL", "http://127.0.0.1:9")
     credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
     tickets = seeded_app["client"].post("/api/kai/tickets", headers={"Authorization": f"Bearer {credential}"}).json()
     tool_ticket = tickets["mcp"]
@@ -641,13 +648,24 @@ def test_the_tool_ticket_is_confined_to_the_kai_route(seeded_app, kai_env, monke
     assert denied.json()["detail"] == "ticket_scope_mismatch"
 
     # 3. And it DOES get past /api/kai/mcp's own gates — the mint/require
-    #    agreement. There is no MCP server to talk to in this environment, so
+    #    agreement. There is no MCP server for the self-call to reach here, so
     #    the proof is that the handler reaches the upstream CONNECTION at all:
     #    that is downstream of the availability gate, the scope check and the
     #    access-token mint. A scope rejection would have returned a 401 response
-    #    instead of attempting any network call.
+    #    instead of attempting any network call. The self-call's default target
+    #    is localhost:8000, which a dev machine may genuinely serve (a running
+    #    docker-compose stack answers and nothing raises) — so point it at a
+    #    loopback port that provably refuses: bind-and-release an ephemeral
+    #    listener and dial the now-dead port. (Bound-but-never-listening looks
+    #    tidier but macOS DROPS such SYNs, turning the instant refusal into a
+    #    connect-timeout wait.)
     import httpx
 
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        probe.listen(1)
+        dead_port = probe.getsockname()[1]
+    monkeypatch.setenv("AGNES_MCP_INTERNAL_URL", f"http://127.0.0.1:{dead_port}")
     with pytest.raises(httpx.TransportError):
         seeded_app["client"].post("/api/kai/mcp", headers={"Authorization": f"Bearer {tool_ticket}"}, content=b"{}")
 

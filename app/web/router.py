@@ -9,7 +9,7 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Final, Optional
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
@@ -1641,12 +1641,28 @@ async def me_activity_page(
     (Sessions / Token usage / Data access / Sync activity) backed by
     ``/api/me/stats/*`` endpoints.  The Sessions tab merges usage
     metrics with verification-pipeline status and download links.
+
+    ``last_session_upload_at`` is the only server-rendered datum: the Token
+    usage tab's empty state needs to distinguish "this account has never
+    pushed a session HERE" (usually a workspace pointed at another instance)
+    from "pushed, not processed yet", and the tokens API cannot see the audit
+    trail. Best-effort — a failing audit read must not take the page down.
     """
+    last_session_upload_at = None
+    try:
+        rows, _ = audit_repo().query(user_id=user["id"], action="session.upload", limit=1)
+        stamp = rows[0].get("timestamp") if rows else None
+        if stamp is not None:
+            last_session_upload_at = stamp.strftime("%Y-%m-%d %H:%M UTC") if hasattr(stamp, "strftime") else str(stamp)
+    except Exception:
+        logger.debug("could not read last session.upload for %s", user["id"], exc_info=True)
+
     ctx = _build_context(
         request,
         user=user,
         conn=conn,
         is_admin=is_user_admin(user["id"], conn),
+        last_session_upload_at=last_session_upload_at,
     )
     return templates.TemplateResponse(request, "me_activity.html", ctx)
 
@@ -5077,6 +5093,13 @@ async def library_detail(
         except Exception as e:
             logger.warning("/library/%s: facts summary failed: %s", slug, e)
 
+    # A scope-referenced collection refuses manual uploads (409
+    # collection_source_managed on POST .../files) — tell the reader up
+    # front instead of rendering a drop zone that can only fail.
+    from app.api.collections import source_managing_connection
+
+    managing = source_managing_connection(col["id"])
+
     ctx = _build_context(
         request,
         user=user,
@@ -5088,6 +5111,7 @@ async def library_detail(
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
         facts_summary=facts_summary,
+        source_managed_by=(managing.get("name") or managing.get("id")) if managing else None,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 
@@ -7516,14 +7540,15 @@ async def admin_data_packages(
     # ── The unpackaged tray — distributable tables no analyst can pull. ──
     # Same fold as the /admin gap card: blank query_mode reads as local,
     # `remote` rows are excluded (they answer server-side without a package).
+    # `internal` rows are packageable now (they carry the seeded `agnes-usage`
+    # package) but their query_mode is `internal`, so this distribution-shaped
+    # tray still passes over them — there is no parquet to pull.
     unpackaged_tables: list[dict] = []
     try:
         packaged_ids: set[str] = set()
         for ids in pkg_repo.list_member_ids_bulk().values():
             packaged_ids.update(ids)
         for t in table_registry_repo().list_all():
-            if (t.get("source_type") or "") == "internal":
-                continue
             if (t.get("query_mode") or "") not in ("", "local", "materialized"):
                 continue
             if t["id"] not in packaged_ids:
@@ -7674,7 +7699,9 @@ async def admin_package_detail(
     # Server-rendered rather than a second fetch: the registry is already read
     # above, and a picker that cannot open because one more request failed is
     # a worse failure than a page that is 30 kB heavier. `internal` rows
-    # (agnes_* bookkeeping tables) are never package material.
+    # (the agnes_* usage tables) ARE package material: they ship in the seeded
+    # `agnes-usage` package, and an admin who wants a different bundle must be
+    # able to see them here.
     #
     # Each row carries what the picker's toolbar filters and sorts ON, because
     # an instance with three hundred registered tables cannot be worked with a
@@ -7694,7 +7721,7 @@ async def admin_package_detail(
 
     candidate_tables = []
     for t in sorted(registry.values(), key=lambda r: (r.get("name") or r["id"]).lower()):
-        if t["id"] in member_set or (t.get("source_type") or "") == "internal":
+        if t["id"] in member_set:
             continue
         st = states.get(t["id"]) or {}
         last = _aware(st.get("last_sync"))
@@ -8884,7 +8911,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     #
     # `in_agnes` (TCRD-226) is a SEPARATE, additive sub-object: the
     # in-Agnes `corpus-extraction` job kind's own schedule state for THIS
-    # connection — whether extraction.enabled is on, the configured cadence
+    # connection — whether sharepoint.enabled is on, the configured cadence
     # (if any), and this connection's own last/next run (last_run_at is
     # this connection's own `config.extraction.last_run_at`, the SAME
     # bookkeeping `app/api/admin_sharepoint.py::_record_extraction_dispatch`
@@ -8913,7 +8940,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         from src.scheduler import next_due_at
 
         in_agnes_schedule["enabled"] = feature_enabled(
-            "extraction", "enabled", env_var="AGNES_EXTRACTION_ENABLED", default=False
+            "sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False
         )
         schedule_cfg = str(get_value("extraction", "schedule", default="") or "").strip() or None
         in_agnes_schedule["schedule"] = schedule_cfg
@@ -11052,6 +11079,7 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     """
     from src.rbac import get_accessible_tables
     from src.marketplace_filter import resolve_allowed_plugins
+    from app.api.marketplace import _curated_stack_sets
 
     by_source: dict[str, int] = {}
     try:
@@ -11071,6 +11099,22 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
 
     try:
         plugins = resolve_allowed_plugins(conn, user)
+        # Grant-only is only ELIGIBILITY (issue #1913): resolve_allowed_plugins
+        # answers "did some group's admin make this plugin reachable", not
+        # "is this plugin actually in the caller's served set". The sandbox
+        # only ever installs `resolve_user_marketplace`'s effective stack --
+        # admin-granted plugins narrowed to `subscriptions ∪ required-tier
+        # grants` -- so a plugin an admin merely made available, that this
+        # caller never subscribed to, was never loaded into their session and
+        # this panel must not claim otherwise. `_curated_stack_sets` is the
+        # exact same union `resolve_user_marketplace` filters the admin set
+        # through (and what the Library derives its own "in stack" state
+        # from, per its own docstring) -- reusing it here is what keeps this
+        # panel from drifting from the sandbox's real content a second time.
+        # Two more fixed-cardinality reads, no loop over `plugins`: still
+        # single-pass, same as the tables branch above.
+        in_stack, _required = _curated_stack_sets(conn, user["id"])
+        plugins = [p for p in plugins if (p["marketplace_id"], p["original_name"]) in in_stack]
         # Keep only the fields the template renders to keep the embedded
         # JSON small; ``plugin_dir`` is a Path which doesn't survive
         # ``tojson``, ``raw`` is upstream marketplace.json and can be MB.

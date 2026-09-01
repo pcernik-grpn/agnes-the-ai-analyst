@@ -1,5 +1,7 @@
 """Tests for agnes query command."""
 
+import csv
+import io
 import json
 import pytest
 from unittest.mock import patch, MagicMock
@@ -156,6 +158,31 @@ class TestRemoteQuery:
         # ...but the notice is present on stderr.
         assert "BigQuery scanned" in result.stderr
 
+    def test_remote_query_csv_format_round_trips_special_values(self):
+        """#1801: `--remote` renders through the same `_output` csv branch
+        as `--scope local` (and therefore the default `--scope auto`
+        fallback) — not a separate, still-broken code path. Remote rows
+        arrive as JSON lists rather than local's DuckDB tuples;
+        csv.writer must handle both the same way.
+        """
+        payload = {
+            "columns": ["comma", "quote", "newline", "nullable", "empty", "n"],
+            "rows": [["a,b", 'say "hi"', "line1\nline2", None, "", 2]],
+            "truncated": False,
+        }
+        sql = (
+            "SELECT 'a,b' AS comma, 'say \"hi\"' AS quote, "
+            "'line1' || chr(10) || 'line2' AS newline, "
+            "NULL AS nullable, '' AS empty, 2 AS n"
+        )
+        with patch("cli.client.api_post", return_value=_resp(200, payload)):
+            result = runner.invoke(app, ["query", sql, "--remote", "--format", "csv"])
+        assert result.exit_code == 0
+
+        parsed = list(csv.reader(io.StringIO(result.output)))
+        assert parsed[0] == ["comma", "quote", "newline", "nullable", "empty", "n"]
+        assert parsed[1] == ["a,b", 'say "hi"', "line1\nline2", "", "", "2"]
+
     def test_remote_query_uses_long_timeout(self):
         """--remote passes the long-running QUERY_TIMEOUT_S to api_post.
 
@@ -218,6 +245,58 @@ class TestLocalQuery:
         lines = result.output.strip().splitlines()
         assert lines[0] == "a,b"
         assert "1,x" in lines[1]
+
+    def test_local_query_csv_format_escapes_comma_and_quote(self, tmp_config):
+        """RFC 4180 escaping (#1801): the issue's canonical example — a
+        value containing a comma must be wrapped in double quotes, and an
+        embedded double quote must be doubled. Asserts on the literal
+        physical CSV bytes (not just a round-trip) so a fix that handles
+        the delimiter but forgets to double an embedded quote can't pass
+        by accident.
+        """
+        import duckdb
+
+        db_dir = tmp_config / "local" / "user" / "duckdb"
+        db_dir.mkdir(parents=True)
+        duckdb.connect(str(db_dir / "analytics.duckdb")).close()
+
+        result = runner.invoke(
+            app,
+            ["query", "SELECT 'a,b' AS comma, 'say \"hi\"' AS quote", "--format", "csv"],
+        )
+        assert result.exit_code == 0
+        lines = result.output.strip().splitlines()
+        assert lines[0] == "comma,quote"
+        assert lines[1] == '"a,b","say ""hi"""'
+
+    def test_local_query_csv_format_round_trips_special_values(self, tmp_config):
+        """RFC 4180 escaping (#1801): every value class that broke the
+        previous plain ",".join(...) — a comma, an embedded double quote,
+        an embedded newline, NULL, and an empty string — must round-trip
+        through a standard CSV parser. Mirrors the issue's exact repro
+        shape (plus NULL/empty columns). Verified via round-trip
+        (`csv.reader` over the CLI's own stdout) rather than literal
+        string matching — the exact physical quoting bytes for the
+        comma/quote case are already pinned by
+        test_local_query_csv_format_escapes_comma_and_quote.
+        """
+        import duckdb
+
+        db_dir = tmp_config / "local" / "user" / "duckdb"
+        db_dir.mkdir(parents=True)
+        duckdb.connect(str(db_dir / "analytics.duckdb")).close()
+
+        sql = (
+            "SELECT 'a,b' AS comma, 'say \"hi\"' AS quote, "
+            "'line1' || chr(10) || 'line2' AS newline, "
+            "NULL AS nullable, '' AS empty, 2 AS n"
+        )
+        result = runner.invoke(app, ["query", sql, "--format", "csv"])
+        assert result.exit_code == 0
+
+        parsed = list(csv.reader(io.StringIO(result.output)))
+        assert parsed[0] == ["comma", "quote", "newline", "nullable", "empty", "n"]
+        assert parsed[1] == ["a,b", 'say "hi"', "line1\nline2", "", "", "2"]
 
     def test_local_query_table_format(self, tmp_config):
         """Default table format renders without crash."""

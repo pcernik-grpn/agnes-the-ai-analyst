@@ -87,6 +87,8 @@ def _seed_summary(
     cache_creation_tokens=0,
     tool_calls=0,
     tool_errors=0,
+    mcp_calls=0,
+    subagent_dispatches=0,
     user_messages=0,
 ):
     repo.upsert_summary(
@@ -102,6 +104,8 @@ def _seed_summary(
             "user_messages": user_messages,
             "tool_calls": tool_calls,
             "tool_errors": tool_errors,
+            "mcp_calls": mcp_calls,
+            "subagent_dispatches": subagent_dispatches,
             "primary_model": primary_model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -273,8 +277,8 @@ def test_count_events(usage_repo):
 def test_reset_all_zeroes_tables_and_returns_counts(usage_repo):
     repo, _, _ = usage_repo
     now = datetime.now(timezone.utc)
-    _seed_summary(repo, session_file="bob/s1.jsonl", username="bob", started_at=now)
-    _seed_summary(repo, session_file="bob/s2.jsonl", username="bob", started_at=now)
+    _seed_summary(repo, session_file="bob/s1.jsonl", username="bob", user_id="uid-bob", started_at=now)
+    _seed_summary(repo, session_file="bob/s2.jsonl", username="bob", user_id="uid-bob", started_at=now)
     _seed_event(repo, event_id="r1", username="bob", session_file="bob/s1.jsonl", occurred_at=now)
 
     counts = repo.reset_all()
@@ -294,7 +298,7 @@ def test_reset_all_zeroes_tables_and_returns_counts(usage_repo):
 
     # Everything is gone.
     assert repo.count_events() == 0
-    assert repo.list_sessions_for_user_self("bob") == []
+    assert repo.list_sessions_for_user_self("uid-bob") == []
 
 
 def test_reset_all_clear_processors_clears_state_and_usage_together(usage_repo):
@@ -335,7 +339,7 @@ def test_list_sessions_for_user_admin_filters_on_user_id_or_username(usage_repo)
     rows = repo.list_sessions_for_user_admin(user_id="uid-1", username="carol")
     files = {r["session_file"] for r in rows}
     assert files == {"u/s1.jsonl", "u/s2.jsonl"}
-    # 9-column shape.
+    # 11-column shape.
     assert set(rows[0].keys()) == {
         "session_file",
         "session_id",
@@ -345,21 +349,29 @@ def test_list_sessions_for_user_admin_filters_on_user_id_or_username(usage_repo)
         "wall_seconds",
         "tool_calls",
         "tool_errors",
+        "mcp_calls",
+        "subagent_dispatches",
         "primary_model",
     }
 
 
-def test_list_sessions_for_user_self_filters_on_username_only(usage_repo):
+def test_list_sessions_for_user_self_filters_on_user_id_only(usage_repo):
+    """The self list is keyed on the account id. Since v60 ``username`` holds
+    the display email, so a row is the caller's iff its ``user_id`` matches —
+    a same-email row belonging to another account must not leak, and a row
+    whose username was written under a different display value still shows."""
     repo, _, _ = usage_repo
     now = datetime.now(timezone.utc)
-    _seed_summary(repo, session_file="d/s1.jsonl", username="dave", user_id="uid-x", started_at=now)
-    # Same user_id but different username — must NOT appear (self filters on username).
-    _seed_summary(repo, session_file="d/s2.jsonl", username="someone-else", user_id="uid-x", started_at=now)
+    _seed_summary(repo, session_file="d/s1.jsonl", username="dave@example.com", user_id="uid-x", started_at=now)
+    # Same display email, DIFFERENT account — must NOT appear.
+    _seed_summary(repo, session_file="d/s2.jsonl", username="dave@example.com", user_id="uid-other", started_at=now)
+    # Same account, stale display name (pre-v60 dir-name fallback) — must appear.
+    _seed_summary(repo, session_file="d/s3.jsonl", username="dave", user_id="uid-x", started_at=now)
 
-    rows = repo.list_sessions_for_user_self("dave")
+    rows = repo.list_sessions_for_user_self("uid-x")
     files = {r["session_file"] for r in rows}
-    assert files == {"d/s1.jsonl"}
-    # 14-column shape.
+    assert files == {"d/s1.jsonl", "d/s3.jsonl"}
+    # 16-column shape.
     assert set(rows[0].keys()) == {
         "session_file",
         "session_id",
@@ -370,6 +382,8 @@ def test_list_sessions_for_user_self_filters_on_username_only(usage_repo):
         "user_messages",
         "tool_calls",
         "tool_errors",
+        "mcp_calls",
+        "subagent_dispatches",
         "input_tokens",
         "output_tokens",
         "cache_read_tokens",
@@ -392,6 +406,7 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
         repo,
         session_file="tk/s1.jsonl",
         username="tok",
+        user_id="user-42",
         started_at=now,
         input_tokens=100,
         output_tokens=200,
@@ -405,6 +420,73 @@ def test_get_session_summary_projects_the_token_counters_on_both_backends(usage_
     assert row["output_tokens"] == 200
     assert row["cache_read_tokens"] == 300
     assert row["cache_creation_tokens"] == 400
+    # The transcript viewer's activity-timeline link needs the resolved
+    # users.id — same widened-projection seam as the token counters above.
+    assert row["user_id"] == "user-42"
+
+
+def test_tool_call_totals_include_mcp_and_subagent_on_both_backends(usage_repo):
+    """A session whose work is mostly MCP tools used to render as
+    "Tool calls: 2, Errors: 15" — `tool_calls` counts only native tool_use
+    events while `tool_errors` counts `is_error` across ALL call kinds. Every
+    admin read surface now reports the full call count (native + MCP +
+    subagent): the detail projection carries the breakdown columns, the KPI
+    total and the `tool_calls` sort key sum all three.
+    """
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="mc/s1.jsonl",
+        username="mcp-heavy",
+        # The self listing keys on `user_id`, not `username` (v60 moved the
+        # display email into `username`; see list_sessions_for_user_self), so
+        # the row needs one or the self-view assertion below reads an empty
+        # list rather than the breakdown it is checking for.
+        user_id="mcp-heavy",
+        started_at=now,
+        tool_calls=2,
+        mcp_calls=18,
+        subagent_dispatches=1,
+        tool_errors=15,
+    )
+    _seed_summary(
+        repo,
+        session_file="mc/s2.jsonl",
+        username="native-only",
+        started_at=now,
+        tool_calls=5,
+    )
+
+    row = repo.get_session_summary("mc/s1.jsonl")
+    assert row is not None
+    assert row["tool_calls"] == 2
+    assert row["mcp_calls"] == 18
+    assert row["subagent_dispatches"] == 1
+
+    kpis = repo.sessions_kpis({"since": now - timedelta(days=1)})
+    assert kpis["tool_calls_total"] == 2 + 18 + 1 + 5
+    assert kpis["tool_errors_total"] == 15
+
+    # Sorting by "tool_calls" orders by the TOTAL (21 vs 5), not the
+    # native-only count (2 vs 5).
+    rows = repo.sessions_list(
+        {"since": now - timedelta(days=1)},
+        sort_col="tool_calls",
+        direction="DESC",
+        limit=10,
+        offset=0,
+    )
+    files = [r["session_file"] for r in rows]
+    assert files.index("mc/s1.jsonl") < files.index("mc/s2.jsonl")
+
+    # The per-user admin/self listings carry the breakdown columns too.
+    admin_rows = repo.list_sessions_for_user_admin(user_id="none", username="mcp-heavy")
+    assert admin_rows and admin_rows[0]["mcp_calls"] == 18
+    assert admin_rows[0]["subagent_dispatches"] == 1
+    self_rows = repo.list_sessions_for_user_self("mcp-heavy")
+    assert self_rows and self_rows[0]["mcp_calls"] == 18
+    assert self_rows[0]["subagent_dispatches"] == 1
 
 
 def test_sessions_listing_carries_the_token_counters_on_both_backends(usage_repo):
@@ -445,7 +527,8 @@ def test_tokens_totals_and_by_model(usage_repo):
     _seed_summary(
         repo,
         session_file="t/s1.jsonl",
-        username="erin",
+        username="erin@example.com",
+        user_id="uid-erin",
         started_at=now,
         primary_model="claude-a",
         input_tokens=10,
@@ -456,7 +539,8 @@ def test_tokens_totals_and_by_model(usage_repo):
     _seed_summary(
         repo,
         session_file="t/s2.jsonl",
-        username="erin",
+        username="erin@example.com",
+        user_id="uid-erin",
         started_at=now,
         primary_model="claude-b",
         input_tokens=100,
@@ -465,7 +549,7 @@ def test_tokens_totals_and_by_model(usage_repo):
         cache_creation_tokens=0,
     )
 
-    totals = repo.tokens_totals("erin")
+    totals = repo.tokens_totals("uid-erin")
     assert totals["input"] == 110
     assert totals["output"] == 220
     assert totals["cache_read"] == 3
@@ -473,7 +557,7 @@ def test_tokens_totals_and_by_model(usage_repo):
     assert totals["total"] == 335
     assert totals["sessions"] == 2
 
-    by_model = repo.tokens_by_model("erin")
+    by_model = repo.tokens_by_model("uid-erin")
     # Ordered by total desc → claude-b (300) first, claude-a (35) second.
     assert [m["model"] for m in by_model] == ["claude-b", "claude-a"]
     assert by_model[0]["total"] == 300
@@ -484,33 +568,53 @@ def test_tokens_top_sessions_orders_by_total(usage_repo):
     repo, _, _ = usage_repo
     now = datetime.now(timezone.utc)
     _seed_summary(
-        repo, session_file="ts/small.jsonl", username="frank", started_at=now, input_tokens=1, output_tokens=1
+        repo,
+        session_file="ts/small.jsonl",
+        username="frank@example.com",
+        user_id="uid-frank",
+        started_at=now,
+        input_tokens=1,
+        output_tokens=1,
     )
     _seed_summary(
-        repo, session_file="ts/big.jsonl", username="frank", started_at=now, input_tokens=1000, output_tokens=1000
+        repo,
+        session_file="ts/big.jsonl",
+        username="frank@example.com",
+        user_id="uid-frank",
+        started_at=now,
+        input_tokens=1000,
+        output_tokens=1000,
     )
 
-    top = repo.tokens_top_sessions("frank", limit=10)
+    top = repo.tokens_top_sessions("uid-frank", limit=10)
     assert top[0]["session_file"] == "ts/big.jsonl"
     assert top[0]["total"] == 2000
     assert top[1]["session_file"] == "ts/small.jsonl"
     # limit is honored.
-    assert len(repo.tokens_top_sessions("frank", limit=1)) == 1
+    assert len(repo.tokens_top_sessions("uid-frank", limit=1)) == 1
 
 
 def test_tokens_daily_series_window(usage_repo):
     repo, _, _ = usage_repo
     now = datetime.now(timezone.utc)
-    _seed_summary(repo, session_file="ds/s1.jsonl", username="grace", started_at=now, input_tokens=5, output_tokens=5)
+    _seed_summary(
+        repo,
+        session_file="ds/s1.jsonl",
+        username="grace@example.com",
+        user_id="uid-grace",
+        started_at=now,
+        input_tokens=5,
+        output_tokens=5,
+    )
 
-    series = repo.tokens_daily_series("grace", days=30)
+    series = repo.tokens_daily_series("uid-grace", days=30)
     assert len(series) == 1
     assert series[0]["total"] == 10
     assert series[0]["sessions"] == 1
 
 
-def test_tokens_daily_series_filters_username_and_days(usage_repo):
-    """Pins the username + days predicates: an old same-user row (outside the
+def test_tokens_daily_series_filters_user_id_and_days(usage_repo):
+    """Pins the user_id + days predicates: an old same-user row (outside the
     window) and a current other-user row must both be excluded, so the series
     reflects only the requested user's in-window totals."""
     repo, _, _ = usage_repo
@@ -518,7 +622,8 @@ def test_tokens_daily_series_filters_username_and_days(usage_repo):
     _seed_summary(
         repo,
         session_file="ds/current.jsonl",
-        username="grace",
+        username="grace@example.com",
+        user_id="uid-grace",
         started_at=now - timedelta(days=5),
         input_tokens=5,
         output_tokens=5,
@@ -526,7 +631,8 @@ def test_tokens_daily_series_filters_username_and_days(usage_repo):
     _seed_summary(
         repo,
         session_file="ds/old.jsonl",
-        username="grace",
+        username="grace@example.com",
+        user_id="uid-grace",
         started_at=now - timedelta(days=45),
         input_tokens=500,
         output_tokens=500,
@@ -534,16 +640,91 @@ def test_tokens_daily_series_filters_username_and_days(usage_repo):
     _seed_summary(
         repo,
         session_file="ds/other.jsonl",
-        username="heidi",
+        username="heidi@example.com",
+        user_id="uid-heidi",
         started_at=now - timedelta(days=5),
         input_tokens=50,
         output_tokens=50,
     )
 
-    series = repo.tokens_daily_series("grace", days=30)
+    series = repo.tokens_daily_series("uid-grace", days=30)
     assert len(series) == 1
     assert series[0]["total"] == 10
     assert series[0]["sessions"] == 1
+
+
+def test_self_reads_ignore_the_username_column(usage_repo):
+    """All five self-scoped reads key on ``user_id``. A row carrying the
+    caller's display email under a DIFFERENT account id must be invisible to
+    every one of them — otherwise the /me/activity panels would attribute
+    another account's tokens to the caller."""
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="mine/s1.jsonl",
+        username="ivan@example.com",
+        user_id="uid-ivan",
+        started_at=now,
+        input_tokens=10,
+        output_tokens=20,
+    )
+    _seed_summary(
+        repo,
+        session_file="theirs/s1.jsonl",
+        username="ivan@example.com",  # same display email, other account
+        user_id="uid-impostor",
+        started_at=now,
+        input_tokens=9999,
+        output_tokens=9999,
+    )
+
+    assert [r["session_file"] for r in repo.list_sessions_for_user_self("uid-ivan")] == ["mine/s1.jsonl"]
+    totals = repo.tokens_totals("uid-ivan")
+    assert totals["total"] == 30
+    assert totals["sessions"] == 1
+    assert [s["session_file"] for s in repo.tokens_top_sessions("uid-ivan")] == ["mine/s1.jsonl"]
+    assert sum(m["total"] for m in repo.tokens_by_model("uid-ivan")) == 30
+    assert sum(d["total"] for d in repo.tokens_daily_series("uid-ivan", days=30)) == 30
+
+
+def test_self_reads_drop_legacy_rows_without_user_id(usage_repo):
+    """Rows written before the v45 ``user_id`` column carry NULL there and are
+    NOT backfilled: they simply fall out of the caller's own views. They stay
+    reachable through the admin variant, which also matches on ``username``."""
+    repo, _, _ = usage_repo
+    now = datetime.now(timezone.utc)
+    _seed_summary(
+        repo,
+        session_file="uid-judy/current.jsonl",
+        username="judy@example.com",
+        user_id="uid-judy",
+        started_at=now,
+        input_tokens=10,
+        output_tokens=20,
+    )
+    _seed_summary(
+        repo,
+        session_file="judy/legacy.jsonl",
+        username="judy@example.com",
+        user_id=None,
+        started_at=now,
+        input_tokens=500,
+        output_tokens=500,
+    )
+
+    assert [r["session_file"] for r in repo.list_sessions_for_user_self("uid-judy")] == ["uid-judy/current.jsonl"]
+    totals = repo.tokens_totals("uid-judy")
+    assert totals["total"] == 30
+    assert totals["sessions"] == 1
+    assert [s["session_file"] for s in repo.tokens_top_sessions("uid-judy")] == ["uid-judy/current.jsonl"]
+    assert sum(d["total"] for d in repo.tokens_daily_series("uid-judy", days=30)) == 30
+
+    # No backfill — but the admin view still finds the orphan by username.
+    admin_files = {
+        r["session_file"] for r in repo.list_sessions_for_user_admin(user_id="uid-judy", username="judy@example.com")
+    }
+    assert admin_files == {"uid-judy/current.jsonl", "judy/legacy.jsonl"}
 
 
 def test_delete_older_than_present_on_both_backends(usage_repo):
@@ -1154,11 +1335,12 @@ def test_pg_day_bucketing_is_utc_regardless_of_session_timezone(pg_repo_skewed_t
     _seed_summary(
         repo,
         session_file="alice/tz.jsonl",
-        username="alice",
+        username="alice@example.com",
+        user_id="uid-alice",
         started_at=utc_now,
         input_tokens=7,
     )
-    tokens = repo.tokens_daily_series("alice", days=3)
+    tokens = repo.tokens_daily_series("uid-alice", days=3)
     assert [r["day"] for r in tokens] == [utc_day.isoformat()]
 
     # audit_log.timestamp path (query-telemetry frequency): same UTC pin.
@@ -1190,14 +1372,20 @@ def test_upsert_summary_uploaded_at_first_arrival_wins(usage_repo):
     repo.upsert_summary(dict(base), processor_version=1)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     first = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert first is not None
     repo.upsert_summary(dict(base), processor_version=2)
     rows = repo.sessions_list(
         {"since": datetime(2000, 1, 1, tzinfo=timezone.utc), "anchor": "uploaded"},
-        sort_col="uploaded_at", direction="desc", limit=10, offset=0,
+        sort_col="uploaded_at",
+        direction="desc",
+        limit=10,
+        offset=0,
     )
     second = next(r for r in rows if r["session_id"] == "arr")["uploaded_at"]
     assert second == first
@@ -1251,8 +1439,11 @@ def _seed_query_audit(repo, backend, conn, rows):
     if backend == "duckdb":
         for r in rows:
             conn.execute(
-                stmt.replace(":id", "?").replace(":ts", "?").replace(":action", "?")
-                    .replace(":resource", "?").replace(":result", "?"),
+                stmt.replace(":id", "?")
+                .replace(":ts", "?")
+                .replace(":action", "?")
+                .replace(":resource", "?")
+                .replace(":result", "?"),
                 [r["id"], r["ts"], r["action"], r["resource"], r["result"]],
             )
     else:

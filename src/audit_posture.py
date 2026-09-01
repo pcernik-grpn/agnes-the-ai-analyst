@@ -800,6 +800,13 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.chat_session_files --
     "GET /api/chat/sessions/{chat_id}/files": "exempt:self",
     "GET /api/chat/sessions/{chat_id}/files/download": "chat.session_file.download",
+    # A preview reads the caller's OWN session file and returns a capped
+    # glance of it — same self-scoped read as the listing above, which is why
+    # it carries the listing's exemption and not the download's action. The
+    # bytes-serving sibling does log: `…/raw` hands the real file to the
+    # browser, which is the same egress `…/download` records.
+    "GET /api/chat/sessions/{chat_id}/files/preview": "exempt:self",
+    "GET /api/chat/sessions/{chat_id}/files/raw": "chat.session_file.download",
     # -- app.api.claude_md --
     "GET /api/admin/workspace-prompt-template": "exempt:ui_support",
     "GET /api/welcome": "exempt:ui_support",

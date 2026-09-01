@@ -20,7 +20,7 @@ The practical consequences:
 - **Scope at the source.** If a group must not see a Confluence space or a Jira project, that restriction belongs on the service account in Confluence/Jira — typically as a second, narrower connection. Granting or withholding the Agnes-side resource is all-or-nothing over whatever the credential can reach.
 - **A shared service account flattens identity.** Everyone reaching a system through one connection is the same principal upstream, which is the point (people without a seat in the upstream tool can still read through it) and also the cost: the upstream audit log records the service account, not the human. Agnes's own audit trail is where per-user attribution survives.
 - **Grants are deterministic and flat.** No nesting, no inheritance, no negative grants. A user's access is the union over their groups — there is no way to express "everything in this package except one table". Split the package instead.
-- **Grants are table-level.** A group either can or cannot see a whole registered table — there is no row- or column-grain grant in this model. The internal `agnes_sessions` / `agnes_telemetry` / `agnes_audit` tables carry their own hard-coded per-row filter, applied at query time regardless of grants (`src/rbac.py`, `connectors/internal/access.py`); that mechanism is specific to those three tables, not a general primitive.
+- **Grants are table-level.** A group either can or cannot see a whole registered table — there is no row- or column-grain grant in this model. The internal `agnes_sessions` / `agnes_telemetry` / `agnes_audit` tables additionally carry a hard-coded per-row filter, applied at query time on top of whatever the grant said (`connectors/internal/access.py`); that mechanism is specific to those tables, not a general primitive. Reaching those tables at all is an ordinary Data-Package grant — see [Internal usage tables](#internal-usage-tables-the-agnes-usage-package).
 
 To limit what an *agent* can reach, use agent scopes (an agent's effective authority is owner grants ∩ agent scope, enforced live at every brokered request) — but the same boundary applies underneath: the agent inherits whatever the connection's upstream principal can see.
 
@@ -43,6 +43,52 @@ to. Granting only the package leaves the agent's/session's effective table
 set empty for that table, regardless of the owner's own query access to it
 via `agnes query`/`agnes pull`. If nobody in the instance uses agent scoping
 or co-sessions, a `TABLE` grant has no live effect at all.
+
+### Internal usage tables: the `agnes-usage` package
+
+The internal tables — `agnes_sessions` (Claude Code sessions),
+`agnes_telemetry` (tool/skill invocations), `agnes_audit` (the audit trail)
+and, on Postgres-backed instances, `agnes_turns` (per-assistant-turn token
+usage) — are registered like any other table and are **members of a seeded
+data package with the stable slug `agnes-usage`** ("Agnes Usage"). Access
+works exactly like any other table:
+
+- **Visibility of the table** = the `agnes-usage` package is in the caller's
+  stack (a `resource_grants(group, 'data_package', <agnes-usage id>)` row on
+  one of their groups, `required` or subscribed). Without it the tables do
+  not appear in `agnes catalog` / `/api/v2/catalog`, and `SELECT … FROM
+  agnes_sessions` returns **403** on `/api/query` (and through the CLI and
+  the MCP `query` tool, which proxy to it).
+- **Which rows** = unchanged and independent of the grant: a non-admin sees
+  only their own rows, an admin sees the unscoped table. There is no
+  "grantee sees everyone" tier — granting the package never widens row
+  scope.
+- **Admins** need no grant (god-mode short-circuit), so admin usage
+  dashboards are unaffected.
+- **Agents and co-sessions** (`SessionPrincipal` / `AgentPrincipal`) keep
+  reaching the internal tables without the package — a deliberate carve-out:
+  a principal has no personal stack, its authority is already owner grants ∩
+  agent scope, and the row filter binds it to the rows it is entitled to.
+
+The tables are server-side only: `agnes pull` never downloads them, and the
+sync API refuses to sign their parquet URLs, so a package grant is a query
+grant and nothing more.
+
+**Upgrade step (breaking change).** Before this change every authenticated
+user could read their own usage rows implicitly. After upgrading, an admin
+must grant `agnes-usage` to the groups that should keep that access:
+
+```bash
+# the grant command takes the package id, not the slug — look it up first
+agnes admin data-package list --search agnes-usage
+agnes admin grant create "Everyone" data_package <pkg-id> --requirement required
+```
+
+or, in the UI, `/admin/access` → the *Agnes Usage* package → grant it to the
+group (mark it **Required** to land it in stacks without a subscribe step).
+Granting it to `Everyone` restores the previous behaviour exactly, since the
+row filter was — and remains — the thing that kept one user out of another's
+rows.
 
 ### A third layer: row and column access policies
 
@@ -376,10 +422,10 @@ Schema v49 (unified Browse + My Stack for Data Packages and Memory):
 
 Effective Required = OR across grants. Any grant with `requirement='required'` wins for the user.
 
-**Stack membership modes** (`features.stack_auto_membership`, spec `docs/superpowers/specs/2026-08-07-default-chrome-ux-parity.md`): for `data_package`/`memory_domain` grants, `StackResolver` resolves in one of two modes.
+**Stack membership modes** (`features.stack_auto_membership`, spec `docs/superpowers/specs/2026-08-07-default-chrome-ux-parity.md`): for `data_package`/`memory_domain` grants, `StackResolver` resolves in one of two modes. Auto-membership has been the **default since Wave 0 (2026-08)** — the `redesign` experience preset, now the only one, implies `stack_auto_membership: true`; classic remains a fully-supported explicit opt-out (`features.stack_auto_membership: false` or `AGNES_STACK_AUTO_MEMBERSHIP=0`), and an explicit `false` always wins over the default.
 
-- **Classic — the default** (the original v49 "subscribe to add" model): effective stack = `required ∪ (subscribed ∩ available)`. A `user_stack_subscriptions` row means "is in the stack", and every member is downloaded by `agnes pull`. A `required → available` downgrade on `PUT /api/admin/grants/{id}` eagerly fans out subscription rows to the group's members (idempotent `subscribe_group_members`) so nobody silently loses the resource.
-- **Auto-membership — opt-in** (`features.stack_auto_membership: true`, implied by `instance.experience: redesign`): BOTH `required` and `available` grants are automatically in the user's stack — no subscription needed for visibility or server-side query authorization. `user_stack_subscriptions` keeps its schema but is reinterpreted: a row means "keep a local copy" (`agnes pull` downloads it), not "is in the stack". The `required → available` downgrade needs no fan-out — the resource stays in every granted user's stack, only the "always downloaded" guarantee relaxes to "downloaded once subscribed".
+- **Auto-membership — the default** (since Wave 0): BOTH `required` and `available` grants are automatically in the user's stack — no subscription needed for visibility or server-side query authorization. `user_stack_subscriptions` keeps its schema but is reinterpreted: a row means "keep a local copy" (`agnes pull` downloads it), not "is in the stack". The `required → available` downgrade needs no fan-out — the resource stays in every granted user's stack, only the "always downloaded" guarantee relaxes to "downloaded once subscribed".
+- **Classic — explicit opt-out** (the original v49 "subscribe to add" model): effective stack = `required ∪ (subscribed ∩ available)`. A `user_stack_subscriptions` row means "is in the stack", and every member is downloaded by `agnes pull`. A `required → available` downgrade on `PUT /api/admin/grants/{id}` eagerly fans out subscription rows to the group's members (idempotent `subscribe_group_members`) so nobody silently loses the resource. **Symptom of running classic without realizing it:** a group member holding an `available` data-package grant gets 403 `table_not_in_stack` on the package's tables until they subscribe — check the flag (env, `instance.yaml`, or the `/admin/server-config` overlay) before suspecting a grant bug.
 
 The flag flips behavior instantly; rows are interpreted, never rewritten. `marketplace_plugin` grants are mode-independent: they resolve via `resolve_user_marketplace` (`granted ∩ (subscribed ∪ required)`) off the separate opt-out `user_plugin_optouts` table, so a `required → available` downgrade there always eagerly fans out to keep every group member's served set from silently shrinking.
 

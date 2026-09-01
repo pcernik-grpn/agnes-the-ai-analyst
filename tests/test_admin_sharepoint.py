@@ -5,6 +5,17 @@ error (surface absence rather than fail, per spec) vs. a real Graph browse
 with the Graph transport mocked, scope->collection creation idempotency
 (re-confirming a scope reuses the same collection), the no-group ("indexed
 but invisible") warning, and the producer-handoff corpus-map endpoint.
+
+2026-09-01: the whole router is gated by the single ``sharepoint`` switch
+(``app/api/admin_sharepoint.py``'s module-level ``_require_sharepoint_enabled``
+dependency, 409 ``feature_disabled`` when off) — see ``TestSharePointGate``
+below for that gate itself. The module-level ``_sharepoint_enabled_by_default``
+fixture turns the switch ON for every OTHER test in this file via
+``AGNES_SHAREPOINT_ENABLED`` so the rest of the suite exercises the routes'
+own behavior, not the gate; a class that needs to control the switch itself
+(``TestAclSyncTrigger``, ``TestSubtreeSweepTrigger``, ``TestExtractionTrigger``,
+``TestExtractionRunDue``) clears the env var in its own autouse fixture and
+drives the flag through the mocked ``get_value`` config instead.
 """
 
 from __future__ import annotations
@@ -20,6 +31,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 BASE = "/api/admin/sharepoint/connections"
+
+
+@pytest.fixture(autouse=True)
+def _sharepoint_enabled_by_default(monkeypatch):
+    monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
 
 
 def _auth(token: str) -> dict:
@@ -1010,8 +1026,25 @@ class TestAnonymizationDeclaredField:
         assert listed.json()["items"][0]["anonymization_declared"] is False
 
 
+def _add_corpus_file(collection_id: str, filename: str = "doc.md") -> str:
+    """Plant one ingested file row so a collection reads as non-empty."""
+    from src.repositories import corpus_files_repo
+
+    return corpus_files_repo().add(
+        corpus_id=collection_id,
+        filename=filename,
+        sha256="0" * 64,
+        file_type="text/markdown",
+        size_bytes=1,
+        storage_path=None,
+    )
+
+
 class TestScopeRemoval:
-    def test_removing_a_scope_drops_the_row_not_the_collection(self, seeded_app):
+    def test_removing_a_scope_keeps_a_collection_that_has_files(self, seeded_app):
+        """Deleting a collection that holds indexed data stays a separate,
+        deliberate operation — untick only drops the wizard's bookkeeping row
+        and TELLS the admin the collection stayed (``collection_kept``)."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="remove-conn")
@@ -1022,9 +1055,14 @@ class TestScopeRemoval:
             headers=_auth(token),
         )
         collection_id = confirmed.json()["collection_id"]
+        _add_corpus_file(collection_id)
 
         deleted = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:gone"}, headers=_auth(token))
-        assert deleted.status_code == 204
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+        assert body["collection_kept"] is True
+        assert body["collection"]["id"] == collection_id
+        assert body["collection"]["slug"]
 
         listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
         assert listed.json()["items"] == []
@@ -1032,6 +1070,32 @@ class TestScopeRemoval:
         # The collection itself is untouched by unselecting the scope.
         coll = c.get(f"/api/collections/{collection_id}", headers=_auth(token))
         assert coll.status_code == 200
+
+    def test_removing_a_scope_with_an_empty_collection_deletes_it(self, seeded_app):
+        """An EMPTY scope collection holds no data, so keeping it on untick
+        only breeds orphans (observed live 2026-08-31: a 0-file collection
+        with no scope pointing at it, next to its re-tick twin)."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-empty-conn")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:empty-gone", "display_path": "Never crawled"},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        deleted = c.delete(
+            f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:empty-gone"}, headers=_auth(token)
+        )
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+        assert body["collection_kept"] is False
+        assert body["collection"] is None
+
+        coll = c.get(f"/api/collections/{collection_id}", headers=_auth(token))
+        assert coll.status_code == 404
 
     def test_removing_unknown_scope_is_404(self, seeded_app):
         c = seeded_app["client"]
@@ -1075,7 +1139,7 @@ class TestScopeRemoval:
         r = c.delete(
             f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:remove-hygiene"}, headers=_auth(token)
         )
-        assert r.status_code == 204
+        assert r.status_code == 200
 
         remaining = [
             g
@@ -1084,6 +1148,103 @@ class TestScopeRemoval:
         ]
         assert len(remaining) == 1
         assert remaining[0]["group_id"] == admin_group_id
+
+
+class TestUntickRetickLifecycle:
+    """Tick → untick → re-tick must never breed a duplicate collection.
+
+    Observed live 2026-08-31: unticking and re-ticking the SAME folder left
+    an orphaned 0-file collection next to a live slug-suffixed twin, because
+    ``confirm_scope``'s idempotency was keyed on the scope row that
+    ``remove_scope`` had just deleted."""
+
+    def _confirm(self, c, token, conn_id, scope_id, path="Site / Folder"):
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": scope_id, "display_path": path},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def _untick(self, c, token, conn_id, scope_id):
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": scope_id}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _live_collections_named(self, name_fragment: str) -> list:
+        from src.repositories import file_corpora_repo
+
+        return [r for r in file_corpora_repo().list_all() if name_fragment in (r.get("name") or "")]
+
+    def test_empty_scope_cycle_restores_the_same_collection(self, seeded_app):
+        """Untick auto-deletes the empty collection; re-tick brings back the
+        SAME one — same id, same slug, exactly one live collection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-empty-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-empty")
+        self._untick(c, token, conn_id, "drive:cycle-empty")
+        again = self._confirm(c, token, conn_id, "drive:cycle-empty")
+
+        assert again["collection_id"] == first["collection_id"]
+        assert again["collection"]["slug"] == first["collection"]["slug"]
+        assert len(self._live_collections_named("cycle-empty-conn")) == 1
+
+    def test_empty_scope_cycle_survives_repeated_unticks(self, seeded_app):
+        """Three full cycles: the deterministic slug-suffix fallback in
+        ``_create_scope_collection`` absorbs only ONE collision, so anything
+        short of true re-adoption 500s by the third tick."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-thrice-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-thrice")
+        for _ in range(3):
+            self._untick(c, token, conn_id, "drive:cycle-thrice")
+            again = self._confirm(c, token, conn_id, "drive:cycle-thrice")
+            assert again["collection_id"] == first["collection_id"]
+        assert len(self._live_collections_named("cycle-thrice-conn")) == 1
+
+    def test_kept_collection_is_readopted_on_retick(self, seeded_app):
+        """A collection kept on untick (it has files) is re-adopted on
+        re-tick of the same folder — files intact, no suffixed twin."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-kept-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-kept")
+        _add_corpus_file(first["collection_id"])
+        unticked = self._untick(c, token, conn_id, "drive:cycle-kept")
+        assert unticked["collection_kept"] is True
+
+        again = self._confirm(c, token, conn_id, "drive:cycle-kept")
+        assert again["collection_id"] == first["collection_id"]
+        assert len(self._live_collections_named("cycle-kept-conn")) == 1
+
+        files = c.get(f"/api/collections/{first['collection_id']}/files", headers=_auth(token))
+        assert files.status_code == 200
+        assert len(files.json()["files"]) == 1
+
+    def test_library_delete_between_untick_and_retick_is_respected(self, seeded_app):
+        """A DELIBERATE Library delete of the kept collection is never
+        resurrected by a later re-tick — that mints a fresh collection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-libdel-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-libdel")
+        _add_corpus_file(first["collection_id"])
+        self._untick(c, token, conn_id, "drive:cycle-libdel")
+
+        deleted = c.delete(f"/api/collections/{first['collection_id']}", headers=_auth(token))
+        assert deleted.status_code == 204, deleted.text
+
+        again = self._confirm(c, token, conn_id, "drive:cycle-libdel")
+        assert again["collection_id"] != first["collection_id"]
+        assert c.get(f"/api/collections/{first['collection_id']}", headers=_auth(token)).status_code == 404
+        assert len(self._live_collections_named("cycle-libdel-conn")) == 1
 
 
 class TestNoGroupWarning:
@@ -1419,10 +1580,6 @@ class TestAclSyncTrigger:
 
     ACL_SYNC = "{base}/{cid}/acl-sync"
 
-    @pytest.fixture(autouse=True)
-    def _clear_acl_mirroring_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
             self.ACL_SYNC.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
@@ -1433,14 +1590,22 @@ class TestAclSyncTrigger:
         r = seeded_app["client"].post(self.ACL_SYNC.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+    def test_409_when_flag_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface before any
+        per-route work — including the connection lookup — so an unknown
+        connection id gets the same 409 as a real one. Clears the
+        module-level `_sharepoint_enabled_by_default` env override so the
+        mocked `get_value` config is what actually decides."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         r = seeded_app["client"].post(
             self.ACL_SYNC.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
-        assert r.status_code == 404
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-flag-off")
@@ -1449,7 +1614,7 @@ class TestAclSyncTrigger:
         assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-happy")
         r = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1464,7 +1629,7 @@ class TestAclSyncTrigger:
         assert job["payload_json"] == {"connection_id": conn_id}
 
     def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="acl-dup")
         first = c.post(self.ACL_SYNC.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1483,10 +1648,6 @@ class TestSubtreeSweepTrigger:
 
     SWEEP = "{base}/{cid}/subtree-sweep"
 
-    @pytest.fixture(autouse=True)
-    def _clear_acl_mirroring_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_ACL_MIRRORING_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(
             self.SWEEP.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
@@ -1497,14 +1658,17 @@ class TestSubtreeSweepTrigger:
         r = seeded_app["client"].post(self.SWEEP.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_even_with_the_flag_off(self, seeded_app, monkeypatch):
+    def test_409_when_flag_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         r = seeded_app["client"].post(
             self.SWEEP.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
-        assert r.status_code == 404
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_409_when_flag_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-flag-off")
@@ -1513,7 +1677,7 @@ class TestSubtreeSweepTrigger:
         assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-happy")
         r = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1528,7 +1692,7 @@ class TestSubtreeSweepTrigger:
         assert job["payload_json"] == {"connection_id": conn_id}
 
     def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-dup")
         first = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1542,7 +1706,7 @@ class TestSubtreeSweepTrigger:
         """A sweep trigger and an acl-sync trigger for the SAME connection
         must never dedup against each other — they are different job kinds
         with different idempotency-key prefixes."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"acl_mirroring": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="sweep-vs-acl-sync")
         sweep = c.post(self.SWEEP.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
@@ -1919,7 +2083,13 @@ def _config_get_value(config: dict):
     return _get
 
 
-_ENABLED_EXTRACTION_CONFIG = {"extraction": {"enabled": True, "timeout_s": 60}}
+_ENABLED_EXTRACTION_CONFIG = {
+    "sharepoint": {"enabled": True},
+    "extraction": {
+        "producer": {"command": "python -m fake_producer"},
+        "timeout_s": 60,
+    },
+}
 
 
 class TestExtractionTrigger:
@@ -1930,12 +2100,14 @@ class TestExtractionTrigger:
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):
-        # AGNES_EXTRACTION_ENABLED / AGNES_EXTRACTION_PRODUCER_COMMAND /
-        # AGNES_EXTRACTION_PRODUCER_MODULE all win over the mocked
-        # get_value config — clear them so each test's fake config is what
-        # actually decides, except the one test below that sets one on
-        # purpose.
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
+        # AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE
+        # win over the mocked get_value config — clear them so each test's
+        # fake config is what actually decides, except the one test below
+        # that sets one on purpose. AGNES_SHAREPOINT_ENABLED is left alone
+        # (module-level `_sharepoint_enabled_by_default` keeps it ON) so
+        # test_requires_admin/test_requires_auth still reach the per-route
+        # auth dependency; the two tests below that need it OFF clear it
+        # themselves.
         monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_COMMAND", raising=False)
         monkeypatch.delenv("AGNES_EXTRACTION_PRODUCER_MODULE", raising=False)
 
@@ -1949,22 +2121,37 @@ class TestExtractionTrigger:
         r = seeded_app["client"].post(self.EXTRACT.format(base=BASE, cid="nope"))
         assert r.status_code == 401
 
-    def test_404_for_unknown_connection_before_any_work(self, seeded_app, monkeypatch):
-        """404 fires even with extraction fully disabled — connection
-        existence is checked BEFORE the feature-usable gate."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+    def test_404_for_unknown_connection_before_extraction_readiness(self, seeded_app, monkeypatch):
+        """404 fires even with NO producer configured — connection
+        existence is checked BEFORE the extraction-readiness gate. Requires
+        the sharepoint switch itself ON (the router-level gate runs first
+        and unconditionally, so an unknown connection with the WHOLE
+        connector off gets 409, not 404 — see the sibling test below)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         r = seeded_app["client"].post(
             self.EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
         )
         assert r.status_code == 404
 
-    def test_refuses_when_extraction_disabled(self, seeded_app, monkeypatch):
+    def test_409_when_sharepoint_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface before any
+        per-route work — including the connection lookup."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_refuses_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-disabled")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "extraction_disabled"
+        assert r.json()["detail"]["error"] == "feature_disabled"
 
     def test_refuses_when_the_extraction_extra_is_not_installed(self, seeded_app, monkeypatch):
         """The pipeline runs IN-PROCESS now, so a server without the
@@ -1986,7 +2173,7 @@ class TestExtractionTrigger:
         """A deployment that activates extraction purely via env (the
         Terraform-rendered ``/opt/agnes/.env`` case) needs no
         ``extraction.producer`` block in ``instance.yaml`` at all."""
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"enabled": True}}))
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
         monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-env-producer")
@@ -2045,25 +2232,36 @@ class TestExtractionRunDue:
 
     RUN_DUE = "/api/admin/sharepoint/extraction/run-due"
 
-    @pytest.fixture(autouse=True)
-    def _clear_extraction_env_var(self, monkeypatch):
-        monkeypatch.delenv("AGNES_EXTRACTION_ENABLED", raising=False)
-
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(self.RUN_DUE, headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 403
 
-    def test_noop_when_extraction_disabled(self, seeded_app, monkeypatch):
-        config = {
-            "extraction": {
-                **_ENABLED_EXTRACTION_CONFIG["extraction"],
-                "enabled": False,
-                "schedule": "every 15m",
-            }
-        }
+    def test_409_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface (409
+        feature_disabled) before this route's own body — including its
+        usually-graceful "not usable yet" no-op — ever runs. The scheduler
+        (which polls this endpoint unconditionally once a schedule is
+        configured) tolerates a non-2xx status by logging and moving on
+        (`services/scheduler/__main__.py`'s dispatch loop), so this is a
+        louder signal than the old no-op, not a functional break."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         _create_connection(c, seeded_app["admin_token"], name="due-off")
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_noop_when_no_producer_configured(self, seeded_app, monkeypatch):
+        """Sharepoint itself ON (router-level gate passes), but no producer
+        configured — the route's OWN readiness no-op still applies, a clean
+        200 rather than an error, since this endpoint fires unconditionally
+        on its own cadence once a schedule is configured."""
+        config = {"sharepoint": {"enabled": True}, "extraction": {"schedule": "every 15m"}}
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        _create_connection(c, seeded_app["admin_token"], name="due-no-producer")
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["count"] == 0
@@ -2078,7 +2276,10 @@ class TestExtractionRunDue:
         assert r.json()["count"] == 0
 
     def test_dispatches_a_connection_never_run_before(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="due-never-run")
@@ -2092,7 +2293,10 @@ class TestExtractionRunDue:
         assert any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
 
     def test_skips_a_connection_not_due_yet(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         conn_id = _create_connection(c, seeded_app["admin_token"], name="due-not-yet")
@@ -2104,7 +2308,10 @@ class TestExtractionRunDue:
         assert second.json()["dispatched"] == []
 
     def test_ignores_non_sharepoint_connections(self, seeded_app, monkeypatch):
-        config = {"extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"}}
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
         c = seeded_app["client"]
         c.post(

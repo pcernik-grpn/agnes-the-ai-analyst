@@ -1300,6 +1300,7 @@ async function deleteSession(chatId) {
   await loadSidebar();
   if (currentChatId === chatId) {
     currentChatId = null;
+    _syncSessionUrl(null);
     markActiveSidebar(null);
     if (ws) { ws.close(); ws = null; }
     $("chat-messages").innerHTML = "";
@@ -1352,6 +1353,33 @@ function _takeAgentSlugFromUrl() {
     return slug;
   } catch (_) {
     return null;
+  }
+}
+
+/** Keep ``?session=<id>`` in the address bar aligned with the OPEN
+ * conversation (issue #1914) — refreshing re-reads this into
+ * ``data-initial-session`` (chat.html) and reopens the same session instead
+ * of landing on a brand-new "Untitled chat" every time.
+ *
+ * Same replaceState pattern as ``_takeAgentSlugFromUrl`` above: no
+ * ``pushState`` (this page wires no ``popstate`` handling, so a history
+ * entry per open would just be dead Back-button clutter), and every other
+ * param (``?q=``, …) survives untouched since only the one key is ever
+ * touched. Pass a falsy ``chatId`` to clear the param — used both when the
+ * page resets to no session and when the open session has no turns yet (a
+ * just-created "Untitled chat" must not become a refreshable/shareable
+ * URL). */
+function _syncSessionUrl(chatId) {
+  try {
+    const u = new URL(window.location.href);
+    if (chatId) {
+      u.searchParams.set("session", chatId);
+    } else {
+      u.searchParams.delete("session");
+    }
+    window.history.replaceState({}, "", u.toString());
+  } catch (_) {
+    // Best-effort — a malformed location must never break the chat itself.
   }
 }
 
@@ -1412,6 +1440,11 @@ function _markConversationStarted() {
   _syncAgentPicker();
   const meta = _sessionsCache.find(s => s.id === currentChatId);
   setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
+  // #1914: the moment a conversation has a turn is the moment it deserves a
+  // refreshable URL. Reads `currentChatId` rather than taking a parameter —
+  // every caller (loadAndRenderHistory's history>0 branch, submitUserMessage's
+  // pre/post-send calls) has already settled it by the time this runs.
+  _syncSessionUrl(currentChatId);
 }
 
 /** The inverse: no turns, so the empty-state dashboard and the live picker,
@@ -1877,6 +1910,15 @@ async function openSession(chatId, wsUrlOverride) {
   // Only a genuinely different conversation starts out "no turns yet";
   // loadAndRenderHistory raises the flag again if this one has messages.
   if (_switchingSession) _sessionHasTurns = false;
+  // #1914: mirror `_sessionHasTurns` into the URL right away rather than
+  // waiting on loadAndRenderHistory below — a history/sidebar/palette/
+  // deep-link open of an ALREADY-started conversation (the common case,
+  // `_sessionHasTurns` untouched because this wasn't a switch, or already
+  // known true) gets its `?session=` immediately; a switch into an unknown
+  // or genuinely empty one starts cleared and `_markConversationStarted`
+  // (called from within loadAndRenderHistory) puts it back the moment the
+  // fetch below confirms this session actually has messages.
+  _syncSessionUrl(_sessionHasTurns ? chatId : null);
   _syncAgentPicker();
   setStatus("");
 
@@ -4785,6 +4827,7 @@ $("new-chat")?.addEventListener("click", async (e) => {
     // while the user believes they're starting fresh.
     if (ws) { ws.close(); ws = null; }
     currentChatId = null;
+    _syncSessionUrl(null);
     markActiveSidebar(null);
     $("chat-messages").innerHTML = "";
     showCapabilities();
@@ -5996,10 +6039,12 @@ function renderCoPresence(host, participants) {
   // ── Session files (#1611) ─────────────────────────────────────────────────
   // The way OUT for files the agent generated in the session workspace: the
   // header "Files" button opens an overlay listing the session's files
-  // (GET .../files), each row with a download link (GET .../files/download —
-  // served attachment+nosniff) and a save-to-Library action
-  // (POST .../files/save-artefact). Rows are built with createElement +
-  // textContent — file names/paths are agent-chosen strings, never innerHTML.
+  // (GET .../files), each row with a preview action (GET .../files/preview,
+  // rendered by the shared modal in static/js/file_preview.js), a download
+  // link (GET .../files/download — served attachment+nosniff) and a
+  // save-to-Library action (POST .../files/save-artefact). Rows are built
+  // with createElement + textContent — file names/paths are agent-chosen
+  // strings, never innerHTML.
 
   const filesListEl = $("chat-files-list");
   const filesStatusEl = $("chat-files-status");
@@ -6013,6 +6058,25 @@ function renderCoPresence(host, participants) {
     if (!filesStatusEl) return;
     filesStatusEl.textContent = msg || "";
     filesStatusEl.hidden = !msg;
+  }
+
+  // Opens the shared preview modal on one session file. Defined here rather
+  // than inline so the row's two entry points (the eye button, the name)
+  // cannot drift apart. No-ops when file_preview.js has not loaded — the
+  // download and save actions still work, which is the pre-preview behaviour.
+  function openPreview(chatId, f) {
+    if (typeof window.openFilePreview !== "function") return;
+    window.openFilePreview({
+      previewUrl:
+        "/api/chat/sessions/" + encodeURIComponent(chatId) +
+        "/files/preview?path=" + encodeURIComponent(f.path),
+      filename: f.name,
+      sizeLabel: fmtSize(f.size_bytes),
+      downloadHref:
+        "/api/chat/sessions/" + encodeURIComponent(chatId) +
+        "/files/download?path=" + encodeURIComponent(f.path),
+      downloadName: f.name,
+    });
   }
 
   function renderFileRow(chatId, f) {
@@ -6059,6 +6123,33 @@ function renderCoPresence(host, participants) {
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
       'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
       '<path d="M3 8.5 6.5 12 13 4.5"/></svg>';
+    const ICON_PREVIEW =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4-6.5-4-6.5-4z"/>' +
+      '<circle cx="8" cy="8" r="1.75"/></svg>';
+
+    // Preview before download: the deliverable is usually a deck or a
+    // document, and "is this the thing I asked for?" should not cost a
+    // download plus a native app. window.openFilePreview is the same modal
+    // the Library uses (static/js/file_preview.js); the SERVER decides what
+    // is renderable, this only opens the surface.
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "cloud-chat-files-btn";
+    preview.innerHTML = ICON_PREVIEW;
+    preview.setAttribute("data-tip", "Preview without downloading");
+    preview.setAttribute("aria-label", "Preview " + f.name);
+    preview.addEventListener("click", () => openPreview(chatId, f));
+
+    // The name is the obvious thing to click, so make it do the obvious
+    // thing rather than leaving preview only on an icon.
+    name.setAttribute("role", "button");
+    name.setAttribute("tabindex", "0");
+    name.addEventListener("click", () => openPreview(chatId, f));
+    name.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPreview(chatId, f); }
+    });
 
     const dl = document.createElement("a");
     dl.className = "cloud-chat-files-btn";
@@ -6125,6 +6216,7 @@ function renderCoPresence(host, participants) {
       }
     });
 
+    actions.appendChild(preview);
     actions.appendChild(dl);
     actions.appendChild(save);
     li.appendChild(icon);

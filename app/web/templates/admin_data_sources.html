@@ -966,6 +966,15 @@
      wish/observation, not an earned or enforced state. */
   .sp-badge--unique-perms { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
   .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
+  /* Informational aftermath of an untick (never an error): the collection
+     stayed because it holds indexed files — tells the admin where the
+     deliberate delete lives (the Library). */
+  .sp-untick-notice {
+    margin: 10px 0 0; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+  }
+  .sp-untick-notice a { color: inherit; text-decoration: underline; }
   .sp-share-row {
     display: flex; align-items: flex-start; gap: 12px;
     padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); margin-bottom: 10px;
@@ -1730,6 +1739,7 @@
           The original file is not copied — {{ instance_brand or 'Agnes' }} stores the extracted markdown.
           Originals open in the source, under your own identity.
         </p>
+        <div id="spw-tree-notice" class="sp-untick-notice" style="display:none;"></div>
         <div id="spw-tree-error" class="ds-wizard-error"></div>
       </section>
 
@@ -6325,6 +6335,16 @@ function spTreeErr(msg) {
   el.style.display = "block";
 }
 
+/* Informational sibling of spTreeErr — `html` is built ONLY from spEsc'd
+   values plus our own static markup (the Library link), never raw server
+   text. */
+function spTreeNotice(html) {
+  const el = document.getElementById("spw-tree-notice");
+  if (!html) { el.style.display = "none"; el.innerHTML = ""; return; }
+  el.innerHTML = html;
+  el.style.display = "block";
+}
+
 function spLoadScopesThenTree() {
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`).then((body) => {
     spScopes = {};
@@ -6600,6 +6620,7 @@ function spRefreshVisibleLists() {
 
 function spConfirmScope(sourceScopeId, displayPath, anonymize) {
   spTreeErr("");
+  spTreeNotice("");
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
     method: "POST",
     body: { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
@@ -6614,11 +6635,22 @@ function spConfirmScope(sourceScopeId, displayPath, anonymize) {
 
 function spRemoveScope(sourceScopeId) {
   spTreeErr("");
+  spTreeNotice("");
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes?source_scope_id=${encodeURIComponent(sourceScopeId)}`, {
     method: "DELETE",
-  }).then(() => {
+  }).then((resp) => {
     delete spScopes[sourceScopeId];
     spRefreshVisibleLists();
+    /* An empty collection is tidied away server-side; one with indexed
+       files is kept — say so, and point at where the deliberate delete
+       lives, instead of leaving the admin to discover the leftover later. */
+    if (resp && resp.collection_kept && resp.collection) {
+      spTreeNotice(
+        `Scope removed. Its collection <strong>${spEsc(resp.collection.slug)}</strong> already holds indexed files, ` +
+        `so it was kept — delete it in the <a href="/library?section=files">Library</a> if it should go too. ` +
+        `Re-ticking this folder re-attaches to the same collection.`
+      );
+    }
   }).catch((e) => {
     spTreeErr("Could not remove that scope: " + e.message);
     spLoadTree();

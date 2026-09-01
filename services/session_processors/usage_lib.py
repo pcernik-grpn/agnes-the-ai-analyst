@@ -38,18 +38,43 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Any, Iterator
 
 from src.repositories import marketplace_plugins_repo, store_entities_repo
 
-# v9: phase-6 plugin-level rollup parity for flea. `_aggregate_events`
-# now produces synthetic (source='flea', type='plugin', parent_plugin='',
+# v11: TWO changes landed together, each of which was cut as v10 on its
+# own branch. The version is the reprocess signal, so shipping both AS v10
+# would leave a session already processed at v10 by one of them never
+# reprocessed for the other. Bumped once, for both:
+#
+#  (a) per-assistant-turn token rows. The processor now emits one
+# `usage_turns` row per assistant turn that reports a `message.usage` block
+# (`iter_turn_usage` below), so tokens — including the two cache counters —
+# are attributable to a turn and a model instead of only to a whole session.
+# Bumping the version is the signal operators reprocess on
+# (`agnes admin usage reprocess` / POST /api/admin/usage/reprocess), which
+# clears the `usage` state rows and backfills turns for sessions already on
+# disk. The write is idempotent — unique on (session_file, turn_uuid) — so a
+# reprocess cannot double-count.
+#
+#  (b) summary `tool_calls` now counts EVERY tool invocation the model made
+# (tool_use + mcp_call + subagent), not only the plain-tool subset. The old
+# definition made the number a lie on any MCP-heavy session — a web-chat
+# session whose tools are all MCP-served showed "Tool calls: 0" next to a
+# transcript full of tool cards — and left `tool_errors` (which has always
+# counted errors across ALL tool events) with a mismatched denominator, so
+# the KPI error rate could exceed 100%. `mcp_calls` / `subagent_dispatches`
+# remain as breakdowns of the total. Historic summary rows keep the old
+# number until their file changes or an admin runs
+# `POST /api/admin/usage/reprocess` (`agnes admin usage reprocess`).
+# (v9: phase-6 plugin-level rollup parity for flea. `_aggregate_events`
+# produces synthetic (source='flea', type='plugin', parent_plugin='',
 # name=<plugin_synth>) rows aggregating nested skill/agent invocations,
 # mirroring the curated path. Without this, flea plugin entity cards +
 # detail telemetry chips read 0 from `_load_invocation_stats` (which
 # filters `parent_plugin = ''` for flea) even though nested children
 # had correct rollup rows. Bump forces a re-aggregation pass so historic
-# nested-invocation data fills the new plugin-level rows.
+# nested-invocation data fills the new plugin-level rows.)
 # (v8: phase-5 attribution keyspace fix + phase-4 bundle rename. Lookup
 # tables key by `store_entities.synthetic_name` instead of `name`;
 # `_attribute_event` gained the flea-plugin-nested branch so nested
@@ -59,7 +84,12 @@ from src.repositories import marketplace_plugins_repo, store_entities_repo
 # attribution and usage_events.source / ref_id are populated per-event from
 # the live marketplace_plugins + store_entities tables.)
 # (v4: #293 user_id column; v3: #303 <command-name> slash extraction.)
-USAGE_PROCESSOR_VERSION = 9
+USAGE_PROCESSOR_VERSION = 11
+
+#: The event_types that are a tool invocation by the model — one Anthropic
+#: `tool_use` block each. `slash_command` is excluded: it is a user action,
+#: not a model call, and can never carry `is_error`.
+TOOL_EVENT_TYPES = frozenset({"tool_use", "mcp_call", "subagent"})
 
 # Claude Code wraps user-typed slash invocations as
 # <command-name>/<name></command-name> inside the user message content
@@ -358,6 +388,81 @@ def compute_active_seconds(timestamps: list[datetime]) -> int:
     return int(sum((end - start).total_seconds() for start, end in blocks))
 
 
+#: ``message.usage`` key -> the column every usage surface stores it under.
+#: The jsonl names both cache counters ``*_input_tokens``; the storage schema
+#: (``usage_session_summary``, ``usage_turns``) drops the "input" because a
+#: cache write is not an input read.
+_USAGE_TOKEN_COLUMNS = (
+    ("input_tokens", "input_tokens"),
+    ("output_tokens", "output_tokens"),
+    ("cache_read_input_tokens", "cache_read_tokens"),
+    ("cache_creation_input_tokens", "cache_creation_tokens"),
+)
+
+
+def _token_counts(msg: Any) -> dict[str, int] | None:
+    """The four token counters from one assistant message's ``usage`` block.
+
+    ``None`` when the message reports no usage at all: an unmeasured turn
+    must not become a row of zeros claiming otherwise. Sessions older than
+    prompt caching simply lack the ``cache_*`` keys, and non-int values
+    (corrupt jsonl) count as zero — one bad turn can't poison a session.
+
+    Single source of truth for reading the usage block, shared by
+    :func:`compute_summary` (session grain) and :func:`iter_turn_usage`
+    (turn grain) so the two readings of the same session cannot drift.
+    """
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+    counts: dict[str, int] = {}
+    for key, column in _USAGE_TOKEN_COLUMNS:
+        value = usage.get(key, 0)
+        counts[column] = value if isinstance(value, int) else 0
+    return counts
+
+
+def iter_turn_usage(turns: list[dict]) -> Iterator[dict]:
+    """Yield one token record per assistant turn that reports usage.
+
+    Keys are ``usage_turns`` column names, so a caller only adds the session
+    identity (``session_file`` / ``session_id`` / ``user_id`` / ``surface``)
+    before handing the dict to ``usage_turns_repo().insert_batch``.
+
+    Skipped:
+
+    * turns with no ``usage`` block — nothing was measured;
+    * turns with no ``uuid`` — ``turn_uuid`` is half the idempotency key
+      ``(session_file, turn_uuid)``, so a row without one could not be
+      de-duplicated when the session is re-processed.
+
+    ``occurred_at`` is the event's own timestamp and stays ``None`` when it
+    cannot be parsed. Contrast :func:`iter_events`, which falls back to
+    "now": there the value only orders events, while a turn carries tokens
+    into time windows, and stamping an unparseable timestamp with "now"
+    would drag a backfilled session's tokens into today's totals.
+    """
+    for turn in turns:
+        if turn.get("type") != "assistant":
+            continue
+        event_uuid = turn.get("uuid")
+        if not event_uuid:
+            continue
+        msg = turn.get("message") or {}
+        counts = _token_counts(msg)
+        if counts is None:
+            continue
+        yield {
+            "turn_uuid": event_uuid,
+            "parent_uuid": turn.get("parentUuid"),
+            "model": msg.get("model"),
+            **counts,
+            "occurred_at": _parse_ts(turn.get("timestamp")),
+        }
+
+
 def compute_summary(turns: list[dict], events: list[dict]) -> dict:
     """Build the usage_session_summary row dict from parsed turns and event rows.
 
@@ -395,35 +500,27 @@ def compute_summary(turns: list[dict], events: list[dict]) -> dict:
             m = msg.get("model")
             if m:
                 model_counter[m] += 1
-            # Anthropic API usage block on assistant turns. Older sessions
-            # may lack `cache_*` keys (pre-prompt-caching) — `.get(k, 0)`
-            # tolerates that. Non-int values (corrupted JSONL) are skipped
-            # to keep one bad turn from poisoning the whole summary.
-            usage = msg.get("usage") or {}
-            for key, accum in (
-                ("input_tokens", "input_tokens"),
-                ("output_tokens", "output_tokens"),
-                ("cache_read_input_tokens", "cache_read_tokens"),
-                ("cache_creation_input_tokens", "cache_creation_tokens"),
-            ):
-                v = usage.get(key, 0)
-                if isinstance(v, int):
-                    if accum == "input_tokens":
-                        input_tokens += v
-                    elif accum == "output_tokens":
-                        output_tokens += v
-                    elif accum == "cache_read_tokens":
-                        cache_read_tokens += v
-                    elif accum == "cache_creation_tokens":
-                        cache_creation_tokens += v
+            # Anthropic API usage block on assistant turns, read through the
+            # same helper `iter_turn_usage` uses so the session totals and the
+            # per-turn rows can never disagree about the same session.
+            counts = _token_counts(msg)
+            if counts is not None:
+                input_tokens += counts["input_tokens"]
+                output_tokens += counts["output_tokens"]
+                cache_read_tokens += counts["cache_read_tokens"]
+                cache_creation_tokens += counts["cache_creation_tokens"]
 
     started_at = min(timestamps) if timestamps else None
     ended_at = max(timestamps) if timestamps else None
     wall_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
     active_seconds = compute_active_seconds(timestamps)
 
-    # Aggregate counts from events
-    tool_calls = sum(1 for e in events if e["event_type"] == "tool_use")
+    # Aggregate counts from events. `tool_calls` counts every tool
+    # invocation (tool_use + mcp_call + subagent) — the same population
+    # `tool_errors` has always drawn from, and the number an operator can
+    # verify against the transcript's tool cards. `mcp_calls` /
+    # `subagent_dispatches` below are breakdowns of it, not siblings.
+    tool_calls = sum(1 for e in events if e["event_type"] in TOOL_EVENT_TYPES)
     tool_errors = sum(1 for e in events if e.get("is_error"))
     skill_invocations = sum(1 for e in events if e.get("skill_name"))
     subagent_dispatches = sum(1 for e in events if e["event_type"] == "subagent")
