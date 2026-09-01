@@ -14,7 +14,7 @@ does not enumerate. The policy is the issue's own body:
         ELSE FALSE
     END
 
-Eight properties, one class each:
+Nine properties, one class each:
 
 1. alice and bob get DIFFERENT row counts and different data for the SAME
    ``SELECT country, COUNT(*) ... GROUP BY 1`` on ``POST /api/query``;
@@ -38,7 +38,15 @@ Eight properties, one class each:
    is refused;
 8. ``POST /api/admin/registry/{id}/policy/preview`` as alice's persona and
    as the ad-hoc group set ``['sales-de']`` reports the matching
-   ``rows_visible``.
+   ``rows_visible``;
+9. the table-level RBAC gate and the row-level policy are SEPARATE layers,
+   both load-bearing — the wrapping data package is granted only to the
+   three pilot groups (never ``Everyone``), so a caller in no granted group
+   is refused at the table layer (403, before the policy runs), distinct
+   from the ``ELSE FALSE`` empty slice a package-granted-but-unmatched
+   caller gets, and revoking one group's package grant reproduces that same
+   table-layer refusal for a caller the policy would otherwise admit rows
+   for (#1979 review finding).
 
 Hermetic on purpose: NO live Keboola credentials. The pilot's Keboola-ness
 is reproduced by its on-disk shape — ``mock_extract_factory`` writes the
@@ -625,6 +633,102 @@ class TestPolicyPreview:
         )
         assert r.status_code == 200, r.text
         assert all(col["hidden"] is False for col in r.json()["columns"])
+
+
+# ---------------------------------------------------------------------------
+# 9. The table-level gate is a SEPARATE layer from the row-level policy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestTableLevelGateIsSeparateFromRowLevel:
+    """MonikaFeigler's live-pilot finding #3 (issue #1979): in her run the
+    target table was already reachable through a pre-existing data package
+    granted to ``Everyone``, so the two pilot groups only ever gated ROWS,
+    never the TABLE itself — the RBAC layer never visibly fired. This class
+    proves the two layers are independent and BOTH load-bearing on the
+    pilot's own configuration: the ``grant_table_via_package`` fixture wraps
+    ``orders`` in one data package granted ONLY to the three pilot groups
+    (``sales-cz`` / ``sales-de`` / ``sales-fr``), never to ``Everyone``, so a
+    caller outside all three is refused at the TABLE layer before the
+    row-level policy ever runs — a refusal that must be distinguishable from
+    the ``ELSE FALSE`` empty slice a package-granted-but-policy-unmatched
+    caller (carol) gets.
+    """
+
+    def test_a_caller_in_no_granted_group_gets_the_table_level_gate(self, pilot):
+        """analyst1 (seeded_app's default analyst) belongs to nothing but
+        ``Everyone`` — no grant, direct or through a package, reaches
+        ``orders``. This must fail BEFORE the policy: a 403 naming the
+        table as "not in your stack", never a 200 with an empty slice."""
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["analyst_token"]))
+        assert r.status_code == 403, r.text
+        assert "orders" in r.text
+        assert "not in your stack" in r.text
+
+    def test_that_403_is_distinguishable_from_the_else_false_zero_row_case(self, pilot):
+        """Carol IS in the wrapping package (via sales-fr) but matches no
+        CASE branch: she gets a 200 with zero rows — the row-level policy's
+        own refusal, not the table-level gate's. Same table, two different
+        callers, two different layers, two different HTTP outcomes."""
+        c = pilot["client"]
+        gated = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["analyst_token"]))
+        policied = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["carol_token"]))
+
+        assert gated.status_code == 403
+        assert policied.status_code == 200, policied.text
+        assert policied.json()["row_count"] == 0
+        assert policied.json()["rows"] == []
+
+    def test_the_wrapping_package_is_granted_only_to_the_pilot_groups_never_everyone(self, pilot):
+        """The exact shape of #1979's finding: assert the grant list for the
+        package wrapping ``orders``, not just a query outcome — a future
+        fixture change that widens the grant (e.g. adds Everyone) must fail
+        here even if it doesn't happen to break a query-outcome test."""
+        from src.repositories import data_packages_repo, resource_grants_repo
+
+        packages = data_packages_repo().list_packages_of_table("orders")
+        assert len(packages) == 1, packages
+        pkg_id = packages[0]["id"]
+
+        grants = resource_grants_repo().list_all(resource_type="data_package")
+        relevant = [g for g in grants if g["resource_id"] == pkg_id]
+        group_names = {g["group_name"] for g in relevant}
+
+        assert group_names == {GROUP_CZ, GROUP_DE, GROUP_OTHER}
+        assert "Everyone" not in group_names
+
+    def test_revoking_one_groups_package_grant_hits_the_table_gate_even_though_the_policy_would_admit_the_rows(
+        self, pilot
+    ):
+        """Bob is in sales-de, whose CASE branch matches DE rows — but that
+        is a ROW-level fact. Pull the wrapping package's grant for sales-de
+        and Bob's next query must be refused at the TABLE layer; the policy
+        never gets the chance to run, let alone admit his 2 DE rows."""
+        from src.repositories import data_packages_repo, resource_grants_repo
+
+        # Sanity: before revocation, Bob's normal outcome is the policy's DE slice.
+        before = pilot["client"].post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["bob_token"]))
+        assert before.status_code == 200, before.text
+        assert _group_counts(before.json()) == {"DE": 2}
+
+        pkg_id = data_packages_repo().list_packages_of_table("orders")[0]["id"]
+        grants_repo = resource_grants_repo()
+        de_grant = next(
+            g
+            for g in grants_repo.list_all(resource_type="data_package")
+            if g["resource_id"] == pkg_id and g["group_name"] == GROUP_DE
+        )
+
+        r = pilot["client"].delete(f"/api/admin/grants/{de_grant['id']}", headers=_auth(pilot["admin_token"]))
+        assert r.status_code == 204, r.text
+
+        after = pilot["client"].post(
+            "/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["bob_token"])
+        )
+        assert after.status_code == 403, after.text
+        assert "not in your stack" in after.text
 
 
 # ---------------------------------------------------------------------------

@@ -153,6 +153,21 @@ agnes admin update-table user_access --policy-mapping
 
 An Admin-group member is unfiltered by every policy **only when their credential's surface is `all`** — the default for a browser session and for `agnes auth token create` (no `--surface` flag). A PAT minted with `--surface stack` is filtered exactly like an ordinary analyst, even though its holder is an Admin — that surface exists specifically to make a script or session behave like an analyst's own view, and policies follow it on purpose. This matters because **`agnes init`'s token exchange mints `surface='stack'` PATs** — so an admin's own `agnes query` from their initialized analyst workspace is filtered by any policy on a table they can otherwise see everything of in the browser. If a query looks unexpectedly filtered, check `agnes auth whoami` / the token's surface before assuming the policy is broken.
 
+## Grant narrowly, or the RBAC layer stays invisible
+
+A policy is silent about *who can reach the table at all* — that's RBAC's job (the grant model in [`RBAC.md`](RBAC.md), referenced above). When you set up a policy — piloting it, demoing it, or just registering the table for the first time — put it in its **own data package granted only to the group(s) the policy branches on**. Do not reuse a broadly-granted package (one already granted to `Everyone`, or to any group outside the policy's `CASE`) just because it's convenient.
+
+Why it matters: with a broad grant, a caller outside every group the policy enumerates still reaches the table — RBAC lets them in, and they land on the policy's own `ELSE FALSE` (or equivalent) branch, seeing an empty slice. That's a 200 with zero rows, not a refusal — indistinguishable, from the caller's side, from "the table happens to be empty." It also means the table-level RBAC gate never actually fires in your test or demo: every caller you tried already had a *table* grant, so only the *row*-level layer was ever exercised. A caller with no grant at all gets a different, earlier outcome — a `403` naming the table as "not in your stack," raised before the policy body ever runs (see [`RBAC.md`](RBAC.md)). Granting the wrapping package only to the policy's own groups is what makes both layers observable:
+
+```bash
+agnes admin data-package create --name "Sales, row-scoped" --slug sales-scoped
+agnes admin data-package add-table sales-scoped orders
+agnes admin grant create sales-cz data_package sales-scoped --requirement required
+agnes admin grant create sales-de data_package sales-scoped --requirement required
+```
+
+A caller in `sales-cz`/`sales-de` gets their row-level slice; a caller in neither group gets the table-level 403, never the policy's empty slice. `tests/test_rls_pilot_e2e.py::TestTableLevelGateIsSeparateFromRowLevel` pins this end to end.
+
 ## Attaching a policy
 
 ### Web UI
