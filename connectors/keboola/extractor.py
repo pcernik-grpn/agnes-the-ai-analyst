@@ -870,10 +870,11 @@ def _persist_materialized_inner_view(
       writes this file, so the row and view persist until the next materialize
       replaces them.
     - **Mixed local + materialized source**: :func:`run` rebuilds
-      ``extract.duckdb`` from scratch on every extractor pass — it writes a
+      ``extract.duckdb`` from scratch on a full-coverage pass — it writes a
       fresh ``extract.duckdb.tmp`` and ``shutil.move``s it over the old file —
       so a materialized row registered on an earlier tick is wiped by any later
-      pass on which that table is not itself due. In the same tick it is
+      FULL pass on which that table is not itself due (a scoped pass merges and
+      leaves it alone). In the same tick it is
       harmless (the materialized pass runs after the subprocess and re-registers
       what it just published); across ticks the master view is carried by the
       orchestrator's pre-existing filesystem-fallback pass, which recreates it
@@ -1015,11 +1016,16 @@ def run(
             this call only replaces its own tables' ``_meta`` rows and
             views, preserving every other table already in the extract.
             ``app.api.sync._run_sync`` dispatches one ``run()`` per
-            ``connection_id`` credential group (#B2); the first group of
-            a pass runs ``merge=False`` and every later group
-            ``merge=True`` — without this, each group's atomic
+            ``connection_id`` credential group (#B2), and only the first
+            group of a pass that carries every local row of the source
+            (``_covers_every_local_row``) runs ``merge=False``. Every
+            later group merges — without this, each group's atomic
             tmp-then-move swap clobbered the previous group's extract and
-            only the LAST connection's tables survived the pass.
+            only the LAST connection's tables survived the pass — and so
+            does every group of a SCOPED pass (``tables=[...]``, or a
+            ``sync_schedule`` filter that left only some rows due), whose
+            prune would otherwise delete the ``_meta`` rows and inner
+            views of the tables it was not asked about.
 
     Returns:
         Dict with extraction stats: {tables_extracted: int, tables_failed: int, errors: list}
