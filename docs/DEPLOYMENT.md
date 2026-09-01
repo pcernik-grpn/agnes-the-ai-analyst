@@ -643,29 +643,29 @@ On a VM provisioned by the Terraform module
 (`infra/modules/customer-instance`), none of this is assembled by hand —
 the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
 reverted on the next recreate. Instead set the per-instance
-`extraction_worker_enabled = true` (default off) together with the
-module-level `extraction_worker_image` — normally the SAME ref as the app
-image, since every standard app image already carries the `extraction`
-optional extra (markitdown, pypdfium2); it stays a separate variable only
-so an operator can hold the worker on a different tag during a canary.
-The module refuses the flag without an image at plan time. The module then
-renders the Redis coordination backend, the `.env` coordination
-declaration, an `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint
-connector, not just extraction — see the migration note in
+`extraction_worker_enabled = true` (default off). The module then renders
+the Redis coordination backend, the `.env` coordination declaration, an
+`AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint connector, not just
+extraction — see the migration note in
 [`feature-flags.md`](feature-flags.md)), and an always-on
-`extraction-worker` service into the boot path. (The former
-`AGNES_EXTRACTION_PRODUCER_COMMAND` line died with the external-producer
-mode; the module variable is kept declared but deprecated and inert.) Because these ride `.env`
-(env overrides `instance.yaml` — the same posture
-`app/coordination/factory.py` already uses for the coordination backend
-itself), the TF flag alone activates `corpus-extraction` end to end — no
-applier-owned edit of `instance.yaml` on the VM's data disk is needed for
-the ordinary case. The startup script is under `lifecycle.ignore_changes`,
-so flipping the flag on an existing VM takes effect only through a VM
-recreate (`terraform apply -replace=<vm address>`); the Postgres app-state
-and explicit-secrets prerequisites above remain yours to satisfy — on a
-DuckDB app-state instance the app still refuses to boot, naming the
-missing piece.
+`extraction-worker` service into the boot path — pinned to the SAME
+image/tag as `app`/`scheduler` (`AGNES_IMAGE_REPO`/`AGNES_TAG`), since the
+built-in extraction pipeline needs nothing bundled that image does not
+already carry. Because these ride `.env` (env overrides `instance.yaml` —
+the same posture `app/coordination/factory.py` already uses for the
+coordination backend itself), the TF flag alone activates
+`corpus-extraction` end to end — no applier-owned edit of `instance.yaml`
+on the VM's data disk is needed for the ordinary case. The startup script
+is under `lifecycle.ignore_changes`, so flipping the flag on an existing VM
+takes effect only through a VM recreate (`terraform apply
+-replace=<vm address>`); the Postgres app-state and explicit-secrets
+prerequisites above remain yours to satisfy — on a DuckDB app-state
+instance the app still refuses to boot, naming the missing piece.
+
+(The module-level `extraction_worker_image` and `extraction_producer_command`
+variables from an earlier, external-producer design are still accepted for
+backward compatibility but are no longer read — see their `variables.tf`
+descriptions.)
 
 If any SharePoint scope is anonymize-marked, provision the per-instance
 pseudonym key **before the first run** — generation, `runtime_secret_env`

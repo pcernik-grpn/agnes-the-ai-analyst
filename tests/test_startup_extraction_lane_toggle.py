@@ -66,35 +66,39 @@ def test_both_object_types_declare_the_fields_default_off():
         assert re.search(r"extraction_worker_enabled\s*=\s*optional\(bool,\s*false\)", block)
         assert re.search(r'extraction_worker_mem_limit\s*=\s*optional\(string,\s*"4g"\)', block)
         assert re.search(r'extraction_worker_cpus\s*=\s*optional\(string,\s*"2.0"\)', block)
-    # The image is module-level (like kai_agent_image), not per-VM.
+    # Deprecated, ignored — kept declared (module-level, like kai_agent_image
+    # used to be per-instance) so a root module still setting it does not
+    # fail `terraform plan` with "unsupported argument". Neither variable is
+    # forwarded to the startup script any more; see test_main_tf_forwards_
+    # and_validates and test_tpl_gates_everything_on_the_flag below.
     assert re.search(r'variable\s+"extraction_worker_image"\s*\{', body)
-    # The producer command variable is DEPRECATED (external mode removed,
-    # 2026-09-01): it must stay DECLARED so existing tfvars keep planning,
-    # must say so, and must default to the inert empty string — a revived
-    # meaningful default would silently resurrect dead config.
+    # Both extraction_worker_image and extraction_producer_command are
+    # DEPRECATED (external-producer mode removed, 2026-09-01): they must
+    # stay DECLARED so existing tfvars keep planning, must say so, and must
+    # default to the inert empty string — a revived meaningful default
+    # would silently resurrect dead config.
     m = re.search(r'variable\s+"extraction_producer_command"\s*\{', body)
     assert m, "variables.tf must keep the deprecated extraction_producer_command declared (tfvars compat)"
     block_end = body.index("\n}\n", m.end())
     block = body[m.end() : block_end]
-    assert "DEPRECATED" in block and "IGNORED" in block
+    assert "deprecated" in block.lower() and "ignored" in block.lower()
     assert re.search(r'default\s*=\s*""', block), "the deprecated variable must default to the inert empty string"
 
 
 def test_main_tf_forwards_and_validates():
     body = (MODULE / "main.tf").read_text()
     assert re.search(r"extraction_worker_enabled\s*=\s*each\.value\.extraction_worker_enabled", body)
-    assert re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
     assert re.search(r"extraction_worker_mem_limit\s*=\s*each\.value\.extraction_worker_mem_limit", body)
     assert re.search(r"extraction_worker_cpus\s*=\s*each\.value\.extraction_worker_cpus", body)
-    # The deprecated producer variable must NOT be forwarded into the
-    # startup template anymore — nothing reads it.
+    # The worker follows the app image now (docker-compose.prod.yml's own
+    # AGNES_IMAGE_REPO/AGNES_TAG pin) — neither deprecated variable is
+    # forwarded to the startup script any more, and there is nothing left to
+    # validate at plan time: an enabled instance can never render an empty
+    # `image:` because the overlay no longer sets one.
+    assert not re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
     assert not re.search(r"extraction_producer_command\s*=\s*var\.extraction_producer_command", body)
-    # Plan-time catch: enabled without an image would render an empty
-    # `image:` and fail the whole boot at `docker compose up`.
-    assert re.search(
-        r"!each\.value\.extraction_worker_enabled\s*\|\|\s*var\.extraction_worker_image\s*!=\s*\"\"",
-        body,
-    )
+    assert "extraction_worker_image" not in body
+    assert "extraction_producer_command" not in body
 
 
 def test_tpl_gates_everything_on_the_flag():
@@ -108,15 +112,12 @@ def test_tpl_gates_everything_on_the_flag():
         'COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.extraction.yml"',
         "AGNES_COORDINATION_BACKEND=redis",
         "AGNES_REDIS_URL=redis://redis:6379/0",
-        "AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}",
         "AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}",
         "AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}",
-        # TCRD-259 follow-up: the app-side gates (the sharepoint switch + the
-        # must ride .env, or the TF flag alone never activates the
+        # TCRD-259 follow-up: the app-side gate (the sharepoint switch) must
+        # also ride .env, or the TF flag alone never activates the
         # corpus-extraction job kind — it would still need the per-VM
-        # instance.yaml SSH edit this env plumbing exists to avoid. (The
-        # producer command line died with the external mode; a test below
-        # pins its absence.)
+        # instance.yaml SSH edit this env plumbing exists to avoid.
         "AGNES_SHAREPOINT_ENABLED=1",
     ):
         idx = body.index(needle)
@@ -125,6 +126,20 @@ def test_tpl_gates_everything_on_the_flag():
         opening = body.rindex(guard, 0, idx)
         closing = body.index("%{ endif ~}", opening)
         assert opening < idx < closing, f"{needle!r} must be gated on extraction_worker_enabled"
+
+
+def test_tpl_writes_no_producer_or_image_env_lines():
+    """Regression guard for the pin-rot/tag-drift bug (TCRD-306-ish): the
+    worker used to be re-pinned to a separate, module-supplied image and
+    invocation command, both leftovers of the retired external-producer
+    mode. Neither may be written into the VM's .env — the worker follows
+    the app's own AGNES_IMAGE_REPO/AGNES_TAG pin from docker-compose.prod.yml
+    like every other in-repo service."""
+    body = (MODULE / "startup-script.sh.tpl").read_text()
+    assert "AGNES_EXTRACTION_WORKER_IMAGE" not in body
+    assert "AGNES_EXTRACTION_PRODUCER_COMMAND" not in body
+    assert "extraction_worker_image" not in body
+    assert "extraction_producer_command" not in body
 
 
 def test_coordination_rides_env_not_instance_yaml():
@@ -138,6 +153,15 @@ def test_coordination_rides_env_not_instance_yaml():
             "coordination.backend must not be written into instance.yaml — "
             "declare it via AGNES_COORDINATION_BACKEND in .env instead"
         )
+
+
+def _extraction_worker_block(overlay: str) -> str:
+    """Isolate just the ``extraction-worker:`` service mapping from the
+    overlay YAML, so an assertion about its shape can't accidentally match
+    the sibling ``redis:`` service (which legitimately sets ``image:``)."""
+    m = re.search(r"^  extraction-worker:\n(.*?)(?=^  \S|\Z)", overlay, re.MULTILINE | re.DOTALL)
+    assert m, "extraction-worker service block not found in the overlay"
+    return m.group(1)
 
 
 def test_overlay_shape():
@@ -163,6 +187,26 @@ def test_overlay_shape():
     assert not re.search(r"^  scheduler:$", overlay, re.MULTILINE), (
         "the extraction overlay must never override the scheduler service — "
         "the state-applier's force-recreate would strip the override"
+    )
+
+    worker = _extraction_worker_block(overlay)
+    # Pin-rot/tag-drift guard: the overlay must not re-pin the worker to a
+    # separate image — docker-compose.prod.yml already pins this service to
+    # ${AGNES_IMAGE_REPO}:${AGNES_TAG}, exactly like app/scheduler, and a
+    # second override here is exactly the bug this test locks shut (a worker
+    # image immutably pinned ahead of the DB migrations the fleet's
+    # auto-upgrade applies eventually crash-loops it forever).
+    yaml_lines = [ln for ln in worker.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert not any(re.match(r"^\s*image:", ln) for ln in yaml_lines), (
+        "the extraction-worker service must carry no image override — it "
+        "follows AGNES_IMAGE_REPO/AGNES_TAG from docker-compose.prod.yml "
+        "like every other in-repo service"
+    )
+    # The two things this overlay still must do to the service: clear its
+    # profile gate and wire it to wait on redis.
+    assert "profiles: !reset []" in worker
+    assert re.search(r"depends_on:\s*\n\s*redis:\s*\n\s*condition:\s*service_healthy", worker), (
+        "extraction-worker must additively depend_on redis: service_healthy"
     )
 
 

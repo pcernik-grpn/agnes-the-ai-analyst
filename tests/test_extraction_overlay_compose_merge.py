@@ -15,9 +15,11 @@ The merge facts worth a real ``docker compose config`` run:
   worker is always-on with the overlay present, absent without it. This is
   the overlay's entire activation mechanism and it rides a compose merge
   feature (``!reset``) that plain YAML tooling does not implement.
-* The overlay's ``image:`` re-pin beats docker-compose.prod.yml's
-  plain-app-image pin (file order), while ``AGNES_ROLE``/``AGNES_WORKER_LANES``
-  and the resource-limit interpolations inherit from the base service.
+* The overlay carries no ``image:`` for the worker any more — it inherits
+  docker-compose.prod.yml's own app-image pin (``AGNES_IMAGE_REPO``/
+  ``AGNES_TAG``), the SAME pin the ``app``/``scheduler`` services get, while
+  ``AGNES_ROLE``/``AGNES_WORKER_LANES`` and the resource-limit interpolations
+  also inherit from the base service.
 * ``depends_on`` merges additively (app: service_healthy stays, redis:
   service_healthy joins).
 * The app service is untouched except for what ``env_file: .env`` carries —
@@ -40,19 +42,16 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 TPL = REPO / "infra/modules/customer-instance/startup-script.sh.tpl"
 
-WORKER_IMAGE = "registry.example.com/agnes/extraction-worker:1.2.3-producer"
-
 VM_ENV = """\
 AGNES_TAG=stable
 AGNES_IMAGE_REPO=ghcr.io/keboola/agnes-the-ai-analyst
 AGNES_COORDINATION_BACKEND=redis
 AGNES_REDIS_URL=redis://redis:6379/0
-AGNES_EXTRACTION_WORKER_IMAGE={image}
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=4g
 AGNES_EXTRACTION_WORKER_CPUS=2.0
 JWT_SECRET_KEY=test-jwt
 SESSION_SECRET=test-session
-""".format(image=WORKER_IMAGE)
+"""
 
 
 def overlay_as_written_on_vm() -> str:
@@ -113,7 +112,7 @@ def test_without_overlay_worker_stays_profile_gated(project: Path):
     assert "redis" not in cfg["services"]
 
 
-def test_overlay_activates_and_repins_the_worker(project: Path):
+def test_overlay_activates_and_worker_follows_the_app_image(project: Path):
     cfg = _compose_config(project, BASE_CHAIN + ["docker-compose.extraction.yml"])
     services = cfg["services"]
 
@@ -124,9 +123,13 @@ def test_overlay_activates_and_repins_the_worker(project: Path):
     worker = services["extraction-worker"]
     assert not worker.get("profiles"), "profiles must be cleared, not merged"
 
-    # Image re-pin beats docker-compose.prod.yml's plain-app-image pin …
-    assert worker["image"] == WORKER_IMAGE
-    # … while the prod pin still governs the app service.
+    # No image re-pin any more: the overlay carries no `image:` for the
+    # worker, so it falls through to docker-compose.prod.yml's own pin —
+    # the exact same image/tag the app service resolves to. Pinning the
+    # worker to a separate, immutable image used to crash-loop it forever
+    # once the fleet's auto-upgrade migrated the DB past that image's
+    # baked-in schema — this is the regression guard for that bug.
+    assert worker["image"] == "ghcr.io/keboola/agnes-the-ai-analyst:stable"
     assert services["app"]["image"] == "ghcr.io/keboola/agnes-the-ai-analyst:stable"
 
     # Base-service inheritance the overlay must not disturb.
