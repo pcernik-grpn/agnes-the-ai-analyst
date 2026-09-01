@@ -1545,3 +1545,45 @@ class TestLibrarySemanticSection:
         body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
         assert "Hand-edited row description." in body
         assert "Retail domain: orders and customers." not in body
+
+
+class TestTheModelFilterAnswersAsYouType:
+    """It was the only search in the app that needed a button press.
+
+    The form is server-side, so the answer cost a page load — while every
+    other search on the platform (the Library, /chats, the Definitions page)
+    filters on input. The rows are all rendered already, so the answer is on
+    the page before the button is pressed.
+    """
+
+    def _get(self, seeded_app, path: str, token: str = "admin_token", **kw):
+        return seeded_app["client"].get(path, headers=_auth(seeded_app[token]), **kw)
+
+    def test_the_form_still_submits_without_js(self, seeded_app):
+        """Progressive enhancement, not a replacement: the GET form and the
+        server's `?q=` stay, so a deep link, a bookmark and a no-JS client
+        behave exactly as before. The button is HIDDEN by the script, not
+        removed from the markup — without JS it is the only way to submit."""
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        assert '<form class="slb-filter" method="get"' in body
+        assert 'id="slb-filter-submit"' in body, "the no-JS submit stays in the markup"
+        assert "if (submit) submit.hidden = true;" in body, "…and the script hides it"
+
+    def test_typing_filters_and_keeps_the_url_truthful(self, seeded_app):
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        js = body.split("function apply()", 1)[1].split("\n    }", 1)[0]
+        assert "r.hidden = !hit" in js
+        assert "history.replaceState" in js, "typing must not fill history"
+        assert "chip.hidden = !q" in js, (
+            "the chip states the ACTIVE filter — left alone it shows whatever the "
+            "last page load filtered on"
+        )
+
+    def test_enter_does_not_reload_the_page(self, seeded_app):
+        """Submitting would fetch a state already on screen."""
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        assert "form.addEventListener('submit', function (e) { e.preventDefault(); apply(); });" in body
+
