@@ -1,0 +1,731 @@
+"""Phase 1 of the RLS pilot (#1979) — the target pilot CONFIGURATION,
+end to end, as a permanent regression test.
+
+One Keboola table (``orders``) registered ``query_mode='materialized'`` +
+``server_only=true``, wrapped in a data package granted to two groups
+(``sales-cz``, ``sales-de``) with one analyst in each (alice, bob), plus a
+third analyst (carol) granted the same package through a group the policy
+does not enumerate. The policy is the issue's own body:
+
+    SELECT * FROM orders
+    WHERE CASE
+        WHEN list_contains($user_groups, 'sales-cz') THEN country = 'CZ'
+        WHEN list_contains($user_groups, 'sales-de') THEN country = 'DE'
+        ELSE FALSE
+    END
+
+Eight properties, one class each:
+
+1. alice and bob get DIFFERENT row counts and different data for the SAME
+   ``SELECT country, COUNT(*) ... GROUP BY 1`` on ``POST /api/query``;
+2. a caller in neither group gets ZERO rows (the ``ELSE FALSE`` branch) —
+   an empty answer, not an error;
+3. an admin on a ``surface='all'`` credential sees ALL rows; the SAME admin
+   on a ``surface='stack'`` credential is filtered like an analyst
+   (``docs/table-access-policies.md`` → "The admin bypass" — deliberate,
+   and the reason an admin's own ``agnes query`` from an ``agnes init``-ed
+   workspace is filtered);
+4. every filtered response carries the ``row_scope`` disclosure; the
+   unfiltered admin response carries ``null``;
+5. the MCP-facing read path (``POST /api/mcp/query-table/{id}``, what the
+   per-table MCP tool calls) filters identically and discloses identically;
+6. distribution lockout — the table is listed in the manifest (so ``agnes
+   catalog`` still discovers it) but flagged ``server_only``, and both
+   byte-serving surfaces ``agnes pull`` would use are 403 for EVERYONE,
+   admin included;
+7. the interlock, both directions — flipping the policied table back to
+   distributable is refused, and attaching a policy to a distributed table
+   is refused;
+8. ``POST /api/admin/registry/{id}/policy/preview`` as alice's persona and
+   as the ad-hoc group set ``['sales-de']`` reports the matching
+   ``rows_visible``.
+
+Hermetic on purpose: NO live Keboola credentials. The pilot's Keboola-ness
+is reproduced by its on-disk shape — ``mock_extract_factory`` writes the
+parquet to ``${DATA_DIR}/extracts/keboola/data/<name>.parquet``, which is
+exactly where ``app/api/sync.py::_run_materialized_pass`` puts a
+materialized row's bytes, and the registry row is registered
+``query_mode='materialized'`` over it. What is under test is the pilot's
+ACCESS behavior, not the Keboola transport (``tests/test_keboola_
+materialized_e2e.py`` covers that, and is skipped without live creds).
+
+ONE DELIBERATE DEVIATION FROM THE ISSUE, and it is a LEAK, not a
+convenience — read this before copying the pilot's group names anywhere.
+The issue spells the two groups ``sales_cz`` / ``sales_de``, with an
+underscore. ``src/access_policy.py::policied_relation`` refuses to bind a
+live group name containing a LIKE/SIMILAR-TO metacharacter (``%`` or
+``_``) and raises ``PolicyError`` — but ``rewrite_sql``, the AST rewrite
+behind ``POST /api/query`` and ``agnes query``, swallows ``PolicyError``
+from its per-name ``resolve(...)`` call as "this name is not a registered
+table" and leaves the reference UNSUBSTITUTED. The caller then reads the
+raw base view: HTTP 200, every row of the table, ``row_scope: null``. So
+the pilot exactly as written in #1979 does not fail closed on the surface
+it is meant to be used from — it silently serves the whole table to every
+member of ``sales_cz`` / ``sales_de``. (The ``table_id``-shaped surfaces
+that call ``policied_relation`` directly — ``/api/mcp/query-table/{id}``,
+``/api/v2/sample`` — do fail closed with ``500 policy_error``, and
+``/api/v2/scan`` lets the exception escape uncaught, so the three surfaces
+disagree.)
+
+The groups here are therefore spelled ``sales-cz`` / ``sales-de`` so the
+rest of the file exercises real enforcement; the literal,
+underscore-spelled configuration is pinned in
+``TestIssueLiteralGroupNamesUnderscore`` at the bottom (strict xfail), so
+whichever way that is fixed — narrowing the guard, escaping the bound
+values, or making ``rewrite_sql`` distinguish "unknown table" from
+"refused to bind" — flips the pin to XPASS and forces the pilot's own
+naming to be revisited.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# The pilot configuration.
+# ---------------------------------------------------------------------------
+
+GROUP_CZ = "sales-cz"
+GROUP_DE = "sales-de"
+GROUP_OTHER = "sales-fr"  # granted the package, absent from the policy
+
+POLICY_SQL = f"""SELECT * FROM orders
+WHERE CASE
+    WHEN list_contains($user_groups, '{GROUP_CZ}') THEN country = 'CZ'
+    WHEN list_contains($user_groups, '{GROUP_DE}') THEN country = 'DE'
+    ELSE FALSE
+END"""
+
+ROWS = [
+    {"id": "1", "country": "CZ", "customer": "Novak", "amount": "100"},
+    {"id": "2", "country": "CZ", "customer": "Svoboda", "amount": "200"},
+    {"id": "3", "country": "CZ", "customer": "Dvorak", "amount": "300"},
+    {"id": "4", "country": "DE", "customer": "Mueller", "amount": "400"},
+    {"id": "5", "country": "DE", "customer": "Schmidt", "amount": "500"},
+    {"id": "6", "country": "FR", "customer": "Dupont", "amount": "600"},
+]
+CZ_IDS = {"1", "2", "3"}
+DE_IDS = {"4", "5"}
+ALL_IDS = {"1", "2", "3", "4", "5", "6"}
+
+GROUP_BY_SQL = "SELECT country, COUNT(*) AS n FROM orders GROUP BY 1"
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _group_counts(body: dict) -> dict:
+    """`{country: n}` from a /api/query response body (columns + rows)."""
+    country = body["columns"].index("country")
+    n = body["columns"].index("n")
+    return {row[country]: row[n] for row in body["rows"]}
+
+
+def _mint_pat(user_id: str, email: str, *, surface: str) -> str:
+    """A PAT with an explicit credential surface — ``surface='stack'`` is
+    what ``agnes init``'s token exchange mints, and is the credential the
+    admin bypass deliberately does NOT apply to."""
+    from app.auth.jwt import create_access_token
+    from src.repositories import access_token_repo
+
+    token_id = str(uuid.uuid4())
+    jwt_token = create_access_token(user_id=user_id, email=email, token_id=token_id, typ="pat")
+    access_token_repo().create(
+        id=token_id,
+        user_id=user_id,
+        name=f"pilot-{surface}",
+        token_hash=hashlib.sha256(jwt_token.encode()).hexdigest(),
+        prefix=token_id.replace("-", "")[:8],
+        surface=surface,
+    )
+    return jwt_token
+
+
+@pytest.fixture
+def pilot(seeded_app, mock_extract_factory, monkeypatch):
+    """The pilot as configured in #1979 — one materialized, server_only
+    Keboola table under the two-group policy, three analysts and two admin
+    credentials of different surfaces.
+
+    The policy is attached through the ADMIN API (``PUT /api/admin/registry/
+    {id}``), not the repository, so this fixture also proves the pilot's own
+    body survives save-time validation (function allowlist, variable
+    positions, transpilability, duplicate output columns) rather than
+    smuggling it past the validated write path.
+    """
+    from app.auth.jwt import create_access_token
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+    from src.repositories.users import UserRepository
+    from tests.conftest import grant_table_via_package
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+
+    env = seeded_app["env"]
+    mock_extract_factory("keboola", [{"name": "orders", "data": ROWS}])
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).register(
+            id="orders",
+            name="orders",
+            source_type="keboola",
+            query_mode="materialized",
+            server_only=True,
+            bucket="in.c-sales",
+            source_table="orders",
+            # Keboola materialized rows take a JSON filter spec, never SQL;
+            # NULL means "full-table export", which is what the pilot is.
+            source_query=None,
+        )
+
+        users = UserRepository(conn)
+        users.create(id="u_alice", email="alice@example.com", name="Alice")
+        users.create(id="u_bob", email="bob@example.com", name="Bob")
+        users.create(id="u_carol", email="carol@example.com", name="Carol")
+
+        # ONE data package wrapping the table, granted to each group in turn
+        # (grant_table_via_package reuses the package it already made for a
+        # given table_id) — the issue's "a data package containing the table
+        # granted to both groups".
+        grant_table_via_package(conn, "orders", "u_alice", group_name=GROUP_CZ)
+        grant_table_via_package(conn, "orders", "u_bob", group_name=GROUP_DE)
+        grant_table_via_package(conn, "orders", "u_carol", group_name=GROUP_OTHER)
+        # The admin joins the CZ group so their surface='stack' credential
+        # has the package in its stack at all — the surface distinction is
+        # about FILTERING, and it can only be observed on a table the
+        # narrowed credential can still reach.
+        grant_table_via_package(conn, "orders", "admin1", group_name=GROUP_CZ)
+    finally:
+        conn.close()
+
+    client = seeded_app["client"]
+    attach = client.put(
+        "/api/admin/registry/orders",
+        json={"access_policy_sql": POLICY_SQL, "access_policy_note": "RLS pilot: per-country sales scoping (#1979)"},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert attach.status_code == 200, attach.text
+
+    return {
+        **seeded_app,
+        "alice_token": create_access_token("u_alice", "alice@example.com"),
+        "bob_token": create_access_token("u_bob", "bob@example.com"),
+        "carol_token": create_access_token("u_carol", "carol@example.com"),
+        "admin_stack_token": _mint_pat("admin1", "admin@test.com", surface="stack"),
+        "admin_all_token": _mint_pat("admin1", "admin@test.com", surface="all"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 1. Two analysts, one query, two different answers.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestTwoGroupsTwoAnswers:
+    def test_alice_and_bob_get_different_counts_for_the_same_query(self, pilot):
+        c = pilot["client"]
+
+        alice = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["alice_token"]))
+        bob = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["bob_token"]))
+        assert alice.status_code == 200, alice.text
+        assert bob.status_code == 200, bob.text
+
+        assert _group_counts(alice.json()) == {"CZ": 3}
+        assert _group_counts(bob.json()) == {"DE": 2}
+        assert _group_counts(alice.json()) != _group_counts(bob.json())
+
+    def test_alice_sees_only_cz_rows(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 3
+        assert {row[body["columns"].index("id")] for row in body["rows"]} == CZ_IDS
+        assert "Mueller" not in r.text and "Dupont" not in r.text
+
+    def test_bob_sees_only_de_rows(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["bob_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2
+        assert {row[body["columns"].index("id")] for row in body["rows"]} == DE_IDS
+        assert "Novak" not in r.text and "Dupont" not in r.text
+
+    def test_an_aggregate_is_each_analysts_own_slice(self, pilot):
+        """The disclosure's whole reason to exist: SUM() over a policied
+        table is a slice total, not a company total."""
+        c = pilot["client"]
+        sql = "SELECT sum(CAST(amount AS DOUBLE)) AS s FROM orders"
+
+        alice = c.post("/api/query", json={"sql": sql}, headers=_auth(pilot["alice_token"])).json()
+        bob = c.post("/api/query", json={"sql": sql}, headers=_auth(pilot["bob_token"])).json()
+        admin = c.post("/api/query", json={"sql": sql}, headers=_auth(pilot["admin_token"])).json()
+
+        assert alice["rows"][0][0] == 600.0
+        assert bob["rows"][0][0] == 900.0
+        assert admin["rows"][0][0] == 2100.0
+
+
+# ---------------------------------------------------------------------------
+# 2. The ELSE FALSE branch — empty, not broken.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestUngroupedCallerGetsZeroRows:
+    def test_carol_gets_an_empty_result_not_an_error(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["carol_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 0
+        assert body["rows"] == []
+        # An empty slice still returns the table's SHAPE — an analyst can
+        # tell "no rows for me" from "no such table".
+        assert "country" in body["columns"]
+
+    def test_the_empty_slice_still_discloses_that_it_is_a_slice(self, pilot):
+        """Zero rows is exactly where silent filtering is most dangerous —
+        it is indistinguishable from a legitimately empty table."""
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["carol_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["row_scope"] is not None
+        assert "orders" in r.json()["row_scope"]["policied_tables"]
+
+    def test_effective_access_names_the_empty_slice(self, pilot):
+        c = pilot["client"]
+        r = c.get("/api/me/effective-access", headers=_auth(pilot["carol_token"]))
+        assert r.status_code == 200, r.text
+        entry = next((t for t in r.json()["tables"] if t["table_id"] == "orders"), None)
+        assert entry is not None, r.text
+        assert entry["policy"]["applies"] is True
+        assert entry["policy"]["rows_visible"] == 0
+        assert entry["policy"]["reason"] == "empty_slice"
+
+
+# ---------------------------------------------------------------------------
+# 3. The admin bypass follows the CREDENTIAL SURFACE, not the group.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestAdminSurfaceDistinction:
+    def test_admin_on_a_full_surface_credential_sees_every_row(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["admin_all_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 6
+        assert {row[body["columns"].index("id")] for row in body["rows"]} == ALL_IDS
+
+    def test_admin_on_a_stack_surface_credential_is_filtered_like_an_analyst(self, pilot):
+        """The `agnes init` default. Same human, same Admin group, narrowed
+        credential — CZ only, because the admin is in the CZ group."""
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["admin_stack_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 3
+        assert {row[body["columns"].index("id")] for row in body["rows"]} == CZ_IDS
+
+    def test_the_two_admin_credentials_disagree_on_purpose(self, pilot):
+        c = pilot["client"]
+        full = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["admin_all_token"]))
+        stack = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["admin_stack_token"]))
+        assert _group_counts(full.json()) == {"CZ": 3, "DE": 2, "FR": 1}
+        assert _group_counts(stack.json()) == {"CZ": 3}
+
+
+# ---------------------------------------------------------------------------
+# 4. Disclosure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestRowScopeDisclosure:
+    @pytest.mark.parametrize("token_key", ["alice_token", "bob_token", "carol_token", "admin_stack_token"])
+    def test_every_filtered_response_carries_row_scope(self, pilot, token_key):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot[token_key]))
+        assert r.status_code == 200, r.text
+        scope = r.json()["row_scope"]
+        assert scope is not None, f"{token_key} got a filtered slice with no disclosure"
+        assert scope["policied_tables"] == ["orders"]
+        assert scope["note"]
+
+    def test_the_unfiltered_admin_response_carries_none(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["admin_all_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["row_scope"] is None
+
+    def test_the_arrow_surface_discloses_in_a_header_since_it_has_no_json_body(self, pilot):
+        """`POST /api/v2/scan` streams Arrow IPC, so the same payload rides
+        on ``X-Agnes-Row-Scope`` — the snapshot path an analyst uses to
+        materialize a slice must disclose too."""
+        import json
+
+        c = pilot["client"]
+        r = c.post("/api/v2/scan", json={"table_id": "orders"}, headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 200, r.text
+        scope = json.loads(r.headers["X-Agnes-Row-Scope"])
+        assert scope["policied_tables"] == ["orders"]
+
+        admin = c.post("/api/v2/scan", json={"table_id": "orders"}, headers=_auth(pilot["admin_all_token"]))
+        assert admin.status_code == 200, admin.text
+        assert "X-Agnes-Row-Scope" not in admin.headers
+
+
+# ---------------------------------------------------------------------------
+# 5. The MCP-facing read path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestMcpReadPath:
+    """``POST /api/mcp/query-table/{id}`` — the per-table read the MCP tool
+    surface calls. An agent is the caller most likely to present a filtered
+    aggregate as an organization-wide figure, so this path must filter AND
+    disclose exactly like ``/api/query``."""
+
+    def test_alice_sees_only_cz_rows(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/mcp/query-table/orders", json={"filter": {}, "limit": 50}, headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 3
+        assert {row["id"] for row in body["rows"]} == CZ_IDS
+        assert {row["country"] for row in body["rows"]} == {"CZ"}
+
+    def test_bob_sees_only_de_rows(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/mcp/query-table/orders", json={"filter": {}, "limit": 50}, headers=_auth(pilot["bob_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2
+        assert {row["id"] for row in body["rows"]} == DE_IDS
+
+    def test_ungrouped_caller_sees_nothing(self, pilot):
+        c = pilot["client"]
+        r = c.post("/api/mcp/query-table/orders", json={"filter": {}, "limit": 50}, headers=_auth(pilot["carol_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["row_count"] == 0
+
+    def test_admin_full_surface_sees_everything(self, pilot):
+        c = pilot["client"]
+        r = c.post(
+            "/api/mcp/query-table/orders",
+            json={"filter": {}, "limit": 50},
+            headers=_auth(pilot["admin_all_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["row_count"] == 6
+
+    def test_the_filtered_mcp_response_discloses_row_scope(self, pilot):
+        c = pilot["client"]
+        filtered = c.post(
+            "/api/mcp/query-table/orders", json={"filter": {}, "limit": 50}, headers=_auth(pilot["alice_token"])
+        )
+        assert filtered.json()["row_scope"] is not None
+        assert filtered.json()["row_scope"]["policied_tables"] == ["orders"]
+
+        unfiltered = c.post(
+            "/api/mcp/query-table/orders",
+            json={"filter": {}, "limit": 50},
+            headers=_auth(pilot["admin_all_token"]),
+        )
+        assert unfiltered.json()["row_scope"] is None
+
+    def test_a_country_filter_cannot_widen_the_slice(self, pilot):
+        """The filter runs INSIDE the policy, never instead of it — asking
+        for DE as a CZ analyst returns nothing, not the DE rows."""
+        c = pilot["client"]
+        r = c.post(
+            "/api/mcp/query-table/orders",
+            json={"filter": {"country": "DE"}, "limit": 50},
+            headers=_auth(pilot["alice_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["row_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Distribution lockout.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestDistributionLockout:
+    def test_the_manifest_lists_the_table_but_flags_it_undistributed(self, pilot):
+        """`agnes pull` reads this manifest; ``server_only: true`` is what
+        makes it list-but-skip the parquet (tests/test_pull_server_only.py
+        pins the client half)."""
+        c = pilot["client"]
+        r = c.get("/api/sync/manifest", headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 200, r.text
+        entry = r.json()["tables"].get("orders")
+        assert entry is not None, r.json()["tables"]
+        assert entry["server_only"] is True
+
+    @pytest.mark.parametrize("token_key", ["alice_token", "bob_token", "carol_token", "admin_token"])
+    def test_direct_parquet_download_is_403_for_everyone(self, pilot, token_key):
+        c = pilot["client"]
+        r = c.get("/api/data/orders/download", headers=_auth(pilot[token_key]))
+        assert r.status_code == 403, r.text
+        assert "server_only" in r.text
+
+    @pytest.mark.parametrize("token_key", ["alice_token", "admin_token"])
+    def test_the_reverse_proxy_check_access_gate_is_403_too(self, pilot, token_key):
+        """On a Caddy deployment ``forward_auth`` → ``check-access`` →
+        ``file_server`` serves the bytes without the app seeing the GET, so
+        this is the only place that can close that path."""
+        c = pilot["client"]
+        r = c.get("/api/data/orders/check-access", headers=_auth(pilot[token_key]))
+        assert r.status_code == 403, r.text
+        assert "server_only" in r.text
+
+
+# ---------------------------------------------------------------------------
+# 7. The interlock, both directions.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestDistributionInterlock:
+    def test_flipping_the_policied_pilot_table_to_distributable_is_refused(self, pilot):
+        c = pilot["client"]
+        r = c.put(
+            "/api/admin/registry/orders",
+            json={"server_only": False},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert "access_policy_requires_undistributed" in r.text
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get("orders")
+        assert row["server_only"] is True, "the refused write must not have partially landed"
+        assert row["access_policy_sql"] is not None
+
+    def test_moving_the_policied_pilot_table_to_a_distributed_query_mode_is_refused(self, pilot):
+        c = pilot["client"]
+        r = c.put(
+            "/api/admin/registry/orders",
+            json={"server_only": False, "query_mode": "local"},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert "access_policy_requires_undistributed" in r.text
+
+    def test_attaching_the_pilot_policy_to_a_distributed_table_is_refused(self, pilot):
+        """The other direction — the policy may not be the thing that makes
+        a table safe; the table must already be undistributed."""
+        c = pilot["client"]
+        reg = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "orders_distributed",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "bucket": "in.c-sales",
+                "source_table": "orders_distributed",
+            },
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert reg.status_code == 201, reg.text
+        table_id = reg.json()["id"]
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": POLICY_SQL.replace("FROM orders", "FROM orders_distributed"),
+                "access_policy_note": "RLS pilot",
+            },
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 422, r.text
+        assert "access_policy_requires_undistributed" in r.text
+        assert "server_only=true" in r.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get(table_id)["access_policy_sql"] is None
+
+    def test_the_pilot_table_still_serves_its_slices_after_both_refusals(self, pilot):
+        """A refused interlock write must leave enforcement intact, not a
+        half-applied row that stops filtering."""
+        c = pilot["client"]
+        c.put("/api/admin/registry/orders", json={"server_only": False}, headers=_auth(pilot["admin_token"]))
+        r = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(pilot["bob_token"]))
+        assert r.status_code == 200, r.text
+        assert _group_counts(r.json()) == {"DE": 2}
+
+
+# ---------------------------------------------------------------------------
+# 8. The admin preview.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestPolicyPreview:
+    def test_preview_as_alices_persona(self, pilot):
+        c = pilot["client"]
+        r = c.post(
+            "/api/admin/registry/orders/policy/preview",
+            json={"as_user": "alice@example.com"},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rows_total"] == 6
+        assert body["rows_visible"] == 3
+        assert {row["id"] for row in body["sample_rows"]} == CZ_IDS
+
+    def test_preview_as_the_ad_hoc_de_group(self, pilot):
+        c = pilot["client"]
+        r = c.post(
+            "/api/admin/registry/orders/policy/preview",
+            json={"as_groups": [GROUP_DE]},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rows_total"] == 6
+        assert body["rows_visible"] == 2
+        assert {row["id"] for row in body["sample_rows"]} == DE_IDS
+
+    def test_preview_as_an_unenumerated_group_shows_the_else_false_branch(self, pilot):
+        """The `CASE`-with-a-missing-branch check the doc tells admins to do
+        by hand — an unlisted group must come back 0, not everything."""
+        c = pilot["client"]
+        r = c.post(
+            "/api/admin/registry/orders/policy/preview",
+            json={"as_groups": [GROUP_OTHER]},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rows_visible"] == 0
+        assert body["rows_total"] == 6
+
+    def test_preview_columns_are_all_visible_this_policy_masks_nothing(self, pilot):
+        c = pilot["client"]
+        r = c.post(
+            "/api/admin/registry/orders/policy/preview",
+            json={"as_groups": [GROUP_CZ]},
+            headers=_auth(pilot["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert all(col["hidden"] is False for col in r.json()["columns"])
+
+
+# ---------------------------------------------------------------------------
+# The issue's literal group spelling — pinned as a known failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def literal_pilot(seeded_app, mock_extract_factory, monkeypatch):
+    """The same pilot, with the issue's LITERAL group names (``sales_cz`` /
+    ``sales_de``) and the issue's literal policy body."""
+    from app.auth.jwt import create_access_token
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+    from src.repositories.users import UserRepository
+    from tests.conftest import grant_table_via_package
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+
+    env = seeded_app["env"]
+    mock_extract_factory("keboola", [{"name": "orders", "data": ROWS}])
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).register(
+            id="orders",
+            name="orders",
+            source_type="keboola",
+            query_mode="materialized",
+            server_only=True,
+            bucket="in.c-sales",
+            source_table="orders",
+        )
+        UserRepository(conn).create(id="u_dana", email="dana@example.com", name="Dana")
+        grant_table_via_package(conn, "orders", "u_dana", group_name="sales_cz")
+    finally:
+        conn.close()
+
+    client = seeded_app["client"]
+    attach = client.put(
+        "/api/admin/registry/orders",
+        json={
+            "access_policy_sql": POLICY_SQL.replace(GROUP_CZ, "sales_cz").replace(GROUP_DE, "sales_de"),
+            "access_policy_note": "RLS pilot, issue-literal group spelling (#1979)",
+        },
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert attach.status_code == 200, attach.text
+
+    return {**seeded_app, "dana_token": create_access_token("u_dana", "dana@example.com")}
+
+
+@pytest.mark.journey
+class TestIssueLiteralGroupNamesUnderscore:
+    """#1979's pilot spells its groups ``sales_cz`` / ``sales_de``, and that
+    single underscore turns the policy OFF on ``POST /api/query``.
+
+    ``policied_relation`` refuses to bind any live group name containing a
+    LIKE/SIMILAR-TO metacharacter (``%``/``_``) -- defense in depth against
+    a group literally named ``%`` widening a LIKE-adjacent policy -- and
+    signals the refusal with ``PolicyError``. ``rewrite_sql`` catches
+    ``PolicyError`` around its per-name ``resolve(...)`` call to mean "this
+    identifier is not a registered table" (a CTE name, an
+    ``information_schema`` view) and ``continue``s, so a SECURITY refusal
+    lands in the same branch as a benign unknown name: the table reference
+    is never substituted and the caller reads the unfiltered base view --
+    HTTP 200, all six rows, ``row_scope: null``.
+
+    Measured on this branch for a member of ``sales_cz``:
+
+    ==============================  ==========================================
+    ``POST /api/query``             200, 6/6 rows, ``row_scope: null`` (LEAK)
+    ``POST /api/mcp/query-table``   500 ``policy_error`` (fail-closed)
+    ``GET /api/v2/sample/{id}``     500 ``policy_error`` (fail-closed)
+    ``POST /api/v2/scan``           uncaught ``PolicyError`` (500, unstructured)
+    ``GET /api/me/effective-access`` ``reason: "policy_error"``
+    ==============================  ==========================================
+
+    Asserted as the DESIRED behavior and marked strict-xfail rather than
+    pinning the leak: production code is out of scope for this test-only
+    change, and a strict pin turns XPASS into a failure the moment someone
+    fixes it, which is exactly when the pilot's naming needs revisiting.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "#1979 LEAK: an underscore in a live group name makes policied_relation raise "
+            "PolicyError, which rewrite_sql swallows as 'not a registered table' -- so "
+            "POST /api/query serves the whole unfiltered table (200, row_scope null) to every "
+            "member of 'sales_cz'. Fail-open, not fail-closed"
+        ),
+    )
+    def test_a_member_of_sales_cz_sees_only_their_cz_slice(self, literal_pilot):
+        c = literal_pilot["client"]
+        r = c.post("/api/query", json={"sql": GROUP_BY_SQL}, headers=_auth(literal_pilot["dana_token"]))
+        assert r.status_code == 200, r.text
+        assert _group_counts(r.json()) == {"CZ": 3}
+        assert r.json()["row_scope"] is not None
