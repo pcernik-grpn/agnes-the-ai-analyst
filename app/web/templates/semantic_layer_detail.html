@@ -132,7 +132,10 @@
 {% block body_attrs %}class="page-sheet"{% endblock %}
 
 {% block page_prehead %}
-<a class="slb-back" href="/semantic-layer">&larr; Semantic models</a>
+{# The arrow matches `.apg-back`, the way back every other page draws, and
+   is hidden from screen readers — "left arrow Semantic models" is not a
+   label. The list page draws the same mark. #}
+<a class="slb-back" href="/semantic-layer"><span aria-hidden="true">&larr;</span> Semantic models</a>
 {% endblock %}
 
 {% set page_hero_eyebrow = "Semantic models" %}
@@ -145,7 +148,11 @@
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }}</span>
     {% else %}
-    <span class="badge">Native</span>
+    {# "Native" said nothing to a reader who does not already know the import
+       machinery — it is the badge's own jargon for "nobody imported this". Its
+       opposite says "Imported from X", so the pair reads as a sentence now:
+       where the document came from, in the words a reader already has. #}
+    <span class="badge">Created in Agnes</span>
     {% endif %}
     {% if status == 'invalid' %}
     <span class="badge badge--danger">Invalid</span>

@@ -1074,17 +1074,20 @@ class TestGlossaryRowExpansion:
         assert "if (!item.dataset.hasMore) item.classList.add('is-flat');" in tpl
         assert ".sl-item.is-flat .sl-row__chev { visibility: hidden; }" in tpl
 
-    def test_a_term_definition_wraps_instead_of_clipping(self):
-        """Glossary rows only: a metric's detail holds SQL, so its one-line
-        preview still trades for something."""
+    def test_a_row_definition_wraps_instead_of_clipping(self):
+        """Every row, not only a term's. One line meant a description a few
+        words too long was cut mid-sentence and then restated in full inside
+        the panel — the same duplication, one registry over."""
         from pathlib import Path
 
         tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
-        clamp = tpl.split(".sl-item[data-gcat] .sl-row__desc {", 1)
-        assert len(clamp) == 2, "glossary rows no longer carry their own desc rule"
-        block = clamp[1].split("}", 1)[0]
+        block = tpl.split("\n.sl-row__desc {", 1)[1].split("}", 1)[0]
         assert "white-space: normal" in block
         assert "-webkit-line-clamp: 2" in block
+        assert "white-space: nowrap" not in block
+        assert ".sl-item[data-gcat] .sl-row__desc {" not in tpl, (
+            "the glossary-only override is the base rule now"
+        )
 
 
 class TestGlossaryCrossReferences:
@@ -1181,3 +1184,61 @@ class TestSemanticPageChrome:
             css = css.split(".slb-back {")[1].split("}")[0]
             assert "font-weight: 600" in css, name
             assert "margin: 0 0 10px" in css, name
+
+
+class TestSemanticPageDetails:
+    """Four near-misses that each made this corner read as a different product
+    from the rest of the app."""
+
+    def test_a_metric_panel_does_not_restate_the_row(self):
+        """The row wraps to two lines and carries the description; the panel
+        drops its copy unless the row is actually clipping it. Which it is can
+        only be answered at a width, so the page asks the browser — and asks
+        again on resize, or a description that fit wide would vanish narrow."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert "function trimRedundantDescriptions()" in tpl
+        assert "row.scrollHeight > row.clientHeight + 1" in tpl
+        assert "trimRedundantDescriptions();" in tpl
+        assert "addEventListener('resize'" in tpl, "a width-dependent rule has to re-run"
+
+    def test_a_metric_panel_keeps_a_description_that_is_more_than_the_row(self):
+        """The guard against over-trimming: only an exact text match is
+        redundant. A description whose markdown renders a link or a list says
+        more than its plain preview and must survive."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        fn = tpl.split("function trimRedundantDescriptions()", 1)[1].split("\n    }", 1)[0]
+        assert "norm(panel.textContent) !== norm(row.textContent)" in fn
+        assert "return;" in fn
+
+    def test_a_model_card_never_advertises_a_zero(self, seeded_app):
+        """A zero spent one of the card's three visible chips saying a thing is
+        absent, which pushed the real counts behind a "+2" and truncated the
+        survivors mid-word ("0 constrai…")."""
+        body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+        for noun in ("constraint", "relationship", "glossary term", "dataset", "metric"):
+            assert "0 %s" % noun not in body
+
+    def test_both_semantic_pages_draw_the_same_way_back(self):
+        """An arrow on one page and a chevron on the other, one click apart."""
+        from pathlib import Path
+
+        for name in ("semantic_layer_list.html", "semantic_layer_detail.html"):
+            src = Path("app/web/templates/%s" % name).read_text(encoding="utf-8")
+            back = src.split('class="slb-back"', 1)[1].split("</a>", 1)[0]
+            assert '<span aria-hidden="true">&larr;</span>' in back, name
+            assert "<svg" not in back, name
+
+    def test_the_provenance_badge_says_what_it_means(self):
+        """"Native" was the badge's own jargon for "nobody imported this". Its
+        opposite says "Imported from X", so the pair reads as a sentence now."""
+        from pathlib import Path
+
+        for name in ("semantic_layer_detail.html", "semantic_layer_object.html"):
+            src = Path("app/web/templates/%s" % name).read_text(encoding="utf-8")
+            assert ">Created in Agnes<" in src, name
+            assert ">Native<" not in src, name
+

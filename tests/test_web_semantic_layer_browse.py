@@ -906,7 +906,7 @@ class TestObjectDetail:
         r = c.get(f"/semantic-layer/{_SLUG}/dataset:orders", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         assert "Imported from" not in r.text
-        assert ">Native<" in r.text
+        assert ">Created in Agnes<" in r.text
 
     def test_unknown_object_type_is_404(self, seeded_app):
         _seed_model()
@@ -1006,12 +1006,12 @@ class TestObjectDetailScaffold:
         assert _side_row(r.text, "Source ref") is None
 
     def test_native_model_has_no_source_row(self, seeded_app):
-        """The hero badge already says Native; a rail row repeating it teaches
-        the reader that the rail restates the header."""
+        """The hero badge already states the provenance; a rail row repeating
+        it teaches the reader that the rail restates the header."""
         _seed_model()
         r = self._object(seeded_app, seeded_app["admin_token"])
         assert r.status_code == 200, r.text
-        assert ">Native<" in r.text  # the header still states it
+        assert ">Created in Agnes<" in r.text  # the header still states it
         assert _side_row(r.text, "Source") is None
 
     def test_detached_model_says_so_in_the_rail(self, seeded_app, monkeypatch):

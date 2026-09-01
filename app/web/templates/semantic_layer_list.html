@@ -243,24 +243,17 @@
 
 .sl-row__main { flex: 1; min-width: 0; }
 .sl-row__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); }
+/* Two lines, wrapped — for a METRIC as much as for a term. One line meant a
+   description a few words too long was cut mid-sentence on the row and then
+   restated in full inside the panel, so the reader paid a click to be told
+   what they had already half-read. Two lines hold every description this
+   registry actually carries; the panel keeps the overflow case (see
+   `trimRedundantDescriptions` below), so nothing is ever unreadable. */
 .sl-row__desc {
     font-size: 12px;
     color: var(--ds-text-muted);
     margin-top: 1px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-/* A TERM's definition wraps instead of being clipped to one line. Clipping it
-   created the reason to expand and then answered that reason with the same
-   sentence again — a panel that repeats the line above it because the line was
-   two words too long. Two lines of definition on the row, and there is nothing
-   left to reveal. (A metric keeps the one-line clamp: its detail holds SQL,
-   grain, tables and variants, so expanding it was never about the text.) */
-.sl-item[data-gcat] .sl-row__desc {
     white-space: normal;
-    overflow: visible;
-    text-overflow: clip;
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
@@ -392,10 +385,10 @@
 
 {% block page_head %}
 {% set _back = detail_back('semantics', '/library', 'Library') %}
-<a class="slb-back" href="{{ _back.href }}">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-  {{ _back.label }}
-</a>
+{# Same mark as `.apg-back` and as the model detail page: an arrow, not a
+   chevron. Two ways back drawn two ways, one screen apart, is the kind of
+   near-miss that makes one page feel like a different product. #}
+<a class="slb-back" href="{{ _back.href }}"><span aria-hidden="true">&larr;</span> {{ _back.label }}</a>
 {# The SAME header every other content page renders — `page-header--plain`
    with an eyebrow, a title and a subtitle (see `_page_hero.html`). This page
    hand-rolled its own `.sl-head` / `.sl-kicker` / `.page-title` trio, which
@@ -432,6 +425,10 @@
 <div class="fbar-grid sl-grid">
     {% for m in models %}
     {% set _is_invalid = m.status == 'invalid' %}
+    {# The card's `tags` carry only what the model HAS. A zero spent one of the
+       three visible chips saying a thing is ABSENT, which pushed the real counts
+       behind a "+2" and left the survivors truncated mid-word ("0 constrai…").
+       A model with two datasets and two metrics now says exactly that. #}
     {% set _card = {
          'kind': 'data',
          'title': m.name,
@@ -439,12 +436,12 @@
          'description': m.description or '',
          'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
          'tags': [] if _is_invalid else [
-             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's'),
-             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's'),
-             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's'),
-             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's'),
-             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's'),
-         ],
+             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's') if m.counts.datasets else None,
+             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's') if m.counts.metrics else None,
+             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's') if m.counts.constraints else None,
+             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's') if m.counts.relationships else None,
+             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's') if m.counts.glossary else None,
+         ] | reject('none') | list,
          'attrs': 'data-status="invalid"' if _is_invalid else None,
        } %}
     {% if m.is_imported or _is_invalid %}
@@ -851,6 +848,39 @@
     // SQL, not more prose), so length reveals nothing to trade a click for.
     document.querySelectorAll('.sl-item[data-gcat]').forEach(item => {
         if (!item.dataset.hasMore) item.classList.add('is-flat');
+    });
+
+    // ── A metric's description, said once ────────────────────────────────
+    //    A metric row always has something behind it (type, expression, the
+    //    link into its model), so unlike a term it always earns its chevron.
+    //    What it had not earned was restating the description at the top of
+    //    that panel: the row above shows the same sentence, and now wraps to
+    //    two lines, so on all but the longest descriptions the panel opened
+    //    with a line the reader had just finished reading.
+    //
+    //    Removed only when BOTH hold: the row is not clipping (the browser is
+    //    the only thing that knows, and it depends on the width — hence the
+    //    resize pass), and the panel's text is the row's text and nothing more,
+    //    so a description whose markdown renders a link or a list keeps its
+    //    rendered copy. The effect is that the description is always fully
+    //    readable — on the row when it fits, in the panel when it does not —
+    //    and never twice.
+    function trimRedundantDescriptions() {
+        document.querySelectorAll('.sl-item[data-cat]').forEach(item => {
+            const row = item.querySelector('.sl-row__desc');
+            const panel = item.querySelector('.sl-detail__desc');
+            if (!row || !panel) return;
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+            if (norm(panel.textContent) !== norm(row.textContent)) return;
+            const clipped = row.scrollHeight > row.clientHeight + 1;
+            panel.hidden = !clipped;
+        });
+    }
+    trimRedundantDescriptions();
+    let _descPass;
+    window.addEventListener('resize', () => {
+        clearTimeout(_descPass);
+        _descPass = setTimeout(trimRedundantDescriptions, 150);
     });
 
     // A cross-reference to another TERM stays on this page: it puts the name
