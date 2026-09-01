@@ -38,7 +38,7 @@ def search(
     scope: str | None = typer.Option(
         None,
         "--scope",
-        help="server (documents + knowledge + catalog + metrics + glossary) | local (offline, documents only)",
+        help="server (documents + knowledge + catalog + metrics + glossary + plugins) | local (offline, documents only)",
     ),
 ):
     """One query across documents, the knowledge base, and the data catalog."""

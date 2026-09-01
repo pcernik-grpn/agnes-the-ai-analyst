@@ -58,12 +58,8 @@ def _glossary_search(query: str, limit: int = 10) -> List[Dict[str, Any]]:
 def _dedupe_by_document(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """One hit per document, keeping its best-scoring passage.
 
-    A document is stored as many chunks and every chunk is ranked separately,
-    so a file that mentions the query in six places arrived as six hits — and
-    `_minmax` below then spread them from 1.0 downward, so they took six of the
-    caller's k slots and pushed out the table, metric or note that also
-    matched. In the web combobox (k=8) that read as "the same document repeated
-    up to 6x, and the thing I searched for is missing" (#1956 item 5).
+    Called only when another source also matched — see the caller, which gates
+    this and the name cap on the same question for the same reason.
 
     Ranking is unchanged: the surviving hit is the one the ranker already put
     first for that document, so the ORDER of documents is exactly what it was
@@ -267,7 +263,7 @@ def unified_search(
     # below and `_minmax` both reason about "how many slots this bucket takes",
     # and six passages of one file are one document's worth of answer, not six.
     chunk_hits = (
-        _dedupe_by_document([dict(h, type="chunk") for h in _chunk_search(corpus_ids, query, k=k)])
+        [dict(h, type="chunk") for h in _chunk_search(corpus_ids, query, k=k)]
         if corpus_ids
         else []
     )
@@ -276,7 +272,6 @@ def unified_search(
     # and merely rescales them, an all-filename bucket is now rare and an
     # all-or-nothing test would almost never fire. Body hits are untouched.
     # (Devin Review on #1267.)
-    named = [h for h in chunk_hits if h.get("matched_on") == "filename"]
     buckets.append(chunk_hits)
 
     knowledge_hits: List[Dict[str, Any]] = []
@@ -344,9 +339,24 @@ def unified_search(
     # the answer to the query that motivated the fallback — "what is in
     # quarterly-report.md?" deserves more than two chunks of that file when
     # nothing else in the instance matched. (Devin Review on #1267.)
-    if named and any(bucket for bucket in buckets[1:]):
-        keep = {id(h) for h in named[:_sem_cap]}
-        buckets[0] = [h for h in buckets[0] if h.get("matched_on") != "filename" or id(h) in keep]
+    # One hit per document, under exactly the same condition and for exactly
+    # the same reason as the cap below it. Six chunks of one file arrive as six
+    # separately-ranked hits, `_minmax` spreads them from 1.0 downward, and
+    # they take six of the caller's k slots — which in the web combobox (k=8)
+    # read as "the same document repeated up to 6x, and the thing I searched
+    # for is missing" (#1956 item 5).
+    #
+    # But when the chunk bucket is ALL that matched, collapsing it is the same
+    # mistake the cap is careful not to make: "what is in quarterly-report.md?"
+    # is answered by that file's passages, and there is nothing they could be
+    # crowding out. So both narrowings are gated on the same question — did
+    # anything else match at all — and a lone document keeps every passage.
+    if any(bucket for bucket in buckets[1:]):
+        buckets[0] = _dedupe_by_document(buckets[0])
+        named = [h for h in buckets[0] if h.get("matched_on") == "filename"]
+        if named:
+            keep = {id(h) for h in named[:_sem_cap]}
+            buckets[0] = [h for h in buckets[0] if h.get("matched_on") != "filename" or id(h) in keep]
 
     merged: List[Dict[str, Any]] = []
     for bucket in buckets:
