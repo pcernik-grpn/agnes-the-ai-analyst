@@ -2,17 +2,30 @@
 {% from "macros/_fbar_card.html" import fbar_card %}
 {% import "macros/_state.html" as state %}
 
-{# NAME: "Semantic models", never "Semantic layer" — that name was worn by
-   three of the four semantic surfaces at once, so a browser tab could not
-   tell them apart. The eyebrow keeps the concept; the title names the page's
-   contents. Guarded by tests/test_semantic_page_names_contract.py.
+{# NAME: "Definitions". The page had FOUR names between the Library card that
+   sends you here and its own detail pages — the card said "Definitions", its
+   link said "Browse semantic models", this title said "Semantic models" over
+   an eyebrow saying "Semantic layer", and the detail page's eyebrow said
+   "Semantic models" again. One area, four words, all within two clicks.
+
+   "Definitions" wins because it is the word a reader who is not an engineer
+   already has: these are the words and numbers the organization agreed on.
+   "Semantic layer" is the architecture's name for the machinery, and
+   "semantic model" stays the name of a DOCUMENT TYPE inside this page — which
+   is what the Models tab lists, and what it is still correctly called there.
+
+   The two admin surfaces keep their own vocabulary ("Semantic layer health",
+   "Semantic sources") on purpose: an admin operates the layer, an analyst
+   reads the definitions, and the naming contract's own rule is that each page
+   is named for what it is FOR.
 
    The name does NOT change per tab. Since the fold (#1707 N5) this one page
    carries three views — the stored documents, and the flat metric/glossary
    projections that used to live at /catalog/semantics — and a <title> that
-   changed under the reader would put three names back into circulation,
-   which is the exact collision that contract exists to prevent. #}
-{% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+   changed under the reader would put several names back into circulation,
+   which is the exact collision that contract exists to prevent.
+   Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Definitions — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {#- The writer badge on a flat registry row. Kept in step with its client-side
     twin in this page's own script (the glossary list is fetched, not
@@ -399,9 +412,13 @@
    `base_page.html`'s hero variables — one shape, two hosts. #}
 <section class="page-header page-header--plain">
   <div class="page-header__main">
-    <div class="page-header__eyebrow">Semantic layer</div>
-    <h1 class="page-header__title">Semantic models</h1>
-    <p class="page-header__subtitle">Browse your organization's datasets, metrics, relationships and glossary — the stored documents, and the flat metric and glossary registries projected from them.</p>
+    <div class="page-header__eyebrow">Library</div>
+    <h1 class="page-header__title">Definitions</h1>
+    {# Said in the reader's terms, not the implementation's. The old subtitle
+       ("the stored documents, and the flat metric and glossary registries
+       projected from them") described the data model: a reader has to know
+       what a projection is before the sentence means anything. #}
+    <p class="page-header__subtitle">The words and numbers your organization has agreed on — what counts as revenue, what an active account is. Your agents answer with them.</p>
   </div>
 </section>
 {# ── One page, three views (#1707 N5) ─────────────────────────────────────

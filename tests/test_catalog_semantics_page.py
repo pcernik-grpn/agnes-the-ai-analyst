@@ -85,8 +85,11 @@ class TestCatalogSemanticsContent:
         assert 'class="tab-strip__item' in body
         assert 'href="/semantic-layer?tab=all_metrics"' in body
         assert 'href="/semantic-layer?tab=all_glossary"' in body
-        assert "All metrics" in body
-        assert "All glossary" in body
+        # The keys stay `all_*` — they are in bookmarks and in the 308 above —
+        # but the LABELS dropped the "All", which said nothing beside a count
+        # badge and read as a filter state on tabs that have none.
+        assert ">Metrics (" in body
+        assert ">Glossary (" in body
 
         # Server-rendered metrics list: category grouping + row content.
         assert "revenue" in body
