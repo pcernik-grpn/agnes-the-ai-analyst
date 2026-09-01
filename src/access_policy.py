@@ -406,6 +406,40 @@ def _transpile_policy_to_snowflake(policy_sql: str, *, table_id: str) -> str:
     return statements[0]
 
 
+def transpile_policy_sql(policy_sql: str, *, table_id: str, dialect: str) -> str:
+    """Transpile an admin-authored, DuckDB-dialect policy body to ``dialect``
+    for DISPLAY -- the admin preview's "Transpiled for <dialect>" block
+    (§13, K1-sweep finding 3, issue #1979).
+
+    A thin dispatch over the same three engine-specific arms
+    ``policied_relation`` itself uses. Unlike that resolver, this takes the
+    policy body directly rather than resolving one from a registry row, so
+    a preview can transpile a CANDIDATE body that was never saved, not only
+    a table's stored ``access_policy_sql``.
+
+    Raises the SAME bare ``PolicyError`` every transpile failure raises
+    elsewhere (§16: no engine detail in the exception) -- callers map it
+    exactly like ``policied_relation``'s own transpile failures. This is
+    deliberately a preview of what a LIVE read would run, not a friendlier
+    authoring-time check: ``validate_policy_sql``'s ``for_remote`` rule
+    already runs this same transpile at save time for a table that IS
+    ``query_mode='remote'`` at that moment, but a body saved while the
+    table was still local/``server_only`` never went through that check --
+    if the table is switched to ``remote`` afterward without the SQL
+    itself being re-saved, the stored body can be untranspilable and no
+    save-time gate ever caught it. This lets the preview surface that
+    BEFORE the first live analyst read hits it as a 500 ``policy_error``,
+    rather than only after.
+    """
+    if dialect == "bigquery":
+        return _transpile_policy_to_bigquery(policy_sql, table_id=table_id)
+    if dialect == "databricks":
+        return _transpile_policy_to_databricks(policy_sql, table_id=table_id)
+    if dialect == "snowflake":
+        return _transpile_policy_to_snowflake(policy_sql, table_id=table_id)
+    raise ValueError(f"unknown dialect: {dialect!r}")
+
+
 def _resolve_table_row(table_id: str) -> dict:
     """id-or-name lookup (§5.3) — ``id`` checked first (registry PK, exact
     match), then ``name`` (what master views and SQL ``FROM`` clauses name).

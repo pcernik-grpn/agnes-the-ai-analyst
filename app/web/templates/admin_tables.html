@@ -713,6 +713,34 @@
             margin-right: 4px;
         }
 
+        /* K1-sweep finding 3 (#1979): a remote table on a transpiling
+           engine (BigQuery, Databricks) does not run the DuckDB text in
+           #apSql on a live read -- it runs this TRANSPILED form. Collapsed
+           by default (secondary to the row/column preview above), plain
+           read-only text -- same idiom as admin_data_sources.html's
+           `.ds-errdetail`. */
+        .ap-preview-transpiled {
+            margin-top: 10px;
+        }
+
+        .ap-preview-transpiled summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-preview-transpiled pre {
+            margin: 6px 0 0;
+            padding: 8px 10px;
+            overflow-x: auto;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border-light);
+            border-radius: 6px;
+            font-size: 11.5px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         .ap-history-row {
             padding: 6px 0;
             border-bottom: 1px solid var(--ds-border);
@@ -6390,6 +6418,17 @@
         if (hiddenCols.length) {
             html += '<div class="form-hint" style="margin-top:6px;">Hidden columns: '
                  + escapeHtml(hiddenCols.join(', ')) + '</div>';
+        }
+        // K1-sweep finding 3 (#1979): a remote table on a transpiling engine
+        // (BigQuery, Databricks) runs THIS form on a live read, not the
+        // DuckDB text in #apSql above -- `null` for local/materialized
+        // tables and for remote Snowflake (see `_policy_preview_dialect`
+        // server-side). Collapsed by default: secondary to the row/column
+        // preview above, useful mainly when something looks off.
+        if (body.transpiled) {
+            html += '<details class="ap-preview-transpiled"><summary>Transpiled for '
+                 + escapeHtml(body.transpiled.dialect) + '</summary><pre>'
+                 + escapeHtml(body.transpiled.relation_sql) + '</pre></details>';
         }
         if (!comparable && policiedRows.length) {
             html += '<div class="form-hint ap-preview-note">Showing what this persona sees. A '

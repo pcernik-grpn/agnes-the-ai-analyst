@@ -529,3 +529,25 @@ def test_flag_on_is_zero_visual_change(seeded_app, monkeypatch):
     body = r.text
     assert 'id="apFlagDisabledNotice"' not in body
     assert 'id="apSaveBtn" onclick="apSavePolicy()">Save policy</button>' in body
+
+
+def test_preview_renders_the_transpiled_block_when_present(seeded_app):
+    """K1-sweep finding 3 (#1979): a remote table on a transpiling engine
+    runs the TRANSPILED body on a live read, not the DuckDB text in
+    ``#apSql`` — ``_apRenderPreviewResult`` must show it, collapsed by
+    default (secondary to the row/column preview above), read-only."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+
+    render = body[body.index("function _apRenderPreviewResult") :]
+    render = render[: render.index("function _apLoadHistory")]
+    assert "body.transpiled" in render
+    assert "ap-preview-transpiled" in render
+    assert "<details" in render and "<summary>" in render
+    assert "Transpiled for " in render
+    # Read-only text, escaped like every other server-controlled string
+    # rendered into this modal — never innerHTML'd raw.
+    assert "escapeHtml(body.transpiled.dialect)" in render
+    assert "escapeHtml(body.transpiled.relation_sql)" in render

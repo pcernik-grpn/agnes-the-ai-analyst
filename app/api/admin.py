@@ -6789,6 +6789,31 @@ def _policy_preview_variable_usage(sql: str) -> tuple[set, set]:
     return referenced, variables_in_pattern_position(statement)
 
 
+def _policy_preview_dialect(row: dict) -> Optional[str]:
+    """Which transpile dialect (if any) a LIVE read of this table's policy
+    actually executes in -- so the preview's "Transpiled for <dialect>"
+    block never shows SQL that is not what would run (K1-sweep finding 3,
+    issue #1979).
+
+    Mirrors the live query path's own engine dispatch: only a
+    ``query_mode='remote'`` row on ``bigquery`` or ``databricks``
+    transpiles at read time (``app/api/query.py``'s
+    ``_bq_policied_execution_sql`` / ``_databricks_policy_resolver``, both
+    calling ``policied_relation(..., dialect=...)``). A remote Snowflake
+    row is deliberately excluded: per ``_transpile_policy_to_snowflake``'s
+    own docstring, a registered Snowflake ``query_mode='remote'`` row is a
+    plain DuckDB VIEW over the ATTACHed ``sf`` catalog, so its live reads
+    run through the ordinary ``dialect="duckdb"`` arm, not the Snowflake
+    transpile -- showing that arm's output here would preview a body that
+    never actually executes. A ``local``/``materialized`` row (or any other
+    ``query_mode``) always runs the verbatim DuckDB body -- ``None``.
+    """
+    if row.get("query_mode") != "remote":
+        return None
+    source_type = row.get("source_type")
+    return source_type if source_type in ("bigquery", "databricks") else None
+
+
 @router.post("/registry/{table_id}/policy/preview")
 async def preview_table_policy(
     table_id: str,
@@ -6865,6 +6890,43 @@ async def preview_table_policy(
             )
         except PolicyValidationError as e:
             raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+    # K1-sweep finding 3 (#1979): a `query_mode='remote'` table on a
+    # transpiling engine does NOT execute the DuckDB-dialect text above on a
+    # live read -- it executes that body TRANSPILED to the engine's own SQL
+    # (`_bq_policied_execution_sql` for BigQuery, `_databricks_policy_resolver`
+    # for Databricks; see `app/api/query.py`). Showing the DuckDB text alone
+    # here would preview SQL that never actually runs for these two engines.
+    # `_policy_preview_dialect` decides which (if any) -- `None` for
+    # local/materialized tables and for remote Snowflake, whose live reads
+    # stay on the `dialect="duckdb"` arm (`_transpile_policy_to_snowflake`'s
+    # own docstring), so a Snowflake-transpiled block here would show a body
+    # that likewise never executes.
+    transpiled = None
+    preview_dialect = _policy_preview_dialect(row)
+    if preview_dialect is not None:
+        from src.access_policy import PolicyError, transpile_policy_sql
+
+        try:
+            transpiled_sql = transpile_policy_sql(policy_sql, table_id=table_id, dialect=preview_dialect)
+        except PolicyError:
+            # Fail-soft (§16: no engine detail leaked): a CANDIDATE body on
+            # a currently-remote table is already caught earlier by
+            # `validate_policy_sql`'s `for_remote` transpile check above, so
+            # this branch is mainly the STORED-policy case -- a body saved
+            # while the table was still local/server_only (never checked
+            # against `for_remote=True`) whose table was later switched to
+            # `query_mode='remote'` without the SQL itself being re-saved.
+            # Surfacing it here, inline, beats discovering it as the first
+            # live analyst's `500 policy_error`.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"policy_preview_transpile_failed: this policy body does not transpile to "
+                    f"{preview_dialect} SQL, which is what a live read of this remote table actually runs"
+                ),
+            )
+        transpiled = {"dialect": preview_dialect, "relation_sql": transpiled_sql}
 
     # Persona resolution -- exactly one of as_user / as_groups was required
     # above, so exactly one branch below runs.
@@ -6988,6 +7050,13 @@ async def preview_table_policy(
         "base_sample_comparable": bool(base_sample_comparable),
         "rows_visible": int(rows_visible),
         "rows_total": int(rows_total),
+        # `None` for local/materialized tables and for remote Snowflake
+        # (§ K1-sweep finding 3 above) -- present only for a remote
+        # BigQuery/Databricks table, where it is what the live read
+        # actually executes. `relation_sql` never carries a bound VALUE --
+        # only the SAME `$name`/`@name`/`:name` markers the live resolver
+        # sends, so this is safe to render verbatim.
+        "transpiled": transpiled,
     }
 
 

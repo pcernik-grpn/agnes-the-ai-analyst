@@ -881,3 +881,341 @@ class TestPolicyPreviewSampleWindow:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["base_sample_comparable"] is False
+
+
+# ── Deliverable 3: `transpiled` on the preview response (K1-sweep finding
+# 3, issue #1979) — a remote table on a transpiling engine (bigquery,
+# databricks) executes the TRANSPILED body on a live read, never the
+# DuckDB text the admin authored; the preview must show what actually
+# runs. ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def policied_bq_remote_for_preview(seeded_app, mock_extract_factory, monkeypatch):
+    """A `query_mode='remote'` BigQuery-registered row, carrying real local
+    data the same way `policied_invoices_for_preview` does — standing in
+    for the physical view a real BigQuery ATTACH would create — so the
+    row-count / sample queries the preview endpoint runs have something to
+    execute against. `source_type='bigquery'` + `query_mode='remote'` is
+    what drives the NEW dialect-detection logic under test; the DATA path
+    is otherwise identical to the local-table fixture above.
+    """
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+    env = seeded_app["env"]
+    mock_extract_factory(
+        "keboola",
+        [
+            {
+                "name": "preview_bq_invoices",
+                "data": [
+                    {"id": "1", "unit": "Finance", "secret": "s1"},
+                    {"id": "2", "unit": "Ops", "secret": "s2"},
+                ],
+            }
+        ],
+    )
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id="preview_bq_invoices",
+            name="preview_bq_invoices",
+            source_type="bigquery",
+            bucket="fin",
+            source_table="invoices",
+            query_mode="remote",
+        )
+        registry.set_access_policy(
+            "preview_bq_invoices",
+            sql=("SELECT * EXCLUDE (secret) FROM preview_bq_invoices WHERE list_contains($user_groups, unit)"),
+            note="restrict to the caller's unit",
+            updated_by="admin",
+        )
+    finally:
+        conn.close()
+
+    return seeded_app
+
+
+@pytest.fixture
+def policied_databricks_remote_for_preview(seeded_app, mock_extract_factory, monkeypatch):
+    """Same shape as `policied_bq_remote_for_preview`, on `source_type='databricks'`."""
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+    env = seeded_app["env"]
+    mock_extract_factory(
+        "keboola",
+        [
+            {
+                "name": "preview_dbx_invoices",
+                "data": [
+                    {"id": "1", "unit": "Finance", "secret": "s1"},
+                    {"id": "2", "unit": "Ops", "secret": "s2"},
+                ],
+            }
+        ],
+    )
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id="preview_dbx_invoices",
+            name="preview_dbx_invoices",
+            source_type="databricks",
+            bucket="main.fin",
+            source_table="invoices",
+            query_mode="remote",
+        )
+        registry.set_access_policy(
+            "preview_dbx_invoices",
+            sql=("SELECT * EXCLUDE (secret) FROM preview_dbx_invoices WHERE list_contains($user_groups, unit)"),
+            note="restrict to the caller's unit",
+            updated_by="admin",
+        )
+    finally:
+        conn.close()
+
+    return seeded_app
+
+
+@pytest.mark.journey
+class TestPolicyPreviewTranspiled:
+    def test_remote_bigquery_table_shows_the_transpiled_sql(self, policied_bq_remote_for_preview):
+        c = policied_bq_remote_for_preview["client"]
+        token = policied_bq_remote_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_bq_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        transpiled = body["transpiled"]
+        assert transpiled is not None
+        assert transpiled["dialect"] == "bigquery"
+        # EXCLUDE -> EXCEPT is the BigQuery arm's documented rewrite.
+        assert "EXCEPT" in transpiled["relation_sql"]
+        # `$user_groups` survives as BigQuery's own `@name` marker -- never
+        # the bound VALUE ("Finance") inlined into the SQL text.
+        assert "@user_groups" in transpiled["relation_sql"]
+        assert "Finance" not in transpiled["relation_sql"]
+
+    def test_remote_databricks_table_shows_the_transpiled_sql(self, policied_databricks_remote_for_preview):
+        c = policied_databricks_remote_for_preview["client"]
+        token = policied_databricks_remote_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_dbx_invoices/policy/preview",
+            json={"as_groups": ["Ops"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        transpiled = body["transpiled"]
+        assert transpiled is not None
+        assert transpiled["dialect"] == "databricks"
+        # `$name` -> `:name` is the Databricks arm's own marker rewrite.
+        assert ":user_groups" in transpiled["relation_sql"]
+        assert "Ops" not in transpiled["relation_sql"]
+
+    def test_local_table_has_no_transpiled_block(self, policied_invoices_for_preview):
+        """`policied_invoices_for_preview` is `query_mode='local'` --
+        the DuckDB body it saved IS what a live read runs, so there is
+        nothing to transpile."""
+        c = policied_invoices_for_preview["client"]
+        token = policied_invoices_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["transpiled"] is None
+
+    def test_materialized_bigquery_table_has_no_transpiled_block(self, seeded_app, mock_extract_factory, monkeypatch):
+        """`source_type='bigquery'` alone is not enough -- a materialized
+        row's scheduler already wrote local rows, so a live read runs the
+        verbatim DuckDB body on those local rows, exactly like a `local`
+        table (design doc: `query_mode='materialized'` Snowflake/Databricks
+        rows likewise execute locally)."""
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola",
+            [{"name": "preview_bq_materialized", "data": [{"id": "1", "unit": "Finance"}]}],
+        )
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="preview_bq_materialized",
+                name="preview_bq_materialized",
+                source_type="bigquery",
+                bucket="fin",
+                source_table="invoices",
+                query_mode="materialized",
+            )
+            registry.set_access_policy(
+                "preview_bq_materialized",
+                sql="SELECT * FROM preview_bq_materialized WHERE list_contains($user_groups, unit)",
+                note="restrict to the caller's unit",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_bq_materialized/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["transpiled"] is None
+
+    def test_remote_snowflake_table_has_no_transpiled_block(self, seeded_app, mock_extract_factory, monkeypatch):
+        """A registered `query_mode='remote'` Snowflake row's live reads run
+        through the ordinary DuckDB arm (a plain view over the ATTACHed
+        `sf` catalog, per `_transpile_policy_to_snowflake`'s own
+        docstring) -- showing the Snowflake-transpiled form here would
+        preview a body that never actually executes, so this is `None`
+        exactly like a local table, not a third dialect option."""
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola",
+            [{"name": "preview_sf_invoices", "data": [{"id": "1", "unit": "Finance"}]}],
+        )
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="preview_sf_invoices",
+                name="preview_sf_invoices",
+                source_type="snowflake",
+                bucket="FIN",
+                source_table="INVOICES",
+                query_mode="remote",
+            )
+            registry.set_access_policy(
+                "preview_sf_invoices",
+                sql="SELECT * FROM preview_sf_invoices WHERE list_contains($user_groups, unit)",
+                note="restrict to the caller's unit",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_sf_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["transpiled"] is None
+
+    def test_candidate_sql_transpiles_the_candidate_not_the_stored_body(self, policied_bq_remote_for_preview):
+        """The candidate never even needs to reach the saved policy --
+        `_policy_preview_dialect` only looks at the row's own
+        `source_type`/`query_mode`, so this also proves the transpile
+        block reflects whatever body is being previewed, stored or not."""
+        c = policied_bq_remote_for_preview["client"]
+        token = policied_bq_remote_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_bq_invoices/policy/preview",
+            json={
+                "sql": "SELECT * FROM preview_bq_invoices WHERE list_contains($user_groups, unit)",
+                "as_groups": ["Finance"],
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        transpiled = resp.json()["transpiled"]
+        assert transpiled["dialect"] == "bigquery"
+        # The candidate has no EXCLUDE -- unlike the stored policy, so the
+        # transpiled SQL must not carry the stored body's EXCEPT clause.
+        assert "EXCEPT" not in transpiled["relation_sql"]
+        assert "@user_groups" in transpiled["relation_sql"]
+
+    def test_untranspilable_stored_policy_on_a_remote_table_surfaces_the_error_inline(
+        self, policied_bq_remote_for_preview, monkeypatch
+    ):
+        """A stored body saved back when the table was NOT yet
+        `query_mode='remote'` (so `validate_policy_sql`'s `for_remote`
+        transpile check never ran against it) can be untranspilable —
+        this must surface as a 422 the admin sees inline, not a 500 the
+        first live analyst hits later."""
+        from src.access_policy import PolicyError
+
+        def _boom(sql, *, table_id, dialect):
+            raise PolicyError(table_id)
+
+        monkeypatch.setattr("src.access_policy.transpile_policy_sql", _boom)
+
+        c = policied_bq_remote_for_preview["client"]
+        token = policied_bq_remote_for_preview["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_bq_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_preview_transpile_failed" in resp.text
+
+    def test_untranspilable_candidate_sql_surfaces_the_error_inline(
+        self, policied_bq_remote_for_preview, monkeypatch
+    ):
+        from src.access_policy import PolicyError
+
+        def _boom(sql, *, table_id, dialect):
+            raise PolicyError(table_id)
+
+        monkeypatch.setattr("src.access_policy.transpile_policy_sql", _boom)
+
+        c = policied_bq_remote_for_preview["client"]
+        token = policied_bq_remote_for_preview["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_bq_invoices/policy/preview",
+            json={
+                "sql": "SELECT * FROM preview_bq_invoices WHERE list_contains($user_groups, unit)",
+                "as_groups": ["Finance"],
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_preview_transpile_failed" in resp.text

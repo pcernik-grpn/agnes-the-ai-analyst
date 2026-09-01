@@ -196,6 +196,8 @@ Prints rows-visible / rows-total, which columns are hidden, and a sample. `0` ro
 
 This calls the same single-persona primitive the web modal uses (`POST /api/admin/registry/{id}/policy/preview`) — every call is audited, because "who looked at whose data, when" is the first question after an incident. See [v1 limitations](#v1-limitations) for what this preview does *not* yet do.
 
+**Transpiled form (#1979).** For a `query_mode='remote'` table on BigQuery or Databricks, a live read does not execute the DuckDB text above — it executes that body *transpiled* to the engine's own SQL (the BigQuery jobs-API path, the Databricks Statement Execution API path). The preview response carries a `transpiled: {dialect, relation_sql} | null` field so what you're checking is what would actually run: `null` for a `local`/`materialized` table (the DuckDB text *is* what executes) and, deliberately, also `null` for a `remote` Snowflake table — a registered Snowflake row is a plain DuckDB `VIEW` over the ATTACHed `sf` catalog, so its live reads stay on the ordinary DuckDB arm too, and showing the Snowflake transpile there would preview a body that never runs. `relation_sql` never carries a bound *value* — only the same `$name`/`@name`/`:name` markers the live resolver itself sends, exactly like the row/column preview above never shows a bound value inlined either. The web modal renders this, collapsed, as "Transpiled for `<dialect>`" under the row/column result. A policy body that doesn't transpile to the table's engine surfaces as `policy_preview_transpile_failed` (a stored body attached before the table became `query_mode='remote'` is the realistic case — see `policy_untranspilable` below for the save-time check that catches a *new* remote-table write).
+
 ## Disclosure: the caller is told they got a slice
 
 Silent row filtering is actively dangerous — an analyst (or an agent, with more confidence) who sums a policied table's own column and reports the total has no way to know it was never the whole table. Every enforcement point surfaces the fact of filtering, not just the filtered data:
@@ -236,6 +238,7 @@ Every policy-related rejection is a structured `reason`-keyed detail (never a ra
 | `kbc_path_policied` | 403, query surfaces | the same for `kbc."<bucket>"."<table>"` (#1492; the prefix also gained the registry gate `kbc_path_not_registered` and the grant gate `kbc_path_access_denied` the other three already had) |
 | `policy_note_required` | 422, admin write | `access_policy_sql` is set without `access_policy_note` |
 | `policy_var_in_pattern_position` | 422, admin write and preview | an identity variable stands on the *pattern* side of `LIKE` / `ILIKE` / `SIMILAR TO` or a regex function — rejected at save time, and refused again by the resolver (and so by the preview) if a stored body carries the shape anyway |
+| `policy_preview_transpile_failed` | 422, preview only | the previewed body (stored or candidate) does not transpile to the table's engine — the realistic case is a body saved before the table became `query_mode='remote'`, so `policy_untranspilable`'s save-time check never ran against it (#1979) |
 
 ## Snapshots and staleness
 
