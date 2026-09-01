@@ -71,11 +71,10 @@ Surface:
                                                                 enqueueing (typed 409, never a job
                                                                 that fails 30 minutes later in a
                                                                 worker) when ``sharepoint.enabled``
-                                                                is off or no producer is configured
-                                                                — the same two gates
-                                                                ``app/worker/kinds.py::
-                                                                _run_corpus_extraction`` itself
-                                                                checks. Deduped on a stable
+                                                                is off or the ``extraction`` extra
+                                                                is not installed — see
+                                                                ``_extraction_readiness``.
+                                                                Deduped on a stable
                                                                 per-connection idempotency key
                                                                 shared with the sweep below.
   POST   /api/admin/sharepoint/extraction/run-due             — scheduler-driven sweep (TCRD-226):
@@ -145,7 +144,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -730,20 +729,25 @@ def _readopted_scope_collection_id(tombstone: Any) -> Optional[str]:
 
 
 def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
-    """Whether the ``corpus-extraction`` job kind can actually run right now
-    — the SAME two gates ``app/worker/kinds.py::_run_corpus_extraction``
-    itself checks (``sharepoint.enabled`` + a configured producer command/
-    module), read here so an admin (or the scheduled sweep below) finds out
-    BEFORE a job is queued rather than 30 minutes later when a worker claims
-    it and the handler raises.
+    """Whether the ``corpus-extraction`` job kind can actually run right now,
+    read here so an admin (or the scheduled sweep below) finds out BEFORE a
+    job is queued rather than 30 minutes later when a worker claims it and
+    the handler raises.
+
+    Two gates. ``sharepoint.enabled`` is the one
+    ``app/worker/kinds.py::_run_corpus_extraction`` itself checks. The second
+    is the ``extraction`` optional dependency extra: since the built-in
+    pipeline became the only pipeline (owner decision 2026-08-31) the crawl
+    runs IN-PROCESS, so on a server without the converter backends installed
+    every document of a run would fail with the same
+    ``MissingConversionDependency``. ``connectors.sharepoint.convert`` is
+    deliberately importable WITHOUT the extra (its backends are imported
+    lazily), so the probe has to reach past it to the backends themselves.
 
     The first gate already honors a deploy-time env override ahead of
     ``instance.yaml`` — ``AGNES_SHAREPOINT_ENABLED`` (via ``feature_enabled``
-    below) — and the producer gate honors ``AGNES_EXTRACTION_PRODUCER_COMMAND``
-    / ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
-    :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
-    this function and the handler it mirrors see the identical truth
-    regardless of which source (env or yaml) an instance configures
+    below) — so this function and the handler it mirrors see the identical
+    truth regardless of which source (env or yaml) an instance configures
     through.
 
     Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
@@ -757,15 +761,17 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
             "message": "sharepoint.enabled is false — enable it in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
         }
 
-    from app.worker.kinds import _extraction_producer_argv
+    try:
+        import markitdown  # noqa: F401
+        import pypdfium2  # noqa: F401
 
-    if _extraction_producer_argv() is None:
+        import connectors.sharepoint.convert  # noqa: F401
+    except ImportError:
         return False, {
-            "error": "extraction_producer_not_configured",
+            "error": "extraction_dependencies_missing",
             "message": (
-                "No producer configured — set extraction.producer.command or "
-                "extraction.producer.module in instance.yaml (or "
-                "AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)."
+                "The document converter is not installed — run "
+                "pip install 'agnes[extraction]' on the process that runs the extraction lane."
             ),
         }
 
@@ -1424,14 +1430,12 @@ async def corpus_map(
     connection_id: str,
     user=Depends(require_admin_or_producer_connection("{connection_id}")),
 ):
-    """Producer handoff (spec §13.2 / item 3): the corpus map the external
-    crawl pipeline reads via ``ship_to_agnes.py --corpus-map``. Keys are in
-    the producer resolver's OWN shape — ``"<site display name>"`` or
+    """Scope→collection routing map (spec §13.2 / item 3). Keys are in the
+    crawl resolver's OWN shape — ``"<site display name>"`` or
     ``"<site display name>/<drive-relative folder path>"`` — built by the
-    same shared translation the in-Agnes ``corpus-extraction`` job handler
-    uses for its ``AGNES_EXTRACTION_CORPUS_MAP`` env handoff
-    (``connectors/sharepoint/corpus_map.py``), so the two surfaces cannot
-    drift. The earlier flat ``{source_scope_id: collection_id}`` shape was
+    shared translation in ``connectors/sharepoint/corpus_map.py``, so this
+    endpoint and anything else reasoning about scope routing cannot drift.
+    The earlier flat ``{source_scope_id: collection_id}`` shape was
     unusable for routing: the resolver matches keys against crawler rows'
     site/path components, which a Graph scope id never equals.
 
@@ -1449,19 +1453,10 @@ async def corpus_map(
     an unambiguous map (e.g. a site scope plus a drive scope of the same
     site) — never a best-guess map.
 
-    Deliberately does NOT carry ``anonymize`` — a producer that needs to
-    know WHICH scopes to anonymize reads ``GET .../scopes`` instead (each
-    row already carries ``anonymize``); Agnes's own ``corpus-extraction``
-    job handler does the equivalent lookup internally
-    (``app/worker/kinds.py::_anonymize_marked_scope_map``).
-
-    THIS is the primary callback the corpus-extraction producer itself
-    calls (TCRD-...): a ``ProducerPrincipal`` scoped to THIS connection may
-    call it too (see ``require_admin_or_producer_connection``) —
-    self-audited here (``sharepoint_connection.corpus_map_read``,
-    ``client_kind="producer"``) for the same reason ``list_scopes`` above
-    self-audits its own producer branch.
-    """
+    Deliberately does NOT carry ``anonymize`` — a caller that needs to know
+    WHICH scopes to anonymize reads ``GET .../scopes`` instead (each row
+    already carries ``anonymize``); the built-in crawl reads the same flag
+    off the scope rows directly."""
     row = _sharepoint_connection_or_404(connection_id)
     try:
         mapping = producer_corpus_map(_scopes(row), active_zone_rows(row))
@@ -1518,17 +1513,20 @@ async def rotate_webhook_secret(
     user: dict = Depends(require_admin),
 ):
     """(Re)generate this connection's Graph change-notification receiver
-    secret and return the receiver URL alongside it, so an operator can run
-    the producer's own ``subscriptions.py create --url <webhook_url>``
-    against this connection without hand-assembling either value.
+    secret and return the receiver URL alongside it. The secret becomes the
+    ``clientState`` of every Graph drive subscription
+    ``POST .../subscriptions/ensure`` (below) creates for this connection;
+    the URL is what those subscriptions push to.
 
     Always mints a FRESH random secret — there is no "read the current
     one" verb, matching the outbound-webhook pattern
     (``app/api/agent_webhooks.py``): a caller who wants to see it again
     calls this again, which also rotates it, invalidating whatever Graph
-    subscription was signed with the old value (the operator must then
-    re-point the subscription's ``clientState``, or simply create a new
-    subscription — Agnes does not manage Graph subscriptions itself).
+    subscription was signed with the old value. A rotation does NOT rewrite
+    a live subscription's ``clientState`` (Graph treats it as immutable), so
+    follow a rotation with ``POST .../subscriptions/ensure`` — every
+    notification signed with the old secret is dropped silently by the
+    receiver until you do.
 
     Unlike the outbound-webhook secret, this one is NOT hidden after
     creation: it lives in this connection's own ``config.webhook_secret``
@@ -1555,23 +1553,224 @@ async def rotate_webhook_secret(
     return {"webhook_url": webhook_url, "secret": secret}
 
 
+class ExtractionRunOptions(BaseModel):
+    """Optional per-run overrides for one manual extraction trigger. Both
+    fields default to the CONFIGURED values (`extraction.crawler.concurrency`
+    / `extraction.timeout_s`) when absent — the body itself is optional, so
+    the pre-options `POST` with no body keeps working unchanged. Bounds
+    mirror the crawler's own clamps so a value the run would silently
+    re-clamp is refused here instead, where the admin can see why."""
+
+    concurrency: Optional[int] = Field(
+        None,
+        ge=1,
+        le=16,
+        description="Files of one delta page pipelined at once for this run (1 = sequential).",
+    )
+    timeout_s: Optional[int] = Field(
+        None,
+        ge=0,
+        le=86400,
+        description="Hard ceiling for this one run, seconds (0 = unbounded).",
+    )
+# --- Graph subscription lifecycle -------------------------------------------
+#
+# The secret-minting endpoint above is only half of what near-real-time
+# crawling needs: something has to tell Graph to push in the first place.
+# That was the retired external producer's `subscriptions.py`, run by hand;
+# it now lives at `connectors/sharepoint/subscriptions.py` and these three
+# routes are its admin surface. The lifecycle module owns every decision
+# (which drives, expiry math, per-drive isolation, the state on
+# `config.webhook_subscriptions`); these handlers only translate its typed
+# refusals into HTTP and audit the outcome.
+#
+# There is no GET: subscription state is plain server-written config, so it
+# rides the connection read (`GET /api/admin/source-connections/{id}`) that
+# already returns `config` — a fourth route would be a second name for data
+# an admin can already see.
+
+if TYPE_CHECKING:  # import-time only: the runtime imports stay inside the handlers
+    from connectors.sharepoint.subscriptions import SubscriptionError
+
+
+def _subscription_http_error(exc: "SubscriptionError") -> HTTPException:
+    """One typed refusal → one typed HTTP error whose body names the fix
+    (`{"error", "message"}`, the same detail shape `_resolved_token` and the
+    extraction trigger already use)."""
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+@router.post("/connections/{connection_id}/subscriptions/ensure")
+async def ensure_graph_subscriptions(
+    connection_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Create or renew this connection's Microsoft Graph drive subscriptions
+    so its confirmed scopes push change notifications at
+    ``POST /api/webhooks/sharepoint/{connection_id}``.
+
+    Idempotent — one subscription per DISTINCT drive named by a confirmed
+    scope (several scopes in one library share one subscription), created
+    when missing, renewed when within the renewal window, left alone
+    otherwise, and deleted when its drive leaves scope. Returns the per-drive
+    outcome (``created``/``renewed``/``unchanged``/``removed``/``failed``)
+    plus counts: one library failing never hides the others' success.
+
+    Refuses BEFORE touching Graph, with a body naming the fix, when
+    ``sharepoint.enabled`` is off (``409
+    sharepoint_disabled`` — a subscription pointed at a 404 receiver
+    is dead on arrival), no webhook secret has been minted yet (``409
+    webhook_secret_missing`` — it is the subscription's ``clientState``), no
+    public HTTPS origin is configured (``409 public_url_not_configured`` —
+    Graph validates the notification URL synchronously during create), or
+    the connection's certificate does not resolve / Entra rejects it (``409
+    sharepoint_cert_unresolved`` / ``502 sharepoint_graph_error``).
+    """
+    from connectors.sharepoint.subscriptions import SubscriptionError, ensure_subscriptions
+
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        result = await ensure_subscriptions(row, request=request)
+    except SubscriptionError as exc:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.subscriptions_ensure",
+            resource=f"source_connection:{connection_id}",
+            params={"error": exc.error},
+            result="error",
+        )
+        raise _subscription_http_error(exc) from exc
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.subscriptions_ensure",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "created": result["created"],
+            "renewed": result["renewed"],
+            "unchanged": result["unchanged"],
+            "removed": result["removed"],
+            "failed": result["failed"],
+        },
+    )
+    return result
+
+
+class SubscriptionTeardownRow(BaseModel):
+    """One recorded subscription's teardown outcome."""
+
+    drive_id: str
+    subscription_id: str
+    action: Literal["removed", "failed"]
+    error: Optional[str] = None
+
+
+class SubscriptionTeardownResult(BaseModel):
+    """Why this DELETE answers ``200`` with a body rather than the house
+    ``204``: teardown is PARTIAL by nature. One subscription's delete can
+    fail (Graph 5xx, a revoked permission) while the rest succeed, and its
+    record is deliberately KEPT so a later call retries — an admin has to be
+    able to see which one, and a bodyless 204 cannot say. Declared as a
+    response model and allowlisted in
+    ``tests/test_api_design_rules.py::_DELETE_200_WITH_BODY_ALLOWLIST``,
+    which is exactly the escape hatch that rule documents."""
+
+    connection_id: str
+    subscriptions: List[SubscriptionTeardownRow]
+    removed: int
+    failed: int
+
+
+@router.delete("/connections/{connection_id}/subscriptions", response_model=SubscriptionTeardownResult)
+async def delete_graph_subscriptions(
+    connection_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Delete every Graph subscription recorded for this connection and drop
+    the records it could delete.
+
+    Deliberately NOT gated on ``sharepoint.enabled``: the moment an
+    operator most needs teardown is right after turning the receiver off.
+    A connection with no recorded subscriptions is a clean ``{"removed": 0}``
+    no-op, not a 404 — "there is nothing to remove" is the state the caller
+    asked for. Graph answering ``404`` for a subscription counts as removed;
+    a real failure keeps the record so a later call retries — which is why
+    this answers ``200`` with a per-subscription body instead of ``204``
+    (see :class:`SubscriptionTeardownResult`).
+    """
+    from connectors.sharepoint.subscriptions import SubscriptionError, remove_subscriptions
+
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        result = await remove_subscriptions(row)
+    except SubscriptionError as exc:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.subscriptions_remove",
+            resource=f"source_connection:{connection_id}",
+            params={"error": exc.error},
+            result="error",
+        )
+        raise _subscription_http_error(exc) from exc
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.subscriptions_remove",
+        resource=f"source_connection:{connection_id}",
+        params={"removed": result["removed"], "failed": result["failed"]},
+    )
+    return result
+
+
+@router.post("/subscriptions/run-due")
+async def run_due_subscription_renewal(
+    _user: dict = Depends(require_admin),
+):
+    """Scheduler-driven renewal sweep: walks every SharePoint connection and
+    ensures the ones with due work — a drive with no subscription, one
+    expiring within the renewal window (72h by default), or a record whose
+    drive left scope.
+
+    Exactly the shape ``POST /extraction/run-due`` above uses (walk +
+    per-row due-check + act, no second scheduling mechanism), and for the
+    same reason: Graph subscriptions expire (30-day ceiling; Agnes asks for
+    25), so renewal is a clock, and this instance already has one. Scheduler
+    row ``sharepoint-subscriptions-renew`` in
+    ``services/scheduler/__main__.py``, registered only when
+    ``sharepoint.enabled`` is on.
+
+    A clean, typed no-op (never an error) when the receiver flag is off,
+    since the row once registered fires unconditionally. A connection whose
+    own preconditions fail (no secret minted, no public URL, an expired
+    certificate) is counted in ``errors`` and the sweep continues — one
+    misconfigured connection never costs another its renewal.
+    """
+    from connectors.sharepoint.subscriptions import renew_due_subscriptions
+
+    return await renew_due_subscriptions()
+
+
 @router.post("/connections/{connection_id}/extract", status_code=202)
 async def trigger_extraction(
     connection_id: str,
+    options: Optional[ExtractionRunOptions] = None,
     _user: dict = Depends(require_admin),
 ):
     """Admin-triggered one-off extraction run for this connection
     (TCRD-226) — enqueues the existing ``corpus-extraction`` job kind
     (``app/worker/kinds.py::_run_corpus_extraction``) with
     ``{"connection_id": connection_id}``, the exact payload shape that
-    handler documents.
+    handler documents. An optional :class:`ExtractionRunOptions` body adds
+    the handler's per-run overrides (``concurrency``, ``timeout_s``) for
+    THIS run only — configured values stay untouched.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
     worker) when the feature isn't usable: ``409 extraction_disabled``
     (``sharepoint.enabled`` is false) or ``409
-    extraction_producer_not_configured`` (neither ``extraction.producer
-    .command`` nor ``.module`` is set) — see :func:`_extraction_readiness`.
+    extraction_dependencies_missing`` (the ``extraction`` optional
+    dependency extra is not installed) — see :func:`_extraction_readiness`.
 
     Deduped on the STABLE per-connection idempotency key
     (:func:`_extraction_idempotency_key`) also used by the scheduled sweep
@@ -1589,9 +1788,19 @@ async def trigger_extraction(
 
     from src.repositories import jobs_repo
 
+    payload: Dict[str, Any] = {"connection_id": connection_id}
+    if options is not None:
+        # Only the keys the admin actually set ride in the payload — an
+        # absent key means "the configured value", and the handler/crawler
+        # already document exactly that fallback for each.
+        if options.concurrency is not None:
+            payload["concurrency"] = options.concurrency
+        if options.timeout_s is not None:
+            payload["timeout_s"] = options.timeout_s
+
     job = jobs_repo().enqueue(
         "corpus-extraction",
-        {"connection_id": connection_id},
+        payload,
         idempotency_key=_extraction_idempotency_key(connection_id),
     )
     if job["deduped"]:
@@ -1724,8 +1933,8 @@ async def run_due_extraction(
     default posture as ``sharepoint.enabled``).
 
     A clean, typed no-op (never an error) when the feature isn't usable —
-    ``sharepoint.enabled`` is false, no producer is configured, or no
-    schedule is configured — since this endpoint, once registered, fires
+    ``sharepoint.enabled`` is false, the ``extraction`` extra is missing, or
+    no schedule is configured — since this endpoint, once registered, fires
     UNCONDITIONALLY on its own cadence; the JOB HANDLER
     (``_run_corpus_extraction``) raises on the same conditions because a
     ``corpus-extraction`` job only ever exists because something explicitly

@@ -1,17 +1,19 @@
 """Microsoft Graph change-notification receiver for SharePoint connections —
 ``POST /api/webhooks/sharepoint/{connection_id}``.
 
-Agnes today only learns about a SharePoint change through the scheduled
-sweep (``extraction.schedule`` -> ``POST /api/admin/sharepoint/extraction/
-run-due``, see ``app/api/admin_sharepoint.py``). The external producer
-already implements Graph drive subscriptions; its subscriptions module
-deliberately leaves the HTTP listener to the deployment — THIS module is
-that listener. Agnes never creates, renews, or deletes the Graph
-subscription itself (the producer's ``subscriptions.py create --url
-<receiver_url>`` does that, against the URL + secret ``POST /api/admin/
-sharepoint/connections/{connection_id}/webhook`` mints); this module only
-answers the two calls Graph makes against a subscription that already
-exists.
+Without this route Agnes only learns about a SharePoint change through the
+scheduled sweep (``extraction.schedule`` -> ``POST /api/admin/sharepoint/
+extraction/run-due``, see ``app/api/admin_sharepoint.py``). This module is
+the LISTENER half of the near-real-time path: it answers the two calls
+Graph makes against a subscription. The other half — creating, renewing and
+deleting those subscriptions — was the retired external producer's
+``subscriptions.py`` and now lives inside Agnes at
+``connectors/sharepoint/subscriptions.py``, driven by ``POST /api/admin/
+sharepoint/connections/{connection_id}/subscriptions/ensure`` and a daily
+renewal sweep. That module supplies the ``clientState`` this route verifies
+(the secret ``POST /api/admin/sharepoint/connections/{connection_id}/
+webhook`` mints) and points Graph at this exact URL, which is also why
+creating a subscription is refused while THIS route's feature flag is off.
 
 Two request shapes, both ``POST`` to the same route (Graph's own contract):
 

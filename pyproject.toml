@@ -293,6 +293,19 @@ distribution = [
     # (object_store() returns None) instead of crashing at boot.
     "boto3>=1.34",
 ]
+# Document → markdown extraction for the built-in SharePoint/Collections
+# crawl (connectors/sharepoint/convert.py + pdf_structure.py). Deliberately
+# permissive: markitdown is MIT (mammoth BSD-2, python-pptx MIT, openpyxl MIT
+# underneath) and pypdfium2 is Apache-2.0/BSD-3 over BSD-licensed PDFium.
+# NEVER add PyMuPDF/fitz here — it is AGPL-3.0 and Agnes ships under
+# PolyForm Small Business 1.0.0 (an AST guard in
+# connectors/sharepoint/test_convert.py enforces this). Both backends are
+# lazy-imported: without this extra, conversion raises a typed
+# MissingConversionDependency naming `pip install 'agnes[extraction]'`.
+extraction = [
+    "markitdown[all]>=0.1.5,<0.2",
+    "pypdfium2>=5.13.0,<6",
+]
 dev = [
     "pytest>=9.0.0",
     "pytest-timeout>=2.0.0",

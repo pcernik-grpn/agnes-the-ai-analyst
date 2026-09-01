@@ -139,6 +139,28 @@ class SystemSecretsPgRepository:
             hint="Treating as unset.",
         )
 
+    def insert_if_absent(self, name: str, value: str) -> bool:
+        """Store ``value`` under ``name`` ONLY if no row exists yet (PG).
+
+        Signature-compatible with
+        ``app.secrets_vault.SystemSecretsRepository.insert_if_absent`` — see
+        its docstring for why this write-once, single-statement sibling of
+        ``upsert`` exists.
+        """
+        token = encrypt_secret(value)
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    """INSERT INTO system_secrets
+                           (name, secret_value_enc, updated_at)
+                       VALUES (:name, :token, CURRENT_TIMESTAMP)
+                       ON CONFLICT (name) DO NOTHING
+                       RETURNING name"""
+                ),
+                {"name": name, "token": token},
+            ).fetchone()
+        return row is not None
+
     def delete(self, name: str) -> None:
         with self._engine.begin() as conn:
             conn.execute(

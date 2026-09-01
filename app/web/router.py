@@ -8715,7 +8715,6 @@ def _source_inventory(user: dict | None = None) -> dict:
 # queue's cost in $" but the only honest input Agnes holds is a rejected/
 # deferred item COUNT from the last run report, not a $ figure. Replace once
 # the producer reports real per-item cost.
-_FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
 # Every `claims_rejected` reason the verbatim gate itself produces (spec §8 +
 # §8.4) — both fold into the "rejected quotes" badge, never "protocol
@@ -8888,10 +8887,12 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         rejected_quotes = [r for r in claims_rejected if r.get("reason") in _VERBATIM_GATE_REASONS]
         protocol_errors = [r for r in claims_rejected if r.get("reason") not in _VERBATIM_GATE_REASONS]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
-        cell["cost_estimate"] = {
-            "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
-            "placeholder": True,
-        }
+        # Honest queue signal (UX review 2026-08-31, finding on the fabricated
+        # `$0.02 × items` figure): a COUNT of items awaiting review is a fact;
+        # a dollar figure with no price model behind it is not. Real cost
+        # rendering arrives with operator-configured pricing (extraction
+        # observability spec §5) — until then no `$` is shown here at all.
+        cell["queue"] = {"items": queue_items}
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
@@ -8901,7 +8902,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
         }
     else:
-        cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
+        cell["queue"] = {"items": 0}
         cell["last_run"] = None
 
     # ── schedule: static text — the crawl runs externally, so this is
@@ -8962,7 +8963,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 
-    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
+    cell["schedule"] = {"text": "built-in crawler", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity
