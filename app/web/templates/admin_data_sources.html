@@ -241,7 +241,7 @@
 
   /* Inline token rotate row */
   .ds-rotate-row {
-    display: none; align-items: center; gap: 8px;
+    display: none; align-items: center; flex-wrap: wrap; gap: 8px;
     padding: 10px 16px;
     border-top: 1px solid var(--border-light, var(--ds-border-light));
     background: var(--ds-surface-dim);
@@ -254,6 +254,13 @@
     font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
   }
   .ds-rotate-row input:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  /* A run-options checkbox (e.g. "Re-process everything") is not a text
+     field — override the generic `input` rule above so it renders as a
+     normal checkbox instead of stretching to fill the flex row. */
+  .ds-rotate-row input[type="checkbox"] {
+    flex: 0 0 auto; width: 15px; height: 15px; padding: 0;
+    accent-color: var(--ds-primary);
+  }
   .ds-rotate-row textarea {
     flex: 1; padding: 7px 10px; resize: vertical;
     border-radius: 8px; border: 1px solid var(--border, var(--ds-border));
@@ -2569,6 +2576,18 @@ function _sharepointFactsHtml(row) {
     inAgnesParts.push("no schedule configured");
   }
 
+  // The "re-process everything" run option skips BOTH the delta cursor and
+  // the per-document cTag check (`connectors.sharepoint.crawler.
+  // run_builtin_crawl`'s `force_reprocess`), so it re-downloads, re-converts
+  // and — when fact extraction is on — re-runs the LLM pass over the whole
+  // corpus, not just what changed. One sentence naming that cost up front,
+  // sized with the actual document count when the card already knows it.
+  const forceDocs = fs.crawl && typeof fs.crawl.documents === "number" ? fs.crawl.documents : null;
+  const forceReprocessHelp = forceDocs
+    ? `Re-downloads, re-converts, and (if fact extraction is on) re-runs the LLM pass over all ${forceDocs} ` +
+      `document${forceDocs === 1 ? "" : "s"} — not just what changed.`
+    : "Re-downloads, re-converts, and (if fact extraction is on) re-runs the LLM pass over every document — not just what changed.";
+
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Static label — the built-in crawl's live state is the extraction row below.">Schedule</span>
@@ -2586,6 +2605,11 @@ function _sharepointFactsHtml(row) {
     <input type="number" id="ds-sp-runopts-conc-${row.id}" min="1" max="16" step="1" placeholder="configured" style="max-width:9rem;">
     <label class="field-hint" for="ds-sp-runopts-timeout-${row.id}">Time limit in seconds (0 = unbounded, blank = configured)</label>
     <input type="number" id="ds-sp-runopts-timeout-${row.id}" min="0" max="86400" step="60" placeholder="configured" style="max-width:9rem;">
+    <label class="field-hint" for="ds-sp-runopts-force-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-force-${row.id}">
+      Re-process everything (ignore the delta cursor)
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">${_esc(forceReprocessHelp)}</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
@@ -3197,9 +3221,12 @@ async function runSpExtraction(id) {
     showToast("Run options out of range — concurrency 1–16, time limit 0–86400 s.", false);
     return;
   }
+  const forceEl = document.getElementById(`ds-sp-runopts-force-${id}`);
+  const forceReprocess = !!(forceEl && forceEl.checked);
   const overrides = {};
   if (conc !== null) overrides.concurrency = conc;
   if (timeout !== null) overrides.timeout_s = timeout;
+  if (forceReprocess) overrides.force_reprocess = true;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
@@ -3217,6 +3244,10 @@ async function runSpExtraction(id) {
       showToast("Extraction queued.", true);
       const optsRow = document.getElementById(`ds-sp-runopts-row-${id}`);
       if (optsRow) optsRow.classList.remove("show");
+      // A run option, not a saved setting — uncheck it so reopening this
+      // row and clicking "Start run" again does not silently re-process
+      // everything a second time.
+      if (forceEl) forceEl.checked = false;
       // The dispatch stamps `config.extraction.last_run_at` on the connection
       // row, and the body's "In-Agnes extraction" line reads it — so this
       // needs the rows re-read too, not just the strip.
