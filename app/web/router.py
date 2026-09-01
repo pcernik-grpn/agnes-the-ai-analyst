@@ -4467,13 +4467,18 @@ def _readable_model_by_slug(slug: str, user: dict, conn) -> dict | None:
 #: not be deleting it.
 _SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
 
-#: The tab KEYS stay `all_metrics` / `all_glossary` — they are in bookmarks,
-#: in the 308 from the retired /catalog/semantics, and in skill references.
-#: Only the labels change: "All" was doing no work next to a count badge that
-#: already says how many, and it read as a filter state ("all, as opposed to
-#: some") on tabs that have no other state.
+#: The tab KEYS stay `models` / `all_metrics` / `all_glossary` — they are in
+#: bookmarks, in the 308 from the retired /catalog/semantics, and in skill
+#: references. Only the labels changed.
+#:
+#: "All" went because it did no work beside a count badge that already says how
+#: many, and read as a filter state on tabs that have none. "Models" became
+#: "Semantic models" for the opposite reason — it was too little, not too much:
+#: on a page called Definitions, a bare "Models" names no particular kind of
+#: thing, while "semantic model" is the actual name of the document type this
+#: tab lists and the one piece of the old vocabulary worth keeping.
 _SEMANTIC_LAYER_LIST_TAB_LABELS = {
-    "models": "Models",
+    "models": "Semantic models",
     "all_metrics": "Metrics",
     "all_glossary": "Glossary",
 }
