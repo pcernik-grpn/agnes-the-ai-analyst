@@ -332,6 +332,39 @@ def _is_token_live(token: Dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) <= expires_at
 
 
+def _is_admin_manageable_system_agent(row: Dict[str, Any]) -> bool:
+    """True iff ``row`` is owned by a recognized SYSTEM identity whose
+    profile is organizational configuration, not a human's personal agent.
+
+    Narrow, explicit allowlist (issue #1971 Part 1) — currently just the
+    seeded ``memory-curator`` profile. The blanket "admin may inspect but
+    not modify a foreign agent" rule in :func:`_load_agent` exists to
+    protect a HUMAN's own agent config from admin overreach; that privacy
+    rationale does not apply to a profile nobody personally owns, and
+    without this carve-out "admin-gated editing through the existing
+    agents UI/API" would be unreachable by anyone — the profile's owner is
+    a synthetic user nothing ever authenticates as, so ``is_owner`` is
+    always False for every real caller, admin included.
+
+    This does not touch the ownership rule for any other agent: a regular
+    user's row is unaffected (`row["owner_user_id"]` never matches the
+    memory-curator system user's id), so
+    `test_admin_cannot_mutate_foreign_agent` stays exactly as strict as
+    before. Only one extra query, and only on the branch that would
+    otherwise already 403.
+    """
+    owner_user_id = row.get("owner_user_id")
+    if not owner_user_id:
+        return False
+    try:
+        from app.auth.system_users import MEMORY_CURATOR_USER_EMAIL
+
+        owner = users_repo().get_by_email(MEMORY_CURATOR_USER_EMAIL)
+    except Exception:
+        return False
+    return bool(owner) and owner.get("id") == owner_user_id
+
+
 def _load_agent(
     agent_id: str,
     user: dict,
@@ -346,7 +379,11 @@ def _load_agent(
     C1.1) a grantee — existence of another user's agent is never leaked.
     Admins pass the existence check (so GET works for governance) but
     `require_owner=True` (every mutating route, including token issuance)
-    still 403s them on a foreign agent. A grantee (a `ResourceType.AGENT`
+    still 403s them on a foreign agent — UNLESS the agent is one of the
+    admin-manageable system profiles (`_is_admin_manageable_system_agent`,
+    issue #1971): those are organizational configuration owned by a
+    synthetic identity, not a human's personal agent, so an admin may
+    manage them through this same route. A grantee (a `ResourceType.AGENT`
     row via one of the caller's groups — the /agents builder's own sharing
     reach, `app.api.agents_builder_shared._granted_agent_ids`) may likewise
     only READ:
@@ -367,7 +404,7 @@ def _load_agent(
     is_owner = row["owner_user_id"] == user["id"]
     if not is_owner:
         if is_user_admin(user["id"], conn):
-            if require_owner:
+            if require_owner and not _is_admin_manageable_system_agent(row):
                 raise _err(403, "agent_not_owned", "Admins may inspect but not modify another user's agent")
         else:
             from app.api.agents_builder_shared import _granted_agent_ids

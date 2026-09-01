@@ -1072,6 +1072,46 @@
         .detection-info code {
             font-size: inherit;
         }
+        /* Detection-run observability (issue #1971 Part 3/4) — the
+           "How detection works" panel's recent-runs list + dry-run
+           control. Same info palette as the panel it lives inside. */
+        .detection-runs-list {
+            margin-top: var(--space-2);
+            max-height: 220px;
+            overflow-y: auto;
+        }
+        .detection-run-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: var(--space-2);
+            align-items: baseline;
+            font-size: var(--text-xs);
+            color: var(--text-secondary);
+            padding: var(--space-1) 0;
+            border-bottom: 1px solid var(--ds-border-light);
+        }
+        .detection-run-row:last-child {
+            border-bottom: none;
+        }
+        .detection-run-row .badge-dry-run {
+            background: var(--ds-accent-info-bg);
+            color: var(--ds-accent-info-ink);
+            border-radius: var(--radius-sm);
+            padding: 0 var(--space-1);
+            font-size: 10px;
+            font-weight: var(--font-semibold);
+            text-transform: uppercase;
+        }
+        .detection-run-row .detection-run-error {
+            color: var(--ds-accent-danger-ink);
+        }
+        .detection-dry-run-result {
+            margin-top: var(--space-3);
+            padding: var(--space-3);
+            border-radius: var(--radius-md);
+            background: var(--ds-surface-dim);
+            font-size: var(--text-xs);
+        }
         .delivery-warning__title {
             font-size: var(--text-xs);
             font-weight: 650;
@@ -1233,7 +1273,32 @@
                     <a href="/admin/server-config">/admin/server-config</a> under
                     <code>corporate_memory.sources.session_transcripts</code>.
                 </li>
+                <li>
+                    <strong>Detection policy</strong> (what counts as a correction,
+                    confirmation, or reusable-vs-engagement-scoped fact) is editable
+                    text, not a code change — it's the <code>memory-curator</code>
+                    agent's "Instructions" field in
+                    <a href="/agents">the Agents builder</a>. Facts scoped to a
+                    single client/engagement are routed to a restricted domain
+                    rather than dropped or mixed into the general queue.
+                </li>
             </ul>
+
+            <!-- issue #1971 Part 3/4: run-log observability + a dry-run
+                 control, both client-side fetched so a DuckDB-backed
+                 instance (memory_detection_runs is Postgres-only) degrades
+                 to a plain message instead of failing the whole page
+                 render. -->
+            <div style="margin-top: var(--space-3); display:flex; align-items:center; gap: var(--space-3); flex-wrap: wrap;">
+                <strong style="font-size: var(--text-xs);">Recent detection runs</strong>
+                <button type="button" class="btn btn-sm" id="detectionDryRunBtn" onclick="runDetectionDryRun()">
+                    Dry run
+                </button>
+            </div>
+            <div id="detectionRunsList" class="detection-runs-list">
+                <span style="font-size: var(--text-xs); color: var(--text-secondary);">Loading…</span>
+            </div>
+            <div id="detectionDryRunResult" class="detection-dry-run-result" style="display:none;"></div>
         </details>
 
         <!-- Tab Navigation — v55 grouped under Moderation / Catalog labels
@@ -4352,6 +4417,110 @@
             showToast('Network error: ' + e.message, 'error');
             btn.disabled = false;
             btn.textContent = 'Import from JSON';
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Detection-run observability + dry-run (issue #1971 Part 3/4).
+    // Client-side fetched (not server-rendered context): memory_detection_runs
+    // is Postgres-only, so a DuckDB-backed instance must degrade to a plain
+    // message here instead of failing the whole page render.
+    // ─────────────────────────────────────────────────────────────
+
+    let _detectionRunsLoaded = false;
+
+    (function initDetectionInfoPanel() {
+        const details = document.querySelector('.detection-info');
+        if (!details) return;
+        details.addEventListener('toggle', function () {
+            if (details.open && !_detectionRunsLoaded) {
+                _detectionRunsLoaded = true;
+                loadDetectionRuns();
+            }
+        });
+    })();
+
+    function _formatDetectionRun(run) {
+        const src = run.source === 'session_transcripts' ? 'Session transcripts' : 'CLAUDE.local.md';
+        const when = run.started_at ? new Date(run.started_at).toLocaleString() : '?';
+        const dryBadge = run.dry_run ? '<span class="badge-dry-run">dry run</span>' : '';
+        const errPart = run.error
+            ? ' <span class="detection-run-error">error: ' + escapeHtml(run.error) + '</span>'
+            : '';
+        return '<div class="detection-run-row">'
+            + '<span>' + escapeHtml(src) + '</span>'
+            + '<span>' + escapeHtml(when) + '</span>'
+            + '<span>' + run.items_proposed + ' proposed</span>'
+            + '<span>' + run.items_filtered + ' filtered</span>'
+            + '<span>' + run.items_inserted + ' inserted</span>'
+            + '<span>' + run.items_routed_side_domain + ' routed</span>'
+            + dryBadge + errPart
+            + '</div>';
+    }
+
+    async function loadDetectionRuns() {
+        const el = document.getElementById('detectionRunsList');
+        if (!el) return;
+        el.innerHTML = '<span style="font-size: var(--text-xs); color: var(--text-secondary);">Loading…</span>';
+        try {
+            const r = await fetch('/api/memory/admin/detection-runs?per_page=20', { credentials: 'same-origin' });
+            if (r.status === 501) {
+                el.innerHTML = '<em style="font-size: var(--text-xs);">Detection run history requires the Postgres app-state backend.</em>';
+                return;
+            }
+            if (!r.ok) {
+                el.innerHTML = '<em style="font-size: var(--text-xs);">Could not load run history.</em>';
+                return;
+            }
+            const body = await r.json();
+            if (!body.runs || !body.runs.length) {
+                el.innerHTML = '<em style="font-size: var(--text-xs);">No runs recorded yet.</em>';
+                return;
+            }
+            el.innerHTML = body.runs.map(_formatDetectionRun).join('');
+        } catch (e) {
+            el.innerHTML = '<em style="font-size: var(--text-xs);">Could not load run history.</em>';
+        }
+    }
+
+    async function runDetectionDryRun() {
+        const btn = document.getElementById('detectionDryRunBtn');
+        const resultEl = document.getElementById('detectionDryRunResult');
+        if (!btn || !resultEl) return;
+        btn.disabled = true;
+        btn.textContent = 'Running…';
+        resultEl.style.display = 'none';
+        try {
+            const r = await fetch('/api/memory/admin/detection-dry-run', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const data = await r.json().catch(() => ({}));
+            if (r.status === 501) {
+                showToast('Dry run needs the Postgres app-state backend to record its result', 'error');
+                return;
+            }
+            if (!r.ok) {
+                showToast((data && data.detail) || 'Dry run failed', 'error');
+                return;
+            }
+            resultEl.style.display = 'block';
+            resultEl.innerHTML = '<strong>Dry run — nothing written.</strong> '
+                + 'Scanned ' + (data.sessions_scanned || 0) + ' session(s): '
+                + (data.items_proposed || 0) + ' proposed, '
+                + (data.items_filtered || 0) + ' filtered, '
+                + (data.items_inserted || 0) + ' would be inserted, '
+                + (data.items_routed_side_domain || 0) + ' would route to the engagement-scoped domain.';
+            showToast('Dry run complete', 'success');
+            _detectionRunsLoaded = false;
+            loadDetectionRuns();
+        } catch (e) {
+            showToast('Network error: dry run failed', 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Dry run';
         }
     }
     </script>

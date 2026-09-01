@@ -211,6 +211,16 @@ def test_rendered_ontology_keeps_attributes_and_folded_conventions():
     assert "conventions.id: <type>:<kebab-slug>" in rendered
 
 
+def test_rendered_ontology_includes_the_relationship_description():
+    """A relationship's own ``ai_context`` (what the ontology builder's
+    section-3 description field maps to) must reach the real extraction
+    prompt exactly like it reaches the dry-run one -- this is the note the
+    builder's edge author writes to distinguish two similarly-shaped edge
+    types by what they MEAN, not just their endpoints."""
+    rendered = render_ontology([ONTOLOGY_MODEL])
+    assert "who the work is for" in rendered
+
+
 def test_render_ontology_ignores_a_dataset_that_is_not_a_node_type():
     """A semantic model may hold ordinary datasets beside its node types;
     only the ontology-marked ones are entity types."""
