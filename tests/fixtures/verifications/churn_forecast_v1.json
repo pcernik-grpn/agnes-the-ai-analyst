@@ -6,8 +6,13 @@
       "content": "Forecasted churn is computed monthly by summing projected cancellations across active subscriptions and dividing by total active subscriptions at the start of the period.",
       "user_quote": "No, forecasted churn is monthly: sum up the projected cancellations across active subscriptions and divide by total active subscriptions at the start of the period.",
       "domain": "finance",
-      "entities": ["churn", "forecast", "MRR"],
-      "base_confidence": 0.90
+      "entities": [
+        "churn",
+        "forecast",
+        "MRR"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

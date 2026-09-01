@@ -4,10 +4,14 @@
       "detection_type": "correction",
       "title": "Forecasted churn tracking frequency",
       "content": "Forecasted churn is computed weekly by summing projected cancellations across active subscriptions and dividing by total active subscriptions at the start of the week.",
-      "user_quote": "No — forecasted churn is computed weekly by summing projected cancellations across active subscriptions and dividing by total active subscriptions at the start of the week.",
+      "user_quote": "No \u2014 forecasted churn is computed weekly by summing projected cancellations across active subscriptions and dividing by total active subscriptions at the start of the week.",
       "domain": "finance",
-      "entities": ["churn", "forecast"],
-      "base_confidence": 0.90
+      "entities": [
+        "churn",
+        "forecast"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

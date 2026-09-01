@@ -3960,21 +3960,24 @@ class TestLiveActivity:
         deterministically by
         ``TestActivityBookkeeping::test_recent_is_capped_and_newest_first``
         below, which drives ``enter``/``exit_item_activity`` directly in a
-        fixed order. This test is the integration half: a REAL crawl, at
-        this instance's default concurrency (6), exercises it end to end.
+        fixed order. This test is the integration half: a REAL crawl
+        exercises it end to end.
 
-        Six real workers finish 8 trivial items in whatever order they
-        actually complete — not dispatch order — so asserting an exact
-        finishing position here would pin a race, not a behavior (confirmed
-        empirically: the SAME non-determinism reproduces identically on the
-        pre-process-isolation code, so it is not something conversion
-        running in a child process introduced). What the checkpoint
-        actually promises, and what this asserts, is the cap itself and
-        that the LAST item enumerated is never silently dropped from it —
-        the one thing a real crawl adds over the deterministic unit test.
+        Sequential on purpose (``_at_concurrency(1)``, same as the
+        deterministic checkpoint-count test above): the recent list records
+        COMPLETION order, so under real concurrency the last item
+        *enumerated* (f7) can legitimately finish before five slower
+        earlier items and be evicted from the 5-cap — the "never silently
+        dropped" assertion then pins a race, not a promise the code makes
+        (it fired exactly that way under a shifted CI shard layout,
+        2/2 attempts: f7 absent from {f0, f2, f4, f5, f6}). At concurrency
+        1 completion order IS enumeration order, so both the cap and the
+        last-item assertion hold by construction while the crawl→checkpoint
+        integration path stays fully exercised.
         """
         runs = _install_runs_repo(monkeypatch)
         _install_graph(monkeypatch, _one_page(_many_items(8)))
+        _at_concurrency(monkeypatch, 1)
 
         _run(_connection([_drive_scope()]), monkeypatch)
 
