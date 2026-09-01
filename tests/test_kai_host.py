@@ -624,6 +624,12 @@ def test_the_tool_ticket_is_confined_to_the_kai_route(seeded_app, kai_env, monke
     from src.repositories import ticket_repo
 
     monkeypatch.setenv("KAI_BROKER_MCP_ENABLED", "1")
+    # Step 3 proves the handler reaches the upstream CONNECTION by expecting the
+    # dial itself to fail — but the default upstream (localhost:8000) is a port
+    # a dev's unrelated local stack may well be serving, which turns the
+    # expected TransportError into a real answer. Pin an address nothing can
+    # accept on (port 9, discard) so "no MCP server" is true by construction.
+    monkeypatch.setenv("AGNES_MCP_INTERNAL_URL", "http://127.0.0.1:9")
     credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
     tickets = seeded_app["client"].post("/api/kai/tickets", headers={"Authorization": f"Bearer {credential}"}).json()
     tool_ticket = tickets["mcp"]
