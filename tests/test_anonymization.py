@@ -22,6 +22,7 @@ from src.anonymization import (
     anonymize_markdown,
     compile_custom_terms,
     normalize,
+    pseudonym,
 )
 
 KEY = b"0123456789abcdef0123456789abcdef"
@@ -104,12 +105,40 @@ def test_unrelated_names_do_not_share_a_pseudonym():
 
 
 def test_two_full_names_sharing_a_surname_stay_two_people():
+    # Unlike the fixture this replaces, `fixed_detector` here explicitly
+    # reports the bare surname alongside both full names — the old version
+    # never gave `_alias_canonicals`'s union-find an ambiguous bare surname
+    # to unify on, so it passed identically whether the invariant held or
+    # not. Assert the exact pseudonym each full name gets (its own
+    # normalized form, unmerged) rather than just a token count, so a wrong
+    # merge that happens to still total two tokens cannot slip through.
     result = anonymize_markdown(
-        "Jan Novák a Petr Novák podepsali.",
+        "John Smith and Mary Smith attended. Smith signed the deed.",
         key=KEY,
-        detector=fixed_detector([("Jan Novák", "person"), ("Petr Novák", "person")]),
+        detector=fixed_detector([("John Smith", "person"), ("Mary Smith", "person"), ("Smith", "person")]),
     )
-    assert len(set(PERSON_TOKEN.findall(result.text))) == 2, result.text
+    john_token = pseudonym(KEY, "person", "john smith")
+    mary_token = pseudonym(KEY, "person", "mary smith")
+    assert john_token != mary_token
+    assert john_token in result.text
+    assert mary_token in result.text
+
+
+def test_the_shared_surname_invariant_holds_with_the_real_detector():
+    # The fixed-detector test above pins the invariant precisely and fast;
+    # this one proves it end-to-end, because in production the ambiguous
+    # bare surname is manufactured by RegexDetector's own pass 3
+    # (`_inflected_variants`), not handed in by a caller.
+    text = "John Smith and Mary Smith attended. Smith signed the deed."
+    assert any(entity.text == "Smith" and entity.kind == "person" for entity in RegexDetector()(text)), (
+        "fixture must reach the ambiguous bare-surname path via the real detector"
+    )
+    result = anonymize_markdown(text, key=KEY)
+    john_token = pseudonym(KEY, "person", "john smith")
+    mary_token = pseudonym(KEY, "person", "mary smith")
+    assert john_token != mary_token
+    assert john_token in result.text
+    assert mary_token in result.text
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +269,41 @@ def test_markdown_structure_survives():
     assert "Novák" not in result.text
     assert "jan.novak@example.com" not in result.text
     assert "acme.example.com" not in result.text
+
+
+# ---------------------------------------------------------------------------
+# entity name runs split by a line wrap (PDF/DOCX→markdown conversion wraps
+# lines constantly, so this is the ordinary case, not an edge case)
+# ---------------------------------------------------------------------------
+
+
+def test_a_company_name_split_by_a_single_line_wrap_is_fully_redacted():
+    text = "Northwind\nLogistics Holding a.s. signed the contract."
+    result = anonymize_markdown(text, key=KEY)
+    assert "Northwind" not in result.text
+    assert "Logistics" not in result.text
+    assert len(set(COMPANY_TOKEN.findall(result.text))) == 1, result.text
+
+
+def test_a_person_name_split_by_a_single_line_wrap_is_fully_redacted():
+    text = "Ing. Jan\nNovák podepsal smlouvu."
+    result = anonymize_markdown(text, key=KEY)
+    assert "Novák" not in result.text
+    assert "Jan" not in result.text
+    assert len(set(PERSON_TOKEN.findall(result.text))) == 1, result.text
+
+
+def test_a_blank_line_paragraph_break_does_not_merge_the_two_sides():
+    # Two blank-line-separated full names must stay two people, not one run
+    # spliced together across the paragraph boundary. Both sides use a
+    # two-token name so each is independently detectable without relying on
+    # the line-wrap join under test — the property here is that the blank
+    # line does NOT act as a joinable gap, not that either side is found.
+    text = "Jan Novák\n\nPetr Dvořák signed the contract."
+    result = anonymize_markdown(text, key=KEY)
+    assert "Novák" not in result.text
+    assert "Dvořák" not in result.text
+    assert len(set(PERSON_TOKEN.findall(result.text))) == 2, result.text
 
 
 # ---------------------------------------------------------------------------

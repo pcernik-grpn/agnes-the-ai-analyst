@@ -234,37 +234,23 @@ class FactsIngestRunsPgRepository:
             )
         return [_decode_row(dict(r)) for r in rows]
 
-    def distinct_corpus_ids(self) -> List[str]:
-        """Every collection id that has ever appeared in a run report.
-
-        Interim heuristic for "this file source's scope collections" (spec
-        §13.2's source card) until a real connection-to-collection scope
-        mapping exists (the connect wizard's step 2, a sibling effort) —
-        only a file-source producer ever calls ``POST /api/facts/ingest``,
-        so the set of collections it has ever ingested into is, today, the
-        best available proxy for its scope. Two sharepoint connections
-        would not be distinguishable by this alone; that limitation is
-        acceptable for a single-connection instance and named here so it is
-        not rediscovered as a surprise.
-        """
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.text("SELECT DISTINCT jsonb_array_elements_text(corpus_ids) AS cid FROM facts_ingest_runs")
-            ).fetchall()
-        return sorted({r[0] for r in rows if r[0]})
-
     def llm_usage_rollup(self) -> Dict[str, Any]:
         """Cumulative producer-reported LLM usage across EVERY persisted
         ingest run — honest, ongoing cost VISIBILITY, not a metric to win
         (the token-efficiency criterion this feeds is a separate,
         known-losing comparison against baselines).
 
-        Instance-wide, not per-connection: there is no persisted
-        connection -> collection mapping yet (the SAME limitation
-        :meth:`distinct_corpus_ids` documents), so a per-connection split
-        would silently misattribute usage the moment a second SharePoint
-        connection exists on one instance. Acceptable for today's common
-        single-connection instance; revisit alongside that mapping.
+        Instance-wide, not per-connection: an ingest run report has no
+        column tying it back to the connection that produced it (only the
+        ``corpus_ids`` it touched), so a per-connection split here would
+        silently misattribute usage the moment a second SharePoint
+        connection exists on one instance. Unlike ``_sharepoint_pipeline_
+        cell``'s crawl/extract/facts counts (``app/web/router.py``), which
+        DO resolve a connection's own scope collections from its
+        ``config.scopes[].collection_id``, this rollup has nothing
+        equivalent to key off — acceptable for today's common
+        single-connection instance; revisit if a run report ever carries
+        its own connection id.
 
         A run whose ``llm_usage`` is ``NULL`` (never reported, or predates
         this feature) contributes nothing and is not counted in

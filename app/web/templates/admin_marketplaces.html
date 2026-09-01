@@ -308,6 +308,48 @@
    per-row `.icon-btn` actions stay page-local. #}
 <div class="marketplaces-page">
 
+  {# ── Synced, listed here, and in nobody's Library ────────────────────────
+     The page's own table proves a marketplace produced plugins; the served
+     feed (`/marketplace.zip`, `/marketplace.git/*`) is grant-filtered per
+     caller, so until a group is granted them those plugins reach no user.
+     That gap is invisible from every column above, and the reported symptom
+     was an admin registering a marketplace, seeing its plugins right here,
+     opening /library and concluding the product was broken.
+
+     The shared context strip in its warn state (`.apg-strip`,
+     css/admin_page.css), built exactly like the Packages lens's "N tables in
+     no package" band: leading mark, one sentence, plain trailing links. A
+     tinted strip renders every `a` inside it as inherited-ink + underline, so
+     a `.btn` in here would come out a colourless underlined rectangle — the
+     links are the house form for this object, not a downgrade.
+
+     Server-rendered and CONDITIONAL: once every plugin is granted it is gone,
+     because a finished setup should not be nagged. Data:
+     `_marketplace_plugin_delivery()` in app/web/router.py. #}
+  {% if plugin_delivery and plugin_delivery.ungranted %}
+  {% set _n = plugin_delivery.ungranted %}
+  <div class="apg-strip apg-strip--warn" id="mp-ungranted-note">
+    <span class="apg-strip__mark" aria-hidden="true">!</span>
+    <span>
+      <strong>{{ _n }} plugin{{ '' if _n == 1 else 's' }} granted to no group</strong>
+      — synced and listed below, but the served marketplace is filtered by group,
+      so {{ 'it reaches' if _n == 1 else 'they reach' }} nobody. Grant
+      {{ 'it' if _n == 1 else 'them' }} to a group and
+      {{ 'it appears' if _n == 1 else 'they appear' }} in those people's Library.
+    </span>
+    <span class="apg-strip__end">
+      {# `?kind=` is the Access page's own resource-type filter (`listKind`),
+         so the reader lands on the grant editor already narrowed to plugins
+         rather than on every resource this instance governs. #}
+      <a href="/admin/access?kind=marketplace_plugin">Grant {{ 'it' if _n == 1 else 'them' }} to a group &rarr;</a>
+      {# The preview lens, not "open the Library as yourself" — a different
+         question. It is the honest check that the grant landed. #}
+      <a href="{{ simulate_lens_href }}"
+         title="Preview a person's Library exactly as their groups leave it">Preview someone's Library &rarr;</a>
+    </span>
+  </div>
+  {% endif %}
+
   <div class="marketplaces-toolbar">
     <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" aria-label="Filter by slug, name, or URL" autocomplete="off">
     <a class="icon-btn" href="/marketplace/format-guide" target="_blank" rel="noopener"

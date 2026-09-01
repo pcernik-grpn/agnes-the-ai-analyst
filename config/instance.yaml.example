@@ -1073,6 +1073,10 @@ chat:
   #        keep working).
   # none — internal-only network: the sandbox reaches nothing but the
   #        containers on that network (breaks in-sandbox package installs).
+  #        A skill's `requirements.txt` can therefore never install at
+  #        runtime under this mode, at any point in the session — its
+  #        packages must be baked into the sandbox image (see the
+  #        Dockerfile's hand-maintained pip list) or shipped some other way.
   # allowlist — the internal network of `none` PLUS the egress-proxy sidecar
   #        (compose profile `chat-docker-egress`): sandboxes get HTTP(S)_PROXY
   #        pointed at it and may reach only docker_egress_allow_hosts, each
@@ -1219,6 +1223,16 @@ data_apps:
                                 # runtime image with it and extending that
                                 # list from what actually failed; otherwise
                                 # every hosted app crash-loops.
+  # Deploy-time exposure scan (#1946): a pure, best-effort static scan
+  # (src/data_apps/deploy_check.py) over the target commit before it is
+  # promoted to `agnes-live` — an exposed static-file root, the whole
+  # process environment echoed into a response, the injected AGNES_TOKEN
+  # echoed back, etc. `warn` (default) surfaces findings alongside a deploy
+  # that still runs; `block` refuses the deploy outright on any finding;
+  # `off` skips the scan. A repo_mode=external app's source never reaches
+  # Agnes, so it can't be scanned — `block` refuses those deploys too
+  # rather than silently exempting them from the operator's own policy.
+  deploy_checks: warn          # warn | block | off
 
 
 # --- Fact graph over Collections (optional) ---
@@ -1375,6 +1389,38 @@ extraction:
     # multiply: two concurrent crawls at 6 = twelve files in flight against
     # the same tenant.
     concurrency: 6
+    # A conversion worker process is recycled (replaced) after converting
+    # this many documents, whichever concurrency slot it is. Insurance
+    # against a real, observed failure: markitdown/pypdfium2 hold onto
+    # memory per document, so a worker that never dies keeps growing over a
+    # large crawl until the container's own memory limit starts killing
+    # whichever child allocates next -- indiscriminately, including files
+    # nowhere near the limit on their own. Tune this DOWN if the worker
+    # container's memory limit is tight, UP if it is generous and cold
+    # starts (a fresh process per recycle pays markitdown/pypdfium2's import
+    # cost again) start to show up in run duration. 0 disables the
+    # document-count trigger; convert_recycle_rss_mb below still applies.
+    convert_recycle_after_docs: 40
+    # A worker is ALSO recycled the moment its own peak RSS crosses this
+    # many MiB, whichever trigger fires first -- some documents are simply
+    # heavier than others, so a fixed document count alone under-reacts to
+    # a run that draws a cluster of large files early. 0 disables the RSS
+    # trigger; convert_recycle_after_docs above still applies.
+    convert_recycle_rss_mb: 512
+    # Each conversion worker's OWN memory ceiling (RLIMIT_AS), in MiB,
+    # installed once right after it starts. A SEPARATE guard from the two
+    # above: recycling holds the STEADY STATE down, but a single
+    # pathological document (a spreadsheet loaded whole into memory, a
+    # crafted PDF) can still spike ONE worker past the container's own
+    # limit in isolation, and the kernel then SIGKILLs whichever child
+    # happens to be allocating at that moment -- not necessarily the file
+    # that caused it. Capping the worker itself turns that into a plain,
+    # ATTRIBUTABLE conversion failure for the file that hit the ceiling,
+    # instead of collateral damage to an innocent sibling. Raising the
+    # container's own memory limit is NOT a fix for this -- it only moves
+    # the ceiling a single heavy document can still reach. 0 disables the
+    # cap; not enforceable on every platform (notably macOS).
+    convert_child_memory_limit_mb: 1536
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.

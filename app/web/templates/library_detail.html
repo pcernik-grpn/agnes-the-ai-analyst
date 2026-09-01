@@ -67,6 +67,42 @@
      one empty state for every resource type — so this page's own rule for it
      is gone. #}
 
+  /* Edit-details form — the owner's rename/describe surface, hidden until
+     the Manage cluster (or its legacy main-column twin) opens it. Deliberately
+     an in-page section rather than a drawer or modal: the reader is already
+     standing on the thing being renamed, and the two fields it needs are the
+     two the page already displays. */
+  .cedit { display: flex; flex-direction: column; gap: var(--space-3); }
+  .cedit__field { display: flex; flex-direction: column; gap: 6px; }
+  .cedit__field label { font-size: 0.8rem; font-weight: var(--font-medium); color: var(--ds-text-secondary); }
+  .cedit__field input, .cedit__field textarea {
+    font: inherit; color: var(--ds-text-primary); background: var(--ds-surface);
+    border: 1px solid var(--ds-border); border-radius: var(--radius-md);
+    padding: var(--space-2) var(--space-3);
+  }
+  .cedit__field input:focus-visible, .cedit__field textarea:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--kind) 55%, transparent); outline-offset: 1px;
+    border-color: var(--kind);
+  }
+  .cedit__field textarea { min-height: 5.5em; resize: vertical; }
+  .cedit__hint { font-size: 0.76rem; color: var(--ds-text-muted); }
+  .cedit__actions { display: flex; align-items: center; gap: var(--space-2); }
+  .cedit__err { font-size: 0.82rem; color: var(--ds-accent-danger-ink); }
+  /* Quiet until hover/focus: a delete sitting at full contrast on every row
+     of a file list reads as the list's purpose. */
+  .file__del {
+    flex: none; display: grid; place-items: center; width: 30px; height: 30px;
+    border: 1px solid transparent; border-radius: var(--radius-md);
+    background: none; color: var(--ds-text-muted); cursor: pointer;
+    transition: color .14s ease, background .14s ease, border-color .14s ease;
+  }
+  .file__del:hover, .file__del:focus-visible {
+    color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg);
+    border-color: color-mix(in srgb, var(--ds-accent-danger-ink) 30%, transparent);
+  }
+  .file__del svg { width: 15px; height: 15px; }
+  .file__del[disabled] { opacity: .5; cursor: default; }
+
   /* Facts section (spec §13.2 "Collection detail") */
   .facts-type-counts { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0 0 var(--space-3); }
   .facts-type-chip {
@@ -150,6 +186,36 @@
    sharing entry point. It opens the same dialog the badge opens; it used to
    link to `/library?share=…`, a URL nothing handles, which is why sharing a
    collection from its own page never worked. #}
+{# The owner-or-admin actions on this collection, defined ONCE and rendered
+   in exactly one place per layout — the rail's Manage cluster under the
+   redesign, a main-column section on the legacy path (which has no rail) —
+   for the same reason sharing is: two entry points to one action is what made
+   this page's predecessor unreadable.
+
+   NOT the hero's overflow menu: `detail.hero` renders its `menu` argument
+   only under the redesign, so a legacy-themed instance would have shown no
+   control at all — which is exactly what the "Manage sharing" item below
+   still does there, a pre-existing dead entry this change deliberately does
+   not extend.
+
+   `can_manage` is owner-or-admin, the same predicate PATCH/DELETE
+   /api/collections/{id} enforce, so a control is offered only where the API
+   would accept it. Editing is additionally withheld on a source-managed
+   collection, where PATCH answers 409: its name comes from the source scope
+   and the next sync would revert a rename. Deleting one is still allowed —
+   that is how an admin retires a collection whose scope is gone. #}
+{% set _manage_actions = [] %}
+{% if can_manage %}
+  {% if not source_managed_by %}
+    {% set _ = _manage_actions.append({
+         'label': 'Edit details', 'icon': 'edit',
+         'attrs': 'data-edit-open aria-controls="lib-edit"'}) %}
+  {% endif %}
+  {% set _ = _manage_actions.append({
+       'label': 'Delete ' ~ _noun, 'icon': 'trash', 'danger': True,
+       'attrs': 'data-delete-collection'}) %}
+{% endif %}
+
 {% set _menu_items = [] %}
 {% if can_share and not detail.redesign %}
   {% set _ = _menu_items.append({
@@ -172,6 +238,31 @@
 {# No in-page ask/search box: a detail page presents its entity (like the data
    package / plugin / table pages), and asking happens in chat via the hero's
    Ask Agnes action. #}
+{% if can_manage and not source_managed_by %}
+{{ detail.section_open('Edit details', icon='edit', id='lib-edit', hidden=True) }}
+  <form class="cedit" id="lib-edit-form" autocomplete="off">
+    <div class="cedit__field">
+      <label for="lib-edit-name">Name</label>
+      <input type="text" id="lib-edit-name" maxlength="255" value="{{ collection.name }}" required>
+    </div>
+    <div class="cedit__field">
+      <label for="lib-edit-desc">Description</label>
+      <textarea id="lib-edit-desc" maxlength="2000" placeholder="What is in here, and what it is good for.">{{ collection.description or '' }}</textarea>
+      <p class="cedit__hint">Shown on this page and in the Library list. Clear it to remove it.</p>
+    </div>
+    <p class="cedit__hint">
+      The web address stays <code>/library/{{ collection.slug }}</code> — renaming does not
+      move it, so links you have already shared keep working.
+    </p>
+    <p class="cedit__err" id="lib-edit-err" hidden></p>
+    <div class="cedit__actions">
+      {{ ds.button("Save changes", variant="primary", size="sm", attrs='type="submit" id="lib-edit-save"') }}
+      {{ ds.button("Cancel", variant="ghost", size="sm", attrs='type="button" data-edit-cancel') }}
+    </div>
+  </form>
+{{ detail.section_close() }}
+{% endif %}
+
 {{ detail.section_open('Files', icon='file') }}
   {% if not files %}
     {{ detail.empty('No files yet — drop some below.', icon='file') }}
@@ -221,6 +312,17 @@
         <span class="status-pill {{ pill }}">{{ f.processing_status }}</span>
         {% if is_admin and f.processing_status in ("rejected", "needs_review", "indexed") %}
           {{ ds.button("Re-ingest", variant="ghost", size="sm", attrs='type="button" data-reingest="' ~ f.id ~ '"') }}
+        {% endif %}
+        {% if can_manage and not source_managed_by %}
+          {# Removing a file is the other half of the drop zone below, and it
+             lived only in the CLI (`agnes collections rm-file`) — so a reader
+             who uploaded the wrong PDF from this page could not undo it from
+             this page. Icon-only and quiet: see `.file__del`. #}
+          <button type="button" class="file__del" data-delete-file="{{ f.id }}"
+                  data-filename="{{ f.filename }}"
+                  title="Delete {{ f.filename }}" aria-label="Delete {{ f.filename }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>
+          </button>
         {% endif %}
       </div>
     {% endfor %}
@@ -342,6 +444,21 @@
 {{ detail.section_close() }}
 {% endif %}
 
+{# ── Managing it, legacy chrome ────────────────────────────────────────
+   The redesign puts these in the rail's Manage cluster (below); a legacy
+   instance has no rail, so they render as the last main-column section —
+   same list, same order, same handlers. #}
+{% if _manage_actions and not detail.redesign %}
+{{ detail.section_open('Manage this ' ~ _noun, icon='edit') }}
+  <div class="cedit__actions">
+    {% for a in _manage_actions %}
+      <button type="button" class="btn btn-secondary btn-sm{% if a.danger %} detail-manage__danger{% endif %}"
+              {{ a.attrs | safe }}>{{ a.label }}</button>
+    {% endfor %}
+  </div>
+{{ detail.section_close() }}
+{% endif %}
+
 {{ detail.aside_open() }}
 {# The rail's content is redesign-only: on the legacy path there is no
    rail, and appending these as extra sections would change a page default
@@ -407,6 +524,14 @@
   </p>
 {{ detail.side_close() }}
 
+{# ── Managing it ───────────────────────────────────────────────────────
+   LAST in the rail, for the reason the package page states: everything
+   above answers "what is this and can I use it"; this answers "and I am
+   allowed to change it", which is true of very few readers. #}
+{% if _manage_actions %}
+{{ detail.manage(_manage_actions, title='Manage this ' ~ _noun) }}
+{% endif %}
+
 {% endif %}
 {{ detail.cols_close() }}
 
@@ -445,7 +570,118 @@
       for (var i = 0; i < input.files.length; i++) fd.append("files", input.files[i]);
       var r = await fetch("/api/collections/" + cid + "/files", { method: "POST", credentials: "same-origin", body: fd });
       if (r.ok || r.status === 422) { window.location.reload(); }
-      else { alert("Upload failed: " + r.status); }
+      else { await window.alertModal(await explain(r, "Upload failed")); }
+    });
+
+    /* ── Edit details ──────────────────────────────────────────────────
+       PATCH /api/collections/{id} with ONLY what the reader changed: the
+       endpoint reads presence, not value, so sending an unchanged field is
+       not merely wasteful — sending `description: ""` when they never
+       touched it would CLEAR a description they meant to keep. */
+    var editSection = document.getElementById("lib-edit");
+    var editForm = document.getElementById("lib-edit-form");
+    var nameInput = document.getElementById("lib-edit-name");
+    var descInput = document.getElementById("lib-edit-desc");
+    var editErr = document.getElementById("lib-edit-err");
+    var originalName = nameInput ? nameInput.value : "";
+    var originalDesc = descInput ? descInput.value : "";
+
+    function openEdit() {
+      if (!editSection) return;
+      editSection.hidden = false;
+      editSection.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (nameInput) nameInput.focus();
+    }
+    function closeEdit() {
+      if (!editSection) return;
+      editSection.hidden = true;
+      if (nameInput) nameInput.value = originalName;
+      if (descInput) descInput.value = originalDesc;
+      if (editErr) { editErr.hidden = true; editErr.textContent = ""; }
+    }
+    document.querySelectorAll("[data-edit-open]").forEach(function (btn) {
+      btn.addEventListener("click", openEdit);
+    });
+    document.querySelectorAll("[data-edit-cancel]").forEach(function (btn) {
+      btn.addEventListener("click", closeEdit);
+    });
+
+    /* One place turns a failed response into a sentence, so every control on
+       this page fails the same way. The API's typed details are worth
+       showing verbatim — "this collection is fed by the X connection" is the
+       whole answer — while a bare status is not, so that gets a fallback. */
+    async function explain(resp, fallback) {
+      var detail = null;
+      try { detail = (await resp.json()).detail; } catch (e) { /* empty/HTML body */ }
+      if (detail && typeof detail === "object" && detail.message) return detail.message;
+      if (typeof detail === "string" && detail) return detail;
+      return fallback + " (HTTP " + resp.status + ")";
+    }
+
+    if (editForm) editForm.addEventListener("submit", async function (ev) {
+      ev.preventDefault();
+      var body = {};
+      var newName = nameInput.value.trim();
+      if (newName !== originalName.trim()) body.name = newName;
+      if (descInput.value !== originalDesc) body.description = descInput.value;
+      if (!Object.keys(body).length) { closeEdit(); return; }
+      var save = document.getElementById("lib-edit-save");
+      if (save) save.disabled = true;
+      editErr.hidden = true;
+      var resp = await fetch("/api/collections/" + cid, {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) { window.location.reload(); return; }
+      editErr.textContent = await explain(resp, "Could not save the changes");
+      editErr.hidden = false;
+      if (save) save.disabled = false;
+    });
+
+    /* ── Delete the collection ─────────────────────────────────────────
+       A soft delete server-side, but there is no user-reachable restore, so
+       the prompt says what the reader will experience rather than what the
+       column is called. */
+    document.querySelectorAll("[data-delete-collection]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var name = {{ _title | tojson }};
+        var n = {{ _n }};
+        var what = n === 1 ? "1 file" : n + " files";
+        var ok = await window.confirmModal({
+          title: "Delete “" + name + "”?",
+          message: "It holds " + what + ". They stop being searchable by your agents "
+                   + "immediately, and this cannot be undone.",
+          confirmText: "Delete",
+        });
+        if (!ok) return;
+        btn.disabled = true;
+        var resp = await fetch("/api/collections/" + cid, { method: "DELETE", credentials: "same-origin" });
+        if (resp.ok) { window.location.assign("/library"); return; }
+        await window.alertModal(await explain(resp, "Could not delete this collection"));
+        btn.disabled = false;
+      });
+    });
+
+    /* ── Delete one file ─────────────────────────────────────────────── */
+    document.querySelectorAll("[data-delete-file]").forEach(function (btn) {
+      btn.addEventListener("click", async function () {
+        var fid = btn.getAttribute("data-delete-file");
+        var fname = btn.getAttribute("data-filename") || "this file";
+        var ok = await window.confirmModal({
+          title: "Delete “" + fname + "”?",
+          message: "It stops being searchable immediately, and this cannot be undone.",
+          confirmText: "Delete",
+        });
+        if (!ok) return;
+        btn.disabled = true;
+        var resp = await fetch("/api/collections/" + cid + "/files/" + fid,
+                              { method: "DELETE", credentials: "same-origin" });
+        if (resp.ok) { window.location.reload(); return; }
+        await window.alertModal(await explain(resp, "Could not delete this file"));
+        btn.disabled = false;
+      });
     });
 
     document.querySelectorAll("[data-reingest]").forEach(function (btn) {
@@ -455,7 +691,10 @@
               { method: "POST", credentials: "same-origin" })
           .then(function (r) {
             if (r.ok) { window.location.reload(); }
-            else { alert("Re-ingest failed (HTTP " + r.status + ")"); btn.disabled = false; }
+            else {
+              window.alertModal("Re-ingest failed (HTTP " + r.status + ")");
+              btn.disabled = false;
+            }
           });
       });
     });

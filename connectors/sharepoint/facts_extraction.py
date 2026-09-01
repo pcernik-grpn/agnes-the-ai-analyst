@@ -1309,6 +1309,16 @@ def run_facts_extraction(
                     continue
 
                 report.docs_seen += 1
+                # `path`/`filename` here are exactly what `corpus_files`
+                # stores — for an anonymize-marked collection that is the
+                # ANONYMIZED value (``connectors.sharepoint.crawler
+                # ._anonymize_identity`` writes it there at ingest time, the
+                # same as the document body), never the real SharePoint name
+                # or folder. This module deliberately has no anonymize gate
+                # of its own: there is no raw text left to gate by the time
+                # it gets here, so `build_user_message` and
+                # `quote_is_verbatim` below can only ever see/cite the
+                # already-redacted identity, same as the chunk text.
                 path = file_row.get("path")
                 filename = file_row.get("filename")
                 if _is_tabular(path, filename):
