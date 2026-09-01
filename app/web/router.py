@@ -2414,6 +2414,37 @@ def _library_type_map(user: dict) -> list[dict]:
     return [{"type": t, "count": n} for t, n in counts.items()]
 
 
+def _has_connected_tools(user) -> bool:
+    """Whether this reader has already connected Agnes to a tool of theirs.
+
+    True when the connect page has been reached (``user_journey_state.
+    use_anywhere``) OR the caller holds a live personal access token — the
+    credential `agnes init` writes, so its existence is the connection.
+    Best-effort: a bookkeeping read must never fail the Library, and a false
+    here only means the invitation is shown one more time.
+    """
+    uid = user.get("id") if isinstance(user, dict) else None
+    if not uid:
+        return False
+    # Imports inside the guard with the calls they serve. Outside it, a wrong
+    # name or a PG-only repo on a DuckDB instance raises past the handler and
+    # takes the whole Library down — over a banner.
+    try:
+        from src.repositories import user_journey_repo
+
+        if (user_journey_repo().get(uid) or {}).get("use_anywhere"):
+            return True
+    except Exception as e:
+        logger.warning("/library: could not read journey state: %s", e)
+    try:
+        from src.repositories import access_token_repo
+
+        return bool(access_token_repo().list_for_user(uid, include_revoked=False))
+    except Exception as e:
+        logger.warning("/library: could not read access tokens: %s", e)
+        return False
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -4045,6 +4076,15 @@ async def library_page(
         # TCRD-250: node types with live, caller-scoped counts at the head
         # of the Knowledge tab. Empty list = render nothing, see helper.
         library_type_map=_library_type_map(user),
+        # Has this reader already taken Agnes to their tools? The foot banner
+        # asked everyone forever, including the people who had finished
+        # (#1956 item 2). Two signals, because either one alone misses a real
+        # case: `use_anywhere` is set by ARRIVING at the connect page, which
+        # is the product's own model of that step but never fires for someone
+        # who set the CLI up without visiting it; a live PAT is what `agnes
+        # init` actually authenticates with, so holding one IS being
+        # connected, however they got there.
+        library_connected=_has_connected_tools(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
