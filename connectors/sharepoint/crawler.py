@@ -67,6 +67,10 @@ Security posture:
   drive-relative path and every file under that prefix is skipped.
   Fail-closed — a scope whose exclusion roots cannot be resolved is not
   crawled at all.
+* ``GraphTransport.download_to_temp`` follows a file download's 302 to its
+  pre-authenticated URL BY HAND, on a separate request that carries no
+  ``Authorization`` header — the bearer token must never reach the
+  non-Graph host that redirect points at. See its own docstring.
 """
 
 from __future__ import annotations
@@ -717,6 +721,21 @@ def _require_graph_url(url: str) -> str:
     return url
 
 
+async def _stream_body_to_temp(resp: httpx.Response, tmp_path: Path, max_bytes: int, item_id: str) -> int:
+    """Stream ``resp``'s body into ``tmp_path``, enforcing ``max_bytes`` as it
+    goes. Shared by :meth:`GraphTransport.download_to_temp`'s direct-200 and
+    followed-redirect-200 paths, so the size cap applies identically to
+    either — a redirect must never become a way around it."""
+    written = 0
+    with open(tmp_path, "wb") as fh:
+        async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
+            written += len(chunk)
+            if max_bytes and written > max_bytes:
+                raise CrawlError(f"download exceeded the {max_bytes}-byte cap for item {item_id}")
+            fh.write(chunk)
+    return written
+
+
 class GraphAuth:
     """App-only token with proactive mid-crawl refresh.
 
@@ -945,6 +964,20 @@ class GraphTransport:
         ``max_bytes`` is a second, independent guard on top of the caller's
         ``size``-based skip: Graph's reported ``size`` is metadata, and a
         response that disagrees with it must not be able to fill the disk.
+
+        **The 302.** Graph answers ``GET .../content`` with a redirect to a
+        pre-authenticated URL on a DIFFERENT host (blob storage, never
+        ``graph.microsoft.com``) rather than the bytes themselves. httpx does
+        not follow redirects by default, and turning that on
+        (``follow_redirects=True``) would not be safe here even so: httpx
+        replays the ``Authorization`` header across a redirect, which would
+        hand the Graph bearer token to that other host. So a 3xx with a
+        ``Location`` is followed by hand, with a SEPARATE, unauthenticated
+        request — never through :func:`_require_graph_url`, deliberately,
+        since that guard exists to keep the bearer token off a non-Graph
+        host, and this second request carries no token to protect. The size
+        cap and the temp-file cleanup guarantee apply identically to
+        whichever response actually carried the bytes.
         """
         url = _require_graph_url(f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content")
         fd, tmp_name = tempfile.mkstemp(suffix=Path(name or "").suffix)
@@ -958,24 +991,32 @@ class GraphTransport:
             while True:
                 attempt += 1
                 self.stats.add(requests=1)
-                written = 0
                 try:
                     headers, used_token = await self._authorized()
                     async with graph_client._http_client() as client:
+                        redirect_location: Optional[str] = None
                         async with client.stream("GET", url, headers=headers, timeout=_REQUEST_TIMEOUT_S) as resp:
-                            action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
-                            if action == "ok":
-                                with open(tmp_path, "wb") as fh:
-                                    async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
-                                        written += len(chunk)
-                                        if max_bytes and written > max_bytes:
-                                            raise CrawlError(
-                                                f"download exceeded the {max_bytes}-byte cap for item {item_id}"
-                                            )
-                                        fh.write(chunk)
-                                self.stats.add(downloads=1, bytes_downloaded=written)
-                                return tmp_path
-                            await resp.aread()  # drain before deciding, so the connection is reusable
+                            if 300 <= resp.status_code < 400:
+                                redirect_location = resp.headers.get("Location")
+                            if redirect_location is None:
+                                action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
+                                if action == "ok":
+                                    written = await _stream_body_to_temp(resp, tmp_path, max_bytes, item_id)
+                                    self.stats.add(downloads=1, bytes_downloaded=written)
+                                    return tmp_path
+                                await resp.aread()  # drain before deciding, so the connection is reusable
+                            else:
+                                await resp.aread()  # drain the redirect body before following it
+
+                        if redirect_location is not None:
+                            # No Authorization header on this one — see the docstring.
+                            async with client.stream("GET", redirect_location, timeout=_REQUEST_TIMEOUT_S) as resp:
+                                action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
+                                if action == "ok":
+                                    written = await _stream_body_to_temp(resp, tmp_path, max_bytes, item_id)
+                                    self.stats.add(downloads=1, bytes_downloaded=written)
+                                    return tmp_path
+                                await resp.aread()
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
                     if attempt >= self.max_attempts:
                         raise CrawlError(f"download failed after {attempt} attempts: {type(exc).__name__}") from exc
