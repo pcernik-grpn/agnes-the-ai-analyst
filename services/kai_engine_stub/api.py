@@ -189,6 +189,32 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("\n\n**CZ leads** with 1204 sessions, ahead of DE at 998."),
         {"type": "finish"},
     ],
+    # The turn shape from #1974: a research question that opens with a RUN of
+    # consecutive calls, two of them failing, before the answer's first
+    # sentence. Nothing else here reproduces it — every other scenario puts
+    # prose between its tool calls — and it is the shape the tool-call group
+    # exists for. The failures name an internal endpoint on purpose: that URL
+    # must reach the reader as text, never as a link.
+    "wall": [
+        _tool_call("call_w1", "fact_search", {"q": "AI roadmap building products", "limit": 20}),
+        _tool_error("call_w1", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_w2", "fact_search", {"q": "rapid AI roadmap private equity", "limit": 20}),
+        _tool_error("call_w2", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_w3", "knowledge_search", {"query": "AI roadmap building products", "k": 10}),
+        _tool_output("call_w3", _mcp_envelope({"hits": 3})),
+        _tool_call("call_w4", "knowledge_search", {"query": "AI Value Backlog manufacturing", "k": 10}),
+        _tool_output("call_w4", _mcp_envelope({"hits": 5})),
+        _tool_call("call_w5", "Bash", {"command": 'agnes query "SELECT COUNT(*) FROM engagements"'}),
+        _tool_error(
+            "call_w5",
+            "Error executing tool query: 400 Bad Request for http://localhost:8000/api/query",
+        ),
+        _tool_call("call_w6", "Bash", {"command": "agnes catalog --json"}),
+        _tool_output("call_w6", {"columns": ["id", "rows"], "rows": [["engagements", 812]]}),
+        _text("The closest precedent is the 2025 building-products roadmap.\n\n"),
+        _text("```sources\ntable: engagements\nmetric: delivery/utilization\n```"),
+        {"type": "finish"},
+    ],
     "table": [
         _text("Pulling the numbers.\n\n"),
         _tool_call("call_t", "Bash", {"command": 'agnes query "SELECT * FROM orders LIMIT 400"'}),
@@ -274,7 +300,8 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_call("call_d", "server_info", {}),
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
         _text(
-            "\n\nTry `interleaved`, `table`, `fail`, `approval`, `error`, `markdown`, `nextactions` or `deliverable`."
+            "\n\nTry `interleaved`, `wall`, `table`, `fail`, `approval`, `error`, `markdown`, "
+            "`nextactions` or `deliverable`."
         ),
         {"type": "finish"},
     ],

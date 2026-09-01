@@ -273,6 +273,15 @@
     </span>
     {% endif %}
     <span class="ch-count" id="ch-count">{{ chat_rows | length }} chat{{ '' if chat_rows | length == 1 else 's' }}</span>
+    {# The count says "7 of 27" the moment anything is filtered out, and until
+       now the twenty had no control behind them anywhere near the number: the
+       only way into the Archived view was inside the Filter menu, so the
+       missing conversations read as unreachable rather than put away (#1974).
+       This is that control, next to the number that raises the question.
+       Written by chats_page.js and shown only while the default view is the
+       thing hiding rows: during a search there is nothing for it to offer,
+       because a search already looks in every view. #}
+    <button type="button" class="ch-hidden-note" id="ch-show-archived" hidden></button>
     {# The applied facets, as removable chips, on the same line as the count —
        they are one sentence ("4 of 31, because Agent is Revenue Analyst"), and
        splitting them put the number here and the chips in the toolbar above.

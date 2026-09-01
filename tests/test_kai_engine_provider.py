@@ -1065,3 +1065,94 @@ def test_the_agent_api_runs_on_the_engine_provider():
     kai_src = Path("app/api/kai.py").read_text()
     assert "_agent_workspace_members" in kai_src
     assert "mint_agent_session_jwt" in kai_src
+
+
+def test_ask_user_question_is_not_gated_behind_an_approval_card():
+    """The engine asks for approval on ``AskUserQuestion``, whose entire effect
+    is to render a question card back to the same person being asked. Gating it
+    put a shield card — with the question's raw JSON behind it — in front of
+    every clarifying-question turn: the user approved being asked, and only then
+    got to read the question (#1974). Answered here instead, with no card."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [
+            {
+                "pre": [
+                    {
+                        "type": "tool-input-available",
+                        "toolCallId": "call-q",
+                        "toolName": "AskUserQuestion",
+                        "input": {"questions": [{"question": "Which region?"}]},
+                    },
+                    {"type": "tool-approval-request", "toolCallId": "call-q"},
+                    {"type": "tool-output-available", "toolCallId": "call-q", "output": "answered"},
+                    {"type": "finish"},
+                ],
+            }
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "hi"})
+        frames = await _drain_until_done(handle)
+        for _ in range(50):
+            if engine.approvals:
+                break
+            await asyncio.sleep(0.02)
+        await handle.kill()
+
+        assert "approval_request" not in _types(frames), "no card for a tool that only asks the user something"
+        # No card was raised, so none may be retired either — an
+        # approval_resolved for a request the client never saw is a frame about
+        # nothing.
+        assert "approval_resolved" not in _types(frames)
+        assert engine.approvals == [{"toolUseId": "call-q", "approved": True}], (
+            "the engine still gets a decision — it is parked waiting for one"
+        )
+        # The tool call itself is unaffected: it renders like any other.
+        assert "tool_call" in _types(frames) and "tool_result" in _types(frames)
+
+    asyncio.run(_run())
+
+
+def test_a_mutating_tool_still_raises_its_card_when_approvals_are_off():
+    """The auto-approval is a NAMED SET, not a "read-only tools" inference, and
+    it runs ahead of the ``approvals_enabled`` kill-switch on purpose: that
+    switch exists so tool calls do not sit waiting on a human who is not there,
+    and a question card waits on nobody. Everything else keeps the instant-deny."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [
+            {
+                "pre": [
+                    {
+                        "type": "tool-input-available",
+                        "toolCallId": "call-m",
+                        "toolName": "create_config",
+                        "input": {"name": "x"},
+                    },
+                    {"type": "tool-approval-request", "toolCallId": "call-m"},
+                    {"type": "tool-output-error", "toolCallId": "call-m", "errorText": "denied"},
+                    {"type": "finish"},
+                ],
+            }
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await provider.spawn(
+            workdir=Path("/tmp"),
+            env={"AGNES_SESSION_ID": str(uuid.uuid4()), "AGNES_USER_EMAIL": "u@x", "AGNES_APPROVALS": "off"},
+            argv=[],
+        )
+        await _send(handle, {"type": "user_msg", "text": "hi"})
+        frames = await _drain_until_done(handle)
+        for _ in range(50):
+            if engine.approvals:
+                break
+            await asyncio.sleep(0.02)
+        await handle.kill()
+
+        assert "approval_request" in _types(frames), "a mutating tool is still asked about"
+        assert engine.approvals == [{"toolUseId": "call-m", "approved": False}]
+
+    asyncio.run(_run())

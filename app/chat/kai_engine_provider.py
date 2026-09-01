@@ -117,6 +117,22 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 15 * 60
 #: server-side, this value only labels the card.
 _APPROVAL_TIMEOUT_FALLBACK_SECONDS = 300
 
+#: Tools whose approval request is answered here instead of shown to the user.
+#:
+#: The engine asks for approval on ``AskUserQuestion``, whose entire effect is
+#: to render a multiple-choice card back to the same person being asked. Gating
+#: it put a shield card — with the question's raw JSON sitting behind it — in
+#: front of every clarifying-question turn: the user approved being asked, and
+#: only then got to read the question. Nothing is mutated, nothing leaves the
+#: session, and the decision carries no information, so it is made here (#1974).
+#:
+#: Deliberately a NAMED SET, never a "read-only tools" rule. Whether a tool
+#: mutates is a property of the tool, not of its name, and an approval gate that
+#: infers is a gate that eventually infers wrong in the unsafe direction. A tool
+#: joins this set one at a time, on the same argument: no effect beyond the
+#: asking user's own screen.
+_AUTO_APPROVED_TOOLS = frozenset({"AskUserQuestion"})
+
 
 def _default_mint(user_email: str, session_id: str) -> tuple[str, int]:
     """Mint the engine session JWT via the host wiring's own helper.
@@ -655,6 +671,21 @@ class KaiEngineHandle:
             )
         elif etype == "tool-approval-request":
             tool_call_id = str(event.get("toolCallId", ""))
+            if state.tool_names.get(tool_call_id, "") in _AUTO_APPROVED_TOOLS:
+                # Answered here, with no card and no pending entry: the user
+                # never sees an approval step for a tool whose only effect is
+                # to put a question in front of them (#1974). Not added to
+                # `pending_approvals` precisely because nothing was raised —
+                # the resolution frames below retire cards, and there is none.
+                #
+                # Ahead of the `approvals_enabled` kill-switch below on
+                # purpose. That switch exists so tool calls do not sit waiting
+                # on a human who is not there; this call waits on nobody, and
+                # denying it would only cost the agent the ability to ask a
+                # clarifying question on exactly the instances that turned
+                # human round-trips off.
+                self._spawn_side_task(self._post_approval(tool_call_id, "allow"))
+                return
             state.pending_approvals.add(tool_call_id)
             # No-args tools send "" (not "{}"): the client only renders the
             # command block when there is something to show. indent=2 keeps
