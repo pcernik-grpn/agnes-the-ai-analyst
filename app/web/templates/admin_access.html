@@ -4220,6 +4220,24 @@
   el("ax-group-find").addEventListener("input", (e) => {
     groupFilter = e.target.value;
     syncUrl();          // replace: one history entry per keystroke is noise
+    /* On By person the search selects rather than filters: the pane shows one
+       person's chain, so "narrow to a subset" has no meaning here but "find
+       the person I mean" does. First match by name or email wins, and an
+       empty box leaves the current selection alone rather than clearing a
+       chain the reader is in the middle of. */
+    if (viewMode === "person") {
+      const q = groupFilter.trim().toLowerCase();
+      const sel = el("ax-sim-user");
+      if (sel && q) {
+        const hit = [...sel.options].find(
+          (o) => o.value && o.textContent.toLowerCase().includes(q));
+        if (hit && sel.value !== hit.value) {
+          sel.value = hit.value;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      return;
+    }
     repaintQuery();
     /* The roster the people-match reads is fetched on the first search, not
        on page load — most visits never search, and this page already makes
@@ -4339,7 +4357,7 @@
   const FIND_PLACEHOLDER = {
     group: "Search groups, what they hold, or people in them…",
     resource: "Search resources by name, id or block…",
-    person: "Search groups, resources or people…",
+    person: "Search people…",
   };
   const LEDE = {
     group: "Every group you can write a grant against, and what each one can reach.",
@@ -4367,12 +4385,20 @@
     document.querySelectorAll("[data-axpane]").forEach((p) => {
       p.classList.toggle("is-on", p.dataset.axpane === (person ? "sim" : "edit"));
     });
-    /* The search narrows a list of groups and bundles, and + New group makes
-       an audience; neither means anything while you are reading one person's
-       access. A control that is present but inert is worse than an absent
-       one — it invites a click that does nothing. */
-    const find = el("ax-group-find");
-    if (find) find.closest(".fbar__search").hidden = person;
+    /* The search STAYS on every tab. It used to hide here, on the reasoning
+       that narrowing a list of groups means nothing while reading one
+       person's access — sound while the toolbar sat below the tabs and read
+       as that pane's own. Above the tabs it is the page's toolbar, and a
+       page-level control that vanishes on one of three tabs reads as a bug,
+       not as a judgement.
+
+       So it is given a job here instead of being taken away: on this tab it
+       picks the person (see the input handler), which is the one thing a
+       search can mean when the pane shows exactly one of them.
+
+       + New group is a different case and still hides — it makes an audience,
+       which is not a thing this tab does, and unlike the search there is no
+       honest job to give it. */
     const nu = el("ax-new-group");
     if (nu) nu.hidden = person;
   }
