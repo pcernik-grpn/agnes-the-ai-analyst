@@ -102,11 +102,30 @@ Consent:       grant admin consent once for the organization (Enterprise
    resolved email, `oid`, `tid`, the domain-allowlist verdict and which Agnes
    account the login *would* attach to — **without** creating a user, writing
    an identity, or issuing a session.
-5. **Enable** — the button appears on the login page instantly, and is just
-   as instantly reversible:
+5. **Enable** — instantly reversible:
    ```bash
    agnes admin sso set --enable
    ```
+   The button appears on the login page immediately — **unless the instance
+   pins `auth.providers`**, in which case enabling changes nothing observable.
+
+**Enabling does not add `sso` to `auth.providers`.** The login page, the
+`/auth/sso/login` route and `sso_forced_for_email` all gate on
+`provider_allowed("sso")`, so where `auth.providers` pins a list that omits
+`sso` an enabled config is inert: no button renders, `/auth/sso/login` answers
+404, and force-SSO never engages — the permitted domains quietly keep their
+password and magic-link doors while `agnes admin sso status` reads ENABLED.
+(Failing open is deliberate: forcing while the routes 404 would leave those
+addresses with no door at all.) Add the provider on `/admin/server-config`, or:
+
+```bash
+agnes admin config apply <file> --confirm-danger
+```
+
+The overlay merge **replaces** the `auth` section rather than merging into it,
+so the YAML must carry the whole section — `allowed_domain`,
+`webapp_secret_key` and the rest — not just `providers`. Run `--dry-run` first:
+it prints exactly which keys would be nulled.
 
 `agnes admin sso status` shows the live state (config, secret presence, vault
 key) at any point. An enabled config is announced in the boot log, naming the
@@ -230,7 +249,10 @@ is the detective control.
 
 - **Button missing from the login page** → `agnes admin sso status`: the
   provider renders only when configured + secret decryptable + enabled +
-  (`auth.providers` unset or naming `sso`) + Postgres backend.
+  (`auth.providers` unset or naming `sso`) + Postgres backend. When
+  `auth.providers` is the missing leg, `GET /auth/sso/login` answers 404 and
+  force-SSO is inactive too, while status still reads ENABLED — see *Configure,
+  prove, enable*.
 - **Every sign-in dies on `domain_not_allowed`** → the user picked (or Entra
   silently reused) an account outside the permitted domains — the account
   picker is forced, so re-try and pick the right one; or the allowlist is

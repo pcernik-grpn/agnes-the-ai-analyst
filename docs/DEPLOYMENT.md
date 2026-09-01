@@ -667,6 +667,13 @@ and explicit-secrets prerequisites above remain yours to satisfy — on a
 DuckDB app-state instance the app still refuses to boot, naming the
 missing piece.
 
+If any SharePoint scope is anonymize-marked, provision the per-instance
+pseudonym key **before the first run** — generation, `runtime_secret_env`
+delivery, and why this key must never be rotated are in
+[`anonymization.md`](anonymization.md#provisioning-the-key-on-a-deployment);
+without it the `corpus-extraction` job fails cleanly, naming the missing
+variable.
+
 **Scaling the extraction lane.** `extraction.concurrency` (`instance.yaml`)
 / `AGNES_EXTRACTION_CONCURRENCY` (env, takes precedence) sizes how many
 `corpus-extraction` jobs run at once — default 1, clamped to `[1, 8]`,

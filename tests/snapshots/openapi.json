@@ -9392,6 +9392,30 @@
         "title": "SaveArtefactResponse",
         "type": "object"
       },
+      "ScopeCollectionRef": {
+        "description": "The collection a scope maps to \u2014 same trio ``_scope_out`` projects.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "name"
+        ],
+        "title": "ScopeCollectionRef",
+        "type": "object"
+      },
       "ScopeItem": {
         "properties": {
           "item_id": {
@@ -9408,6 +9432,30 @@
           "item_id"
         ],
         "title": "ScopeItem",
+        "type": "object"
+      },
+      "ScopeRemovalOut": {
+        "description": "What untick did to the scope's collection (see :func:`remove_scope`):\n``collection_kept=True`` carries the kept collection's ref so the wizard\ncan point the admin at the Library for the deliberate delete; ``False``\nmeans it was empty and tidied away (or already gone).",
+        "properties": {
+          "collection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScopeCollectionRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "collection_kept": {
+            "title": "Collection Kept",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "collection_kept"
+        ],
+        "title": "ScopeRemovalOut",
         "type": "object"
       },
       "SecretsRequest": {
@@ -9745,6 +9793,115 @@
         "title": "SessionFileEntry",
         "type": "object"
       },
+      "SessionFilePreview": {
+        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
+        "properties": {
+          "file_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Type"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "raw_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Url"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          },
+          "slides": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SlidePreview"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slides"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "kind"
+        ],
+        "title": "SessionFilePreview",
+        "type": "object"
+      },
       "SessionFilesResponse": {
         "properties": {
           "files": {
@@ -10021,6 +10178,33 @@
           "value"
         ],
         "title": "SlackSecretBody",
+        "type": "object"
+      },
+      "SlidePreview": {
+        "description": "One slide of a ``.pptx`` preview \u2014 see ``src/office_preview.Slide``.",
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "lines": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "title": "SlidePreview",
         "type": "object"
       },
       "SourceRequest": {
@@ -31339,7 +31523,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/scopes": {
       "delete": {
-        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row only;\nany collection already created for it is left alone (deleting a\ncollection is a separate, deliberate operation, not a side effect of\nunchecking a wizard row).\n\nIts ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that\ncollection do NOT survive, though (2026-08-31 plan, Task 8): with the\nscope row gone, the sync never reconciles that collection again, so a\nsentinel-owned grant left behind would dangle forever \u2014 indistinguishable\nfrom a deliberate, still-maintained grant to anyone reading ``/admin/\naccess``. Same removal loop :func:`confirm_scope` uses for its own\n``mirrored`` -> ``manual`` transition; an admin-assigned grant on the\nsame collection is untouched either way.",
+        "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row; what\nhappens to the scope's collection depends on whether it holds data:\n\n* **Empty (0 files)** \u2014 soft-deleted. Deleting a collection stays a\n  separate, deliberate operation where DATA is at stake, but an empty\n  scope collection has none, and keeping it is exactly what bred\n  orphaned 0-file collections (observed live 2026-08-31). The response\n  says ``collection_kept: false``.\n* **Has files** \u2014 kept, and the response says so (``collection_kept:\n  true`` + the collection ref) so the wizard can tell the admin where to\n  delete it deliberately (the Library).\n\nEither way a tombstone (``config.retired_scope_collections``, keyed by\n``source_scope_id``) records which collection this scope owned, so a\nlater re-tick of the same folder re-adopts it \u2014 restoring the\nauto-deleted empty one, re-attaching to the kept one \u2014 instead of\nminting a slug-suffixed duplicate (see\n:func:`_readopted_scope_collection_id`).\n\nIts ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that\ncollection do NOT survive, though (2026-08-31 plan, Task 8): with the\nscope row gone, the sync never reconciles that collection again, so a\nsentinel-owned grant left behind would dangle forever \u2014 indistinguishable\nfrom a deliberate, still-maintained grant to anyone reading ``/admin/\naccess``. Same removal loop :func:`confirm_scope` uses for its own\n``mirrored`` -> ``manual`` transition; an admin-assigned grant on the\nsame collection is untouched either way (on the kept collection it keeps\nworking; on the soft-deleted one it resurrects with it on re-tick, so\nthe share state round-trips the untick like everything else).",
         "operationId": "remove_scope_api_admin_sharepoint_connections__connection_id__scopes_delete",
         "parameters": [
           {
@@ -31378,7 +31562,14 @@
           }
         ],
         "responses": {
-          "204": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScopeRemovalOut"
+                }
+              }
+            },
             "description": "Successful Response"
           },
           "401": {
@@ -31465,7 +31656,7 @@
         ]
       },
       "post": {
-        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation; re-confirming the same\n``source_scope_id`` reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.",
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation \u2014 unless the same\n``source_scope_id`` was unticked earlier on this connection, in which\ncase its previous collection is re-adopted via :func:`remove_scope`'s\ntombstone (see :func:`_readopted_scope_collection_id`) rather than a\nduplicate minted. Re-confirming a LIVE scope (same\n``source_scope_id``) reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.",
         "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
         "parameters": [
           {
@@ -37772,6 +37963,156 @@
           }
         },
         "summary": "Download Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/preview": {
+      "get": {
+        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``) is previewed as its own words, read straight out of the OOXML\narchive by ``src/office_preview`` \u2014 no optional extra, no conversion\nservice. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
+        "operationId": "preview_session_file_api_chat_sessions__chat_id__files_preview_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFilePreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/raw": {
+      "get": {
+        "description": "Stream one session file INLINE for the browser to draw (images + PDF).\n\nThe only route in this module that does not force an attachment, which is\nwhy it serves the closed ``_PREVIEW_INLINE_MEDIA`` set and nothing else,\nwith the media type read out of that map rather than guessed from the\nfile. Any other extension is 415 pointing at ``\u2026/preview`` \u2014 this is a\nviewer, not a second download route.",
+        "operationId": "raw_session_file_api_chat_sessions__chat_id__files_raw_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Raw Session File",
         "tags": [
           "chat"
         ]

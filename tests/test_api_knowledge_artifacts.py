@@ -125,6 +125,32 @@ def test_download_granted_corpus_no_artifact_built_404(seeded_app):
     assert resp.status_code == 404
 
 
+def test_download_soft_deleted_collection_404(seeded_app):
+    """A soft-deleted collection must not keep serving its packaged artifact.
+
+    Grants are not revoked on soft-delete (a Library delete, or the SharePoint
+    wizard tidying away an emptied scope collection), and this endpoint never
+    consulted ``deleted_at`` — so a grant-holder could keep downloading a
+    "removed" collection's knowledge.duckdb for as long as the file stayed on
+    disk. The admin caller is deliberate: god-mode passes every grant check,
+    so a 404 here can only come from the endpoint's own liveness guard.
+    """
+    c = seeded_app["client"]
+    admin = seeded_app["admin_token"]
+    col = c.post("/api/collections", json={"name": "KA Deleted"}, headers=_auth(admin)).json()
+    _seed_artifact(col["id"])
+
+    # Sanity: downloadable while live.
+    assert c.get(f"/api/knowledge/artifacts/{col['id']}/download", headers=_auth(admin)).status_code == 200
+
+    from src.repositories import file_corpora_repo
+
+    file_corpora_repo().soft_delete(col["id"])
+
+    resp = c.get(f"/api/knowledge/artifacts/{col['id']}/download", headers=_auth(admin))
+    assert resp.status_code == 404
+
+
 def test_download_success_bytes_and_etag_then_304(seeded_app):
     c = seeded_app["client"]
     admin = seeded_app["admin_token"]

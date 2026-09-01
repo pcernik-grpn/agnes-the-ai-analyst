@@ -127,7 +127,8 @@ def list_sessions(
         when = _fmt_ts(r.get("started_at"))
         uname = (r.get("username") or "—")[:20]
         active = _fmt_duration(r.get("active_seconds"))
-        tools = str(r.get("tool_calls") or 0)
+        # ALL call kinds (native + MCP + subagent), same total the web list shows.
+        tools = str((r.get("tool_calls") or 0) + (r.get("mcp_calls") or 0) + (r.get("subagent_dispatches") or 0))
         errs = str(r.get("tool_errors") or 0)
         model_s = (r.get("primary_model") or "—")[:28]
         fname = (r.get("session_file") or "").split("/")[-1][:24]
@@ -171,7 +172,14 @@ def show_transcript(
         typer.echo(f"# Session: {username}/{session_file}")
         typer.echo(f"# Started:  {summary.get('started_at') or '—'}")
         typer.echo(f"# Active:   {_fmt_duration(summary.get('active_seconds'))}")
-        typer.echo(f"# Tools:    {summary.get('tool_calls') or 0} calls, {summary.get('tool_errors') or 0} errors")
+        native = summary.get("tool_calls") or 0
+        mcp = summary.get("mcp_calls") or 0
+        subagents = summary.get("subagent_dispatches") or 0
+        total_calls = native + mcp + subagents
+        typer.echo(
+            f"# Tools:    {total_calls} calls ({native} native · {mcp} MCP · {subagents} subagent), "
+            f"{summary.get('tool_errors') or 0} errors"
+        )
         typer.echo(f"# Model:    {summary.get('primary_model') or '—'}")
         typer.echo("")
     else:

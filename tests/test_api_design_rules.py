@@ -211,6 +211,12 @@ _DELETE_200_WITH_BODY_ALLOWLIST = frozenset(
         # model's current `package_ids` so the CLI/UI can redraw without a
         # follow-up GET. response_model=SemanticModelPackageIds.
         "/api/admin/semantic-models/{slug}/packages/{package_id}",
+        # Untick tells the wizard whether the scope's collection was kept
+        # (it holds indexed files → the admin is pointed at the Library for
+        # the deliberate delete) or tidied away because it was empty — a
+        # fact only this write can report, not a follow-up read.
+        # response_model=ScopeRemovalOut.
+        "/api/admin/sharepoint/connections/{connection_id}/scopes",
     }
 )
 
