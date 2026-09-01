@@ -501,16 +501,22 @@
     // `position: fixed` does not follow the anchor, so re-place the open submenu
     // when the page moves or resizes under it. Capture phase, to catch scrolling
     // inside an ancestor as well as the window.
-    function replaceOpenSubmenu() {
+    function replaceOpenSubmenu(e) {
       if (!menuEl) return;
-      // The menu's own room below the trigger changes with the same events, so
+      // The menu's room below the trigger changes with the same events, so
       // re-clamp before re-placing — otherwise a resize leaves the menu the
-      // height the OLD viewport allowed.
-      clampMenuHeight();
+      // height the OLD viewport allowed. Scrolling INSIDE the menu is the one
+      // case to skip: it cannot move a menu anchored to its trigger, and
+      // re-clamping on it is how the menu's own scrolling fought the reader.
+      if (!(e && e.target && e.target.nodeType === 1 && menuEl.contains(e.target))) {
+        clampMenuHeight();
+      }
       var open = qs('.fbar-cat.is-open', menuEl);
       if (open) placeSubmenu(open);
     }
-    on(global, 'resize', replaceOpenSubmenu);
+    // A resize changes what the stylesheet's `vh` cap resolves to, so drop the
+    // cached value before re-clamping.
+    on(global, 'resize', function (e) { cssMenuMaxHeight = null; replaceOpenSubmenu(e); });
     on(global, 'scroll', replaceOpenSubmenu, true);
 
     // Open the Filter menu with ONE category's options showing — what a chip
@@ -872,18 +878,30 @@
     //: trigger, measured from live rects like every other coordinate in this
     //: component, and let the CSS cap stand when it is the smaller of the two.
     //: Only ever REDUCES the height, so a short menu is untouched.
-    var MENU_EDGE = 8;   //: keep this clear of the viewport's bottom edge
+    var MENU_EDGE = 8;    //: keep this clear of the viewport's bottom edge
+    var MENU_FLOOR = 160; //: never clamp below this — a scrollable stub beats none
+    //: The stylesheet's own cap, read ONCE while no inline height is set. It has
+    //: to be cached rather than re-read: clearing the inline value to re-measure
+    //: momentarily removes the overflow, which drops the menu's `scrollTop` to
+    //: 0 — and because the re-clamp runs on a capture-phase window `scroll`
+    //: listener, that fires on the MENU's own scrolling too. The menu snapped
+    //: back to the top on every wheel tick, i.e. read as "it won't scroll".
+    var cssMenuMaxHeight = null;
 
     function clampMenuHeight() {
       if (!menuEl || menuEl.hidden) return;
-      menuEl.style.maxHeight = '';
+      if (cssMenuMaxHeight === null) {
+        var declared = parseFloat(global.getComputedStyle(menuEl).maxHeight);
+        cssMenuMaxHeight = isFinite(declared) ? declared : Infinity;
+      }
+      // The menu is anchored under its trigger, so its top does not depend on
+      // its own height — nothing needs clearing to measure it.
       var top = menuEl.getBoundingClientRect().top;
       var room = Math.round(global.innerHeight - top - MENU_EDGE);
-      var css = parseFloat(global.getComputedStyle(menuEl).maxHeight);
-      if (!isFinite(css) || room < css) {
-        // Never collapse to nothing on a very short window: below this the menu
-        // is unusable either way, and a scrollable 160px is the better failure.
-        menuEl.style.maxHeight = Math.max(160, room) + 'px';
+      if (room < cssMenuMaxHeight) {
+        menuEl.style.maxHeight = Math.max(MENU_FLOOR, room) + 'px';
+      } else {
+        menuEl.style.maxHeight = '';
       }
     }
 

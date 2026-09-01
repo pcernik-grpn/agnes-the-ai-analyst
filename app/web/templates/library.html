@@ -662,13 +662,23 @@
      splitting them put the number under the page title and the chips two bands
      lower. */
   .lib-browse { margin: 0 0 10px; }
+  /* Two rows, not one: the count is a fact about the list, the chips are the
+     conditions that produced it, and reading them as one line made the chips
+     look like part of the number. They stay in ONE block, one row under the
+     other — which is what keeps the earlier failure this comment records (the
+     number under the page title, the chips two bands lower) from returning.
+     A hidden chip row is , so it contributes no gap and an
+     unfiltered page looks exactly as it did. */
   .lib-browse__state {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
     min-height: 22px; margin-top: 10px;
+  }
+  .lib-browse__count {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-height: 22px;
   }
   .lib-browse__state .lib-count { font-size: 12.5px; color: var(--ds-text-muted); }
   .lib-browse__state #lib-chips { margin: 0; }
-  /* A chip sits on the same baseline as the count beside it. */
+  /* A chip sits on the same baseline as the count above it. */
   .library-page .lib-browse__state .fbar-chip { height: 22px; }
   /* The strip closes the header, full width, so it reads as the divider
      between the page and its list rather than as another control. Everything
@@ -2424,8 +2434,10 @@
     </div>
       </div>
     <div class="lib-browse__state">
-            <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
-            {{ library_more_coming() }}
+      <div class="lib-browse__count">
+        <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
+        {{ library_more_coming() }}
+      </div>
       {# Applied filters, stated above the list they narrow. NOT `--center`: that
          modifier belonged to the dock's card, where the row was centred over a
          centred bar; over a left-aligned list it left the chips floating in the

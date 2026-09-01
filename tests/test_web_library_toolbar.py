@@ -543,6 +543,35 @@ def test_a_category_menu_is_not_exempt_from_the_height_cap():
     )
 
 
+def test_the_clamp_does_not_fight_the_menus_own_scrolling():
+    """The clamp must not clear `max-height` to re-measure: dropping the cap
+    momentarily removes the overflow, which resets `scrollTop` to 0 — and the
+    re-clamp runs on a capture-phase window `scroll` listener, so it fires on
+    the MENU's own scrolling. The menu snapped back to the top on every wheel
+    tick and read as unscrollable. The stylesheet's cap is cached instead, and
+    a scroll originating inside the menu skips the clamp entirely."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    body = js.split("function clampMenuHeight()")[1].split("\n    }")[0]
+    assert "style.maxHeight = ''" not in body.split("var top")[0], (
+        "clearing the inline cap before measuring is what reset scrollTop"
+    )
+    assert "cssMenuMaxHeight" in body, "the stylesheet's cap must be cached, not re-read"
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
+    assert "menuEl.contains(e.target)" in replacer, "a scroll from inside the menu must not trigger a re-clamp"
+
+
+def test_the_count_and_the_applied_chips_are_separate_rows():
+    """The count is a fact about the list; the chips are the conditions that
+    produced it. On one line the chips read as part of the number. They stay in
+    one block, one row under the other — which is what keeps the earlier
+    failure (count under the page title, chips two bands lower) from
+    returning."""
+    html = (pathlib.Path(__file__).resolve().parents[1] / "app/web/templates/library.html").read_text(encoding="utf-8")
+    assert 'class="lib-browse__count"' in html, "the count needs its own row wrapper"
+    state = html.split(".lib-browse__state {")[1].split("}")[0]
+    assert "flex-direction: column" in state
+
+
 def test_the_menu_is_clamped_to_the_room_below_its_trigger():
     """A CSS `max-height` is a limit on height and says nothing about where the
     menu starts, so a toolbar partway down the page can still push the footer
@@ -554,5 +583,5 @@ def test_the_menu_is_clamped_to_the_room_below_its_trigger():
     assert "innerHeight" in js.split("function clampMenuHeight()")[1][:600]
     opener = js.split("function openMenu(open)")[1][:400]
     assert "clampMenuHeight()" in opener, "the clamp must run on open"
-    replacer = js.split("function replaceOpenSubmenu()")[1][:400]
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
     assert "clampMenuHeight()" in replacer, "…and again when the page moves or resizes under it"
