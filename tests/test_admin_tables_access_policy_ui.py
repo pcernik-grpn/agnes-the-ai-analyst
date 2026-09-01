@@ -551,3 +551,135 @@ def test_preview_renders_the_transpiled_block_when_present(seeded_app):
     # rendered into this modal — never innerHTML'd raw.
     assert "escapeHtml(body.transpiled.dialect)" in render
     assert "escapeHtml(body.transpiled.relation_sql)" in render
+
+
+# ── #1979 K1-sweep finding 1: restore a policy version ────────────────
+
+
+def test_history_prefers_the_revision_store_over_the_audit_trail(seeded_app):
+    """The panel now reads ``GET .../policy/revisions`` first — the only
+    source that carries the SQL BODY of each saved state, which is what
+    "Restore" needs. The audit trail cannot serve it: #1979 redacted
+    ``access_policy_sql`` out of ``update_table`` params."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "/policy/revisions?limit=" in body
+    assert "async function _apLoadHistory" in body
+    assert "function _apRenderRevisions" in body
+
+    loader = body[body.index("async function _apLoadHistory") :]
+    loader = loader[: loader.index("async function _apLoadHistoryFromActivity")]
+    assert "/policy/revisions" in loader
+    assert "_apLoadHistoryFromActivity" in loader, "the audit-derived history must remain the fallback"
+
+
+def test_history_falls_back_to_the_audit_trail_when_there_is_no_revision_store(seeded_app):
+    """``access_policy_revisions`` is PG-only (A3), so a DuckDB-backed
+    instance answers a typed 501. The panel must degrade to the read-only
+    audit-derived history it always had — not to an empty section, which
+    would read as "this policy was never edited"."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "async function _apLoadHistoryFromActivity" in body
+    assert "/api/admin/activity?resource=" in body
+
+    fallback = body[body.index("async function _apLoadHistoryFromActivity") :]
+    fallback = fallback[: fallback.index("function _apParseAuditParams")]
+    # The fallback rows carry no Restore button: without a stored body there
+    # is nothing to restore, and a button that cannot work is worse than none.
+    assert "apRestoreRevision(" not in fallback
+
+
+def test_restore_button_fills_the_editor_and_never_saves_by_itself(seeded_app):
+    """Restore is not a write. It loads the revision into the SQL + note
+    boxes and hands it back to the admin, so the ordinary Save runs every
+    validation and interlock a fresh policy pays for (distribution
+    interlock, mandatory note, static validation, live probe)."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function apRestoreRevision" in body
+    assert ">Restore</button>" in body
+
+    fn = body[body.index("function apRestoreRevision") :]
+    fn = fn[: fn.index("function _apShowRestoreNotice")]
+    assert "document.getElementById('apSql').value" in fn
+    assert "document.getElementById('apNote').value" in fn
+    # No write of any kind from the restore path itself.
+    assert "fetch(" not in fn, "restore must not call the API — the admin's Save does"
+    assert "apSavePolicy(" not in fn, "restore must not auto-save; the editor/save flow is the point"
+    # The restored body lands on the tab that shows it, and the stale-builder
+    # guard is cleared the same way a hand edit clears it.
+    assert "apSwitchTab('sql')" in fn
+    assert "apSqlEdited()" in fn
+
+
+def test_restore_announces_that_nothing_is_saved_yet(seeded_app):
+    """An admin who clicks Restore and closes the modal must not believe the
+    old policy is back. The notice says the editor is loaded and nothing has
+    changed until Save."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert 'id="apRestoreNotice"' in body
+    assert "function _apShowRestoreNotice" in body
+    assert "function _apHideRestoreNotice" in body
+    assert "Nothing has changed yet" in body
+    assert "Save policy" in body
+
+
+def test_a_cleared_revision_renders_as_such_and_offers_no_restore(seeded_app):
+    """A revision whose SQL is NULL is the moment protection was REMOVED.
+    It belongs in the history (it is the most important row in it), but
+    "restore" on it would mean re-clearing — which the Clear button already
+    does, explicitly and with a confirmation."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "rev.cleared" in renderer
+    assert "cleared the policy" in renderer
+    assert "if (!rev.cleared)" in renderer, "the Restore button is conditional on a body existing"
+
+
+def test_history_rows_show_a_peek_at_the_stored_sql(seeded_app):
+    """Who/when/note alone cannot tell two edits apart. The row shows the
+    head of the stored body — truncated, because the panel is a chooser, not
+    a viewer; the editor is where the full body goes."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apSqlPeek" in body
+    assert "ap-history-sql" in body
+    # Every interpolation into the row HTML is escaped — saved_by and the
+    # note are admin-authored free text.
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "escapeHtml(_apSqlPeek(" in renderer
+    assert "escapeHtml(who)" in renderer
+
+
+def test_a_truncated_history_says_so(seeded_app):
+    """The endpoint returns an untruncated ``count`` alongside the capped
+    list, so ten of thirty-four never renders as the whole history."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "body.count" in renderer
+    assert "most recent of" in renderer
+
+
+def test_new_history_styles_are_tokenized_and_not_inline(seeded_app):
+    """Design-system contract: the new rows style through classes in the
+    page's CSS block using --ds-* tokens, never inline style attributes and
+    never raw colours."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    for cls in (".ap-history-sql", ".ap-history-restore", ".ap-history-meta"):
+        assert cls + " {" in body, f"missing CSS rule for {cls}"
+    block = body[body.index(".ap-history-sql {") :]
+    block = block[: block.index(".ap-history-restore {")]
+    assert "var(--ds-" in block
+    assert "#" not in block, "raw hex colour in the new history styles"
+
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "style=" not in renderer, "new history rows must not carry inline styles"

@@ -696,6 +696,15 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/discover-tables": "table_registry.discover_preview",
     "GET /api/admin/registry": "exempt:ui_support",
     "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
+    # #1979 — the policy editor's history panel. Same category as
+    # `GET /api/admin/registry` above, which already hands the same admin
+    # the CURRENT `access_policy_sql` of every table: this is that same
+    # admin-authored configuration, one table at a time, over time. It is
+    # not data content, not a secret, not another user's data, and not the
+    # audit trail (the trail deliberately cannot carry these bodies — see
+    # `app/api/admin.py::_SECRET_FIELDS`). The WRITES it lists are all
+    # cataloged where they happen (`update_table`).
+    "GET /api/admin/registry/{table_id}/policy/revisions": "exempt:ui_support",
     "GET /api/admin/server-config": "server_config.read",
     "GET /api/admin/server-config/overlay": "server_config.read",
     # Same fold the /admin/data-sources template inlines at render time, for

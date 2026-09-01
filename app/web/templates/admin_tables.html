@@ -751,6 +751,33 @@
             border-bottom: none;
         }
 
+        /* #1979 — a history row is now a chooser, not a sentence: who/when/
+           note, a peek at the stored body so two edits can be told apart,
+           and the action that loads it back into the editor. */
+        .ap-history-meta {
+            color: var(--ds-text-secondary);
+        }
+
+        .ap-history-sql {
+            margin: 4px 0 0;
+            padding: 6px 8px;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border);
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-restore {
+            margin-top: 6px;
+        }
+
+        .ap-history-more {
+            margin-top: 8px;
+        }
+
         /* ── Access Policy builder tabs + column list (access-policy-builder-ux
            plan, Task 4). Builder is the default tab; Advanced SQL keeps
            today's plain textarea untouched underneath. The Builder never
@@ -3684,6 +3711,12 @@
                     <div class="form-hint">The next admin who finds this policy needs to know whether it's safe to change.</div>
                 </div>
 
+                <!-- #1979: what a Restore click loaded, and the fact that
+                     nothing is saved until the admin presses Save policy.
+                     Deliberately a separate slot from #apSaveError — one is a
+                     rejection, the other is a state the admin has to act on. -->
+                <div class="form-hint form-hint--warn" id="apRestoreNotice" style="display:none;" role="status"></div>
+
                 <div class="form-hint form-hint--danger" id="apSaveError" style="display:none;"></div>
 
                 <div class="form-group">
@@ -6482,20 +6515,137 @@
     }
 
     // Recent policy edits (design doc §13: "History inline: the last N
-    // audit_log rows with the note"). Reads the existing Activity Center
-    // API (GET /api/admin/activity, resource + action_prefix filters) —
-    // zero new backend surface — rather than
-    // templates/macros/_detail.html's version_timeline(): that macro
-    // renders server-side from a Jinja-built `versions` list, but this
-    // page's rows (and which table's modal is open) are chosen entirely at
-    // runtime by the operator, so there is no per-table `versions` list to
-    // pass at template-render time. `since_minutes` is capped at 30 days
-    // (the endpoint's own max) — an edit older than that won't show here.
+    // rows with the note"), from two sources in preference order:
+    //
+    //   1. GET /api/admin/registry/{id}/policy/revisions — the revision
+    //      store (#1979). One row per saved state, carrying the SQL BODY,
+    //      which is what a "Restore" button needs to put back.
+    //   2. GET /api/admin/activity — the audit-derived history this panel
+    //      originally used, kept as the fallback. It can say who edited
+    //      the policy and when, but never WHAT it was: #1979 redacted
+    //      `access_policy_sql` out of `update_table` params (content never
+    //      enters the audit trail), so its rows are read-only by
+    //      construction and carry no Restore action.
+    //
+    // (2) covers a DuckDB-backed instance, where `access_policy_revisions`
+    // is a Postgres-only table and the endpoint answers a typed 501 — and
+    // a table whose policy predates this store and has not been edited
+    // since, which has audit rows but no revisions yet. Falling back beats
+    // an empty section, which would read as "never edited".
+    var _apRevisions = [];
+
     async function _apLoadHistory(tableId) {
         var section = document.getElementById('apHistorySection');
         var list = document.getElementById('apHistoryList');
         section.style.display = 'none';
         list.innerHTML = '';
+        _apRevisions = [];
+        _apHideRestoreNotice();
+        try {
+            var rr = await fetch('/api/admin/registry/' + encodeURIComponent(tableId)
+                + '/policy/revisions?limit=10', { credentials: 'same-origin' });
+            if (rr.ok && _apRenderRevisions(await rr.json())) return;
+        } catch (e) {
+            // Fall through to the audit-derived history below.
+        }
+        await _apLoadHistoryFromActivity(tableId);
+    }
+
+    // The first ~240 characters of a stored policy body. The panel is a
+    // CHOOSER — enough to tell two edits apart — not a viewer; restoring
+    // puts the full body in the editor, which is where it is read.
+    function _apSqlPeek(sql) {
+        var text = String(sql || '').replace(/\s+/g, ' ').trim();
+        return text.length > 240 ? text.slice(0, 240) + '…' : text;
+    }
+
+    // Renders the revision store's rows. Returns false when there is
+    // nothing to render, so the caller can fall back to the audit-derived
+    // history rather than showing an empty panel.
+    function _apRenderRevisions(body) {
+        var revisions = (body && body.revisions) || [];
+        if (!revisions.length) return false;
+        _apRevisions = revisions;
+        var list = document.getElementById('apHistoryList');
+        var html = revisions.map(function(rev, idx) {
+            var when = String(rev.saved_at || '').slice(0, 16).replace('T', ' ');
+            var who = rev.saved_by || 'unknown';
+            // `cleared` comes from the server (the revision's SQL is NULL),
+            // never from a falsiness check here — the same rule the API and
+            // the repository already agree on.
+            var summary = rev.cleared
+                ? 'cleared the policy'
+                : (rev.policy_note ? escapeHtml(rev.policy_note) : 'saved a policy (no note recorded)');
+            var row = '<div class="ap-history-row">'
+                + '<div class="ap-history-meta"><strong>' + escapeHtml(when) + '</strong> — '
+                + escapeHtml(who) + ': ' + summary + '</div>';
+            if (!rev.cleared) {
+                row += '<pre class="ap-history-sql">' + escapeHtml(_apSqlPeek(rev.policy_sql)) + '</pre>'
+                    + '<button type="button" class="btn btn-secondary btn-sm ap-history-restore" '
+                    + 'onclick="apRestoreRevision(' + idx + ')">Restore</button>';
+            }
+            return row + '</div>';
+        }).join('');
+        // `count` is the untruncated total: ten of thirty-four must never
+        // render as the whole history.
+        if (body.count > revisions.length) {
+            html += '<div class="form-hint ap-history-more">Showing the ' + revisions.length
+                + ' most recent of ' + body.count + ' saved versions.</div>';
+        }
+        list.innerHTML = html;
+        document.getElementById('apHistorySection').style.display = '';
+        return true;
+    }
+
+    // Restore is NOT a write. It loads the chosen version into the editor
+    // and stops there, so applying it goes through the ordinary Save: the
+    // §3.1 distribution interlock, the mandatory note, the static
+    // validator and the live LIMIT 0 probe all judge a restored body
+    // exactly as they judge a freshly typed one. A policy that was valid
+    // when it was saved is not necessarily valid now — the table may have
+    // become distributable, or lost a column the policy names — and a
+    // one-click reattach would be precisely the shape that skips the
+    // checks it most needs.
+    function apRestoreRevision(index) {
+        var rev = _apRevisions[index];
+        if (!rev) return;
+        document.getElementById('apSql').value = rev.policy_sql || '';
+        document.getElementById('apNote').value = rev.policy_note || '';
+        // Same bookkeeping a hand edit does: cancel any queued builder
+        // compile and clear the stale-compile guard, so the restored body
+        // is not overwritten by (or blocked behind) builder output.
+        apSqlEdited();
+        apSwitchTab('sql');
+        _apShowRestoreNotice(rev);
+        document.getElementById('apSql').focus();
+    }
+
+    function _apShowRestoreNotice(rev) {
+        var el = document.getElementById('apRestoreNotice');
+        var when = String(rev.saved_at || '').slice(0, 16).replace('T', ' ');
+        var who = rev.saved_by || 'unknown';
+        // textContent, not innerHTML: `saved_by` is free text off the wire.
+        el.textContent = 'Loaded the version saved ' + when + ' by ' + who
+            + '. Nothing has changed yet — review it and press Save policy to apply, '
+            + 'which re-runs every check a new policy goes through.';
+        el.style.display = '';
+    }
+
+    function _apHideRestoreNotice() {
+        var el = document.getElementById('apRestoreNotice');
+        if (!el) return;
+        el.style.display = 'none';
+        el.textContent = '';
+    }
+
+    // The audit-derived fallback (design doc §13's original "the last N
+    // audit_log rows with the note"). Read-only: `audit_log.params` masks
+    // the SQL body, so there is nothing here to restore FROM and these rows
+    // deliberately carry no Restore button. `since_minutes` is capped at 30
+    // days (the endpoint's own max) — an edit older than that won't show.
+    async function _apLoadHistoryFromActivity(tableId) {
+        var section = document.getElementById('apHistorySection');
+        var list = document.getElementById('apHistoryList');
         try {
             var r = await fetch('/api/admin/activity?resource=' + encodeURIComponent(tableId)
                 + '&action_prefix=update_table&since_minutes=43200&limit=50', { credentials: 'same-origin' });
@@ -6521,8 +6671,9 @@
                 var summary = cleared
                     ? 'cleared the policy'
                     : (params.access_policy_note ? escapeHtml(params.access_policy_note) : 'updated the policy (no note recorded)');
-                return '<div class="ap-history-row"><strong>' + escapeHtml(when) + '</strong> — '
-                     + escapeHtml(who) + ': ' + summary + '</div>';
+                return '<div class="ap-history-row"><div class="ap-history-meta"><strong>'
+                     + escapeHtml(when) + '</strong> — ' + escapeHtml(who) + ': ' + summary
+                     + '</div></div>';
             }).join('');
             section.style.display = '';
         } catch (e) {

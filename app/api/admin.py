@@ -12,6 +12,7 @@ import math
 import os
 import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -36,6 +37,8 @@ from src.identifier_validation import (
     is_safe_quoted_identifier as _is_safe_quoted_identifier,
 )
 from src.repositories import (
+    RequiresPostgresBackend,
+    access_policy_revisions_repo,
     audit_repo,
     knowledge_repo,
     profile_repo,
@@ -6065,6 +6068,93 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
         )
 
 
+def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
+    """``table_registry.access_policy_updated_at`` as an aware datetime.
+
+    The column round-trips as a datetime on both backends, but a row read
+    back through a JSON-ish path can arrive as an ISO string — and this
+    value only ever feeds the BACKFILLED baseline revision's ``saved_at``,
+    where "unparseable" must degrade to "stamp it now" rather than to a
+    lost revision.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _record_access_policy_revision(
+    table_id: str,
+    *,
+    existing: Dict[str, Any],
+    policy_sql: Optional[str],
+    policy_note: Optional[str],
+    policy_mapping: bool,
+    saved_by: Optional[str],
+) -> None:
+    """Append the state a table's access policy was just saved in (#1979).
+
+    Called from ``update_table`` right after ``set_access_policy`` persisted
+    that state, i.e. on exactly the writes the history panel is about
+    (attach, edit, clear) — never on a PUT that merely carried the policy
+    fields through untouched.
+
+    **Never load-bearing.** ``access_policy_revisions`` is a post-A3 PG-only
+    table, so on a DuckDB-backed instance resolving it raises
+    ``RequiresPostgresBackend``; that (and any other failure) is swallowed
+    here. An admin narrowing access to a table must never be blocked
+    because the history of that change could not be written — and the modal
+    already degrades to the audit-derived, read-only history when this
+    store is absent.
+
+    **The baseline backfill.** A table whose policy was attached before this
+    store existed has no revision for it, so the first write after that
+    would overwrite a body nothing ever recorded — precisely the loss this
+    feature exists to prevent. When the table has no revisions yet and IS
+    carrying a policy, the state being replaced is recorded first, dated
+    with its own ``access_policy_updated_at`` and attributed to its own
+    ``access_policy_updated_by``: a history that re-dates or re-attributes
+    the past is worse than one that is short.
+    """
+    try:
+        repo = access_policy_revisions_repo()
+    except RequiresPostgresBackend:
+        return
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not resolve the access-policy revision store for %s: %s", table_id, e)
+        return
+
+    try:
+        if not repo.count_for_table(table_id) and existing.get("access_policy_sql"):
+            repo.record(
+                table_id=table_id,
+                policy_sql=existing.get("access_policy_sql"),
+                policy_note=existing.get("access_policy_note"),
+                policy_mapping=bool(existing.get("policy_mapping")),
+                saved_by=existing.get("access_policy_updated_by"),
+                saved_at=_coerce_policy_timestamp(existing.get("access_policy_updated_at")),
+            )
+        repo.record(
+            table_id=table_id,
+            policy_sql=policy_sql,
+            policy_note=policy_note,
+            policy_mapping=bool(policy_mapping),
+            saved_by=saved_by,
+        )
+    except Exception as e:
+        logger.warning(
+            "Access policy for %s was saved, but its revision could not be recorded: %s "
+            "-- the policy itself is persisted; only its history entry is missing",
+            table_id,
+            e,
+        )
+
+
 @router.put("/registry/{table_id}")
 async def update_table(
     table_id: str,
@@ -6558,6 +6648,28 @@ async def update_table(
             )
         if "policy_mapping" in updates:
             repo.set_policy_mapping(table_id, bool(updates["policy_mapping"]))
+
+        # #1979 — record the state the policy was just saved in, so the
+        # editor's history panel can offer "restore this version". Keyed on
+        # the SAME condition as the setter call above: every write through
+        # ``set_access_policy`` gets exactly one revision, and a PUT that
+        # merely carried the policy fields through untouched gets none.
+        #
+        # Deliberately NOT derived from the audit row this handler writes
+        # below: ``audit_log.params`` redacts ``access_policy_sql`` (content
+        # never enters the trail), so the trail records THAT a policy changed
+        # but never what it was — and restoring needs the body.
+        if "access_policy_sql" in updates or "access_policy_note" in updates:
+            _record_access_policy_revision(
+                table_id,
+                existing=existing,
+                policy_sql=_final_access_policy_sql,
+                policy_note=_final_access_policy_note,
+                policy_mapping=bool(
+                    updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
+                ),
+                saved_by=user.get("email"),
+            )
 
     audit_repo().log(
         user_id=user.get("id"),
@@ -7126,6 +7238,63 @@ def _policy_builder_looks_like_pii(col_name: str, profile_col: dict) -> bool:
     )
 
 
+@router.get("/registry/{table_id}/policy/revisions")
+async def list_access_policy_revisions(
+    table_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    user: dict = Depends(require_admin),
+):
+    """The saved states of this table's access policy, newest first (#1979).
+
+    What the policy editor's history panel lists, and what its "Restore"
+    button prefills the editor from. Each revision carries the full
+    ``policy_sql`` body: restoring means putting that body back in the
+    textarea, and a truncated preview cannot be restored from.
+
+    **There is no restore endpoint, on purpose.** The client re-submits a
+    revision's body through the ordinary ``PUT /registry/{id}``, so a
+    restore pays for every interlock a fresh save pays for — the §3.1
+    undistributed check, the mandatory note, the static validator, the live
+    LIMIT 0 probe — and lands in the audit trail as the ordinary policy
+    write that it is. A dedicated restore route would either duplicate that
+    validation chain (and drift from it) or quietly skip it, which is
+    exactly the shape "reattach yesterday's policy" must not have.
+
+    **PG-only** (post-A3 ``access_policy_revisions``): a DuckDB-backed
+    instance gets the typed ``501 requires_postgres_backend`` the factory
+    raises, and the modal falls back to its audit-derived, read-only
+    history. The registry lookup runs FIRST, so a typo'd table id is a 404
+    on every backend rather than advice to migrate a database.
+    """
+    if not table_registry_repo().get(table_id):
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    repo = access_policy_revisions_repo()
+    revisions = repo.list_for_table(table_id, limit=limit)
+    return {
+        "table_id": table_id,
+        # `count` is the UNTRUNCATED total, so a panel showing ten of
+        # thirty-four can say so instead of rendering a silent prefix that
+        # reads as the whole history.
+        "count": repo.count_for_table(table_id),
+        "limit": limit,
+        "revisions": [
+            {
+                "id": r["id"],
+                "saved_at": r["saved_at"],
+                "saved_by": r["saved_by"],
+                "policy_sql": r["policy_sql"],
+                "policy_note": r["policy_note"],
+                "policy_mapping": r["policy_mapping"],
+                # Derived in the repository so the API and the modal cannot
+                # disagree about what "the policy was removed here" means.
+                "cleared": r["cleared"],
+            }
+            for r in revisions
+        ],
+    }
+
+
 @router.get("/registry/{table_id}/policy/columns")
 async def policy_builder_columns(
     table_id: str,
@@ -7405,6 +7574,26 @@ async def unregister_table(
     name = existing.get("name") or table_id
 
     cascade = repo.unregister(table_id)
+
+    # #1979 — the table's access-policy revision bodies go with it. Table
+    # ids are derived from names, so re-registering the same name yields the
+    # same id; without this purge a brand-new table would inherit (and offer
+    # for restore) the policy SQL of the one that used to live at that id.
+    # PG-only store, and never load-bearing: a DuckDB instance has none, and
+    # a failure here must not strand a DELETE whose registry row is already
+    # gone.
+    try:
+        access_policy_revisions_repo().delete_for_table(table_id)
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:
+        logger.warning(
+            "Could not drop access-policy revisions for unregistered table %s: %s "
+            "-- the registry row is still gone; the orphaned revisions are only "
+            "reachable again if an identically named table is registered",
+            table_id,
+            e,
+        )
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the

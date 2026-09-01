@@ -27866,6 +27866,81 @@
         ]
       }
     },
+    "/api/admin/registry/{table_id}/policy/revisions": {
+      "get": {
+        "description": "The saved states of this table's access policy, newest first (#1979).\n\nWhat the policy editor's history panel lists, and what its \"Restore\"\nbutton prefills the editor from. Each revision carries the full\n``policy_sql`` body: restoring means putting that body back in the\ntextarea, and a truncated preview cannot be restored from.\n\n**There is no restore endpoint, on purpose.** The client re-submits a\nrevision's body through the ordinary ``PUT /registry/{id}``, so a\nrestore pays for every interlock a fresh save pays for \u2014 the \u00a73.1\nundistributed check, the mandatory note, the static validator, the live\nLIMIT 0 probe \u2014 and lands in the audit trail as the ordinary policy\nwrite that it is. A dedicated restore route would either duplicate that\nvalidation chain (and drift from it) or quietly skip it, which is\nexactly the shape \"reattach yesterday's policy\" must not have.\n\n**PG-only** (post-A3 ``access_policy_revisions``): a DuckDB-backed\ninstance gets the typed ``501 requires_postgres_backend`` the factory\nraises, and the modal falls back to its audit-derived, read-only\nhistory. The registry lookup runs FIRST, so a typo'd table id is a 404\non every backend rather than advice to migrate a database.",
+        "operationId": "list_access_policy_revisions_api_admin_registry__table_id__policy_revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Access Policy Revisions",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/reports/marketplace-digest": {
       "get": {
         "description": "Compose the full digest payload for `period`.\n\nWindows (all UTC, upper bound exclusive):\n- daily:  primary = the anchor day; comparison = the day before;\n          trend_series = trailing 14 days ending on the anchor.\n- weekly: primary = 7 days ending on the anchor; comparison = the 7 days\n          before that; trend_series = trailing 30 days ending on the anchor.",

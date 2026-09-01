@@ -2905,6 +2905,14 @@ KNOWN_UNTESTED = {
     # duplicated in this parameter-free smoke sweep.
     "GET /api/admin/registry/{table_id}/policy/columns",
     "POST /api/admin/registry/{table_id}/policy/compile",
+    # Access-policy revision history (#1979) — backed by the PG-only
+    # `access_policy_revisions` table, so its per-backend behaviour IS the
+    # point and is asserted directly (200 + shape and the write/restore
+    # round-trip on PG by tests/db_pg/test_access_policy_revisions_api_pg.py;
+    # typed 501, 403 for a non-admin, and 404-before-any-repo-work on DuckDB
+    # by tests/test_admin_access_policy_revisions_api.py). Takes a path
+    # param, so it is out of this parameter-free sweep either way.
+    "GET /api/admin/registry/{table_id}/policy/revisions",
     "PATCH /api/admin/registry/{table_id}/docs",
     "POST /api/admin/bigquery/test-connection",
     "POST /api/admin/discover-and-register",

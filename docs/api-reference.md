@@ -80,6 +80,7 @@ are the unit of curation and user-facing discovery.
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
+| `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
 | `GET` | `/api/admin/metadata/{table_id}` | — | Get per-column metadata (see §3.6) |
 | `POST` | `/api/admin/metadata/{table_id}` | see §3.6 | Save per-column metadata |
 | `POST` | `/api/admin/metadata/{table_id}/push` | — | Push saved column metadata downstream (no body) |
@@ -337,6 +338,41 @@ Both builder routes are admin-only and, like `.../policy/preview`, available reg
 of `access_policies.enabled`: they neither read nor write a stored policy. That flag
 gates attaching one (`PUT` with a non-null `access_policy_sql`) and applying one on a
 read.
+
+### 3.9 Access-policy history — `GET /api/admin/registry/{table_id}/policy/revisions`
+
+Every policy write through `PUT /api/admin/registry/{table_id}` (attach, edit, clear)
+appends a revision. This lists them newest first — who saved what, when, and the full
+SQL body — which is what the policy editor's history panel renders and what its
+**Restore** button prefills the editor from.
+
+The audit trail cannot answer this question: `audit_log.params` redacts
+`access_policy_sql` (content never enters the trail), so an audit row records *that* a
+policy changed and by whom, never what it was.
+
+```bash
+curl -s "https://{your-instance}/api/admin/registry/orders_daily/policy/revisions?limit=10" \
+  -H "Authorization: Bearer $PAT"
+# {"table_id": "orders_daily", "count": 12, "limit": 10, "revisions": [
+#   {"id": "apr_1a2b...", "saved_at": "2026-09-01T09:12:03+00:00", "saved_by": "admin@example.com",
+#    "policy_sql": "SELECT ...", "policy_note": "regional scoping", "policy_mapping": false,
+#    "cleared": false}, ...]}
+```
+
+`limit` is 1–50 (default 10); `count` is the untruncated total, so a truncated list can
+say so. `cleared: true` marks the revision that REMOVED the policy — `policy_sql` is
+`null` there, and the revision before it is the body a restore would put back.
+
+**There is no restore endpoint, by design.** Restoring means re-submitting a revision's
+`policy_sql` + `policy_note` through the ordinary `PUT /api/admin/registry/{table_id}`,
+so it is re-validated exactly like a fresh save (distribution interlock, mandatory note,
+static validation, live probe) and can be refused — e.g. a policy saved while the table
+was `server_only=true` will not reattach itself to a table that has since become
+distributable.
+
+Requires the Postgres app-state backend (`access_policy_revisions` is a Postgres-only
+table); a DuckDB-backed instance answers `501 requires_postgres_backend` and the editor
+falls back to a read-only history derived from the audit trail.
 
 ---
 
@@ -728,6 +764,7 @@ checks against.
 - /api/admin/registry/{table_id}/policy/preview
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
+- /api/admin/registry/{table_id}/policy/revisions
 
 ### `/api/admin/register-table` — Table registration
 

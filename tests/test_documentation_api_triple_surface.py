@@ -1059,6 +1059,18 @@ _EXEMPT: dict[str, str] = {
         "reasoning as the policy/preview exemption above; no CLI planned for "
         "this web-UI-only builder slice."
     ),
+    "/api/admin/registry/{table_id}/policy/revisions": (
+        "admin-only access-policy revision history (#1979): the saved states "
+        "the editor modal's history panel lists and its Restore button "
+        "prefills from. No MCP analogue by design, same reasoning as the "
+        "policy/preview exemption above — the response carries policy SQL "
+        "bodies, i.e. a map of what each policy is filtering and masking, "
+        "which is not something an agent tool call should be able to read on "
+        "an admin's behalf. No CLI planned for this web-UI-only slice: the "
+        "history exists to feed the editor, and restoring is just the "
+        "already-CLI-reachable PUT /api/admin/registry/{id} with an older "
+        "body."
+    ),
     "/api/admin/registry/{table_id}/policy/compile": (
         "admin-only access-policy builder: structured spec -> validated SQL "
         "(plan Task 3), never persists anything itself. No MCP analogue by "
