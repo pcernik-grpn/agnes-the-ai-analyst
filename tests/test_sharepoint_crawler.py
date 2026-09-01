@@ -1902,6 +1902,99 @@ class TestRunRecording:
             assert ("run_id" in real) == ("run_id" in fake), name
 
 
+class TestProgressCheckpointing:
+    """A delta PAGE (`_DELTA_PAGE_SIZE`, 200) can be many minutes of real
+    download/convert/anonymize/ingest work once files actually download —
+    while `_crawl_drive`'s own state checkpoint (deltaLink/cTags) correctly
+    stays put at the page boundary, an operator watching `files_done` was
+    stuck at 0 for that whole window. `_RunRecorder.maybe_checkpoint` is the
+    fix: a rate-limited PROGRESS checkpoint, called after every item."""
+
+    def test_progress_advances_mid_page_not_only_at_the_boundary(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        _at_concurrency(monkeypatch, 1)  # sequential — deterministic checkpoint count
+        items = _many_items(25)
+        _install_graph(monkeypatch, _one_page(items))
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 25
+        files_done_seen = [c["files_done"] for c in runs.checkpoints]
+        # At least one checkpoint landed strictly BETWEEN 0 and the full
+        # count — i.e. before the page (and its unconditional boundary
+        # checkpoint) finished.
+        assert any(0 < n < 25 for n in files_done_seen), files_done_seen
+        assert files_done_seen[-1] == 25
+        # And every value is non-decreasing — progress never appears to
+        # run backwards to an operator polling it.
+        assert files_done_seen == sorted(files_done_seen)
+
+    def _recorder(self, monkeypatch, clock):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start(clock=clock)
+        return recorder, runs
+
+    def test_the_item_count_threshold_fires_a_checkpoint(self, monkeypatch):
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        for _ in range(crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS - 1):
+            stats.add(items_done=1)
+            recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert runs.checkpoints == []  # not due yet
+
+        stats.add(items_done=1)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+        assert runs.checkpoints[0]["files_done"] == crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS
+
+    def test_the_elapsed_time_threshold_fires_even_with_few_items(self, monkeypatch):
+        """A single very slow file (a large PDF, a throttled download) must
+        still move the needle — the item-count threshold alone would leave
+        it stuck until nine more files finished."""
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        stats.add(items_done=1)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert runs.checkpoints == []
+
+        clock["t"] += crawler._PROGRESS_CHECKPOINT_INTERVAL_S + 0.1
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+        assert runs.checkpoints[0]["files_done"] == 1
+
+    def test_it_stays_rate_limited_between_the_two_thresholds(self, monkeypatch):
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        stats.add(items_done=crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+
+        stats.add(items_done=1)  # below both thresholds since the last fire
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1  # unchanged
+
+    def test_never_fires_when_recording_is_unavailable(self, monkeypatch):
+        """The same 'observability, never load-bearing' posture the rest of
+        `_RunRecorder` already has: no run id, no write, no exception."""
+
+        def _raise():
+            raise RuntimeError("no backend")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()  # swallows the failure; run_id stays None
+        stats = crawler.CrawlStats()
+        stats.add(items_done=999)
+        recorder.maybe_checkpoint(stats)  # must not raise
+
+
 class TestDetectorUsageRecording:
     """The LLM tier's token accounting must reach the run record (`usage`)
     and the crawl report (`ner_usage`) — and `{}`/absence must keep meaning

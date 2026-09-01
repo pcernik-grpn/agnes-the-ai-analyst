@@ -154,8 +154,21 @@ _OVERSIZE_SAMPLE = 20
 #: itself is capped to at ``finish()`` — so the in-memory sample and the
 #: stored one never disagree about how many are honestly kept.
 _ERROR_SAMPLE = 200
-#: Delta page size asked of Graph — also the state-checkpoint granularity.
+#: Delta page size asked of Graph — also the RESUME-STATE checkpoint
+#: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
+#: here, load-bearing for the resume contract. The run recorder's PROGRESS
+#: checkpoint (`files_done`/`checkpoint_at`, `_RunRecorder.maybe_checkpoint`)
+#: is a separate, more frequent cadence — see the constants below.
 _DELTA_PAGE_SIZE = 200
+#: How often `_RunRecorder.maybe_checkpoint` is allowed to write PROGRESS
+#: (never the resume state above) between delta-page boundaries: at most
+#: once per this many seconds, or once per `_PROGRESS_CHECKPOINT_EVERY_
+#: ITEMS` newly finished items, whichever comes first. A page can span many
+#: minutes of real download/convert/anonymize/ingest work once downloads
+#: actually succeed, and without this an operator watches "0 files
+#: processed" for that whole window despite the crawl demonstrably working.
+_PROGRESS_CHECKPOINT_INTERVAL_S = 5.0
+_PROGRESS_CHECKPOINT_EVERY_ITEMS = 10
 #: Streaming download chunk.
 _DOWNLOAD_CHUNK = 1 << 20
 
@@ -332,6 +345,11 @@ class _RunRecorder:
         self.job_id = job_id
         self.run_id: Optional[str] = None
         self._repo: Any = None
+        # Bookkeeping for `maybe_checkpoint` — a SEPARATE, rate-limited
+        # sibling of `checkpoint`, never the crawl's own resume state.
+        self._progress_lock = threading.Lock()
+        self._last_progress_at = 0.0
+        self._last_progress_items_done = 0
 
     def _resolve(self) -> Any:
         if self._repo is None:
@@ -340,7 +358,12 @@ class _RunRecorder:
             self._repo = extraction_runs_repo()
         return self._repo
 
-    def start(self) -> None:
+    def start(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        # Measured from here, not from process epoch: a run whose first
+        # delta page takes a while must not have its very first item
+        # trigger `maybe_checkpoint` purely because "now - 0" is huge.
+        # ``clock`` is a test seam only — production never passes one.
+        self._last_progress_at = clock()
         try:
             self.run_id = self._resolve().start(
                 connection_id=self.connection_id,
@@ -371,6 +394,42 @@ class _RunRecorder:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("sharepoint crawl: run checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def maybe_checkpoint(self, stats: "CrawlStats", *, clock: Callable[[], float] = time.monotonic) -> None:
+        """A RATE-LIMITED sibling of :meth:`checkpoint`, called after every
+        item — not just at the delta-page boundary.
+
+        A delta PAGE is up to :data:`_DELTA_PAGE_SIZE` (200) items, and once
+        downloads actually succeed (as opposed to failing instantly), one
+        page can be many minutes of real download/convert/anonymize/ingest
+        work. `checkpoint` alone left an operator watching `files_done: 0`
+        for that whole window even while the crawl was demonstrably
+        working — the same "unverified renders healthy" failure the status
+        guard elsewhere in this module exists to avoid, just for PROGRESS
+        instead of OUTCOME.
+
+        Fires at most once per :data:`_PROGRESS_CHECKPOINT_INTERVAL_S`
+        seconds or :data:`_PROGRESS_CHECKPOINT_EVERY_ITEMS` newly finished
+        items, whichever comes first, so a slow single file (elapsed time)
+        and a fast run of small ones (item count) both get seen. Writes to
+        the exact same destination `checkpoint` does
+        (`files_seen`/`files_done`/`progress`/`checkpoint_at`) — never the
+        crawl's own resume state (`deltaLink`/cTags in the state file),
+        which still persists only at the page boundary in `_crawl_drive`
+        and is unaffected by this.
+        """
+        if not self.run_id:
+            return
+        now = clock()
+        with self._progress_lock:
+            items_since = stats.items_done - self._last_progress_items_done
+            due = (now - self._last_progress_at) >= _PROGRESS_CHECKPOINT_INTERVAL_S
+            due = due or items_since >= _PROGRESS_CHECKPOINT_EVERY_ITEMS
+            if not due:
+                return
+            self._last_progress_at = now
+            self._last_progress_items_done = stats.items_done
+        self.checkpoint(stats)
 
     def finish(
         self,
@@ -1890,18 +1949,20 @@ async def _process_page(
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
     concurrency: int = 1,
+    recorder: Optional["_RunRecorder"] = None,
 ) -> None:
     """Run ONE delta page's rows, up to ``concurrency`` items at a time.
 
-    The page is the unit of the resume contract, and this function is what
+    The page is the unit of the RESUME contract, and this function is what
     keeps that true under parallelism:
 
     * every item's cTag is still written by the item itself, right after its
       own durable ingest — a slow neighbour cannot delay it, and a fast
       neighbour cannot claim it;
     * this function does not return until every worker has finished, so the
-      caller's ``deltaLink`` persist + recorder checkpoint still happen after
-      *all* of the page's rows, never in the middle of it;
+      caller's ``deltaLink`` persist + the unconditional recorder checkpoint
+      it makes afterward still happen after *all* of the page's rows, never
+      in the middle of it;
     * the deadline is re-checked before each item is picked up, so an expired
       budget stops FEEDING the pool and then drains it, rather than starting
       work it has no time to finish;
@@ -1943,6 +2004,8 @@ async def _process_page(
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
         return
 
     if not items:
@@ -2007,6 +2070,8 @@ async def _process_page(
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
 
     try:
         # `gather` without `return_exceptions` would cancel the peers on the
@@ -2132,6 +2197,7 @@ async def _crawl_drive(
             detector=detector,
             deadline=deadline,
             concurrency=governor.current(),
+            recorder=recorder,
         )
         # The page's OWN throttling, not the run's running total: the
         # governor folds a DELTA, so one bad page cannot keep halving the
@@ -2156,10 +2222,12 @@ async def _crawl_drive(
             next_link = page.get("@odata.nextLink")
             save_state(connection_id, state)
             url = _require_graph_url(str(next_link)) if next_link else None
-        # The SAME checkpoint boundary, a second destination — no new write
-        # loop and no new frequency (design §7.1). It runs after the state
-        # file, so a recorder failure can never cost the crawl its resume
-        # point.
+        # The SAME state-checkpoint boundary, a second destination (design
+        # §7.1) — and, unlike `_process_page`'s per-item `maybe_checkpoint`
+        # calls above, UNCONDITIONAL: every page's final numbers are
+        # durably recorded even if the rate limiter would otherwise have
+        # withheld a write. Runs after the state file, so a recorder
+        # failure can never cost the crawl its resume point.
         if recorder is not None:
             recorder.checkpoint(stats)
 
