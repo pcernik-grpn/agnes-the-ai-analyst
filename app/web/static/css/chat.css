@@ -1421,40 +1421,121 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 }
 .cloud-chat-tool[open] .cloud-chat-tool-chevron { transform: rotate(90deg); }
 
+/* A panel is just a caption over a payload. The box it used to draw is now the
+   open step's left rule (above), so nesting one here would be a rectangle
+   inside a rectangle — which is exactly what the Command panel looked like:
+   a bordered white box whose only content was another padded block holding
+   thirteen characters. */
 .cloud-chat-tool-args,
 .cloud-chat-tool-json,
 .cloud-chat-tool-result-full {
   margin-top: var(--space-2);
-  padding: var(--space-2);
-  background: var(--ds-surface);
-  border: 1px solid var(--ds-border);
-  border-radius: var(--radius-sm);
+  padding: 0;
 }
-/* The label over a formatted-JSON panel (Args / Result) — same voice as
-   the toggles below, but it is a heading, not a control. */
+/* The caption over a panel (Command / SQL / Args / Result) — a heading, not a
+   control, and close enough to what it labels to read as attached to it. */
 .cloud-chat-tool-panel-label {
+  margin-bottom: var(--space-1);
   font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--ds-text-muted);
   user-select: none;
 }
-.cloud-chat-tool-result-full > summary {
+/* "Show all 22 lines" / "Show less" / "Raw JSON" are controls, so they read
+   like the group header's Show/Hide rather than like a caption — same accent,
+   sentence case, no box of their own. `.cloud-chat-tool-result-more` is a real
+   <button>: it grows the payload in place rather than disclosing a hidden one,
+   which is not what a <summary> means (see chat.js -> _expandInPlace). */
+.cloud-chat-tool-result-full > summary,
+.cloud-chat-tool-result-more {
   cursor: pointer;
   user-select: none;
   font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  color: var(--ds-text-muted);
+  color: var(--ds-primary);
+}
+.cloud-chat-tool-result-more {
+  display: block;
+  margin-top: var(--space-1);
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+}
+.cloud-chat-tool-result-full > summary:hover,
+.cloud-chat-tool-result-full > summary:focus-visible,
+.cloud-chat-tool-result-more:hover,
+.cloud-chat-tool-result-more:focus-visible {
+  text-decoration: underline;
 }
 .cloud-chat-tool-args pre,
 .cloud-chat-tool-json pre,
 .cloud-chat-tool-result-full pre {
-  margin: var(--space-2) 0 0;
-  padding: 0;
-  background: transparent;
+  margin: 0;
   font-size: var(--text-xs);
   overflow-x: auto;
+}
+/* A code panel inside a tool card wears the CARD's surface, not the
+   transcript's dark code chrome. The rule directly above already asks for
+   that — `background: transparent` over the panel's own --ds-surface — but
+   `.cloud-chat-messages details pre.code-block-wrap` outranks it (0,2,2 vs
+   0,1,1) and repainted every panel --ds-code-bg: a dark slab dropped into a
+   white card, for what is usually one line of shell. The selectors here carry
+   three classes so the panel's own intent wins. Geometry is deliberately left
+   to the rules above and below; only the paint is corrected.
+
+   The --ds-code-* token family cannot come along onto that surface. Every
+   value in it is tuned to clear 5.5:1 against the near-black --ds-code-bg
+   (see the token block near the top of this file), so on a light card it
+   would be the unreadable half of the very problem that block exists to fix.
+   The token spans fall back to the card's ink instead — these panels are
+   unhighlighted by design, and short shell/SQL/JSON reads fine without it. */
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {
+  /* A quiet tint rather than the transcript's near-black slab: enough to read
+     as code, and somewhere for the hover copy button to sit. Geometry is
+     corrected here too — the shared rule's --space-3 padding and --space-2
+     margin were nesting inside the panel's own, which is most of why one line
+     of shell occupied a box five lines tall. */
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+  border-radius: var(--radius-sm);
+  /* Shrink to the code, not to the column. `agnes catalog` is thirteen
+     characters and was painting a band the full width of the reading column;
+     inline-block sizes the tint to what is actually in it, and max-width keeps
+     a long statement inside the column and scrolling. */
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+}
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap code,
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap code [class*="hljs-"] {
+  color: inherit;
+}
+/* Console output whose alignment is the content (a rich box table from
+   `agnes query` / `agnes catalog`): monospace, unwrapped, scrolling
+   sideways rather than reflowing — a wrapped column is a broken column. */
+.cloud-chat-tool-console {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
+  border-radius: var(--radius-sm);
+  /* Sized to the table, not to the column — same reason as the code block
+     above. A 43-column catalog listing has no business painting 750px. */
+  display: inline-block;
+  vertical-align: top;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--ds-text-primary);
+  white-space: pre;
+  max-height: 280px;
+  overflow: auto;
+}
+.cloud-chat-tool-result-full .cloud-chat-tool-console {
+  margin-top: var(--space-2);
 }
 
 .cloud-chat-tool-result {
@@ -1496,10 +1577,11 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool-result-preview > :last-child  { margin-bottom: 0; }
 .cloud-chat-tool-result.is-json pre {
   margin: 0;
-  padding: var(--space-2);
-  background: var(--ds-surface);
-  border: 1px solid var(--ds-border);
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
   border-radius: var(--radius-sm);
+  display: inline-block;
+  vertical-align: top;
   font-size: var(--text-xs);
   max-height: 280px;
   overflow: auto;

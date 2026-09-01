@@ -232,17 +232,26 @@ def test_live_and_history_headers_use_the_label():
     assert "_toolLabel(tc.tool, tc.args)" in js, "history formatToolCall must agree"
 
 
-def test_summarize_args_shows_the_command_line():
+def test_a_collapsed_step_carries_no_args_only_an_outcome():
+    """A collapsed step is one quiet line: a verb and an outcome. The whole
+    command used to sit on it, which made it the single longest thing in a
+    settled transcript — `agnes query "SELECT sum(total) FROM orders"` beside
+    every row of a six-step run is most of what made the trail feel crowded.
+    The args moved into the body, one click away.
+
+    The summary ELEMENT stays, because a failed call writes its diagnosis there
+    (_setToolCardError): on an error, what went wrong is the one thing worth a
+    collapsed line, and it is now the only thing this slot ever holds. The
+    summarizer that used to fill it is gone rather than left unused."""
     js = _read(CHAT_JS)
-    fn = js[js.index("function _summarizeArgs") : js.index("const _TOOL_LABELS")]
-    cases = {"cmd": {"command": "agnes schema hr_headcount"}, "sql": {"sql": "SELECT 1"}}
-    script = (
-        fn
-        + f"\nprocess.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)}).map(([k, v]) => [k, _summarizeArgs(v)]))));\n"
-    )
-    res = json.loads(_node_run(script))
-    assert res["cmd"] == "agnes schema hr_headcount"
-    assert res["sql"] == "SELECT 1"
+    assert "_summarizeArgs" not in js, "dead once the header stopped showing args — deleted, not orphaned"
+
+    card = js[js.index("function _buildToolCard") : js.index("function _toolErrorLine")]
+    assert 'summary.className = "cloud-chat-tool-summary"' in card, "the slot survives for the error line"
+    assert "summary.textContent" not in card, "nothing but the error line may fill it"
+
+    err = js[js.index("function _setToolCardError") : js.index("// ---------- Tool-call groups")]
+    assert "summary.textContent = line;" in err, "the diagnosis is what the slot is for now"
 
 
 # ── tool results: JSON is one click away, never the primary rendering ───────
@@ -273,13 +282,40 @@ def test_json_panel_is_highlighted_capped_and_keeps_a_full_route():
     assert "enhanceCodeBlocks(" in fn, "the shared pass adds highlight + copy button"
 
 
-def test_args_render_as_formatted_json_on_card_expand():
-    """One click total: expanding the card shows the args as formatted JSON —
-    the old nested args toggle was a second click inside a collapsed card."""
+def test_args_render_on_card_expand_with_no_nested_toggle():
+    """One click total: expanding the card shows the args — the old nested args
+    toggle was a second click inside a collapsed card."""
     js = _read(CHAT_JS)
     card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
-    assert '_jsonPanel("Args"' in card
+    assert "_argsPanels(args)" in card
     assert "Show args" not in js, "no nested args toggle on either path"
+
+
+def test_a_command_arg_is_a_code_block_not_escaped_json():
+    """`{"command": "agnes query \\"SELECT * FROM orders\\""}` made the reader
+    undo the escaping in their head to reach the SQL they opened the card for.
+    A command / SQL arg renders as a code block in its own language; anything
+    LEFT OVER still gets the JSON panel, so no arg drops out of the record."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("const _ARG_LANGUAGES") : js.index("function _toolCallId")]
+    assert '{ command: ["Command", "bash"], sql: ["SQL", "sql"] }' in js, (
+        "the two language args, each with the language to highlight it as"
+    )
+    assert "_codePanel(label, value, language" in fn, "a language arg goes to the code panel"
+    assert '_jsonPanel(panels.length ? "Other args" : "Args", rest' in fn, (
+        "leftovers keep the JSON panel, and a call with no language arg is unchanged"
+    )
+    code = js[js.index("function _codePanel") : js.index("const _ARG_LANGUAGES")]
+    assert "code.textContent = text" in code, "the command text is set verbatim — never re-escaped"
+    assert "enhanceCodeBlocks(" in code, "the shared pass adds the copy button"
+
+
+def test_a_language_arg_is_only_taken_when_it_is_a_non_empty_string():
+    """`{command: ""}` / `{command: {…}}` must fall back to the JSON panel
+    rather than render an empty or `[object Object]` code block."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _argsPanels") : js.index("function _toolCallId")]
+    assert 'typeof value !== "string" || value.trim() === ""' in fn
 
 
 def test_mcp_envelope_unwraps_to_its_payload():

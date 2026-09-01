@@ -3618,6 +3618,61 @@ function _jsonPanel(label, value, className) {
   return panel;
 }
 
+/** A code panel for one arg that IS a language — a shell command line, a SQL
+ *  statement — in its own language, at full length, with the shared copy
+ *  button. */
+function _codePanel(label, text, language, className) {
+  const panel = document.createElement("div");
+  panel.className = className;
+  const lab = document.createElement("div");
+  lab.className = "cloud-chat-tool-panel-label";
+  lab.textContent = label;
+  panel.appendChild(lab);
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.className = `language-${language}`;
+  code.textContent = text;
+  pre.appendChild(code);
+  panel.appendChild(pre);
+  enhanceCodeBlocks(panel);
+  return panel;
+}
+
+//: The args a tool takes that are a LANGUAGE rather than a value, and the
+//: language each one is. These two are what a reader opens a step FOR, so they
+//: get a code panel of their own; everything else is a value and stays JSON.
+const _ARG_LANGUAGES = { command: ["Command", "bash"], sql: ["SQL", "sql"] };
+
+/** The card body's account of what the tool was ASKED to do, as one or two
+ *  panels.
+ *
+ *  Nearly every call in this product is a command line — the agent does its
+ *  data work through the agnes CLI inside Bash — and a command line inside a
+ *  JSON object is the worst of both: `{"command": "agnes query \"SELECT *
+ *  FROM orders\""}` makes the reader undo the escaping in their head to read
+ *  the SQL they opened the card for. So `command` / `sql` render as a code
+ *  block in their own language, unescaped and untruncated (the header shows
+ *  the same string, but clipped to a line — this is where the rest of a long
+ *  statement actually becomes readable).
+ *
+ *  Any REMAINING args still get the formatted-JSON panel, so nothing the tool
+ *  was passed is dropped from the record; a call with no language arg is
+ *  entirely unchanged. Still one click total either way — no nested toggle. */
+function _argsPanels(args) {
+  const panels = [];
+  const rest = { ...args };
+  for (const [key, [label, language]] of Object.entries(_ARG_LANGUAGES)) {
+    const value = args[key];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    panels.push(_codePanel(label, value, language, "cloud-chat-tool-args"));
+    delete rest[key];
+  }
+  if (panels.length === 0 || Object.keys(rest).length > 0) {
+    panels.push(_jsonPanel(panels.length ? "Other args" : "Args", rest, "cloud-chat-tool-args"));
+  }
+  return panels;
+}
+
 function _toolCallId(frame) {
   // Pair tool_call ↔ tool_result via the runner's dedicated tool_use_id:
   // frame.id is NOT usable — the server's frame envelope overwrites it
@@ -3625,35 +3680,6 @@ function _toolCallId(frame) {
   // so pairing on it left every tool block stuck on "running…" forever.
   // Fall back to id (pre-envelope runners) then tool name.
   return frame.tool_use_id || frame.id || frame.tool;
-}
-
-function _summarizeArgs(args) {
-  if (args == null) return "";
-  if (typeof args === "string") return args.length > 80 ? args.slice(0, 78) + "…" : args;
-  if (typeof args !== "object") return String(args);
-  const keys = Object.keys(args);
-  if (keys.length === 0) return "";
-  // Heuristic: prefer the SQL arg if present (run_query, agnes query)
-  // — that's what the user actually wants to see. Otherwise show the
-  // first scalar value or a "k=v, k=v" sketch.
-  if (typeof args.command === "string") {
-    const cmd = args.command.replace(/\s+/g, " ").trim();
-    return cmd.length > 100 ? cmd.slice(0, 98) + "…" : cmd;
-  }
-  if (typeof args.sql === "string") {
-    const sql = args.sql.replace(/\s+/g, " ").trim();
-    return sql.length > 100 ? sql.slice(0, 98) + "…" : sql;
-  }
-  if (typeof args.table === "string") return args.table;
-  if (typeof args.name === "string") return args.name;
-  const parts = [];
-  for (const k of keys.slice(0, 3)) {
-    const v = args[k];
-    if (v == null) continue;
-    const text = typeof v === "object" ? JSON.stringify(v) : String(v);
-    parts.push(`${k}=${text.length > 30 ? text.slice(0, 28) + "…" : text}`);
-  }
-  return parts.join(", ");
 }
 
 // ---------- Tool labels -----------------------------------------------------
@@ -4176,9 +4202,17 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   }
   head.appendChild(name);
 
+  // Deliberately EMPTY of args. A collapsed step is one quiet line — a verb
+  // and an outcome — and the whole command on it was the single longest thing
+  // in a settled transcript: `agnes query "SELECT sum(total) FROM orders"` set
+  // beside every row of a six-step run is most of what made the trail feel
+  // crowded. The args live in the body, one click away (see _argsPanels).
+  //
+  // The element stays, because a FAILED call writes its diagnosis here
+  // (_setToolCardError): on an error the one thing worth a collapsed line is
+  // what went wrong, and that is the only thing this slot now ever holds.
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
-  summary.textContent = _summarizeArgs(args);
   head.appendChild(summary);
 
   if (status === "running") {
@@ -4205,11 +4239,11 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // its args sketch where its error should be.
   if (wrapIsError) _setToolCardError(wrap, result);
 
-  // Args — formatted JSON, visible the moment the card is expanded. The
-  // card header is the one click now; the old nested args toggle inside a
-  // collapsed card was two clicks to see what a tool was asked to do.
+  // Args — visible the moment the card is expanded. The card header is the
+  // one click now; the old nested args toggle inside a collapsed card was two
+  // clicks to see what a tool was asked to do.
   if (args && Object.keys(args).length > 0) {
-    wrap.appendChild(_jsonPanel("Args", args, "cloud-chat-tool-args"));
+    for (const panel of _argsPanels(args)) wrap.appendChild(panel);
   }
 
   // A replayed card's result, from the persisted part. Routed through the

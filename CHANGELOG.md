@@ -54,6 +54,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **A code panel inside a chat tool card wears the card's own surface.** The
+  panel rules already asked for it, but `.cloud-chat-messages details
+  pre.code-block-wrap` out-ranked them (0,2,2 vs 0,1,1) and repainted every
+  panel with the transcript's near-black code background — a dark slab dropped
+  into a light card, for what is usually one line of shell. The `--ds-code-*`
+  token family deliberately does not follow onto that surface (every value in
+  it is tuned for contrast against the dark one), so these panels are
+  unhighlighted by design.
 - **An answer that arrives as a document now reads like one.** Markdown
   headings in a chat answer had no styling of their own and fell through to
   the browser's defaults — `h1` at 2em (30px against a 15px body), `h2` at
