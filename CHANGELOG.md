@@ -15,6 +15,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **Chat session restore, part 2: a refresh mid-answer no longer loses the
+  reply, and a session deep link no longer looks like a silent new chat.**
+  `?session=` reached the address bar in the last round; the rest of the
+  restore lifecycle is what this fixes.
+  A turn that was cut off now ALWAYS leaves a row. The partial-save only ran
+  when the answer had already emitted text, so an answer interrupted while its
+  first tool call was still running persisted nothing at all — the session
+  dead-ended holding the question and no reply, which no later reload could
+  recover. It now saves whatever arrived (text, and the ordered tool calls that
+  did run) plus an `interrupted` marker the transcript renders as "this answer
+  was interrupted", so a stopped turn is legible instead of missing. The idle
+  reaper also stopped pausing a session mid-turn — pausing cancels the pump, so
+  it discarded the very answer the detach path has always waited for — and its
+  sandbox keepalive now covers a turn whose client has disconnected, which is
+  exactly the shape a mid-answer reload creates.
+  One submit can no longer persist two questions: the `user_msg` frame carries
+  an opaque per-submit id, and the manager's single ingress records it only
+  once the message is actually persisted — so a re-delivery of one submit is
+  dropped whole, while the wait-for-a-booting-sandbox retry that needs to
+  re-enter still works and a genuine re-ask is still its own turn.
+  The client is told when an answer is in progress: `POST
+  /sessions/{id}/ticket` reports `turn_in_flight`, and the `ready` frame
+  carries the attaching process's own verdict so a stale guess is corrected in
+  both directions. A reload mid-answer paints the spinner and the Stop button
+  before the socket is up, instead of five to ten seconds of a page that looks
+  idle — the silence that invited the second refresh behind the duplicated
+  questions.
+  A `?session=` deep link now takes the pre-conversation hero down
+  synchronously and starts its fetches before the sidebar's, keeps the param it
+  was opened from (it used to be stripped on entry and only restored a fetch
+  later, so a slow restore was indistinguishable from being dropped into a new
+  chat), and says so in the transcript when the conversation genuinely cannot
+  be opened rather than leaving the reader on the "Ask anything" page with no
+  error. A restored conversation opens at its newest message instead of at the
+  top.
 
 ### Removed
 
