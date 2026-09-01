@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 
+import pytest
 
 from src.db import get_system_db
 
@@ -1359,6 +1360,11 @@ class TestSourceAnchoredUpsert:
     triggers the typed 501 before any file is touched. End-to-end PG-backed
     behavior (stable-id matching, mapping upserts) lives in
     tests/db_pg/test_collections_upsert_pg.py."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
 
     def _create_and_grant(self, seeded_app, name: str = "Source Upsert Target"):
         c = seeded_app["client"]
