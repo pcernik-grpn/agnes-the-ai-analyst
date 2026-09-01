@@ -2092,40 +2092,42 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 }
 
 /* Next-action chips — the model's suggested follow-ups, lifted out of the
-   ```next_actions trailer and rendered under the latest answer only. */
+   ```next_actions trailer and rendered under the latest answer only.
+   
+   The CHIP itself is the landing screen's `.rdb-action` (chat_dashboard.css),
+   applied by chat.js rather than re-described here. It is the same offer in
+   both places — a question you can ask next — and describing it twice is what
+   let the two drift into visibly different components: 9px radius against
+   11px, an opaque surface against a translucent one, a hover that recoloured
+   the text against one that tinted the background. Only what is genuinely
+   different about this context lives below.
+
+   The row stays LEFT-aligned where the landing row centres: there it is a
+   hero above the composer, here it hangs off the end of an answer. */
 .cloud-chat-next-actions {
+  /* A COLUMN, one suggestion per line. Wrapped in a row they read as a
+     toolbar — a set of controls acting on the answer — where stacked and
+     left-aligned they read as what they are: alternative next questions, the
+     same shape as a list of choices. It also keeps a long suggestion from
+     making its neighbour look truncated. */
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  /* Far enough to read as its own offer rather than as the answer's last
+     line. 10px put it inside the paragraph rhythm it sits after. */
+  margin-top: var(--space-4);
 }
-.cloud-chat-next-action {
-  border: 1px solid var(--ds-border);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  /* --ds-radius-btn, not -pill: pill is badge language; these are labelled
-     buttons (design-system shape rule). */
-  border-radius: var(--ds-radius-btn);
-  padding: 4px 12px;
-  font-size: 0.85rem;
-  cursor: pointer;
-  text-align: left;
-}
-.cloud-chat-next-action:hover:not([disabled]) {
-  border-color: var(--ds-primary);
-  color: var(--ds-primary);
+.cloud-chat-next-actions-hd {
+  margin: 0 0 var(--space-1);
 }
 /* Drawn mid-stream: the follow-ups are on screen the moment the trailer
    closes, but the turn is still running and a click would submit into it.
-   Muted and inert until finalize re-renders the row enabled. */
-.cloud-chat-next-action[disabled] {
-  color: var(--ds-text-muted);
-  cursor: default;
-}
-.cloud-chat-next-action:focus-visible {
-  outline: var(--ds-focus-outline);
-  outline-offset: var(--ds-focus-outline-offset);
-}
+   The greying comes from `.rdb-action:disabled` with the rest of the chip —
+   this only stops the TITLE opting back out, since `.rdb-action-title` sets
+   its own colour and would otherwise stay full-strength inside a greyed
+   button. */
+.cloud-chat-next-action[disabled] .rdb-action-title { color: inherit; }
 
 .cloud-chat-capabilities-footer {
   margin-top: var(--space-1);

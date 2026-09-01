@@ -54,6 +54,22 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **Suggested follow-ups are a labelled column, not an unlabelled row.** They
+  stack one per line under a "Suggested actions" heading — wrapped into a row
+  they read as a toolbar acting on the answer, where stacked they read as what
+  they are: alternative next questions.
+- **The follow-up chips under an answer are the landing screen's suggestion
+  chip, not a lookalike.** Both offer the same thing — a question you can ask
+  next — and they had been described separately, which let them drift into two
+  visibly different components: 9px radius against 11px, an opaque surface
+  against a translucent one, no leading icon against one, and a hover that
+  recoloured the text against one that tinted the background. The answer's
+  chips now apply `.rdb-action` itself, so they cannot drift again, and the
+  row sits 16px below the answer instead of 10px, where it read as the last
+  line of the message rather than as its own offer. Making them match surfaced
+  that the LANDING chip was the one breaking the design-system shape rule (a
+  hand-set `11px` where every labelled button wears `--ds-radius-btn`), so it
+  moved onto the token rather than the rule being dropped to accommodate it.
 - **The SOURCES row says each thing once.** Three repetitions turned an
   answer's provenance into noise. Every chip spelled its CATEGORY as a word,
   so five cited tables meant reading "table" five times — it is a glyph now,

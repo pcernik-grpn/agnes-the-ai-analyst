@@ -879,11 +879,34 @@ function renderNextActions(bubble, actions, pending = false) {
   if (!bubble || !actions || actions.length === 0) return;
   const row = document.createElement("div");
   row.className = "cloud-chat-next-actions";
+  // Named, like the landing screen's row and like SOURCES beside it: a bare
+  // stack of buttons under an answer does not say whose suggestions they are
+  // or that they are optional. Reuses the landing row's own heading class so
+  // the two rows are labelled in one voice.
+  const heading = document.createElement("p");
+  heading.className = "rdb-actions-hd cloud-chat-next-actions-hd";
+  heading.textContent = "Suggested actions";
+  row.appendChild(heading);
   for (const action of actions) {
+    // Built as the landing screen's own suggestion chip (`.rdb-action`, see
+    // chat_dashboard.css) rather than as a lookalike: these are the same
+    // offer — a question you can ask next — and they were reading as two
+    // different components, one at the top of the page and one under every
+    // answer. Reusing the class means they cannot drift apart again, and
+    // `.cloud-chat-next-action` is left holding only what is genuinely
+    // different here: the mid-stream disabled state below.
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "cloud-chat-next-action";
-    btn.textContent = action;
+    btn.className = "rdb-action cloud-chat-next-action";
+    const icon = document.createElement("span");
+    icon.className = "rdb-action-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.appendChild(iconEl("arrow-right"));
+    btn.appendChild(icon);
+    const label = document.createElement("span");
+    label.className = "rdb-action-title";
+    label.textContent = action;
+    btn.appendChild(label);
     // `pending` is the mid-stream draw: the trailer has closed but the turn
     // has not. Showing the row there is the point — the reader learns the
     // follow-ups exist while the tail is still arriving — but CLICKING it

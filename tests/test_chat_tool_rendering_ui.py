@@ -122,15 +122,26 @@ def test_history_reload_restores_chips_only_when_the_answer_is_the_tail():
     )
 
 
-def test_next_action_chip_styles_use_ds_tokens():
+def test_next_action_chips_are_the_landing_chip_not_a_lookalike():
+    """The follow-ups under an answer and the "Suggested for you" chips on the
+    landing screen are the same offer — a question you can ask next — and were
+    two visibly different components: 9px radius against 11px, an opaque
+    surface against a translucent one, a hover that recoloured the text against
+    one that tinted the background. The answer's chips now ARE the landing
+    chip (`.rdb-action`), applied rather than re-described, so they cannot
+    drift apart again."""
+    js = _read(CHAT_JS)
+    assert 'btn.className = "rdb-action cloud-chat-next-action"' in js
+    assert 'label.className = "rdb-action-title"' in js, "the chip's own label class, so the type matches too"
+
+    # Only the genuinely-different bits may remain local: the mid-stream
+    # disabled state and the row's placement under an answer.
     css = _read(CHAT_CSS)
-    assert ".cloud-chat-next-actions" in css
-    block = css[css.index(".cloud-chat-next-action {") :]
+    block = css[css.index(".cloud-chat-next-actions {") :]
     block = block[: block.index("}")]
-    assert "var(--ds-radius-btn)" in block, (
-        "a labelled button wears --ds-radius-btn — the design system reserves pill for badges"
-    )
-    assert "--ds-radius-pill" not in block
+    assert "margin-top:" in block
+    for prop in ("border-radius", "background", "padding"):
+        assert prop not in block, f"`{prop}` re-describes the chip instead of reusing it"
 
 
 def test_the_prompt_mandates_the_next_actions_trailer():
@@ -855,12 +866,18 @@ def test_errors_and_cancels_reach_the_transcript():
     assert "textContent" in body and ".innerHTML" not in body
 
 
-def test_next_action_chips_wear_the_button_radius():
+def test_suggestion_chips_wear_the_button_radius():
     """Design-system shape rule: pill radius is badge language; every labelled
-    button wears --ds-radius-btn. (Devin Review on this PR.)"""
-    css = _read(CHAT_CSS)
-    rule = css[css.index(".cloud-chat-next-action {") : css.index(".cloud-chat-next-action:hover")]
-    assert "var(--ds-radius-btn)" in rule
+    button wears --ds-radius-btn. (Devin Review on #1974.)
+
+    Asserted where the shape now lives. Making the answer's follow-ups match
+    the landing chip surfaced that the LANDING one was the rule-breaker — a
+    hand-set 11px — so it moved onto the token rather than the rule being
+    dropped to accommodate it."""
+    dash = Path("app/web/static/css/chat_dashboard.css").read_text(encoding="utf-8")
+    rule = dash[dash.index(".rdb-action {") :]
+    rule = rule[: rule.index("}")]
+    assert "border-radius: var(--ds-radius-btn);" in rule
     assert "radius-pill" not in rule
 
 
