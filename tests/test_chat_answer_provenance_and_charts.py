@@ -400,6 +400,16 @@ def test_the_sandbox_image_carries_matplotlib():
     assert "matplotlib>=" in body, f"{DOCKER_SANDBOX} must bake matplotlib in"
 
 
+def test_the_sandbox_image_carries_the_curated_office_package_allowlist():
+    """A curated skill that authors a deck/document/workbook has the same
+    problem matplotlib had: under `docker_egress_mode: none` nothing can
+    install its `requirements.txt` at runtime (#1977), so the three packages
+    must be baked into the image instead."""
+    body = _read(DOCKER_SANDBOX)
+    for pkg in ("python-pptx>=", "python-docx>=", "openpyxl>="):
+        assert pkg in body, f"{DOCKER_SANDBOX} must bake {pkg.rstrip('>=')} in"
+
+
 def test_the_contract_label_matches_what_the_docs_tell_operators_to_expect():
     """The operator note in docs/cloud-chat.md tells the reader to rebuild the
     sandbox image after upgrading Agnes and confirm the new contract with

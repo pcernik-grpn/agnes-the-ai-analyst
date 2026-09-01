@@ -281,6 +281,39 @@
     });
   }
 
+  // ---- "N archived" — the control behind the count ---------------------
+  // The default view excludes archived conversations, so the count reads
+  // "7 of 27" with nothing next to it to act on: twenty chats that are put
+  // away look exactly like twenty chats that are lost, and the only way
+  // through was a segment button inside the Filter menu (#1974). This puts
+  // the way in beside the number that raises the question.
+  //
+  // Shown while the VIEW is what is hiding rows — which stays true with a
+  // facet applied, so it is not conditioned on that. Not during a search:
+  // a search already looks in every view (filter_toolbar.js
+  // `searchSpansSegments`), so there would be nothing left to offer.
+  function syncHiddenNote() {
+    var btn = document.getElementById("ch-show-archived");
+    if (!btn) return;
+    var search = document.getElementById("ch-search");
+    var searching = !!(search && (search.value || "").trim());
+    var active = document.querySelector("#ch-seg .fbar-seg__btn.is-active");
+    var view = (active && active.getAttribute("data-own")) || "all";
+    var archived = rows().filter(function (r) {
+      return (r.dataset.buckets || "").split("|").indexOf("archived") !== -1;
+    }).length;
+    var show = view === "all" && !searching && archived > 0;
+    btn.hidden = !show;
+    if (show) btn.textContent = "Show " + archived + " archived";
+  }
+
+  var showArchivedBtn = document.getElementById("ch-show-archived");
+  if (showArchivedBtn) {
+    showArchivedBtn.addEventListener("click", function () {
+      if (toolbar && toolbar.setSegment) toolbar.setSegment("archived");
+    });
+  }
+
   // ---- Segment badge counts -------------------------------------------
   // The UNFILTERED tally per segment, matching how the Filter menu's category
   // options count. Recomputed from the rows' own bucket sets after any action, so
@@ -296,6 +329,10 @@
       var el = document.querySelector('[data-seg-count="' + key + '"]');
       if (el) el.textContent = String(counts[key]);
     });
+    // Same tally, other readout: archiving the last unarchived chat has to move
+    // the "Show N archived" control too, or it reports a number that has moved
+    // on without it.
+    syncHiddenNote();
   }
 
   // ---- Selection + bulk bar -------------------------------------------
@@ -599,7 +636,12 @@
       // Non-exclusive segments over a pipe-separated set — a chat can be pinned
       // AND shared, and `all` is a real token so archived rows stay out of every
       // view but their own (see `segments.multi` in filter_toolbar.js).
-      segments: { container: "#ch-seg", attr: "data-buckets", multi: true },
+      // `searchSpansSegments`: a search looks in EVERY view, not just the one
+      // showing. Without it an archived conversation was unreachable twice
+      // over — absent from the default list AND invisible to a search for its
+      // own title, which is how a chat from the same morning became impossible
+      // to reopen (#1974). The facets still apply: those the user set.
+      segments: { container: "#ch-seg", attr: "data-buckets", multi: true, searchSpansSegments: true },
       facets: [
         { key: "agent", attr: "data-agent", label: "Agent" },
         { key: "surface", attr: "data-surface", label: "Source" },
@@ -643,6 +685,7 @@
         // survive invisibly (see syncSelection).
         syncSelection();
         syncFilterView();
+        syncHiddenNote();
       },
     });
   }
@@ -650,4 +693,5 @@
   updateSegmentCounts();
   syncSelection();
   syncFilterView();
+  syncHiddenNote();
 })();

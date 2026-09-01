@@ -2,6 +2,7 @@
 
 Commands:
   create  --name ... [--description ...] [--json]
+  edit    <id> [--name ...] [--description ...] [--slug ...] [--json]
   list    [--json]
   show    <id>       [--json]
   upload    <id> <path...>   (multipart POST per file)
@@ -22,6 +23,7 @@ from cli.v2_client import (
     V2ClientError,
     api_delete,
     api_get_json,
+    api_patch_json,
     api_post_json,
     api_post_multipart,
 )
@@ -51,7 +53,7 @@ def create_collection(
     slug: Optional[str] = typer.Option(None, "--slug", help="URL-safe slug (auto-generated if omitted)"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """Create a new file collection (admin only)."""
+    """Create a new file collection (any signed-in user; you own what you create)."""
     payload: dict = {"name": name}
     if description is not None:
         payload["description"] = description
@@ -73,6 +75,64 @@ def create_collection(
     if body.get("visibility"):
         line += f"  visibility={body['visibility']}"
     typer.echo(line)
+
+
+# ---------------------------------------------------------------------------
+# edit
+# ---------------------------------------------------------------------------
+
+
+@collections_app.command("edit")
+def edit_collection(
+    collection_id: str = typer.Argument(..., help="Collection id (col_...) from `collections list`"),
+    name: Optional[str] = typer.Option(None, "--name", help="New display name"),
+    description: Optional[str] = typer.Option(
+        None,
+        "--description",
+        "-d",
+        help='New description; pass an empty string ("") to clear it',
+    ),
+    slug: Optional[str] = typer.Option(
+        None, "--slug", help="New URL slug (normalised to [a-z0-9-]); changes the /library/<slug> URL"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+):
+    """Edit a collection's name, description or slug (owner or admin).
+
+    Only the options you pass are changed — anything omitted is left alone.
+    Renaming does NOT move the slug, so links already handed out keep working;
+    pass --slug as well when you want the URL to follow the name.
+    """
+    payload: dict = {}
+    # Presence, not truthiness: `--description ""` is a deliberate clear, and
+    # dropping it here would make that the one edit the CLI cannot express.
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if slug is not None:
+        payload["slug"] = slug
+    if not payload:
+        typer.echo(
+            "Nothing to change. Pass at least one of --name, --description, --slug "
+            f"— e.g. agnes collections edit {collection_id} --name 'Q3 contracts'",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        body = api_patch_json(f"/api/collections/{collection_id}", payload)
+    except V2ClientError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    if as_json:
+        typer.echo(json_lib.dumps(body, indent=2, default=str))
+        return
+    typer.echo(
+        f"Updated: id={body['id']}  slug={body.get('slug', '')}  name={body['name']}"
+        f"  changed={','.join(sorted(payload))}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +382,7 @@ def remove_collection(
     collection_id: str = typer.Argument(..., help="Collection ID to delete"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
-    """Soft-delete a collection (admin only)."""
+    """Soft-delete a collection (owner or admin)."""
     if not yes:
         confirmed = typer.confirm(f"Delete collection {collection_id}?")
         if not confirmed:

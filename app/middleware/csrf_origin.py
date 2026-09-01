@@ -47,8 +47,19 @@ from urllib.parse import urlsplit
 from starlette.requests import Request
 
 # Only unsafe (state-changing) methods are gated. GET/HEAD/OPTIONS/TRACE are
-# safe and must never be blocked (and there are no state-changing GET routes —
-# an invariant the security playbook already requires).
+# safe and must never be blocked.
+#
+# This used to add "and there are no state-changing GET routes — an invariant
+# the security playbook already requires". The requirement stands; the claim
+# that it HOLDS did not, and stating it as fact is how the next reader stops
+# looking. At least two GETs carry writes today: the MCP OAuth connect
+# authorize/callback pair (`app/api/mcp_oauth_connect.py`, which parks an
+# upstream credential) and `GET /api/sync/manifest` (`app/api/sync.py`, which
+# stamps `users.last_pull_at` and emits a usage event). Both predate this
+# comment. Anything relying on "a GET cannot mutate" must therefore prove it
+# for the route in hand rather than inherit it from here — the read-only
+# view-as guard is the worked example: it refuses by method and then covers
+# the mutating GETs one by one at their own call sites.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Reverse-proxied data-app content (`/apps/<slug>/...`, 3+ path segments,

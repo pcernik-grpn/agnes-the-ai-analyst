@@ -606,13 +606,11 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     pins (env-lock honesty) rather than whatever `instance.yaml` happens to
     hold underneath it.
 
-    Every reader resolves env-first (`app.worker.kinds
-    ._extraction_producer_argv` for the two leaves below; the connector's
-    `enabled` state itself lives on the separate `sharepoint` switch, not
-    here — see `app.switches.switch_value`), so a stale/absent yaml value
-    under an active pin would otherwise render a value the runtime does not
-    actually use — for a field the operator cannot act on here anyway, that
-    is worse than showing the truth.
+    Currently a no-op body: `_EXTRACTION_ENV_LOCKS` above is empty, since
+    the external-producer leaves it used to cover were removed along with
+    external-producer mode (the connector's `enabled` state lives on the
+    separate `sharepoint` switch — see `app.switches.switch_value`). Kept
+    as the mechanism a future locked `extraction.*` leaf slots back into.
     """
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):
@@ -1802,13 +1800,17 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "options": ["mandatory_only", "admin_curated", "hybrid"],
             "default": "hybrid",
             "hint": (
-                "How knowledge reaches users. mandatory_only = admin-only; "
-                "admin_curated = admin + user voting as feedback; "
-                "hybrid = default (mandatory from admin + optional from user "
-                "voting). NOT YET ENFORCED (#1573): GET /api/memory/bundle "
-                "currently ships every approved item to every user in all "
-                "three modes — changing this value has no effect on "
-                "distribution yet, only on what this field records."
+                "How OPTIONAL (approved, non-required) items reach a user's "
+                "bundle/sync. Required (mandatory) items always reach their "
+                "target audience in every mode — this only ever narrows the "
+                "optional channel. mandatory_only / admin_curated = no "
+                "optional channel at all (admin_curated's voting is a "
+                "feedback signal for admins, not a distribution trigger); "
+                "hybrid = default — an approved item also reaches a caller "
+                "who has personally upvoted it. Enforced (#1573) at "
+                "GET /api/memory/bundle, the per-domain markdown `agnes pull` "
+                "writes, and the sync-manifest md5 — all three call the same "
+                "predicate (select_distributable_items in app/api/memory.py)."
             ),
         },
         "approval_mode": {
@@ -1837,7 +1839,11 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         "review_period_months": {
             "kind": "int",
             "default": 6,
-            "hint": "How often approved/mandatory items are flagged for re-review (months).",
+            "hint": (
+                "How often approved/mandatory items are flagged for "
+                "re-review (months). Not yet wired (#1971) — no scheduled "
+                "job reads this value or moves items to an expired state yet."
+            ),
         },
         "notify_on_new_items": {
             "kind": "bool",
@@ -1850,6 +1856,13 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "fields": {
                 "claude_local_md": {
                     "kind": "object",
+                    "hint": (
+                        "Not yet wired (#1971): the nightly collector "
+                        "(services/corporate_memory/collector.py) always runs "
+                        "regardless of enabled, and always scores items from "
+                        "corporate_memory.confidence.base['claude_local_md'] "
+                        "below, not confidence_base here."
+                    ),
                     "fields": {
                         "enabled": {"kind": "bool", "default": True},
                         "confidence_base": {
@@ -1862,12 +1875,35 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "session_transcripts": {
                     "kind": "object",
                     "fields": {
-                        "enabled": {"kind": "bool", "default": True},
-                        "confidence_base": {"kind": "float", "default": 0.60},
+                        "enabled": {
+                            "kind": "bool",
+                            "default": True,
+                            "hint": (
+                                "Live: read fresh on every verification-processor "
+                                "run (every cadence_minutes=15) — false skips "
+                                "session-transcript extraction entirely for that "
+                                "run. No restart needed."
+                            ),
+                        },
+                        "confidence_base": {
+                            "kind": "float",
+                            "default": 0.60,
+                            "hint": (
+                                "Not yet wired (#1971): extracted items are scored "
+                                "from corporate_memory.confidence.base"
+                                "['user_verification.<detection_type>'] below, "
+                                "not this value."
+                            ),
+                        },
                         "max_turns_per_session": {
                             "kind": "int",
                             "default": 100,
-                            "hint": "Truncate transcripts longer than this many turns.",
+                            "hint": (
+                                "Not yet wired (#1971): the transcript truncation "
+                                "window is the hardcoded MAX_TURNS_PER_SESSION "
+                                "constant in services/verification_detector/"
+                                "detector.py (100), not this value."
+                            ),
                         },
                         "detection_types": {
                             "kind": "array",
@@ -1877,7 +1913,12 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                                 "confirmation",
                                 "unprompted_definition",
                             ],
-                            "hint": ("Which extraction patterns to detect. Each entry is a detection-type tag."),
+                            "hint": (
+                                "Live: read fresh on every verification-processor "
+                                "run. Extracted items whose detection_type is not "
+                                "in this list are dropped before dedup/insert. No "
+                                "restart needed."
+                            ),
                         },
                     },
                 },
@@ -1885,6 +1926,12 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         },
         "extraction": {
             "kind": "object",
+            "hint": (
+                "Not yet wired (#1971): the collector and verification "
+                "processor both build their LLM extractor from the top-level "
+                "ai.* section, and both call their sensitivity/contradiction "
+                "checks unconditionally — none of these three fields is read."
+            ),
             "fields": {
                 "model": {
                     "kind": "string",
@@ -1980,6 +2027,12 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         },
         "entity_resolution": {
             "kind": "object",
+            "hint": (
+                "Not yet wired (#1971): no extraction or resolution path "
+                "reads this section yet — entity names are extracted "
+                "freeform per item (services/verification_detector/schemas.py "
+                "`entities`), not matched against this vocabulary."
+            ),
             "fields": {
                 "enabled": {"kind": "bool", "default": True},
                 "entities": {

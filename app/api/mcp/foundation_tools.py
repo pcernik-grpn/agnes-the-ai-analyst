@@ -100,6 +100,12 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "collection_get",
     "collections_search",
     "collection_file_read",
+    # The ONE collection WRITE tool (editable metadata only). Triple-surface
+    # with PATCH /api/collections/{id} + `agnes collections edit`. Deliberately
+    # narrow: create/upload/delete stay off the agent surface — a renamed
+    # collection is reversible and audited, a deleted one is neither, and a
+    # prompt-injected turn must not be able to reach the destructive half.
+    "collection_update",
     "knowledge_search",
     "glossary_search",
     # Open semantic-layer contract (Task 12) — read-only search + get over
@@ -915,6 +921,50 @@ def register_foundation_tools(
             r = await c.post(
                 f"{base_url}/api/collections/{collection_id}/files/{file_id}/reingest",
                 json={},
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def collection_update(
+        collection_id: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Rename a Collection or rewrite its description (owner or admin only).
+
+        For tidying a library from chat: a collection created from a file drop
+        is named after the file, and "call this one Q3 supplier contracts and
+        describe what is in it" is the fix. Only metadata changes — the files
+        inside are untouched, and there is deliberately no tool here that
+        creates, uploads into or deletes a collection (use the Library UI or
+        `agnes collections`).
+
+        Omit an argument to leave that field alone; pass ``description=""`` to
+        clear the description. Answers 403 unless you OWN the collection (a
+        group grant conveys reading, not renaming), 409 when the collection is
+        fed by a source connection, and 400 when neither field is given.
+
+        The collection keeps its URL slug — renaming does not move
+        ``/library/{slug}`` — so links already handed to somebody keep working.
+
+        Args:
+            collection_id: Collection id from ``collections_list`` (``col_...``).
+            name: New display name. Omit to keep the current one.
+            description: New description; ``""`` clears it. Omit to keep it.
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            # "" is a deliberate clear; the REST layer maps it to NULL.
+            body["description"] = description
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(
+                f"{base_url}/api/collections/{collection_id}",
+                json=body,
                 headers=headers_fn(),
                 timeout=30,
             )

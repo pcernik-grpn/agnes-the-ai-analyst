@@ -142,6 +142,53 @@ def test_get_running_returns_only_this_connections_live_run(pg_engine, monkeypat
     assert repo.get_running("conn_a") is None
 
 
+def test_abandon_stale_running_closes_every_running_row_for_the_connection(pg_engine, monkeypatch):
+    """A worker that dies mid-crawl leaves its row `running` forever unless
+    something closes it. The production symptom this guards: two zombie
+    rows for the same connection, both `running`, neither ever finalized."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    zombie1 = repo.start(connection_id="conn_a")
+    repo.checkpoint(zombie1, files_seen=61, files_done=61, progress={"new": 61})
+    zombie2 = repo.start(connection_id="conn_a")
+    other_conn_run = repo.start(connection_id="conn_b")
+
+    abandoned = repo.abandon_stale_running("conn_a")
+
+    assert set(abandoned) == {zombie1, zombie2}
+
+    row1 = repo.get(zombie1)
+    assert row1["status"] == "interrupted"
+    assert row1["report"]["interrupted"] is True
+    assert row1["report"]["interrupted_reason"] == "abandoned"
+    assert row1["finished_at"] is not None
+    assert row1["error"]
+    # The dead run's own progress is preserved, not lost or overwritten.
+    assert row1["files_done"] == 61
+
+    row2 = repo.get(zombie2)
+    assert row2["status"] == "interrupted"
+    assert row2["report"]["interrupted_reason"] == "abandoned"
+
+    # A different connection's live run is never touched.
+    assert repo.get(other_conn_run)["status"] == "running"
+
+
+def test_abandon_stale_running_is_a_no_op_with_nothing_to_close(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.abandon_stale_running("conn_never_run") == []
+
+
+def test_abandon_stale_running_never_touches_an_already_finished_row(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    done = repo.start(connection_id="conn_a")
+    repo.finish(done, status="done", report={"new": 3})
+
+    assert repo.abandon_stale_running("conn_a") == []
+    row = repo.get(done)
+    assert row["status"] == "done"
+    assert row["report"] == {"new": 3}
+
+
 def test_last_completed_ignores_live_and_failed_runs(pg_engine, monkeypatch):
     """The card's "last run" figures come from a run that actually ended and
     has counters — never from a failed row that has none."""

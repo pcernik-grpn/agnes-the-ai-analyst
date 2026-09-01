@@ -72,6 +72,16 @@ _ERROR_MESSAGES = {
     "parent_has_no_main": "This app's repo has no `main` branch yet — push something before creating a draft.",
     "parent_not_found": "This draft's parent app no longer exists on the server.",
     "path_not_allowed": "That path isn't reachable from here.",
+    # Deploy-time exposure scan (#1946). "deploy_check_failed" itself is
+    # handled specially in `deploy_app` (it prints the findings, not this
+    # generic message) — this entry only covers it reaching `_fail` some
+    # other way (e.g. `--json`-less scripting against a raw response).
+    "deploy_check_failed": "The deploy check found issues that block deployment in 'block' mode.",
+    "deploy_check_unavailable_external_repo": (
+        "This app's source lives outside Agnes, so it can't be scanned — and this server's"
+        " data_apps.deploy_checks is set to 'block', which refuses a deploy it can't scan."
+        " Ask an admin to switch it to 'warn' (or 'off') for external-repo apps."
+    ),
 }
 
 
@@ -106,6 +116,11 @@ def _detail(resp) -> str:
     except Exception:
         return resp.text
     detail = body.get("detail", "") if isinstance(body, dict) else str(body)
+    if isinstance(detail, dict):
+        # Deploy-time exposure scan (#1946): a structured `{"error": ...}`
+        # detail rather than a bare string — look up the code, findings (if
+        # any) are printed separately by the caller.
+        detail = detail.get("error", "")
     if isinstance(detail, str) and detail.startswith(_RUNNER_ERROR_PREFIX):
         code = detail[len(_RUNNER_ERROR_PREFIX) :]
         hint = _RUNNER_HINTS.get(code)
@@ -116,6 +131,18 @@ def _detail(resp) -> str:
 def _fail(resp) -> None:
     typer.echo(f"Failed: {_detail(resp)}", err=True)
     raise typer.Exit(1)
+
+
+def _print_deploy_check(report: Optional[dict]) -> None:
+    """Human-readable deploy-check findings — rule id, `file:line`, message.
+    Silent when there's nothing to say: no report, a `pass`, or `skipped`."""
+    if not report or not report.get("findings"):
+        return
+    for finding in report["findings"]:
+        loc = finding.get("file", "")
+        if finding.get("line"):
+            loc = f"{loc}:{finding['line']}"
+        typer.echo(f"  [{finding.get('rule_id', '?')}] {loc}: {finding.get('message', '')}")
 
 
 def _not_found(slug: str) -> None:
@@ -297,6 +324,17 @@ def deploy_app(
     resp = api_post(f"/api/data-apps/{slug}/deploy", json=payload)
     if resp.status_code == 404:
         _not_found(slug)
+    if resp.status_code == 422:
+        try:
+            detail = resp.json().get("detail")
+        except Exception:
+            detail = None
+        # Deploy-time exposure scan (#1946) in `block` mode: print the
+        # findings that caused the refusal, not just the generic message.
+        if isinstance(detail, dict) and detail.get("error") == "deploy_check_failed":
+            typer.echo(f"Failed: {_ERROR_MESSAGES['deploy_check_failed']}", err=True)
+            _print_deploy_check(detail.get("deploy_check"))
+            raise typer.Exit(1)
     if resp.status_code != 200:
         _fail(resp)
 
@@ -306,6 +344,7 @@ def deploy_app(
         return
 
     typer.echo(f"State: {body.get('state', '')}  deployed_sha={body.get('deployed_sha', '')}")
+    _print_deploy_check(body.get("deploy_check"))
 
 
 # ---------------------------------------------------------------------------

@@ -325,6 +325,197 @@ class TestGetCollection:
         assert resp.status_code == 404
 
 
+class TestUpdateCollection:
+    """PATCH /api/collections/{id} — the editable metadata (name, slug,
+    description). Owner-or-admin, deliberately NOT every grant-holder: a
+    grant conveys reading, and renaming somebody's collection out from under
+    them is not a read."""
+
+    def _own(self, seeded_app, name="Analyst Upload", description=None):
+        """A collection OWNED by the analyst (created with their own token)."""
+        c = seeded_app["client"]
+        body = {"name": name}
+        if description is not None:
+            body["description"] = description
+        cr = c.post("/api/collections", json=body, headers=_auth(seeded_app["analyst_token"]))
+        assert cr.status_code == 201, cr.text
+        return cr.json()["id"]
+
+    def test_owner_renames_own_collection(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Old Name")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Q3 Supplier Contracts"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "Q3 Supplier Contracts"
+        # …and it stuck.
+        reread = c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).json()
+        assert reread["name"] == "Q3 Supplier Contracts"
+
+    def test_rename_does_not_move_the_slug(self, seeded_app):
+        """The slug is this collection's URL. Re-deriving it from a new name
+        would break every /library/{slug} link already handed out, so a rename
+        alone leaves it alone."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Keeps Its Url")
+        before = c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).json()["slug"]
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Totally Different"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["slug"] == before
+
+    def test_admin_may_edit_someone_elses_collection(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Analyst Owned")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": "Curated by an admin."},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "Curated by an admin."
+
+    def test_a_mere_grant_holder_gets_403(self, seeded_app):
+        """The regression this gate exists for: read access is not write
+        access. The caller here can open the collection and search it."""
+        c = seeded_app["client"]
+        cr = c.post(
+            "/api/collections",
+            json={"name": "Shared Not Owned"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        cid = cr.json()["id"]
+        _seed_collection_grant(cid, "analyst1")
+        # Precondition: the grant really does convey reading.
+        assert c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).status_code == 200
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Renamed By A Grantee"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "collection_not_owned"
+
+    def test_description_null_clears_it(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Has Desc", description="something")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": None},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] is None
+
+    def test_empty_string_description_clears_it_too(self, seeded_app):
+        """What an HTML textarea sends when the reader empties it."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Textarea Clear", description="something")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": "   "},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] is None
+
+    def test_omitted_description_survives_a_rename(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Keep Desc", description="keep me")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Renamed Only"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "keep me"
+
+    def test_slug_is_normalised(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Slug Patch")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"slug": "My New Slug!"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["slug"] == "my-new-slug"
+
+    def test_slug_collision_is_409(self, seeded_app):
+        c = seeded_app["client"]
+        first = self._own(seeded_app, name="Slug Taken")
+        taken = c.get(f"/api/collections/{first}", headers=_auth(seeded_app["analyst_token"])).json()["slug"]
+        second = self._own(seeded_app, name="Wants That Slug")
+        resp = c.patch(
+            f"/api/collections/{second}",
+            json={"slug": taken},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"].startswith("collection_slug_conflict:")
+
+    def test_no_known_field_is_400(self, seeded_app):
+        """A client that meant to change something and named nothing has a
+        bug; answering 200 would hide it."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Nothing To Do")
+        for body in ({}, {"origin": "generated"}):
+            resp = c.patch(
+                f"/api/collections/{cid}",
+                json=body,
+                headers=_auth(seeded_app["analyst_token"]),
+            )
+            assert resp.status_code == 400, resp.text
+            assert "collection_nothing_to_update" in resp.json()["detail"]
+
+    def test_a_collection_cannot_be_left_nameless(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Named")
+        blank = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "   "},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert blank.status_code == 400
+        assert "collection_name_empty" in blank.json()["detail"]
+        # An explicit null is the same mistake in JSON clothing.
+        nulled = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": None},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert nulled.status_code == 400
+
+    def test_missing_collection_is_404(self, seeded_app):
+        resp = seeded_app["client"].patch(
+            "/api/collections/col_does_not_exist",
+            json={"name": "Ghost"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 404
+
+    def test_deleted_collection_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Deleted Then Edited")
+        assert c.delete(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).status_code == 204
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Resurrected"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 404
+
+    def test_unauthenticated_is_401(self, seeded_app):
+        resp = seeded_app["client"].patch("/api/collections/col_x", json={"name": "N"})
+        assert resp.status_code == 401
+
+
 class TestDeleteCollection:
     def test_admin_soft_deletes(self, seeded_app):
         c = seeded_app["client"]
@@ -1865,26 +2056,21 @@ class TestTieredAudienceDocumentText:
         return cid, top_group
 
     def _upload(self, seeded_app, cid: str, filename: str, body: bytes, ctype: str) -> str:
-        """Uploads ride the PRODUCER's scoped credential: the collection is
-        scope-managed (`_tiered_collection` references it from
-        `config.scopes`), so an interactive upload is 409
-        `collection_source_managed` by design — audience-tiered documents
-        only ever arrive through the pipeline."""
-        from app.api.collections import source_managing_connection
-        from app.auth.producer_token import mint_producer_token
+        """A scope-managed collection (`_tiered_collection` references it
+        from `config.scopes`) accepts documents ONLY through the in-process
+        pipeline — an interactive upload is 409 `collection_source_managed`
+        by design, and the external producer's HTTP credential no longer
+        exists. Simulate the pipeline by suspending the integrity rule for
+        this one request; the refusal itself is covered by
+        `test_upload_into_source_managed_collection_is_409`."""
+        from unittest import mock
 
-        conn = source_managing_connection(cid)
-        if conn is None:
-            # Plain (unmanaged) collection — the interactive path is the
-            # normal one (`test_plain_collection_regression_unchanged`).
-            token = seeded_app["admin_token"]
-        else:
-            token = mint_producer_token(connection_id=conn["id"], collection_ids=[cid], ttl_seconds=3600)
-        r = seeded_app["client"].post(
-            f"/api/collections/{cid}/files",
-            files={"files": (filename, io.BytesIO(body), ctype)},
-            headers=_auth(token),
-        )
+        with mock.patch("app.api.collections.source_managing_connection", return_value=None):
+            r = seeded_app["client"].post(
+                f"/api/collections/{cid}/files",
+                files={"files": (filename, io.BytesIO(body), ctype)},
+                headers=_auth(seeded_app["admin_token"]),
+            )
         assert r.status_code in (200, 201, 422), r.text
         return r.json()[0]["file_id"]
 
@@ -2190,69 +2376,6 @@ class TestAutoShareAdminUploads:
         assert not self._everyone_grant_exists(body["id"])
 
 
-class TestProducerUploadAccess:
-    """A corpus-extraction producer's own scoped callback credential
-    (`ProducerPrincipal`, `app.auth.producer_token`) may upload into a
-    collection listed in its own `collection_ids` claim — every OTHER
-    collection route (list/delete/reingest/preview/raw) still 403s it,
-    since only `upload_files` uses `require_collection_write_or_producer_
-    access` instead of the plain `require_collection_access`."""
-
-    def _create_collection(self, seeded_app, name: str) -> str:
-        c = seeded_app["client"]
-        cr = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"]))
-        assert cr.status_code == 201, cr.text
-        return cr.json()["id"]
-
-    def _producer_token(self, collection_ids) -> str:
-        from app.auth.producer_token import mint_producer_token
-
-        return mint_producer_token(connection_id="conn1", collection_ids=list(collection_ids), ttl_seconds=3600)
-
-    def test_producer_uploads_into_its_own_scoped_collection(self, seeded_app):
-        c = seeded_app["client"]
-        corpus_id = self._create_collection(seeded_app, "Producer Scoped Upload")
-        token = self._producer_token([corpus_id])
-
-        resp = c.post(
-            f"/api/collections/{corpus_id}/files",
-            files={"files": ("notes.txt", io.BytesIO(b"hello world"), "text/plain")},
-            headers=_auth(token),
-        )
-        assert resp.status_code == 201, resp.text
-
-    def test_producer_upload_to_undeclared_collection_is_403(self, seeded_app):
-        c = seeded_app["client"]
-        corpus_id = self._create_collection(seeded_app, "Producer Undeclared")
-        # Token scoped to a DIFFERENT collection only.
-        token = self._producer_token(["some-other-collection"])
-
-        resp = c.post(
-            f"/api/collections/{corpus_id}/files",
-            files={"files": ("notes.txt", io.BytesIO(b"hello world"), "text/plain")},
-            headers=_auth(token),
-        )
-        assert resp.status_code == 403
-
-    def test_producer_cannot_list_files_of_its_own_scoped_collection(self, seeded_app):
-        """Scope is upload-only — GET .../files stays on the plain
-        `require_collection_access`, which never accepts a producer."""
-        c = seeded_app["client"]
-        corpus_id = self._create_collection(seeded_app, "Producer Read Denied")
-        token = self._producer_token([corpus_id])
-
-        resp = c.get(f"/api/collections/{corpus_id}/files", headers=_auth(token))
-        assert resp.status_code == 403
-
-    def test_producer_cannot_read_the_collection_itself(self, seeded_app):
-        c = seeded_app["client"]
-        corpus_id = self._create_collection(seeded_app, "Producer Detail Denied")
-        token = self._producer_token([corpus_id])
-
-        resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(token))
-        assert resp.status_code == 403
-
-
 class TestSourceManagedCollections:
     """A collection referenced by a source connection's confirmed scope is
     fed by that source's pipeline — an interactive upload into it is refused
@@ -2313,13 +2436,22 @@ class TestSourceManagedCollections:
         assert resp.status_code == 409, resp.text
         assert resp.json()["detail"]["error"] == "collection_source_managed"
 
-    def test_producer_upload_still_passes(self, seeded_app):
-        from app.auth.producer_token import mint_producer_token
-
-        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Producer", connection_id="conn-sm-3")
-        token = mint_producer_token(connection_id="conn-sm-3", collection_ids=[corpus_id], ttl_seconds=3600)
-        resp = self._upload(seeded_app, corpus_id, token)
-        assert resp.status_code == 201, resp.text
+    def test_admin_edit_of_a_source_managed_collection_is_409(self, seeded_app):
+        """Same integrity rule as the upload above, one step further: the name
+        and description are derived from the source scope, so an edit here
+        would be reverted by the next sync rather than kept."""
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Rename", connection_id="conn-sm-edit")
+        resp = seeded_app["client"].patch(
+            f"/api/collections/{corpus_id}",
+            json={"name": "Renamed By Hand"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "collection_source_managed"
+        assert detail["connection"] == "Corp SharePoint"
+        # The message explains the EDIT, not an upload nobody attempted.
+        assert "sync" in detail["message"]
 
     def test_orphaned_collection_is_editable_again(self, seeded_app):
         """Unticking the scope orphans the collection — from then on it is an
@@ -2392,17 +2524,20 @@ def _seed_sharepoint_scope(corpus_id: str, *, connection_id: str) -> None:
 
 
 class TestSharePointIngestGateUpload:
-    """The uploader here is the PRODUCER's scoped credential — since the
-    source-managed gate (`TestSourceManagedCollections` above), an
+    """The exclusion gate's real caller is the in-process pipeline — since
+    the source-managed gate (`TestSourceManagedCollections` above), an
     interactive upload into a scope-referenced collection is refused
-    outright with 409, so the exclusion gate's real caller is the only one
-    that can reach it."""
+    outright with 409, and the external producer's HTTP credential no
+    longer exists. Each upload here suspends the source-managed integrity
+    rule (mock) to reach the exclusion gate, exactly like the pipeline's
+    own in-process path does by never going over HTTP."""
 
     @staticmethod
-    def _producer_token(connection_id: str, corpus_id: str) -> str:
-        from app.auth.producer_token import mint_producer_token
+    def _gate_upload(client, corpus_id: str, **kwargs):
+        from unittest import mock
 
-        return mint_producer_token(connection_id=connection_id, collection_ids=[corpus_id], ttl_seconds=3600)
+        with mock.patch("app.api.collections.source_managing_connection", return_value=None):
+            return client.post(f"/api/collections/{corpus_id}/files", **kwargs)
 
     def test_upload_under_excluded_subtree_is_refused_and_stores_nothing(self, seeded_app, monkeypatch):
         monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
@@ -2415,14 +2550,15 @@ class TestSharePointIngestGateUpload:
 
         before, _ = audit_repo().query(action="sharepoint_acl.ingest_rejected", limit=1000)
 
-        resp = c.post(
-            f"/api/collections/{corpus_id}/files",
+        resp = self._gate_upload(
+            c,
+            corpus_id,
             files=[
                 ("files", ("doc.docx", io.BytesIO(b"secret bytes"), "application/octet-stream")),
                 ("files", ("ok.md", io.BytesIO(b"fine"), "text/markdown")),
             ],
             data={"paths": ["Secret/doc.docx", "open/ok.md"]},
-            headers=_auth(self._producer_token("conn-gate-1", corpus_id)),
+            headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
@@ -2443,11 +2579,12 @@ class TestSharePointIngestGateUpload:
         corpus_id = cr.json()["id"]
         _seed_sharepoint_scope(corpus_id, connection_id="conn-gate-2")
 
-        resp = c.post(
-            f"/api/collections/{corpus_id}/files",
+        resp = self._gate_upload(
+            c,
+            corpus_id,
             files={"files": ("ok.md", io.BytesIO(b"fine"), "text/markdown")},
             data={"paths": "open/ok.md"},
-            headers=_auth(self._producer_token("conn-gate-2", corpus_id)),
+            headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 201, resp.text
 
@@ -2460,10 +2597,11 @@ class TestSharePointIngestGateUpload:
         corpus_id = cr.json()["id"]
         _seed_sharepoint_scope(corpus_id, connection_id="conn-gate-3")
 
-        resp = c.post(
-            f"/api/collections/{corpus_id}/files",
+        resp = self._gate_upload(
+            c,
+            corpus_id,
             files={"files": ("doc.docx", io.BytesIO(b"secret bytes"), "application/octet-stream")},
             data={"paths": "Secret/doc.docx"},
-            headers=_auth(self._producer_token("conn-gate-3", corpus_id)),
+            headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 201, resp.text
