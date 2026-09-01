@@ -1185,6 +1185,26 @@ async def update_connection(
                 for _acl_key in ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS:
                     if _acl_key not in config and old_config.get(_acl_key) is not None:
                         config = {**config, _acl_key: old_config[_acl_key]}
+
+                # Same class again, third writer: the Graph change-notification
+                # SUBSCRIPTION lifecycle (`connectors/sharepoint/
+                # subscriptions.py`) records `webhook_subscriptions` — the
+                # `{drive_id, subscription_id, expires_at}` rows it needs in
+                # order to renew and, eventually, delete what it created.
+                # Erasing those on an unrelated edit does not merely lose
+                # bookkeeping: it ORPHANS live Graph subscriptions, which
+                # Agnes can then neither renew nor tear down while they keep
+                # pushing at the receiver until Graph expires them weeks
+                # later. Written from a connector module (a renewal sweep plus
+                # an admin endpoint that delegates to it), so — exactly like
+                # the ACL keys above — it stays out of
+                # `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`, whose ratchet scans
+                # `admin_sharepoint.py`'s own writers only.
+                from connectors.sharepoint.subscriptions import SUBSCRIPTION_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _sub_key in SUBSCRIPTION_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _sub_key not in config and old_config.get(_sub_key) is not None:
+                        config = {**config, _sub_key: old_config[_sub_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`

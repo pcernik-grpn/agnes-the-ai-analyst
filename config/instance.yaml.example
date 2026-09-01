@@ -1517,12 +1517,12 @@ extraction:
 # POST /api/webhooks/sharepoint/{connection_id}. Lets a subscribed Graph
 # drive push near-real-time notifications instead of Agnes waiting for
 # extraction.schedule above. Gated by `sharepoint.enabled` above (404 when
-# off) — no separate flag; a notification it accepts still needs a
-# configured producer + a worker polling the `extraction` lane to actually
-# run the resulting `corpus-extraction` job. Agnes never creates, renews, or
-# deletes the Graph subscription itself; an operator runs the producer's own
-# `subscriptions.py create --url <webhook_url>` against the URL + secret
-# `POST /api/admin/sharepoint/connections/{connection_id}/webhook` mints.
+# off) — no separate flag; a notification it accepts still needs a worker
+# polling the `extraction` lane to actually run the resulting
+# `corpus-extraction` job. Agnes owns the Graph subscription lifecycle
+# itself (create/renew/delete) — see the SUBSCRIPTIONS section near the end
+# of this file; the secret every subscription is signed with is minted by
+# `POST /api/admin/sharepoint/connections/{connection_id}/webhook`.
 
 
 # Authoring Studio (chat-assisted builders at /admin/studio for skills,
@@ -1680,3 +1680,54 @@ studio:
 #   # Per-field env overrides (win over the yaml values above):
 #   # AGNES_DISTRIBUTION_OBJECT_STORE_BUCKET, _ENDPOINT_URL, _REGION, _PREFIX,
 #   # _ACCESS_KEY_ENV, _SECRET_KEY_ENV
+
+
+# --- SharePoint Graph change-notification SUBSCRIPTIONS ---------------------
+# (Lifecycle for the webhook receiver described earlier in this file. Both
+# receiver and lifecycle ride the single `sharepoint.enabled` switch — there
+# is no separate webhook flag anymore — so everything this lifecycle reads
+# beyond that is an ENVIRONMENT variable, listed below.)
+#
+# The receiver route (`POST /api/webhooks/sharepoint/{connection_id}`) answers
+# Graph's calls; something still has to tell Graph to make them. Agnes now
+# owns that too: `connectors/sharepoint/subscriptions.py`, reached by
+#
+#   POST   /api/admin/sharepoint/connections/{id}/subscriptions/ensure
+#   DELETE /api/admin/sharepoint/connections/{id}/subscriptions
+#   POST   /api/admin/sharepoint/subscriptions/run-due   (scheduler-driven)
+#
+# `ensure` is idempotent: one Graph subscription per DISTINCT drive named by a
+# confirmed scope, created when missing, renewed when near expiry, left alone
+# when healthy, deleted when its drive leaves scope. State is recorded on the
+# connection row (`config.webhook_subscriptions`) — never a new table, never
+# the secret itself.
+#
+# Order of operations for an operator turning this on:
+#   1. sharepoint.enabled: true  (above, or AGNES_SHAREPOINT_ENABLED)
+#   2. POST /api/admin/sharepoint/connections/{id}/webhook   -> mints the
+#      clientState secret every subscription is signed with
+#   3. AGNES_BASE_URL (or SERVER_URL) must name this instance's PUBLIC https
+#      origin — Graph validates the notification URL synchronously while
+#      creating the subscription, by calling the receiver's handshake, so a
+#      localhost/internal origin is refused up front (409
+#      public_url_not_configured) rather than failing opaquely inside Graph.
+#   4. POST .../subscriptions/ensure for each connection.
+# Re-minting the secret in step 2 later does NOT rewrite live subscriptions
+# (Graph treats clientState as immutable) — re-run `ensure`, which detects the
+# rotation and re-creates them.
+#
+# Environment knobs (all optional; the defaults are what the expiry math
+# needs, not preferences):
+#   AGNES_SP_SUBSCRIPTION_DAYS=25
+#       Requested subscription lifetime. Graph's ceiling for a drive
+#       subscription is 30 days; values above it are clamped.
+#   AGNES_SP_SUBSCRIPTION_RENEW_WITHIN_HOURS=72
+#       Renew anything expiring inside this window. With a daily sweep this
+#       means three consecutive missed runs are survivable.
+#   SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE="daily 04:30"
+#       Cadence of the `sharepoint-subscriptions-renew` scheduler row
+#       (services/scheduler). The row exists whenever the receiver is
+#       enabled — unlike `extraction.schedule` there is nothing to opt into,
+#       since a renewal sweep that never runs costs the subscriptions
+#       themselves. An unparseable value falls back to the default rather
+#       than disabling the sweep.

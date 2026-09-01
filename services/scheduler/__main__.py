@@ -408,6 +408,67 @@ def _acl_sync_schedule() -> str:
         hours = 4
     schedule = f"every {hours}h"
     return schedule if is_valid_schedule(schedule) else "every 4h"
+#: Daily, off-peak. See :func:`_subscription_renewal_schedule` for why this
+#: sweep has a default cadence where the extraction sweep above has none.
+_SUBSCRIPTION_RENEWAL_SCHEDULE_DEFAULT = "daily 04:30"
+
+
+def _sharepoint_webhook_feature_enabled() -> bool:
+    """Whether this instance runs the Graph change-notification receiver —
+    ``sharepoint.enabled``, with ``AGNES_SHAREPOINT_ENABLED``
+    winning (the order ``app.instance_config.feature_enabled`` itself uses).
+
+    Wrapped rather than called directly so a missing/unreadable
+    ``instance.yaml`` — a normal state for the scheduler container on some
+    deployments — reads as "off" instead of taking ``build_jobs()`` down
+    with a traceback. Same defensive shape as ``_extraction_schedule``.
+    """
+    try:
+        from app.instance_config import feature_enabled
+
+        return bool(
+            feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False)
+        )
+    except Exception:
+        logger.exception("scheduler: failed to read sharepoint.enabled")
+        return False
+
+
+def _subscription_renewal_schedule() -> Optional[str]:
+    """Resolve the SharePoint Graph subscription renewal sweep's cadence.
+
+    Graph expires a drive change-notification subscription (30-day ceiling;
+    ``connectors/sharepoint/subscriptions.py`` asks for 25 days and renews
+    inside 72h of expiry), so near-real-time crawling needs a clock of its
+    own — this one, driving
+    ``POST /api/admin/sharepoint/subscriptions/run-due``.
+
+    Unlike :func:`_extraction_schedule` there IS a sensible default
+    (``daily 04:30``): the cadence is not a policy choice an operator makes,
+    it is what the 25-day/72h expiry math requires, and a renewal sweep that
+    silently never runs costs the subscriptions themselves. So the switch
+    here is the FEATURE flag, not the schedule — the row exists whenever
+    ``sharepoint.enabled`` is on (the same flag gating the receiver
+    route, since a subscription with no live receiver is pointless) — and
+    ``SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE`` only re-times it. An invalid
+    override falls back to the default rather than disabling the sweep, the
+    opposite of the extraction sweep's choice and for the same reason the
+    default exists at all.
+    """
+    from src.scheduler import is_valid_schedule
+
+    if not _sharepoint_webhook_feature_enabled():
+        return None
+    raw = os.environ.get("SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE", "").strip()
+    if raw and is_valid_schedule(raw):
+        return raw
+    if raw:
+        logger.warning(
+            "scheduler: invalid subscription renewal schedule %r — falling back to %r",
+            raw,
+            _SUBSCRIPTION_RENEWAL_SCHEDULE_DEFAULT,
+        )
+    return _SUBSCRIPTION_RENEWAL_SCHEDULE_DEFAULT
 
 
 def _verification_schedule(verify_seconds: int) -> str:
@@ -902,6 +963,29 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
                 "extraction-run-due",
                 extraction_sched,
                 "/api/admin/sharepoint/extraction/run-due",
+                "POST",
+                900,
+            )
+        )
+
+    # SharePoint Graph subscription renewal sweep: renews (and back-fills)
+    # the drive change-notification subscriptions that make near-real-time
+    # crawling work at all — see `connectors/sharepoint/subscriptions.py` and
+    # `app/api/admin_sharepoint.py::run_due_subscription_renewal`. Same
+    # walk + per-row due-check + act shape as `extraction-run-due` above, and
+    # deliberately the same registration discipline: the row exists only when
+    # the feature is on, so an instance that never turned the receiver on
+    # never fires it. Its `daily …` cadence stays out of the tick-guard
+    # `smallest` computation, same as the extraction row. The generous
+    # timeout is because the sweep talks to Graph once per drive (and Graph
+    # validates the notification URL synchronously on a create).
+    subscription_sched = _subscription_renewal_schedule()
+    if subscription_sched is not None:
+        jobs.append(
+            (
+                "sharepoint-subscriptions-renew",
+                subscription_sched,
+                "/api/admin/sharepoint/subscriptions/run-due",
                 "POST",
                 900,
             )

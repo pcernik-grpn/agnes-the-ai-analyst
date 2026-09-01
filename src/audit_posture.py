@@ -160,6 +160,21 @@ POSTURE: dict[str, str] = {
     # (Re)generates the Graph change-notification receiver's shared secret.
     # Handler writes its own row (log_safe), same as scope_confirm above.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
+    # Graph subscription lifecycle (connectors/sharepoint/subscriptions.py) —
+    # the half that tells Graph to push at all. Both connection-scoped
+    # handlers write their OWN row (log_safe, on the success AND the typed-
+    # refusal branch, carrying the per-drive counts / the refusal code the
+    # middleware could not know), so the middleware stays silent for them.
+    # The sweep keeps the `run_` prefix so it stays inside
+    # SCHEDULER_ACTION_SQL's liveness predicate, same as run_sharepoint_
+    # extraction above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure": (
+        "sharepoint_connection.subscriptions_ensure"
+    ),
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/subscriptions": (
+        "sharepoint_connection.subscriptions_remove"
+    ),
+    "POST /api/admin/sharepoint/subscriptions/run-due": "run_sharepoint_subscription_renewal",
     # -- app.api.sharepoint_webhooks --------------------------------------------
     # Public, unauthenticated (Graph is the caller) — carries no user
     # identity, so AuditFallbackMiddleware never fires for it regardless of

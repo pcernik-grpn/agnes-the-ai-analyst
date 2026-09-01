@@ -1162,6 +1162,24 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "A SharePoint Graph change notification was rejected (clientState did not match the connection's secret).",
     ),
+    # -- SharePoint Graph change-notification SUBSCRIPTION lifecycle
+    # (connectors/sharepoint/subscriptions.py) — the half that tells Graph to
+    # push at all, appended at the end of the receiver's own section.
+    "sharepoint_connection.subscriptions_ensure": AuditEvent(
+        "sharepoint_connection.subscriptions_ensure",
+        "mutation",
+        "A SharePoint connection's Graph drive subscriptions were created/renewed to match its confirmed scopes.",
+    ),
+    "sharepoint_connection.subscriptions_remove": AuditEvent(
+        "sharepoint_connection.subscriptions_remove",
+        "mutation",
+        "A SharePoint connection's Graph drive subscriptions were deleted, ending its change notifications.",
+    ),
+    "run_sharepoint_subscription_renewal": AuditEvent(
+        "run_sharepoint_subscription_renewal",
+        "system",
+        "The scheduler's SharePoint Graph subscription renewal sweep ran.",
+    ),
     # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
     # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).
     # `sync_triggered` is emitted by Task 5's admin route, registered here

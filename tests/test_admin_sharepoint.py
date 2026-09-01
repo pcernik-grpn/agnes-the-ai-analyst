@@ -1788,9 +1788,10 @@ class TestCertificateMetadata:
 
 class TestWebhookSecretRotation:
     """`POST /connections/{id}/webhook` — (re)generates the Graph
-    change-notification receiver's shared secret, returning it alongside
-    the receiver URL an operator feeds to the producer's own
-    `subscriptions.py create --url ...`."""
+    change-notification receiver's shared secret, returning it alongside the
+    receiver URL. Both feed `connectors/sharepoint/subscriptions.py`: the
+    secret becomes each drive subscription's `clientState`, the URL its
+    `notificationUrl` (see tests/test_sharepoint_subscriptions.py)."""
 
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(f"{BASE}/nope/webhook", headers=_auth(seeded_app["analyst_token"]))

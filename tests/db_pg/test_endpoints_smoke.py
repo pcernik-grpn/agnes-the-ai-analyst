@@ -3307,6 +3307,25 @@ KNOWN_UNTESTED = {
     # tests/test_sharepoint_webhooks.py; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook",
     "POST /api/webhooks/sharepoint/{connection_id}",
+    # Graph subscription lifecycle (connectors/sharepoint/subscriptions.py) —
+    # same reasoning as the receiver rows above: the only state it touches is
+    # the EXISTING `source_connections.config` JSON column (a
+    # `webhook_subscriptions` key, written through the existing
+    # `source_connections_repo().config_patch`), so there is no new schema
+    # surface to verify per-backend. The auth matrix, every typed refusal
+    # (flag off / no secret / no public URL / unresolved certificate), the
+    # create-renew-unchanged-remove decisions, per-drive failure isolation
+    # and idempotency are covered against a mocked Graph transport in
+    # tests/test_sharepoint_subscriptions.py; not duplicated in this sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/subscriptions",
+    "POST /api/admin/sharepoint/subscriptions/run-due",
+    # Anonymization dry-run for the config drawer's preview panel — auth
+    # matrix, typed refusals (key unavailable, too long, bad detector,
+    # custom-terms), and the redaction behavior itself are covered in
+    # tests/test_admin_anonymization_preview.py; nothing persisted, so
+    # there is no per-backend behavior for this sweep to add.
+    "POST /api/admin/sharepoint/anonymization/preview",
     # Observed-changes feed (2026-08-30) — NEW schema surface
     # (corpus_file_events, PG-only, A3 ratchet), so unlike its siblings
     # above it IS covered per-backend, just not in this file: auth matrix,

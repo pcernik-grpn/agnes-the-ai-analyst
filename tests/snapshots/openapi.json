@@ -10722,6 +10722,77 @@
         "title": "SubscribeRequest",
         "type": "object"
       },
+      "SubscriptionTeardownResult": {
+        "description": "Why this DELETE answers ``200`` with a body rather than the house\n``204``: teardown is PARTIAL by nature. One subscription's delete can\nfail (Graph 5xx, a revoked permission) while the rest succeed, and its\nrecord is deliberately KEPT so a later call retries \u2014 an admin has to be\nable to see which one, and a bodyless 204 cannot say. Declared as a\nresponse model and allowlisted in\n``tests/test_api_design_rules.py::_DELETE_200_WITH_BODY_ALLOWLIST``,\nwhich is exactly the escape hatch that rule documents.",
+        "properties": {
+          "connection_id": {
+            "title": "Connection Id",
+            "type": "string"
+          },
+          "failed": {
+            "title": "Failed",
+            "type": "integer"
+          },
+          "removed": {
+            "title": "Removed",
+            "type": "integer"
+          },
+          "subscriptions": {
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionTeardownRow"
+            },
+            "title": "Subscriptions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "connection_id",
+          "subscriptions",
+          "removed",
+          "failed"
+        ],
+        "title": "SubscriptionTeardownResult",
+        "type": "object"
+      },
+      "SubscriptionTeardownRow": {
+        "description": "One recorded subscription's teardown outcome.",
+        "properties": {
+          "action": {
+            "enum": [
+              "removed",
+              "failed"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "drive_id": {
+            "title": "Drive Id",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "subscription_id": {
+            "title": "Subscription Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "drive_id",
+          "subscription_id",
+          "action"
+        ],
+        "title": "SubscriptionTeardownRow",
+        "type": "object"
+      },
       "SuggestRequest": {
         "properties": {
           "description": {
@@ -32146,6 +32217,134 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions": {
+      "delete": {
+        "description": "Delete every Graph subscription recorded for this connection and drop\nthe records it could delete.\n\nDeliberately NOT gated on ``sharepoint.enabled``: the moment an\noperator most needs teardown is right after turning the receiver off.\nA connection with no recorded subscriptions is a clean ``{\"removed\": 0}``\nno-op, not a 404 \u2014 \"there is nothing to remove\" is the state the caller\nasked for. Graph answering ``404`` for a subscription counts as removed;\na real failure keeps the record so a later call retries \u2014 which is why\nthis answers ``200`` with a per-subscription body instead of ``204``\n(see :class:`SubscriptionTeardownResult`).",
+        "operationId": "delete_graph_subscriptions_api_admin_sharepoint_connections__connection_id__subscriptions_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionTeardownResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Graph Subscriptions",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure": {
+      "post": {
+        "description": "Create or renew this connection's Microsoft Graph drive subscriptions\nso its confirmed scopes push change notifications at\n``POST /api/webhooks/sharepoint/{connection_id}``.\n\nIdempotent \u2014 one subscription per DISTINCT drive named by a confirmed\nscope (several scopes in one library share one subscription), created\nwhen missing, renewed when within the renewal window, left alone\notherwise, and deleted when its drive leaves scope. Returns the per-drive\noutcome (``created``/``renewed``/``unchanged``/``removed``/``failed``)\nplus counts: one library failing never hides the others' success.\n\nRefuses BEFORE touching Graph, with a body naming the fix, when\n``sharepoint.enabled`` is off (``409\nsharepoint_disabled`` \u2014 a subscription pointed at a 404 receiver\nis dead on arrival), no webhook secret has been minted yet (``409\nwebhook_secret_missing`` \u2014 it is the subscription's ``clientState``), no\npublic HTTPS origin is configured (``409 public_url_not_configured`` \u2014\nGraph validates the notification URL synchronously during create), or\nthe connection's certificate does not resolve / Entra rejects it (``409\nsharepoint_cert_unresolved`` / ``502 sharepoint_graph_error``).",
+        "operationId": "ensure_graph_subscriptions_api_admin_sharepoint_connections__connection_id__subscriptions_ensure_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ensure Graph Subscriptions",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": {
       "post": {
         "description": "Admin-triggered one-off run of the ``sharepoint-subtree-sweep`` job\nfor this connection (2026-08-31 plan, Task 8's \"re-check subtrees now\")\n\u2014 enqueues ``connectors.sharepoint.acl_sync.run_subtree_sweep`` (via\n``app/worker/kinds.py::_run_sharepoint_subtree_sweep``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_acl_sync`. The explicit-connection payload also bypasses\nthe job's own per-connection ``acl_sync.sweep_interval_days`` due-guard\n(:func:`connectors.sharepoint.acl_sync._sweep_due`), so this always\ntriggers a real sweep, never a same-day no-op.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. The\nrouter-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``\nabove) already refuses the whole surface with ``409 feature_disabled``\nwhen the connector is off, so there is no separate per-route check here.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_sweep_idempotency_key`) \u2014 a second trigger while one is already\nqueued/running for this connection gets ``409 sweep_already_running``\ninstead of a second job.",
@@ -32488,7 +32687,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/webhook": {
       "post": {
-        "description": "(Re)generate this connection's Graph change-notification receiver\nsecret and return the receiver URL alongside it, so an operator can run\nthe producer's own ``subscriptions.py create --url <webhook_url>``\nagainst this connection without hand-assembling either value.\n\nAlways mints a FRESH random secret \u2014 there is no \"read the current\none\" verb, matching the outbound-webhook pattern\n(``app/api/agent_webhooks.py``): a caller who wants to see it again\ncalls this again, which also rotates it, invalidating whatever Graph\nsubscription was signed with the old value (the operator must then\nre-point the subscription's ``clientState``, or simply create a new\nsubscription \u2014 Agnes does not manage Graph subscriptions itself).\n\nUnlike the outbound-webhook secret, this one is NOT hidden after\ncreation: it lives in this connection's own ``config.webhook_secret``\n(see ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``), the same trust\nboundary ``config.tenant_id``/``client_id`` already sit behind, so any\nadmin who can ``GET`` this connection can also read it back later. That\nis an admin-to-admin visibility question, not a public one \u2014 the\nreceiver route (``app/api/sharepoint_webhooks.py``) never returns it and\nverifies every notification's ``clientState`` against it in constant\ntime.",
+        "description": "(Re)generate this connection's Graph change-notification receiver\nsecret and return the receiver URL alongside it. The secret becomes the\n``clientState`` of every Graph drive subscription\n``POST .../subscriptions/ensure`` (below) creates for this connection;\nthe URL is what those subscriptions push to.\n\nAlways mints a FRESH random secret \u2014 there is no \"read the current\none\" verb, matching the outbound-webhook pattern\n(``app/api/agent_webhooks.py``): a caller who wants to see it again\ncalls this again, which also rotates it, invalidating whatever Graph\nsubscription was signed with the old value. A rotation does NOT rewrite\na live subscription's ``clientState`` (Graph treats it as immutable), so\nfollow a rotation with ``POST .../subscriptions/ensure`` \u2014 every\nnotification signed with the old secret is dropped silently by the\nreceiver until you do.\n\nUnlike the outbound-webhook secret, this one is NOT hidden after\ncreation: it lives in this connection's own ``config.webhook_secret``\n(see ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``), the same trust\nboundary ``config.tenant_id``/``client_id`` already sit behind, so any\nadmin who can ``GET`` this connection can also read it back later. That\nis an admin-to-admin visibility question, not a public one \u2014 the\nreceiver route (``app/api/sharepoint_webhooks.py``) never returns it and\nverifies every notification's ``clientState`` against it in constant\ntime.",
         "operationId": "rotate_webhook_secret_api_admin_sharepoint_connections__connection_id__webhook_post",
         "parameters": [
           {
@@ -32598,6 +32797,60 @@
           }
         },
         "summary": "Run Due Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/subscriptions/run-due": {
+      "post": {
+        "description": "Scheduler-driven renewal sweep: walks every SharePoint connection and\nensures the ones with due work \u2014 a drive with no subscription, one\nexpiring within the renewal window (72h by default), or a record whose\ndrive left scope.\n\nExactly the shape ``POST /extraction/run-due`` above uses (walk +\nper-row due-check + act, no second scheduling mechanism), and for the\nsame reason: Graph subscriptions expire (30-day ceiling; Agnes asks for\n25), so renewal is a clock, and this instance already has one. Scheduler\nrow ``sharepoint-subscriptions-renew`` in\n``services/scheduler/__main__.py``, registered only when\n``sharepoint.enabled`` is on.\n\nA clean, typed no-op (never an error) when the receiver flag is off,\nsince the row once registered fires unconditionally. A connection whose\nown preconditions fail (no secret minted, no public URL, an expired\ncertificate) is counted in ``errors`` and the sweep continues \u2014 one\nmisconfigured connection never costs another its renewal.",
+        "operationId": "run_due_subscription_renewal_api_admin_sharepoint_subscriptions_run_due_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Due Subscription Renewal",
         "tags": [
           "admin"
         ]

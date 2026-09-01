@@ -1202,6 +1202,9 @@ for a DIFFERENT connection 403s.
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
 - /api/admin/sharepoint/connections/{connection_id}/webhook
+- /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure
+- /api/admin/sharepoint/connections/{connection_id}/subscriptions
+- /api/admin/sharepoint/subscriptions/run-due
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
@@ -1387,17 +1390,61 @@ document surface is `agnes facts …`.
 
 **Graph change-notification receiver.** `POST …/webhook` (re)generates this
 connection's Microsoft Graph change-notification shared secret and returns
-`{webhook_url, secret}` — the URL and secret an operator feeds to the
-external producer's own `subscriptions.py create --url <webhook_url>` to
-actually create the Graph drive subscription (Agnes never creates, renews,
-or deletes that subscription itself). Always mints a FRESH secret; there is
-no "read the current one" verb, so a caller who needs it again calls this
-again, which also invalidates whatever subscription was signed with the old
-value. Persisted in `config.webhook_secret` — the same trust boundary
+`{webhook_url, secret}`. The secret becomes the `clientState` of every Graph
+drive subscription for this connection, and the URL is the receiver those
+subscriptions push to. Always mints a FRESH secret; there is no "read the
+current one" verb, so a caller who needs it again calls this again — which
+also invalidates whatever subscription was signed with the old value, so
+follow a rotation with `POST …/subscriptions/ensure` below (a rotation does
+not rewrite live subscriptions' `clientState`; re-creating them does).
+Persisted in `config.webhook_secret` — the same trust boundary
 `config.tenant_id`/`client_id` already sit behind, unlike the outbound
 agent-webhook secret this mirrors, which is shown once and never re-served.
 See `/api/webhooks/sharepoint/{connection_id}` below for the receiver
 itself.
+
+**Graph subscription lifecycle.** Minting a secret and answering
+notifications are only two thirds of near-real-time crawling; something has
+to tell Graph to push. `POST …/connections/{id}/subscriptions/ensure` does,
+and is the single idempotent verb: for every DISTINCT drive named by a
+confirmed scope (several scopes in one document library share one
+subscription) it creates a Graph subscription where there is none, renews the
+one on record when it is within 72h of expiring, leaves a healthy one alone,
+and deletes one whose drive has left scope. Returns the per-drive outcome
+(`created` / `renewed` / `unchanged` / `removed` / `failed`) plus counts, so
+one library failing on permissions never hides four successes. State lives in
+the connection's own `config.webhook_subscriptions` — a server-written list
+of `{drive_id, subscription_id, expires_at}`, no new table, never the secret.
+
+Refuses before touching Graph, with a body naming the fix, when
+`sharepoint.enabled` is off (`409 sharepoint_disabled` — a
+subscription pointed at a 404 receiver is dead on arrival), no secret has been
+minted (`409 webhook_secret_missing`), no public HTTPS origin is configured
+(`409 public_url_not_configured` — Graph validates the notification URL
+synchronously during create, by calling the receiver's own handshake, so
+`AGNES_BASE_URL`/`SERVER_URL` must name a publicly reachable origin), or the
+certificate does not resolve / Entra rejects it (`409
+sharepoint_cert_unresolved` / `502 sharepoint_graph_error`).
+
+`DELETE …/connections/{id}/subscriptions` is the teardown — deliberately NOT
+gated on `sharepoint.enabled`, since the moment an operator most needs
+cleanup is right after turning the receiver off. A connection with no records
+is a clean `{"removed": 0}` no-op; Graph answering `404` for a subscription
+counts as removed; a real failure keeps the record so a later call retries.
+
+`POST /api/admin/sharepoint/subscriptions/run-due` is the renewal sweep,
+shaped exactly like `extraction/run-due` (walk + per-row due-check + act, no
+second scheduling mechanism). Agnes requests a 25-day subscription against
+Graph's 30-day ceiling and renews inside 72h, so a daily sweep can miss
+several runs before anything lapses. Scheduler row
+`sharepoint-subscriptions-renew` in `services/scheduler/__main__.py`,
+registered whenever `sharepoint.enabled` is on (default cadence
+`daily 04:30`, re-timed by `SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE`). A
+typed no-op when the flag is off; a connection whose own preconditions fail
+lands in `errors` and the sweep continues.
+
+There is no `GET` for subscription state: it is plain server-written config,
+already returned by `GET /api/admin/source-connections/{id}`.
 
 ### `/api/webhooks/sharepoint/{connection_id}` — Graph change-notification receiver
 

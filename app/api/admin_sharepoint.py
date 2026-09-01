@@ -144,7 +144,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -1513,17 +1513,20 @@ async def rotate_webhook_secret(
     user: dict = Depends(require_admin),
 ):
     """(Re)generate this connection's Graph change-notification receiver
-    secret and return the receiver URL alongside it, so an operator can run
-    the producer's own ``subscriptions.py create --url <webhook_url>``
-    against this connection without hand-assembling either value.
+    secret and return the receiver URL alongside it. The secret becomes the
+    ``clientState`` of every Graph drive subscription
+    ``POST .../subscriptions/ensure`` (below) creates for this connection;
+    the URL is what those subscriptions push to.
 
     Always mints a FRESH random secret — there is no "read the current
     one" verb, matching the outbound-webhook pattern
     (``app/api/agent_webhooks.py``): a caller who wants to see it again
     calls this again, which also rotates it, invalidating whatever Graph
-    subscription was signed with the old value (the operator must then
-    re-point the subscription's ``clientState``, or simply create a new
-    subscription — Agnes does not manage Graph subscriptions itself).
+    subscription was signed with the old value. A rotation does NOT rewrite
+    a live subscription's ``clientState`` (Graph treats it as immutable), so
+    follow a rotation with ``POST .../subscriptions/ensure`` — every
+    notification signed with the old secret is dropped silently by the
+    receiver until you do.
 
     Unlike the outbound-webhook secret, this one is NOT hidden after
     creation: it lives in this connection's own ``config.webhook_secret``
@@ -1570,6 +1573,182 @@ class ExtractionRunOptions(BaseModel):
         le=86400,
         description="Hard ceiling for this one run, seconds (0 = unbounded).",
     )
+# --- Graph subscription lifecycle -------------------------------------------
+#
+# The secret-minting endpoint above is only half of what near-real-time
+# crawling needs: something has to tell Graph to push in the first place.
+# That was the retired external producer's `subscriptions.py`, run by hand;
+# it now lives at `connectors/sharepoint/subscriptions.py` and these three
+# routes are its admin surface. The lifecycle module owns every decision
+# (which drives, expiry math, per-drive isolation, the state on
+# `config.webhook_subscriptions`); these handlers only translate its typed
+# refusals into HTTP and audit the outcome.
+#
+# There is no GET: subscription state is plain server-written config, so it
+# rides the connection read (`GET /api/admin/source-connections/{id}`) that
+# already returns `config` — a fourth route would be a second name for data
+# an admin can already see.
+
+if TYPE_CHECKING:  # import-time only: the runtime imports stay inside the handlers
+    from connectors.sharepoint.subscriptions import SubscriptionError
+
+
+def _subscription_http_error(exc: "SubscriptionError") -> HTTPException:
+    """One typed refusal → one typed HTTP error whose body names the fix
+    (`{"error", "message"}`, the same detail shape `_resolved_token` and the
+    extraction trigger already use)."""
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+@router.post("/connections/{connection_id}/subscriptions/ensure")
+async def ensure_graph_subscriptions(
+    connection_id: str,
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """Create or renew this connection's Microsoft Graph drive subscriptions
+    so its confirmed scopes push change notifications at
+    ``POST /api/webhooks/sharepoint/{connection_id}``.
+
+    Idempotent — one subscription per DISTINCT drive named by a confirmed
+    scope (several scopes in one library share one subscription), created
+    when missing, renewed when within the renewal window, left alone
+    otherwise, and deleted when its drive leaves scope. Returns the per-drive
+    outcome (``created``/``renewed``/``unchanged``/``removed``/``failed``)
+    plus counts: one library failing never hides the others' success.
+
+    Refuses BEFORE touching Graph, with a body naming the fix, when
+    ``sharepoint.enabled`` is off (``409
+    sharepoint_disabled`` — a subscription pointed at a 404 receiver
+    is dead on arrival), no webhook secret has been minted yet (``409
+    webhook_secret_missing`` — it is the subscription's ``clientState``), no
+    public HTTPS origin is configured (``409 public_url_not_configured`` —
+    Graph validates the notification URL synchronously during create), or
+    the connection's certificate does not resolve / Entra rejects it (``409
+    sharepoint_cert_unresolved`` / ``502 sharepoint_graph_error``).
+    """
+    from connectors.sharepoint.subscriptions import SubscriptionError, ensure_subscriptions
+
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        result = await ensure_subscriptions(row, request=request)
+    except SubscriptionError as exc:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.subscriptions_ensure",
+            resource=f"source_connection:{connection_id}",
+            params={"error": exc.error},
+            result="error",
+        )
+        raise _subscription_http_error(exc) from exc
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.subscriptions_ensure",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "created": result["created"],
+            "renewed": result["renewed"],
+            "unchanged": result["unchanged"],
+            "removed": result["removed"],
+            "failed": result["failed"],
+        },
+    )
+    return result
+
+
+class SubscriptionTeardownRow(BaseModel):
+    """One recorded subscription's teardown outcome."""
+
+    drive_id: str
+    subscription_id: str
+    action: Literal["removed", "failed"]
+    error: Optional[str] = None
+
+
+class SubscriptionTeardownResult(BaseModel):
+    """Why this DELETE answers ``200`` with a body rather than the house
+    ``204``: teardown is PARTIAL by nature. One subscription's delete can
+    fail (Graph 5xx, a revoked permission) while the rest succeed, and its
+    record is deliberately KEPT so a later call retries — an admin has to be
+    able to see which one, and a bodyless 204 cannot say. Declared as a
+    response model and allowlisted in
+    ``tests/test_api_design_rules.py::_DELETE_200_WITH_BODY_ALLOWLIST``,
+    which is exactly the escape hatch that rule documents."""
+
+    connection_id: str
+    subscriptions: List[SubscriptionTeardownRow]
+    removed: int
+    failed: int
+
+
+@router.delete("/connections/{connection_id}/subscriptions", response_model=SubscriptionTeardownResult)
+async def delete_graph_subscriptions(
+    connection_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Delete every Graph subscription recorded for this connection and drop
+    the records it could delete.
+
+    Deliberately NOT gated on ``sharepoint.enabled``: the moment an
+    operator most needs teardown is right after turning the receiver off.
+    A connection with no recorded subscriptions is a clean ``{"removed": 0}``
+    no-op, not a 404 — "there is nothing to remove" is the state the caller
+    asked for. Graph answering ``404`` for a subscription counts as removed;
+    a real failure keeps the record so a later call retries — which is why
+    this answers ``200`` with a per-subscription body instead of ``204``
+    (see :class:`SubscriptionTeardownResult`).
+    """
+    from connectors.sharepoint.subscriptions import SubscriptionError, remove_subscriptions
+
+    row = _sharepoint_connection_or_404(connection_id)
+    try:
+        result = await remove_subscriptions(row)
+    except SubscriptionError as exc:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.subscriptions_remove",
+            resource=f"source_connection:{connection_id}",
+            params={"error": exc.error},
+            result="error",
+        )
+        raise _subscription_http_error(exc) from exc
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.subscriptions_remove",
+        resource=f"source_connection:{connection_id}",
+        params={"removed": result["removed"], "failed": result["failed"]},
+    )
+    return result
+
+
+@router.post("/subscriptions/run-due")
+async def run_due_subscription_renewal(
+    _user: dict = Depends(require_admin),
+):
+    """Scheduler-driven renewal sweep: walks every SharePoint connection and
+    ensures the ones with due work — a drive with no subscription, one
+    expiring within the renewal window (72h by default), or a record whose
+    drive left scope.
+
+    Exactly the shape ``POST /extraction/run-due`` above uses (walk +
+    per-row due-check + act, no second scheduling mechanism), and for the
+    same reason: Graph subscriptions expire (30-day ceiling; Agnes asks for
+    25), so renewal is a clock, and this instance already has one. Scheduler
+    row ``sharepoint-subscriptions-renew`` in
+    ``services/scheduler/__main__.py``, registered only when
+    ``sharepoint.enabled`` is on.
+
+    A clean, typed no-op (never an error) when the receiver flag is off,
+    since the row once registered fires unconditionally. A connection whose
+    own preconditions fail (no secret minted, no public URL, an expired
+    certificate) is counted in ``errors`` and the sweep continues — one
+    misconfigured connection never costs another its renewal.
+    """
+    from connectors.sharepoint.subscriptions import renew_due_subscriptions
+
+    return await renew_due_subscriptions()
 
 
 @router.post("/connections/{connection_id}/extract", status_code=202)

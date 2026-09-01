@@ -1218,6 +1218,26 @@ _EXEMPT: dict[str, str] = {
         "subscription create call — admin-only wizard bookkeeping, no analyst "
         "CLI/MCP analogue"
     ),
+    # Graph subscription lifecycle (connectors/sharepoint/subscriptions.py) —
+    # same admin/scheduler maintenance class as the extract / run-due /
+    # webhook rows above: an admin wiring one connection's near-real-time
+    # push, and the renewal clock that keeps it alive. Nothing an analyst
+    # queries.
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure": (
+        "admin-triggered create/renew of a SharePoint connection's Microsoft Graph drive "
+        "subscriptions — admin-only wizard bookkeeping against an external tenant, mirrors "
+        "the webhook secret-rotation exemption above; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions": (
+        "admin teardown of a SharePoint connection's Microsoft Graph drive subscriptions — "
+        "same admin-only lifecycle surface as its ensure sibling above; no analyst CLI/MCP "
+        "analogue"
+    ),
+    "/api/admin/sharepoint/subscriptions/run-due": (
+        "scheduler-driven sweep renewing Graph drive subscriptions before they expire — "
+        "admin/scheduler maintenance op, mirrors the extraction/run-due exemption above; "
+        "no analyst CLI/MCP analogue"
+    ),
     "/api/webhooks/sharepoint/{connection_id}": (
         "Microsoft Graph change-notification receiver (validation handshake + "
         "notification delivery) for a SharePoint connection — system-to-system, "
