@@ -36,6 +36,54 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The PDF route has one implementation. `pdf_structure.reconstruct_pdf` already degrades per page to that page's plain reading-order text when the block structure is ambiguous, so the whole-document plain-extraction fallback that sat behind it was a second, near-duplicate implementation reachable only when the first crashed; a structure-pass failure is now a `ConversionError` the crawl counts in `convert_failed` and walks past, like any other unconvertible file.
 
 ### Fixed
+- **Chat session restore, part 2: a refresh mid-answer no longer loses the
+  reply, and a session deep link no longer looks like a silent new chat.**
+  `?session=` reached the address bar in the last round; the rest of the
+  restore lifecycle is what this fixes.
+  A turn that was cut off now ALWAYS leaves a row. The partial-save only ran
+  when the answer had already emitted text, so an answer interrupted while its
+  first tool call was still running persisted nothing at all — the session
+  dead-ended holding the question and no reply, which no later reload could
+  recover. It now saves whatever arrived (text, and the ordered tool calls that
+  did run) plus an `interrupted` marker the transcript renders as "this answer
+  was interrupted", so a stopped turn is legible instead of missing. The idle
+  reaper also stopped pausing a session mid-turn — pausing cancels the pump, so
+  it discarded the very answer the detach path has always waited for — and its
+  sandbox keepalive now covers a turn whose client has disconnected, which is
+  exactly the shape a mid-answer reload creates.
+  One submit can no longer persist two questions: the `user_msg` frame carries
+  an opaque per-submit id, and the single ingress claims it atomically
+  (set-if-absent in the coordination backend) immediately before the row is
+  written — so a re-delivery of one submit is dropped whole even when two
+  coroutines or two replicas race it, while the wait-for-a-booting-sandbox
+  retry that needs to re-enter still works and a genuine re-ask is still its
+  own turn. The claim is handed back if the write itself fails, and an
+  unreachable coordination backend fails open: a duplicate question is an
+  annoyance, a dropped one is a loss.
+  The client is told when an answer is in progress: `POST
+  /sessions/{id}/ticket` reports `turn_in_flight`, and the `ready` frame
+  carries the attaching process's own verdict so a stale guess is corrected in
+  both directions. A reload mid-answer paints the spinner and the Stop button
+  before the socket is up, instead of five to ten seconds of a page that looks
+  idle — the silence that invited the second refresh behind the duplicated
+  questions.
+  Concurrent opens can no longer clobber each other: `openSession` takes a
+  generation on entry and re-checks it after every await, so a slow open the
+  user has since navigated away from cannot paint into the conversation now on
+  screen or overwrite the live WebSocket. Pre-existing, but reachable by an
+  ordinary click now that a deep-link restore runs alongside the rest of boot.
+  A failed WS ticket for a conversation whose transcript already loaded is
+  reported as a retryable reconnect error that keeps the transcript, the id and
+  the URL — only a history fetch that fails is treated as an unopenable
+  session.
+  A `?session=` deep link now takes the pre-conversation hero down
+  synchronously and starts its fetches before the sidebar's, keeps the param it
+  was opened from (it used to be stripped on entry and only restored a fetch
+  later, so a slow restore was indistinguishable from being dropped into a new
+  chat), and says so in the transcript when the conversation genuinely cannot
+  be opened rather than leaving the reader on the "Ask anything" page with no
+  error. A restored conversation opens at its newest message instead of at the
+  top.
 
 - **The SharePoint wizard shows a saved site again when "Manage scopes" reopens.** Step 2 only rendered rows the live sites listing returned, and sites resolved by URL were kept in memory for the one wizard session — so on a `Sites.Selected` tenant (where Graph 403-forbids site discovery by design) reopening the wizard showed "Nothing here." with the confirmed site invisible, and even with discovery available a site beyond the listing's first page vanished. A saved site scope now rebuilds its own sites-level row from the scope itself (its id is the Graph site id, its display path the site name): ticked, carrying its collection badge, and still navigable into drives and folders. The rescue covers every way the listing can fail, not just the forbidden-discovery one — a missing certificate, a Graph outage or a disabled SharePoint switch left the saved site just as invisible — and is confined to the sites level, since a site row spliced into a drive or folder listing would answer a different question than the breadcrumb asks. The failure itself is still reported alongside the rows: the site is real and the rest of the tree is genuinely missing.
 
