@@ -87,6 +87,65 @@ _WORKSPACE_WAIT_SECONDS = 180
 _CONTEXT_RESTORE_PATH = "/tmp/agnes-context.md"
 
 
+#: The ``next_actions`` trailer contract, stated where the model cannot skim
+#: past it.
+#:
+#: The rule already exists, in prose, in the workspace prompt
+#: (``config/claude_md_template.txt`` -> "Offer the next step"). That is the
+#: wrong surface for it: CLAUDE.md is a ~400-line project memory the model
+#: reads as *context*, the section sits two thirds of the way down, and it
+#: ends in a soft opt-out ("skip the block when the conversation is clearly
+#: over"). The observable result is that the chips stopped appearing —
+#: nothing in the client broke, the model simply stopped writing the block.
+#:
+#: The embedded kai-agent turn engine, whose buttons are reliable, puts the
+#: same requirement in its SYSTEM prompt with hard rules and a fixed count.
+#: This is that placement, borrowed. It is not a second, competing copy of
+#: the rule: the CLAUDE.md section stays as the human-readable statement an
+#: admin can read and edit, and both say the same thing about the same fence.
+#:
+#: The word cap is not cosmetic. The trailer streams AFTER the visible prose
+#: and the client withholds a half-open fence (``_streamingSafeText`` in
+#: chat.js), so every token spent here is a token the reader waits through
+#: with nothing changing on screen. Two short lines keep that tail small.
+_NEXT_ACTIONS_CONTRACT = """\
+## Next actions — required trailer
+
+End EVERY reply with a fenced `next_actions` block holding exactly TWO
+follow-up prompts, one per `- ` line, phrased so the user could send them
+verbatim, in the user's own language.
+
+Write it directly after your prose, BEFORE any `sources` block. Both are
+hidden from the reader while they stream, and the chat can draw the buttons
+the instant this block closes — putting it first is the difference between
+buttons that appear with the answer and buttons that appear after it.
+
+Rules, ordered by impact:
+1. MATCH THE USER'S GOAL, not merely the last thing you discussed.
+2. BEST SUGGESTION FIRST.
+3. START WITH A VERB.
+4. USE SPECIFIC NAMES from this conversation — table, metric, report, file.
+5. IMMEDIATELY ACTIONABLE with the tools you have. No waiting, no vague
+   exploration, nothing whose prerequisite is missing.
+6. TWO DIFFERENT PATHS FORWARD, not two phrasings of one.
+7. AT MOST TEN WORDS EACH. These render as buttons, not as prose.
+
+```next_actions
+- [Best next step]
+- [Alternative action]
+```
+
+The chat lifts this block out of your reply and renders the lines as
+one-click buttons — it never appears to the user as text, so writing it
+costs the answer nothing.
+
+Omit it in exactly two cases: you are asking the user a direct question and
+their answer is the only sensible next step, or the reply was requested as a
+single machine-readable value (JSON only, a named schema) — there, one extra
+character is the difference between a parseable answer and a broken one.
+"""
+
+
 def _emit(frame: dict) -> None:
     sys.stdout.write(json.dumps(frame) + "\n")
     sys.stdout.flush()
@@ -1564,12 +1623,33 @@ async def _real_agent_loop(
     except OSError as exc:
         print(f"context restore read failed: {exc}", file=sys.stderr, flush=True)
         restore_ctx = ""
+    # Everything appended to the CLI's default system prompt, in one place:
+    # the always-on trailer contract, then this session's restored transcript
+    # when there is one. Composed rather than assigned twice — an earlier
+    # shape had the restore branch OWN `system_prompt`, so any second thing
+    # that needed the append slot would have silently replaced the first.
+    append_parts = [_NEXT_ACTIONS_CONTRACT]
     if restore_ctx:
+        append_parts.append(restore_ctx)
+    # Field-guarded like `hooks`/`can_use_tool` above: a sandbox image older
+    # than the wheel's SDK pin has no `system_prompt` on ClaudeAgentOptions,
+    # and passing it there is a TypeError that kills the turn. The append was
+    # previously reached only by the rare restore path, so the crash was rare
+    # too; now it would be every turn. Degrade to the CLAUDE.md statement of
+    # the same contract instead.
+    if "system_prompt" in getattr(ClaudeAgentOptions, "__dataclass_fields__", {}):
         options_kwargs["system_prompt"] = {
             "type": "preset",
             "preset": "claude_code",
-            "append": restore_ctx,
+            "append": "\n\n".join(append_parts),
         }
+    elif restore_ctx:
+        print(
+            "restored-conversation context dropped: the installed claude-agent-sdk "
+            "ClaudeAgentOptions has no `system_prompt` field",
+            file=sys.stderr,
+            flush=True,
+        )
 
     async def _interrupt(client) -> None:
         # interrupt() is a coroutine — an un-awaited call never reaches the

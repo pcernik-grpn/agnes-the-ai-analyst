@@ -2931,6 +2931,24 @@ function _renderStreamingMarkdown() {
   } catch (_e) {
     currentAssistantBody.textContent = visible;
   }
+  // The chips do not have to wait for the turn to end. The trailer streams
+  // inside THIS answer, so the moment its closing fence arrives the buttons
+  // are already knowable — and what sits between that moment and the
+  // `assistant_message` frame is the entire turn close: whatever the model
+  // still has to write, the SDK's ResultMessage, the manager's persist and
+  // fan-out. That was seconds of a blinking caret with nothing to show for
+  // it. Drawing here is what the kai-agent turn engine's own client does:
+  // it reads next_actions off the streaming message, not off a finished one.
+  //
+  // Idempotent by construction: renderNextActions clears the existing row
+  // before it draws, and finalize renders the identical row from the
+  // server's content — so a repaint, a seal, and the final frame all
+  // converge on one row. Guarded on a non-empty list so a paint mid-trailer
+  // (nothing parseable yet) never clears a row that is already up.
+  const streamedActions = extractNextActions(currentAssistantText).actions;
+  if (streamedActions.length) {
+    renderNextActions(currentAssistantBody.closest(".msg-bubble"), streamedActions);
+  }
   maybeScrollToBottom();
 }
 

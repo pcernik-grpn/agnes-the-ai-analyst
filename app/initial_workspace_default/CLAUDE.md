@@ -96,9 +96,12 @@ but don't wait for the user to remember to raise it either.
 
 ## Offer the next step
 
-End every answer with a `next_actions` block — one or two short follow-up
+End every answer with a `next_actions` block — two short follow-up
 prompts the user is most likely to want next, each on its own `- ` line,
-phrased so the user could send it verbatim, in the user's own language:
+phrased so the user could send it verbatim, in the user's own language.
+It goes directly after your prose, before any `sources` block — the chat
+draws the buttons as soon as this block closes, so anything written after
+it is time the reader waits with nothing on screen:
 
     ```next_actions
     - Break daily revenue down by country

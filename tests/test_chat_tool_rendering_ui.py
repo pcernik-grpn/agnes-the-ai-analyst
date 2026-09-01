@@ -918,3 +918,90 @@ def test_reset_clears_the_seal_bookkeeping():
     reset = js[js.index("function _resetStreamingState") : js.index("function _sealStreamingSegment")]
     assert '_turnSealedText = ""' in reset
     assert "_turnSealedArticles = []" in reset
+
+
+# ── the trailer is a system-prompt contract, not only project memory ─────────
+
+
+def test_the_sandbox_system_prompt_carries_the_next_actions_contract():
+    """Why this exists at all, given the CLAUDE.md sections above already say
+    it: CLAUDE.md is a ~400-line project memory the model reads as context,
+    the section sits two thirds down, and it ends in an opt-out. The chips
+    stopped appearing with nothing in the client broken — the model had
+    simply stopped writing the block. The embedded kai-agent turn engine
+    puts the same requirement in its SYSTEM prompt with a fixed count and
+    hard rules; this pins that placement so a later refactor of the
+    restore-context branch cannot quietly drop it."""
+    src = Path("app/chat/runner.py").read_text(encoding="utf-8")
+    assert "_NEXT_ACTIONS_CONTRACT" in src
+    start = src.index('_NEXT_ACTIONS_CONTRACT = """')
+    contract = src[start : src.index('"""\n', start + len('_NEXT_ACTIONS_CONTRACT = """'))]
+    assert "```next_actions" in contract
+    assert "exactly TWO" in contract, "a fixed count is what makes compliance checkable"
+    # It must reach the CLI as an append to the stock preset — assigning
+    # `system_prompt` outright would replace Claude Code's own preset.
+    assert 'options_kwargs["system_prompt"] = {' in src
+    assert '"preset": "claude_code"' in src
+    assert '"append": "\\n\\n".join(append_parts)' in src, (
+        "the contract and the restored transcript must COMPOSE — an earlier shape "
+        "had the restore branch own the append slot, so one silently replaced the other"
+    )
+    assert "append_parts = [_NEXT_ACTIONS_CONTRACT]" in src
+    # A sandbox image older than the wheel's SDK pin has no `system_prompt`
+    # field; passing it is a TypeError that kills every turn. Before this
+    # change the append slot was reached only by the rare restore path, so
+    # the guard was optional. It is not any more.
+    assert 'if "system_prompt" in getattr(ClaudeAgentOptions, "__dataclass_fields__", {}):' in src
+
+
+def test_the_trailer_is_written_before_the_sources_block():
+    """Both trailers are withheld from the painter while they stream
+    (_streamingSafeText), so their ORDER decides when the buttons can be
+    drawn: next_actions first means the chips land with the answer instead
+    of after the whole tail. All three prompt surfaces must agree, or the
+    model picks one at random."""
+    runner = Path("app/chat/runner.py").read_text(encoding="utf-8")
+    assert "BEFORE any `sources` block" in runner
+    for path in (Path("config/claude_md_template.txt"), WORKSPACE_CLAUDE_MD):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "before any `sources` block" in flat, path
+
+
+def test_chips_are_drawn_mid_stream_not_only_at_finalize():
+    """The trailer rides inside the same stream, so the buttons are knowable
+    the moment its closing fence arrives. Everything between that moment and
+    the assistant_message frame is turn-close latency the reader used to
+    spend watching a caret."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function _renderStreamingMarkdown") : js.index("function _flushStreamingTail")]
+    assert "extractNextActions(currentAssistantText).actions" in body
+    assert "renderNextActions(" in body
+    assert "if (streamedActions.length)" in body, (
+        "a paint mid-trailer parses nothing yet and must not clear a row already up"
+    )
+
+
+def test_structured_output_validation_survives_the_trailer():
+    """The contract makes the trailer near-certain on EVERY reply, agent-API
+    ones included. Left on, it broke JSON validation twice over: the raw
+    parse fails on the trailing fence, and the fence fallback then returns
+    the TRAILER's body instead of the JSON."""
+    from app.chat.structured_output import validate
+
+    fmt = {"type": "json_schema", "schema": {"type": "object", "required": ["n"]}}
+    answer = '{"n": 4}\n\n```next_actions\n- Chart it\n- Break it down\n```'
+    ok, parsed, err = validate(answer, fmt)
+    assert ok, err
+    assert parsed == {"n": 4}
+
+    both = '{"n": 4}\n\n```next_actions\n- Chart it\n```\n\n```sources\ntable: orders\n```'
+    ok, parsed, err = validate(both, fmt)
+    assert ok, err
+    assert parsed == {"n": 4}
+
+    # A fenced JSON answer still parses, and an unfenced one whose own string
+    # content holds a fence is still parsed whole (the pre-existing rule).
+    ok, parsed, _ = validate('```json\n{"n": 1}\n```', fmt)
+    assert ok and parsed == {"n": 1}
+    ok, parsed, _ = validate('{"n": 1, "code": "```py\\npass\\n```"}', fmt)
+    assert ok and parsed["n"] == 1
