@@ -28,7 +28,12 @@ _PER_TYPE_COLUMN: Dict[str, str] = {
 
 
 class ResourceGrantsPgRepository:
-    _SELECT_COLS = "id, group_id, resource_type, resource_id, assigned_at, assigned_by, requirement"
+    # `source` rides every read so the Access page can say WHERE a grant came
+    # from, not just who wrote it. PG-only (migration 0095) — the DuckDB
+    # sibling has no such column and its rows simply carry no key.
+    _SELECT_COLS = (
+        "id, group_id, resource_type, resource_id, assigned_at, assigned_by, requirement, source"
+    )
 
     def __init__(self, engine: Engine):
         self._engine = engine
@@ -48,9 +53,13 @@ class ResourceGrantsPgRepository:
             params["gid"] = group_id
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+        # `g.source` rides this read too — it is the one the Access overview
+        # uses, and it has its own column list rather than `_SELECT_COLS`
+        # (it joins the group name), so adding the column in one place was
+        # not enough.
         sql = f"""SELECT g.id, g.group_id, ug.name AS group_name,
                        g.resource_type, g.resource_id,
-                       g.assigned_at, g.assigned_by, g.requirement
+                       g.assigned_at, g.assigned_by, g.requirement, g.source
                 FROM resource_grants g
                 JOIN user_groups ug ON ug.id = g.group_id
                 {where_sql}
@@ -148,6 +157,7 @@ class ResourceGrantsPgRepository:
         resource_id: str,
         assigned_by: Optional[str] = None,
         requirement: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> str:
         """Insert a new grant. Returns the assigned id.
 
@@ -155,6 +165,13 @@ class ResourceGrantsPgRepository:
         ``None``. Pass ``'required'`` to create a Required-tier grant in a
         single round-trip (parity with the DuckDB repo). Rejected if it is
         anything other than the two enum values.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``) — ``assigned_by`` answers who, which is a
+        different question when a fanout stamps every row with the admin who
+        clicked on another page. Postgres-only (migration 0095); the DuckDB
+        sibling accepts it and drops it, because that ladder is frozen (A3).
+        ``None`` is stored as NULL, which the API reports as no provenance.
         """
         if requirement is not None and requirement not in ("available", "required"):
             raise ValueError(f"requirement must be 'available' or 'required', got {requirement!r}")
@@ -179,6 +196,10 @@ class ResourceGrantsPgRepository:
             cols.append("requirement")
             vals.append(":req")
             params["req"] = requirement
+        if source is not None:
+            cols.append("source")
+            vals.append(":src")
+            params["src"] = source
 
         sql = sa.text(f"INSERT INTO resource_grants ({', '.join(cols)}) VALUES ({', '.join(vals)})")
         with self._engine.begin() as conn:
@@ -211,12 +232,20 @@ class ResourceGrantsPgRepository:
         resource_type: str,
         resource_id: str,
         assigned_by: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> bool:
         """Create a grant if it does not already exist. Returns True iff the
         grant row exists after the call (whether newly inserted or pre-existing).
 
         Uses INSERT … ON CONFLICT DO NOTHING so repeated calls on every boot
         are idempotent and cheap.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``) — ``assigned_by`` answers who, which is a
+        different question when a fanout stamps every row with the admin who
+        clicked on another page. Postgres-only (migration 0095); the DuckDB
+        sibling accepts it and drops it, because that ladder is frozen (A3).
+        ``None`` is stored as NULL, which the API reports as no provenance.
         """
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
@@ -226,8 +255,8 @@ class ResourceGrantsPgRepository:
                     conn.execute(
                         sa.text(
                             f"INSERT INTO resource_grants "
-                            f"(id, group_id, resource_type, resource_id, {per_type_col}, assigned_by) "
-                            f"VALUES (:id, :g, :rt, :ri, :ri2, :ab) "
+                            f"(id, group_id, resource_type, resource_id, {per_type_col}, assigned_by, source) "
+                            f"VALUES (:id, :g, :rt, :ri, :ri2, :ab, :src) "
                             f"ON CONFLICT (group_id, resource_type, resource_id) DO NOTHING"
                         ),
                         {
@@ -237,14 +266,15 @@ class ResourceGrantsPgRepository:
                             "ri": resource_id,
                             "ri2": resource_id,
                             "ab": assigned_by,
+                            "src": source,
                         },
                     )
                 else:
                     conn.execute(
                         sa.text(
                             "INSERT INTO resource_grants "
-                            "(id, group_id, resource_type, resource_id, assigned_by) "
-                            "VALUES (:id, :g, :rt, :ri, :ab) "
+                            "(id, group_id, resource_type, resource_id, assigned_by, source) "
+                            "VALUES (:id, :g, :rt, :ri, :ab, :src) "
                             "ON CONFLICT (group_id, resource_type, resource_id) DO NOTHING"
                         ),
                         {
@@ -253,6 +283,7 @@ class ResourceGrantsPgRepository:
                             "rt": resource_type,
                             "ri": resource_id,
                             "ab": assigned_by,
+                            "src": source,
                         },
                     )
         except IntegrityError:

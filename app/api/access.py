@@ -27,6 +27,7 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType, list_resource_types
+from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
 from src.repositories.user_groups import SystemGroupProtected
 
 from src.repositories import (
@@ -282,18 +283,21 @@ async def access_overview(
         logger.warning("access-overview: could not resolve system plugins: %s", e)
         _system_plugin_ids = set()
 
-    def _managed_by(resource_type: str, resource_id: str):
-        """The surface that owns this grant, when it is not this page."""
+    def _managed_by(resource_type: str, resource_id: str, source: str | None):
+        """The surface that owns this grant, when it is not this page.
+
+        Two paths, and the order matters. `source` is the RECORDED answer
+        (migration 0095) and wins when present. The plugin lookup below is the
+        DERIVED one, kept for the two cases the column cannot cover: a row
+        written before it existed, and any row on a DuckDB instance, where the
+        column does not exist at all. Both of those are real and neither is a
+        migration away — one is history, the other is the frozen ladder.
+        """
+        described = describe_grant_source(source)
+        if described is not None:
+            return described
         if resource_type == ResourceType.MARKETPLACE_PLUGIN.value and resource_id in _system_plugin_ids:
-            return {
-                "label": "Required plugin",
-                "surface": "Marketplaces",
-                "href": "/admin/marketplaces",
-                "reason": (
-                    "This plugin is marked Required, which grants it to every group. "
-                    "Turn Required off on Marketplaces to revoke it."
-                ),
-            }
+            return describe_grant_source("marketplace_required")
         return None
 
     grants = [
@@ -320,7 +324,8 @@ async def access_overview(
             # `None` for an ordinary grant — the page renders those exactly as
             # before. Non-null means: another surface owns this, do not offer a
             # control here that will fail.
-            "managed_by": _managed_by(r["resource_type"], r["resource_id"]),
+            "source": r.get("source"),
+            "managed_by": _managed_by(r["resource_type"], r["resource_id"], r.get("source")),
         }
         for r in grants_repo.list_all()
     ]
@@ -898,6 +903,10 @@ async def create_grant(
         _reject_required_on_user_published(rt, payload.resource_id)
     try:
         grant_id = grants.create(
+            # This page IS the source. Recorded rather than left NULL: "an
+            # admin did this here" and "nobody wrote down where this came
+            # from" are different facts, and only one of them is reassuring.
+            source=ACCESS_PAGE,
             group_id=payload.group_id,
             resource_type=rt.value,
             resource_id=payload.resource_id,

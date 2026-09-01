@@ -3001,13 +3001,14 @@
        is owned and send the admin there, rather than offer the act here. The
        tier pair goes too — Optional/Automatic on a mandatory plugin is the
        same false choice. (#1956 item 13.) */
-    if (o.managedBy) {
-      // No Optional/Automatic pair: that choice does not exist on a mandatory
-      // plugin, and offering it was the same falsehood the Revoke was. The
-      // tier it actually has, stated — the Manage column beside it says where
-      // that was decided, so this does not repeat the destination.
+    /* Only a NON-revocable grant loses its tier pair: on those the
+       Optional/Automatic choice does not exist (a Required plugin is
+       mandatory by definition), and offering it was the same falsehood the
+       Revoke was. A seeded default still has a real tier the admin may
+       change, so it keeps the control and merely carries its origin. */
+    if (o.managedBy && o.managedBy.revocable === false) {
       return `<span class="ax-ctl ax-ctl--managed">
-        <span class="ax-managed" data-tip="${esc(o.managedBy.reason || "")}">Required</span></span>`;
+        <span class="ax-managed" data-tip="${esc(o.managedBy.reason || "")}">${esc(o.managedBy.label)}</span></span>`;
     }
     return `<span class="ax-ctl">${tierPart}</span>`;
   };
@@ -3022,8 +3023,19 @@
       return `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
         title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`;
     }
-    if (m.managedBy) {
+    /* A grant another surface wrote. `revocable` is the honest split: several
+       writers SEED a default an admin is expected to override (an MCP
+       source's visibility, the chat seed for Everyone), and refusing a revoke
+       there would be worse than saying nothing. Those keep Revoke and merely
+       say where they came from; only the ones that genuinely re-assert — a
+       Required plugin, the nightly sync, the SharePoint wizard — replace it
+       with the way to their own surface. */
+    if (m.managedBy && m.managedBy.revocable === false) {
       return `<a class="ax-inherit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} →</a>`;
+    }
+    if (m.managedBy) {
+      return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
+        m.managedBy.href ? `<a class="ax-own__edit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} ↗</a>` : ""}`;
     }
     return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
       m.href ? `<a class="ax-own__edit" href="${m.href}">where it lives ↗</a>` : ""}`;

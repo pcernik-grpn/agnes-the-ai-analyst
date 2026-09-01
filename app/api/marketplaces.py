@@ -38,6 +38,9 @@ from src.repositories import (
     user_groups_repo,
 )
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "marketplace_required"
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/marketplaces", tags=["marketplaces"])
 
@@ -797,6 +800,7 @@ def mark_plugin_system(
             ResourceType.MARKETPLACE_PLUGIN.value,
             resource_id,
             actor_email,
+            source=GRANT_SOURCE,
         )
         if not already:
             affected_groups += 1

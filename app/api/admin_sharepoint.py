@@ -159,6 +159,9 @@ from src.repositories import (
     user_groups_repo,
 )
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "sharepoint_wizard"
+
 logger = logging.getLogger(__name__)
 
 
@@ -1284,6 +1287,7 @@ async def confirm_scope(
                 ResourceType.COLLECTION.value,
                 collection_id,
                 assigned_by=user.get("id"),
+                source=GRANT_SOURCE,
             )
         # Revoke what was unticked. Scoped to grants on THIS collection, so a
         # group's access to anything else is untouched — and a mirrored

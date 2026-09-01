@@ -44,6 +44,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "chat_seed"
+
 logger = logging.getLogger(__name__)
 
 #: Written next to `.session_secret` on the persistent state volume.
@@ -115,6 +118,7 @@ def seed_everyone_chat_grant(*, chat_enabled: bool) -> bool:
         resource_type=ResourceType.CHAT.value,
         resource_id="chat",
         assigned_by="app.main:seed_chat_grant",
+        source=GRANT_SOURCE,
     )
 
     _write_marker(marker, "seeded by app.main:seed_chat_grant")

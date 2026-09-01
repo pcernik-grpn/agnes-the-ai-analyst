@@ -60,6 +60,9 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.resource_types import ResourceType
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "library_share"
+
 #: Resource types an owner may share through this module. Each maps to a
 #: callable returning the owning user id for a resource id (or ``None`` when
 #: the resource doesn't exist).
@@ -365,7 +368,7 @@ def set_shares(
         to_add = set()  # nothing granted yet — queued for admin decision
 
     for gid in sorted(to_add):
-        grants_repo.ensure_grant(gid, resource_type, resource_id, assigned_by=actor_id)
+        grants_repo.ensure_grant(gid, resource_type, resource_id, assigned_by=actor_id, source=GRANT_SOURCE)
     for gid in sorted(to_remove):
         for g in grants_repo.list_all(resource_type=resource_type, group_id=gid):
             if g["resource_id"] == resource_id:

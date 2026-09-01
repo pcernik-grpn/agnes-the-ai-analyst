@@ -26,6 +26,9 @@ from urllib.parse import urlparse
 
 from app.utils import get_marketplace_cache_dir, get_marketplaces_dir
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "marketplace_sync"
+
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT_SEC = 300
@@ -1038,6 +1041,7 @@ def seed_builtin_marketplace() -> None:
             group_id=group["id"],
             resource_type="marketplace_plugin",
             resource_id=resource_id,
+            source=GRANT_SOURCE,
         )
         logger.info(
             "built-in marketplace: RBAC grant seeded: %s -> %s",

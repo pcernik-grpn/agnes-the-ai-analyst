@@ -76,6 +76,9 @@ from src.repositories import (
     table_registry_repo,
 )
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "collection_create"
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
@@ -208,6 +211,7 @@ def _maybe_auto_share_admin_upload(corpus_id: str, user: dict) -> str:
             ResourceType.COLLECTION.value,
             corpus_id,
             assigned_by=user["id"],
+            source=GRANT_SOURCE,
         )
         logger.info(
             "collection %s auto-shared to Everyone by admin %s (library.auto_share_admin_uploads)",

@@ -272,6 +272,61 @@ def test_ensure_grant_creates_then_idempotent(rbac_repos):
     assert grants.has_grant([grp["id"]], "marketplace_plugin", "agnes-builtin/agnes-analyst") is True
 
 
+def test_grant_source_accepted_by_both_backends_and_surfaced_by_pg(rbac_repos):
+    """`source` records WHICH surface wrote a grant, so /admin/access can say
+    where a grant is managed instead of re-deriving it (only the Required-plugin
+    case was ever derivable).
+
+    The column is Postgres-only — the DuckDB app-state backend is frozen under
+    A3 and takes no new schema — so the contract is deliberately asymmetric and
+    this test pins BOTH halves of it:
+
+      - every backend ACCEPTS the keyword on `create` and `ensure_grant`
+        without raising, so a writer passing `source=` is portable;
+      - Postgres READS it back through `list_all`, the projection
+        `/api/admin/access-overview` actually consumes;
+      - DuckDB drops it and reports no source, which is what makes an
+        unlabelled row on a frozen instance correct rather than a bug.
+
+    `list_all` is named explicitly because it has its own inline SELECT (it
+    joins the group name) rather than the shared `_SELECT_COLS`, so adding the
+    column to the repo is not enough to make the page see it.
+    """
+    repos, _, backend = rbac_repos
+    groups = repos["groups"]
+    grants = repos["grants"]
+
+    grp = groups.create(name="provenance", created_by="admin@x.com")
+    grants.create(
+        group_id=grp["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/from-wizard",
+        assigned_by="admin@x.com",
+        source="sharepoint_wizard",
+    )
+    assert (
+        grants.ensure_grant(
+            grp["id"],
+            "marketplace_plugin",
+            "acme/from-sync",
+            "system",
+            source="marketplace_sync",
+        )
+        is True
+    )
+
+    by_rid = {g["resource_id"]: g for g in grants.list_all(resource_type="marketplace_plugin")}
+    assert {"acme/from-wizard", "acme/from-sync"} <= set(by_rid)
+
+    if backend == "duckdb":
+        # Frozen backend: the argument is accepted and dropped, never stored.
+        assert by_rid["acme/from-wizard"].get("source") is None
+        assert by_rid["acme/from-sync"].get("source") is None
+    else:
+        assert by_rid["acme/from-wizard"]["source"] == "sharepoint_wizard"
+        assert by_rid["acme/from-sync"]["source"] == "marketplace_sync"
+
+
 def test_list_groups_for_user_returns_joined_groups(rbac_repos):
     repos, _, _ = rbac_repos
     users = repos["users"]

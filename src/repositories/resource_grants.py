@@ -156,8 +156,17 @@ class ResourceGrantsRepository:
         resource_id: str,
         assigned_by: Optional[str] = None,
         requirement: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> str:
         """Insert a new grant. Returns the assigned id.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``). Accepted and DROPPED here: the column is
+        Postgres-only (migration 0095) because the DuckDB ladder is frozen
+        (A3), so this backend simply does not gain provenance and the API
+        reports ``None`` — which the Access page already renders as an
+        ordinary grant. The parameter exists so every caller can pass it
+        without asking which backend is active.
 
         ``requirement`` defaults to the column default (``'available'``)
         when ``None``. Pass ``'required'`` to create a Required-tier
@@ -236,6 +245,7 @@ class ResourceGrantsRepository:
         resource_type: str,
         resource_id: str,
         assigned_by: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> bool:
         """Create a grant if it does not already exist. Returns True iff the
         grant row exists after the call (whether newly inserted or already
@@ -245,6 +255,14 @@ class ResourceGrantsRepository:
 
         Uses INSERT OR IGNORE so repeated calls (e.g. on every boot from the
         built-in marketplace seeder) are idempotent and cheap.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``). Accepted and DROPPED here: the column is
+        Postgres-only (migration 0095) because the DuckDB ladder is frozen
+        (A3), so this backend simply does not gain provenance and the API
+        reports ``None`` — which the Access page already renders as an
+        ordinary grant. The parameter exists so every caller can pass it
+        without asking which backend is active.
         """
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
