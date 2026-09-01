@@ -157,6 +157,14 @@ _ROUTING_LEASE_TTL_SEC = 180
 # been attached here.
 _SESSION_LOCKS_MAX_ENTRIES = 10_000
 
+# Upper bound on ChatManager._accepted_msg_ids — the per-process record of
+# ``client_msg_id``s already accepted, which makes one submit idempotent at
+# the manager's single user-message ingress (#1973). Sized for "recent
+# enough that a re-delivery of the same submit is still plausible", not for
+# a session's whole history: a duplicate arrives within one turn (a retry, a
+# reconnect, a double submit), never thousands of messages later.
+_ACCEPTED_MSG_IDS_MAX_ENTRIES = 2_048
+
 # Poll-fallback cadence for ChatManager._inbound_consumer_loop (wave-2F
 # task 4). The coordination-backend pub/sub notify (app.chat.inbound.
 # subscribe_notify) wakes the loop promptly in the common case; this is
@@ -548,6 +556,14 @@ class ChatManager:
         # which bounds worst-case memory instead of chasing full
         # eviction-time safety with no clean way to prove it.
         self._session_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+        # #1973: (chat_id, client_msg_id) pairs already ACCEPTED (persisted)
+        # by send_user_message, oldest-first, trimmed at
+        # `_ACCEPTED_MSG_IDS_MAX_ENTRIES`. An entry is written only after the
+        # `chat_messages` row exists, which is what lets the WS route keep
+        # retrying a send that raised while the sandbox was still booting
+        # while still making a genuine re-delivery of the same submit a no-op.
+        # Process-local by design — see send_user_message's docstring.
+        self._accepted_msg_ids: "OrderedDict[tuple[str, str], None]" = OrderedDict()
         # Track C7 (@delegation MVP): chat_id -> delegation_depth for a
         # child session `handle_delegation` has just created via
         # `create_session` but not yet `attach()`ed. Consumed (popped) by
@@ -1158,7 +1174,15 @@ class ChatManager:
         # Sent directly to this one sink (not _broadcast — every other sink
         # already has its own connection, no fan-out needed here), so it
         # needs its own stamp (wave-2F task 2).
-        await ws.send_json(stamp_frame(live.chat_id, {"type": "ready"}))
+        #
+        # `turn_in_flight` (#1973) is the authoritative answer to "is an answer
+        # being written right now", from the process that hosts the runner. The
+        # ticket response carries the same flag so the client can paint the
+        # working state before the socket exists; this is what lets it CORRECT
+        # that guess — a turn that finished in between (or a ticket minted by a
+        # replica with no manager, which always reports False) is reconciled
+        # here instead of leaving a spinner nothing will ever clear.
+        await ws.send_json(stamp_frame(live.chat_id, {"type": "ready", "turn_in_flight": live.turn_in_flight}))
 
     def _load_agent_row(self, agent_id: Optional[str]) -> Optional[dict]:
         """Best-effort load of an `agents` row for spawn-time profile
@@ -1385,6 +1409,41 @@ class ChatManager:
         await self._renotify_unattended_approvals(live)
         if not live.sinks:
             self._on_all_sinks_gone(live)
+
+    def _already_accepted(self, chat_id: str, client_msg_id: str) -> bool:
+        """Whether ``client_msg_id`` was already accepted for ``chat_id``."""
+        return (chat_id, client_msg_id) in self._accepted_msg_ids
+
+    def _note_accepted(self, chat_id: str, client_msg_id: Optional[str]) -> None:
+        """Record an accepted submit so a re-delivery of it is dropped.
+
+        No-op without an id — every pre-#1973 caller (Slack, headless, the
+        agent runtime) keeps today's exactly-as-delivered behavior.
+        """
+        if not client_msg_id:
+            return
+        self._accepted_msg_ids[(chat_id, client_msg_id)] = None
+        self._accepted_msg_ids.move_to_end((chat_id, client_msg_id))
+        while len(self._accepted_msg_ids) > _ACCEPTED_MSG_IDS_MAX_ENTRIES:
+            self._accepted_msg_ids.popitem(last=False)
+
+    def is_turn_in_flight(self, chat_id: str) -> bool:
+        """Whether ``chat_id`` has a turn running right now.
+
+        #1973: a browser that reloads mid-answer has no way to know a turn is
+        still running — it reloads persisted history (which ends on the user's
+        own question, because the answer is not persisted until the turn ends)
+        and then waits on a WebSocket whose attach can take seconds to resume
+        a sandbox. For that whole window the page looked idle: no spinner, no
+        Stop button, nothing. ``POST /sessions/{id}/ticket`` reports this so
+        the client can paint the working state before the socket is up.
+
+        False for a session this process does not host — an api-role replica
+        has no ChatManager at all (the endpoint degrades to False there), and
+        a session owned by another gateway answers over its own socket.
+        """
+        live = self._live.get(chat_id)
+        return bool(live is not None and live.turn_in_flight)
 
     def turn_buffer_min_seq(self, chat_id: str) -> Optional[int]:
         """Lowest ``seq`` currently held in ``chat_id``'s in-flight turn
@@ -3513,9 +3572,25 @@ class ChatManager:
         *,
         sender_email: Optional[str] = None,
         slack_origin: Optional[dict] = None,
+        client_msg_id: Optional[str] = None,
     ) -> None:
         """Deliver ``text`` to ``chat_id``'s runner, forwarding to the owning
         gateway if this process doesn't host the session (wave-2F task 4).
+
+        ``client_msg_id`` (#1973) makes one submit idempotent at this single
+        ingress: the id is recorded only once the message has actually been
+        ACCEPTED (persisted), and a later call carrying an id already accepted
+        is dropped whole — no second ``chat_messages`` row, no second turn.
+        The reported symptom was a session holding the same question twice
+        with no answer at all, and this closes it for every re-delivery of one
+        submit regardless of which path re-delivered it: the web WS route's
+        wait-for-runner retry, a client that re-sends after a dropped socket,
+        or a double submit. An id is NOT registered when this method raises
+        before the persist (``SessionNotFound`` while the sandbox is still
+        booting), so the retry that exists precisely for that case still
+        works. Process-local and bounded (see ``_accepted_msg_ids``): a
+        message forwarded to another gateway is deduped by the id recorded
+        here on the forwarding side, not across the coordination stream.
 
         ``slack_origin`` (``{"channel": ..., "thread_ts": ...}``) marks a
         message that entered via a Slack webhook on a replica that does NOT
@@ -3565,6 +3640,13 @@ class ChatManager:
         inside ``_resume_live``, never the reverse), matching ``attach()``'s
         existing order, so no new deadlock is introduced.
         """
+        if client_msg_id and self._already_accepted(chat_id, client_msg_id):
+            logger.info(
+                "dropping duplicate user_msg for %s (client_msg_id=%s already accepted)",
+                chat_id,
+                client_msg_id,
+            )
+            return
         live = self._live.get(chat_id)
         if live is None:
             async with self._get_session_lock(chat_id):
@@ -3598,6 +3680,7 @@ class ChatManager:
                         await self._forward_inbound_message(
                             chat_id, text, sender_email=sender_email, slack_origin=slack_origin
                         )
+                        self._note_accepted(chat_id, client_msg_id)
                         return
                     # Post-restart: no LiveSession in memory, but repo row may have sandbox refs.
                     session = self._repo.get_session(chat_id)
@@ -3625,6 +3708,7 @@ class ChatManager:
             content=text,
             sender_email=sender_email or live.user_email,
         )
+        self._note_accepted(chat_id, client_msg_id)
         # F2d (audit-full-coverage plan, Task 6): the manager's single user_msg
         # ingress point — every surface (web WS, Slack, agent runtime, headless)
         # funnels through send_user_message, so one write here covers them all.
@@ -3809,6 +3893,49 @@ class ChatManager:
         async with self._get_session_lock(chat_id):
             await self._kill_locked(chat_id, reason=reason)
 
+    def _partial_save(self, live: "LiveSession", *, reason: str) -> None:
+        """Persist an interrupted turn so a torn-down session never dead-ends.
+
+        #1973: a turn killed mid-flight used to be saved only when it had
+        already emitted TEXT tokens — an answer interrupted while its first
+        tool call was still running left the session with the user's question
+        and nothing else, which is indistinguishable from "Agnes never
+        replied" and is not recoverable by any later reload. A turn that was
+        in flight now ALWAYS leaves a row: whatever text arrived (possibly
+        empty), the ordered ``parts`` of the tool calls that did run, and the
+        ``interrupted`` marker the web client renders as "this answer was
+        interrupted".
+
+        Keyed on ``turn_in_flight`` rather than on a non-empty
+        ``turn_buffer``: a turn suspended on an approval, or one killed
+        between delivery and its first frame, has an empty buffer and is
+        exactly the case that used to vanish.
+        """
+        if not live.turn_in_flight and not live.turn_buffer:
+            return
+        partial = "".join(f.get("text", "") for f in live.turn_buffer if f.get("type") == "token").strip()
+        parts = build_message_parts(live.turn_buffer) if live.turn_buffer else None
+        tool_calls: list[dict] = [{"interrupted": True, "reason": reason}]
+        if parts:
+            tool_calls.extend(parts_to_tool_calls(parts) or [])
+        try:
+            self._repo.append_message(
+                session_id=live.chat_id,
+                role="assistant",
+                content=partial,
+                tool_calls=tool_calls,
+                parts=parts,
+                tokens_in=None,
+                tokens_out=None,
+                model=None,
+            )
+        except Exception:
+            # Teardown is best-effort throughout — a failed partial-save must
+            # not abort the rest of the kill (sandbox destroy, lease release).
+            logger.exception("partial-save failed for %s", live.chat_id)
+        live.turn_buffer.clear()
+        live.turn_in_flight = False
+
     async def _kill_locked(self, chat_id: str, *, reason: str) -> None:
         # Spawn-time profile is no longer needed once the session is torn down;
         # drop it so the map doesn't grow unboundedly with studio usage.
@@ -3882,20 +4009,7 @@ class ChatManager:
             return
         await self._release_routing_lease(chat_id)
         live.state = SessionState.DEAD
-        # Partial-save: if a turn was in flight, persist the accumulated token
-        # text as an interrupted assistant message so it's not lost.
-        if live.turn_buffer:
-            partial = "".join(f.get("text", "") for f in live.turn_buffer if f.get("type") == "token").strip()
-            if partial:
-                self._repo.append_message(
-                    session_id=chat_id,
-                    role="assistant",
-                    content=partial,
-                    tool_calls=[{"interrupted": True, "reason": reason}],
-                    tokens_in=None,
-                    tokens_out=None,
-                    model=None,
-                )
+        self._partial_save(live, reason=reason)
         if live.handle is not None:
             await live.handle.kill()
         for t in live.tasks:
@@ -4368,13 +4482,28 @@ class ChatManager:
                 continue
             # Idle TTL: last_activity recency check.
             if (now - live.last_activity).total_seconds() > idle_cutoff:
-                if self._config.on_detach == "pause":
-                    to_pause.append(chat_id)
-                else:
+                if self._config.on_detach != "pause":
                     to_kill.append((chat_id, "idle_ttl"))
-                continue
-            # Keepalive heartbeat for ACTIVE sessions with at least one sink.
-            if live.state == SessionState.ACTIVE and live.sinks and live.handle is not None:
+                    continue
+                # #1973: pausing mid-turn discards the in-flight answer —
+                # _pause_live cancels the pump, so the assistant_message that
+                # would have been persisted never arrives. The detach path
+                # (_linger_then_pause) has always waited for the turn to finish
+                # first; the reaper must agree, or a turn whose client
+                # disconnected loses its reply on the next sweep. The
+                # max_session_seconds ceiling above still ALWAYS kills, so a
+                # turn whose in-flight flag never clears cannot leak. An
+                # in-flight turn falls THROUGH to the keepalive below rather
+                # than skipping the sweep: it is the case that most needs the
+                # sandbox kept alive.
+                if not live.turn_in_flight:
+                    to_pause.append(chat_id)
+                    continue
+            # Keepalive heartbeat for ACTIVE sessions with at least one sink —
+            # or with a turn still running, which is the case a mid-answer
+            # browser reload creates: no sink, but an answer being written that
+            # must outlive the sandbox's external timeout (#1973).
+            if live.state == SessionState.ACTIVE and (live.sinks or live.turn_in_flight) and live.handle is not None:
                 try:
                     await self._provider.keepalive(
                         live.handle,
