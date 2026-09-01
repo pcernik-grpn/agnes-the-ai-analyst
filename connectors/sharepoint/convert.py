@@ -44,8 +44,13 @@ second, whole-document plain route out here for a failure to fall back to.
 Pages are separated by ``\\n\\n---\\n\\n``.
 
 A PDF with no text layer at all (a scan) is **not** an error: it returns
-``engine="empty"`` with empty markdown. Transcribing scans is a separate
-feature with its own cost surface — this module never calls a model.
+``engine="empty"`` with empty markdown. Transcribing such a scan is a separate
+feature with its own cost surface — :mod:`connectors.sharepoint.scan_ocr`,
+**off by default** behind ``extraction.scan_ocr.enabled``. While it is off
+this module never calls a model and the empty result above is byte-identical
+to what it always was; with it on, a scan comes back as ``engine="ocr"`` and a
+transcription that could not be produced at all is a :class:`ConversionError`,
+never a silently empty document.
 """
 
 from __future__ import annotations
@@ -93,6 +98,11 @@ ENGINE_MARKITDOWN = "markitdown"
 ENGINE_PYPDFIUM2 = "pypdfium2"
 ENGINE_PASSTHROUGH = "passthrough"
 ENGINE_EMPTY = "empty"
+#: A PDF with no text layer, transcribed by the vision model
+#: (:mod:`connectors.sharepoint.scan_ocr`). Its own engine name, never
+#: ``"pypdfium2"``: a downstream reader must be able to tell text that was read
+#: off the page from text a model produced from a bitmap.
+ENGINE_OCR = "ocr"
 
 
 class ConversionError(RuntimeError):
@@ -187,8 +197,7 @@ def convert_to_markdown(
         text = _read_text(path, filename, max_chars)
         engine = ENGINE_PASSTHROUGH
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
-        text = _convert_pdf(path, filename)
-        engine = ENGINE_PYPDFIUM2
+        text, engine = _convert_pdf(path, filename)
     else:
         text = _convert_markitdown(path, filename)
         engine = ENGINE_MARKITDOWN
@@ -260,7 +269,7 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 # ---------------------------------------------------------------------- pdf
 
 
-def _convert_pdf(path: Path, filename: str) -> str:
+def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
     """PDF → markdown through the structure pass, and only through it.
 
     :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf` is the ONE
@@ -276,6 +285,9 @@ def _convert_pdf(path: Path, filename: str) -> str:
 
     Takes no ``max_chars``: the cap is applied once, by the caller
     (:func:`convert_to_markdown`'s :func:`_truncate`), for every route.
+
+    Returns ``(markdown, engine)`` — the engine because this is the one route
+    with two of them: the structure pass, and the scan-OCR fallback below.
     """
     try:
         # Presence probe for the typed error below: `reconstruct_pdf` imports
@@ -297,10 +309,25 @@ def _convert_pdf(path: Path, filename: str) -> str:
             engine=ENGINE_PYPDFIUM2,
         ) from exc
 
+    if len(structured) >= MIN_PDF_TEXT_CHARS:
+        return structured, ENGINE_PYPDFIUM2
+
     # Near-empty means no usable text layer — a scan, or pure vector art.
-    # Signalled by returning empty so convert_to_markdown reports
-    # engine="empty"; not an error, and never a different engine.
-    return structured if len(structured) >= MIN_PDF_TEXT_CHARS else ""
+    # OFF by default (`extraction.scan_ocr.enabled`, a COST switch: ~$0.2-0.5
+    # per document at vision rates), and while it is off this returns empty
+    # exactly as it always did, so convert_to_markdown reports engine="empty".
+    # Enabled, the pages are rendered and transcribed by the vision model and
+    # the document comes back as engine="ocr" — and a transcription that could
+    # not be produced at all raises, because a caller who turned OCR on must
+    # never receive a silently empty document.
+    from connectors.sharepoint import scan_ocr
+
+    if not scan_ocr.scan_ocr_enabled():
+        return "", ENGINE_PYPDFIUM2
+    try:
+        return scan_ocr.transcribe_scan(path), ENGINE_OCR
+    except scan_ocr.ScanOcrUnavailable as exc:
+        raise ConversionError(filename, f"scan OCR failed: {exc}", engine=ENGINE_OCR) from exc
 
 
 # ------------------------------------------------------------------ helpers

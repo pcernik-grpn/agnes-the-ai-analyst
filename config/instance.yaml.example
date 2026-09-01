@@ -1455,6 +1455,37 @@ extraction:
     # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
     # the recall is worth that per-corpus bill.
     detector: "regex"
+  # Scan transcription (OCR) for PDFs with no usable text layer.
+  #
+  # A scanned or photographed PDF converts to nothing today: the text route
+  # finds no glyphs, the document is reported as empty and it is lost to
+  # search and to the fact graph. With this on, those pages are rendered to
+  # bitmaps (pypdfium2, the same permissive engine the text route uses) and
+  # transcribed by this instance's existing vision model, and the document
+  # comes back with engine "ocr". Only a genuinely empty text layer takes
+  # this route — a normal PDF never pays for it.
+  #
+  # OFF by default as a COST decision: transcription is per PAGE, roughly
+  # $0.2-0.5 per document at the default Haiku-class model (~50 pages), so a
+  # crawl of a thousand scans is a bill to opt into deliberately. With it
+  # off nothing is rendered and no model is contacted — behaviour is exactly
+  # as it was before the feature existed.
+  scan_ocr:
+    enabled: false
+    # Model for the transcription. Falls back to `extraction.model`, then to
+    # the AGNES_VISION_MODEL env var, then to a Haiku-class default. Accepts
+    # a tier name (`haiku`/`sonnet`/`opus`) or a concrete claude-* id. It
+    # must be vision-capable; a model that is not fails every page, which
+    # fails the document loudly rather than emptying it.
+    model: ""
+    # Pages transcribed per document. A 500-page scan must not burn the
+    # budget silently: past this cap the first N pages are transcribed and a
+    # truncation marker naming the cap is appended to the markdown. Clamped
+    # to a hard 200-page ceiling in code, so a typo cannot turn one document
+    # into a four-figure invoice.
+    max_pages: 50
+    # Pages transcribed in parallel; clamped to [1, 8], 1 = one at a time.
+    concurrency: 3
 
 
 # Microsoft Graph change-notification receiver for SharePoint connections —
