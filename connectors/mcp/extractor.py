@@ -18,18 +18,20 @@ handler (see RFC #461 §7).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import duckdb
 import pandas as pd
 
 from src.duckdb_conn import _open_duckdb
-from src.identifier_validation import validate_quoted_identifier
+from src.identifier_validation import is_safe_identifier, validate_quoted_identifier
 from src.parquet_publish import atomic_publish
 from src.repositories.mcp_sources import MCPSourceRepository
 from src.repositories.tool_registry import MATERIALIZE, ToolRegistryRepository
@@ -388,8 +390,77 @@ def _data_dir() -> Path:
     return Path(root) / "extracts"
 
 
-def output_dir_for_source(source_name: str) -> Path:
-    return _data_dir() / source_name
+# ``mcp_`` + slug + ``_`` + 8 hex = 13 characters of envelope; the strict
+# identifier rule caps the whole name at 64.
+_DIR_SLUG_MAX = 51
+
+
+def source_dir_name(source_id: str, source_name: str) -> str:
+    """The extracts subdirectory this source writes to.
+
+    The directory is a SQL identity, not a display one: ``SyncOrchestrator``
+    ATTACHes ``extracts/<dir>/extract.duckdb`` under ``<dir>`` as a bare alias,
+    so it must satisfy the strict identifier rule or the extract is written and
+    then silently refused at rebuild. ``mcp_sources.name`` is human-facing and
+    only the admin CRUD path constrains it (``_require_safe_source_name``), so
+    a source created any other way — a derived Keboola source, whose name is
+    ``f"Keboola: {connection_name}"`` by construction — could name a directory
+    that never reaches the catalog.
+
+    A name that is ALREADY a safe identifier is used verbatim. That is what
+    makes this change free to deploy: every source that works today was
+    created through the guarded path, so its directory does not move and no
+    existing extract is orphaned. Only names that could never have been
+    attached get the derived form.
+
+    The digest is of the source **id**, not the name: two distinct names can
+    sanitize to the same slug, and sharing a directory would have them
+    overwrite each other's ``_meta`` and parquets.
+    """
+    if is_safe_identifier(source_name):
+        return source_name
+    digest = hashlib.sha256((source_id or "").encode("utf-8")).hexdigest()[:8]
+    slug = re.sub(r"[^a-z0-9]+", "_", (source_name or "").lower()).strip("_")
+    slug = slug[:_DIR_SLUG_MAX].rstrip("_")
+    return f"mcp_{slug}_{digest}" if slug else f"mcp_{digest}"
+
+
+def output_dir_for_source(source: Mapping[str, Any]) -> Path:
+    """Extracts directory for a ``mcp_sources`` row."""
+    return _data_dir() / source_dir_name(source.get("id") or "", source.get("name") or "")
+
+
+def adopt_legacy_output_dir(source_name: str, target: Path) -> bool:
+    """Move an extract written under the raw ``source_name`` into ``target``.
+
+    Before :func:`source_dir_name` the directory WAS the display name, so an
+    unsafe name left a real extract in a location the orchestrator refuses to
+    attach — and goes on refusing, once per rebuild, forever. Such a directory
+    was by definition never ATTACHed, which is what makes moving it safe: no
+    DuckDB session holds it and nothing references its alias.
+
+    Returns True only when a move happened. An existing ``target`` is never
+    overwritten: it is the newer extract, and replacing it with the stale one
+    would serve old rows as current.
+
+    ``source_name`` is admin-supplied text being turned into a path, so the
+    candidate is realpath-contained to a direct child of the extracts root — a
+    name carrying ``/`` or ``..`` resolves elsewhere and is refused rather than
+    followed.
+    """
+    root = _data_dir()
+    legacy = root / source_name
+    try:
+        if legacy.resolve().parent != root.resolve():
+            return False
+    except OSError:
+        return False
+    if legacy == target or not legacy.is_dir() or target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    legacy.rename(target)
+    logger.info("adopted legacy extract dir %r -> %r", legacy.name, target.name)
+    return True
 
 
 # ── _meta + extract.duckdb writers ──────────────────────────────────────────
@@ -679,7 +750,8 @@ async def extract_source_async(
         }
 
     if output_root is None:
-        output_root = output_dir_for_source(source["name"])
+        output_root = output_dir_for_source(source)
+        adopt_legacy_output_dir(source["name"], output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "data").mkdir(exist_ok=True)
 
@@ -757,7 +829,7 @@ def extract_source(
     """Materialize all (or one) materialize-mode tools for an MCP source.
 
     Writes ``extract.duckdb`` + ``data/*.parquet`` under
-    ``<AGNES_DATA_DIR>/extracts/<source.name>/``. The orchestrator's next
+    ``<AGNES_DATA_DIR>/extracts/<source_dir_name(...)>/``. The orchestrator's next
     ``rebuild()`` will ATTACH it into ``analytics.duckdb`` automatically.
 
     Args:
@@ -794,7 +866,8 @@ def extract_source(
         }
 
     if output_root is None:
-        output_root = output_dir_for_source(source["name"])
+        output_root = output_dir_for_source(source)
+        adopt_legacy_output_dir(source["name"], output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "data").mkdir(exist_ok=True)
 
