@@ -930,13 +930,18 @@ function renderNextActions(bubble, actions, pending = false) {
     });
     row.appendChild(btn);
   }
-  // Live order is chips-then-actions (finalize renders chips BEFORE
-  // attachMessageActions appends the row). On a history reload the actions
-  // row already exists when the chips arrive — insert above it so both
-  // paths agree about the bubble's tail.
-  const actionsRow = bubble.querySelector(":scope > .msg-actions");
-  if (actionsRow) bubble.insertBefore(row, actionsRow);
-  else bubble.appendChild(row);
+  // The tail of a bubble reads: what the answer rested on (sources, assumes),
+  // then what you can do with the answer (time, copy, ask again), then what
+  // you might ask NEXT. The suggestions are the only forward-looking thing
+  // here, so they close the bubble — sitting them above the actions row put a
+  // timestamp underneath an invitation and made the row look like it belonged
+  // to the suggestions rather than to the message.
+  //
+  // Appended unconditionally, which is what makes that true on BOTH paths:
+  // live the actions row does not exist yet and arrives later (it inserts
+  // itself above these — see attachMessageActions), on reload it is already
+  // there and this lands after it. Neither path has to know which ran first.
+  bubble.appendChild(row);
 }
 
 function _clearNextActions() {
@@ -2766,6 +2771,15 @@ function attachMessageActions(article, copyText) {
 
   const wrap = document.createElement("div");
   wrap.className = "msg-actions";
+  // The other half of the tail order described in renderNextActions: this row
+  // belongs to the MESSAGE, so it sits above any follow-up suggestions rather
+  // than below them. Whichever of the two renders first, the pair lands the
+  // same way round.
+  const appendRow = () => {
+    const suggestions = bubble.querySelector(":scope > .cloud-chat-next-actions");
+    if (suggestions) bubble.insertBefore(wrap, suggestions);
+    else bubble.appendChild(wrap);
+  };
 
   const ts = article.dataset.createdAt
     ? new Date(article.dataset.createdAt)
@@ -2821,7 +2835,7 @@ function attachMessageActions(article, copyText) {
     wrap.appendChild(regen);
   }
 
-  bubble.appendChild(wrap);
+  appendRow();
 }
 
 /** Whether a persisted assistant row is a partial-save of an interrupted turn

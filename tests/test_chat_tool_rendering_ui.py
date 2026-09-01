@@ -668,15 +668,40 @@ def test_reset_finalizes_an_orphan_bubble():
     assert "renderSourcesChips" not in reset, "no server verdict exists for an unfinalized turn"
 
 
-def test_reload_chips_sit_above_the_actions_row():
-    """Live order is chips-then-actions (finalize renders chips before
-    attachMessageActions appends the row). On reload, renderMessage has
-    already appended .msg-actions before loadAndRenderHistory adds the chips
-    — so renderNextActions must insert BEFORE an existing actions row, or the
-    two paths disagree about the bubble's tail."""
+def test_the_bubble_tail_reads_sources_then_actions_then_suggestions():
+    """The tail is three things in a fixed order: what the answer rested on
+    (sources / assumes), what you can do with the ANSWER (time, copy, ask
+    again), and what you might ask NEXT. The suggestions are the only
+    forward-looking part, so they close the bubble — with them above the
+    actions row, a timestamp sat underneath an invitation and the row read as
+    belonging to the suggestions rather than to the message.
+
+    The order must hold on BOTH paths, which arrive in opposite sequences:
+    live, finalize renders sources and suggestions before
+    attachMessageActions; on reload, renderMessage has already appended
+    .msg-actions before loadAndRenderHistory adds either. So no appender may
+    assume it ran first — each places itself relative to what is already
+    there, and the three rules compose to one order either way."""
     js = _read(CHAT_JS)
-    body = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
-    assert ".msg-actions" in body and "insertBefore" in body
+
+    # Sources sit above the actions row (matters on reload, where it exists).
+    sources = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert 'bubble.querySelector(":scope > .msg-actions")' in sources and "insertBefore" in sources
+    # `place()` is the only appender; the fallback inside it is the sole
+    # bubble.appendChild in the function.
+    assert sources.count("bubble.appendChild(") == 1, "every placement goes through the ordered `place`"
+    assert sources.count("place(") >= 3, "the sources row, the empty state and the assumes row all use it"
+
+    # The actions row sits above the suggestions (matters live, where the
+    # suggestions render first).
+    actions = js[js.index("function attachMessageActions") : js.index("/** Whether a persisted assistant row")]
+    assert 'bubble.querySelector(":scope > .cloud-chat-next-actions")' in actions
+    assert "insertBefore(wrap, suggestions)" in actions
+
+    # The suggestions close the bubble, unconditionally.
+    nxt = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
+    assert "bubble.appendChild(row);" in nxt
+    assert "insertBefore" not in nxt, "the suggestions are last — nothing to insert above"
 
 
 def test_over_cap_result_keeps_a_raw_json_route():

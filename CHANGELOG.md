@@ -54,6 +54,17 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **A message's own controls sit with the message, not under the
+  suggestions.** The bubble's tail now reads: what the answer rested on
+  (`Sources` / `Assumes`), then what you can do with the ANSWER (timestamp,
+  copy, ask again), then what you might ask NEXT. The actions row used to come
+  last, which put a timestamp underneath an invitation and made the row read as
+  belonging to the follow-ups rather than to the message. The order holds on
+  both render paths even though they arrive in opposite sequences — live,
+  finalize renders sources and suggestions before the actions row exists; on a
+  history reload the actions row is already in the bubble before either. No
+  appender assumes it ran first: each places itself relative to what is
+  already there, and the three rules compose to the same tail either way.
 - **Suggested follow-ups are a labelled column, not an unlabelled row.** They
   stack one per line under a "Suggested actions" heading — wrapped into a row
   they read as a toolbar acting on the answer, where stacked they read as what
