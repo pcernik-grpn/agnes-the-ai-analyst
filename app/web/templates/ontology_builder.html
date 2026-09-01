@@ -522,12 +522,18 @@
   function loadCollections() {
     return fetch('/api/collections', { credentials: 'same-origin' })
       .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (rows) {
-        collectionsCache = (rows || []).map(function (c) { return { id: c.id, name: c.name, files: null }; });
+      .then(function (data) {
+        // GET /api/collections returns {"items": [...]}, not a bare array —
+        // accept either shape rather than assuming one.
+        var rows = Array.isArray(data) ? data : (data && data.items) || [];
+        collectionsCache = rows.map(function (c) { return { id: c.id, name: c.name, files: null }; });
         var sel = document.getElementById('ont-collection-select');
         sel.innerHTML = '<option value="">Pick a collection…</option>' +
           collectionsCache.map(function (c) { return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>'; }).join('');
-      }).catch(function () {
+      }).catch(function (err) {
+        // Log the real cause — a shape bug, a network failure and a 500 all
+        // used to render the same dead-end string with nothing in the console.
+        console.error('ontology builder: could not load collections', err);
         document.getElementById('ont-collection-select').innerHTML = '<option value="">Could not load collections</option>';
       });
   }
@@ -538,7 +544,17 @@
     if (entry.files) return Promise.resolve(entry.files);
     return fetch('/api/collections/' + encodeURIComponent(id) + '/files', { credentials: 'same-origin' })
       .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (rows) { entry.files = rows || []; return entry.files; });
+      .then(function (data) {
+        // Same shape as above: {"files": [...]}, not a bare array.
+        var rows = Array.isArray(data) ? data : (data && data.files) || [];
+        entry.files = rows;
+        return entry.files;
+      })
+      .catch(function (err) {
+        console.error('ontology builder: could not load files for collection', id, err);
+        entry.files = [];
+        return entry.files;
+      });
   }
 
   function wireDocumentSample() {

@@ -23,6 +23,11 @@ user sees there, and when to send them.
   (schema, sample rows, query mode), a data package at
   `/catalog/p/{slug}`, a recipe at `/catalog/r/{slug}`, a memory domain at
   `/memory/d/{slug}`, a hosted data app at `/apps/detail/{slug}`.
+  A collection's own page is also where its OWNER (or an admin) manages it:
+  *Edit details* renames it and rewrites its description, *Delete* removes it,
+  and each file row has its own delete. A collection fed by a source
+  connection shows "managed by …" instead — its name and content come from
+  that source. Renaming never changes the `/library/{slug}` URL.
 - `/agents` — the agent builder: create a named, scoped agent over the
   user's own stack — identity, knowledge, capabilities, surfaces,
   schedules, boundaries. The model and other boundaries are admin-set

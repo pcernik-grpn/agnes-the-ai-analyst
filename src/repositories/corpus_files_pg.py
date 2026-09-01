@@ -166,6 +166,13 @@ class CorpusFilesPgRepository:
             )
         return int(row["n"]) if row else 0
 
+    def count_by_corpus(self) -> Dict[str, int]:
+        """``corpus_id -> file count`` for every corpus that has files, in one
+        query. See the DuckDB sibling for why this exists."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text("SELECT corpus_id, COUNT(*) AS n FROM corpus_files GROUP BY corpus_id")).all()
+        return {r[0]: int(r[1]) for r in rows}
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:

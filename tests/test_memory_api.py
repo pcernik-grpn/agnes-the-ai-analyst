@@ -1873,6 +1873,175 @@ class TestPatchAndBulkUpdate:
         assert after["category"] == "engineering"
 
 
+class TestBulkReject:
+    """POST /api/memory/admin/bulk-reject — issue #1957.
+
+    The Review Queue only ever fills with ``pending`` items, so this is the
+    scoped bulk counterpart to ``POST /admin/reject`` — same status
+    transition, same ``corporate_memory.reject`` audit action per item as a
+    one-by-one click, never a generic bulk status setter (that's exactly
+    what ``bulk-update`` refuses, PR #126 review).
+    """
+
+    def _seed(self, item_id: str, status: str = "pending", title: str = "harvested candidate"):
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            KnowledgeRepository(conn).create(
+                id=item_id,
+                title=title,
+                content="content",
+                category="business_logic",
+                status=status,
+            )
+        finally:
+            conn.close()
+
+    def _status(self, item_id: str) -> str:
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            return KnowledgeRepository(conn).get_by_id(item_id)["status"]
+        finally:
+            conn.close()
+
+    def test_bulk_reject_happy_path(self, seeded_app):
+        self._seed("br_pending_1")
+        self._seed("br_pending_2")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        resp = c.post(
+            "/api/memory/admin/bulk-reject",
+            json={"item_ids": ["br_pending_1", "br_pending_2"], "reason": "duplicate crop"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert set(body["rejected"]) == {"br_pending_1", "br_pending_2"}
+        assert body["not_found"] == []
+        assert body["skipped_not_pending"] == []
+        assert body["errors"] == {}
+
+        assert self._status("br_pending_1") == "rejected"
+        assert self._status("br_pending_2") == "rejected"
+
+        # Same per-item audit action a one-by-one reject click writes — the
+        # governance queue's ``/admin/audit`` tab must show one row per item.
+        audit = c.get("/api/memory/admin/audit?action=reject", headers=_auth(token))
+        assert audit.status_code == 200
+        entries = audit.json()["entries"]
+        resources = {e["resource"] for e in entries}
+        assert {"br_pending_1", "br_pending_2"}.issubset(resources)
+
+    def test_bulk_reject_mixed_batch_never_raises(self, seeded_app):
+        self._seed("br_mixed_pending")
+        self._seed("br_mixed_approved", status="approved")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        resp = c.post(
+            "/api/memory/admin/bulk-reject",
+            json={"item_ids": ["br_mixed_pending", "br_mixed_approved", "br_does_not_exist"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["rejected"] == ["br_mixed_pending"]
+        assert body["skipped_not_pending"] == ["br_mixed_approved"]
+        assert body["not_found"] == ["br_does_not_exist"]
+        assert body["errors"] == {}
+
+        # The non-pending item must be left exactly as it was — bulk-reject
+        # never silently flips an already-approved item.
+        assert self._status("br_mixed_approved") == "approved"
+        assert self._status("br_mixed_pending") == "rejected"
+
+    def test_bulk_reject_empty_item_ids(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/memory/admin/bulk-reject",
+            json={"item_ids": []},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"rejected": [], "not_found": [], "skipped_not_pending": [], "errors": {}}
+
+    def test_bulk_reject_requires_admin(self, seeded_app):
+        self._seed("br_forbidden")
+        c = seeded_app["client"]
+        resp = c.post(
+            "/api/memory/admin/bulk-reject",
+            json={"item_ids": ["br_forbidden"]},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 403
+        # Untouched — the 403 must land before any repo write.
+        assert self._status("br_forbidden") == "pending"
+
+    def test_bulk_reject_reason_propagates_to_audit_row(self, seeded_app):
+        import json
+
+        self._seed("br_reason")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/memory/admin/bulk-reject",
+            json={"item_ids": ["br_reason"], "reason": "off-topic scratch note"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        audit = c.get("/api/memory/admin/audit?action=reject", headers=_auth(token))
+        entry = next(e for e in audit.json()["entries"] if e["resource"] == "br_reason")
+        params = json.loads(entry["params"]) if isinstance(entry["params"], str) else entry["params"]
+        assert params["reason"] == "off-topic scratch note"
+
+
+class TestBulkUpdateStatusStaysDisallowed:
+    """Guard rail alongside bulk-reject landing: bulk-update's exclusion of
+    ``status`` (PR #126 review) must not loosen now that a dedicated
+    bulk-REJECT exists — that is the point of building bulk-reject as its
+    own endpoint instead of widening ``_BULK_UPDATE_ALLOWED``."""
+
+    def test_status_field_still_rejected_by_bulk_update(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        item_resp = c.post(
+            "/api/memory",
+            json={"title": "still disallowed", "content": "content", "category": "business_logic"},
+            headers=_auth(token),
+        )
+        item_id = item_resp.json()["id"]
+
+        resp = c.post(
+            "/api/memory/admin/bulk-update",
+            json={"item_ids": [item_id], "updates": {"status": "rejected"}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 400
+        assert "status" in resp.json()["detail"]
+
+    def test_no_bulk_approve_route_exists(self, seeded_app):
+        """Deliberate: bulk-reject has no bulk-approve sibling (issue #1957's
+        own warning — approving in bulk injects items into every analyst's
+        workspace rules with nobody reading them first). ``POST
+        /admin/bulk-approve`` falls through to the catch-all ``/admin/
+        {item_id}`` route, which only registers GET/PATCH, hence 405 rather
+        than 404 — either way, no bulk-approve handler exists."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/memory/admin/bulk-approve",
+            json={"item_ids": ["whatever"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 405
+
+
 class TestStatsExtensionsAPI:
     def test_stats_includes_by_tag_and_by_audience(self, seeded_app):
         c = seeded_app["client"]

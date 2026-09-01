@@ -1111,3 +1111,249 @@ def test_reason_clause_never_takes_the_row_down(seeded_app, monkeypatch):
     row = _row_for(resp.text, "Still Renders")
     assert LOCKED_TOOLTIP in row
     assert "You have it because" not in row
+
+
+# ── The empty state has to say WHICH emptiness it means ──────────────────────
+#
+# /library is grant-scoped and deliberately not admin god-mode (see
+# `library_page`'s docstring), so a fully stocked workspace still renders an
+# empty Library for anyone no admin has granted anything to. The one copy the
+# page used to have — "Your library is empty … upload a file" — framed the
+# surface as purely self-authored, so that reader concluded the product was
+# broken rather than that they were ungranted. Same class of claim as the
+# `library_load_errors` band one branch away: "empty" is a statement about the
+# world, and the page can only honestly make it when it knows the world is.
+
+#: Verbatim, so a copy edit that reintroduces the conflation fails here.
+SELF_AUTHORED_EMPTY_TITLE = "Your library is empty"
+UNGRANTED_EMPTY_TITLE = "Nothing has been shared with you yet"
+#: The primary upload CTA specifically — the words "Upload a file" also appear
+#: in the always-present "+ Add" menu, which is not what these assert about.
+PRIMARY_UPLOAD_CTA = '<button type="button" class="cc-btn cc-btn--primary" data-new-upload>Upload a file</button>'
+
+
+def _seed_ungranted_package(conn, *, slug: str, name: str) -> str:
+    """A data package that exists instance-wide and is granted to nobody."""
+    from src.repositories.data_packages import DataPackagesRepository
+
+    return DataPackagesRepository(conn).create(
+        name=name, slug=slug, description="d", icon=None, color=None, created_by="test"
+    )
+
+
+def _empty_state(body: str) -> str:
+    """The ONE `.lib-empty` block a rowless Library renders.
+
+    Its no-results twin (`id="lib-noresults"`) lives inside the has-rows
+    branch, so it is absent here — but the rail around the page is not, and an
+    admin's rail is full of `/admin/*` links. Scoping keeps "this state offers
+    no admin action" an assertion about the state rather than about the chrome.
+    """
+    start = body.index('<div class="lib-empty">')
+    return body[start : body.index("</section>", start)]
+
+
+def test_genuinely_empty_instance_keeps_the_self_authored_copy(seeded_app):
+    """Nothing to be granted anywhere → the old copy is the true one. "Upload a
+    file" really is the next move on an instance with no content in it yet."""
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert SELF_AUTHORED_EMPTY_TITLE in body
+    assert PRIMARY_UPLOAD_CTA in body
+    assert UNGRANTED_EMPTY_TITLE not in body
+
+
+def test_the_empty_starter_memory_domains_are_not_grantable_content(seeded_app):
+    """The subtle half of "genuinely empty". Every instance ships six empty
+    starter memory domains, so a domain EXISTING says nothing — and an empty
+    domain is hidden from the Memory band even when granted, so counting them
+    would make the genuinely-empty state unreachable. Memory only counts once
+    a domain holds knowledge."""
+    from src.repositories import memory_domains_repo
+
+    assert memory_domains_repo().list(limit=100), "fixture assumption: starter domains are seeded"
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert SELF_AUTHORED_EMPTY_TITLE in body
+    assert UNGRANTED_EMPTY_TITLE not in body
+
+
+def test_ungranted_memory_with_content_is_grantable_content(seeded_app):
+    """Data packages are not the only kind the copy names — knowledge nobody
+    has been granted reaches the same state."""
+    from src.db import get_system_db
+    from src.repositories.knowledge import KnowledgeRepository
+    from src.repositories.memory_domains import MemoryDomainsRepository
+
+    conn = get_system_db()
+    domain_id = MemoryDomainsRepository(conn).create(
+        slug="unshared-memory", name="Unshared Memory", description="d", icon=None, color=None, created_by="test"
+    )
+    KnowledgeRepository(conn).create(
+        id="unshared_item",
+        title="Runbook",
+        content="# Runbook",
+        category="workflow",
+        status="approved",
+        source_user="contrib@example.com",
+    )
+    MemoryDomainsRepository(conn).add_item(domain_id, "unshared_item", added_by="test")
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert UNGRANTED_EMPTY_TITLE in body
+    assert SELF_AUTHORED_EMPTY_TITLE not in body
+
+
+def test_ungranted_content_is_not_reported_as_an_empty_library(seeded_app):
+    """The bug: a package exists instance-wide, is granted to nobody, and the
+    page told the reader their library was empty and to upload a file."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _seed_ungranted_package(conn, slug="unshared-pkg", name="Unshared Package")
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert UNGRANTED_EMPTY_TITLE in body
+    assert SELF_AUTHORED_EMPTY_TITLE not in body
+    # The wrong next move, so never the primary action here.
+    assert PRIMARY_UPLOAD_CTA not in body
+    # Aggregate only: the state discloses THAT the workspace holds grantable
+    # content, never which content — naming a resource to someone with no
+    # grant is the disclosure the empty/blocked vocabulary spec rules out.
+    assert "Unshared Package" not in body
+
+
+def test_ungranted_state_names_the_grant_mechanism(seeded_app):
+    """Why the list is empty, in the vocabulary the reader can act on."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _seed_ungranted_package(conn, slug="mech-pkg", name="Mechanism Package")
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert "data packages, memory and plugins" in body
+    assert "an admin shares one with a group you are in" in body
+
+
+def test_ungranted_state_sends_a_non_admin_to_an_admin(seeded_app):
+    """A reader who cannot grant is told who can — and is offered none of the
+    admin actions, which would 403 on arrival."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _seed_ungranted_package(conn, slug="ask-pkg", name="Ask Package")
+    conn.close()
+
+    state = _empty_state(seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text)
+    assert "Ask an admin to grant your group what you need." in state
+    assert "/admin/access" not in state
+
+
+def test_ungranted_state_gives_an_admin_the_grant_and_preview_actions(seeded_app):
+    """An admin reading "ask an admin" is the same lie in a different hat: they
+    ARE the admin, so the state carries the two things they need — the page
+    that writes the grant, and the lens that proves it landed."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _seed_ungranted_package(conn, slug="admin-pkg", name="Admin Package")
+    conn.close()
+
+    state = _empty_state(seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text)
+    assert UNGRANTED_EMPTY_TITLE in state
+    assert '<a class="cc-btn cc-btn--primary" href="/admin/access">Grant access</a>' in state
+    assert '<a class="cc-btn" href="/admin/access?lens=simulate">Simulate a person</a>' in state
+    assert "Ask an admin to grant your group what you need." not in state
+
+
+def test_a_granted_caller_sees_rows_and_no_empty_state_at_all(seeded_app):
+    """The third state, and the control for the other two: once the grant
+    exists neither empty copy may appear."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _grant_package_to_named_group(
+        conn, slug="shared-pkg", name="Shared Package", user_id="analyst1", group_name="Analysts"
+    )
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert "Shared Package" in body
+    assert SELF_AUTHORED_EMPTY_TITLE not in body
+    assert UNGRANTED_EMPTY_TITLE not in body
+
+
+def test_a_failed_read_still_wins_over_the_ungranted_copy(seeded_app, monkeypatch):
+    """Precedence: with a content read down we do not know whether anything is
+    granted, so the honest "couldn't be loaded" branch keeps the page — the
+    ungranted copy would be a second confident claim about an unread world."""
+    from src.db import get_system_db
+
+    conn = get_system_db()
+    _seed_ungranted_package(conn, slug="down-pkg", name="Down Package")
+    conn.close()
+
+    from app.services.stack_resolver import StackResolver
+
+    def _explode(self, user_id, resource_type):
+        raise RuntimeError("grants repo down")
+
+    monkeypatch.setattr(StackResolver, "browse", _explode)
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert "Your library couldn’t be loaded" in body
+    assert UNGRANTED_EMPTY_TITLE not in body
+
+
+def test_a_granted_plugin_row_says_which_group_grants_it(seeded_app):
+    """The "because you are in X" clause must reach plugin rows too.
+
+    `_because_of` fed the ROW's type key straight into `ResourceType()`. Rows
+    say `plugin` (it drives `data-kind` and the toolbar facet); grants are
+    stored as `marketplace_plugin`. So every plugin row raised
+    `'plugin' is not a valid ResourceType`, `_granted_via` swallowed it, and
+    the clause silently vanished — on every render, for every plugin, while
+    data-package rows next to it explained themselves fine.
+
+    Invisible from the inside: the page still rendered, the row still
+    appeared, and nothing failed. It was found by reading the log of a real
+    render, which is why the assertion here is on the clause a person reads
+    rather than on the absence of a warning.
+    """
+    from src.db import get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    conn.execute(
+        "INSERT INTO marketplace_registry (id, name, url) VALUES (?, 'Why Co', 'https://example.com/w.git')",
+        ["why-mkt"],
+    )
+    conn.execute(
+        "INSERT INTO marketplace_plugins (marketplace_id, name, description, is_system) "
+        "VALUES (?, ?, 'Explains itself', FALSE)",
+        ["why-mkt", "why-plugin"],
+    )
+    groups = UserGroupsRepository(conn)
+    grp = groups.get_by_name("why-group") or groups.create(name="why-group", description="t", created_by="t")
+    UserGroupMembersRepository(conn).add_member("analyst1", grp["id"], source="admin", added_by="t")
+    ResourceGrantsRepository(conn).create(
+        group_id=grp["id"],
+        resource_type="marketplace_plugin",
+        resource_id="why-mkt/why-plugin",
+        assigned_by="admin",
+        # REQUIRED, not available: `_because_of` is only composed for a row
+        # that is IN the stack (the locked state whose tooltip answers "can I
+        # remove this"). An available-tier grant nobody subscribed to renders
+        # the Add affordance instead and carries no such clause for ANY kind,
+        # which is a separate design choice, not this bug.
+        requirement="required",
+    )
+    conn.close()
+
+    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    assert "why-plugin" in body, "the granted plugin should be listed at all"
+    assert "because you are in why-group" in body, (
+        "a plugin row must name the group that grants it, exactly as a data-package row does"
+    )

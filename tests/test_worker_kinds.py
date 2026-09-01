@@ -160,14 +160,89 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 600
 
     def test_sharepoint_subtree_sweep_lease_default(self):
-        """Default 4h (14400s) — a full probe pass over a large library is
-        multi-hour (spec §6.2)."""
+        """300s, same heartbeat-protected default as every other
+        long-running kind (data-refresh, corpus-extraction) — NOT sized to
+        the multi-hour probe pass (spec §6.2) itself. The sweep can
+        legitimately run for hours; the worker's heartbeat renews this
+        lease every ``lease_seconds/3`` for as long as the handler thread
+        is alive, so the lease only has to survive the gap between two
+        ticks, not the whole sweep. The old 4h (14400s) default meant a
+        worker that died mid-sweep left the job unreclaimable for up to 4
+        hours."""
         from app.worker.kinds import register_all_kinds
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
 
-        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 14400
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 300
+
+    def test_data_refresh_lease_default_is_heartbeat_sized_not_duration_sized(self):
+        """300s, not the old 900s (15min) — a full Keboola extractor run +
+        orchestrator rebuild can legitimately take much longer than that;
+        the heartbeat (not the lease's own size) is what keeps a genuinely
+        running sync's lease alive. A worker that dies mid-sync must become
+        reclaimable in minutes, not up to 15."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["data-refresh"].lease_seconds == 300
+
+    def test_corpus_extraction_lease_is_independent_of_extraction_timeout(self, monkeypatch):
+        """The bug this PR fixes: the lease used to be
+        ``extraction.timeout_s`` (the crawl's own wall-clock bound) plus a
+        margin, so a worker killed mid-crawl left its job unreclaimable for
+        up to that whole ceiling (observed live, twice in one afternoon).
+        The crawl's timeout is still enforced entirely inside the crawl
+        (untouched by this test); the lease must no longer track it at
+        all — proven here by configuring a large ``extraction.timeout_s``
+        and asserting the registered lease stays at the small,
+        heartbeat-protected default regardless."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"timeout_s": 7200}}))
+        register_all_kinds()
+
+        assert JOB_KINDS["corpus-extraction"].lease_seconds == 300
+
+    def test_dead_worker_lease_expiry_is_within_minutes_not_up_to_an_hour(self):
+        """End-to-end proof of the reclaim-latency win: claim a REAL
+        ``corpus-extraction``/``data-refresh`` job with the kind's own
+        REGISTERED ``lease_seconds`` (exactly what ``_lane_slot`` does in
+        production), then check how far in the future ``lease_expires_at``
+        lands. Under the old duration-sized defaults this was ~62 minutes
+        (corpus-extraction) / 15 minutes (data-refresh) out — a dead
+        worker's job stayed unreclaimable that whole time. Under the new
+        sizing it must land within a handful of minutes, regardless of how
+        long the underlying job may legitimately run (the heartbeat, not
+        this lease, covers that — see the module docstring's lease/retry
+        tuning note)."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+        from src.db import close_system_db, get_system_db
+        from src.repositories import jobs_repo
+
+        register_all_kinds()
+        repo = jobs_repo()
+        for kind in ("corpus-extraction", "data-refresh"):
+            lease_seconds = JOB_KINDS[kind].lease_seconds
+            repo.enqueue(kind, {})
+            before = datetime.now(timezone.utc)
+            claimed = repo.claim_next(kinds=[kind], worker_id="dead-worker", lease_seconds=lease_seconds)
+            assert claimed is not None
+            lease_expires_at = claimed["lease_expires_at"]
+            if lease_expires_at.tzinfo is None:
+                lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+            assert lease_expires_at - before <= timedelta(minutes=10), (
+                f"{kind}: lease_expires_at {lease_expires_at.isoformat()} is more than 10 minutes "
+                f"out — a dead worker's job would stay unreclaimable that long"
+            )
+        close_system_db()
+        get_system_db()  # keep the fixture's own teardown symmetric
 
 
 class TestAgentResponseRoleSplitRegistration:
@@ -673,6 +748,73 @@ class TestCorpusExtractionHandler:
         assert not hasattr(_kinds, "_extraction_producer_argv")
         assert not hasattr(_kinds, "_extraction_producer_mode")
         assert not hasattr(_kinds, "_agnes_producer_callback_env")
+
+
+class TestDispatchJobThreadsSharePointJobId:
+    """``extraction_runs.job_id`` was null in production because nothing
+    upstream of the crawl ever supplied it — the handler only ever sees
+    ``job["payload_json"]``, never the job row. ``dispatch_job`` (the ONE
+    place both are in scope) is where that gets fixed; the handler test
+    above (``test_enabled_delegates_the_whole_payload_to_the_builtin_crawl``)
+    deliberately calls the handler directly and stays unaffected."""
+
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}, "extraction": {"timeout_s": 60}}
+
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+    def _stub_crawl(self, monkeypatch):
+        calls: list = []
+
+        def _fake(payload):
+            calls.append(dict(payload))
+            return {"mode": "builtin", "new": 0}
+
+        monkeypatch.setattr("connectors.sharepoint.crawler.run_builtin_crawl", _fake)
+        return calls
+
+    def test_the_claimed_jobs_own_id_reaches_the_crawl_payload(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {"id": "job-77", "kind": "corpus-extraction", "payload_json": {"connection_id": "conn1"}}
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "job-77"}]
+
+    def test_an_explicit_payload_job_id_is_never_overwritten(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {
+            "id": "job-77",
+            "kind": "corpus-extraction",
+            "payload_json": {"connection_id": "conn1", "job_id": "explicit"},
+        }
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "explicit"}]
+
+    def test_a_different_kinds_payload_is_never_touched(self, jobs_db, monkeypatch):
+        """``_INJECT_JOB_ID_KINDS`` is a closed, named set — no other kind's
+        payload gains a key it never asked for."""
+        from app.worker.kinds import dispatch_job
+        from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+
+        calls: list = []
+        register_kind(JobKind(name="trivial-kind", handler=calls.append, lane=LIGHT_LANE))
+
+        job = {"id": "job-1", "kind": "trivial-kind", "payload_json": {"foo": "bar"}}
+        dispatch_job(job)
+
+        assert calls == [{"foo": "bar"}]
 
 
 class TestAnonymizationKeyResolution:

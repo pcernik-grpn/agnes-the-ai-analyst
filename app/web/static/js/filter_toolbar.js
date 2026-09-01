@@ -28,7 +28,16 @@
        // (archived) be excluded from it without a special case:
        //   segments:{ container: '#ch-seg', attr: 'data-buckets', multi: true }
        //   <tr data-buckets="all|pinned">  <tr data-buckets="archived">
-       segments:{ container: '#ch-seg', attr: 'data-buckets', multi: true },
+       //   `searchSpansSegments: true` then makes an ACTIVE SEARCH ignore the
+       //   segment entirely. With `multi`, a bucket left out of the default
+       //   view is unreachable by search too — you cannot find what the view
+       //   already excluded — so searching a term from an archived chat
+       //   returned nothing at all and the conversation was simply lost
+       //   (#1974). Searching is a request for a specific thing, not a way of
+       //   browsing the current view, so it looks everywhere; the facets still
+       //   apply, because those the user set on purpose.
+       segments:{ container: '#ch-seg', attr: 'data-buckets', multi: true,
+                  searchSpansSegments: true },
        facets:  [ { key: 'type', attr: 'data-type', label: 'Type' },
                   { key: 'origin', attr: 'data-origin', label: 'Source' },
                   // A binary condition, not a category: on = keep only rows
@@ -144,12 +153,20 @@
     // Non-exclusive segments: the row's attribute is a pipe-separated SET
     // rather than one value (see the usage block above).
     var segMulti = !!(cfg.segments && cfg.segments.multi);
+    //: Opt-in: an active search looks in every segment, not just the current
+    //: view (see segMatch). Off by default — a page whose segments are a real
+    //: scope ("mine" vs "everyone's") means them, search included.
+    var segSpansOnSearch = !!(cfg.segments && cfg.segments.searchSpansSegments);
     var facetState = {};                 // key -> Set(values)
     facets.forEach(function (f) { facetState[f.key] = new Set(); });
 
     // ── matching ──
     function segMatch(row) {
       if (!cfg.segments) return true;
+      // An active search outranks the segment when the page asks for it: a
+      // search is a request for one named thing, and a view that hides it
+      // makes the thing unfindable rather than merely unlisted (#1974).
+      if (segSpansOnSearch && searchActive()) return true;
       // `all` is a wildcard only for exclusive segments. With `multi` it is a
       // real token, so a row that doesn't carry it (an archived chat) stays out
       // of the default view — which is the whole point of the mode.
@@ -184,6 +201,9 @@
         }
       }
       return true;
+    }
+    function searchActive() {
+      return !!(searchEl && (searchEl.value || '').trim());
     }
     function searchMatch(row) {
       if (!searchEl) return true;
@@ -985,6 +1005,10 @@
     apply();
     return {
       apply: apply, refresh: refresh, reset: resetAll,
+      // Exposed so a page can offer a second route into a segment beside the
+      // segmented control itself — /chats puts one next to the count, where
+      // the number that says rows are hidden actually appears.
+      setSegment: setSegment,
       setView: setView, renderGrid: renderGrid, setSort: setSort,
       destroy: destroy,
     };

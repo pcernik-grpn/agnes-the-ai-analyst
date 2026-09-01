@@ -81,3 +81,20 @@ def test_app_fetches_relative_not_root_anchored():
     src = (ROOT / "src" / "App.tsx").read_text()
     assert 'fetch("/api' not in src and "fetch('/api" not in src, "fetch must not be root-anchored"
     assert "document.baseURI" in src
+
+
+def test_scaffold_passes_the_deploy_check_clean():
+    """The deploy-time exposure scan (#1946, src/data_apps/deploy_check.py)
+    runs on every internal-repo deploy — the scaffold it ships to every new
+    app must never trip its own linter."""
+    from src.data_apps.deploy_check import check_tree
+
+    files = {}
+    for path in ROOT.rglob("*"):
+        if path.is_file():
+            files[path.relative_to(ROOT).as_posix()] = path.read_text(encoding="utf-8", errors="replace")
+
+    report = check_tree(files)
+    assert report["findings"] == [], report["findings"]
+    assert report["status"] == "pass"
+    assert report["files_scanned"] > 0

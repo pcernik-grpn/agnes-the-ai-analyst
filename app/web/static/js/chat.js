@@ -92,6 +92,13 @@ function renderMarkdownSafe(text) {
 
 let ws = null;
 let currentChatId = null;
+/** Bumped by every `openSession` call. A call whose generation is no longer
+ *  the newest one has been superseded — the user clicked another conversation,
+ *  or a submit re-opened this one — and must not paint into the transcript or
+ *  claim the global socket after its awaits resolve (#1973 review: the
+ *  deep-link restore now runs alongside the rest of boot, so a click landing
+ *  during it is an ordinary race rather than a rare one). */
+let _openGeneration = 0;
 let inFlightToolCalls = new Map();
 // Cards rendered by renderToolCallStart during the turn in progress. Collapsed
 // in one pass once the turn ends (see _collapseFinishedToolCalls) so the
@@ -99,6 +106,12 @@ let inFlightToolCalls = new Map();
 // a permanently-expanded dump of every stdout/stderr. Cleared by that same
 // pass — a card belongs to exactly one turn's collapse.
 let _currentTurnToolCards = [];
+// The open tool-call GROUP — the <details> that consecutive cards share (see
+// "Tool-call groups" below) — and, before there are two of them, the lone card
+// still standing on its own in the stream. Both are cleared by anything that
+// ends a run: a text token, an approval/question card, or the turn itself.
+let _currentToolGroup = null;
+let _looseToolCard = null;
 // tool_use_ids of in-flight preview tools. tool_result frames carry the call id
 // in `frame.tool` (NOT the tool name — see runner._emit_tool_result), so a
 // non-directive preview result (error / data_apps_disabled) is identified by
@@ -167,16 +180,69 @@ const currentUserEmail = document.body.dataset.userEmail || "";
 // in an empty/error state, which is acceptable and RBAC-safe.)
 let _initialSessionId = (document.body.dataset.initialSession || "").trim() || null;
 
+/** The in-flight deep-link restore, or null when none was started. Set by
+ *  `_restoreInitialSessionEarly` and read by `_maybeOpenInitialSession` so the
+ *  two can never both open the same session (#1973). */
+let _initialRestorePromise = null;
+
+/** Start the deep-link restore IMMEDIATELY, before anything the boot awaits.
+ *
+ *  #1973: the restore used to wait for `loadSidebar()` (a network round-trip)
+ *  and then for a `requestAnimationFrame`, and only after that fetched history
+ *  and minted a ticket. For all of those seconds the page showed the
+ *  pre-conversation hero — "Ask Agnes anything" — with the `?session=` param
+ *  already stripped from the URL by `openSession`. That is indistinguishable
+ *  from being dropped into a new chat, and it is what the reporter saw. So:
+ *  the hero comes down synchronously here, the status line says what is
+ *  happening, and the fetches start now instead of after the sidebar.
+ *
+ *  The session id is deliberately NOT consumed: `_hadInitialSession` (the
+ *  `?agent=` race guard) is captured later in boot and must still see it. */
+function _restoreInitialSessionEarly() {
+  if (!_initialSessionId || currentChatId || _initialRestorePromise) return null;
+  // A deep link names a conversation that exists — never show the
+  // pre-conversation dashboard for it, not even for one frame.
+  hideCapabilities();
+  setStatus("Restoring conversation…", "info");
+  _initialRestorePromise = openSession(_initialSessionId, undefined, { restoring: true }).catch((err) => {
+    console.error("chat: deep-link restore failed", err);
+  });
+  return _initialRestorePromise;
+}
+
 /** Open the deep-linked session exactly once on boot. No-op if there's no
- *  deep link, if the user already opened a session, or after first use. */
+ *  deep link, if the user already opened a session, or after first use.
+ *  Retained as the late-boot fallback for the case where the early restore
+ *  above could not start (a session opened from a click in between). */
 function _maybeOpenInitialSession() {
+  if (_initialRestorePromise) {
+    _initialSessionId = null;          // the early restore owns it
+    return;
+  }
   if (!_initialSessionId || currentChatId) return;
   const id = _initialSessionId;
   _initialSessionId = null;            // consume once — refreshes can't re-fire
   requestAnimationFrame(() => {
     if (currentChatId) return;          // re-check: a click may have raced in
-    openSession(id);
+    openSession(id, undefined, { restoring: true });
   });
+}
+
+/** Re-read the open conversation's title/agent from the sidebar cache.
+ *
+ *  The early deep-link restore runs BEFORE `loadSidebar()` resolves, so it has
+ *  no cached row to read a title from and `_markConversationStarted` falls back
+ *  to "Untitled chat". Called once the cache is populated so the header ends up
+ *  saying what the conversation is actually called. */
+function _resyncOpenSessionMeta() {
+  if (!currentChatId) return;
+  const meta = _sessionsCache.find(s => s.id === currentChatId);
+  if (!meta) return;
+  if (meta.agent_id && !_currentAgentId) {
+    _currentAgentId = meta.agent_id;
+    _syncAgentPicker();
+  }
+  if (meta.title && _sessionHasTurns) setThreadTitle(meta.title);
 }
 
 // Promise that resolves on the first ``ready`` / ``runner_ready`` frame from
@@ -235,6 +301,7 @@ function renderSystemNote(text, tone) {
   note.className = `cloud-chat-system-note is-${tone === "error" ? "error" : "warn"}`;
   note.setAttribute("role", "status");
   note.textContent = text;
+  _endToolGroup();
   $("chat-messages").appendChild(note);
   maybeScrollToBottom();
 }
@@ -519,6 +586,31 @@ function stripSourcesFence(markdown) {
 
 const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
 
+/** Where a claim's chip goes when you click it.
+ *
+ *  Checking a number means opening the thing it came from, so the chip that
+ *  names that thing IS the link — it rendered as a dead label, which put the
+ *  most obvious next click of the whole answer nowhere (#1974).
+ *
+ *  The workspace prompt asks for the REGISTRY ID on a `table:` line and the
+ *  canonical `family/name` on a `metric:` one (see the "Say where every number
+ *  came from" section of app/initial_workspace_default/CLAUDE.md), which is
+ *  exactly what `/catalog/t/{id}` and the metrics tab's search take. A ref that
+ *  resolves to nothing lands on the catalog's own not-found page, which is a
+ *  true answer to "show me this table" — better than a chip that cannot be
+ *  asked. `assumption` is free text about the analyst's own choices, with
+ *  nothing to open, so it stays a plain label.
+ *
+ *  Built with encodeURIComponent, never string-pasted: the ref is model output
+ *  and lands in a URL. */
+function _claimHref(claim) {
+  const ref = (claim && claim.ref) || "";
+  if (!ref) return "";
+  if (claim.kind === "table") return `/catalog/t/${encodeURIComponent(ref)}`;
+  if (claim.kind === "metric") return `/semantic-layer?tab=all_metrics&q=${encodeURIComponent(ref)}`;
+  return "";
+}
+
 /** Chips under an assistant turn. `verdict` is the server's, never recomputed
  *  here — the client has no record of what actually ran, and a second opinion
  *  derived from less information would be worse than none. */
@@ -574,13 +666,17 @@ function renderSourcesChips(bubble, verdict) {
   }
 
   for (const c of claims) {
-    const chip = document.createElement("span");
+    // A table or metric claim is a link to the thing it names; an assumption
+    // has nothing to open and stays a <span> (see _claimHref).
+    const href = _claimHref(c);
+    const chip = document.createElement(href ? "a" : "span");
+    if (href) chip.href = href;
     // Three states, and the middle one is the point of the whole feature:
     // verified (a tool call supports it), unverified (the answer named
     // something nothing ran touched), and neutral (an assumption, which there
     // is nothing to check against).
     const state = c.verified === true ? "is-ok" : c.verified === false ? "is-unverified" : "is-neutral";
-    chip.className = `msg-source-chip ${state}`;
+    chip.className = `msg-source-chip ${state}${href ? " is-link" : ""}`;
     const kind = document.createElement("span");
     kind.className = "msg-source-kind";
     kind.textContent = _CLAIM_LABEL[c.kind] || c.kind;
@@ -1317,6 +1413,7 @@ async function deleteSession(chatId) {
     markActiveSidebar(null);
     if (ws) { ws.close(); ws = null; }
     $("chat-messages").innerHTML = "";
+    _endToolGroup();
     setStatus("");
     setThreadTitle(null);
     showCapabilities();
@@ -1771,7 +1868,13 @@ async function newChat(agentSlug) {
  * what openSession already does on first open, so this is just that
  * logic made callable a second time. */
 async function loadAndRenderHistory(chatId) {
+  // Whichever open (or `full_refresh`) we belong to. If another one starts
+  // while our fetch is in flight, the transcript below is no longer ours to
+  // draw — see `_openGeneration`.
+  const gen = _openGeneration;
   $("chat-messages").innerHTML = "";
+  _endToolGroup();
+  clearThinkingPlaceholder();
   // Reset recall state for the chat being loaded up front, not after a
   // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
   // browsing the PREVIOUS conversation's prompts under the new chatId.
@@ -1782,9 +1885,13 @@ async function loadAndRenderHistory(chatId) {
   let history = [];
   try {
     history = await api(`/api/chat/sessions/${chatId}/messages`);
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
   } catch (err) {
+    if (gen !== _openGeneration) return { ok: true, error: null, count: 0, superseded: true };
     setStatus(`Could not load history: ${err.message}`, "warn");
-    return;
+    // #1973: the outcome is the caller's to act on — a RESTORE that cannot
+    // read its own history must show an error, not the empty-state hero.
+    return { ok: false, error: err.message, count: 0 };
   }
   if (history.length === 0) {
     // A conversation with an agent opens with that agent introducing itself —
@@ -1857,6 +1964,85 @@ async function loadAndRenderHistory(chatId) {
   for (const frame of pendingQuestionFrames.values()) {
     renderQuestionRequest(frame);
   }
+  // #1973: a freshly rendered transcript opens at its NEWEST message. A
+  // restored conversation used to open at the very top — for a long analysis
+  // that is a full scroll away from where the reader left off. Unconditional
+  // (not maybeScrollToBottom): this is a fresh render, so there is no reading
+  // position to protect, and the container's scrollTop is 0 either way.
+  if (history.length > 0) scrollToLatestMessage();
+  return { ok: true, error: null, count: history.length };
+}
+
+/** Put the newest message in view. Used after a full transcript render
+ *  (first open, deep-link restore, `full_refresh`) where `maybeScrollToBottom`
+ *  cannot help: it protects a reading position, and a fresh render has none. */
+function scrollToLatestMessage() {
+  const el = $("chat-messages");
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+  // Once more after layout settles — images, mermaid diagrams and code
+  // highlighting all change the height after the first paint.
+  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+}
+
+/** A deep-link restore that could not be completed (#1973).
+ *
+ *  The failure modes are all "this id is not openable by you": deleted,
+ *  archived, someone else's (the session-scoped endpoints answer 404 for all
+ *  three), or the backend is down. Whichever it is, the reader asked for a
+ *  specific conversation and must be told they are not in it — the pre-#1973
+ *  path set a status line nobody looks at, left the "Ask anything" hero up and
+ *  the `?session=` param already stripped, so it read as "the app quietly
+ *  started a new chat".
+ *
+ *  Leaves the page in a usable pre-conversation state: no session pointer, no
+ *  socket, the dashboard back, the dead id out of the URL so a reload does not
+ *  re-run the same failure. */
+function _renderRestoreFailure(detail) {
+  if (ws) { ws.close(); ws = null; }
+  currentChatId = null;
+  _syncSessionUrl(null);
+  markActiveSidebar(null);
+  _markConversationNotStarted();
+  clearThinkingPlaceholder();
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = true;
+  const host = $("chat-messages");
+  if (host) host.innerHTML = "";
+  showCapabilities();
+  renderSystemNote(
+    "That conversation could not be opened — it may have been deleted, or it " +
+      "belongs to someone else. Nothing was lost from it; this is a new chat." +
+      (detail ? ` (${detail})` : ""),
+    "error",
+  );
+  setStatus("Conversation could not be opened.", "error");
+  // Status banner AND toast: the report on #1973 was explicit that the silent
+  // fallback showed "no error, no toast", and the banner alone sits above a
+  // hero the reader is already looking past.
+  showToast("That conversation could not be opened.", "error", { durationMs: 6000 });
+}
+
+/** The transcript loaded but the socket could not be armed (#1973 review).
+ *
+ *  Deliberately non-destructive, and the difference from
+ *  `_renderRestoreFailure` is the whole point: there, the conversation could
+ *  not be READ, so there is nothing to keep and the id is probably dead. Here
+ *  it was read — the reader is looking at it — and only the WS ticket failed,
+ *  which is usually a blip. So the transcript, `currentChatId` and the
+ *  `?session=` URL all stay exactly as they are, and the message says how to
+ *  retry: both routes back (send a message, or reload this same URL) re-mint a
+ *  ticket for this same session. */
+function _renderResumeFailure(detail) {
+  clearThinkingPlaceholder();
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = true;
+  renderSystemNote(
+    "Could not reconnect to this conversation just now. Nothing is lost — " +
+      "send a message or reload the page to try again." + (detail ? ` (${detail})` : ""),
+    "warn",
+  );
+  setStatus(`Could not resume chat: ${detail}`, "error");
 }
 
 /** Open (or resume) a chat session.
@@ -1867,8 +2053,20 @@ async function loadAndRenderHistory(chatId) {
  * session each time, which used to be the path here and caused "click
  * on old chat shows old history but routes new messages to a brand-new
  * session" confusion.)
+ *
+ * ``opts.restoring`` marks a RESTORE — a `?session=` deep link, which is what
+ * a refresh of an open conversation is (#1973). Two things change: the
+ * `?session=` param is left alone (the pre-#1973 code cleared it on entry and
+ * only put it back once the history fetch confirmed turns, so a slow fetch
+ * looked exactly like being dropped into a new chat), and a restore that
+ * FAILS says so in the transcript instead of silently leaving the caller on
+ * the pre-conversation hero with a dead id in hand.
  */
-async function openSession(chatId, wsUrlOverride) {
+async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
+  // Claim this open. Every await below is followed by a check that we are
+  // still the newest one; a superseded call returns without touching the
+  // transcript, `currentChatId` or `ws`.
+  const openGen = ++_openGeneration;
   if (ws) { ws.close(); ws = null; }
   // The streaming pointers belong to the conversation being left: without
   // this, a pending 150 ms tick paints into a node the wipe below detaches,
@@ -1931,26 +2129,67 @@ async function openSession(chatId, wsUrlOverride) {
   // or genuinely empty one starts cleared and `_markConversationStarted`
   // (called from within loadAndRenderHistory) puts it back the moment the
   // fetch below confirms this session actually has messages.
-  _syncSessionUrl(_sessionHasTurns ? chatId : null);
+  // #1973: a restore keeps the param it was opened FROM. Clearing it here and
+  // restoring it a fetch later is what made a deep link look like a new chat
+  // (the address bar lost the id before anything had failed).
+  if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);
   _syncAgentPicker();
-  setStatus("");
+  if (!restoring) setStatus("");
 
   // Hydrate history. Show the capability/intro panel only when this
   // session has no messages yet — otherwise the chat-main area is a
   // blank rectangle and the user has no visual guidance about what
   // they can ask.
-  await loadAndRenderHistory(chatId);
+  const hydrated = await loadAndRenderHistory(chatId);
+  if (openGen !== _openGeneration) return;   // superseded while fetching
+  // A restore whose history fetch failed has nothing to show and no honest
+  // fallback: the id may be gone, archived, or someone else's. Say that,
+  // rather than dropping the reader on the "Ask anything" hero with the
+  // conversation they asked for silently missing (#1973).
+  if (restoring && !hydrated.ok) {
+    _renderRestoreFailure(hydrated.error);
+    return;
+  }
+  // The restore got its transcript — drop the "Restoring conversation…" line.
+  // (The in-flight-turn branch below sets its own, truer line.)
+  if (restoring) setStatus("");
 
   // Mint a fresh WS ticket for THIS chat_id (unless caller already has one).
   let wsUrl = wsUrlOverride;
+  let turnInFlight = false;
   if (!wsUrl) {
     try {
       const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
+      if (openGen !== _openGeneration) return; // superseded while minting
       wsUrl = t.ws_url;
+      // #1973: the server knows whether an answer is being written right now.
+      // Absent on an older server — falsy, i.e. today's behavior.
+      turnInFlight = !!(t && t.turn_in_flight);
     } catch (err) {
-      setStatus(`Could not resume chat: ${err.message}`, "error");
+      if (openGen !== _openGeneration) return;
+      // NOT `_renderRestoreFailure`, even while restoring: the transcript
+      // above loaded fine, so the session is real and readable and only the
+      // socket could not be armed — usually transient. Erasing a transcript
+      // we just proved good, and telling the reader the conversation may
+      // belong to someone else, would be wrong on both counts (#1973
+      // review). Keep the transcript, the id and the URL, and say it is
+      // retryable: sending a message re-mints a ticket via ensureWsReady,
+      // and so does a reload of this same URL.
+      _renderResumeFailure(err.message);
       return;
     }
+  }
+  // Paint the working state BEFORE the socket: attaching can take seconds
+  // (a paused sandbox has to resume), and for that whole window a reload
+  // mid-answer used to show no spinner, no Stop button and no status — the
+  // silence that invited the second reload behind the duplicated questions
+  // in #1973. The replayed turn frames land in this same bubble.
+  if (turnInFlight) {
+    setStatus("Reattaching to the answer in progress…", "info");
+    showThinkingPlaceholder();
+    _reattachPlaceholder = true;
+    const cancelBtn = $("cancel-btn");
+    if (cancelBtn) cancelBtn.hidden = false;
   }
 
   // Reconnect replay (wave-2F task 3): tell the server the highest seq we
@@ -1971,7 +2210,10 @@ async function openSession(chatId, wsUrlOverride) {
   // connecting state; for a paused session (~1–2 s resume) it tells the user
   // something is happening. The ready frame handler clears it — connected is
   // the normal state and gets no pill.
-  setStatus("Resuming session…", "info");
+  // Not while reattaching to a live answer — "Reattaching to the answer in
+  // progress…" is the truer line and it is already up (#1973).
+  if (!turnInFlight) setStatus("Resuming session…", "info");
+  if (openGen !== _openGeneration) return;   // last check before claiming `ws`
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
   ws.onclose = () => {
@@ -2059,6 +2301,19 @@ function handleFrame(frame) {
       // "Resuming session…" line instead; the status surfaces only when
       // something is wrong (warn/error) or in progress (info).
       setStatus("");
+      // #1973: the attach's own verdict on whether a turn is running. The
+      // ticket's flag is a pre-socket guess (and is always false on a replica
+      // with no ChatManager) — this corrects it, in both directions, but only
+      // for a placeholder the REATTACH painted: a submit's own placeholder is
+      // waiting for a message the server has not received yet.
+      if (_reattachPlaceholder && frame.turn_in_flight === false) {
+        clearThinkingPlaceholder();
+        $("cancel-btn").hidden = true;
+      } else if (frame.turn_in_flight === true && !thinkingEl) {
+        showThinkingPlaceholder();
+        _reattachPlaceholder = true;
+        $("cancel-btn").hidden = false;
+      }
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
@@ -2466,6 +2721,13 @@ function attachMessageActions(article, copyText) {
   bubble.appendChild(wrap);
 }
 
+/** Whether a persisted assistant row is a partial-save of an interrupted turn
+ *  — the `{interrupted: true, reason}` marker `ChatManager._partial_save`
+ *  stores in `tool_calls` ahead of whatever calls did run (#1973). */
+function _isInterruptedRow(m) {
+  return Array.isArray(m.tool_calls) && m.tool_calls.some(tc => tc && tc.interrupted === true);
+}
+
 /** A message from history.
  *
  *  An assistant turn is a SEQUENCE — prose, a tool call, more prose about what
@@ -2585,7 +2847,26 @@ function renderMessage(m) {
   // without them. It carries the WHOLE answer, not just this bubble's segment.
   attachMessageActions(tailArticle, stripNextActionsFence(m.content || ""));
 
-  for (const node of nodes) $("chat-messages").appendChild(node);
+  // #1973: an assistant row the server wrote for a turn that was CUT OFF
+  // (ChatManager._partial_save). A reload has to be able to tell "this is all
+  // Agnes managed to write" from a finished answer — and the case that used to
+  // persist nothing at all, a turn interrupted before its first token, now
+  // leaves a row whose whole content is this line.
+  if (m.role === "assistant" && _isInterruptedRow(m)) {
+    const note = document.createElement("div");
+    note.className = "cloud-chat-system-note is-warn";
+    note.setAttribute("role", "status");
+    note.textContent = (m.content || "").trim()
+      ? "This answer was interrupted before it finished."
+      : "This answer was interrupted before Agnes wrote anything — ask again to retry.";
+    nodes.push(note);
+  }
+  // Runs of consecutive cards fold into groups here exactly as they do live,
+  // so a reload renders the same compact trail the turn settled into rather
+  // than the wall it was built from. Applied AFTER the interrupted-turn note
+  // is pushed, so the note lands where it belongs — outside the run, under it,
+  // which is also what its position in `nodes` already says.
+  for (const node of _groupConsecutiveToolCards(nodes)) $("chat-messages").appendChild(node);
   if (m.role === "assistant") _markLatestAssistant(tailArticle);
   // Measured after insertion, and against the tail article only: the cards
   // and earlier segments are siblings, not part of the answer's height —
@@ -2837,6 +3118,12 @@ function maybeScrollToBottom() {
 // the gap between "I sent a message" and "the agent has started".
 
 let thinkingEl = null;
+/** True while the placeholder on screen was painted by a REATTACH (#1973 —
+ *  openSession found `turn_in_flight` on the ticket) rather than by a submit.
+ *  Only such a placeholder may be taken down by the `ready` frame's own
+ *  verdict; a submit's placeholder must survive a `ready` that arrives before
+ *  the server has even received the message. */
+let _reattachPlaceholder = false;
 
 function showThinkingPlaceholder() {
   if (thinkingEl) return;
@@ -2852,6 +3139,9 @@ function showThinkingPlaceholder() {
 }
 
 function clearThinkingPlaceholder() {
+  // Whatever the placeholder was for, it is gone — so is any claim that a
+  // reattach owns it (#1973). Every terminal frame routes through here.
+  _reattachPlaceholder = false;
   if (!thinkingEl) return;
   thinkingEl.remove();
   thinkingEl = null;
@@ -3066,6 +3356,9 @@ function _sealStreamingSegment() {
 function appendToken(text) {
   clearThinkingPlaceholder();
   if (!currentAssistantArticle) {
+    // Prose after a run of tool calls closes that run: the next card belongs
+    // to whatever the agent does AFTER this sentence, not before it.
+    _endToolGroup();
     currentAssistantArticle = createMessageShell({ role: "assistant" });
     currentAssistantArticle.classList.add("is-streaming");
     currentAssistantBody = currentAssistantArticle.querySelector(".msg-body");
@@ -3196,8 +3489,11 @@ function finalizeAssistantMessage(frame) {
 // the body, no nested toggles (only oversize payloads keep a "show all"
 // route). Tabular results (`agnes catalog`, `agnes query`,
 // `agnes describe`) get a real <table>; markdown-ish strings render as
-// markdown; everything else is pretty-printed JSON. A FAILED call opens
-// itself — its output is the diagnosis.
+// markdown; everything else is pretty-printed JSON. A FAILED call stays
+// collapsed like any other and puts its diagnosis on the header line, where
+// folding keeps it — auto-opening put the ARGS dump on screen instead (#1974).
+//
+// Consecutive cards fold into one group; see "Tool-call groups" below.
 //
 // Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
 // check = done, triangle-alert = error. The status class on the wrapper
@@ -3459,6 +3755,8 @@ function renderApprovalRequest(frame) {
   actions.appendChild(mkBtn("Deny", "deny", "is-deny"));
   wrap.appendChild(actions);
 
+  // An approval card is not a tool card — it ends the run above it.
+  _endToolGroup();
   $("chat-messages").appendChild(wrap);
   maybeScrollToBottom();
 }
@@ -3685,6 +3983,8 @@ function renderQuestionRequest(frame) {
   actions.appendChild(dismissBtn);
   wrap.appendChild(actions);
 
+  // A question card is not a tool card — it ends the run above it.
+  _endToolGroup();
   $("chat-messages").appendChild(wrap);
   maybeScrollToBottom();
 }
@@ -3749,9 +4049,16 @@ function resolveQuestionCard(frame) {
  *  — `state` is absent there and the card stays deliberately neutral rather
  *  than claim a success the row cannot evidence.
  *
- *  <details>/<summary> — COLLAPSED by default: the header line (status,
- *  name, args summary, timing) is the transcript trail; one click opens the
- *  formatted args + result. A FAILED call opens itself. */
+ *  <details>/<summary> — COLLAPSED by default, a failed call included: the
+ *  header line (status, name, args-or-error, timing) is the transcript trail,
+ *  and one click opens the formatted args + result.
+ *
+ *  A failed call used to open itself, on the reasoning that its output is the
+ *  diagnosis nobody knows to click for. True — but what it opened onto was the
+ *  ARGS panel, so a turn with two failures led with two screens of request JSON
+ *  above the answer (#1974). The diagnosis is now on the HEADER instead, in
+ *  place of the args summary: the reader gets the error without a click, and
+ *  the raw payload stays behind the same one expander as every other card. */
 function _buildToolCard({ tool, args, status, state, result, isError }) {
   const wrap = document.createElement("details");
   // One status vocabulary for both paths: a replayed part's `state` maps onto
@@ -3764,9 +4071,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const wrapIsError = statusClass === "is-error";
   wrap.className = `cloud-chat-tool ${statusClass}`;
   wrap.dataset.tool = tool || "";
-  // A failed call opens itself — the error text is the one body a reader
-  // must not have to know to click for. Same rule live and replayed.
-  if (wrapIsError) wrap.open = true;
 
   // Header line — status + tool name + args summary. Always visible, even
   // collapsed: it's a <summary>, not a body element.
@@ -3824,6 +4128,12 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   head.appendChild(chevron);
 
   wrap.appendChild(head);
+  // A replayed failure carries its diagnosis on the header, exactly as a live
+  // one does once its result lands (see renderToolCallEnd). AFTER the header is
+  // in the card: _setToolCardError finds the summary by querying `wrap`, so
+  // called any earlier it silently does nothing and a reloaded failure shows
+  // its args sketch where its error should be.
+  if (wrapIsError) _setToolCardError(wrap, result);
 
   // Args — formatted JSON, visible the moment the card is expanded. The
   // card header is the one click now; the old nested args toggle inside a
@@ -3840,10 +4150,214 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // bespoke quote/document preview a live one does (see
   // _renderFactClaimsPreview) instead of a generic JSON dump.
   if (status !== "running" && result !== undefined) {
-    const body = _renderToolResultPreview(result, tool);
+    const body = _renderToolResultPreview(result, tool, wrapIsError);
     if (body) wrap.appendChild(body);
   }
   return wrap;
+}
+
+//: The header only has room for a line. The whole payload is one click away
+//: inside the card, so this is a lead, not a truncation of the record.
+const _TOOL_ERROR_LINE_CHARS = 160;
+
+/** The one-line diagnosis a failed card shows on its header, in place of the
+ *  args sketch: the args are behind the expander, the error is the thing the
+ *  reader needs at a glance.
+ *
+ *  Returns plain text and is ALWAYS written with `textContent`. An internal
+ *  failure routinely names an internal endpoint ("400 Bad Request for
+ *  http://localhost:8000/api/query"), and rendering that through markdown made
+ *  the chat offer a localhost URL as a link to click (#1974). Nothing in an
+ *  error string is improved by markdown, and one thing in it is made worse. */
+function _toolErrorLine(result) {
+  let text = _unwrapMcpEnvelope(result);
+  if (text && typeof text === "object") {
+    text = text.error || text.message || text.detail || text.errorText || JSON.stringify(text);
+  }
+  if (typeof text !== "string") text = text == null ? "" : String(text);
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > _TOOL_ERROR_LINE_CHARS ? text.slice(0, _TOOL_ERROR_LINE_CHARS - 1) + "…" : text;
+}
+
+/** Put the diagnosis on a failed card's header line. No-op when the payload
+ *  yields no text — the status icon and edge already say it failed. */
+function _setToolCardError(wrap, result) {
+  const line = _toolErrorLine(result);
+  if (!line) return;
+  const summary = wrap.querySelector(".cloud-chat-tool-summary");
+  if (!summary) return;
+  summary.classList.add("is-error");
+  summary.textContent = line;
+  summary.title = line;
+}
+
+// ---------- Tool-call groups ----------------------------------------------
+// A research question can open with a dozen tool calls before the answer's
+// first sentence. One card per call is a readable trail; twelve stacked cards
+// is two screens of machinery above the thing the reader asked for (#1974).
+// So a RUN of consecutive calls — nothing but tool cards between them — folds
+// into ONE collapsed <details> whose summary is the whole run ("6 steps ·
+// 2 failed"). The cards themselves are unchanged, one click inside.
+//
+// A run of ONE is never wrapped: a lone call is already a single line, and a
+// group header over it would add a click and say nothing. The group appears
+// the moment a second consecutive card arrives, and adopts the first.
+//
+// What ENDS a run is anything that isn't another tool card — a text token
+// opening a fresh bubble, an approval or question card, a system note, the end
+// of the turn. That is what keeps a group meaning "these ran together, between
+// these two things the agent said" rather than "every tool call of the turn".
+
+function _buildToolGroup() {
+  const group = document.createElement("details");
+  group.className = "cloud-chat-tool-group";
+  const head = document.createElement("summary");
+  head.className = "cloud-chat-tool-group-head";
+  const icon = document.createElement("span");
+  icon.className = "cloud-chat-tool-group-icon";
+  icon.setAttribute("aria-hidden", "true");
+  head.appendChild(icon);
+  const label = document.createElement("span");
+  label.className = "cloud-chat-tool-group-label";
+  head.appendChild(label);
+  const meta = document.createElement("span");
+  meta.className = "cloud-chat-tool-group-meta";
+  head.appendChild(meta);
+  const chevron = document.createElement("span");
+  chevron.className = "cloud-chat-tool-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.appendChild(iconEl("chevron-right"));
+  head.appendChild(chevron);
+  group.appendChild(head);
+  const body = document.createElement("div");
+  body.className = "cloud-chat-tool-group-body";
+  group.appendChild(body);
+  return group;
+}
+
+/** Re-derive the group header from the cards inside it. Called on every add
+ *  and every result, so a live run reads as the step it is on and a settled
+ *  one as what it did. The counts are READ OFF THE CARDS rather than tracked
+ *  in a counter: the cards are the record, and a counter that drifts would
+ *  report a run that failed as one that did not. */
+function _updateToolGroupSummary(group) {
+  if (!group) return;
+  const body = group.querySelector(".cloud-chat-tool-group-body");
+  const cards = body ? Array.from(body.children).filter((c) => c.classList.contains("cloud-chat-tool")) : [];
+  const n = cards.length;
+  let running = 0;
+  let failed = 0;
+  let unknown = 0;
+  for (const c of cards) {
+    if (c.classList.contains("is-running")) running++;
+    else if (c.classList.contains("is-error")) failed++;
+    else if (!c.classList.contains("is-done")) unknown++;
+  }
+  group.classList.toggle("is-running", running > 0);
+  group.classList.toggle("is-error", running === 0 && failed > 0);
+  group.classList.toggle("is-done", running === 0 && failed === 0 && unknown === 0);
+  const icon = group.querySelector(".cloud-chat-tool-group-icon");
+  if (icon) {
+    // A pre-v123 replayed card records no outcome, so a group holding one
+    // shows NO status icon rather than a tick it cannot evidence — the same
+    // rule the individual card follows.
+    if (running > 0) icon.replaceChildren(iconEl("hourglass"));
+    else if (failed > 0) icon.replaceChildren(iconEl("triangle-alert"));
+    else if (unknown === 0) icon.replaceChildren(iconEl("check"));
+    else icon.replaceChildren();
+  }
+  const steps = `${n} step${n === 1 ? "" : "s"}`;
+  const label = group.querySelector(".cloud-chat-tool-group-label");
+  if (label) {
+    // Live: the name of the call in progress, so a collapsed group still says
+    // what is happening right now. Settled: the size of the run.
+    //
+    // The last RUNNING card, not simply the last card. Calls can settle out of
+    // order, so once the newest one finished while an earlier one was still
+    // going, "last card" named a step that was already done while the group
+    // still read as running. (Copilot review on #1985.)
+    let active = null;
+    for (let i = n - 1; i >= 0; i--) {
+      if (cards[i].classList.contains("is-running")) {
+        active = cards[i];
+        break;
+      }
+    }
+    const activeName = active ? active.querySelector(".cloud-chat-tool-name") : null;
+    label.textContent = activeName ? activeName.textContent : steps;
+  }
+  const meta = group.querySelector(".cloud-chat-tool-group-meta");
+  if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
+}
+
+/** Put a tool card in the stream, folding it together with the card before it
+ *  when that card is still the last thing in the stream. */
+function _appendToolCard(wrap) {
+  const stream = $("chat-messages");
+  // The open group only counts while it is still the LAST thing in the stream.
+  // `_endToolGroup` is called from every appender that knows about runs, but
+  // the preview paths append an assistant article without going through any of
+  // them — and a card then dropped into the older group would jump visually
+  // back above that article. Tail-checked rather than fixed at those two call
+  // sites, so a future appender cannot reintroduce it. (Copilot review
+  // on #1985.)
+  if (_currentToolGroup && stream.lastElementChild !== _currentToolGroup) _endToolGroup();
+  if (_currentToolGroup) {
+    _currentToolGroup.querySelector(".cloud-chat-tool-group-body").appendChild(wrap);
+    _updateToolGroupSummary(_currentToolGroup);
+    return;
+  }
+  // Second consecutive card: build the group in the first card's place and
+  // move it inside, so the run reads as one block from the outside.
+  if (_looseToolCard && _looseToolCard.parentNode === stream && stream.lastElementChild === _looseToolCard) {
+    const group = _buildToolGroup();
+    stream.insertBefore(group, _looseToolCard);
+    const body = group.querySelector(".cloud-chat-tool-group-body");
+    body.appendChild(_looseToolCard);
+    body.appendChild(wrap);
+    _currentToolGroup = group;
+    _looseToolCard = null;
+    _updateToolGroupSummary(group);
+    return;
+  }
+  stream.appendChild(wrap);
+  _looseToolCard = wrap;
+}
+
+/** Close the open run. Anything appended after this starts a new one. */
+function _endToolGroup() {
+  _currentToolGroup = null;
+  _looseToolCard = null;
+}
+
+/** Fold every run of two or more consecutive tool cards in `nodes` into a
+ *  group, preserving order. The reload twin of the live path above — a
+ *  refresh must not turn one compact group back into a wall of cards. */
+function _groupConsecutiveToolCards(nodes) {
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (run.length < 2) {
+      out.push(...run);
+    } else {
+      const group = _buildToolGroup();
+      const body = group.querySelector(".cloud-chat-tool-group-body");
+      for (const card of run) body.appendChild(card);
+      _updateToolGroupSummary(group);
+      out.push(group);
+    }
+    run = [];
+  };
+  for (const node of nodes) {
+    if (node && node.classList && node.classList.contains("cloud-chat-tool")) run.push(node);
+    else {
+      flush();
+      out.push(node);
+    }
+  }
+  flush();
+  return out;
 }
 
 function renderToolCallStart(frame) {
@@ -3854,7 +4368,7 @@ function renderToolCallStart(frame) {
   _sealStreamingSegment();
   const wrap = _buildToolCard({ tool: frame.tool, args: frame.args, status: "running" });
   wrap.dataset.startedAt = String(performance.now());
-  $("chat-messages").appendChild(wrap);
+  _appendToolCard(wrap);
   inFlightToolCalls.set(_toolCallId(frame), wrap);
   _currentTurnToolCards.push(wrap);
   maybeScrollToBottom();
@@ -3877,9 +4391,10 @@ function renderToolCallEnd(frame) {
   const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
-  // A FAILED call opens itself: cards start collapsed, and the error text
-  // is the one body a reader must not have to know to click for.
-  if (isError) wrap.open = true;
+  // A failed card stays COLLAPSED and puts its diagnosis on the header line
+  // instead (see _buildToolCard's note): the reader gets the error without a
+  // click, and the raw args stay behind the same expander as everywhere else.
+  if (isError) _setToolCardError(wrap, result);
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
   if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
 
@@ -3913,8 +4428,12 @@ function renderToolCallEnd(frame) {
   if (_bareToolName(toolName) === "fact_claims") {
     _recordFactClaimsEvidence(_asToolResultObject(result));
   }
-  const body = _renderToolResultPreview(result, toolName);
+  const body = _renderToolResultPreview(result, toolName, isError);
   if (body) wrap.appendChild(body);
+
+  // The group header counts running / failed off its cards, so it has to be
+  // recomputed the moment one of them settles.
+  _updateToolGroupSummary(wrap.closest(".cloud-chat-tool-group"));
 
   maybeScrollToBottom();
 }
@@ -3929,17 +4448,27 @@ function renderToolCallEnd(frame) {
  *  the finished answer. Each card's own <details> toggle still opens it
  *  back up on click.
  *
- *  A FAILED card is left open. `renderToolCallEnd` marks it `is-error` (red
- *  border, warning icon) precisely because its output is the thing the reader
- *  needs, and the `error` terminal case is the one where that matters most: a
- *  turn that died mid-tool would otherwise fold shut the very card explaining
- *  why, behind a click nobody knows to make. Folding is for the noise, not
- *  for the diagnosis. */
+ *  A FAILED card folds with the rest now. It used to be exempt, because its
+ *  output was the thing the reader needed and folding it put the diagnosis
+ *  behind a click nobody knows to make — but the diagnosis is on the HEADER
+ *  line since #1974, which is exactly the part folding keeps. Nothing is
+ *  hidden by folding it that was visible before; what folds away is the args
+ *  dump that came with it.
+ *
+ *  Runs fold too: the group is the compact form of the whole trail, so a
+ *  settled turn is one line per run rather than one per call. */
 function _collapseFinishedToolCalls() {
+  const groups = new Set();
   for (const wrap of _currentTurnToolCards) {
-    if (wrap.classList.contains("is-error")) continue;
     wrap.open = false;
+    const group = wrap.closest(".cloud-chat-tool-group");
+    if (group) groups.add(group);
   }
+  for (const group of groups) {
+    group.open = false;
+    _updateToolGroupSummary(group);
+  }
+  _endToolGroup();
   _currentTurnToolCards = [];
   // Defensive: the normal path resets facts-turn evidence inside
   // `renderFactsScopeLine` once it has been read. A turn that ends WITHOUT
@@ -4144,7 +4673,7 @@ function _renderFactClaimsPreview(result) {
  *  `fact_neighbors` are left on the generic path — their JSON already reads
  *  fine here, and they get their human head from `_TOOL_LABELS` alone.
  */
-function _renderToolResultPreview(result, toolName) {
+function _renderToolResultPreview(result, toolName, isError) {
   if (result == null || result === "") return null;
 
   if (_bareToolName(toolName) === "fact_claims") {
@@ -4156,6 +4685,21 @@ function _renderToolResultPreview(result, toolName) {
 
   result = _unwrapMcpEnvelope(result);
   if (result == null || result === "") return null;
+
+  // A failure's output is a diagnostic message, not a document: plain text,
+  // never markdown. marked's GFM autolinker turns a bare URL into an <a>, so
+  // an internal error was offering `http://localhost:8000/api/query` to the
+  // reader as a link to follow (#1974). Nothing in an error string is made
+  // better by markdown, and that one thing is made worse.
+  if (isError === true && typeof result === "string") {
+    const wrap = document.createElement("div");
+    wrap.className = "cloud-chat-tool-result is-text is-error";
+    const pre = document.createElement("pre");
+    pre.className = "cloud-chat-tool-error-body";
+    pre.textContent = result;
+    wrap.appendChild(pre);
+    return wrap;
+  }
 
   // Already-tabular JSON shapes — render a real <table> preview.
   const table = _coerceToTablePreview(result);
@@ -4702,7 +5246,23 @@ async function ensureWsReady() {
   throw new Error("WebSocket did not open within 6 s");
 }
 
+/** An opaque id for one submit, so the server can make its ingress idempotent
+ *  (#1973: "refresh ... never persists a duplicate user message"). One id per
+ *  submitUserMessage call — a retry of the SAME submit reuses it and is
+ *  dropped server-side; a genuine re-ask gets a new one and is a new turn. */
+function _newSubmitId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (_) {
+    /* fall through to the arithmetic id below */
+  }
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 async function submitUserMessage(text) {
+  const submitId = _newSubmitId();
   // Attachments pasted into the composer (§5b) ride along with this turn. They
   // are TAKEN synchronously — the chips clear with the text, in the same tick,
   // so the composer empties as one thing — and settled further down, once the
@@ -4828,6 +5388,7 @@ async function submitUserMessage(text) {
   }
 
   showThinkingPlaceholder();
+  _reattachPlaceholder = false;   // this one belongs to the submit, not a reattach
   $("cancel-btn").hidden = false;
   // Arm the long-run nudge here — AFTER the onboarding takeover check, so a
   // turn that never reaches the model (gap resolver, "add X") doesn't start a
@@ -4860,7 +5421,38 @@ async function submitUserMessage(text) {
     onboardingNoteTurnEnded();
     return;
   }
-  ws.send(JSON.stringify({ type: "user_msg", text }));
+  ws.send(JSON.stringify({ type: "user_msg", text, client_msg_id: submitId }));
+}
+
+/** Publish the composer's REAL height as `--chat-composer-h` on the shell.
+ *
+ *  Inside an active thread the composer floats over the transcript
+ *  (`position: absolute`, see chat.css `.has-thread`), and the padding that
+ *  kept the last turn clear of it was a constant sized for one line. Past
+ *  roughly four lines the composer grew up over the conversation — which is
+ *  worst in exactly the case that makes it grow: writing a long answer to a
+ *  question you need to keep reading (#1974). Measuring instead means growth
+ *  shrinks the scroll region rather than covering it.
+ *
+ *  Cheap by construction: one offsetHeight read on a change we already
+ *  handle, and a no-op on the empty-state layout, where the composer is in
+ *  normal flow and the variable goes unused. */
+function _syncComposerHeightVar() {
+  const form = $("chat-form");
+  const shell = document.querySelector(".cloud-chat-shell");
+  if (!form || !shell) return;
+  const next = `${Math.ceil(form.offsetHeight)}px`;
+  if (shell.style.getPropertyValue("--chat-composer-h") === next) return;
+  // Hold the reader's place across the change. What grows is the padding
+  // BELOW the last turn, so reserving the space without this only moves the
+  // scroll floor: the composer still rises over the text that was above it,
+  // which is the overlap being fixed. Measuring from the bottom — the edge
+  // the composer moves — and restoring that distance is what turns growth
+  // into "the transcript scrolls up" instead of "the transcript is covered".
+  const msgs = $("chat-messages");
+  const fromBottom = msgs ? msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight : 0;
+  shell.style.setProperty("--chat-composer-h", next);
+  if (msgs) msgs.scrollTop = msgs.scrollHeight - msgs.clientHeight - fromBottom;
 }
 
 /** Resize the composer textarea to fit its content, capped at 220px
@@ -4875,8 +5467,22 @@ function autosizeComposer() {
   // the column height rather than its single-line content height, which
   // would pin the composer at its 220px max on load. Only measure to
   // grow once there is actual content.
-  if (ta.value.trim() === "") return;
+  if (ta.value.trim() === "") {
+    _syncComposerHeightVar();
+    return;
+  }
   ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+  _syncComposerHeightVar();
+}
+
+// The composer also changes height for reasons no keystroke reports — the
+// window resizing under a wrapped line, the agent picker or an attachment row
+// appearing. Observing the form covers all of them with one rule instead of a
+// call site per cause; the polyfill-free fallback is the autosize path above,
+// which already covers typing.
+if (typeof ResizeObserver === "function") {
+  const _composerForm = $("chat-form");
+  if (_composerForm) new ResizeObserver(_syncComposerHeightVar).observe(_composerForm);
 }
 
 // #new-chat is the sidebar's +New chat button (topnav) OR the rail's
@@ -4900,6 +5506,7 @@ $("new-chat")?.addEventListener("click", async (e) => {
     _syncSessionUrl(null);
     markActiveSidebar(null);
     $("chat-messages").innerHTML = "";
+    _endToolGroup();
     showCapabilities();
     setThreadTitle(null);
     setStatus(`Could not start chat: ${err.message}`, "error");
@@ -7051,8 +7658,16 @@ const ChatAttachments = (() => {
   autosizeComposer();
   // Composer agent picker. Not awaited: the fetch behind it must never delay
   // the composer becoming usable, and it degrades to the brand label on
-  // failure.
+  // failure. Called BEFORE the deep-link restore below so `_agentsLoaded` is
+  // the real fetch by the time the restore awaits it (an empty session's
+  // greeting is read from it) rather than the resolved placeholder.
   initAgentPicker();
+  // #1973: a `?session=` deep link (which is also what a refresh of an open
+  // conversation is) starts restoring HERE — before the sidebar fetch, before
+  // the dashboard wiring — so the pre-conversation hero never shows for a
+  // conversation that exists and the restore's own fetches are not queued
+  // behind anything. Not awaited: the rest of boot must not wait on it either.
+  _restoreInitialSessionEarly();
   // Rail pre-conversation Dashboard (no-op on topnav): greeting fix-up +
   // suggested-next-actions wiring, handed submitUserMessage/openSession so
   // every suggestion starts (or resumes) a conversation through the exact
@@ -7102,6 +7717,9 @@ const ChatAttachments = (() => {
     }
   }
   updateDashboardSuggestions(_sidebarOk ? _sessionsCache : null);
+  // The early deep-link restore ran before this cache existed — give the
+  // header the conversation's real title now that it does (#1973).
+  _resyncOpenSessionMeta();
   // Sidebar cache (_sessionsCache) is now populated so openSession can
   // resolve the title; fire the one-shot deep-link open. Captured BEFORE the
   // call: `_maybeOpenInitialSession` consumes `_initialSessionId` (nulls it)

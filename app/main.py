@@ -2633,6 +2633,21 @@ def create_app() -> FastAPI:
 
     app.add_middleware(DataAppSubdomainMiddleware)
 
+    # Read-only "view this page as another user" (app/auth/view_as.py): stamp
+    # the request-scoped ticket, and refuse every non-GET/HEAD request (and
+    # every WebSocket handshake) while one is active. Pure ASGI, so it covers
+    # the "websocket" scope too — an http-only middleware would leave the one
+    # bidirectional channel in the app outside a read-only mode.
+    #
+    # Position is not load-bearing beyond "outside routing": the guard refuses
+    # by METHOD before the handler runs, and the two authorization guards it
+    # feeds (app.auth.access.is_user_admin, app.auth.elevation.elevation_paused)
+    # read a contextvar, not middleware order. Registered here so the refusal
+    # still gets security headers and a request id.
+    from app.middleware.view_as_readonly import ViewAsReadOnlyMiddleware
+
+    app.add_middleware(ViewAsReadOnlyMiddleware)
+
     # Baseline security response headers (non-breaking CSP subset,
     # X-Frame-Options, nosniff, Referrer-Policy, HSTS on https) — set at the app
     # layer so protection is independent of which TLS terminator is deployed,

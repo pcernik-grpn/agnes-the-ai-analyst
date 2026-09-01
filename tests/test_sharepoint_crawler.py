@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -225,10 +229,37 @@ def _state(tmp_path: Path, connection_id: str = "conn1") -> Dict[str, Any]:
     return json.loads(path.read_text())
 
 
+class FakeSourceConnectionsRepo:
+    """Stands in for ``source_connections_repo()`` — just enough of the
+    contract for the crawl's own reads/writes: ``.get()`` returns the SAME
+    connection dict every call (by reference, so a ``config_patch`` is
+    immediately visible to the next ``.get()``), and ``.config_patch()``
+    merges the patch's TOP-LEVEL keys into ``config`` the same shallow way
+    both real repos do — no new store, the same JSON column
+    ``config.scopes``/``config.extraction`` already live on.
+    """
+
+    def __init__(self, connection: Dict[str, Any]) -> None:
+        self.connection = connection
+
+    def get(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        if connection_id != self.connection.get("id"):
+            return None
+        return self.connection
+
+    def config_patch(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if connection_id != self.connection.get("id"):
+            return None
+        config = dict(self.connection.get("config") or {})
+        config.update(patch)
+        self.connection["config"] = config
+        return self.connection
+
+
 def _run(connection: Dict[str, Any], monkeypatch, scopes: Optional[List[str]] = None) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
-        lambda: type("R", (), {"get": staticmethod(lambda cid: connection)})(),
+        lambda: FakeSourceConnectionsRepo(connection),
     )
     payload: Dict[str, Any] = {"connection_id": connection["id"]}
     if scopes:
@@ -450,6 +481,221 @@ class TestResume:
         assert report["errors"] == 1
         assert report["new"] == 0
         assert _state(crawl_env)["ctags"] == {}
+        # The itemized counterpart: a path, a reason, and the exception's
+        # own message — the difference between "1 error" and knowing why.
+        detail = report["errors_detail"]
+        assert detail["total"] == 1
+        assert detail["listed"] == 1
+        assert detail["truncated"] is False
+        row = detail["items"][0]
+        assert row["reason"] == "ingest_failed"
+        assert row["path"].endswith("brief.docx")
+        assert "ingest exploded" in row["detail"]
+        # RuntimeError carries no HTTP status — never invented.
+        assert row["status_code"] is None
+
+    def test_ingest_failure_logs_status_code_and_message(self, crawl_env, monkeypatch, caplog):
+        """Never just the exception's TYPE name — a status code and a
+        message, which `SharePointGraphError`'s own docstring documents as
+        safe to log (Entra/Graph error bodies, never a credential)."""
+
+        class FailingIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                raise RuntimeError("ingest exploded")
+
+        monkeypatch.setattr(crawler, "_Ingestor", FailingIngestor)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        with caplog.at_level("WARNING", logger="connectors.sharepoint.crawler"):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        messages = [r.message for r in caplog.records if "ingest failed" in r.message]
+        assert messages
+        assert "ingest exploded" in messages[0]
+
+
+# --------------------------------------------------------------------------
+# A per-item failure must not let the drive's cursor advance past it —
+# Graph's delta feed only re-offers an item when it CHANGES, so once the
+# page's deltaLink moves on, a file that failed once and nobody touched
+# again would otherwise never come back around (root-caused live: a run
+# with every download failing, followed by a run where delta reported
+# nothing left to do — 14 documents landed out of roughly 1551).
+# --------------------------------------------------------------------------
+
+
+class TestFailureRetryQueue:
+    def test_a_failed_download_is_retried_next_run_even_when_delta_reports_no_changes(self, crawl_env, monkeypatch):
+        """The core invariant: a file that failed in run N is attempted
+        again in run N+1 — regardless of what the delta feed says, since a
+        genuinely unchanged file is never re-offered by Graph."""
+        item2_recovered = {"value": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "item2" in url and not item2_recovered["value"]:
+                    return httpx.Response(404, json={})
+                return _content_response()
+            if "t=1" in url:
+                # Every run after the first: the delta feed has nothing to
+                # report — item2's failure was never a change Graph saw.
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("item1", name="f1.docx", ctag="c1"),
+                        _file_item("item2", name="f2.docx", ctag="c2"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        assert first["errors"] == 1
+        state = _state(crawl_env)
+        assert set(state["ctags"]) == {"graph:item1"}
+        assert state["failed_items"]["graph:item2"]["attempts"] == 1
+        assert not state["failed_items"]["graph:item2"].get("given_up")
+        item1_downloads = sum(1 for u in seen if u.endswith("/content") and "item1" in u)
+
+        item2_recovered["value"] = True
+        second = _run(connection, monkeypatch)
+
+        assert second["new"] == 1
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item2"
+        state = _state(crawl_env)
+        assert state["ctags"]["graph:item2"] == "c2"
+        assert "graph:item2" not in state["failed_items"]
+        assert second["item_retry_recovered"] == 1
+
+        # Requirement 2 — the successful item's cTag behaviour is
+        # unchanged: it is never re-downloaded just because a neighbour in
+        # the same original page needed a retry.
+        assert sum(1 for u in seen if u.endswith("/content") and "item1" in u) == item1_downloads
+
+    def test_an_item_that_never_failed_is_unaffected_by_the_retry_queue(self, crawl_env, monkeypatch):
+        """Baseline: with nothing to retry, behaviour is exactly the
+        pre-existing ctag fast path — the queue adds a pass, never removes
+        the common case's shortcut."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        second = _run(connection, monkeypatch)
+        assert second["unchanged"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_first
+        assert _state(crawl_env)["failed_items"] == {}
+
+    def test_a_permanently_failing_item_stops_being_retried_after_the_bound_and_stays_visible(
+        self, crawl_env, monkeypatch
+    ):
+        """Requirement 3: the bound. A corrupt file that never downloads
+        must not cost a retry forever — but giving up on it must be
+        recorded, never dropped."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["errors"] == 1
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert not entry.get("given_up")
+
+        # Retried from the queue on this run; fails again and hits the bound.
+        second = _run(connection, monkeypatch)
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 2
+        assert entry["given_up"] is True
+        assert second["item_retry_given_up"] == 1
+        assert second["retry_backlog"]["given_up"] == 1
+        assert second["retry_backlog"]["given_up_sample"][0]["attempts"] == 2
+        content_calls = sum(1 for u in seen if u.endswith("/content"))
+
+        third = _run(connection, monkeypatch)
+        # No further attempt — it stopped costing a download once given up
+        # on — but every future report still names it as stuck, not silent.
+        assert sum(1 for u in seen if u.endswith("/content")) == content_calls
+        assert third["item_retry_given_up"] == 0
+        assert third["retry_backlog"]["given_up"] == 1
+
+
+class TestForcedResync:
+    def test_resync_flag_re_enumerates_from_scratch_but_keeps_ctags(self, crawl_env, monkeypatch):
+        """Requirement 4: an operator can recover a connection whose delta
+        cursor ran past documents it never ingested without hand-editing
+        the state file on the data disk."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?token=STALE"},
+                "ctags": {"graph:item1": "ctag-1"},
+                "failed_items": {
+                    "graph:item2": {
+                        "attempts": 5,
+                        "given_up": True,
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2"},
+                        "path": "x",
+                    }
+                },
+            },
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            assert "token=STALE" not in url, "a resync must not replay the stale deltaLink"
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=fresh"})
+
+        seen = _install_graph(monkeypatch, handler)
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        report = crawler.run_builtin_crawl({"connection_id": "conn1", "resync": True})
+
+        assert any("/root/delta?%24top=" in u or "/root/delta?$top=" in u for u in seen), (
+            "a resync re-enumerates from the drive's bare delta, never the stale saved link"
+        )
+        # The re-offered item's ctag still matches — proving the full walk
+        # happened without forcing a needless re-download.
+        assert report["unchanged"] == 1
+        assert not any(u.endswith("/content") for u in seen)
+        state = _state(crawl_env)
+        assert state["delta_links"]["b!drive1"] == f"{DRIVE_DELTA}?t=fresh"
+        assert state["failed_items"] == {}
+        assert state["ctags"]["graph:item1"] == "ctag-1"
 
 
 # --------------------------------------------------------------------------
@@ -489,6 +735,139 @@ class TestAnonymizeFailClosed:
 
         assert report["anonymize_failed"] == 0
         assert FakeIngestor.instances[-1].ingested[0]["markdown"] == "PERSON_abc met PERSON_def"
+
+    def test_an_anonymized_scope_also_redacts_the_stored_filename_and_path(self, crawl_env, monkeypatch):
+        # A stub that behaves like a real anonymizer (a deterministic
+        # function of its input, unlike the other tests' constant-return
+        # stubs), so the test can assert on the SHAPE of what gets stored —
+        # not just that it changed.
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            name="Northwind Logistics Merger Brief.docx",
+                            parent_path="/drives/b!drive1/root:/Client Files/Northwind Deal",
+                        )
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 0
+        row = FakeIngestor.instances[-1].ingested[0]
+        # Every segment went through the SAME anonymization as the body,
+        # under the same key — the "/" structure survives, only its content
+        # doesn't (the stub above wraps rather than replaces its input
+        # precisely so this test can see EACH segment was passed through
+        # separately, not the whole path as one string). The leaf keeps the
+        # SOURCE extension (`.docx`); `filename` is always the converted
+        # markdown's own name (`.md`).
+        assert row["path"] == (
+            "REDACTED[Client Files]/REDACTED[Northwind Deal]/REDACTED[Northwind Logistics Merger Brief].docx"
+        )
+        assert row["filename"] == "REDACTED[Northwind Logistics Merger Brief].md"
+
+    def test_an_anonymized_scope_leaks_no_fragment_of_the_real_name_through_the_real_anonymizer(
+        self, crawl_env, monkeypatch
+    ):
+        # No stub this time — `crawler.anonymize_markdown` is left wired to
+        # the real `src.anonymization.anonymize_markdown` (the `_key`
+        # autouse fixture already provides a resolvable HMAC key), so this is
+        # the end-to-end proof the unit-level shape assertion above cannot
+        # give: the crawl's own regex detector actually catches the folder
+        # and file name and no raw fragment of either reaches storage.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            name="Northwind Logistics Merger Brief.docx",
+                            parent_path="/drives/b!drive1/root:/Client Files/Northwind Deal",
+                        )
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 0
+        row = FakeIngestor.instances[-1].ingested[0]
+        for leaked in ("Northwind", "Logistics", "Merger", "Brief", "Client", "Files", "Deal"):
+            assert leaked not in row["path"], row["path"]
+            assert leaked not in row["filename"], row["filename"]
+        assert row["filename"].endswith(".md")
+        assert row["path"].endswith(".docx")
+
+    def test_the_same_real_folder_anonymizes_to_the_same_prefix_for_two_files(self, crawl_env, monkeypatch):
+        # Prefix matching / corpus-map routing over the ANONYMIZED tree only
+        # keeps working if two files under the same real folder still share
+        # one anonymized folder prefix — this is what per-segment (not
+        # whole-path) anonymization, under one deterministic key, buys.
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("item1", name="alpha.docx", parent_path="/drives/b!drive1/root:/Northwind Deal"),
+                        _file_item("item2", name="beta.docx", parent_path="/drives/b!drive1/root:/Northwind Deal"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        rows = FakeIngestor.instances[-1].ingested
+        prefixes = {row["path"].rsplit("/", 1)[0] for row in rows}
+        assert len(rows) == 2
+        assert len(prefixes) == 1, rows
+
+    def test_identity_anonymization_failure_is_fail_closed_like_body_failure(self, crawl_env, monkeypatch):
+        # The body anonymizes fine; the filename/path anonymization (the
+        # LATER calls `_anonymize_identity` makes) is what fails here — the
+        # document must still be dropped and counted, exactly as a body
+        # failure already is.
+        calls = {"n": 0}
+
+        def _anonymize(text, *, key, detector=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return AnonymizeResult("safe body")
+            raise RuntimeError("identity anonymizer blew up")
+
+        monkeypatch.setattr(crawler, "anonymize_markdown", _anonymize)
+        _install_graph(monkeypatch, self._handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
 
     def test_a_document_that_cannot_be_anonymized_is_never_ingested_raw(self, crawl_env, monkeypatch):
         def _boom(text, *, key, detector=None):
@@ -560,6 +939,31 @@ class TestConversion:
         assert report["convert_failed"] == 2
         assert report["new"] == 0
         assert FakeIngestor.instances[-1].ingested == []
+        detail = report["errors_detail"]
+        assert detail["total"] == 2
+        assert detail["listed"] == 2
+        assert {row["reason"] for row in detail["items"]} == {"convert_failed"}
+        assert all("markitdown said no" in row["detail"] for row in detail["items"])
+        assert all(row["status_code"] is None for row in detail["items"])
+
+    def test_an_empty_conversion_leaves_no_error_detail(self, crawl_env, monkeypatch):
+        """`convert_empty` is a benign skip (counted in `convert_failed`,
+        exactly as before), never an `errors` count and never itemized in
+        `errors_detail` — it never reached `errors` before this change and
+        must not gain a row just because a neighbouring reason did."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["errors"] == 0
+        assert report["errors_detail"] == {"items": [], "listed": 0, "total": 0, "truncated": False}
 
     def test_an_empty_conversion_is_not_ingested(self, crawl_env, monkeypatch):
         monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
@@ -574,6 +978,345 @@ class TestConversion:
 
         assert report["convert_failed"] == 1
         assert FakeIngestor.instances[-1].ingested == []
+
+
+class TestConversionCrashIsolation:
+    """A native crash inside the converter (observed on a live deployment:
+    a `trap int3` abort inside libpdfium.so, reached via pypdfium2) used to
+    take the ENTIRE worker process down with it — nothing in this module
+    could ever catch it, because by the time it happened nothing here was
+    running: the process itself was simply gone one line later. Conversion
+    now runs in a dedicated child process per concurrency slot
+    (`crawler._ConvertProcessPool`), so a crash there costs exactly the one
+    file it was converting, never this process.
+
+    `os.kill(os.getpid(), signal.SIGABRT)` inside the fake converter below
+    MUST run inside a forked child — if process isolation regressed to the
+    old thread-pool call, this whole test process would abort instead of
+    the assertions below ever running, which is itself the strongest
+    possible proof these tests fail against the pre-isolation code.
+    """
+
+    @staticmethod
+    def _crash_on_marker(marker: bytes) -> Callable[[Path, str], Any]:
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == marker:
+                os.kill(os.getpid(), signal.SIGABRT)
+            return ConvertResult("# converted fine")
+
+        return _convert
+
+    @staticmethod
+    def _two_item_handler(monkeypatch, *, crash_item_id: str = "crash") -> None:
+        """One item whose downloaded bytes are the crash marker, one
+        ordinary — told apart by item id, which Graph's own content URL
+        always carries (``.../items/<id>/content``)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if f"/items/{crash_item_id}/content" in url:
+                    return httpx.Response(200, content=b"CRASH-ME")
+                return httpx.Response(200, content=b"fine-bytes")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(crash_item_id, name="bad.pdf", ctag="c1"),
+                        _file_item("ok", name="ok.txt", ctag="c2"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+    def test_a_signal_crash_is_counted_convert_failed_and_the_run_continues(self, crawl_env, monkeypatch, caplog):
+        # Concurrency 1: the crashed and the healthy file share the SAME
+        # (repaired) slot, back to back — the strongest version of "the run
+        # continues with the next file".
+        _at_concurrency(monkeypatch, 1)
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash_on_marker(b"CRASH-ME"))
+        self._two_item_handler(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # Reaching this line at all proves the crash cost one file, not this
+        # (the crawl's own) process.
+        assert report["convert_failed"] == 1
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("bad.pdf" in m and "SIGABRT" in m for m in messages), messages
+
+    def test_a_crash_on_one_slot_does_not_affect_a_sibling_on_another_slot(self, crawl_env, monkeypatch):
+        # Concurrency > item count: crash and success run on DIFFERENT
+        # worker processes at the same time — proves the isolation is
+        # per-slot, not "the whole pool is down until the next page".
+        _at_concurrency(monkeypatch, 4)
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash_on_marker(b"CRASH-ME"))
+        self._two_item_handler(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+    def test_a_crash_and_an_ordinary_conversion_error_are_both_convert_failed_alongside_a_success(
+        self, crawl_env, monkeypatch
+    ):
+        _at_concurrency(monkeypatch, 1)
+
+        def _convert(path: Path, mime: str) -> Any:
+            content = Path(path).read_bytes()
+            if content == b"CRASH-ME":
+                os.kill(os.getpid(), signal.SIGABRT)
+            if content == b"BOOM-ME":
+                raise RuntimeError("markitdown said no")
+            return ConvertResult("# converted fine")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "/items/crash/content" in url:
+                    return httpx.Response(200, content=b"CRASH-ME")
+                if "/items/boom/content" in url:
+                    return httpx.Response(200, content=b"BOOM-ME")
+                return httpx.Response(200, content=b"fine-bytes")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("crash", name="bad.pdf", ctag="c1"),
+                        _file_item("boom", name="boom.docx", ctag="c2"),
+                        _file_item("ok", name="ok.txt", ctag="c3"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # An ordinary exception behaves exactly as it did before process
+        # isolation existed — same counter, same "not fatal" outcome — right
+        # alongside a signal crash, in the same page.
+        assert report["convert_failed"] == 2
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+
+class TestConvertProcessPoolRecycling:
+    """`_ConvertProcessPool` recycling — the OOM guard for a crash survivor
+    that just keeps running: markitdown/pypdfium2 hold onto memory per
+    document, so a slot that never recycles grows without bound over a
+    large crawl. Observed on a live deployment: ~8.4 GiB across 6 slots
+    (~22 documents each) before the container's memory cgroup started
+    SIGKILLing whichever child allocated next, indiscriminately — including
+    files nowhere near a gigabyte.
+
+    Drives `_ConvertProcessPool` directly (not through a full crawl), the
+    same way `TestActivityBookkeeping` drives `CrawlStats` directly — the
+    mechanism under test is a pool method, not the whole pipeline.
+    """
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_a_slot_is_recycled_after_its_document_budget(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=3, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            for _ in range(3):
+                outcome = pool.convert(0, f, "text/plain")
+                assert outcome.ok
+            # The 3rd conversion crossed the budget and swapped in the
+            # pre-forked SPARE — a genuinely different process, promoted
+            # without this (the test's own, multi-threaded pytest) thread
+            # ever calling fork().
+            assert pool._procs[0].pid != first_pid
+            # ...and the slot keeps converting normally afterwards, on a
+            # fresh document budget.
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_a_slot_is_recycled_when_its_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            # Inflate THIS (child) process's RSS on purpose, deterministically
+            # — the point of testing the trigger in isolation, rather than
+            # waiting on a real multi-hundred-document crawl to grow one
+            # organically.
+            _hog = bytearray(20 * 1024 * 1024)  # noqa: F841 — the allocation is the point
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # A document budget nothing in this test could reach, so only the
+        # RSS trigger can plausibly be what recycles the slot.
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1000, recycle_rss_bytes=5 * 1024 * 1024)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+            assert pool._procs[0].pid != first_pid
+        finally:
+            pool.shutdown()
+
+    def test_recycling_does_not_regress_crash_isolation(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == b"CRASH-ME":
+                os.kill(os.getpid(), signal.SIGABRT)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=2, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            f_crash = self._write(tmp_path, "bad.txt", b"CRASH-ME")
+
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 1/2
+            pid_before_recycle = pool._procs[0].pid
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 2/2 -> recycles
+            assert pool._procs[0].pid != pid_before_recycle, "the slot should now be the pre-forked spare"
+
+            # The RECYCLED (spare-promoted) process crashes on this file —
+            # isolation must still catch it exactly like before recycling
+            # ever existed: this file counts as convert_failed, the parent
+            # survives, and the pool names the real signal.
+            with pytest.raises(crawler._ConvertCrashed) as exc_info:
+                pool.convert(0, f_crash, "text/plain")
+            assert exc_info.value.signal_name == "SIGABRT"
+
+            # And the pool recovers at the next safe point, same as any
+            # other crash.
+            pool.repair()
+            assert pool.convert(0, f_ok, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+
+class TestConvertChildMemoryLimit:
+    """The per-child RLIMIT_AS ceiling (`_install_memory_limit`) and the
+    operator-facing wording that distinguishes ITS failures from an
+    external-pressure SIGKILL — a second, live-deployment finding on top of
+    recycling: recycling holds the STEADY STATE down, but a single
+    pathological document (an .xlsx openpyxl loads whole into memory, in
+    one observed case) can still spike ONE worker past the container's own
+    ceiling in isolation, and the kernel's OOM killer then SIGKILLs
+    whichever child happens to be allocating at that moment — not
+    necessarily the file that caused it.
+    """
+
+    def test_memory_error_is_worded_as_the_files_own_limit(self, crawl_env, monkeypatch):
+        """A `MemoryError` from `convert_to_markdown` — whether raised by
+        the RLIMIT_AS ceiling for real or (as simulated here, portably) by
+        the converter itself — is counted convert_failed with a detail
+        that names the cause plainly and attributes it to THIS file, never
+        a bare `MemoryError` a reader has to already know the mechanism to
+        interpret."""
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(MemoryError())
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+
+    def test_a_sigkill_crash_is_worded_as_external_pressure_not_the_files_fault(self):
+        detail = crawler._convert_crash_detail("SIGKILL")
+        assert "SIGKILL" in detail
+        assert "may not be this file's fault" in detail
+
+    def test_a_non_sigkill_crash_is_worded_as_a_plain_crash(self):
+        detail = crawler._convert_crash_detail("SIGABRT")
+        assert detail == "conversion worker crashed: SIGABRT"
+        assert "may not be this file's fault" not in detail
+
+    def test_installing_a_tiny_limit_never_raises_out_of_the_child(self, tmp_path, monkeypatch):
+        """`_install_memory_limit` is best-effort by design (RLIMIT_AS is
+        not settable on every platform, notably macOS, where this repo's
+        own tests run) — a platform that refuses the syscall must still
+        convert normally, not lose the whole child to an unhandled
+        exception raised while merely trying to install its own safety
+        net."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        # 1 MiB: far below what even a bare Python interpreter maps, so on
+        # a platform that DOES enforce this it would fail every real
+        # conversion too -- the point here is only that installing it does
+        # not crash the worker outright.
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=1024 * 1024)
+        pool.start()
+        try:
+            assert pool._procs[0].is_alive()
+        finally:
+            pool.shutdown()
+
+    @staticmethod
+    def _current_vsz_bytes() -> int:
+        """This (the TEST) process's own current virtual memory size, from
+        /proc/self/status -- Linux only, which is fine since every caller
+        is itself gated to Linux. A freshly forked child's own baseline
+        starts at approximately this, so it calibrates the test below
+        against whatever THIS runner's actual baseline happens to be,
+        rather than a guessed constant that could be a false positive (too
+        tight, tripped by ordinary interpreter overhead on a heavier CI
+        image) or a false negative (too loose to ever exercise the
+        ceiling) on a machine this test has never seen."""
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+        raise RuntimeError("VmSize not found in /proc/self/status")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
+    def test_a_runaway_allocation_is_capped_on_linux(self, tmp_path, monkeypatch):
+        """The REAL enforcement, not a simulation — only meaningful (and
+        only run) on Linux, this module's deployment target and where the
+        memory pressure this guards against was observed. A conversion
+        that tries to allocate well past a tight, real RLIMIT_AS ceiling
+        gets a genuine MemoryError, attributed to the file that caused it,
+        not a SIGKILL that could be blamed on an innocent sibling."""
+        baseline = self._current_vsz_bytes()
+        limit = baseline + 100 * 1024 * 1024  # headroom over THIS runner's own baseline
+        over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
+
+        def _convert(path, mime):
+            data = bytearray(over_allocation)
+            data[0] = 1
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=limit)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert not outcome.ok
+            assert outcome.detail_type == "MemoryError"
+        finally:
+            pool.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -789,6 +1532,132 @@ class TestTransport:
             _run(_connection([_drive_scope()]), monkeypatch)
 
         assert not any("evil.example" in url for url in seen)
+
+    def test_a_persistent_download_failure_is_a_per_file_fault_not_a_crash(self, crawl_env, monkeypatch, caplog):
+        """A drive listing that succeeds but whose ONE file's `/content` GET
+        never comes back clean is counted, itemized with the upstream status
+        code, and logged with both — never a bare exception TYPE name, and
+        never fatal to the rest of the run."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(500, json={"error": {"message": "internal"}})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with caplog.at_level("WARNING", logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 1
+        assert report["new"] == 0
+        assert FakeIngestor.instances[-1].ingested == []
+
+        detail = report["errors_detail"]
+        assert detail["total"] == 1
+        assert detail["listed"] == 1
+        row = detail["items"][0]
+        assert row["reason"] == "download_failed"
+        assert row["status_code"] == 500
+        assert row["path"].endswith("brief.docx")
+        assert row["detail"]
+
+        messages = [r.message for r in caplog.records if "download failed" in r.message]
+        assert messages
+        assert "500" in messages[0]
+
+
+# --------------------------------------------------------------------------
+# `/content` redirect (Graph answers a file download with a 302 to a
+# pre-authenticated URL on a different host, not the bytes themselves).
+# --------------------------------------------------------------------------
+
+
+class TestDownloadRedirect:
+    """Direct unit tests of ``GraphTransport.download_to_temp`` — lower-level
+    than :class:`TestTransport`'s full-crawl runs, because asserting "no
+    Authorization header on the redirect target" needs the raw request the
+    MockTransport handler saw."""
+
+    _REDIRECT_TARGET = "https://contoso-my.blob.example/download?sig=abc"
+
+    @staticmethod
+    def _transport(monkeypatch) -> crawler.GraphTransport:
+        stats = crawler.CrawlStats()
+
+        async def _acquire() -> str:
+            return "tok"
+
+        auth = crawler.GraphAuth(acquire=_acquire, stats=stats)
+        return crawler.GraphTransport(auth, stats)
+
+    def _handler(
+        self, *, redirect_response: Callable[[httpx.Request], httpx.Response]
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == self._REDIRECT_TARGET:
+                return redirect_response(request)
+            return httpx.Response(302, headers={"Location": self._REDIRECT_TARGET})
+
+        return handler
+
+    def test_a_302_is_followed_and_the_bytes_land_in_the_temp_file(self, monkeypatch):
+        _install_graph(
+            monkeypatch, self._handler(redirect_response=lambda req: httpx.Response(200, content=b"the-real-bytes"))
+        )
+        transport = self._transport(monkeypatch)
+
+        path = asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+        try:
+            assert path.read_bytes() == b"the-real-bytes"
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_the_redirect_target_gets_no_authorization_header(self, monkeypatch):
+        seen_auth: Dict[str, Optional[str]] = {}
+
+        def redirect_response(request: httpx.Request) -> httpx.Response:
+            seen_auth["value"] = request.headers.get("authorization")
+            return httpx.Response(200, content=b"bytes")
+
+        _install_graph(monkeypatch, self._handler(redirect_response=redirect_response))
+        transport = self._transport(monkeypatch)
+
+        path = asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+        path.unlink(missing_ok=True)
+
+        assert seen_auth["value"] is None
+
+    def test_max_bytes_is_still_enforced_on_the_redirected_body(self, monkeypatch):
+        _install_graph(
+            monkeypatch, self._handler(redirect_response=lambda req: httpx.Response(200, content=b"x" * 100))
+        )
+        transport = self._transport(monkeypatch)
+
+        with pytest.raises(crawler.CrawlError, match="cap"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=10))
+
+    def test_a_genuine_4xx_still_fails_no_regression(self, monkeypatch):
+        _install_graph(monkeypatch, lambda request: httpx.Response(404, json={}))
+        transport = self._transport(monkeypatch)
+
+        with pytest.raises(gc.SharePointGraphError, match="404"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
+
+    def test_a_genuine_5xx_still_retries_then_fails(self, monkeypatch):
+        _install_graph(monkeypatch, lambda request: httpx.Response(503, json={}))
+        transport = self._transport(monkeypatch)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with pytest.raises(gc.SharePointGraphError, match="503"):
+            asyncio.run(transport.download_to_temp("d1", "i1", "file.txt", max_bytes=0))
 
 
 # --------------------------------------------------------------------------
@@ -1180,7 +2049,7 @@ class TestState:
         path = crawler.state_path("conn1")
         path.write_text("{not json")
         state = crawler.load_state("conn1")
-        assert state == {"delta_links": {}, "ctags": {}}
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
 
     def test_an_unsafe_connection_id_cannot_escape_the_state_directory(self, crawl_env):
         for bad in ("../../etc/passwd", "a/b", "..", ""):
@@ -1264,7 +2133,12 @@ class TestDetectorChoice:
         _install_graph(monkeypatch, handler)
         _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
 
-        assert seen == ["hybrid-sentinel"]
+        # One call for the body, one for the filename stem, one per folder
+        # segment (`_file_item()`'s default path is one folder deep,
+        # "Reports") — the exact count is `_anonymize_identity`'s business,
+        # not this test's; what this test pins is that EVERY call, whatever
+        # its count, carries the SAME configured detector.
+        assert seen and set(seen) == {"hybrid-sentinel"}
 
     def test_no_detector_is_built_when_nothing_in_the_run_anonymizes(self, crawl_env, monkeypatch):
         """The LLM tier costs money per document — an instance that has it
@@ -1458,6 +2332,10 @@ class FakeRunsRepo:
         self.started: List[Dict[str, Any]] = []
         self.checkpoints: List[Dict[str, Any]] = []
         self.finished: List[Dict[str, Any]] = []
+        self.abandon_calls: List[str] = []
+        #: Connection ids `abandon_stale_running` should report as having
+        #: closed something, for tests that want to see the log line fire.
+        self.abandon_returns: List[str] = []
 
     def start(self, *, connection_id, job_id=None, phase="crawl"):
         self.started.append({"connection_id": connection_id, "job_id": job_id, "phase": phase})
@@ -1468,6 +2346,10 @@ class FakeRunsRepo:
 
     def finish(self, run_id, **kwargs):
         self.finished.append({"run_id": run_id, **kwargs})
+
+    def abandon_stale_running(self, connection_id):
+        self.abandon_calls.append(connection_id)
+        return list(self.abandon_returns)
 
 
 def _install_runs_repo(monkeypatch, repo=None):
@@ -1503,6 +2385,46 @@ class TestRunRecording:
         # No detector is wired into the anonymize seam yet, so no tokens are
         # spent — `{}` is "none spent", not a computed $0.00.
         assert final["usage"] == {}
+
+    def test_a_new_run_sweeps_this_connections_abandoned_rows_first(self, crawl_env, monkeypatch):
+        """A worker that died mid-crawl leaves its row `running` forever
+        unless something closes it. The next run for the SAME connection —
+        the only time it is safe to assume any `running` row left over is
+        not us — sweeps it before opening its own."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert runs.abandon_calls == ["conn1"]
+        # The sweep runs BEFORE this run's own row is opened.
+        assert len(runs.started) == 1
+
+    def test_a_failed_sweep_never_blocks_the_new_run_from_starting(self, crawl_env, monkeypatch):
+        """The same 'observability, never load-bearing' posture the rest of
+        `_RunRecorder` already has."""
+
+        class FlakySweep(FakeRunsRepo):
+            def abandon_stale_running(self, connection_id):
+                raise RuntimeError("connection reset")
+
+        runs = _install_runs_repo(monkeypatch, FlakySweep())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert len(runs.started) == 1
 
     def test_progress_carries_absolute_counters_only(self, crawl_env, monkeypatch):
         """No fraction, no percentage, no ETA — the crawl enumerates and
@@ -1564,6 +2486,64 @@ class TestRunRecording:
         assert crawler._record_status_for(crawler.CrawlError("nope")) == "failed"
         assert crawler._record_status_for(KeyboardInterrupt()) == "interrupted"
         assert crawler._record_status_for(SystemExit()) == "interrupted"
+
+    def test_a_run_that_ingests_nothing_while_erroring_on_everything_is_recorded_failed(self, crawl_env, monkeypatch):
+        """The production incident this guards: a run that recorded per-file
+        errors on (almost) every item and landed 0 documents must not read
+        as `done` — the crawl itself never raised, so nothing else would
+        catch this."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(500, json={})
+            items = [_file_item(f"i{i}", ctag=f"c{i}") for i in range(6)]
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 6
+        assert report["new"] == 0
+        assert report["changed"] == 0
+        assert len(runs.finished) == 1
+        final = runs.finished[0]
+        assert final["status"] == "failed"
+        assert "6" in final["error"]
+        assert "0" in final["error"]
+
+    def test_a_lone_stray_error_amid_an_otherwise_clean_pass_still_reports_done(self, crawl_env, monkeypatch):
+        """Below the threshold, one transient per-file fault must not flip
+        an otherwise-productive run's status — only a run that accomplished
+        NOTHING earns the harsher word."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "/items/broken/" in url:
+                    return httpx.Response(500, json={})
+                return _content_response()
+            items = [_file_item("broken", ctag="c1"), _file_item("ok", name="ok.txt", ctag="c2")]
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 1
+        assert report["new"] == 1
+        assert runs.finished[0]["status"] == "done"
+        assert runs.finished[0]["error"] is None
 
     def test_oversize_skips_are_listed_with_an_honest_total(self, crawl_env, monkeypatch):
         """A document over the cap is never downloaded and never appears in
@@ -1648,13 +2628,106 @@ class TestRunRecording:
 
         from src.repositories.extraction_runs_pg import ExtractionRunsPgRepository
 
-        for name in ("start", "checkpoint", "finish"):
+        for name in ("start", "checkpoint", "finish", "abandon_stale_running"):
             real = set(inspect.signature(getattr(ExtractionRunsPgRepository, name)).parameters)
             fake = set(inspect.signature(getattr(FakeRunsRepo, name)).parameters)
             # The fake absorbs the rest through **kwargs; what must match is
             # the positional contract the crawl actually calls with.
             assert {"self"} <= fake
             assert ("run_id" in real) == ("run_id" in fake), name
+
+
+class TestProgressCheckpointing:
+    """A delta PAGE (`_DELTA_PAGE_SIZE`, 200) can be many minutes of real
+    download/convert/anonymize/ingest work once files actually download —
+    while `_crawl_drive`'s own state checkpoint (deltaLink/cTags) correctly
+    stays put at the page boundary, an operator watching `files_done` was
+    stuck at 0 for that whole window. `_RunRecorder.maybe_checkpoint` is the
+    fix: a rate-limited PROGRESS checkpoint, called after every item."""
+
+    def test_progress_advances_mid_page_not_only_at_the_boundary(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        _at_concurrency(monkeypatch, 1)  # sequential — deterministic checkpoint count
+        items = _many_items(25)
+        _install_graph(monkeypatch, _one_page(items))
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 25
+        files_done_seen = [c["files_done"] for c in runs.checkpoints]
+        # At least one checkpoint landed strictly BETWEEN 0 and the full
+        # count — i.e. before the page (and its unconditional boundary
+        # checkpoint) finished.
+        assert any(0 < n < 25 for n in files_done_seen), files_done_seen
+        assert files_done_seen[-1] == 25
+        # And every value is non-decreasing — progress never appears to
+        # run backwards to an operator polling it.
+        assert files_done_seen == sorted(files_done_seen)
+
+    def _recorder(self, monkeypatch, clock):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start(clock=clock)
+        return recorder, runs
+
+    def test_the_item_count_threshold_fires_a_checkpoint(self, monkeypatch):
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        for _ in range(crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS - 1):
+            stats.add(items_done=1)
+            recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert runs.checkpoints == []  # not due yet
+
+        stats.add(items_done=1)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+        assert runs.checkpoints[0]["files_done"] == crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS
+
+    def test_the_elapsed_time_threshold_fires_even_with_few_items(self, monkeypatch):
+        """A single very slow file (a large PDF, a throttled download) must
+        still move the needle — the item-count threshold alone would leave
+        it stuck until nine more files finished."""
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        stats.add(items_done=1)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert runs.checkpoints == []
+
+        clock["t"] += crawler._PROGRESS_CHECKPOINT_INTERVAL_S + 0.1
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+        assert runs.checkpoints[0]["files_done"] == 1
+
+    def test_it_stays_rate_limited_between_the_two_thresholds(self, monkeypatch):
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        stats.add(items_done=crawler._PROGRESS_CHECKPOINT_EVERY_ITEMS)
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+
+        stats.add(items_done=1)  # below both thresholds since the last fire
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1  # unchanged
+
+    def test_never_fires_when_recording_is_unavailable(self, monkeypatch):
+        """The same 'observability, never load-bearing' posture the rest of
+        `_RunRecorder` already has: no run id, no write, no exception."""
+
+        def _raise():
+            raise RuntimeError("no backend")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()  # swallows the failure; run_id stays None
+        stats = crawler.CrawlStats()
+        stats.add(items_done=999)
+        recorder.maybe_checkpoint(stats)  # must not raise
 
 
 class TestDetectorUsageRecording:
@@ -1676,6 +2749,26 @@ class TestDetectorUsageRecording:
         assert usage["output_tokens"] == 90
         assert usage["calls"] == 2
         assert usage["model"] == "claude-haiku-4-5"
+
+    def test_detector_usage_prices_the_spend_through_the_shared_pricing_table(self):
+        """Priced via `src.llm_pricing.cost_usd` — the same single source of
+        truth `facts_extraction._Report.render` already uses for its own
+        stage — never a second, ad hoc price table."""
+        from src.llm_pricing import cost_usd
+
+        class FakeLLM:
+            model = "claude-haiku-4-5"
+            total_usage = {"input_tokens": 1200, "output_tokens": 90, "calls": 2}
+
+        def detect(text):
+            return []
+
+        detect.llm = FakeLLM()
+        usage = crawler._detector_usage(detect)
+        assert usage["estimated_cost_usd"] == round(
+            cost_usd(model="claude-haiku-4-5", input_tokens=1200, output_tokens=90), 4
+        )
+        assert usage["estimated_cost_usd"] > 0
 
     def test_no_llm_tier_reports_empty_not_zero_dollars(self):
         assert crawler._detector_usage(None) == {}
@@ -1990,6 +3083,38 @@ class TestParallelCounters:
         with pytest.raises(AttributeError):
             stats.add(nwe=1)
 
+    def test_note_error_is_bounded_with_an_honest_total(self):
+        """The in-memory sample and the persisted envelope agree: past the
+        cap, `errors_detail` says exactly how many it is NOT showing —
+        mirroring `extraction_runs.skips`' own `{items, total, listed,
+        truncated}` contract, capped at the same 200."""
+        stats = crawler.CrawlStats()
+        for i in range(250):
+            stats.add(errors=1)
+            stats.note_error(f"Reports/f{i}.docx", "download_failed", detail="HTTP 500", status_code=500)
+
+        report = stats.report(max_file_mb=50)
+        detail = report["errors_detail"]
+        assert detail["listed"] == 200
+        assert detail["total"] == 250
+        assert detail["truncated"] is True
+        assert len(detail["items"]) == 200
+        assert detail["items"][0]["reason"] == "download_failed"
+        assert detail["items"][0]["status_code"] == 500
+
+    def test_note_error_never_used_for_deliberate_skip_reasons(self):
+        """`errors_detail` is reserved for the reasons that also bump
+        `errors` (download/ingest/convert failures) — a run with zero
+        errors reports the same empty, honest envelope oversize skips do
+        with no oversize files."""
+        stats = crawler.CrawlStats()
+        assert stats.report(max_file_mb=50)["errors_detail"] == {
+            "items": [],
+            "listed": 0,
+            "total": 0,
+            "truncated": False,
+        }
+
 
 class TestParallelOrdering:
     """The page boundary, and what may and may not cross it."""
@@ -2021,8 +3146,18 @@ class TestParallelOrdering:
 
     def test_a_slow_item_does_not_hold_its_neighbours_ctags_hostage(self, crawl_env, monkeypatch):
         """cTags are per ITEM (written right after that item's own ingest),
-        the page boundary is per PAGE. One slow convert must delay only the
-        latter."""
+        the page boundary is per PAGE. One slow item must delay only the
+        latter.
+
+        The slowness lives in ``ingest``, not ``convert_to_markdown``:
+        convert now runs in a dedicated child PROCESS per concurrency slot
+        (see ``_ConvertProcessPool``), which gets its own private, frozen
+        COPY of every Python object at fork time — a busy-wait there could
+        never observe cTags the PARENT writes later. ``ingest`` is
+        unaffected: it still runs on the crawl's own item-concurrency thread
+        pool, in this process, which is exactly what the invariant under
+        test — a cTag is never held for a neighbour — is about.
+        """
         _at_concurrency(monkeypatch, 4)
         shared: Dict[str, Any] = {"delta_links": {}, "ctags": {}}
         monkeypatch.setattr(crawler, "load_state", lambda cid: shared)
@@ -2035,18 +3170,20 @@ class TestParallelOrdering:
             with crawler._state_lock:
                 return dict(shared["ctags"])
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            if path.suffix == ".slow":
-                # Stay in flight until the NEIGHBOURS' cTags have landed. If
-                # a cTag were held until the page boundary this would time
-                # out with an empty map, which is the regression to catch.
-                deadline = time.monotonic() + 10
-                while len(_peek()) < 3 and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                observed["ctags"] = _peek()
-            return ConvertResult("# converted")
+        class _SlowIngestor(FakeIngestor):
+            def ingest(self, *, stable_id: str, **kwargs: Any) -> Any:
+                if stable_id == "graph:slow":
+                    # Stay in flight until the NEIGHBOURS' cTags have landed.
+                    # If a cTag were held until the page boundary this would
+                    # time out with an empty map, which is the regression to
+                    # catch.
+                    deadline = time.monotonic() + 10
+                    while len(_peek()) < 3 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    observed["ctags"] = _peek()
+                return super().ingest(stable_id=stable_id, **kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _SlowIngestor)
 
         items = [_file_item("slow", name="slow.slow", ctag="c-slow")] + _many_items(3)
         _install_graph(monkeypatch, _one_page(items))
@@ -2063,18 +3200,29 @@ class TestParallelOrdering:
         """Not the event loop's default executor, whose min(32, cpu+4) ceiling
         would silently cap a configured concurrency above it — the knob has to
         mean what it says. Twelve items that only make progress once all
-        twelve are inside the blocking step: a smaller pool cannot get there."""
+        twelve are inside the blocking step: a smaller pool cannot get there.
+
+        The barrier lives in ``ingest``, not ``convert_to_markdown``: convert
+        now runs in a dedicated child PROCESS per slot, each with its own
+        private copy of any Python object post-fork, so a
+        ``threading.Barrier`` split twelve ways across twelve separate
+        processes would never see all twelve parties arrive. ``ingest`` is
+        unaffected — it still runs on the crawl's own item-concurrency
+        thread pool, which is exactly what this test is sizing.
+        """
         _at_concurrency(monkeypatch, 12)
         barrier = threading.Barrier(12, timeout=15)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            barrier.wait()  # BrokenBarrierError -> counted as convert_failed
-            return ConvertResult("# converted")
+        class _BarrierIngestor(FakeIngestor):
+            def ingest(self, **kwargs: Any) -> Any:
+                barrier.wait()  # BrokenBarrierError -> counted as an ingest error
+                return super().ingest(**kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _BarrierIngestor)
         _install_graph(monkeypatch, _one_page(_many_items(12)))
         report = _run(_connection([_drive_scope()]), monkeypatch)
 
+        assert report["errors"] == 0
         assert report["convert_failed"] == 0
         assert report["new"] == 12
         assert report["max_in_flight"] == 12
@@ -2252,17 +3400,28 @@ class TestConcurrencyOneIsTheOldPath:
         assert parallel["concurrency"]["requested"] == 6
 
     def test_sequential_runs_the_pipeline_inline_with_no_worker_thread(self, crawl_env, monkeypatch):
-        """At 1 there is no executor in the picture at all — the convert and
-        ingest calls happen on the crawl's own thread, exactly as before."""
+        """At 1 there is no THREAD executor in the picture at all for the
+        item-level pipeline — ``ingest`` happens on the crawl's own thread,
+        exactly as before.
+
+        ``convert_to_markdown`` is deliberately NOT part of this claim any
+        more: it now always runs in its dedicated child PROCESS (see
+        ``_ConvertProcessPool``), even at concurrency 1 — that isolation, not
+        which thread calls it, is what survives a native crash. There is
+        nothing left to prove about its thread identity; what "1 == the old
+        path" still means is that no `ThreadPoolExecutor` exists for the
+        REST of the pipeline, which ``ingest`` below stands in for.
+        """
         _at_concurrency(monkeypatch, 1)
         threads: List[int] = []
         main = threading.get_ident()
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            threads.append(threading.get_ident())
-            return ConvertResult("# converted")
+        class _ThreadRecordingIngestor(FakeIngestor):
+            def ingest(self, **kwargs: Any) -> Any:
+                threads.append(threading.get_ident())
+                return super().ingest(**kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _ThreadRecordingIngestor)
         _install_graph(monkeypatch, _one_page(_many_items(4)))
         _run(_connection([_drive_scope()]), monkeypatch)
 
@@ -2410,3 +3569,364 @@ class TestFactsExtractionSeam:
 
         assert runs.finished[0]["status"] == "failed"
         assert "FactsExtractionUnavailable" in runs.finished[0]["error"]
+
+
+# --------------------------------------------------------------------------
+# Cooperative stop (owner-frustration fix, 2026-09-01): "it's a black box,
+# I can't see what's happening and I can't stop it". The signal lives on
+# the connection row's own `config.extraction` sub-object — no new store —
+# and is checked at the SAME quiescent points a timeout already is.
+# --------------------------------------------------------------------------
+
+
+class TestStopSignalStore:
+    """`request_stop` / `_clear_stale_stop` / `_stop_requested` against the
+    connection row — the part that has to work on BOTH app-state backends."""
+
+    def test_request_stop_sets_the_flag_and_preserves_sibling_extraction_keys(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"last_run_at": "t0", "last_job_id": "job1"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        stamp = crawler.request_stop("conn1")
+
+        extraction = connection["config"]["extraction"]
+        assert extraction["stop_requested_at"] == stamp
+        # The dispatch bookkeeping next to it (TCRD-226) must survive —
+        # `request_stop` merges into the EXISTING extraction sub-object,
+        # never replaces it wholesale.
+        assert extraction["last_run_at"] == "t0"
+        assert extraction["last_job_id"] == "job1"
+
+    def test_request_stop_works_on_a_connection_with_no_extraction_block_yet(self, monkeypatch):
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        stamp = crawler.request_stop("conn1")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == stamp
+
+    def test_clear_stale_stop_removes_only_the_flag(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "x", "last_run_at": "t0"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1")
+
+        extraction = connection["config"]["extraction"]
+        assert "stop_requested_at" not in extraction
+        assert extraction["last_run_at"] == "t0"
+
+    def test_clear_stale_stop_is_a_noop_when_nothing_is_set(self, monkeypatch):
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1")  # must not raise, and must not write
+
+        assert connection["config"] == {}
+
+    def test_stop_requested_reads_the_live_flag(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        assert crawler._stop_requested("conn1") == "2026-09-01T00:00:00+00:00"
+
+    def test_stop_requested_is_none_for_an_unknown_connection(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo({"id": "conn1", "config": {}}),
+        )
+
+        assert crawler._stop_requested("does-not-exist") is None
+
+
+class TestStopWatcher:
+    """The polling cadence itself: unconditional at a page boundary, only
+    every ``every`` completed items at a file boundary."""
+
+    def test_page_boundary_raises_when_stopped(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: "2026-09-01T00:00:00+00:00")
+        with pytest.raises(crawler.CrawlStopped):
+            crawler._StopWatcher("conn1").check_page_boundary()
+
+    def test_page_boundary_is_a_noop_when_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: None)
+        crawler._StopWatcher("conn1").check_page_boundary()  # must not raise
+
+    def test_item_boundary_cadence_is_exact(self, monkeypatch):
+        calls: List[str] = []
+
+        def fake(connection_id: str) -> Optional[str]:
+            calls.append(connection_id)
+            return None
+
+        monkeypatch.setattr(crawler, "_stop_requested", fake)
+        watcher = crawler._StopWatcher("conn1", every=3)
+        for n in range(1, 10):
+            watcher.maybe_check_item_boundary(n)
+
+        # Checked at 3, 6, 9 — three reads for nine completed items, not one
+        # repo read per item.
+        assert calls == ["conn1", "conn1", "conn1"]
+
+    def test_item_boundary_raises_exactly_at_the_cadence(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: "stopped-at")
+        watcher = crawler._StopWatcher("conn1", every=5)
+        watcher.maybe_check_item_boundary(4)  # not yet — must not raise
+        with pytest.raises(crawler.CrawlStopped):
+            watcher.maybe_check_item_boundary(5)
+
+
+class TestStopReason:
+    def test_stopped_is_a_named_stop_reason(self):
+        assert crawler._stop_reason(crawler.CrawlStopped("x")) == "stopped"
+
+    def test_a_stop_outranks_a_bare_gone_but_not_a_throttle_or_timeout(self):
+        assert crawler._abort_rank(crawler.GraphThrottled("x")) > crawler._abort_rank(crawler.CrawlStopped("x"))
+        assert crawler._abort_rank(crawler.CrawlTimeout("x")) > crawler._abort_rank(crawler.CrawlStopped("x"))
+        assert crawler._abort_rank(crawler.CrawlStopped("x")) > crawler._abort_rank(crawler.GraphGone("x"))
+
+
+class TestCooperativeStopEndToEnd:
+    """A stop requested mid-run through the connection row — the exact path
+    the admin endpoint uses — stops the crawl at a resume-safe boundary."""
+
+    def test_a_stop_requested_between_pages_is_honored_before_the_next_page_is_fetched(self, crawl_env, monkeypatch):
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                # Simulates an admin's `POST .../extraction/stop` landing
+                # while page 1's one item is being processed.
+                crawler.request_stop(connection["id"])
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": _many_items(5, prefix="p2"), "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"},
+                )
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        # Page 1's single item landed; page 2's five never got fetched — the
+        # page-boundary check fires BEFORE that request.
+        assert set(state["ctags"]) == {"graph:item1"}
+        assert not state.get("delta_links")
+
+    def test_a_stop_requested_mid_page_is_honored_only_at_the_file_cadence(self, crawl_env, monkeypatch):
+        """Cadence: the check fires only every `_STOP_CHECK_EVERY_ITEMS`
+        completed items — a stop requested after item 3 does not end the
+        run until item 10, and every item up to and including the 10th
+        still lands. The flag is left on the row afterwards; only the NEXT
+        run's start clears it."""
+        _at_concurrency(monkeypatch, 1)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        items = _many_items(15)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                landed = len(FakeIngestor.instances[-1].ingested) if FakeIngestor.instances else 0
+                if landed == 3:
+                    crawler.request_stop(connection["id"])
+                return _content_response()
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"})
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        assert len(state["ctags"]) == crawler._STOP_CHECK_EVERY_ITEMS
+        assert not state.get("delta_links"), "the page never finished, so its deltaLink must not be persisted"
+        # The run that stopped never clears its own flag.
+        assert connection["config"]["extraction"]["stop_requested_at"]
+
+        # The NEXT run must not be killed by the same, now-stale, flag: it
+        # is cleared unconsumed at THAT run's start. Reconfigure Graph so
+        # this second pass cannot re-trigger a stop of its own.
+        _install_graph(monkeypatch, _one_page(items))
+        report = _run(connection, monkeypatch)
+
+        assert report["interrupted"] is False
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+        # The 10 items ingested before the first stop are unchanged this
+        # time (matching cTags); the remaining 5 land as new.
+        assert report["unchanged"] == crawler._STOP_CHECK_EVERY_ITEMS
+        assert report["new"] == 15 - crawler._STOP_CHECK_EVERY_ITEMS
+
+    def test_a_stale_stop_flag_is_cleared_before_the_run_starts(self, crawl_env, monkeypatch):
+        """A stop requested for a run that already finished (or never
+        started) must not reach forward and kill an unrelated, later run."""
+        connection = _connection([_drive_scope()])
+        connection["config"]["extraction"] = {"stop_requested_at": "2020-01-01T00:00:00+00:00"}
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        _install_graph(monkeypatch, _one_page(_many_items(3)))
+
+        report = _run(connection, monkeypatch)
+
+        assert report["interrupted"] is False
+        assert report["new"] == 3
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_a_stopped_worker_pool_drains_its_in_flight_items(self, crawl_env, monkeypatch):
+        """Same drain mechanism a throttle/timeout abort already uses under
+        concurrency: no new item is picked up once the stop is seen, but the
+        ones already in flight still finish and are recorded."""
+        _at_concurrency(monkeypatch, 4)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        items = _many_items(20)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                landed = len(FakeIngestor.instances[-1].ingested) if FakeIngestor.instances else 0
+                # `>=`, not `==`: under real concurrency several items can
+                # finish between two content requests, so an exact count
+                # would be a race. Re-requesting the same stop repeatedly is
+                # harmless (`request_stop` just re-stamps the same key).
+                if landed >= 2:
+                    crawler.request_stop(connection["id"])
+                return _content_response()
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"})
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        # The pool stopped being FED at the cadence boundary, but not all 20
+        # items — the drain lets whatever was already in flight finish.
+        assert 0 < len(state["ctags"]) < 20
+
+
+# --------------------------------------------------------------------------
+# Live activity in the checkpoint (owner-frustration fix, 2026-09-01): "I
+# can't see what's happening in the extraction".
+# --------------------------------------------------------------------------
+
+
+class TestLiveActivity:
+    def test_activity_appears_in_the_live_checkpoint(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, _one_page(_many_items(3)))
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        activity = runs.checkpoints[-1]["progress"]["activity"]
+        assert activity["phase"] == "crawl"
+        # By the LAST checkpoint of a finished page every item has exited —
+        # `current_path` is honestly None, not a stale leftover.
+        assert activity["current_path"] is None
+        assert activity["recent"], "completed items must be visible in the checkpoint"
+        assert {"path", "outcome"} <= set(activity["recent"][0])
+        assert all(entry["outcome"] == "new" for entry in activity["recent"])
+
+    def test_recent_activity_is_capped_at_five(self, crawl_env, monkeypatch):
+        """The cap-and-newest-first MECHANISM is pinned exactly and
+        deterministically by
+        ``TestActivityBookkeeping::test_recent_is_capped_and_newest_first``
+        below, which drives ``enter``/``exit_item_activity`` directly in a
+        fixed order. This test is the integration half: a REAL crawl, at
+        this instance's default concurrency (6), exercises it end to end.
+
+        Six real workers finish 8 trivial items in whatever order they
+        actually complete — not dispatch order — so asserting an exact
+        finishing position here would pin a race, not a behavior (confirmed
+        empirically: the SAME non-determinism reproduces identically on the
+        pre-process-isolation code, so it is not something conversion
+        running in a child process introduced). What the checkpoint
+        actually promises, and what this asserts, is the cap itself and
+        that the LAST item enumerated is never silently dropped from it —
+        the one thing a real crawl adds over the deterministic unit test.
+        """
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, _one_page(_many_items(8)))
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        activity = runs.checkpoints[-1]["progress"]["activity"]
+        assert len(activity["recent"]) == 5
+        paths = {entry["path"] for entry in activity["recent"]}
+        assert "Reports/f7.docx" in paths, "the last item enumerated must never be silently dropped"
+
+    def test_activity_is_absent_from_a_finished_runs_stored_report(self, crawl_env, monkeypatch):
+        """`report()` (the FINAL, stored shape) is a separate dict from the
+        live checkpoint's `progress` — it never grew an `activity` key, so a
+        finished run honestly shows nothing in flight."""
+        _install_graph(monkeypatch, _one_page(_many_items(2)))
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert "activity" not in report
+
+
+class TestActivityBookkeeping:
+    """`CrawlStats.enter_item_activity` / `exit_item_activity` — the
+    concurrency-safe accumulation `activity_snapshot` reads."""
+
+    def test_a_single_item_shows_up_while_in_flight_and_leaves_when_done(self):
+        stats = crawler.CrawlStats()
+        token = stats.enter_item_activity("Reports/a.docx")
+        snap = stats.activity_snapshot(phase="crawl")
+        assert snap["current_path"] == "Reports/a.docx"
+        assert snap["current_started_at"]
+
+        stats.exit_item_activity(token, "Reports/a.docx", "new")
+        snap = stats.activity_snapshot(phase="crawl")
+        assert snap["current_path"] is None
+        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new"}]
+
+    def test_recent_is_capped_and_newest_first(self):
+        stats = crawler.CrawlStats()
+        for i in range(7):
+            token = stats.enter_item_activity(f"f{i}.docx")
+            stats.exit_item_activity(token, f"f{i}.docx", "new")
+
+        recent = stats.activity_snapshot(phase="crawl")["recent"]
+        assert [r["path"] for r in recent] == ["f6.docx", "f5.docx", "f4.docx", "f3.docx", "f2.docx"]
+
+    def test_bookkeeping_is_exact_under_concurrency(self):
+        """A lost entry/exit here is exactly the same class of bug the
+        counters guard against — see `TestParallelCounters`."""
+        stats = crawler.CrawlStats()
+
+        def worker(i: int) -> None:
+            token = stats.enter_item_activity(f"path{i}.docx")
+            stats.exit_item_activity(token, f"path{i}.docx", "new")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        snap = stats.activity_snapshot(phase="crawl")
+        # Every worker entered AND exited — nothing left dangling in-flight.
+        assert snap["current_path"] is None
+        assert len(snap["recent"]) == 5

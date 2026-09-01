@@ -553,6 +553,18 @@ needs unrestricted internet access and you accept that trade-off; prefer
 | `open` | normal bridge — the sandbox can reach the internet, so in-sandbox `pip install` / `npm install` work. **Unrestricted egress; explicit operator opt-in only.** |
 | `allowlist` | the `none` internal network **plus** the `services/egress_proxy` sidecar dual-homed onto it (compose profile `chat-docker-egress`). Sandboxes get `HTTP(S)_PROXY` pointed at the proxy and may reach exactly `chat.docker_egress_allow_hosts` (exact names or `*.suffix` wildcards) — each connection is re-checked **after DNS resolution** against link-local/metadata/private ranges and connects to the vetted address, closing the DNS-rebinding gap; cloud metadata endpoints stay blocked even if listed. The proxy env is cooperative, but ignoring it is not a bypass: the internal network has no other route out. **Requires the rails URL to be internally reachable** — the sandbox's `NO_PROXY` carries whatever host `AGNES_SERVER` resolves to, so a public `SERVER_URL` would be forced onto a direct connection the no-route-out network cannot make. Use `AGNES_INTERNAL_URL` (e.g. `http://app:8000` under compose), as the rest of this page already instructs. |
 
+A curated skill's own `requirements.txt` is subject to the same rule: under
+`none` it can never install at runtime — there is no route to PyPI, at spawn
+or mid-turn. Its packages must be baked into the sandbox image (the
+Dockerfile's hand-maintained pip list) or shipped some other way. Under
+`open`/`allowlist` (with `chat.docker_egress_allow_hosts` covering
+`pypi.org`/`*.pypi.org`/`files.pythonhosted.org`), the runner best-effort
+warms up any skill `requirements.txt` it finds in one detached `pip install
+-r` right after installing the caller's marketplace plugins — fire-and-forget,
+so a slow or failed install never delays `runner_ready` or surfaces to the
+user; it is a convenience, not a guarantee, and it is skipped outright (one
+debug log) under `none`.
+
 To enable `allowlist` mode under Compose: set `chat.docker_egress_mode:
 allowlist` + `chat.docker_egress_allow_hosts` in `instance.yaml`, export
 `EGRESS_ALLOW_HOSTS` (the same list, comma-separated — the compose-owned
@@ -863,14 +875,15 @@ example) is **two independent rollouts**:
 ### Keep the sandbox image fresh (docker provider)
 
 **A stale image silently loses features, it does not fail.** The sandbox
-image ships `matplotlib` so the agent can draw a chart; an image built
-before that was added may have no way to obtain it at runtime
-(`docker_egress_mode: none`, or an allowlist without PyPI, puts package
-installs out of reach), so the agent falls back to prose or a markdown
-table instead of a chart, with nothing in the logs to say why. After
-upgrading Agnes, rebuild the image —
+image ships `matplotlib` so the agent can draw a chart, and `python-pptx` /
+`python-docx` / `openpyxl` so a curated skill can author a deck, document or
+workbook (#1977); an image built before one of those was added has no way to
+obtain it at runtime (`docker_egress_mode: none`, or an allowlist without
+PyPI, puts package installs out of reach), so the agent either falls back to
+prose or a markdown table, or the skill simply fails, with nothing in the
+logs to say why. After upgrading Agnes, rebuild the image —
 `docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox`
-— and confirm the contract label reads `2`:
+— and confirm the contract label reads `3`:
 `docker inspect -f '{{ index .Config.Labels "agnes.chat-sandbox.contract" }}'`.
 
 ### Per-user workspace size
