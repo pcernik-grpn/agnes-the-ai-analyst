@@ -694,6 +694,19 @@
   /* Who the pane is showing, where the picker used to stand. The search that
      chose them is above the tabs, so without this the card opened on a chain
      with no name at the top of it. */
+  /* The roster. Rows, not a dropdown: this tab's subject is people, and the
+     other two tabs list theirs. */
+  .ax-people { display: flex; flex-direction: column; }
+  .ax-person {
+    display: flex; align-items: baseline; gap: 10px; width: 100%;
+    padding: 10px 12px; border: 0; border-radius: var(--ds-radius-btn);
+    background: none; font: inherit; text-align: left; cursor: pointer;
+  }
+  .ax-person + .ax-person { border-top: 1px solid var(--ds-border-light); border-radius: 0; }
+  .ax-person:hover { background: var(--ds-surface-sunken); }
+  .ax-person:focus-visible { outline: var(--ds-focus-outline); outline-offset: calc(var(--ds-focus-outline-offset) * -1); }
+  .ax-person__nm { font-size: 13.5px; font-weight: 600; color: var(--ds-text-primary); }
+  .ax-person__em { font-size: 12px; color: var(--ds-text-muted); }
   .ax-simwho { font-size: 15px; font-weight: 650; color: var(--ds-text-primary); }
   .ax-simwho:empty { display: none; }
   .ax-onebar {
@@ -2584,11 +2597,12 @@
                      options=[{'value': '', 'label': 'Loading people…'}]) }}
     </span>
     <div class="ax-simrow">
+      <button type="button" class="ax-inherit" id="ax-sim-back" data-people-back hidden>← All people</button>
       <span class="ax-simwho" id="ax-sim-who"></span>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
     </div>
-    <div id="ax-sim-out"><div class="ax-empty">Search for someone above to see what they can use, and why.</div></div>
+    <div id="ax-sim-out"><div class="ax-empty">Loading people…</div></div>
   </div>
 </div>
 
@@ -4229,22 +4243,16 @@
   el("ax-group-find").addEventListener("input", (e) => {
     groupFilter = e.target.value;
     syncUrl();          // replace: one history entry per keystroke is noise
-    /* On By person the search selects rather than filters: the pane shows one
-       person's chain, so "narrow to a subset" has no meaning here but "find
-       the person I mean" does. First match by name or email wins, and an
-       empty box leaves the current selection alone rather than clearing a
-       chain the reader is in the middle of. */
+    /* On By person the search narrows the ROSTER — the same act it performs
+       on the other two tabs, which is the point: one control, one behaviour,
+       whichever tab you are on. (An earlier pass had it select the first
+       match instead, which only helped someone who could already spell the
+       name they wanted.) Typing while a chain is open returns to the list, so
+       the search always narrows something visible. */
     if (viewMode === "person") {
-      const q = groupFilter.trim().toLowerCase();
       const sel = el("ax-sim-user");
-      if (sel && q) {
-        const hit = [...sel.options].find(
-          (o) => o.value && o.textContent.toLowerCase().includes(q));
-        if (hit && sel.value !== hit.value) {
-          sel.value = hit.value;
-          sel.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      }
+      if (sel && sel.value) { sel.value = ""; sel.dispatchEvent(new Event("change", { bubbles: true })); }
+      else { loadUsers().then(renderPeopleList); }
       return;
     }
     repaintQuery();
@@ -4629,7 +4637,12 @@
     setLede(viewMode);
     paintTabCounts();
     paintKindFilter();
-    if (viewMode === "person") { showPane("person"); return; }
+    if (viewMode === "person") {
+      showPane("person");
+      // Arriving by clicking the tab, not by URL — same roster, same reason.
+      if (!(el("ax-sim-user") || {}).value) loadUsers().then(renderPeopleList);
+      return;
+    }
     syncQuery();
     if (viewMode === "resource") { renderBundles(); bindFind(); return; }
     renderGroups();
@@ -5799,6 +5812,63 @@
     syncSimUserDropdown(sel);
   }
 
+  /* The tab lists its subject, like the other two.
+     By group lists groups and By resource lists resources; By person listed
+     nothing and demanded a name you had to already know. A search alone is
+     only usable by someone who can spell the person they are looking for —
+     and an admin auditing access very often cannot, because the question is
+     "who are these people" in the first place.
+
+     So: no selection renders the roster, the toolbar's search narrows it the
+     same way it narrows the other two tabs (one behaviour on all three), and
+     picking a row shows that person's chain with a way back. */
+  function renderPeopleList() {
+    const out = el("ax-sim-out");
+    if (!out) return;
+    const q = (groupFilter || "").trim().toLowerCase();
+    const live = users.filter((u) => u.active !== false);
+    const shown = q
+      ? live.filter((u) => `${u.name || ""} ${u.email || ""}`.toLowerCase().includes(q))
+      : live;
+    el("ax-sim-who").textContent = "";
+    el("ax-sim-detail").hidden = true;
+    if (!live.length) {
+      out.innerHTML = `<div class="ax-empty">No accounts yet.</div>`;
+      return;
+    }
+    if (!shown.length) {
+      out.innerHTML = `<div class="ax-empty">No one matches “${esc(groupFilter)}”.</div>`;
+      return;
+    }
+    out.innerHTML = `<div class="ax-people">` + shown.map((u) => {
+      const label = u.name || u.email;
+      return `<button type="button" class="ax-person" data-person="${esc(u.id)}">
+        <span class="ax-person__nm">${esc(label)}</span>
+        <span class="ax-person__em">${esc(u.email || "")}</span>
+      </button>`;
+    }).join("") + `</div>`;
+  }
+
+  /* Picking one is what the hidden <select> is for — routing through it keeps
+     the URL, the dropdown sync and the chain render on the one path they
+     already used. */
+  document.addEventListener("click", (e) => {
+    const row = e.target.closest("[data-person]");
+    if (!row) return;
+    const sel = el("ax-sim-user");
+    if (!sel) return;
+    sel.value = row.dataset.person;
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("[data-people-back]")) return;
+    const sel = el("ax-sim-user");
+    if (!sel) return;
+    sel.value = "";
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+
   el("ax-sim-user").addEventListener("change", async (e) => {
     syncSimUserSelection(e.target);
     const uid = e.target.value;
@@ -5813,15 +5883,17 @@
     history.replaceState(null, "", url);
     const out = el("ax-sim-out");
     const detailBtn = el("ax-sim-detail");
-    // The name the picker used to show. The search that chose them is above
-    // the tabs, so the pane has to say who it is answering about.
+    // Who this chain is about, where the picker used to stand — the list it
+    // was chosen from is replaced by the chain, so the pane has to say.
     const whoEl = el("ax-sim-who");
     const sel = el("ax-sim-user");
     const chosen = sel && sel.options[sel.selectedIndex];
     if (whoEl) whoEl.textContent = uid && chosen ? chosen.textContent.trim() : "";
+    const backEl = el("ax-sim-back");
+    if (backEl) backEl.hidden = !uid;
     if (!uid) {
-      out.innerHTML = `<div class="ax-empty">Search for someone above to see what they can use, and why.</div>`;
-      detailBtn.hidden = true;
+      await loadUsers();
+      renderPeopleList();
       return;
     }
     detailBtn.hidden = false;
@@ -6200,6 +6272,10 @@
       if (sel && wanted && [...sel.options].some((o) => o.value === wanted)) {
         sel.value = wanted;
         sel.dispatchEvent(new Event("change"));
+      } else {
+        // No one named in the URL: the tab opens on its roster, the way By
+        // group opens on groups. Without this it opened on an empty card.
+        renderPeopleList();
       }
       return;
     }
