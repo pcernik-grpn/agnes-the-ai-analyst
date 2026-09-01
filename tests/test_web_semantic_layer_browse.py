@@ -1322,8 +1322,12 @@ class TestFlatProjectionTabsFold:
     def test_every_tab_offers_the_way_back_to_the_others(self, seeded_app):
         for tab in ("models", "all_metrics", "all_glossary"):
             body = self._get(seeded_app, f"/semantic-layer?tab={tab}").text
-            assert ">Metrics (" in body, tab
-            assert ">Glossary (" in body, tab
+            # The strip is a segmented control now — buckets of one filtered
+            # set — so the count rides its own badge instead of the label, and
+            # it moves as the reader narrows.
+            assert ">Metrics<" in body, tab
+            assert ">Glossary<" in body, tab
+            assert 'data-seg-count="all_metrics"' in body, tab
 
     def test_all_metrics_tab_lists_a_metric_with_no_document_behind_it(self, seeded_app):
         """The reason this could not be a deletion: ``metric_definitions``
