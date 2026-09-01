@@ -138,6 +138,15 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-sources/{source_id}/secret": "mcp_source.secret.set",
     "PUT /api/admin/mcp-tools/{tool_id}": "mcp_tool.update",
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
+    # -- app.api.admin_extraction ----------------------------------------------
+    # A POST that mutates NOTHING — it runs the anonymizer over a pasted
+    # sample and returns the result. Cataloged rather than `exempt:` all the
+    # same, on the `access_policy.preview` precedent: an admin pastes real
+    # content into it and gets back production-matching pseudonyms, which is
+    # an attributable act even though no state changes. The handler writes
+    # its own row (`log_safe`) carrying the sample's LENGTH and the redaction
+    # counts — never the text.
+    "POST /api/admin/sharepoint/anonymization/preview": "anonymization.preview",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_remove",
     # Landed on `integration` in parallel with this wave, declared "fallback"
@@ -151,6 +160,21 @@ POSTURE: dict[str, str] = {
     # (Re)generates the Graph change-notification receiver's shared secret.
     # Handler writes its own row (log_safe), same as scope_confirm above.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
+    # Graph subscription lifecycle (connectors/sharepoint/subscriptions.py) —
+    # the half that tells Graph to push at all. Both connection-scoped
+    # handlers write their OWN row (log_safe, on the success AND the typed-
+    # refusal branch, carrying the per-drive counts / the refusal code the
+    # middleware could not know), so the middleware stays silent for them.
+    # The sweep keeps the `run_` prefix so it stays inside
+    # SCHEDULER_ACTION_SQL's liveness predicate, same as run_sharepoint_
+    # extraction above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure": (
+        "sharepoint_connection.subscriptions_ensure"
+    ),
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/subscriptions": (
+        "sharepoint_connection.subscriptions_remove"
+    ),
+    "POST /api/admin/sharepoint/subscriptions/run-due": "run_sharepoint_subscription_renewal",
     # -- app.api.sharepoint_webhooks --------------------------------------------
     # Public, unauthenticated (Graph is the caller) — carries no user
     # identity, so AuditFallbackMiddleware never fires for it regardless of
@@ -708,6 +732,22 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sessions/list": "admin.sessions_browse",
     "GET /api/admin/sessions/{username}/{session_file}/download": "session_download",
     "GET /api/admin/sessions/{username}/{session_file}/transcript": "session.transcript_view",
+    # -- app.api.admin_extraction (extraction observability, 2026-08-31 design §9) --
+    # A1 is the source card's poll (3 s while a run is active, 30 s idle) and
+    # returns run COUNTERS, no document content — the same class as
+    # `GET /api/jobs` below.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status": "exempt:noise",
+    # A2/A3 back the run-history drawer: outcomes, durations, counters and
+    # the capped skip list (paths of documents the crawl refused). No
+    # document content, no secrets, no other user's data.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs": "exempt:ui_support",
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": "exempt:ui_support",
+    # A5 is NOT exempt: it discloses credential env-var NAMES and the
+    # per-scope audience-class mapping — the same disclosure class as its
+    # `scopes_read` / `certificate_read` siblings below.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
+        "sharepoint_connection.extraction_config_read"
+    ),
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",

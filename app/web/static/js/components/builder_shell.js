@@ -251,7 +251,13 @@
 
   /* The pooled-ingredient picker, over the app-wide modal surface rather
      than a private overlay. A detour from building, so it ends by returning
-     you where you were. `rows` and `foot` are pre-built. */
+     you where you were. `rows` and `foot` are pre-built.
+
+     `controls` is an OPTIONAL pre-built strip under the search box, for a
+     picker whose pool is too big to work with a substring match alone — the
+     package builder slices ~500 registered tables by source, by query mode
+     and by "in no package yet". A caller that passes none renders exactly as
+     before, so the other pickers are untouched. */
   function picker(o) {
     return (
       '<div class="modal-backdrop is-open" data-ag-pick-backdrop>' +
@@ -261,6 +267,7 @@
             '<button type="button" class="ag-pick-x" data-ag-pick-close aria-label="Close">✕</button>' +
           '</div>' +
           toolbar({ key: o.key, placeholder: o.searchPlaceholder, shown: o.shown, total: o.total, value: o.query }) +
+          (o.controls || '') +
           '<div class="ag-pick-rows ag-rows" data-rows="' + esc(o.key) + '">' + (o.rows || '') + '</div>' +
           '<div class="ag-note">' + (o.foot || '') + '</div>' +
           '<div class="modal-actions">' +

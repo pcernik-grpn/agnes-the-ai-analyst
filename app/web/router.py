@@ -7365,18 +7365,46 @@ async def admin_mcp_builder_edit(
     return templates.TemplateResponse(request, "admin_mcp_builder.html", ctx)
 
 
+# Where the builder page returns to when you leave it, keyed by the `from`
+# query param the entry point set. A WHITELIST, not the raw value: `from` is
+# untrusted request input and it lands in a `window.location.href`, so an
+# open value here is an open redirect through the Cancel button.
+_PKG_BUILDER_RETURN = {
+    "admin": ("/admin/data-packages", "Data packages"),
+    "library": ("/library", "Library"),
+}
+
+
+def _pkg_builder_return(from_: str | None, edit_pkg_id: str | None) -> tuple[str, str]:
+    """Resolve (href, label) for the builder's back button.
+
+    `from` names the lens that sent you, because the same builder is now the
+    only write surface for a package and it is reached from three places. An
+    unknown or absent value falls back to where the object itself lives: the
+    package's own page when editing one, the Library when creating.
+    """
+    if from_ in _PKG_BUILDER_RETURN:
+        return _PKG_BUILDER_RETURN[from_]
+    if edit_pkg_id:
+        return (f"/admin/data-packages/{quote(edit_pkg_id, safe='')}", "Package")
+    return ("/library", "Library")
+
+
 @router.get("/admin/data-packages/new", response_class=HTMLResponse)
 async def admin_package_builder(
     request: Request,
     user: dict = Depends(require_admin),
+    from_: str | None = Query(None, alias="from"),
 ):
     """Author a data package, in the same builder shell /agents and /skills use.
 
-    A PAGE, not the drawer. The drawer is right where it is used — mid-sentence
-    on /admin/tables, assigning a table to a package that does not exist yet —
-    because it opens over the lens you are standing on and gives it back. A
-    workspace is the opposite: it is where you have gone to do the thing, and
-    it should look like the other two places you go to do the thing.
+    A PAGE, not the drawer — and now the ONLY surface that writes a package.
+    Create was a page opened from the Library, edit was a drawer over whatever
+    lens you were standing on, and the Library's own detail page opened a third
+    copy of the same form: three chromes for one object. The drawer keeps only
+    the case it was built for — mid-sentence on /admin/tables, assigning a
+    table to a package that does not exist yet — where losing the page you are
+    on is the whole cost.
 
     The FORM is still the drawer component's; this route only gives it a page
     to render into (`mount`), so there is one implementation of a package's
@@ -7385,7 +7413,9 @@ async def admin_package_builder(
     # _build_context, not a bare dict — it is what supplies the rail, the
     # theme and the rest of the app chrome. Without it the page renders as a
     # builder floating on nothing.
-    return templates.TemplateResponse(request, "admin_package_builder.html", _build_context(request, user=user))
+    ctx = _build_context(request, user=user)
+    ctx["back_href"], ctx["back_label"] = _pkg_builder_return(from_, None)
+    return templates.TemplateResponse(request, "admin_package_builder.html", ctx)
 
 
 @router.get("/admin/data-packages/{pkg_id}/edit", response_class=HTMLResponse)
@@ -7393,6 +7423,7 @@ async def admin_package_builder_edit(
     pkg_id: str,
     request: Request,
     user: dict = Depends(require_admin),
+    from_: str | None = Query(None, alias="from"),
 ):
     """The same builder page, opened on a package that already exists.
 
@@ -7409,6 +7440,7 @@ async def admin_package_builder_edit(
         raise HTTPException(status_code=404, detail="data_package_not_found")
     ctx = _build_context(request, user=user)
     ctx["edit_pkg_id"] = pkg_id
+    ctx["back_href"], ctx["back_label"] = _pkg_builder_return(from_, pkg_id)
     return templates.TemplateResponse(request, "admin_package_builder.html", ctx)
 
 
@@ -7695,70 +7727,13 @@ async def admin_package_detail(
     tables.sort(key=lambda t: t["name"])
     source_types = sorted({t["source_type"] for t in tables if t.get("source_type")})
 
-    # Everything this package could still take, for the Add-tables picker.
-    # Server-rendered rather than a second fetch: the registry is already read
-    # above, and a picker that cannot open because one more request failed is
-    # a worse failure than a page that is 30 kB heavier. `internal` rows
-    # (the agnes_* usage tables) ARE package material: they ship in the seeded
-    # `agnes-usage` package, and an admin who wants a different bundle must be
-    # able to see them here.
-    #
-    # Each row carries what the picker's toolbar filters and sorts ON, because
-    # an instance with three hundred registered tables cannot be worked with a
-    # substring match alone: the source and the mode are what an admin slices
-    # by ("the Keboola tables", "the live-query ones"), `packaged` is the one
-    # that answers "what has nobody bundled yet", and `last_sync` is an ISO
-    # string so it sorts lexicographically without a parse (never-synced
-    # sorts first, which is the order that surfaces the problems).
-    member_set = set(member_ids)
-    packaged_elsewhere: set[str] = set()
-    try:
-        for pid, ids in pkg_repo.list_member_ids_bulk().items():
-            if pid != package_id:
-                packaged_elsewhere.update(ids)
-    except Exception as e:  # noqa: BLE001 — the picker still works without the flag
-        logger.warning("package detail: could not read package membership: %s", e)
-
-    candidate_tables = []
-    for t in sorted(registry.values(), key=lambda r: (r.get("name") or r["id"]).lower()):
-        if t["id"] in member_set:
-            continue
-        st = states.get(t["id"]) or {}
-        last = _aware(st.get("last_sync"))
-        candidate_tables.append(
-            {
-                "id": t["id"],
-                "name": t.get("name") or t["id"],
-                "bucket": t.get("bucket") or "",
-                "source_type": t.get("source_type") or "",
-                "mode": _mode_words(t.get("query_mode")),
-                "rows": int(st.get("rows") or 0),
-                "last_sync": last.isoformat() if last else "",
-                "age_minutes": int((now - last).total_seconds() // 60) if last else None,
-                "packaged": t["id"] in packaged_elsewhere,
-            }
-        )
-
-    # The picker's facet vocabularies, each with the count the option covers —
-    # built from the candidates themselves so a filter can never offer a value
-    # that matches nothing.
-    def _facet(key: str) -> list[tuple[str, int]]:
-        counts: dict[str, int] = {}
-        for c in candidate_tables:
-            v = c["mode"]["word"] if key == "mode" else (c.get(key) or "")
-            if v:
-                counts[v] = counts.get(v, 0) + 1
-        return sorted(counts.items())
-
-    candidate_facets = {
-        "source": _facet("source_type"),
-        "mode": _facet("mode"),
-        "bucket": _facet("bucket"),
-    }
-
+    # No candidate-table list here any more. This page reads a package; the
+    # Add-tables picker it used to feed left with the drawer, and the whole
+    # registry it enumerated (plus a bulk membership read across every other
+    # package) is now loaded only by the builder, which is the surface that
+    # actually needs it.
     # ── Who can use it ───────────────────────────────────────────────────
     groups_by_id: dict[str, dict] = {}
-    all_groups: list[dict] = []
     sharing: list[dict] = []
     try:
         members_repo = user_group_members_repo()
@@ -7772,7 +7747,6 @@ async def admin_package_detail(
                 "member_count": members_repo.count_members(grp["id"]),
             }
             groups_by_id[grp["id"]] = entry
-            all_groups.append(entry)
         for g in resource_grants_repo().list_all(resource_type="data_package"):
             if g["resource_id"] != package_id:
                 continue
@@ -7871,11 +7845,8 @@ async def admin_package_detail(
         user=user,
         pkg=pkg,
         tables=tables,
-        candidate_tables=candidate_tables,
-        candidate_facets=candidate_facets,
         source_types=source_types,
         sharing=sharing,
-        all_groups=all_groups,
         delivery=delivery,
         preview_ctx=preview_ctx,
         group_ctx=group_ctx,
@@ -8715,7 +8686,6 @@ def _source_inventory(user: dict | None = None) -> dict:
 # queue's cost in $" but the only honest input Agnes holds is a rejected/
 # deferred item COUNT from the last run report, not a $ figure. Replace once
 # the producer reports real per-item cost.
-_FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM = 0.02
 
 # Every `claims_rejected` reason the verbatim gate itself produces (spec §8 +
 # §8.4) — both fold into the "rejected quotes" badge, never "protocol
@@ -8888,10 +8858,12 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         rejected_quotes = [r for r in claims_rejected if r.get("reason") in _VERBATIM_GATE_REASONS]
         protocol_errors = [r for r in claims_rejected if r.get("reason") not in _VERBATIM_GATE_REASONS]
         queue_items = len(rejected_quotes) + len(protocol_errors) + len(deferred)
-        cell["cost_estimate"] = {
-            "amount_usd": round(queue_items * _FILE_SOURCE_QUEUE_COST_PLACEHOLDER_PER_ITEM, 2),
-            "placeholder": True,
-        }
+        # Honest queue signal (UX review 2026-08-31, finding on the fabricated
+        # `$0.02 × items` figure): a COUNT of items awaiting review is a fact;
+        # a dollar figure with no price model behind it is not. Real cost
+        # rendering arrives with operator-configured pricing (extraction
+        # observability spec §5) — until then no `$` is shown here at all.
+        cell["queue"] = {"items": queue_items}
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
@@ -8901,7 +8873,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
             "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
         }
     else:
-        cell["cost_estimate"] = {"amount_usd": 0.0, "placeholder": True}
+        cell["queue"] = {"items": 0}
         cell["last_run"] = None
 
     # ── schedule: static text — the crawl runs externally, so this is
@@ -8962,7 +8934,7 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 
-    cell["schedule"] = {"text": "external producer · hourly delta", "in_agnes": in_agnes_schedule}
+    cell["schedule"] = {"text": "built-in crawler", "in_agnes": in_agnes_schedule}
 
     # ── certificate: origin + set-date from resolve_sharepoint_settings,
     # NEVER the value (spec §13.2). A resolution error (missing identity

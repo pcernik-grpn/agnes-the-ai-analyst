@@ -1537,7 +1537,7 @@ class TestSharePointSourceCard:
             assert fs["extract"] == {}
             assert fs["graph"] == {"facts": 0, "edges": 0}
             assert fs["last_run"] is None
-            assert fs["cost_estimate"] == {"amount_usd": 0.0, "placeholder": True}
+            assert fs["queue"] == {"items": 0}
             assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
             # `scopes` needs no Postgres at all (config.scopes + the dual-
             # backend file_corpora/resource_grants repos) — an empty
@@ -1605,7 +1605,7 @@ class TestSharePointSourceCard:
         try:
             inv = _source_inventory()
             schedule = inv["pipelines"][conn_id]["file_source"]["schedule"]
-            assert schedule["text"] == "external producer · hourly delta"
+            assert schedule["text"] == "built-in crawler"
             # TCRD-226's in-Agnes schedule state is a SEPARATE, additive
             # sub-object — a fresh connection with no scheduled runs reads
             # honestly off (never a stale/guessed default). `sharepoint.
@@ -1664,11 +1664,11 @@ class TestSharePointSourceCard:
             assert in_agnes["last_run_at"] == last_run_at
             # next_due_at(every 4h, last_run_at) == last_run_at + 4h.
             assert in_agnes["next_run_at"] == "2026-08-29T12:00:00+00:00"
-            # Enabled, but `_fake_get_value` never configures a producer ->
-            # the SECOND readiness gate (not the first) is what blocks the
-            # honest-UI gate here.
-            assert in_agnes["extraction_ready"] is False
-            assert in_agnes["extraction_unready_reason"] == "extraction_producer_not_configured"
+            # Builtin-only world: no producer to configure. With the
+            # `extraction` extra installed (the test venv has it), enabled
+            # means ready — the second gate is only the dependency probe.
+            assert in_agnes["extraction_ready"] is True
+            assert in_agnes["extraction_unready_reason"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1868,8 +1868,8 @@ class TestSharePointSourceCardRendering:
         "crawl": {"documents": 12},
         "extract": {"indexed": 9, "processing": 2, "needs_review": 1},
         "graph": {"facts": 7, "edges": 3},
-        "cost_estimate": {"amount_usd": 0.06, "placeholder": True},
-        "schedule": {"text": "external producer · hourly delta"},
+        "queue": {"items": 3},
+        "schedule": {"text": "built-in crawler"},
         "certificate": {"origin": "vault", "env_name": None, "set_at": "2026-08-20T12:00:00+00:00", "error": None},
         "identity": {"groups_matched": 2, "collections_no_group": 1, "collections_total": 3},
         "last_run": {
@@ -1956,12 +1956,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "12 documents" in html
         assert "9 indexed" in html
         assert "7 facts · 3 edges" in html
-        assert "~$0.06" in html
+        assert "3 items" in html
 
     def test_facts_html_renders_certificate_identity_and_badge_counts(self):
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         html = result["html"]
-        assert "external producer · hourly delta" in html
+        assert "built-in crawler" in html
         assert "vault" in html
         # Never the certificate value, only origin/set-date.
         assert "BEGIN PRIVATE KEY" not in html
@@ -2005,7 +2005,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
         # Ready -> no unready badge, and the button carries no `disabled`.
-        assert "Extraction is disabled on this instance" not in html
+        assert "connector is disabled on this instance" not in html
         assert "No extraction producer is configured" not in html
         assert "disabled" not in html
         assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
@@ -2041,15 +2041,15 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "Extraction is disabled on this instance" in html
+        assert "connector is disabled on this instance" in html
         assert "no schedule configured" in html.lower()
         assert "disabled" in html
 
-    def test_in_agnes_schedule_producer_not_configured_shows_the_reason_and_disables_the_button(self):
+    def test_in_agnes_schedule_missing_deps_shows_the_reason_and_disables_the_button(self):
         """A DIFFERENT unready reason than the disabled case above — the
-        instance has `extraction.enabled: true` but no producer command/
-        module set, the exact state a click would otherwise 409
-        `extraction_producer_not_configured` for."""
+        instance has `extraction.enabled: true` but the `extraction` extra
+        is not installed, the exact state a click would otherwise 409
+        `extraction_dependencies_missing` for."""
         fs = dict(self._FILE_SOURCE)
         fs["schedule"] = {
             **fs["schedule"],
@@ -2059,12 +2059,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "last_run_at": None,
                 "next_run_at": None,
                 "extraction_ready": False,
-                "extraction_unready_reason": "extraction_producer_not_configured",
+                "extraction_unready_reason": "extraction_dependencies_missing",
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "No extraction producer is configured" in html
+        assert "extraction dependencies are not installed" in html.lower() or "agnes[extraction]" in html
         assert "disabled" in html
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):

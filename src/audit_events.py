@@ -1162,6 +1162,24 @@ CATALOG: dict[str, AuditEvent] = {
         "system",
         "A SharePoint Graph change notification was rejected (clientState did not match the connection's secret).",
     ),
+    # -- SharePoint Graph change-notification SUBSCRIPTION lifecycle
+    # (connectors/sharepoint/subscriptions.py) — the half that tells Graph to
+    # push at all, appended at the end of the receiver's own section.
+    "sharepoint_connection.subscriptions_ensure": AuditEvent(
+        "sharepoint_connection.subscriptions_ensure",
+        "mutation",
+        "A SharePoint connection's Graph drive subscriptions were created/renewed to match its confirmed scopes.",
+    ),
+    "sharepoint_connection.subscriptions_remove": AuditEvent(
+        "sharepoint_connection.subscriptions_remove",
+        "mutation",
+        "A SharePoint connection's Graph drive subscriptions were deleted, ending its change notifications.",
+    ),
+    "run_sharepoint_subscription_renewal": AuditEvent(
+        "run_sharepoint_subscription_renewal",
+        "system",
+        "The scheduler's SharePoint Graph subscription renewal sweep ran.",
+    ),
     # -- 2026-08-30 plan, Task 4: sharepoint-acl-sync worker job — per-scope
     # SharePoint permission mirroring (connectors/sharepoint/acl_sync.py).
     # `sync_triggered` is emitted by Task 5's admin route, registered here
@@ -1224,6 +1242,17 @@ CATALOG: dict[str, AuditEvent] = {
         "An admin overrode a detected broken-inheritance subtree exclusion "
         "('include anyway') on one SharePoint scope — should_not guarantee mode only.",
     ),
+    # -- 2026-08-31 extraction-observability-ui design §9 (A5). The run
+    # status/history reads beside it are `exempt:noise` / `exempt:ui_support`
+    # (counters and outcomes, no content); this one is cataloged because it
+    # discloses credential env-var NAMES and the per-scope audience-class
+    # mapping — the same disclosure class as `certificate_read`/`scopes_read`.
+    "sharepoint_connection.extraction_config_read": AuditEvent(
+        "sharepoint_connection.extraction_config_read",
+        "read",
+        "An admin read a SharePoint connection's effective extraction configuration — "
+        "values, their origins, and credential env-var names (never their values).",
+    ),
     # -- 2026-08-31 plan, Tasks 3/6: sweep v2 — permission zones + retroactive
     # cleanup (connectors/sharepoint/acl_sync.py: _reconcile_zones,
     # _cleanup_connection_content).
@@ -1257,6 +1286,36 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_acl.sweep_triggered",
         "mutation",
         "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
+    ),
+    # -- 2026-09-01 owner decision: the anonymize-in-front pipeline's
+    # per-instance HMAC key (design spec §9.2) is generated and stored by
+    # Agnes itself when no operator-minted env key is configured, instead of
+    # failing closed forever. Cataloged because it is a once-per-instance,
+    # irreversible security event: the key is write-once (a second key
+    # orphans every pseudonym written under the first), so the row is the
+    # durable record of WHEN this instance's pseudonym space came into
+    # existence and WHICH key (by fingerprint — never the value) it uses.
+    # Written by src/anonymization_key.py with no actor: no user asks for
+    # provisioning; a run that needs a key triggers it.
+    "anonymization.key_provisioned": AuditEvent(
+        "anonymization.key_provisioned",
+        "system",
+        "Agnes generated this instance's per-instance anonymization HMAC key and stored it "
+        "encrypted in the vault (fingerprint only, never the key value). Write-once — there "
+        "is no automatic rotation.",
+    ),
+    # -- Anonymization preview (POST /api/admin/sharepoint/anonymization/
+    # preview). Cataloged for the same reason `access_policy.preview` is: an
+    # admin pastes real content into it, and the instance's real pseudonym
+    # key produces real, production-matching tokens — so "who previewed,
+    # when, and how much" is a question worth being able to answer. The row
+    # records the sample's LENGTH and the per-kind redaction counts; the
+    # sample text itself is never written to the trail.
+    "anonymization.preview": AuditEvent(
+        "anonymization.preview",
+        "read",
+        "An admin previewed what the anonymizer would redact in a pasted sample "
+        "(length and counts recorded; the sample text itself is never stored).",
     ),
 }
 

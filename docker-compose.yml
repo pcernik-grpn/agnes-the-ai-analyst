@@ -194,16 +194,18 @@ services:
   # §16 step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-
   # collections-design.md) — a SEPARATE process/container running ONLY the
   # `extraction` lane (AGNES_WORKER_LANES=extraction), so the
-  # `corpus-extraction` job kind's producer subprocess (crawl -> convert ->
-  # anonymize -> extract, potentially long-running) can never compete with
+  # `corpus-extraction` job kind's in-process pipeline (crawl -> convert ->
+  # anonymize -> ingest, potentially long-running) can never compete with
   # the `app` service's heavy/light lanes for CPU/memory, and a corpus
   # re-extraction never has a chance to block a table sync (the reason the
   # extraction lane exists at all — see app/worker/registry.py).
   #
-  # Built from the `worker` Dockerfile target — see that stage's comment for
-  # the EXTRACTION_PRODUCER_INSTALL build-arg extension point; this repo does
-  # NOT vendor the producer (a separate project of the operator's, adopted per spec
-  # §7.1). Off by default (`extraction.enabled: false`,
+  # Built from the `worker` Dockerfile target, which is the plain app image:
+  # the pipeline is in-repo (connectors/sharepoint/crawler.py), so there is
+  # no external producer to bundle. What the lane DOES need is the
+  # `extraction` optional extra (markitdown, pypdfium2) — build with
+  # `--build-arg EXTRA_EXTRAS=,extraction`. Off by default
+  # (`extraction.enabled: false`,
   # config/instance.yaml.example) AND behind its own compose profile — a
   # deployment that wants it running does ALL THREE, in order:
   #   1. Satisfy the multi-process prerequisites FIRST. This service sets
@@ -213,8 +215,10 @@ services:
   #      and `coordination.backend: redis` (instance.yaml). Without these,
   #      `app/startup_guards.py::validate_deployment` refuses to boot — see
   #      docs/DEPLOYMENT.md#multi-process.
-  #   2. Flip `extraction.enabled: true` with a configured producer
-  #      (config/instance.yaml.example's `extraction:` block).
+  #   2. Flip `extraction.enabled: true` (config/instance.yaml.example's
+  #      `extraction:` block) and make sure this image carries the
+  #      `extraction` extra — the admin trigger refuses with
+  #      `409 extraction_dependencies_missing` when it does not.
   #   3. Start this service with `--profile extraction-worker`.
   extraction-worker:
     build:
@@ -246,11 +250,10 @@ services:
       app:
         condition: service_healthy
     restart: unless-stopped
-    # A producer subprocess (crawl/convert/anonymize/extract, possibly with
-    # docling/embeddings-class deps if the operator's producer image needs
-    # them) can be considerably heavier than the scheduler's own HTTP calls —
-    # default sized like the app service, not the scheduler. Override via
-    # .env on a deployment whose producer needs more.
+    # A crawl (download -> convert -> anonymize -> chunk, one document at a
+    # time but continuously) is considerably heavier than the scheduler's own
+    # HTTP calls — default sized like the app service, not the scheduler.
+    # Override via .env on a deployment that needs more.
     mem_limit: ${AGNES_EXTRACTION_WORKER_MEM_LIMIT:-4g}
     cpus: ${AGNES_EXTRACTION_WORKER_CPUS:-2.0}
     # Same WAL-corruption-on-SIGKILL rationale as the app/scheduler services.

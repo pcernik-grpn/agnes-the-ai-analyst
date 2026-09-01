@@ -111,8 +111,10 @@ _CONFIG_SECRET_ONLY_ENVS: frozenset[str] = frozenset(
 
 # Env var NAME for the anonymize-in-front pipeline's per-instance HMAC key
 # (design spec §9.2 — PERSON_<hmac(key, ...)> etc., never a fixed marker),
-# resolved by ``app.worker.kinds._resolve_anonymization_key`` and forwarded
-# ONLY to the external producer subprocess's child environment.
+# resolved by ``app.worker.kinds._resolve_anonymization_key`` and used ONLY
+# by the built-in extraction pipeline's anonymize pass. (It was once
+# forwarded to an external producer subprocess; that mode is gone, but the
+# trust-boundary argument below is about the key itself and is unchanged.)
 #
 # Deliberately NOT part of `_DEFAULT_TOKEN_ENVS` above, and this set must
 # NEVER be merged into it. `_DEFAULT_TOKEN_ENVS` feeds `get_allowed_token_

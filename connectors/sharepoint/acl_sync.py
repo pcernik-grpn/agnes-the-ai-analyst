@@ -52,11 +52,12 @@ can express, so this walks each ``access_mode='mirrored'`` scope's folder
 tree (``graph_client.list_item_children`` + the already-``$batch``-based
 ``graph_client.probe_unique_permissions``) and EXCLUDES — never descends
 into, never crawls — every broken-inheritance subtree it finds, by ROOT.
-Detection only; deciding what to do with the exclusion list (the actual
-crawl) is the external producer's job (§6.3's division of labor) — this
-module writes the list, ``app/worker/kinds.py::_run_corpus_extraction``
-hands it to the producer via ``AGNES_SP_EXCLUDED_SUBTREE_IDS``, and
-HONORING it is out of this repo's scope (see that function's docstring).
+Detection only; acting on the exclusion list is the crawl's job — this
+module writes the list, and the built-in crawler
+(``connectors/sharepoint/crawler.py``) honors it in-process (fail-closed:
+an unresolvable exclusion refuses the scope). The external-producer env
+handoff (``AGNES_SP_EXCLUDED_SUBTREE_IDS``) was removed with external
+mode (2026-08-31, builtin-only decision).
 Own job kind (``sharepoint-subtree-sweep``), own weekly scheduler cadence
 (§6.2's cost model: a full probe pass over a large library is multi-hour,
 not a nightly job) — see :func:`run_subtree_sweep`'s own docstring.

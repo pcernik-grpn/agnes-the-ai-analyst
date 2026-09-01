@@ -1218,6 +1218,26 @@ _EXEMPT: dict[str, str] = {
         "subscription create call — admin-only wizard bookkeeping, no analyst "
         "CLI/MCP analogue"
     ),
+    # Graph subscription lifecycle (connectors/sharepoint/subscriptions.py) —
+    # same admin/scheduler maintenance class as the extract / run-due /
+    # webhook rows above: an admin wiring one connection's near-real-time
+    # push, and the renewal clock that keeps it alive. Nothing an analyst
+    # queries.
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure": (
+        "admin-triggered create/renew of a SharePoint connection's Microsoft Graph drive "
+        "subscriptions — admin-only wizard bookkeeping against an external tenant, mirrors "
+        "the webhook secret-rotation exemption above; no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/subscriptions": (
+        "admin teardown of a SharePoint connection's Microsoft Graph drive subscriptions — "
+        "same admin-only lifecycle surface as its ensure sibling above; no analyst CLI/MCP "
+        "analogue"
+    ),
+    "/api/admin/sharepoint/subscriptions/run-due": (
+        "scheduler-driven sweep renewing Graph drive subscriptions before they expire — "
+        "admin/scheduler maintenance op, mirrors the extraction/run-due exemption above; "
+        "no analyst CLI/MCP analogue"
+    ),
     "/api/webhooks/sharepoint/{connection_id}": (
         "Microsoft Graph change-notification receiver (validation handshake + "
         "notification delivery) for a SharePoint connection — system-to-system, "
@@ -1232,10 +1252,41 @@ _EXEMPT: dict[str, str] = {
         "2026-08-30 plan Task 5) — admin/scheduler maintenance op, mirrors the "
         "extract/run-due exemptions above; no analyst CLI/MCP analogue"
     ),
+    # Extraction observability (2026-08-31 design §9, A1/A2/A3/A5) — read-only
+    # display primitives feeding ONE admin card (its live crawl cell, its run
+    # drawer and its config drawer). Same exemption class as the certificate
+    # metadata read above: an admin page's own data, no analyst CLI/MCP
+    # analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/status": (
+        "live run state for the source card's crawl cell — polled admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/runs": (
+        "run history for the source card's run drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": (
+        "one run's stored report/skip list for the source card's run drawer — admin "
+        "display primitive, no analyst CLI/MCP analogue"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/config": (
+        "read-only effective extraction configuration with per-leaf origins for the "
+        "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
         "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
         "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "
         "the acl-sync exemption right above; no analyst CLI/MCP analogue"
+    ),
+    # The config drawer's "Preview redaction" panel: paste a sample, see what
+    # the anonymizer would do to it before a crawl runs over thousands of
+    # documents. Same exemption class as the drawer it lives in — an admin
+    # page's own data. Deliberately NOT given a CLI/MCP surface: it processes
+    # admin-pasted document content under the instance's production pseudonym
+    # key, and an analyst-facing tool that redacts arbitrary text is a
+    # different product decision from an admin sanity-checking their own
+    # extraction configuration.
+    "/api/admin/sharepoint/anonymization/preview": (
+        "anonymization dry-run over an admin-pasted sample for the config drawer's "
+        "preview panel — admin display primitive, nothing persisted, no analyst CLI/MCP analogue"
     ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the

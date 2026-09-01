@@ -69,10 +69,12 @@
       mount: mount,
       mode: editId ? 'edit' : 'create',
       pkgId: editId,
-      // Leaving goes back where the thing lives: the package itself when
-      // there is one, otherwise where packages live.
-      backHref: editId ? '/admin/data-packages/' + encodeURIComponent(editId) : '/library',
-      backLabel: editId ? 'Package' : 'Library',
+      {# Leaving goes back where you CAME from — the route resolved it from
+         the `from` param against a whitelist, because this one builder is now
+         reached from the admin grid, the package's own page and the Library,
+         and each of them should get itself back. #}
+      backHref: {{ back_href | tojson }},
+      backLabel: {{ back_label | tojson }},
       onCreated: function (pkg) {
         window.location.href = pkg && pkg.id
           ? '/admin/data-packages/' + encodeURIComponent(pkg.id)

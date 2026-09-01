@@ -21,6 +21,7 @@ drives the flag through the mocked ``get_value`` config instead.
 from __future__ import annotations
 
 import datetime
+import sys
 
 import httpx
 import pytest
@@ -1787,9 +1788,10 @@ class TestCertificateMetadata:
 
 class TestWebhookSecretRotation:
     """`POST /connections/{id}/webhook` — (re)generates the Graph
-    change-notification receiver's shared secret, returning it alongside
-    the receiver URL an operator feeds to the producer's own
-    `subscriptions.py create --url ...`."""
+    change-notification receiver's shared secret, returning it alongside the
+    receiver URL. Both feed `connectors/sharepoint/subscriptions.py`: the
+    secret becomes each drive subscription's `clientState`, the URL its
+    `notificationUrl` (see tests/test_sharepoint_subscriptions.py)."""
 
     def test_requires_admin(self, seeded_app):
         r = seeded_app["client"].post(f"{BASE}/nope/webhook", headers=_auth(seeded_app["analyst_token"]))
@@ -2062,9 +2064,9 @@ class TestChangesFeedFailsCleanOnDuckDB:
 
 # ---------------------------------------------------------------------------
 # Extraction enqueue wiring (TCRD-226) — the admin trigger + the scheduled
-# sweep. Neither test class launches a real producer subprocess; they cover
-# the endpoints' OWN responsibilities: 404-before-work, the feature-usable
-# gate, duplicate-run dedup, and the exact payload shape enqueued for
+# sweep. Neither test class runs a crawl; they cover the endpoints' OWN
+# responsibilities: 404-before-work, the feature-usable gate, duplicate-run
+# dedup, and the exact payload shape enqueued for
 # app/worker/kinds.py::_run_corpus_extraction to pick up.
 # ---------------------------------------------------------------------------
 
@@ -2157,22 +2159,29 @@ class TestExtractionTrigger:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "feature_disabled"
 
-    def test_refuses_when_no_producer_configured(self, seeded_app, monkeypatch):
-        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
+    def test_refuses_when_the_extraction_extra_is_not_installed(self, seeded_app, monkeypatch):
+        """The pipeline runs IN-PROCESS now, so a server without the
+        converter backends would crawl and then fail on every single file.
+        Refused up front instead, naming the exact install command."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        # `None` in sys.modules makes the import raise ImportError — what an
+        # uninstalled extra actually looks like.
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
         c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-producer")
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-extra")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 409, r.text
-        assert r.json()["detail"]["error"] == "extraction_producer_not_configured"
+        detail = r.json()["detail"]
+        assert detail["error"] == "extraction_dependencies_missing"
+        assert "agnes[extraction]" in detail["message"]
 
-    def test_producer_command_env_override_satisfies_readiness(self, seeded_app, monkeypatch):
-        """A deployment that activates extraction purely via env (the
-        Terraform-rendered ``/opt/agnes/.env`` case) needs no
-        ``extraction.producer`` block in ``instance.yaml`` at all."""
+    def test_the_switch_alone_satisfies_readiness(self, seeded_app, monkeypatch):
+        """Readiness needs exactly two things — ``sharepoint.enabled`` and
+        the installed ``extraction`` extra. No producer config exists
+        anymore, so nothing else may be demanded before a run can start."""
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
-        monkeypatch.setenv("AGNES_EXTRACTION_PRODUCER_COMMAND", "python /opt/producer/agnes_lane.py")
         c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-env-producer")
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-switch-only")
         r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 202, r.text
 
@@ -2192,6 +2201,58 @@ class TestExtractionTrigger:
         # The exact payload shape app/worker/kinds.py::_run_corpus_extraction
         # documents: connection_id required, nothing invented.
         assert job["payload_json"] == {"connection_id": conn_id}
+
+    def test_run_options_ride_in_the_payload(self, seeded_app, monkeypatch):
+        """The Run-now options (per-run concurrency / time limit) land in
+        the job payload under the exact keys the handler documents — and
+        ONLY the keys the admin set, so an absent key keeps meaning "the
+        configured value"."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"concurrency": 8, "timeout_s": 1200},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "concurrency": 8, "timeout_s": 1200}
+
+    def test_a_partial_options_body_only_adds_what_was_set(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-partial")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"concurrency": 2},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "concurrency": 2}
+
+    def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
+        """The crawler would clamp these silently; the endpoint refuses them
+        instead, where the admin can see why the run isn't what they asked
+        for. Bounds mirror the crawler's own ([1,16] payload concurrency,
+        [0,86400] timeout)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-range")
+        for body in ({"concurrency": 0}, {"concurrency": 17}, {"timeout_s": -1}, {"timeout_s": 86401}):
+            r = c.post(
+                self.EXTRACT.format(base=BASE, cid=conn_id),
+                json=body,
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert r.status_code == 422, (body, r.text)
 
     def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
@@ -2249,15 +2310,19 @@ class TestExtractionRunDue:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "feature_disabled"
 
-    def test_noop_when_no_producer_configured(self, seeded_app, monkeypatch):
-        """Sharepoint itself ON (router-level gate passes), but no producer
-        configured — the route's OWN readiness no-op still applies, a clean
-        200 rather than an error, since this endpoint fires unconditionally
-        on its own cadence once a schedule is configured."""
+    def test_noop_when_the_extraction_extra_is_missing(self, seeded_app, monkeypatch):
+        """Sharepoint itself ON (router-level gate passes), but the
+        `extraction` optional dependency extra is not installed — the
+        route's OWN readiness no-op still applies, a clean 200 rather than
+        an error, since this endpoint fires unconditionally on its own
+        cadence once a schedule is configured. (The producer-config leg of
+        this check died with the external mode — deps are the only
+        remaining readiness requirement past the switch.)"""
         config = {"sharepoint": {"enabled": True}, "extraction": {"schedule": "every 15m"}}
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
         c = seeded_app["client"]
-        _create_connection(c, seeded_app["admin_token"], name="due-no-producer")
+        _create_connection(c, seeded_app["admin_token"], name="due-no-extra")
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["count"] == 0
