@@ -2173,6 +2173,22 @@ def _detector_usage(detector: Any) -> Dict[str, Any]:
     return out
 
 
+def _ocr_run_usage(scan_ocr_module: Any) -> Dict[str, Any]:
+    """The scan-OCR tier's run totals, or ``{}`` — the same zero-collapse
+    honesty as :func:`_detector_usage`: an all-zero block (the switch off,
+    or no scanned document met) reads as "no tokens spent", never as a
+    measured $0.00. Never raises: usage is observability, not a gate."""
+    if scan_ocr_module is None:
+        return {}
+    try:
+        usage = scan_ocr_module.run_usage()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(usage, dict):
+        return {}
+    return {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
+
+
 def maybe_run_facts_extraction(
     connection: Dict[str, Any], *, deadline: Optional[_Deadline] = None
 ) -> Optional[Dict[str, Any]]:
@@ -2268,6 +2284,17 @@ async def _run_crawl_async(
     # is still a rendered row rather than a silence (design §4.3).
     recorder = _RunRecorder(connection_id, job_id=job_id)
     recorder.start()
+    # The scan-OCR tier keeps module-level run totals (it is called from
+    # deep inside the converter, which has no channel back to this run) —
+    # zeroed here so a run's `ocr_usage` can never carry a predecessor's
+    # spend. Import guarded: the module is import-light, but a broken
+    # optional install must degrade to "no OCR accounting", not a dead crawl.
+    try:
+        from connectors.sharepoint import scan_ocr as _scan_ocr
+
+        _scan_ocr.reset_run_usage()
+    except Exception:  # noqa: BLE001
+        _scan_ocr = None
     #: The LLM stage's own sub-report, or None when it is switched off.
     facts_report: Optional[Dict[str, Any]] = None
 
@@ -2357,12 +2384,20 @@ async def _run_crawl_async(
         ner_usage = _detector_usage(detector)
         if ner_usage:
             interrupted_report["ner_usage"] = ner_usage
+        ocr_usage = _ocr_run_usage(_scan_ocr)
+        if ocr_usage:
+            interrupted_report["ocr_usage"] = ocr_usage
+        stopped_usage: Dict[str, Any] = {}
+        if ner_usage:
+            stopped_usage["ner"] = ner_usage
+        if ocr_usage:
+            stopped_usage["ocr"] = ocr_usage
         recorder.finish(
             stats,
             status="interrupted" if reason in {r for _, r in _STOP_REASONS} else _record_status_for(exc),
             report=interrupted_report,
             error=f"{type(exc).__name__}: {exc}",
-            usage={"ner": ner_usage} if ner_usage else {},
+            usage=stopped_usage,
         )
         raise
 
@@ -2380,6 +2415,9 @@ async def _run_crawl_async(
     ner_usage = _detector_usage(detector)
     if ner_usage:
         report["ner_usage"] = ner_usage
+    ocr_usage = _ocr_run_usage(_scan_ocr)
+    if ocr_usage:
+        report["ocr_usage"] = ocr_usage
     facts_usage: Dict[str, Any] = {}
     if facts_report is not None:
         report["facts"] = facts_report
@@ -2390,6 +2428,8 @@ async def _run_crawl_async(
     run_usage: Dict[str, Any] = {}
     if ner_usage:
         run_usage["ner"] = ner_usage
+    if ocr_usage:
+        run_usage["ocr"] = ocr_usage
     if facts_usage:
         run_usage["facts"] = facts_usage
     recorder.finish(stats, status="done", report=report, usage=run_usage)

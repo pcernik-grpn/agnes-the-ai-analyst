@@ -2430,7 +2430,15 @@ function _sharepointFactsHtml(row) {
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — the built-in crawl→convert→anonymize→ingest lane.">In-Agnes extraction</span>
     <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
-    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="runSpExtraction('${row.id}')">Run extraction now</button></span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="toggleSpRunOptsRow('${row.id}')">Run extraction now</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-runopts-row-${row.id}">
+    <label class="field-hint" for="ds-sp-runopts-conc-${row.id}">Files in parallel (1–16, blank = configured)</label>
+    <input type="number" id="ds-sp-runopts-conc-${row.id}" min="1" max="16" step="1" placeholder="configured" style="max-width:9rem;">
+    <label class="field-hint" for="ds-sp-runopts-timeout-${row.id}">Time limit in seconds (0 = unbounded, blank = configured)</label>
+    <input type="number" id="ds-sp-runopts-timeout-${row.id}" min="0" max="86400" step="60" placeholder="configured" style="max-width:9rem;">
+    <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
@@ -2989,21 +2997,54 @@ async function testSpConn(id) {
    worker); the visible result here is "queued" or a typed refusal
    (extraction disabled, no producer configured, or already running), never
    the extraction's own outcome. */
+function toggleSpRunOptsRow(id) {
+  // The "Run extraction now" options row: per-run concurrency and time
+  // limit (both optional — blank keeps the configured value). The card's
+  // overflow menu still runs immediately with defaults; this row is where
+  // an admin steers ONE run without touching /admin/server-config.
+  const row = document.getElementById(`ds-sp-runopts-row-${id}`);
+  if (!row) { runSpExtraction(id); return; }
+  setSourceOpen(id, true);
+  row.classList.toggle("show");
+}
+
+function _spRunOption(id, kind, min, max) {
+  const el = document.getElementById(`ds-sp-runopts-${kind}-${id}`);
+  if (!el || el.value.trim() === "") return null;
+  const n = Number(el.value);
+  if (!Number.isInteger(n) || n < min || n > max) return { invalid: true };
+  return n;
+}
+
 async function runSpExtraction(id) {
   const resultEl = document.getElementById(`ds-test-${id}`);
   setSourceOpen(id, true);
+  const conc = _spRunOption(id, "conc", 1, 16);
+  const timeout = _spRunOption(id, "timeout", 0, 86400);
+  if ((conc && conc.invalid) || (timeout && timeout.invalid)) {
+    showToast("Run options out of range — concurrency 1–16, time limit 0–86400 s.", false);
+    return;
+  }
+  const overrides = {};
+  if (conc !== null) overrides.concurrency = conc;
+  if (timeout !== null) overrides.timeout_s = timeout;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
     const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extract`, {
       method: "POST",
       credentials: "include",
+      ...(Object.keys(overrides).length
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(overrides) }
+        : {}),
     });
     const body = await r.json().catch(() => ({}));
     if (r.ok) {
       resultEl.className = "ds-conn-test-result show ok";
       resultEl.textContent = `✓ Extraction queued (job ${body.job_id})`;
       showToast("Extraction queued.", true);
+      const optsRow = document.getElementById(`ds-sp-runopts-row-${id}`);
+      if (optsRow) optsRow.classList.remove("show");
       // The dispatch stamps `config.extraction.last_run_at` on the connection
       // row, and the body's "In-Agnes extraction" line reads it — so this
       // needs the rows re-read too, not just the strip.
@@ -7060,7 +7101,7 @@ function _extRunLine(run) {
   const usage = run.usage && Object.keys(run.usage).length ? run.usage : (run.ner_usage ? { ner: run.ner_usage } : null);
   if (usage) {
     const stages = (usage.input_tokens || usage.output_tokens) ? { ner: usage } : usage;
-    const stageLabels = { ner: "NER", facts: "facts" };
+    const stageLabels = { ner: "NER", ocr: "OCR", facts: "facts" };
     for (const [stage, u] of Object.entries(stages)) {
       if (u && (u.input_tokens || u.output_tokens)) {
         const tok = (u.input_tokens || 0) + (u.output_tokens || 0);

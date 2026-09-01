@@ -1700,6 +1700,41 @@ class TestDetectorUsageRecording:
         assert crawler._detector_usage(detect) == {}
 
 
+class TestOcrUsageRecording:
+    """`_ocr_run_usage` mirrors `_detector_usage`'s honesty rules for the
+    scan-OCR tier's module-level run totals."""
+
+    def test_reads_the_run_totals(self):
+        class FakeScanOcr:
+            @staticmethod
+            def run_usage():
+                return {"calls": 2, "input_tokens": 5000, "output_tokens": 1100, "pages": 4}
+
+        assert crawler._ocr_run_usage(FakeScanOcr) == {
+            "calls": 2,
+            "input_tokens": 5000,
+            "output_tokens": 1100,
+            "pages": 4,
+        }
+
+    def test_zero_counters_and_absence_collapse_to_empty(self):
+        class Idle:
+            @staticmethod
+            def run_usage():
+                return {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+        assert crawler._ocr_run_usage(Idle) == {}
+        assert crawler._ocr_run_usage(None) == {}
+
+    def test_a_broken_accessor_reports_empty_not_a_dead_crawl(self):
+        class Broken:
+            @staticmethod
+            def run_usage():
+                raise RuntimeError("boom")
+
+        assert crawler._ocr_run_usage(Broken) == {}
+
+
 # --------------------------------------------------------------------------
 # Parallel crawl (2026-09-01)
 #
@@ -2297,6 +2332,8 @@ class TestTokenRefreshUnderConcurrency:
         asyncio.run(auth.refresh())
         asyncio.run(auth.refresh())
         assert acquisitions["n"] == 2
+
+
 # --------------------------------------------------------------------------
 # The LLM fact-extraction stage's chaining seam (owner decision 2026-09-01)
 # --------------------------------------------------------------------------

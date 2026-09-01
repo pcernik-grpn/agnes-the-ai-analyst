@@ -1550,16 +1550,41 @@ async def rotate_webhook_secret(
     return {"webhook_url": webhook_url, "secret": secret}
 
 
+class ExtractionRunOptions(BaseModel):
+    """Optional per-run overrides for one manual extraction trigger. Both
+    fields default to the CONFIGURED values (`extraction.crawler.concurrency`
+    / `extraction.timeout_s`) when absent — the body itself is optional, so
+    the pre-options `POST` with no body keeps working unchanged. Bounds
+    mirror the crawler's own clamps so a value the run would silently
+    re-clamp is refused here instead, where the admin can see why."""
+
+    concurrency: Optional[int] = Field(
+        None,
+        ge=1,
+        le=16,
+        description="Files of one delta page pipelined at once for this run (1 = sequential).",
+    )
+    timeout_s: Optional[int] = Field(
+        None,
+        ge=0,
+        le=86400,
+        description="Hard ceiling for this one run, seconds (0 = unbounded).",
+    )
+
+
 @router.post("/connections/{connection_id}/extract", status_code=202)
 async def trigger_extraction(
     connection_id: str,
+    options: Optional[ExtractionRunOptions] = None,
     _user: dict = Depends(require_admin),
 ):
     """Admin-triggered one-off extraction run for this connection
     (TCRD-226) — enqueues the existing ``corpus-extraction`` job kind
     (``app/worker/kinds.py::_run_corpus_extraction``) with
     ``{"connection_id": connection_id}``, the exact payload shape that
-    handler documents.
+    handler documents. An optional :class:`ExtractionRunOptions` body adds
+    the handler's per-run overrides (``concurrency``, ``timeout_s``) for
+    THIS run only — configured values stay untouched.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
@@ -1584,9 +1609,19 @@ async def trigger_extraction(
 
     from src.repositories import jobs_repo
 
+    payload: Dict[str, Any] = {"connection_id": connection_id}
+    if options is not None:
+        # Only the keys the admin actually set ride in the payload — an
+        # absent key means "the configured value", and the handler/crawler
+        # already document exactly that fallback for each.
+        if options.concurrency is not None:
+            payload["concurrency"] = options.concurrency
+        if options.timeout_s is not None:
+            payload["timeout_s"] = options.timeout_s
+
     job = jobs_repo().enqueue(
         "corpus-extraction",
-        {"connection_id": connection_id},
+        payload,
         idempotency_key=_extraction_idempotency_key(connection_id),
     )
     if job["deduped"]:

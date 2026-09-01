@@ -573,7 +573,6 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 },
             )
 
-
     schedule = patch.get("schedule")
     if schedule is not None:
         if not isinstance(schedule, str):
@@ -618,7 +617,6 @@ def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
     extraction = sections.setdefault("extraction", {})
     if not isinstance(extraction, dict):
         return
-
 
 
 def _apply_extraction_env_locks(fields: Dict[str, Any]) -> None:
@@ -1049,6 +1047,50 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
             ),
+        },
+        "facts": {
+            "kind": "object",
+            "hint": (
+                "The LLM stage of the extraction pipeline — turn ingested documents into "
+                "knowledge-graph facts (connectors/sharepoint/facts_extraction.py). Runs "
+                "after a successful crawl, over the documents that crawl just indexed."
+            ),
+            "fields": {
+                "enabled": {
+                    "kind": "bool",
+                    "default": _flag_default_path(("extraction", "facts", "enabled"), False),
+                    "hint": (
+                        "OFF by default, and this is a COST decision: this is the only stage "
+                        "that spends model tokens per document — measured $0.011 for a typical "
+                        "~5k-token document on the default Haiku-class model, $0.020 when the "
+                        "corrective verbatim retry fires, roughly 3x that on Sonnet. Needs "
+                        "facts.enabled too: with the fact-graph surface off the pass is skipped "
+                        "rather than writing claims no endpoint would serve. Spreadsheets and "
+                        "CSVs are never sent to the model, and a re-run re-extracts only "
+                        "documents whose content, model, or effective prompt changed."
+                    ),
+                },
+                "concurrency": {
+                    "kind": "int",
+                    "default": 3,
+                    "hint": (
+                        "How many documents are extracted in parallel; clamped to [1, 16]. "
+                        "1 is exactly sequential — the knob buys wall clock, never a different "
+                        "result. Raise it to spend a large corpus's time budget on more "
+                        "concurrent calls; lower it when the model account's rate limit is the "
+                        "binding constraint."
+                    ),
+                },
+                "model": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Optional model override for this stage only — a tier name "
+                        "(haiku/sonnet/opus) or a concrete model id. Empty falls back to "
+                        "extraction.model, then Haiku."
+                    ),
+                },
+            },
         },
     },
     "features": {
