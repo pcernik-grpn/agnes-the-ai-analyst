@@ -36,6 +36,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+- **The SharePoint card's run state stopped appearing half a minute after the card it belongs to.** The extraction block (the `Run` row, the `Configuration` row and the pipeline strip's live-crawl cell) is drawn by a poller that self-starts when the page's scripts parse — at which point the source cards, which arrive over `fetch`, do not exist yet. That first tick found no connection to ask about and armed nothing, so the scheduler fell through to the idle interval and the block appeared 30 s later; when a mutation's `loadConnections()` repainted the cards while that tick was in flight, a full minute. Every paint of the cards now redraws the block from what the poller already knows — free, so a rebuilt card gets its run row back in the same frame instead of blanking — and asks upstream only for a connection this page cannot already draw.
 - **The built-in SharePoint crawler can download files again.** Microsoft
   Graph answers a file's `GET .../content` with a redirect to a
   pre-authenticated URL on a different host rather than the bytes
