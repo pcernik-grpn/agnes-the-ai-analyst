@@ -124,21 +124,62 @@
             background: var(--border);
         }
 
-        /* Tab Navigation */
+        /* Tab Navigation ------------------------------------------------
+           Two lanes, not one. The tabs scroll; the actions do not.
+
+           They used to share a single `overflow-x: auto` row, which meant
+           the two things you cannot reach any other way — "+ New Item" and
+           "+ New Memory Domain" — were the first to slide off the right
+           edge, behind a scrollbar macOS only draws while it is moving
+           (#1956 item 16). A destination has a tab to fall back on; an
+           action clipped out of the viewport is simply gone. */
+        /* `flex-end` so the tabs' own height drives the row and each tab's
+           `margin-bottom: -2px` underline lands exactly on the row's rule. */
+        .tab-row {
+            display: flex;
+            align-items: flex-end;
+            gap: var(--space-3);
+            margin-bottom: var(--space-5);
+            border-bottom: 2px solid var(--border);
+        }
+        .tab-actions {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+            flex-shrink: 0;
+            padding-bottom: var(--space-2);
+        }
         .tab-nav {
             display: flex;
             gap: var(--space-1);
-            margin-bottom: var(--space-5);
-            border-bottom: 2px solid var(--border);
             /* v55 L50: MODERATION + CATALOG group labels + separator
                pushed total width past most viewports → buttons wrapped
                text 2× per line. Allow horizontal scroll instead of
                wrapping; tabs stay one line, whole strip slides on
-               overflow with a thin scrollbar at the bottom edge. */
+               overflow. */
             flex-wrap: nowrap;
+            flex: 1 1 auto;
+            min-width: 0;
             overflow-x: auto;
             overflow-y: hidden;
-            scrollbar-width: thin;
+            /* A visible scrollbar, not an overlay one. macOS draws overlay
+               scrollbars only while the user is already scrolling, so a strip
+               that overflows looked identical to one that did not — there was
+               nothing on screen to say more tabs existed. Declaring the
+               `::-webkit-scrollbar` geometry below opts this element out of
+               overlay mode and gives the strip a permanent 6px rail.
+
+               Deliberately NOT paired with the standard `scrollbar-width` /
+               `scrollbar-color`: Chrome honours one model or the other, and
+               setting `scrollbar-width` makes it drop the `::-webkit-*` rules
+               and go back to an overlay bar — which is the bug. Firefox and
+               the rest fall through to their own always-visible default. */
+        }
+        .tab-nav::-webkit-scrollbar { height: 6px; }
+        .tab-nav::-webkit-scrollbar-track { background: transparent; }
+        .tab-nav::-webkit-scrollbar-thumb {
+            background: var(--ds-border);
+            border-radius: 3px;
         }
 
         .tab-btn {
@@ -870,9 +911,10 @@
                 gap: var(--space-4);
             }
 
-            .tab-nav {
-                overflow-x: auto;
-            }
+            /* Narrow: the actions take their own line under the tabs rather
+               than competing with them for a ~360px row. */
+            .tab-row { flex-wrap: wrap; }
+            .tab-actions { width: 100%; padding-bottom: var(--space-3); }
 
             .batch-bar {
                 flex-wrap: wrap;
@@ -1130,7 +1172,8 @@
              groupings are cosmetic. Domains + "+ New" actions stay on the
              right edge (E2E found admins had no UI to create a domain
              even though the API existed). -->
-        <div class="tab-nav" style="display:flex; align-items:center; gap:0;">
+        <div class="tab-row">
+        <div class="tab-nav" style="align-items:center; gap:0;">
             <span class="tab-group-label" style="padding:0 8px; font-size:11px; font-weight:600;
                   text-transform:uppercase; letter-spacing:.04em; color:var(--text-muted);">
                 Moderation
@@ -1166,13 +1209,13 @@
                 Domains
                 <span class="tab-badge" id="domainsBadge" style="display:none;"></span>
             </button>
-            <div style="flex:1;"></div>
+        </div>
+        <div class="tab-actions">
             <button class="btn btn-secondary"
-                    onclick="openCreateMemoryItemModal()"
-                    style="margin-left:auto;">+ New Item</button>
+                    onclick="openCreateMemoryItemModal()">+ New Item</button>
             <button class="btn btn-primary"
-                    onclick="openCreateMemoryDomainModal('', null)"
-                    style="margin-left:8px;">+ New Memory Domain</button>
+                    onclick="openCreateMemoryDomainModal('', null)">+ New Memory Domain</button>
+        </div>
         </div>
 
         <!-- Review Queue Tab -->
