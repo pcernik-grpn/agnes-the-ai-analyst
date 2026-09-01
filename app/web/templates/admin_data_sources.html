@@ -981,6 +981,50 @@
     background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
   }
   .sp-untick-notice a { color: inherit; text-decoration: underline; }
+  /* "Saved scopes" (2026-09-01 fix): every confirmed scope on this
+     connection, rendered from the scope rows alone — independent of
+     whatever the live tree can currently browse to. A folder scope several
+     levels deep in a site carries no site/drive identity to rebuild a
+     navigable tree row from (see `spSeedManualSitesFromScopes`'s
+     docstring), so without this panel reopening "Manage scopes" under
+     `Sites.Selected` showed nothing about it at all — an empty tree, no
+     hint the connection already had a scope configured. */
+  .sp-saved-scopes {
+    margin: 0 0 14px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    overflow: hidden;
+  }
+  .sp-saved-scopes__title {
+    margin: 0; padding: 8px 12px; font-size: 11.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.02em; color: var(--ds-text-secondary);
+    background: var(--ds-surface-sunken); border-bottom: 1px solid var(--ds-border-light);
+  }
+  .sp-saved-scopes__row {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    border-bottom: 1px solid var(--ds-border-light); font-size: 12.5px;
+  }
+  .sp-saved-scopes__row:last-child { border-bottom: none; }
+  .sp-saved-scopes__path {
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Discovery-forbidden guidance: an app registration holding only
+     `Sites.Selected` cannot enumerate sites — that is the intended
+     least-privilege posture, not a fault, so it reads as guidance toward
+     "Add a site by URL" (info tone, the same accent `.sp-badge` already
+     uses) rather than `.ds-wizard-error`'s danger ink, which trained an
+     operator to dismiss an expected, permanent state as a failure and
+     buried the one working affordance below a red banner. */
+  .sp-discovery-guidance {
+    margin: 0 0 10px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    border: 1px solid var(--ds-accent-info-line); border-radius: var(--ds-radius-btn);
+    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+  }
+  /* The by-URL box IS the primary action while discovery is forbidden —
+     matching it to the guidance box above it says so without a second
+     widget. */
+  .sp-search--emphasis {
+    border: 1px solid var(--ds-accent-info-line); border-radius: var(--ds-radius-btn);
+    padding: 10px; background: var(--ds-accent-info-bg);
+  }
   .sp-share-row {
     display: flex; align-items: flex-start; gap: 12px;
     padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); margin-bottom: 10px;
@@ -1693,6 +1737,14 @@
           Pick the sites, libraries or folders you want indexed. Each one becomes its own Collection.
         </p>
 
+        {# What this connection already has configured, rendered from the
+           scope rows alone — never from the live tree, which cannot show
+           a folder scope several levels deep in a site once discovery is
+           forbidden (Sites.Selected) or the site was never added by URL.
+           Reopening "Manage scopes" must never look like a blank slate
+           when scopes already exist. #}
+        <div id="spw-saved-scopes" class="sp-saved-scopes" style="display:none;"></div>
+
         <div class="sp-search">
           <div class="sp-search__row">
             <div class="ds-field sp-search__q">
@@ -1725,11 +1777,17 @@
         </div>
 
         {# Sites.Selected escape hatch: that permission forbids ALL site
-           discovery (Graph 403s the listing by design), so a granted site
-           must be addable by the URL an admin pastes. Shown only at the
-           sites level; resolved sites accumulate client-side and render as
-           ordinary site rows. #}
+           discovery (Graph 403s the listing by design — the recommended
+           least-privilege posture, not a fault), so a granted site must be
+           addable by the URL an admin pastes. Shown only at the sites
+           level; resolved sites accumulate client-side and render as
+           ordinary site rows. `spw-discovery-guidance` explains WHY this
+           box is the way in whenever discovery actually is forbidden —
+           guidance, not `.ds-wizard-error`'s failure styling — and
+           `sp-search--emphasis` (toggled by spTreeGuidance) marks the box
+           itself as the primary action in that state. #}
         <div class="sp-search" id="spw-site-by-url-wrap" style="display:none;">
+          <div id="spw-discovery-guidance" class="sp-discovery-guidance" style="display:none;"></div>
           <div class="sp-search__row">
             <div class="ds-field sp-search__q">
               <label for="spw-site-by-url">Add a site by URL</label>
@@ -6198,6 +6256,14 @@ function openSpWizard() {
   document.getElementById("spw-search-results").style.display = "none";
   document.getElementById("spw-search-results").innerHTML = "";
   document.getElementById("spw-search-error").style.display = "none";
+  // The drawer is reused across connections — a stale "Saved scopes" list
+  // or discovery guidance from whichever connection was open last must not
+  // flash before the new one's own scopes load.
+  document.getElementById("spw-saved-scopes").style.display = "none";
+  document.getElementById("spw-saved-scopes").innerHTML = "";
+  document.getElementById("spw-discovery-guidance").style.display = "none";
+  document.getElementById("spw-discovery-guidance").textContent = "";
+  document.getElementById("spw-site-by-url-wrap").classList.remove("sp-search--emphasis");
   document.getElementById("spw-name").value = "";
   document.getElementById("spw-tenant").value = "";
   document.getElementById("spw-client").value = "";
@@ -6461,13 +6527,72 @@ function spTreeNotice(html) {
   el.style.display = "block";
 }
 
+/* GUIDANCE sibling of spTreeErr, for `sharepoint_discovery_forbidden`
+   only: an app registration holding `Sites.Selected` cannot enumerate
+   sites BY DESIGN — that permission is the recommended least-privilege
+   posture, not a fault, so it must never read as a red failure to
+   dismiss. Rendered inside the "Add a site by URL" box (the box IS the
+   fix), which the emphasis class marks as the primary action while this
+   is showing. */
+function spTreeGuidance(msg) {
+  const el = document.getElementById("spw-discovery-guidance");
+  const wrap = document.getElementById("spw-site-by-url-wrap");
+  if (!msg) {
+    el.style.display = "none"; el.textContent = "";
+    wrap.classList.remove("sp-search--emphasis");
+    return;
+  }
+  el.textContent = msg;
+  el.style.display = "block";
+  wrap.classList.add("sp-search--emphasis");
+}
+
+/* "Saved scopes": every confirmed scope on this connection, from the scope
+   rows alone — independent of whatever the live tree can currently browse
+   to. A folder scope carries no site/drive identity to rebuild a
+   navigable tree row from (spSeedManualSitesFromScopes handles the site
+   case only), so this is the only place a folder scope several levels
+   deep in a site is visible at all once discovery is forbidden. Its
+   anonymize checkbox reuses spConfirmScope — the same idempotent
+   confirm-on-source_scope_id path the tree's own checkbox uses, and it
+   never sends `group_ids`, so toggling it here cannot touch this scope's
+   sharing. */
+function spRenderSavedScopes() {
+  const host = document.getElementById("spw-saved-scopes");
+  const scopes = Object.values(spScopes);
+  if (!scopes.length) { host.style.display = "none"; host.innerHTML = ""; return; }
+  host.style.display = "block";
+  host.innerHTML = '<p class="sp-saved-scopes__title">Saved scopes</p>' + scopes.map((s) => {
+    const anon = !!s.anonymize;
+    const badge = s.collection
+      ? `<span class="sp-badge${anon ? (s.anonymization_declared ? " sp-badge--anon-declared" : " sp-badge--anon") : ""}">&rarr; ${spEsc(s.collection.slug)}</span>`
+      : "";
+    return `<div class="sp-saved-scopes__row" data-spw-saved="${spEsc(s.source_scope_id)}">` +
+      `<span class="sp-saved-scopes__path" title="${spEsc(s.display_path)}">${spEsc(s.display_path)}</span>` +
+      badge +
+      `<label class="sp-tree__anon"><input type="checkbox" data-spw-saved-anon="${spEsc(s.source_scope_id)}"${anon ? " checked" : ""}> anonymize</label>` +
+      `</div>`;
+  }).join("");
+  host.querySelectorAll("[data-spw-saved-anon]").forEach((cb) => {
+    cb.addEventListener("change", () => spOnSavedAnonToggle(cb));
+  });
+}
+
+function spOnSavedAnonToggle(cb) {
+  const id = cb.dataset.spwSavedAnon;
+  const scope = spScopes[id];
+  if (!scope) return;
+  spConfirmScope(id, scope.display_path, cb.checked);
+}
+
 function spLoadScopesThenTree() {
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`).then((body) => {
     spScopes = {};
     (body.items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
+    spRenderSavedScopes();
     spSeedManualSitesFromScopes();
     spSeedManualSitesFromConnectionConfig();
-  }).catch(() => { spScopes = {}; }).then(spLoadTree);
+  }).catch(() => { spScopes = {}; spRenderSavedScopes(); }).then(spLoadTree);
 }
 
 /* A saved SITE scope can rebuild its own sites-level row: its
@@ -6553,6 +6678,7 @@ function spSyncSiteByUrlVisibility() {
 
 function spLoadTree() {
   spTreeErr("");
+  spTreeGuidance("");
   spTreeFilterQuery = "";
   document.getElementById("spw-tree-filter").value = "";
   document.getElementById("spw-tree").innerHTML = '<div class="ds-loading">Loading…</div>';
@@ -6593,8 +6719,9 @@ function spLoadTree() {
       // empty Sites list beside a card reading "1 scope" (live run,
       // 2026-09-01). Only at the sites level — deeper levels list drives
       // and folders, where a site row would answer a different question
-      // than the breadcrumb asks. The error below still shows either way:
-      // the rows are real AND the rest of the tree is genuinely missing.
+      // than the breadcrumb asks. The error/guidance below still shows
+      // either way: the rows are real AND the rest of the tree is
+      // genuinely missing.
       if (spCurrentLevel() === "sites") {
         spMergeManualSites();
         if (spItems.length) spRenderTree("sites");
@@ -6602,7 +6729,12 @@ function spLoadTree() {
       if (e.detail && e.detail.error === "sharepoint_cert_unresolved") {
         spTreeErr("No certificate configured yet — " + e.detail.message);
       } else if (e.detail && e.detail.error === "sharepoint_discovery_forbidden") {
-        spTreeErr(e.detail.message);
+        // Sites.Selected 403-forbidding discovery is the intended
+        // least-privilege posture, not a fault — guidance toward "Add a
+        // site by URL", never `.ds-wizard-error`'s failure styling (live
+        // report, 2026-09-01: the red banner trained an operator to
+        // ignore it and buried the one working affordance below it).
+        spTreeGuidance(e.detail.message);
       } else if (e.detail && e.detail.error === "sharepoint_graph_error") {
         spTreeErr("SharePoint did not answer: " + e.detail.message);
       } else {
@@ -6824,20 +6956,49 @@ function spOnAnonToggle(cb) {
 function spRefreshVisibleLists() {
   spRenderTree(spCurrentLevel());
   if (spLastSearchMatches) spRenderSearchResults(spLastSearchMatches);
+  spRenderSavedScopes();
+}
+
+/* `ConfirmScopeBody`'s own docstring calls `access_mode`, `drive_id` and
+   `include_excluded_subtrees` "always persisted on confirm" — unlike
+   `group_ids`/`audience_classes`, omitting them is NOT "leave unchanged"
+   server-side, it is "set to the default" (manual / null / false). A
+   re-confirm that only means to change one field (anonymize here, sharing
+   in the Share & finish handler below) must round-trip the rest of an
+   EXISTING scope's own last-known values or it silently blanks them —
+   `drive_id` most severely: without it the built-in crawler cannot
+   address a folder scope on Graph at all, so the next crawl enumerates
+   nothing for it while still reporting the run as done (live report,
+   2026-09-01). A brand-new scope (not yet in `spScopes`) has no prior
+   state to round-trip, so this returns `{}` and the server's own
+   defaults apply — unchanged behavior for a first-time pick. */
+function spExistingScopeFields(scope) {
+  if (!scope) return {};
+  const out = {
+    access_mode: scope.access_mode || "manual",
+    include_excluded_subtrees: !!scope.include_excluded_subtrees,
+  };
+  if (scope.drive_id) out.drive_id = scope.drive_id;
+  return out;
 }
 
 function spConfirmScope(sourceScopeId, displayPath, anonymize) {
   spTreeErr("");
   spTreeNotice("");
+  const body = Object.assign(
+    { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
+    spExistingScopeFields(spScopes[sourceScopeId])
+  );
   spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
     method: "POST",
-    body: { source_scope_id: sourceScopeId, display_path: displayPath, anonymize: !!anonymize },
+    body: body,
   }).then((scope) => {
     spScopes[sourceScopeId] = scope;
     spRefreshVisibleLists();
   }).catch((e) => {
     spTreeErr("Could not confirm that scope: " + e.message);
     spLoadTree(); // resync checkbox state with the server
+    spRenderSavedScopes();
   });
 }
 
@@ -7117,11 +7278,17 @@ document.getElementById("spw-finish-btn").addEventListener("click", () => {
   const calls = Object.keys(spScopes).map((id) => {
     const s = spScopes[id];
     const groupIds = Array.from(spPendingGroups[id] || []);
+    // Every scope round-trips its own access_mode/drive_id/
+    // include_excluded_subtrees (spExistingScopeFields) — "Share & finish"
+    // re-confirms EVERY scope on the connection in one pass, so without
+    // this it silently blanked drive_id (and reverted any mirrored scope
+    // to manual) on every single wizard completion, not just an edited row.
     return spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
       method: "POST",
-      body: {
-        source_scope_id: id, display_path: s.display_path, anonymize: !!s.anonymize, group_ids: groupIds,
-      },
+      body: Object.assign(
+        { source_scope_id: id, display_path: s.display_path, anonymize: !!s.anonymize, group_ids: groupIds },
+        spExistingScopeFields(s)
+      ),
     });
   });
   Promise.allSettled(calls).then((results) => {
