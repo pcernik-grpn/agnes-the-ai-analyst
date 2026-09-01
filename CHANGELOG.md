@@ -36,6 +36,14 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The PDF route has one implementation. `pdf_structure.reconstruct_pdf` already degrades per page to that page's plain reading-order text when the block structure is ambiguous, so the whole-document plain-extraction fallback that sat behind it was a second, near-duplicate implementation reachable only when the first crashed; a structure-pass failure is now a `ConversionError` the crawl counts in `convert_failed` and walks past, like any other unconvertible file.
 
 ### Fixed
+- **The built-in SharePoint crawler can download files again.** Microsoft
+  Graph answers a file's `GET .../content` with a redirect to a
+  pre-authenticated URL on a different host rather than the bytes
+  themselves; the crawler's HTTP client does not follow redirects
+  automatically, so every download failed and was counted as an error. It
+  now follows that redirect by hand, with a separate, unauthenticated
+  request — never the Graph bearer token — to the redirect target, keeping
+  the per-file size cap and partial-file cleanup intact.
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
