@@ -4,7 +4,7 @@ import json
 
 import typer
 
-from cli.client import api_delete, api_get, api_post, api_put
+from cli.client import api_delete, api_get, api_post, api_put, error_detail, error_detail_object
 from cli.commands.admin_activity import activity_app
 from cli.commands.admin_analytics import analytics_app as admin_analytics_app
 from cli.commands.admin_ask import app as admin_ask_app
@@ -125,7 +125,7 @@ def add_user(
         json={"email": email, "name": name or email.split("@")[0], "send_invite": invite},
     )
     if resp.status_code != 201:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()
@@ -166,7 +166,7 @@ def list_users(as_json: bool = typer.Option(False, "--json")):
     """List all users."""
     resp = api_get("/api/users")
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     users = resp.json()
@@ -455,7 +455,7 @@ def register_table(
                 for c in cols:
                     typer.echo(f"    - {c.get('name'):<32s} {c.get('type', '')}")
             return
-        typer.echo(f"Precheck failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Precheck failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     resp = api_post("/api/admin/register-table", json=payload)
@@ -504,7 +504,7 @@ def register_table(
     elif resp.status_code == 409:
         typer.echo(f"Already exists: {name}")
     else:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
 
@@ -603,7 +603,7 @@ def discover_and_register(
             skipped += 1
         else:
             errors += 1
-            typer.echo(f"  ✗ {name}: {resp.json().get('detail', resp.text)}")
+            typer.echo(f"  ✗ {name}: {error_detail(resp)}")
 
     if not dry_run:
         typer.echo(f"\nDone: {registered} registered, {skipped} already existed, {errors} errors")
@@ -640,7 +640,7 @@ def sync(
     resp = api_post("/api/sync/trigger", params=params, json=json_body)
 
     if resp.status_code == 409:
-        detail = resp.json().get("detail")
+        detail = error_detail_object(resp)
         job_id = detail.get("job_id") if isinstance(detail, dict) else None
         msg = "A sync is already in progress — try again shortly."
         if job_id:
@@ -648,7 +648,7 @@ def sync(
         typer.echo(msg, err=True)
         raise typer.Exit(1)
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()
@@ -926,7 +926,7 @@ def table_policy_show(
     """
     resp = api_get("/api/admin/registry")
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     row = next((t for t in resp.json().get("tables", []) if t.get("id") == table_id), None)
@@ -1081,7 +1081,7 @@ def metadata_show(
     """Show column metadata for a table."""
     resp = api_get(f"/api/admin/metadata/{table_id}")
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()
@@ -1152,7 +1152,7 @@ def metadata_apply(
             if resp.status_code == 200:
                 typer.echo(f"Pushed metadata for {table_id} to source.")
             else:
-                typer.echo(f"Failed to push {table_id}: {resp.json().get('detail', resp.text)}", err=True)
+                typer.echo(f"Failed to push {table_id}: {error_detail(resp)}", err=True)
 
 
 # ---- User management (#11) ----
@@ -1228,7 +1228,7 @@ def reset_password(user_ref: str = typer.Argument(..., help="User id or email"))
         typer.echo(f"Reset URL: {data['reset_url']}")
         typer.echo(f"Email sent: {data['email_sent']}")
     else:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
 
@@ -1249,7 +1249,7 @@ def set_password(
     if resp.status_code == 204:
         typer.echo(f"Password set for {user_ref}")
     else:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
 
@@ -1265,11 +1265,7 @@ admin_app.add_typer(grant_app, name="grant")
 
 
 def _fail(resp, prefix: str = "Failed") -> None:
-    try:
-        detail = resp.json().get("detail", resp.text)
-    except Exception:
-        detail = resp.text
-    typer.echo(f"{prefix}: {detail}", err=True)
+    typer.echo(f"{prefix}: {error_detail(resp)}", err=True)
     raise typer.Exit(1)
 
 
@@ -1620,7 +1616,7 @@ def config_surface(
     """
     resp = api_get("/api/admin/config-surface")
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()

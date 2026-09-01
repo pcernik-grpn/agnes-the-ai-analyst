@@ -4,7 +4,7 @@ import json as json_lib
 
 import typer
 
-from cli.client import api_get
+from cli.client import api_get, error_detail
 
 glossary_app = typer.Typer(help="Search and show glossary terms")
 
@@ -18,7 +18,7 @@ def search_glossary(
     """Relevance-ranked search across glossary term + definition."""
     resp = api_get("/api/glossary/search", params={"q": query, "limit": limit})
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()
@@ -59,7 +59,7 @@ def show_glossary_term(
         )
         raise typer.Exit(1)
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     t = resp.json()

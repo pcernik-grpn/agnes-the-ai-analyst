@@ -7,7 +7,7 @@ import sys
 
 import typer
 
-from cli.client import get_client
+from cli.client import error_detail, get_client
 
 
 app = typer.Typer(help="Ask a natural-language question about telemetry; LLM translates to SQL and runs it.")
@@ -33,7 +33,7 @@ def ask(
         typer.echo("[err] admin only", err=True)
         raise typer.Exit(1)
     if resp.status_code == 503:
-        typer.echo(f"[err] server: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"[err] server: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
     if resp.status_code >= 400:
         try:
