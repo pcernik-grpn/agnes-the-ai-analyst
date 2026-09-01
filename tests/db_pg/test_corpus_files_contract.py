@@ -491,3 +491,36 @@ def test_update_in_place_does_not_touch_processing_status(repo):
         path=None,
     )
     assert repo.get(file_id)["processing_status"] == "indexed"
+
+
+def test_count_by_corpus_groups_every_corpus_in_one_read(repo):
+    """The admin /access projection needs a count per collection; doing that
+    with `list_for_corpus` per collection made the page's query count grow with
+    the number of collections."""
+    for i in range(2):
+        repo.add(
+            corpus_id="col_a",
+            filename=f"a{i}.pdf",
+            sha256=f"sha_a{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/a{i}.pdf",
+        )
+    repo.add(
+        corpus_id="col_b",
+        filename="b.pdf",
+        sha256="sha_b",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/b.pdf",
+    )
+    counts = repo.count_by_corpus()
+    assert counts["col_a"] == 2
+    assert counts["col_b"] == 1
+    # A corpus with no files is ABSENT rather than 0 — the caller renders the
+    # zero, so this method needs no knowledge of which corpora exist.
+    assert "col_empty" not in counts
+
+
+def test_count_by_corpus_is_empty_when_there_are_no_files(repo):
+    assert repo.count_by_corpus() == {}

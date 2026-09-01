@@ -75,6 +75,21 @@
    rail's badge is the control, and a second entry point behind a chevron is
    the redundancy this page had. #}
 {% set _menu_items = [{'label': 'Open collection', 'href': '/library/' ~ collection.slug, 'icon': 'file'}] %}
+{# Removing the file was CLI-only (`agnes collections rm-file`), so the page a
+   reader lands on to look at a file they just uploaded by mistake could not
+   undo it. Owner-or-admin (`can_manage`), and withheld on a source-managed
+   collection where the next crawl would restore the file anyway.
+
+   Rendered TWICE, once per chrome, because `detail.hero` drops its `menu`
+   argument outside the redesign: in the overflow menu here (where this page
+   already keeps its secondary actions), and as a main-column section in the
+   legacy branch below. Same attrs both times, so one handler wires both. #}
+{% set _can_delete = can_manage and not source_managed_by %}
+{% if _can_delete and detail.redesign %}
+  {% set _ = _menu_items.append({'sep': True}) %}
+  {% set _ = _menu_items.append({'label': 'Delete file', 'icon': 'trash', 'danger': True,
+                                 'attrs': 'data-delete-file'}) %}
+{% endif %}
 {% set _menu %}{{ detail.menu(_menu_items) }}{% endset %}
 
 {% call detail.hero(
@@ -163,6 +178,12 @@
   <p class="detail-side__note">{{ _share_note }}</p>
 {{ detail.section_close() }}
 
+{% if _can_delete %}
+{{ detail.section_open('Manage this file', icon='edit') }}
+  <button type="button" class="btn btn-secondary btn-sm detail-manage__danger" data-delete-file>Delete file</button>
+{{ detail.section_close() }}
+{% endif %}
+
 {% endif %}
 
 {{ detail.aside_open() }}
@@ -202,6 +223,34 @@
 
 <script>
   (function () {
+    /* Delete this file, then go back to the collection it was in — staying on
+       the page would leave the reader looking at a 404 of the thing they just
+       removed. */
+    document.querySelectorAll('[data-delete-file]').forEach(function (del) {
+      del.addEventListener('click', async function () {
+        var fname = {{ file.filename | tojson }};
+        var ok = await window.confirmModal({
+          title: 'Delete \u201c' + fname + '\u201d?',
+          message: 'It stops being searchable immediately, and this cannot be undone.',
+          confirmText: 'Delete',
+        });
+        if (!ok) return;
+        del.disabled = true;
+        var resp = await fetch('/api/collections/' + {{ collection.id | tojson }}
+                               + '/files/' + {{ file.id | tojson }},
+                               { method: 'DELETE', credentials: 'same-origin' });
+        if (resp.ok) { window.location.assign('/library/' + {{ collection.slug | tojson }}); return; }
+        var msg = 'Could not delete this file (HTTP ' + resp.status + ')';
+        try {
+          var detail = (await resp.json()).detail;
+          if (detail && typeof detail === 'object' && detail.message) msg = detail.message;
+          else if (typeof detail === 'string' && detail) msg = detail;
+        } catch (e) { /* empty or non-JSON body — keep the fallback */ }
+        await window.alertModal(msg);
+        del.disabled = false;
+      });
+    });
+
     var btn = document.getElementById('lfd-preview-btn');
     if (!btn) return;
     var opts = {

@@ -36,12 +36,18 @@ services:
     image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # extraction-worker (compose profile `extraction-worker`) is `build:`
   # like the services above and needs the same source-less-prod-VM override
-  # for the same reason. It runs the SAME image as `app`/`scheduler` here.
-  # The extraction pipeline is in-repo, so nothing external needs bundling —
-  # but the lane does need the `extraction` optional extra, so a deployment
-  # that runs it points this at an image built with
-  # `--build-arg EXTRA_EXTRAS=,extraction` (mirrors the `-rich` tag pattern
-  # .github/workflows/image-rich.yml uses for docling/embeddings).
+  # for the same reason. It runs the SAME image as `app`/`scheduler` here BY
+  # DEFAULT — the extraction pipeline is in-repo and the `extraction`
+  # optional extra (markitdown, pypdfium2) ships in the DEFAULT image build
+  # (the `worker` Dockerfile stage is byte-for-byte the same image as
+  # `app`), so nothing extra needs bundling. A deployment pinned to a
+  # non-default AGNES_TAG (or a private mirror via AGNES_IMAGE_REPO) gets
+  # the worker on that same tag automatically. The customer-instance
+  # Terraform module's `extraction_worker_image` may still override THIS
+  # pin per-VM for a deliberate, temporary divergence (a canary, holding the
+  # worker back mid-rollout) — see that variable's own description for why
+  # a pin left in place risks a crash loop once the app migrates the
+  # database forward.
   extraction-worker:
     image: ${AGNES_IMAGE_REPO:-ghcr.io/keboola/agnes-the-ai-analyst}:${AGNES_TAG:-stable}
   # corporate-memory and session-collector were dropped in #176 —

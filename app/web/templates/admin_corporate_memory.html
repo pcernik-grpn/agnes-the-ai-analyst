@@ -1058,6 +1058,37 @@
             padding: var(--space-2) var(--space-3);
             margin: var(--space-3) 0 0;
         }
+
+        /* "How detection works" (#1957 interim hotfix) — static explainer so
+           admins can see what feeds the review queue without reading source.
+           Info palette (not warn/danger): this states facts, it isn't
+           flagging a problem. */
+        .detection-info {
+            background: var(--ds-accent-info-bg);
+            border: 1px solid var(--ds-accent-info-line);
+            border-radius: var(--radius-lg);
+            padding: var(--space-2) var(--space-4) var(--space-4);
+            margin-bottom: var(--space-4);
+        }
+        .detection-info summary {
+            cursor: pointer;
+            font-weight: var(--font-semibold);
+            font-size: var(--text-sm);
+            padding: var(--space-2) 0;
+            user-select: none;
+        }
+        .detection-info ul {
+            margin: var(--space-2) 0;
+            padding-left: var(--space-5);
+        }
+        .detection-info li {
+            margin-bottom: var(--space-2);
+            font-size: var(--text-xs);
+            color: var(--text-secondary);
+        }
+        .detection-info code {
+            font-size: inherit;
+        }
         .delivery-warning__title {
             font-size: var(--text-xs);
             font-weight: 650;
@@ -1180,6 +1211,48 @@
             </div>
         </div>
 
+        <!-- "How detection works" (#1957 interim hotfix): before this, admins
+             had no visibility into what feeds the review queue, and no way to
+             tune it short of hand-editing instance.yaml and restarting.
+             session_transcripts_config is read live from the same config
+             VerificationProcessor.process_session reads on every run. -->
+        <details class="detection-info">
+            <summary>How detection works</summary>
+            <ul>
+                <li>
+                    <strong>Session transcripts</strong> — scans the last 100 turns
+                    of each Claude Code session, every 15 minutes.
+                    {% if session_transcripts_config.get('enabled', True) == False %}
+                    <strong>Currently disabled</strong> for this instance
+                    (<code>corporate_memory.sources.session_transcripts.enabled: false</code>).
+                    {% else %}
+                    Looks for:
+                    {{ (session_transcripts_config.get('detection_types') or ['correction', 'confirmation', 'unprompted_definition']) | join(', ') }}.
+                    {% endif %}
+                </li>
+                <li>
+                    <strong>CLAUDE.local.md</strong> — nightly collector reads each
+                    analyst's local memory file.
+                </li>
+                <li>
+                    <strong>Confidence</strong> is a fixed lookup by detection type,
+                    not a quality score: correction 0.90, unprompted_definition 0.90,
+                    confirmation 0.60 (defaults — an admin can retune these under
+                    <code>corporate_memory.confidence.base</code>).
+                </li>
+                <li>
+                    <strong>Category</strong> is currently constant
+                    (<code>business_logic</code>) on the transcript path.
+                </li>
+                <li>
+                    Turn session-transcript detection off entirely, or narrow which
+                    detection types run, at
+                    <a href="/admin/server-config">/admin/server-config</a> under
+                    <code>corporate_memory.sources.session_transcripts</code>.
+                </li>
+            </ul>
+        </details>
+
         <!-- Tab Navigation — v55 grouped under Moderation / Catalog labels
              so the 7-tab strip reads as two intent buckets instead of a
              flat scroll. switchTab() still drives by data-tab; the
@@ -1247,7 +1320,7 @@
                         </svg>
                         Approve Selected
                     </button>
-                    <button class="btn btn-danger" id="batchRejectBtn" disabled onclick="batchAction('reject')">
+                    <button class="btn btn-danger" id="batchRejectBtn" disabled onclick="bulkRejectSelected()">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <line x1="18" y1="6" x2="6" y2="18"/>
                             <line x1="6" y1="6" x2="18" y2="18"/>
@@ -4005,6 +4078,49 @@
         } catch (e) {
             console.error(`Batch ${action} failed:`, e);
             showToast(`Network error: batch ${action} failed`, 'error');
+        }
+    }
+
+    // Review Queue's dedicated bulk-reject (issue #1957). Every item shown
+    // in this tab is already `pending`, so this is functionally the same
+    // action as `batchAction('reject')` from here — but it routes through
+    // POST /api/memory/admin/bulk-reject, the endpoint that (a) skips a row
+    // instead of silently re-rejecting it if its status changed between page
+    // load and click, and (b) reports that per id. The All Items tab keeps
+    // `batchAction('reject')` on purpose — it legitimately targets items in
+    // any status, which a pending-only endpoint would refuse.
+    async function bulkRejectSelected() {
+        const ids = getSelectedIds('review');
+        if (ids.length === 0) return;
+        if (!await confirmModal({
+            title: `Reject ${ids.length} selected item${ids.length !== 1 ? 's' : ''}?`,
+            confirmText: 'Reject',
+            danger: true,
+        })) return;
+
+        try {
+            const resp = await fetch('/api/memory/admin/bulk-reject', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({item_ids: ids}),
+            });
+
+            const result = await resp.json();
+            if (resp.ok) {
+                const rejectedCount = (result.rejected || []).length;
+                const skippedCount = (result.skipped_not_pending || []).length;
+                const failCount = (result.not_found || []).length + Object.keys(result.errors || {}).length;
+                let msg = `${rejectedCount} item${rejectedCount !== 1 ? 's' : ''} rejected`;
+                if (skippedCount > 0) msg += `, ${skippedCount} skipped (no longer pending)`;
+                if (failCount > 0) msg += `, ${failCount} failed`;
+                showToast(msg, failCount > 0 ? 'error' : (skippedCount > 0 ? 'warning' : 'success'));
+                refreshCurrentTab();
+            } else {
+                showToast(result.error || result.detail || 'Bulk reject failed', 'error');
+            }
+        } catch (e) {
+            console.error('Bulk reject failed:', e);
+            showToast('Network error: bulk reject failed', 'error');
         }
     }
 

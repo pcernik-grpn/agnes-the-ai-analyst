@@ -182,23 +182,29 @@ variable "prod_instance" {
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
     # default so a module bump alone never moves the existing fleet. Turning
     # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL +
-    # AGNES_SHAREPOINT_ENABLED=1 + AGNES_EXTRACTION_PRODUCER_COMMAND=<module-
-    # level var.extraction_producer_command> into the VM's app .env (env
-    # overrides instance.yaml for every one of these — app/coordination/
-    # factory.py's posture, mirrored by app/instance_config.py::feature_enabled
-    # and app/worker/kinds.py::_extraction_producer_argv — so the
+    # AGNES_SHAREPOINT_ENABLED=1 into the VM's app .env (env overrides
+    # instance.yaml for every one of these — app/coordination/factory.py's
+    # posture, mirrored by app/instance_config.py::feature_enabled — so the
     # applier-owned /data/state/instance.yaml is never touched) and engages a
     # module-owned docker-compose.extraction.yml overlay carrying the `redis`
-    # service and the worker re-pin. This is what makes the flag alone
-    # activate the `corpus-extraction` job kind end to end — no per-VM SSH
-    # edit of instance.yaml required. AGNES_SHAREPOINT_ENABLED gates the
+    # service and an always-on `extraction-worker`. By DEFAULT the worker
+    # carries no image override: the built-in document pipeline (owner
+    # decision 2026-08-31 — connectors/sharepoint/crawler.py, one pipeline)
+    # needs nothing bundled that the app image does not already carry, so
+    # the service falls through to docker-compose.prod.yml's own pin and
+    # simply follows AGNES_IMAGE_REPO/AGNES_TAG like app/scheduler — this is
+    # what stops pin rot. The module-level extraction_worker_image can still
+    # pin the worker away from that deliberately (a canary, holding the
+    # worker back mid-rollout); see that variable's own description for why
+    # a pin left in place risks a crash loop. This is what makes the flag
+    # alone activate the `corpus-extraction` job kind end to end — no per-VM
+    # SSH edit of instance.yaml required. AGNES_SHAREPOINT_ENABLED gates the
     # WHOLE SharePoint connector (2026-09-01 flag consolidation), not just
     # extraction, so this also turns on the connect wizard, admin routes, and
-    # ACL mirroring on this VM. The multi-process startup guard
-    # (app/startup_guards.py) then requires the instance to already run the
-    # Postgres app-state backend and boots refuse loudly on a DuckDB
-    # instance — deliberate: migrate the backend first, then flip this.
-    # Requires the module-level extraction_worker_image (validated below).
+    # ACL mirroring on this VM. The multi-process
+    # startup guard (app/startup_guards.py) then requires the instance to
+    # already run the Postgres app-state backend and boots refuse loudly on a
+    # DuckDB instance — deliberate: migrate the backend first, then flip this.
     extraction_worker_enabled = optional(bool, false)
     # Worker container resource ceilings, written to /opt/agnes/.env like
     # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
@@ -893,26 +899,36 @@ variable "kai_agent_env" {
 
 variable "extraction_worker_image" {
   description = <<-EOT
-    Full image ref (with tag) of the extraction-worker image — an app image
-    built WITH the `extraction` optional extra (`--build-arg
-    EXTRA_EXTRAS=,extraction`), which carries the document-converter backends
-    the built-in extraction pipeline needs. The operator's own infra builds
-    and publishes the variant, mirroring the `-rich` tag pattern. Pin an
-    immutable tag — the agnes-auto-upgrade tick re-pulls it every cycle.
+    OPTIONAL override for the `extraction-worker` service's image/tag — a
+    deliberate, TEMPORARY divergence from the app, NOT the normal way to run
+    this lane.
 
-    Why a separate variable instead of the app image: docker-compose.prod.yml
-    deliberately pins the `extraction-worker` compose service to the plain app
-    image (source-less prod VMs cannot `build:`), which is built without that
-    extra — a worker started from it has the lane wired up but no converter,
-    so `corpus-extraction` refuses up front with
-    `extraction_dependencies_missing`. The module overlay re-pins the service
-    to THIS image.
+    Empty (the default) is normal: the module renders no `image:` key on the
+    service at all, so it falls through to docker-compose.prod.yml's own
+    AGNES_IMAGE_REPO/AGNES_TAG pin — the SAME ref `app`/`scheduler` run. This
+    is what stops pin rot: the worker follows the app by construction, with
+    nothing separate to fall behind. The built-in extraction pipeline needs
+    nothing bundled that the app image does not already carry (the
+    `extraction` optional extra ships in the DEFAULT image build), so this
+    is also the right default on pure "does it work" grounds, not just
+    safety.
+
+    Set it only for a genuine, SHORT-LIVED reason to run the worker on a
+    different tag than the app — a canary (rebuild the worker while the app
+    stays on `:stable`), or holding the worker back mid-rollout. WARNING: a
+    pin left in place is a liability, not a feature. The app keeps
+    auto-upgrading and migrating the database forward
+    (src/db_pg.py::assert_pg_at_head refuses to boot an image whose
+    migrations trail the live schema) — once the database moves past what
+    THIS pinned image's Alembic head knows, the worker refuses to start and
+    crash-loops under `restart: unless-stopped` forever, silently killing
+    extraction. This happened on a live deployment and is the reason this
+    variable is optional rather than mandatory. Clear it again as soon as
+    the divergence is no longer needed.
 
     Registry access: same rule as kai_agent_image — `gcloud auth
     configure-docker` is run for a *-docker.pkg.dev host, any other private
     registry needs pre-authenticated pull access on the VM.
-
-    Required when any instance sets `extraction_worker_enabled = true`.
   EOT
   type        = string
   default     = ""
@@ -920,25 +936,22 @@ variable "extraction_worker_image" {
 
 variable "extraction_producer_command" {
   description = <<-EOT
-    The extraction lane's producer command line, written verbatim as
-    AGNES_EXTRACTION_PRODUCER_COMMAND into the app .env of every instance with
-    `extraction_worker_enabled = true` (app/worker/kinds.py::
-    _extraction_producer_argv reads it with shlex.split — a JSON/YAML list is
-    NOT supported via this env var, unlike the instance.yaml
-    `extraction.producer.command` key). Module-level, not per-VM, mirroring
-    `extraction_worker_image`: the producer binary ships INSIDE that image
-    (EXTRACTION_PRODUCER_INSTALL build-arg), so its invocation command is the
-    same across every VM that runs it.
+    Deprecated, ignored — the module no longer reads this variable.
 
-    Together with `extraction_worker_enabled` this is what makes the
-    Terraform flag alone activate the `corpus-extraction` job kind end to
-    end — no applier-owned `instance.yaml` edit on the VM's data disk.
+    It used to be written verbatim as AGNES_EXTRACTION_PRODUCER_COMMAND
+    into the app .env of every instance with `extraction_worker_enabled =
+    true`, naming the external producer binary's invocation command. That
+    external-producer mode was removed (owner decision 2026-08-31); nothing
+    in the app reads AGNES_EXTRACTION_PRODUCER_COMMAND any more, and the
+    module no longer writes the line.
 
-    Default points at the conventional in-image path; override only if the
-    operator's producer build installs somewhere else.
+    Kept declared, accepted and unused only so a root module that still
+    sets it does not fail `terraform plan` with "unsupported argument".
+    Slated for removal in a later cleanup once known consumers have
+    dropped it from their own configuration.
   EOT
   type        = string
-  default     = "python /opt/producer/agnes_lane.py"
+  default     = ""
 }
 
 variable "alert_webhook_url" {

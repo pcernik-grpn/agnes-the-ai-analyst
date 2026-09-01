@@ -30,6 +30,39 @@ features in future versions.
 
 ---
 
+## How Candidates Are Detected
+
+Two extraction paths feed the review queue:
+
+- **Session transcripts** — the verification detector
+  (`services/session_processors/verification.py`) scans the last 100 turns
+  of each Claude Code session, every 15 minutes, for corrections,
+  confirmations, and unprompted definitions
+  (`services/verification_detector/prompts.py`).
+- **CLAUDE.local.md** — a nightly collector
+  (`services/corporate_memory/collector.py`) reads each analyst's local
+  memory file.
+
+Confidence is **not** an AI-reported quality score — `confidence` is
+deliberately absent from the extraction schema. It's a fixed lookup by
+`(source_type, detection_type)` in `services/corporate_memory/confidence.py`:
+`correction` and `unprompted_definition` score 0.90, `confirmation` scores
+0.60, admin mandates score 1.00. An admin can retune these defaults under
+`corporate_memory.confidence.base` (see "Configuration in instance.yaml"
+below) without touching code.
+
+Category is currently constant (`business_logic`) on the session-transcript
+path — not AI-classified per item.
+
+Two config knobs narrow session-transcript detection without touching code,
+both editable at `/admin/server-config`:
+- `corporate_memory.sources.session_transcripts.enabled` — turn the whole
+  path off.
+- `corporate_memory.sources.session_transcripts.detection_types` — keep
+  only a subset of `correction` / `confirmation` / `unprompted_definition`.
+
+---
+
 ## Three Governance Modes (configurable)
 
 > **Status (#1573):** `distribution_mode` is enforced at the sync layer.
@@ -380,10 +413,12 @@ All users (not just admins) can flag any visible item:
 
 ### For the AI (Haiku)
 
-Extraction logic stays the same with one addition for threshold mode:
-- New optional field in CATALOG_SCHEMA: `confidence` (float 0-1)
-- AI rates its confidence that each extracted item is valuable and accurate
-- Used by threshold approval mode to auto-publish high-confidence items
+Extraction logic stays the same. The AI does **not** self-report a
+confidence score — `confidence` is deliberately absent from the extraction
+schema. Confidence is computed in code from `(source_type, detection_type)`
+via `services/corporate_memory/confidence.py` (see "How Candidates Are
+Detected" above and Option C below); threshold approval mode compares that
+code-computed score against `auto_publish_min_confidence`.
 
 ---
 
@@ -420,8 +455,8 @@ corporate_memory:
   # "threshold" — high-confidence auto-publish, low-confidence to review queue
   approval_mode: "review_queue"
 
-  # For threshold mode: minimum AI confidence to auto-publish (0.0-1.0)
-  # auto_confidence_threshold: 0.8
+  # For threshold mode: minimum confidence to auto-publish (0.0-1.0)
+  # auto_publish_min_confidence: 0.8
 
   # Default review period for approved/mandatory items (months)
   # Items past this date appear in "Needs re-review" queue

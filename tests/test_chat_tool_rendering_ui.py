@@ -614,21 +614,22 @@ def test_collapse_cap_clears_an_ordinary_long_answer():
 
 
 # ── tool cards: header line by default, one click to the JSON ───────────────
-# A tool card is a <details> collapsed to its header line (status, name, args
-# summary, timing); expanding shows the formatted-JSON args and result. A
-# failed call opens itself. Any card expanded during a turn folds back the
-# moment that turn ends.
+# A tool card is a <details> collapsed to its header line (status, name,
+# args-or-error, timing); expanding shows the formatted-JSON args and result.
+# NOTHING opens a card on its own, a failure included: a failed call used to
+# open itself, which put its ARGS dump on screen above the answer (#1974). Its
+# diagnosis rides the header line instead, which is the part folding keeps.
+# Any card expanded during a turn folds back the moment that turn ends.
 
 
 def test_tool_call_card_is_a_details_element_collapsed_by_default():
     js = _read(CHAT_JS)
-    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    card = js[js.index("function _buildToolCard") : js.index("const _TOOL_ERROR_LINE_CHARS")]
     assert 'document.createElement("details")' in card, "the whole card must be collapsible, not just its nested panels"
     assert 'document.createElement("summary")' in card, "the header becomes the <details>'s native toggle"
-    # Collapsed by default: the ONLY thing that opens a card on construction is
-    # a failed call, whose output is the diagnosis nobody knows to click for.
-    assert "if (wrapIsError) wrap.open = true" in card
-    assert card.count("wrap.open = true") == 1, (
+    # Collapsed by default, with no exception: a card that opens itself is a
+    # card that puts its args panel on screen unasked (#1974).
+    assert "wrap.open = true" not in card, (
         "cards start as just the header line — the name is the toggle (user ask on #1504 follow-up)"
     )
     start = js[js.index("function renderToolCallStart") : js.index("function renderToolCallEnd")]
@@ -636,10 +637,44 @@ def test_tool_call_card_is_a_details_element_collapsed_by_default():
     assert "_currentTurnToolCards.push(wrap)" in start, (
         "tracked so every card opened this turn folds together at turn end"
     )
-    end = js[js.index("function renderToolCallEnd") : js.index("function _collapseFinishedToolCalls")]
-    assert "if (isError) wrap.open = true" in end, (
-        "a FAILED card must open itself — its output is the diagnosis nobody knows to click for"
+    end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
+    assert "wrap.open = true" not in end
+    assert "if (isError) _setToolCardError(wrap, result)" in end, (
+        "a FAILED card must show its diagnosis without a click — on the header, not by opening"
     )
+
+
+def test_a_failed_card_puts_its_diagnosis_on_the_header_as_plain_text():
+    """The error line names internal endpoints ("400 Bad Request for
+    http://localhost:8000/api/query"). Rendered through markdown, marked's GFM
+    autolinker turned that into a link the chat offered the reader (#1974) —
+    so the header line is written with textContent, and a failed result's BODY
+    is a <pre>, never `renderMarkdownSafe`."""
+    js = _read(CHAT_JS)
+    setter = js[js.index("function _setToolCardError") : js.index("function renderToolCallStart")]
+    assert "summary.textContent = line" in setter, "the diagnosis is text, never markup"
+    assert "innerHTML" not in setter
+
+    preview = js[js.index("function _renderToolResultPreview") : js.index("function _appendSemanticValidationNotice")]
+    err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular JSON shapes")]
+    assert "pre.textContent = result" in err_branch, "an error body renders as text"
+    assert "renderMarkdownSafe" not in err_branch, (
+        "markdown on an error string only adds a clickable internal URL (#1974)"
+    )
+    # …and both live and replayed paths have to TELL the renderer it failed,
+    # or the branch above is unreachable on one of them.
+    assert "_renderToolResultPreview(result, toolName, isError)" in js
+    assert "_renderToolResultPreview(result, tool, wrapIsError)" in js
+
+
+def test_a_replayed_failure_gets_its_header_line_after_the_header_exists():
+    """`_setToolCardError` finds the summary by querying the CARD, so called
+    before `wrap.appendChild(head)` it silently does nothing and a reloaded
+    failure shows its args sketch where its error should be. Ordering, not
+    presence — which is why this is a position assertion."""
+    js = _read(CHAT_JS)
+    card = js[js.index("function _buildToolCard") : js.index("const _TOOL_ERROR_LINE_CHARS")]
+    assert card.index("wrap.appendChild(head);") < card.index("if (wrapIsError) _setToolCardError(wrap, result);")
 
 
 def test_collapse_finished_tool_calls_folds_and_clears_the_turn_list():
@@ -672,15 +707,23 @@ def test_tool_head_summary_gets_pointer_cursor_scoped_to_the_real_toggle():
     assert re.search(r"(?<!summary)\.cloud-chat-tool-head\s*\{[^}]*cursor:\s*pointer", css) is None
 
 
-def test_a_failed_tool_card_is_not_folded_shut():
-    """renderToolCallEnd marks a failed card `is-error` — red border, warning
-    icon — because its output is the thing the reader needs. Folding it is
-    worst on the `error` terminal frame: the turn died mid-tool and the card
-    that explains why would go behind a click nobody knows to make."""
+def test_a_failed_tool_card_folds_with_the_rest_because_its_diagnosis_is_on_the_header():
+    """A failed card used to be exempt from the end-of-turn fold, on the
+    argument that folding put the diagnosis behind a click nobody knows to
+    make. That argument is answered rather than abandoned: the diagnosis moved
+    ONTO the header line (`_setToolCardError`), which is exactly the part
+    folding keeps, so the exemption now only preserves the args dump the fold
+    exists to clear (#1974)."""
     js = _read(CHAT_JS)
     fn = js[js.index("function _collapseFinishedToolCalls") :]
     fn = fn[: fn.index("\n}")]
-    assert "is-error" in fn, "a failed card's output must survive the fold"
+    assert 'classList.contains("is-error")' not in fn, (
+        "no card is exempt from the fold — the header carries the error either way"
+    )
+    assert "wrap.open = false" in fn
+    # The header line the fold leaves behind has to be the one carrying it.
+    end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
+    assert "_setToolCardError(wrap, result)" in end
 
 
 def test_no_bare_details_box_rule_can_flatten_a_tool_card():
@@ -727,7 +770,7 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     fn = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
     # `tool` rides along too (facts-graph wave — routes `fact_claims` through
     # its own preview) but it is still the ONE shared call for both paths.
-    assert "_renderToolResultPreview(result, tool)" in fn, "one result renderer for both paths"
+    assert "_renderToolResultPreview(result, tool, wrapIsError)" in fn, "one result renderer for both paths"
     assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
         "the persisted state maps onto the same is-error / is-done classes a live result produces"
     )
@@ -763,12 +806,15 @@ def test_replayed_cards_are_siblings_in_the_messages_column():
     js = _read(CHAT_JS)
     body = js[js.index("function renderMessage") : js.index("// ---------- Result table enhancement")]
     assert "bubble.appendChild(_buildToolCard(" not in body, "a card inside the bubble inherits the bubble's width"
-    assert 'for (const node of nodes) $("chat-messages").appendChild(node)' in body, (
-        "every node — bubbles and cards alike — is appended to the messages column in order"
+    assert 'for (const node of _groupConsecutiveToolCards(nodes)) $("chat-messages").appendChild(node)' in body, (
+        "every node — bubbles and cards alike — is appended to the messages column in order, "
+        "runs of cards wrapped in the same group the live path builds (#1974)"
     )
     # The collapse measures the tail article after insertion; the cards and
     # earlier segments are siblings, not part of the answer's height.
-    assert body.index("for (const node of nodes)") < body.index("maybeMakeCollapsible(tailArticle)")
+    assert body.index("for (const node of _groupConsecutiveToolCards(nodes))") < body.index(
+        "maybeMakeCollapsible(tailArticle)"
+    )
 
 
 def test_history_renders_parts_in_order_with_nothing_hoisted():
@@ -1041,3 +1087,253 @@ def test_structured_output_validation_survives_the_trailer():
     assert ok and parsed == {"n": 1}
     ok, parsed, _ = validate('{"n": 1, "code": "```py\\npass\\n```"}', fmt)
     assert ok and parsed["n"] == 1
+
+
+# ── tool-call groups: a run of calls is one line, not a wall ────────────────
+# A research turn can open with a dozen calls before its first sentence, which
+# rendered as two screens of machinery above the answer (#1974). Consecutive
+# cards fold into ONE <details>; a run of one is left alone.
+
+#: A DOM small enough to read and complete enough for the shipped group
+#: builders to run — same idiom as tests/test_chat_file_preview_ui.py.
+_GROUP_HARNESS = """
+function mkEl(tag) {
+  const node = {
+    tag, _cls: new Set(), children: [], parentNode: null, _text: '', open: undefined,
+    attrs: {},
+    get className() { return [...node._cls].join(' '); },
+    set className(v) { node._cls = new Set(String(v).split(/\\s+/).filter(Boolean)); },
+    classList: {
+      add: (...c) => c.forEach((x) => node._cls.add(x)),
+      remove: (...c) => c.forEach((x) => node._cls.delete(x)),
+      contains: (c) => node._cls.has(c),
+      toggle: (c, on) => { if (on) node._cls.add(c); else node._cls.delete(c); },
+    },
+    setAttribute(k, v) { node.attrs[k] = String(v); },
+    appendChild(c) {
+      if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((k) => k !== c);
+      c.parentNode = node; node.children.push(c); return c;
+    },
+    replaceChildren(...c) { node.children = []; c.forEach((x) => node.appendChild(x)); },
+    querySelector(sel) {
+      const cls = sel.replace(/^\\./, '');
+      for (const k of node.children) {
+        if (k._cls.has(cls)) return k;
+        const deep = k.querySelector(sel);
+        if (deep) return deep;
+      }
+      return null;
+    },
+  };
+  Object.defineProperty(node, 'textContent', {
+    get() { return node._text; },
+    set(v) { node._text = String(v); node.children = []; },
+  });
+  return node;
+}
+const document = { createElement: mkEl };
+function iconEl(name) { const i = mkEl('svg'); i.className = 'icon-' + name; return i; }
+function $() { return mkEl('div'); }
+let _currentToolGroup = null;
+let _looseToolCard = null;
+
+/** A stand-in tool card in one of the states the real one can be in. */
+function card(state, name) {
+  const c = mkEl('details');
+  c.className = 'cloud-chat-tool ' + state;
+  const n = mkEl('span');
+  n.className = 'cloud-chat-tool-name';
+  n.textContent = name || 'Did a thing';
+  c.appendChild(n);
+  return c;
+}
+function head(group, cls) { return group.querySelector(cls).textContent; }
+"""
+
+
+def _group_source() -> str:
+    js = _read(CHAT_JS)
+    return js[js.index("function _buildToolGroup()") : js.index("function renderToolCallStart(")]
+
+
+def test_a_run_of_consecutive_cards_folds_into_one_group():
+    """Executed, not asserted textually: what matters is the SHAPE the walk
+    produces — one group per run, and no group at all around a lone call,
+    which would cost a click and say nothing."""
+    script = (
+        _GROUP_HARNESS
+        + _group_source()
+        + """
+const alone = _groupConsecutiveToolCards([card('is-done')]);
+const run = _groupConsecutiveToolCards([card('is-done'), card('is-done'), card('is-error')]);
+const split = _groupConsecutiveToolCards([card('is-done'), mkEl('article'), card('is-done')]);
+const twoRuns = _groupConsecutiveToolCards([
+  card('is-done'), card('is-done'), mkEl('article'), card('is-done'), card('is-done'),
+]);
+process.stdout.write(JSON.stringify({
+  alone: alone.map((n) => n.tag + ':' + n.className),
+  run_len: run.length,
+  run_cls: run[0].className,
+  run_cards: run[0].querySelector('.cloud-chat-tool-group-body').children.length,
+  run_label: head(run[0], '.cloud-chat-tool-group-label'),
+  run_meta: head(run[0], '.cloud-chat-tool-group-meta'),
+  run_open: !!run[0].open,
+  split: split.map((n) => n.className || n.tag),
+  two_runs: twoRuns.map((n) => n.className || n.tag),
+}));
+"""
+    )
+    res = json.loads(_node_run(script))
+    assert res["alone"] == ["details:cloud-chat-tool is-done"], "a lone call is not worth a group header"
+    assert res["run_len"] == 1 and res["run_cards"] == 3, "the whole run becomes one node"
+    assert "cloud-chat-tool-group" in res["run_cls"]
+    assert res["run_label"] == "3 steps"
+    assert res["run_meta"] == "2 failed" or res["run_meta"] == "1 failed"
+    assert not res["run_open"], "a replayed group opens collapsed — it is the compact form"
+    assert res["split"] == ["cloud-chat-tool is-done", "article", "cloud-chat-tool is-done"], (
+        "prose between two calls ends the run — a group means 'these ran together'"
+    )
+    assert res["two_runs"][0].startswith("cloud-chat-tool-group")
+    assert res["two_runs"][1] == "article"
+    assert res["two_runs"][2].startswith("cloud-chat-tool-group")
+
+
+def test_group_header_reports_failures_and_the_live_step():
+    """The header is derived from the CARDS, never from a counter — a counter
+    that drifts reports a run that failed as one that did not."""
+    script = (
+        _GROUP_HARNESS
+        + _group_source()
+        + """
+const settled = _buildToolGroup();
+const sbody = settled.querySelector('.cloud-chat-tool-group-body');
+[card('is-done'), card('is-error'), card('is-error')].forEach((c) => sbody.appendChild(c));
+_updateToolGroupSummary(settled);
+
+const live = _buildToolGroup();
+const lbody = live.querySelector('.cloud-chat-tool-group-body');
+lbody.appendChild(card('is-done', 'Querying data'));
+lbody.appendChild(card('is-running', 'Reading a file'));
+_updateToolGroupSummary(live);
+
+const replayed = _buildToolGroup();
+const rbody = replayed.querySelector('.cloud-chat-tool-group-body');
+[card('is-replayed'), card('is-replayed')].forEach((c) => rbody.appendChild(c));
+_updateToolGroupSummary(replayed);
+
+process.stdout.write(JSON.stringify({
+  settled: [settled.className, head(settled, '.cloud-chat-tool-group-label'),
+            head(settled, '.cloud-chat-tool-group-meta'),
+            settled.querySelector('.cloud-chat-tool-group-icon').children.map((c) => c.className)],
+  live: [live.className, head(live, '.cloud-chat-tool-group-label'),
+         head(live, '.cloud-chat-tool-group-meta')],
+  replayed_icon: replayed.querySelector('.cloud-chat-tool-group-icon').children.length,
+  replayed_cls: replayed.className,
+}));
+"""
+    )
+    res = json.loads(_node_run(script))
+    assert "is-error" in res["settled"][0], "a run with a failure in it says so on its edge"
+    assert res["settled"][1] == "3 steps"
+    assert res["settled"][2] == "2 failed"
+    assert res["settled"][3] == ["icon-triangle-alert"]
+    assert "is-running" in res["live"][0]
+    assert res["live"][1] == "Reading a file", "a collapsed live group still says what is happening now"
+    assert res["live"][2] == "2 steps"
+    assert res["replayed_icon"] == 0, "a pre-v123 run records no outcome — no tick it cannot evidence"
+    assert "is-done" not in res["replayed_cls"]
+
+
+def test_the_live_label_names_the_call_that_is_still_running():
+    """Calls settle out of order, so "the last card" is not "the card that is
+    running". Once the newest one finished while an earlier one was still
+    going, the header read as running while naming a step already done.
+    (Copilot review on #1985.)"""
+    script = (
+        _GROUP_HARNESS
+        + _group_source()
+        + """
+const g = _buildToolGroup();
+const body = g.querySelector('.cloud-chat-tool-group-body');
+body.appendChild(card('is-running', 'Reading a file'));
+body.appendChild(card('is-done', 'Querying data'));
+_updateToolGroupSummary(g);
+process.stdout.write(JSON.stringify({
+  cls: g.className, label: head(g, '.cloud-chat-tool-group-label'),
+  meta: head(g, '.cloud-chat-tool-group-meta'),
+}));
+"""
+    )
+    res = json.loads(_node_run(script))
+    assert "is-running" in res["cls"]
+    assert res["label"] == "Reading a file", "the header must name the call still in flight, not the last one added"
+    assert res["meta"] == "2 steps"
+
+
+def test_a_run_only_continues_while_its_group_is_still_the_stream_tail():
+    """`_endToolGroup` is called from every appender that knows about runs, but
+    the preview paths append an assistant article without going through any of
+    them. A card dropped into the older group would jump visually back above
+    that article, so the open group is tail-checked rather than trusted.
+    (Copilot review on #1985.)"""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _appendToolCard") : js.index("/** Close the open run.")]
+    assert "if (_currentToolGroup && stream.lastElementChild !== _currentToolGroup) _endToolGroup();" in fn
+    assert fn.index("_endToolGroup()") < fn.index("if (_currentToolGroup) {"), (
+        "the guard has to run BEFORE the group is used, or it guards nothing"
+    )
+
+
+def test_a_run_is_ended_by_everything_that_is_not_another_tool_card():
+    """A group means "these ran together, between these two things the agent
+    said". Anything else appended to the stream has to close it, or a group
+    silently becomes "every tool call of the turn"."""
+    js = _read(CHAT_JS)
+    for fn_name, end in (
+        ("function appendToken", "function finalizeAssistantMessage"),
+        ("function renderSystemNote", "/** Show an ephemeral toast"),
+        ("function renderApprovalRequest", "function resolveApprovalCard"),
+        ("function renderQuestionRequest", "function resolveQuestionCard"),
+        ("function _collapseFinishedToolCalls", "function _looksLikeToolError"),
+    ):
+        body = js[js.index(fn_name) : js.index(end)]
+        assert "_endToolGroup()" in body, f"{fn_name} must close the run above it"
+    # And a fresh/cleared transcript starts with no run open, or the first card
+    # of the next conversation would join the last one's group.
+    for clear in re.finditer(r'\$\("chat-messages"\)\.innerHTML = "";', js):
+        tail = js[clear.end() : clear.end() + 120]
+        assert "_endToolGroup()" in tail, "clearing the transcript must clear the open run"
+
+
+def test_tool_group_css_uses_ds_tokens_only():
+    css = _read(CHAT_CSS)
+    block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-head {")]
+    assert re.search(r"#[0-9a-fA-F]{3,8}\b", block) is None, "raw hex — the group is --ds-* like everything else"
+    assert "var(--primary)" not in block, "the design system's token is --ds-primary"
+    assert "--ds-accent-danger-line" in block and "--ds-accent-success-line" in block
+
+
+# ── the composer must not grow over the transcript ─────────────────────────
+
+
+def test_transcript_reserves_the_composer_s_measured_height():
+    """In a live thread the composer floats over the messages, and the padding
+    that kept the last turn clear of it was a constant sized for one line — so
+    a long prompt grew up over the conversation you were answering (#1974)."""
+    js = _read(CHAT_JS)
+    assert "function _syncComposerHeightVar" in js
+    fn = js[js.index("function _syncComposerHeightVar") : js.index("function autosizeComposer")]
+    assert '"--chat-composer-h"' in fn and "offsetHeight" in fn
+    autosize = js[js.index("function autosizeComposer") : js.index("if (typeof ResizeObserver")]
+    assert autosize.count("_syncComposerHeightVar()") == 2, (
+        "both exits of autosize publish the height — the empty one too, or clearing the box "
+        "leaves the transcript padded for the text that was there"
+    )
+    assert "new ResizeObserver(_syncComposerHeightVar)" in js, (
+        "the composer also changes height for reasons no keystroke reports"
+    )
+    css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
+    rule = css[css.index(".cloud-chat-shell.has-thread .cloud-chat-messages {") :]
+    rule = rule[: rule.index("}")]
+    assert "var(--chat-composer-h" in rule, "the reserved space must track the measurement"
+    assert "116px" not in rule, "the constant this replaced"

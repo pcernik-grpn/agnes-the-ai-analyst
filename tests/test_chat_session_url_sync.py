@@ -71,16 +71,26 @@ def test_load_and_render_history_reaching_turns_goes_through_mark_started():
     test file covers directly above."""
     js = _chat_js()
     body = _slice(
-        js, "async function loadAndRenderHistory(chatId) {", "async function openSession(chatId, wsUrlOverride) {"
+        js,
+        "async function loadAndRenderHistory(chatId) {",
+        "/** A deep-link restore that could not be completed",
     )
     assert "_markConversationStarted();" in body
 
 
 def test_open_session_writes_the_url_from_session_has_turns():
     js = _chat_js()
-    body = _slice(js, "async function openSession(chatId, wsUrlOverride) {", "function chatErrorCopy(raw, kind) {")
+    body = _slice(
+        js,
+        "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+        "function chatErrorCopy(raw, kind) {",
+    )
     assert "if (_switchingSession) _sessionHasTurns = false;" in body
-    sync_call = "_syncSessionUrl(_sessionHasTurns ? chatId : null);"
+    # #1973: a RESTORE (deep link / refresh) keeps the param it was opened
+    # from — clearing it on entry and putting it back a fetch later is what
+    # made a slow restore look like a silent new chat. Every other open keeps
+    # the #1914 behavior.
+    sync_call = "if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);"
     assert sync_call in body
     # Must run AFTER the switch reset (so a switch to an unproven session
     # starts cleared) and BEFORE the history fetch settles (so an

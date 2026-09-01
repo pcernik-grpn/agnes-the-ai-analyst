@@ -139,6 +139,12 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-tools/{tool_id}": "mcp_tool.update",
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
     # -- app.api.admin_extraction ----------------------------------------------
+    # A real mutation: sets `config.extraction.stop_requested_at` on the
+    # connection row, asking a running (or about-to-run) crawl to stop.
+    # Handler writes no row of its own — the fallback middleware emits this
+    # action, carrying `connection_id` only (no run content, no document
+    # paths).
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop": "extraction.stop_requested",
     # A POST that mutates NOTHING — it runs the anonymizer over a pasted
     # sample and returns the result. Cataloged rather than `exempt:` all the
     # same, on the `access_policy.preview` precedent: an admin pastes real
@@ -157,6 +163,15 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
+    # Persistence for a site added by URL (2026-09-01 bug report): the
+    # ``Sites.Selected`` escape hatch used to resolve a site without ever
+    # storing it, forcing a re-paste on every wizard reopen. Same
+    # "handler writes nothing itself; fallback middleware emits" posture as
+    # scope_confirm/scope_remove above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/manual-sites": "sharepoint_connection.manual_site_add",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/manual-sites": (
+        "sharepoint_connection.manual_site_remove"
+    ),
     # (Re)generates the Graph change-notification receiver's shared secret.
     # Handler writes its own row (log_safe), same as scope_confirm above.
     "POST /api/admin/sharepoint/connections/{connection_id}/webhook": "sharepoint_connection.webhook_secret_rotate",
@@ -290,6 +305,7 @@ POSTURE: dict[str, str] = {
     # -- app.api.collections ---------------------------------------------------
     "DELETE /api/collections/{collection_id}": "collection.delete",
     "DELETE /api/collections/{collection_id}/files/{file_id}": "collection.file_delete",
+    "PATCH /api/collections/{collection_id}": "collection.update",
     "POST /api/collections": "collection.create",
     "POST /api/collections/{collection_id}/files": "collection.file_add",
     "POST /api/collections/{collection_id}/files/{file_id}/move": "collection.file_move",
@@ -415,6 +431,7 @@ POSTURE: dict[str, str] = {
     "POST /api/memory": "corporate_memory.create",
     "POST /api/memory/admin/approve": "corporate_memory.dynamic",
     "POST /api/memory/admin/batch": "corporate_memory.dynamic",
+    "POST /api/memory/admin/bulk-reject": "corporate_memory.dynamic",
     "POST /api/memory/admin/bulk-update": "corporate_memory.dynamic",
     "POST /api/memory/admin/contradictions": "corporate_memory.contradiction_create",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve": "corporate_memory.dynamic",
@@ -625,6 +642,12 @@ POSTURE: dict[str, str] = {
     "POST /auth/logout": "logout",
     "POST /me/profile/refetch-groups": "exempt:debug_dry_run_no_write",
     "POST /slack/bind": "slack.bind",
+    # Read-only view-as (app/auth/view_as.py). Both handlers write their own
+    # row via log_safe — they know the target, which the fallback middleware
+    # cannot derive from a form field — so these entries are the cross-check,
+    # not the emitter.
+    "POST /admin/view-as": "view_as.start",
+    "POST /admin/view-as/exit": "view_as.end",
 }
 
 
@@ -751,7 +774,6 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
-    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",
@@ -1465,6 +1487,7 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "catalog": "catalog.list",
     "collections_list": "exempt:ui_support",
     "collection_get": "exempt:ui_support",
+    "collection_update": "collection.update",
     "collections_search": "collection.search",
     "collection_file_read": "collection.file_preview",
     "knowledge_search": "knowledge.search",
