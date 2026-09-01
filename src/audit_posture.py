@@ -139,6 +139,12 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-tools/{tool_id}": "mcp_tool.update",
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
     # -- app.api.admin_extraction ----------------------------------------------
+    # A real mutation: sets `config.extraction.stop_requested_at` on the
+    # connection row, asking a running (or about-to-run) crawl to stop.
+    # Handler writes no row of its own — the fallback middleware emits this
+    # action, carrying `connection_id` only (no run content, no document
+    # paths).
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop": "extraction.stop_requested",
     # A POST that mutates NOTHING — it runs the anonymizer over a pasted
     # sample and returns the result. Cataloged rather than `exempt:` all the
     # same, on the `access_policy.preview` precedent: an admin pastes real
@@ -751,7 +757,6 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
-    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map": "sharepoint_connection.corpus_map_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",

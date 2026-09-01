@@ -68,16 +68,16 @@ def test_both_object_types_declare_the_fields_default_off():
         assert re.search(r'extraction_worker_cpus\s*=\s*optional\(string,\s*"2.0"\)', block)
     # The image is module-level (like kai_agent_image), not per-VM.
     assert re.search(r'variable\s+"extraction_worker_image"\s*\{', body)
-    # So is the producer command — it ships INSIDE that image, so its
-    # invocation is the same across every VM that runs it. Default points at
-    # the conventional in-image path; a TF flag alone (no per-VM
-    # instance.yaml edit) is enough to activate the corpus-extraction lane.
+    # The producer command variable is DEPRECATED (external mode removed,
+    # 2026-09-01): it must stay DECLARED so existing tfvars keep planning,
+    # must say so, and must default to the inert empty string — a revived
+    # meaningful default would silently resurrect dead config.
     m = re.search(r'variable\s+"extraction_producer_command"\s*\{', body)
-    assert m, "variables.tf must declare a module-level extraction_producer_command variable"
+    assert m, "variables.tf must keep the deprecated extraction_producer_command declared (tfvars compat)"
     block_end = body.index("\n}\n", m.end())
-    assert re.search(r'default\s*=\s*"python /opt/producer/agnes_lane\.py"', body[m.end() : block_end]), (
-        "extraction_producer_command must default to the conventional in-image producer path"
-    )
+    block = body[m.end() : block_end]
+    assert "DEPRECATED" in block and "IGNORED" in block
+    assert re.search(r'default\s*=\s*""', block), "the deprecated variable must default to the inert empty string"
 
 
 def test_main_tf_forwards_and_validates():
@@ -86,7 +86,9 @@ def test_main_tf_forwards_and_validates():
     assert re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
     assert re.search(r"extraction_worker_mem_limit\s*=\s*each\.value\.extraction_worker_mem_limit", body)
     assert re.search(r"extraction_worker_cpus\s*=\s*each\.value\.extraction_worker_cpus", body)
-    assert re.search(r"extraction_producer_command\s*=\s*var\.extraction_producer_command", body)
+    # The deprecated producer variable must NOT be forwarded into the
+    # startup template anymore — nothing reads it.
+    assert not re.search(r"extraction_producer_command\s*=\s*var\.extraction_producer_command", body)
     # Plan-time catch: enabled without an image would render an empty
     # `image:` and fail the whole boot at `docker compose up`.
     assert re.search(
@@ -110,11 +112,12 @@ def test_tpl_gates_everything_on_the_flag():
         "AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}",
         "AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}",
         # TCRD-259 follow-up: the app-side gates (the sharepoint switch + the
-        # producer command) must also ride .env, or the TF flag alone never
-        # activates the corpus-extraction job kind — it would still need the
-        # per-VM instance.yaml SSH edit this env plumbing exists to avoid.
+        # must ride .env, or the TF flag alone never activates the
+        # corpus-extraction job kind — it would still need the per-VM
+        # instance.yaml SSH edit this env plumbing exists to avoid. (The
+        # producer command line died with the external mode; a test below
+        # pins its absence.)
         "AGNES_SHAREPOINT_ENABLED=1",
-        "AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}",
     ):
         idx = body.index(needle)
         # The needle must sit inside SOME extraction_worker_enabled block:
@@ -206,3 +209,11 @@ def test_watchdog_covers_the_lane():
     # Redis coordination declared via the module's .env form must arm the
     # CoordinationUnavailable signature exactly like the yaml form.
     assert "AGNES_COORDINATION_BACKEND=redis" in body
+
+
+def test_tpl_renders_no_dead_producer_env():
+    """The external-producer mode is gone: rendering
+    AGNES_EXTRACTION_PRODUCER_COMMAND into .env would be dead config that
+    misleads the next operator into thinking a producer exists to point at."""
+    body = (MODULE / "startup-script.sh.tpl").read_text()
+    assert "AGNES_EXTRACTION_PRODUCER_COMMAND" not in body

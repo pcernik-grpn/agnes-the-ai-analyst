@@ -993,7 +993,6 @@
     padding: 2px 8px; border-radius: var(--ds-radius-pill);
     background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
   }
-  .sp-corpus-map { font-size: 12px; }
 </style>
 <style>
   /* ── Extraction observability (2026-08-31 design §4/§6) ───────────────
@@ -1029,6 +1028,12 @@
     background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
   }
   .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-activity__path { font-family: var(--font-mono, ui-monospace, monospace); color: var(--ds-text-primary); }
+  .ext-activity__recent { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+  .ext-activity__recent-item {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+  }
   .ext-drawer { margin: 4px 16px 8px; }
   .ext-runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .ext-runs li {
@@ -1766,10 +1771,6 @@
           Who gets these collections? A collection with no group is indexed but invisible.
         </p>
         <div id="spw-share-rows"><div class="ds-loading">Loading…</div></div>
-        <p class="sp-corpus-map" id="spw-corpus-map-wrap" hidden>
-          <a href="#" id="spw-corpus-map-link" download="corpus-map.json">Download corpus map</a>
-          — the scope-to-collection mapping the crawl pipeline reads.
-        </p>
         <div id="spw-share-error" class="ds-wizard-error"></div>
       </section>
 
@@ -6480,8 +6481,8 @@ function spLoadScopesThenTree() {
 
 /* A saved SITE scope can rebuild its own sites-level row: its
    source_scope_id IS the Graph site id ("host,siteCollection,web" — the
-   only scope id containing commas, the same discriminator
-   connectors/sharepoint/corpus_map.py::_map_key keys on) and its
+   only scope id containing commas, the same structural discriminator the
+   crawler's _scope_kind keys on) and its
    display_path IS the site name (sites are ticked at the sites level,
    where the crumb path is just the name). Seeding spManualSites here is
    what keeps a saved site visible when the wizard reopens on an existing
@@ -6981,8 +6982,6 @@ function spLoadGroups() {
 }
 
 function spLoadShare() {
-  document.getElementById("spw-corpus-map-wrap").hidden = false;
-  document.getElementById("spw-corpus-map-link").href = `${SP_API}/${encodeURIComponent(spConnId)}/corpus-map`;
   document.getElementById("spw-share-rows").innerHTML = '<div class="ds-loading">Loading…</div>';
   // Returns the promise (unlike before) so `openSpWizardForConnection` can
   // chain a row-highlight onto "rendered", not just "requested".
@@ -7132,8 +7131,11 @@ document.addEventListener("keydown", (e) => {
    * A typed 501 (PG-only `extraction_runs` on a DuckDB instance) renders
      once, explains itself, and STOPS polling — the same degradation the
      card already words for the facts graph.
-   * No Stop control: v1 has no cooperative cancel flag in the crawl
-     (`can_stop: false`), and a button without a mechanism is a lie. #}
+   * The Stop control only draws when the run reports `can_stop !== false`
+     — a cooperative flag, not a hard kill, so the row says "Stopping…"
+     until the next checkpoint confirms it, never a claim it ended instantly.
+     `can_stop === false` keeps the old honest sentence instead of a button
+     that cannot succeed. #}
 <script>
 const EXT_POLL_ACTIVE_MS = 3000;
 const EXT_POLL_IDLE_MS = 30000;
@@ -7148,7 +7150,9 @@ let _extTimer = null;
 let _extInFlight = false;
 
 function _extS(id) {
-  if (!_extState[id]) _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null };
+  if (!_extState[id]) {
+    _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null, stopping: false };
+  }
   return _extState[id];
 }
 
@@ -7172,6 +7176,19 @@ function _extDuration(seconds) {
 
 function _extNum(n) {
   return Number(n || 0).toLocaleString();
+}
+
+/* Middle-truncation keeps a long SharePoint path on one line without hiding
+   which file it is — the START (library/folder) and the END (filename) are
+   the two ends an operator actually reads; the middle is what a `…` can
+   safely eat. The untruncated string still travels in a `title` attribute. */
+function _extTruncMiddle(path, max) {
+  const s = String(path || "");
+  if (s.length <= max) return s;
+  const keep = Math.max(0, max - 1);
+  const head = Math.ceil(keep * 0.6);
+  const tail = keep - head;
+  return `${s.slice(0, head)}…${tail > 0 ? s.slice(s.length - tail) : ""}`;
 }
 
 /* One dot per outcome. `running` is the ONLY animated one — a run past its
@@ -7239,6 +7256,7 @@ function _extRunLine(run) {
 const EXT_STOP_REASON_TEXT = {
   timeout: "the run hit its time ceiling (extraction.timeout_s)",
   throttled: "the tenant's throttling budget was exhausted (HTTP 429)",
+  stopped: "stopped by an admin",
   error: "an unexpected error",
 };
 
@@ -7250,6 +7268,36 @@ function _extThrottleLine(run) {
   if (!run.http_429) return "";
   const waited = run.throttle_wait_s ? `, ${_extDuration(run.throttle_wait_s)} waited` : "";
   return `<div class="ext-sub ext-warn">throttled — ${_extNum(run.http_429)}× HTTP 429${_extEsc(waited)}</div>`;
+}
+
+/* What the crawl is touching RIGHT NOW (design §4 follow-up: "can't see what
+   it's doing"). Older rows (recorded before this field existed, or a DuckDB
+   instance that never got it) carry no `activity` at all — that renders
+   nothing, never empty scaffolding. Every path is untrusted-ish (it is a
+   filename a document owner chose), so it goes through `_extEsc` exactly
+   like every other server string on this card — never raw `innerHTML`. */
+function _extActivityHtml(activity) {
+  if (!activity) return "";
+  const bits = [];
+  if (activity.phase) bits.push(`<strong>${_extEsc(activity.phase)}</strong>`);
+  if (activity.current_path) {
+    const shown = _extTruncMiddle(activity.current_path, 64);
+    bits.push(
+      `<span class="ext-activity__path" title="${_extEsc(activity.current_path)}">${_extEsc(shown)}</span>`,
+    );
+  }
+  let html = bits.length ? `<div class="ext-sub ext-activity">${bits.join(" · ")}</div>` : "";
+  const recent = Array.isArray(activity.recent) ? activity.recent.slice(0, 5) : [];
+  if (recent.length) {
+    const items = recent
+      .map((r) => {
+        const p = _extTruncMiddle(r && r.path, 40);
+        return `<span class="ext-activity__recent-item">${_extDot(r && r.outcome)}<span title="${_extEsc(r && r.path)}">${_extEsc(p)}</span></span>`;
+      })
+      .join(" ");
+    html += `<div class="ext-sub ext-activity__recent">recent: ${items}</div>`;
+  }
+  return html;
 }
 
 /* ── Per-file error detail: a `<details>` an operator can open, never a
@@ -7338,6 +7386,7 @@ function _extRunRowHtml(connId, st) {
     if (run.outcome === "stalled") {
       sub += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note || "no recent checkpoint")}</div>`;
     }
+    if (run.activity) sub += _extActivityHtml(run.activity);
     if (status.can_stop === false) {
       sub += `<div class="ext-sub">A running crawl cannot be stopped from here yet — it finishes, or the worker ends it.</div>`;
     }
@@ -7367,8 +7416,18 @@ function _extRunRowHtml(connId, st) {
   }
 
   const total = status.runs_total || 0;
+  // Cooperative, not a hard kill — the button says "Stopping…" once clicked
+  // and stays disabled until the next poll shows the run actually gone,
+  // never a claim it ended the instant the request was sent. Mirrors the
+  // `can_stop === false` sentence above: exactly one of the two ever shows.
+  const canStopNow = !!run && (run.outcome === "running" || run.outcome === "stalled") && status.can_stop !== false;
+  const stopBtn = canStopNow
+    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extStopRun('${connId}')"
+               ${st.stopping ? "disabled" : ""}>${st.stopping ? "Stopping…" : "Stop run"}</button>`
+    : "";
   const actions = `
       <div class="ext-actions">
+        ${stopBtn}
         <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
                 ${total ? "" : "disabled"}>Run history (${total})</button>
       </div>`;
@@ -7478,6 +7537,11 @@ async function _extFetchOne(connId) {
     st.lastOk = st.data.as_of;
     st.failures = 0;
     st.error = null;
+    // Once the run this admin stopped is no longer the live one — finished,
+    // interrupted, or gone — the "Stopping…" lock is stale. Clearing it here
+    // (rather than on a timer) is what lets a LATER run on this same
+    // connection show a clickable Stop button of its own.
+    if (!st.data.running) st.stopping = false;
   } catch (e) {
     // Keep the last good numbers, VISIBLY marked stale. Blanking them, or
     // redrawing them as current, are the two ways this goes wrong.
@@ -7529,6 +7593,43 @@ function extRetry(connId) {
   st.failures = 0;
   st.error = null;
   _extFetchOne(connId);
+}
+
+/* Cooperative stop (owner ask: "can't see it, can't stop it"). `confirm()`
+   matches this page's other destructive one-click actions (e.g. the
+   master-token / project-lock removals above) rather than the async
+   `confirmModal` — no extra element to wire up in a script that is
+   otherwise dependency-free from the rest of the page. A 202 flips the
+   button to a disabled "Stopping…" and lets the existing 3 s poll carry the
+   outcome; the button never claims the run ended before that poll confirms it. */
+async function extStopRun(connId) {
+  if (!confirm("Stop this extraction run? What it has already ingested is kept — the next run can resume.")) return;
+  const st = _extS(connId);
+  st.stopping = true;
+  _extRender(connId);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/stop`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (r.status === 202) {
+      const body = await r.json().catch(() => ({}));
+      if (typeof showToast === "function") {
+        showToast(body && body.note ? body.note : "Stop requested — the run will end at its next checkpoint.", true);
+      }
+      await _extFetchOne(connId);
+      return;
+    }
+    const body = await r.json().catch(() => ({}));
+    st.stopping = false;
+    const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't stop the run") : "couldn't stop the run";
+    if (typeof showToast === "function") showToast(`Stop failed: ${msg}`, false);
+    _extRender(connId);
+  } catch (e) {
+    st.stopping = false;
+    if (typeof showToast === "function") showToast("Request failed.", false);
+    _extRender(connId);
+  }
 }
 
 document.addEventListener("visibilitychange", () => {

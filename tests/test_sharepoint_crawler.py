@@ -225,10 +225,37 @@ def _state(tmp_path: Path, connection_id: str = "conn1") -> Dict[str, Any]:
     return json.loads(path.read_text())
 
 
+class FakeSourceConnectionsRepo:
+    """Stands in for ``source_connections_repo()`` — just enough of the
+    contract for the crawl's own reads/writes: ``.get()`` returns the SAME
+    connection dict every call (by reference, so a ``config_patch`` is
+    immediately visible to the next ``.get()``), and ``.config_patch()``
+    merges the patch's TOP-LEVEL keys into ``config`` the same shallow way
+    both real repos do — no new store, the same JSON column
+    ``config.scopes``/``config.extraction`` already live on.
+    """
+
+    def __init__(self, connection: Dict[str, Any]) -> None:
+        self.connection = connection
+
+    def get(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        if connection_id != self.connection.get("id"):
+            return None
+        return self.connection
+
+    def config_patch(self, connection_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if connection_id != self.connection.get("id"):
+            return None
+        config = dict(self.connection.get("config") or {})
+        config.update(patch)
+        self.connection["config"] = config
+        return self.connection
+
+
 def _run(connection: Dict[str, Any], monkeypatch, scopes: Optional[List[str]] = None) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
-        lambda: type("R", (), {"get": staticmethod(lambda cid: connection)})(),
+        lambda: FakeSourceConnectionsRepo(connection),
     )
     payload: Dict[str, Any] = {"connection_id": connection["id"]}
     if scopes:
@@ -2800,3 +2827,348 @@ class TestFactsExtractionSeam:
 
         assert runs.finished[0]["status"] == "failed"
         assert "FactsExtractionUnavailable" in runs.finished[0]["error"]
+
+
+# --------------------------------------------------------------------------
+# Cooperative stop (owner-frustration fix, 2026-09-01): "it's a black box,
+# I can't see what's happening and I can't stop it". The signal lives on
+# the connection row's own `config.extraction` sub-object — no new store —
+# and is checked at the SAME quiescent points a timeout already is.
+# --------------------------------------------------------------------------
+
+
+class TestStopSignalStore:
+    """`request_stop` / `_clear_stale_stop` / `_stop_requested` against the
+    connection row — the part that has to work on BOTH app-state backends."""
+
+    def test_request_stop_sets_the_flag_and_preserves_sibling_extraction_keys(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"last_run_at": "t0", "last_job_id": "job1"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        stamp = crawler.request_stop("conn1")
+
+        extraction = connection["config"]["extraction"]
+        assert extraction["stop_requested_at"] == stamp
+        # The dispatch bookkeeping next to it (TCRD-226) must survive —
+        # `request_stop` merges into the EXISTING extraction sub-object,
+        # never replaces it wholesale.
+        assert extraction["last_run_at"] == "t0"
+        assert extraction["last_job_id"] == "job1"
+
+    def test_request_stop_works_on_a_connection_with_no_extraction_block_yet(self, monkeypatch):
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        stamp = crawler.request_stop("conn1")
+
+        assert connection["config"]["extraction"]["stop_requested_at"] == stamp
+
+    def test_clear_stale_stop_removes_only_the_flag(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "x", "last_run_at": "t0"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1")
+
+        extraction = connection["config"]["extraction"]
+        assert "stop_requested_at" not in extraction
+        assert extraction["last_run_at"] == "t0"
+
+    def test_clear_stale_stop_is_a_noop_when_nothing_is_set(self, monkeypatch):
+        connection = {"id": "conn1", "config": {}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        crawler._clear_stale_stop("conn1")  # must not raise, and must not write
+
+        assert connection["config"] == {}
+
+    def test_stop_requested_reads_the_live_flag(self, monkeypatch):
+        connection = {"id": "conn1", "config": {"extraction": {"stop_requested_at": "2026-09-01T00:00:00+00:00"}}}
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        assert crawler._stop_requested("conn1") == "2026-09-01T00:00:00+00:00"
+
+    def test_stop_requested_is_none_for_an_unknown_connection(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo({"id": "conn1", "config": {}}),
+        )
+
+        assert crawler._stop_requested("does-not-exist") is None
+
+
+class TestStopWatcher:
+    """The polling cadence itself: unconditional at a page boundary, only
+    every ``every`` completed items at a file boundary."""
+
+    def test_page_boundary_raises_when_stopped(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: "2026-09-01T00:00:00+00:00")
+        with pytest.raises(crawler.CrawlStopped):
+            crawler._StopWatcher("conn1").check_page_boundary()
+
+    def test_page_boundary_is_a_noop_when_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: None)
+        crawler._StopWatcher("conn1").check_page_boundary()  # must not raise
+
+    def test_item_boundary_cadence_is_exact(self, monkeypatch):
+        calls: List[str] = []
+
+        def fake(connection_id: str) -> Optional[str]:
+            calls.append(connection_id)
+            return None
+
+        monkeypatch.setattr(crawler, "_stop_requested", fake)
+        watcher = crawler._StopWatcher("conn1", every=3)
+        for n in range(1, 10):
+            watcher.maybe_check_item_boundary(n)
+
+        # Checked at 3, 6, 9 — three reads for nine completed items, not one
+        # repo read per item.
+        assert calls == ["conn1", "conn1", "conn1"]
+
+    def test_item_boundary_raises_exactly_at_the_cadence(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_stop_requested", lambda cid: "stopped-at")
+        watcher = crawler._StopWatcher("conn1", every=5)
+        watcher.maybe_check_item_boundary(4)  # not yet — must not raise
+        with pytest.raises(crawler.CrawlStopped):
+            watcher.maybe_check_item_boundary(5)
+
+
+class TestStopReason:
+    def test_stopped_is_a_named_stop_reason(self):
+        assert crawler._stop_reason(crawler.CrawlStopped("x")) == "stopped"
+
+    def test_a_stop_outranks_a_bare_gone_but_not_a_throttle_or_timeout(self):
+        assert crawler._abort_rank(crawler.GraphThrottled("x")) > crawler._abort_rank(crawler.CrawlStopped("x"))
+        assert crawler._abort_rank(crawler.CrawlTimeout("x")) > crawler._abort_rank(crawler.CrawlStopped("x"))
+        assert crawler._abort_rank(crawler.CrawlStopped("x")) > crawler._abort_rank(crawler.GraphGone("x"))
+
+
+class TestCooperativeStopEndToEnd:
+    """A stop requested mid-run through the connection row — the exact path
+    the admin endpoint uses — stops the crawl at a resume-safe boundary."""
+
+    def test_a_stop_requested_between_pages_is_honored_before_the_next_page_is_fetched(self, crawl_env, monkeypatch):
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                # Simulates an admin's `POST .../extraction/stop` landing
+                # while page 1's one item is being processed.
+                crawler.request_stop(connection["id"])
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": _many_items(5, prefix="p2"), "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"},
+                )
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        # Page 1's single item landed; page 2's five never got fetched — the
+        # page-boundary check fires BEFORE that request.
+        assert set(state["ctags"]) == {"graph:item1"}
+        assert not state.get("delta_links")
+
+    def test_a_stop_requested_mid_page_is_honored_only_at_the_file_cadence(self, crawl_env, monkeypatch):
+        """Cadence: the check fires only every `_STOP_CHECK_EVERY_ITEMS`
+        completed items — a stop requested after item 3 does not end the
+        run until item 10, and every item up to and including the 10th
+        still lands. The flag is left on the row afterwards; only the NEXT
+        run's start clears it."""
+        _at_concurrency(monkeypatch, 1)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        items = _many_items(15)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                landed = len(FakeIngestor.instances[-1].ingested) if FakeIngestor.instances else 0
+                if landed == 3:
+                    crawler.request_stop(connection["id"])
+                return _content_response()
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"})
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        assert len(state["ctags"]) == crawler._STOP_CHECK_EVERY_ITEMS
+        assert not state.get("delta_links"), "the page never finished, so its deltaLink must not be persisted"
+        # The run that stopped never clears its own flag.
+        assert connection["config"]["extraction"]["stop_requested_at"]
+
+        # The NEXT run must not be killed by the same, now-stale, flag: it
+        # is cleared unconsumed at THAT run's start. Reconfigure Graph so
+        # this second pass cannot re-trigger a stop of its own.
+        _install_graph(monkeypatch, _one_page(items))
+        report = _run(connection, monkeypatch)
+
+        assert report["interrupted"] is False
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+        # The 10 items ingested before the first stop are unchanged this
+        # time (matching cTags); the remaining 5 land as new.
+        assert report["unchanged"] == crawler._STOP_CHECK_EVERY_ITEMS
+        assert report["new"] == 15 - crawler._STOP_CHECK_EVERY_ITEMS
+
+    def test_a_stale_stop_flag_is_cleared_before_the_run_starts(self, crawl_env, monkeypatch):
+        """A stop requested for a run that already finished (or never
+        started) must not reach forward and kill an unrelated, later run."""
+        connection = _connection([_drive_scope()])
+        connection["config"]["extraction"] = {"stop_requested_at": "2020-01-01T00:00:00+00:00"}
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        _install_graph(monkeypatch, _one_page(_many_items(3)))
+
+        report = _run(connection, monkeypatch)
+
+        assert report["interrupted"] is False
+        assert report["new"] == 3
+        assert "stop_requested_at" not in connection["config"]["extraction"]
+
+    def test_a_stopped_worker_pool_drains_its_in_flight_items(self, crawl_env, monkeypatch):
+        """Same drain mechanism a throttle/timeout abort already uses under
+        concurrency: no new item is picked up once the stop is seen, but the
+        ones already in flight still finish and are recorded."""
+        _at_concurrency(monkeypatch, 4)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: FakeSourceConnectionsRepo(connection),
+        )
+        items = _many_items(20)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                landed = len(FakeIngestor.instances[-1].ingested) if FakeIngestor.instances else 0
+                # `>=`, not `==`: under real concurrency several items can
+                # finish between two content requests, so an exact count
+                # would be a race. Re-requesting the same stop repeatedly is
+                # harmless (`request_stop` just re-stamps the same key).
+                if landed >= 2:
+                    crawler.request_stop(connection["id"])
+                return _content_response()
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=done"})
+
+        _install_graph(monkeypatch, handler)
+
+        with pytest.raises(crawler.CrawlStopped):
+            _run(connection, monkeypatch)
+
+        state = _state(crawl_env)
+        assert state["last_run"]["interrupted_reason"] == "stopped"
+        # The pool stopped being FED at the cadence boundary, but not all 20
+        # items — the drain lets whatever was already in flight finish.
+        assert 0 < len(state["ctags"]) < 20
+
+
+# --------------------------------------------------------------------------
+# Live activity in the checkpoint (owner-frustration fix, 2026-09-01): "I
+# can't see what's happening in the extraction".
+# --------------------------------------------------------------------------
+
+
+class TestLiveActivity:
+    def test_activity_appears_in_the_live_checkpoint(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, _one_page(_many_items(3)))
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        activity = runs.checkpoints[-1]["progress"]["activity"]
+        assert activity["phase"] == "crawl"
+        # By the LAST checkpoint of a finished page every item has exited —
+        # `current_path` is honestly None, not a stale leftover.
+        assert activity["current_path"] is None
+        assert activity["recent"], "completed items must be visible in the checkpoint"
+        assert {"path", "outcome"} <= set(activity["recent"][0])
+        assert all(entry["outcome"] == "new" for entry in activity["recent"])
+
+    def test_recent_activity_is_capped_at_five(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        _install_graph(monkeypatch, _one_page(_many_items(8)))
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        activity = runs.checkpoints[-1]["progress"]["activity"]
+        assert len(activity["recent"]) == 5
+        # Newest first: the LAST item processed (f7, sequential concurrency
+        # 1) is at the front.
+        assert activity["recent"][0]["path"].endswith("f7.docx")
+
+    def test_activity_is_absent_from_a_finished_runs_stored_report(self, crawl_env, monkeypatch):
+        """`report()` (the FINAL, stored shape) is a separate dict from the
+        live checkpoint's `progress` — it never grew an `activity` key, so a
+        finished run honestly shows nothing in flight."""
+        _install_graph(monkeypatch, _one_page(_many_items(2)))
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert "activity" not in report
+
+
+class TestActivityBookkeeping:
+    """`CrawlStats.enter_item_activity` / `exit_item_activity` — the
+    concurrency-safe accumulation `activity_snapshot` reads."""
+
+    def test_a_single_item_shows_up_while_in_flight_and_leaves_when_done(self):
+        stats = crawler.CrawlStats()
+        token = stats.enter_item_activity("Reports/a.docx")
+        snap = stats.activity_snapshot(phase="crawl")
+        assert snap["current_path"] == "Reports/a.docx"
+        assert snap["current_started_at"]
+
+        stats.exit_item_activity(token, "Reports/a.docx", "new")
+        snap = stats.activity_snapshot(phase="crawl")
+        assert snap["current_path"] is None
+        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new"}]
+
+    def test_recent_is_capped_and_newest_first(self):
+        stats = crawler.CrawlStats()
+        for i in range(7):
+            token = stats.enter_item_activity(f"f{i}.docx")
+            stats.exit_item_activity(token, f"f{i}.docx", "new")
+
+        recent = stats.activity_snapshot(phase="crawl")["recent"]
+        assert [r["path"] for r in recent] == ["f6.docx", "f5.docx", "f4.docx", "f3.docx", "f2.docx"]
+
+    def test_bookkeeping_is_exact_under_concurrency(self):
+        """A lost entry/exit here is exactly the same class of bug the
+        counters guard against — see `TestParallelCounters`."""
+        stats = crawler.CrawlStats()
+
+        def worker(i: int) -> None:
+            token = stats.enter_item_activity(f"path{i}.docx")
+            stats.exit_item_activity(token, f"path{i}.docx", "new")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        snap = stats.activity_snapshot(phase="crawl")
+        # Every worker entered AND exited — nothing left dangling in-flight.
+        assert snap["current_path"] is None
+        assert len(snap["recent"]) == 5

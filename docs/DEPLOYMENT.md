@@ -644,18 +644,18 @@ On a VM provisioned by the Terraform module
 the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
 reverted on the next recreate. Instead set the per-instance
 `extraction_worker_enabled = true` (default off) together with the
-module-level `extraction_worker_image` (an app image built with the
-`extraction` optional extra — the plain app image carries no document
-converter, and the module refuses the flag without an image at plan time). The module then
+module-level `extraction_worker_image` — normally the SAME ref as the app
+image, since every standard app image already carries the `extraction`
+optional extra (markitdown, pypdfium2); it stays a separate variable only
+so an operator can hold the worker on a different tag during a canary.
+The module refuses the flag without an image at plan time. The module then
 renders the Redis coordination backend, the `.env` coordination
 declaration, an `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint
 connector, not just extraction — see the migration note in
-[`feature-flags.md`](feature-flags.md)), an
-`AGNES_EXTRACTION_PRODUCER_COMMAND` line (module-level
-`extraction_producer_command`, defaulting to the conventional in-image
-path `python /opt/producer/agnes_lane.py` — override only if your
-producer build installs somewhere else), and an always-on
-`extraction-worker` service into the boot path. Because these ride `.env`
+[`feature-flags.md`](feature-flags.md)), and an always-on
+`extraction-worker` service into the boot path. (The former
+`AGNES_EXTRACTION_PRODUCER_COMMAND` line died with the external-producer
+mode; the module variable is kept declared but deprecated and inert.) Because these ride `.env`
 (env overrides `instance.yaml` — the same posture
 `app/coordination/factory.py` already uses for the coordination backend
 itself), the TF flag alone activates `corpus-extraction` end to end — no
