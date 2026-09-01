@@ -288,7 +288,26 @@ EXEMPT: frozenset[str] = frozenset(
         # non-admin caller once a policy IS attached).
         "app/api/admin.py::policy_builder_columns",
         # POST /api/query/hybrid -- spec §8 names this one explicitly: "out
-        # of scope by §12's admin bypass, not by omission".
+        # of scope by §12's admin bypass, not by omission". K2 (RLS review
+        # #1979) sharpened what that admin bypass means here: this
+        # endpoint runs the caller's raw SQL directly, with no registered-
+        # table-name resolution -- so, unlike every other exempt entry in
+        # this section, it never has a `table_id` or table NAME to run
+        # `can_access_table`/`policied_relation` against in the first
+        # place, not merely "an admin authoring/previewing a policy". Its
+        # gate used to be plain `require_admin`, which (per docs/table-
+        # access-policies.md's "The admin bypass") wrongly handed the
+        # unrestricted bypass to a `surface='stack'` PAT (the `agnes init`
+        # default, deliberately filtered like an analyst everywhere else).
+        # It is now `require_admin_all_surface`
+        # (`app/auth/access.py::require_admin_all_surface`) -- the same
+        # `is_user_admin(...) and _credential_surface(user) == 'all'`
+        # predicate `_caller_is_unrestricted_admin` applies to a direct
+        # `bq.`/`sf.`/`kbc.` path reference elsewhere, applied here to the
+        # endpoint's entire body since its entire body IS a direct path.
+        # Still EXEMPT, not COVERED: it still never calls the resolver's
+        # four functions -- but the admin bypass this exemption rests on
+        # is now genuinely surface-gated instead of merely assumed.
         "app/api/query_hybrid.py::hybrid_query",
         # Live sample for a non-BQ `query_mode='remote'` row -- the exact
         # twin of `_fetch_bq_sample` (which the scanner never sees only
