@@ -1234,6 +1234,12 @@ def _run_corpus_extraction(payload: dict) -> dict:
         a time (``1`` = the sequential pre-parallel behaviour). NOT the same
         knob as ``extraction.concurrency``, which sizes how many extraction
         JOBS this worker runs at once — the two multiply against one tenant.
+      - ``resync`` (optional, truthy) — drops this connection's persisted
+        deltaLinks and item-failure queue before crawling, so every drive
+        re-enumerates from scratch (cTags are kept, so unchanged files are
+        not re-downloaded). The supported recovery path for a connection
+        whose delta cursor ran past documents it never actually ingested —
+        see ``connectors.sharepoint.crawler._apply_resync``.
 
     Returns the crawl report (the same dict persisted as ``last_run`` in the
     connection's crawl state, so the job result and the state file can never

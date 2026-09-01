@@ -242,6 +242,104 @@ def test_deploy_dev_requires_draft_friendly_message():
 
 
 # ---------------------------------------------------------------------------
+# deploy-time exposure check (#1946)
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_warn_findings_printed_after_state_line():
+    body = {
+        "state": "running",
+        "deployed_sha": "abc123",
+        "deploy_check": {
+            "status": "warn",
+            "findings": [
+                {
+                    "rule_id": "DA001",
+                    "severity": "warn",
+                    "message": "Static file server root exposes the project root.",
+                    "file": "server/index.ts",
+                    "line": 3,
+                    "snippet": "app.use(express.static(__dirname));",
+                    "doc_url": "/docs/architecture.md#da001",
+                }
+            ],
+            "rules_run": ["DA001"],
+            "files_scanned": 1,
+            "skipped": None,
+        },
+    }
+    fake = _mock_response(200, body)
+    with patch("cli.commands.data_apps.api_post", return_value=fake):
+        result = runner.invoke(app, ["app", "deploy", "sapp"])
+    assert result.exit_code == 0, result.output
+    assert "running" in result.stdout
+    assert "DA001" in result.stdout
+    assert "server/index.ts:3" in result.stdout
+
+
+def test_deploy_pass_prints_nothing_extra():
+    body = {
+        "state": "running",
+        "deployed_sha": "abc123",
+        "deploy_check": {"status": "pass", "findings": [], "rules_run": ["DA001"], "files_scanned": 3, "skipped": None},
+    }
+    fake = _mock_response(200, body)
+    with patch("cli.commands.data_apps.api_post", return_value=fake):
+        result = runner.invoke(app, ["app", "deploy", "sapp"])
+    assert result.exit_code == 0
+    assert "DA0" not in result.stdout
+
+
+def test_deploy_off_mode_prints_nothing_extra():
+    fake = _mock_response(200, {"state": "running", "deployed_sha": "abc123"})
+    with patch("cli.commands.data_apps.api_post", return_value=fake):
+        result = runner.invoke(app, ["app", "deploy", "sapp"])
+    assert result.exit_code == 0
+    assert "DA0" not in result.stdout
+
+
+def test_deploy_block_mode_prints_findings_and_fails():
+    body = {
+        "detail": {
+            "error": "deploy_check_failed",
+            "deploy_check": {
+                "status": "warn",
+                "findings": [
+                    {
+                        "rule_id": "DA004",
+                        "severity": "warn",
+                        "message": "The whole process environment appears to be serialized.",
+                        "file": "server/index.ts",
+                        "line": 10,
+                        "snippet": "res.json(process.env);",
+                        "doc_url": "/docs/architecture.md#da004",
+                    }
+                ],
+                "rules_run": ["DA004"],
+                "files_scanned": 1,
+                "skipped": None,
+            },
+        }
+    }
+    fake = _mock_response(422, body)
+    with patch("cli.commands.data_apps.api_post", return_value=fake):
+        result = runner.invoke(app, ["app", "deploy", "sapp"])
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "DA004" in output
+    assert "server/index.ts:10" in output
+
+
+def test_deploy_external_repo_unavailable_friendly_message():
+    fake = _mock_response(422, {"detail": {"error": "deploy_check_unavailable_external_repo"}})
+    with patch("cli.commands.data_apps.api_post", return_value=fake):
+        result = runner.invoke(app, ["app", "deploy", "eapp"])
+    assert result.exit_code == 1
+    output = result.output + str(result.stderr_bytes or b"")
+    assert "can't be scanned" in output
+
+
+# ---------------------------------------------------------------------------
 # git-credential
 # ---------------------------------------------------------------------------
 
@@ -412,8 +510,9 @@ def test_show_prints_the_error_detail():
     """A failed deploy records `state_detail`, and the REST detail endpoint
     already returns it — but `agnes app show` printed only `State: error`,
     so the one recorded explanation stayed invisible on every surface."""
-    fake = _mock_response(200, {"slug": "sapp", "name": "S", "state": "error",
-                                "state_detail": "image_not_found", "url": "/apps/sapp/"})
+    fake = _mock_response(
+        200, {"slug": "sapp", "name": "S", "state": "error", "state_detail": "image_not_found", "url": "/apps/sapp/"}
+    )
     with patch("cli.commands.data_apps.api_get", return_value=fake):
         result = runner.invoke(app, ["app", "show", "sapp"])
     assert result.exit_code == 0
@@ -421,8 +520,9 @@ def test_show_prints_the_error_detail():
 
 
 def test_show_stays_quiet_when_there_is_no_error_detail():
-    fake = _mock_response(200, {"slug": "sapp", "name": "S", "state": "running",
-                                "state_detail": "", "url": "/apps/sapp/"})
+    fake = _mock_response(
+        200, {"slug": "sapp", "name": "S", "state": "running", "state_detail": "", "url": "/apps/sapp/"}
+    )
     with patch("cli.commands.data_apps.api_get", return_value=fake):
         result = runner.invoke(app, ["app", "show", "sapp"])
     assert result.exit_code == 0
