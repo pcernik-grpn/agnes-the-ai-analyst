@@ -38,6 +38,21 @@
         "title": "AddItemRequest",
         "type": "object"
       },
+      "AddManualSiteBody": {
+        "description": "The URL an admin pasted into \"Add a site by URL\" (step 2) \u2014 the SAME\ninput :func:`browse_tree`'s ``?site_url=`` already resolves, just carried\nin a POST body instead of a query param so this call can also persist the\nresult (see :func:`add_manual_site`).",
+        "properties": {
+          "site_url": {
+            "minLength": 1,
+            "title": "Site Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_url"
+        ],
+        "title": "AddManualSiteBody",
+        "type": "object"
+      },
       "AddMemberRequest": {
         "properties": {
           "email": {
@@ -32094,6 +32109,144 @@
           }
         },
         "summary": "Request Extraction Stop",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/manual-sites": {
+      "delete": {
+        "description": "Forget one site previously added by URL (see :func:`add_manual_site`).\nPurely local bookkeeping \u2014 unlike a confirmed scope, a manual site owns\nno collection and no grants, so there is nothing else to reconcile.",
+        "operationId": "remove_manual_site_api_admin_sharepoint_connections__connection_id__manual_sites_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Manual Site",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Resolve a site by URL AND persist it on the connection (2026-09-01 bug\nreport): ``GET .../tree?site_url=`` (the ``Sites.Selected`` escape hatch\ndocumented on :func:`browse_tree`) only ever RESOLVED a site \u2014 the result\nlived in the wizard's own client-side ``spManualSites`` and was reset\nevery time the wizard opened, forcing the admin to re-paste the same URL\non every visit. This route reuses the exact same validation\n(:func:`_parse_site_url`) and resolution (``get_site_by_path``) as that\nquery param, then stores the result on ``config.manual_sites`` \u2014 a plain\nlist of ``{id, name, web_url}`` rows, the same normalized shape\n``get_site_by_path`` already returns \u2014 so a reopen (or a page reload) can\nread it straight back from the connection listing instead of losing it.\n\nIdempotent on the resolved site id: adding the same site twice (the same\nURL, or two URLs that resolve to the same site) replaces its row in\nplace rather than appending a duplicate \u2014 the same \"storage anchor is\nthe id, not what the admin typed\" principle the confirmed-scope\ncollections use (module docstring).",
+        "operationId": "add_manual_site_api_admin_sharepoint_connections__connection_id__manual_sites_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddManualSiteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Manual Site",
         "tags": [
           "admin"
         ]
