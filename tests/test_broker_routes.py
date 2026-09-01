@@ -2072,3 +2072,209 @@ def test_vertex_messages_compat_traversal_model_rejected_400(broker_app, monkeyp
     assert r.status_code == 400
     assert r.json()["detail"]["code"] == "vertex_body_invalid"
     assert _UrlCapturingClient._captured_url == ""  # nothing forwarded
+
+
+# ---------------------------------------------------------------------------
+# Turn-usage counters: the broker accumulates provider-reported usage per
+# chat session (app/chat/turn_usage.py) for EVERY session-bound completion —
+# agent or no agent — so ChatManager can hydrate usage-less engine frames.
+# The llm_usage ledger above stays agent-gated; these are a separate seam.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _fresh_turn_counters():
+    from app.coordination.factory import reset_coordination_for_tests
+
+    reset_coordination_for_tests()
+    yield
+    reset_coordination_for_tests()
+
+
+def _agentless_session_ticket():
+    """A seeded user + chat session with NO bound agent + a broker ticket —
+    the shape a Slack session without a channel binding (or any legacy
+    session) presents to the broker."""
+    tag = uuid.uuid4().hex[:8]
+    email = f"broker_turns_{tag}@test.com"
+    conn = get_system_db()
+    UserRepository(conn).create(id=f"broker_turns_user_{tag}", email=email, name="Turns User")
+    conn.close()
+    session = chat_session_repo().create_session(user_email=email, surface=Surface.WEB)
+    tok = ticket_repo().mint(session.id, "main", ttl_seconds=60)
+    return session.id, tok
+
+
+def test_agentless_completion_feeds_turn_counters(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    """Buffered (JSON) path: an agent-less session's completion — which the
+    llm_usage ledger ignores — still lands on the session's turn counters."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_usage
+
+    session_id, tok = _agentless_session_ticket()
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = _json.dumps(
+        {
+            "id": "m1",
+            "model": "claude-sonnet-5",
+            "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 4,
+            },
+        }
+    ).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": []},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+    assert drain_turn_usage(session_id) == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_tokens": 100,
+        "cache_creation_tokens": 4,
+        "model": "claude-sonnet-5",
+    }
+
+
+def test_agentless_sse_completion_feeds_turn_counters(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    """Streaming path: the passthrough iterator's finally-block mirror must
+    feed the counters too — for agent-less sessions it previously did not
+    even collect the bytes."""
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_usage
+
+    session_id, tok = _agentless_session_ticket()
+    real_cls = httpx.AsyncClient
+
+    class _SSEClient(_StreamShimMixin):
+        def __init__(self, *a, **k):
+            self._real = real_cls(*a, **k) if "transport" in k else None
+
+        async def __aenter__(self):
+            return await self._real.__aenter__() if self._real else self
+
+        async def __aexit__(self, *a):
+            return await self._real.__aexit__(*a) if self._real else False
+
+        async def send(self, req, stream=False):
+            class _R:
+                status_code = 200
+                headers = {"content-type": "text/event-stream"}
+
+                async def aiter_bytes(self):
+                    yield (
+                        b"event: message_start\n"
+                        b'data: {"type":"message_start","message":{"model":"claude-sonnet-5",'
+                        b'"usage":{"input_tokens":11,"output_tokens":0}}}\n\n'
+                    )
+                    yield (b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}\n\n')
+
+                async def aclose(self):
+                    pass
+
+            return _R()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _SSEClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": [], "stream": True},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+
+    drained = drain_turn_usage(session_id)
+    assert drained is not None
+    assert drained["input_tokens"] == 11
+    assert drained["output_tokens"] == 7
+    assert drained["model"] == "claude-sonnet-5"
+
+
+def test_count_tokens_does_not_feed_turn_counters(broker_app, e2e_env, _fresh_turn_counters, monkeypatch):
+    """count_tokens spends no tokens (is_completion is False) — even a
+    response body that happens to carry a usage-shaped dict must not count."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+    from app.chat.turn_usage import drain_turn_usage
+
+    session_id, tok = _agentless_session_ticket()
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = _json.dumps({"usage": {"input_tokens": 999}}).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages/count_tokens",
+                headers={"Authorization": f"Bearer {tok}"},
+                json={"model": "claude-sonnet-5", "messages": []},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+    assert drain_turn_usage(session_id) is None
+
+
+def test_agent_session_feeds_both_ledger_and_turn_counters(
+    broker_app, broker_agent_session, _fresh_turn_counters, monkeypatch
+):
+    """An agent-bound session keeps its llm_usage row AND accumulates turn
+    counters — the manager later discards the counters when the frame carries
+    its own usage (the native provider), so both consumers coexist."""
+    import json as _json
+
+    import app.api.broker as broker_mod
+    from app.api.broker_agent_policy import usage_accumulator
+    from app.chat.turn_usage import drain_turn_usage
+    from src.repositories import llm_usage_repo
+
+    ctx = broker_agent_session(model="claude-opus-4-7", token_budget_monthly=100_000)
+    _StubResponseClient.status_code = 200
+    _StubResponseClient.body = _json.dumps(
+        {"id": "m1", "model": "claude-opus-4-7", "usage": {"input_tokens": 11, "output_tokens": 7}}
+    ).encode()
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _StubResponseClient)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+
+    async def _run():
+        transport = httpx.ASGITransport(app=broker_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return await c.post(
+                "/api/broker/anthropic/v1/messages",
+                headers={"Authorization": f"Bearer {ctx['tok']}"},
+                json={"model": "claude-opus-4-7", "messages": []},
+            )
+
+    r = asyncio.run(_run())
+    assert r.status_code == 200, r.text
+
+    usage_accumulator.flush()
+    assert len(llm_usage_repo().list_for_agent(ctx["agent_id"])) == 1
+    drained = drain_turn_usage(ctx["session_id"])
+    assert drained is not None and drained["input_tokens"] == 11
