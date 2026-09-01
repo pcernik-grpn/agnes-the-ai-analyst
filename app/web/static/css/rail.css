@@ -192,7 +192,18 @@ html[data-ui-layout="rail"] .rail-logo-row {
     align-items: center;
     justify-content: space-between;
     gap: 6px;
-    padding: 6px 8px 14px;
+    /* Named because `#rail-toggle` is a STATIC flex child here and an
+       ABSOLUTE one in the collapsed strip, and the two have to centre on the
+       same band or the control moves the instant the class flips. A flex
+       child centres in the CONTENT box; an absolute child inset `top: 0;
+       bottom: 0` centres in the PADDING box, and this row's padding is
+       asymmetric (6 top, 14 bottom) — so the toggle rose 4px on every click
+       while the row around it stood still, which reads as a rendering
+       glitch rather than a state change (#1956 item 4). Both rules take the
+       band from these two, so neither can drift from the other again. */
+    --rail-logo-row-pt: 6px;
+    --rail-logo-row-pb: 14px;
+    padding: var(--rail-logo-row-pt) 8px var(--rail-logo-row-pb);
     flex-shrink: 0;
 }
 
@@ -2121,8 +2132,10 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        the toggle is visible at rest and has no animation to be part of. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-toggle {
         position: absolute;
-        top: 0;
-        bottom: 0;
+        /* The row's own content band — see `--rail-logo-row-pt/pb` at the top
+           of this file for why this is not `top: 0; bottom: 0`. */
+        top: var(--rail-logo-row-pt);
+        bottom: var(--rail-logo-row-pb);
         right: 0;
         left: auto;
         margin: auto 0;
@@ -2296,7 +2309,10 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        this toggle is visible at REST in a 56px strip, with the orb hidden behind
        it, so the middle of the slot is the only place it belongs. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-toggle {
-        inset: 0;
+        /* Same content band as the desktop rule — only the horizontal
+           anchoring differs. */
+        top: var(--rail-logo-row-pt);
+        bottom: var(--rail-logo-row-pb);
         right: auto;
         left: 0;
         margin: auto;
