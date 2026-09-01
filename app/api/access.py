@@ -269,10 +269,11 @@ async def access_overview(
     # on them fails with 409 `cannot_revoke_system_grant`.
     #
     # One set lookup answers it for the case that exists today. This is
-    # deliberately NOT a general provenance column (that is stage 1 of
-    # docs/superpowers/specs/2026-09-01-access-surface-rethink.md, and needs a
-    # schema change): it is the one externally-owned grant kind the product
-    # currently has, named where the page can act on it.
+    # deliberately NOT a general provenance column — that would need a schema
+    # change and would have to cover the other nine surfaces that write grants
+    # (see the design note in the companion PR). This is the one
+    # externally-owned grant kind the product currently has, named where the
+    # page can act on it.
     try:
         from src.repositories import marketplace_plugins_repo
 

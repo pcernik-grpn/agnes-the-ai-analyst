@@ -3618,8 +3618,8 @@
      Translated here rather than at the call sites: all three of them already
      print `err.message`, so one honest message serves every path. The wider
      fix — recording WHICH surface wrote each grant, so the page can say this
-     without a hardcoded case — is stage 1 of
-     docs/superpowers/specs/2026-09-01-access-surface-rethink.md. */
+     without a hardcoded case — is argued for in the companion design-note
+     PR, and needs a schema change this does not. */
   const GRANT_REFUSALS = {
     cannot_revoke_system_grant:
       "this plugin is marked Required, which grants it to every group. "
