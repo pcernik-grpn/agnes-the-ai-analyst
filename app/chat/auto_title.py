@@ -122,8 +122,9 @@ _REQUEST_PREFIX = "Write a title for the conversation that begins with the messa
 _REQUEST_SUFFIX = "\n</first_message>\n\nTitle:"
 # A message that itself contains the delimiter would let its author close the
 # data block early and address the model directly; strip the tag rather than
-# trust it.
-_DELIMITER_TAG = re.compile(r"</?first_message>", re.IGNORECASE)
+# trust it. Tolerant of whitespace inside the tag ("</first_message >",
+# "< / first_message>") so the obvious variants don't slip past.
+_DELIMITER_TAG = re.compile(r"<\s*/?\s*first_message\s*>", re.IGNORECASE)
 
 
 def _title_request(user_message: str) -> str:
@@ -334,7 +335,7 @@ def _generate_title_sync(
             messages=[{"role": "user", "content": _title_request(user_message)}],
         )
     except Exception:
-        logger.exception("auto-title Haiku call failed; keeping default title")
+        logger.exception("auto-title model call failed; returning no title (the caller falls back)")
         return None
     parts: list[str] = []
     for block in getattr(resp, "content", []) or []:

@@ -4214,8 +4214,10 @@ class ChatManager:
 
         All errors are caught and logged — title generation is a
         cosmetic enhancement, not a load-bearing piece of the chat
-        pipeline. But "cosmetic" is not "optional": a session that has a
-        message always ends up with SOME title (TCRD-290)."""
+        pipeline. Best-effort, but with a floor: when the model path yields
+        nothing the fallback title is used, so a session with a message ends
+        up titled unless persisting the title itself fails or the task is
+        cancelled mid-flight (TCRD-290)."""
         from app.chat.auto_title import fallback_title, generate_title
 
         try:
