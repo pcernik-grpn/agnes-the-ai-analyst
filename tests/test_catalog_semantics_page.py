@@ -1616,3 +1616,58 @@ class TestEveryRowDeclaresItsBucket:
         assert "|| 'models'" not in fn
         assert "if (!tab) return;" in fn
 
+
+class TestTheToolbarsRemainingControls:
+    """Three things a reader expected the toolbar to do and it did not."""
+
+    def test_the_list_can_be_sorted_both_ways(self, seeded_app):
+        """It opened alphabetical, said so nowhere, and could not be reversed.
+        Two options only: these rows carry no date and no size, so a "recently
+        added" option would be a control with nothing behind it."""
+        _make_metric()
+        body = seeded_app["client"].get(
+            "/semantic-layer?tab=all_metrics", headers=_auth(seeded_app["admin_token"])
+        ).text
+        assert 'id="sl-sort"' in body
+        assert 'value="name_asc"' in body and 'value="name_desc"' in body
+        # …and the key the engine sorts on is actually on the rows.
+        row = body.split('data-tab="all_metrics"', 1)[1].split(">", 1)[0]
+        assert "data-name=" in row, row
+
+    def test_a_deep_linked_query_survives_the_first_paint(self):
+        """It did not: `syncUrl()` ran on the engine's first apply() with an
+        empty box and replaceState'd `q` straight out of the address, so the
+        read at the end of the file found nothing. Reloading a filtered link
+        gave the whole list with the query sitting in the box, describing a
+        filter that was not applied."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        read_at = tpl.index("const INITIAL_Q")
+        writes_at = tpl.index("function syncUrl()")
+        assert read_at < writes_at, "the query must be read before anything can rewrite the URL"
+        assert "box.value = INITIAL_Q" in tpl
+
+    def test_clear_all_clears_the_search_too(self):
+        """It cleared the FACETS and left the box holding a query the reader had
+        just asked to be rid of — so the list stayed narrowed and the button
+        looked broken. Delegated, because the engine rebuilds that button."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert "e.target.closest('.fbar-chips__clear')" in tpl
+        blk = tpl.split("e.target.closest('.fbar-chips__clear')", 1)[1].split("});", 1)[0]
+        assert "box.value = ''" in blk
+
+    def test_a_model_card_states_all_of_its_counts(self, seeded_app):
+        """Three chips at 11ch each turned five counts into "2 datasets ·
+        2 metrics · 2 constrai…" plus a "+2". Counts are prose and belong in
+        the meta line; the dialect is a label and belongs in the chip."""
+        _seed_model()
+        body = seeded_app["client"].get(
+            "/semantic-layer", headers=_auth(seeded_app["admin_token"])
+        ).text
+        assert "fbar-card__tag--more" not in body, "no counts hidden behind a +N"
+        meta = body.split('class="fbar-card__meta"', 1)[1].split("</p>", 1)[0]
+        assert "dataset" in meta, meta
+

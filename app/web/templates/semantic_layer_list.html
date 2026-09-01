@@ -79,6 +79,18 @@
     </div>
   </div>
   {% endif %}
+  {# A–Z / Z–A. The list opened alphabetical and offered no way to say so or to
+     reverse it — the Library has had a sort control since it shipped, and a
+     reader who scrolled to the bottom of 21 metrics had no way back up by
+     name. Two options only: there is no date on these rows and no size, so
+     "recently added" would be a control with nothing behind it. #}
+  <label class="sl-sort">
+    <span class="sl-sort__label">Sort</span>
+    <select id="sl-sort" aria-label="Sort definitions">
+      <option value="name_asc">A → Z</option>
+      <option value="name_desc">Z → A</option>
+    </select>
+  </label>
 </div>
 {# Chips under the bar that set them, THEN the tabs. The order is the claim:
    everything above narrows the whole page, and the tabs below split what
@@ -152,6 +164,10 @@
    sizing — same page-specific-override pattern as admin_data_packages'
    own `.adp-grid`. */
 .sl-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+/* The counts are the card's substance here, so they wrap rather than ellipse.
+   Platform-wide `.fbar-card__meta` is one nowrap line, which is right for a
+   path or a dialect and wrong for five facts. */
+.sl-grid .fbar-card__meta { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.45; }
 
 /* An invalid document is still a real card, flagged rather than styled
    away — an attribute selector rather than a second class on the `<article>`
@@ -188,6 +204,17 @@
    under the same toolbar. */
 .sl-flat { display: flex; flex-direction: column; gap: 0; }
 .sl-fbar { margin: 0; }
+/* The sort control sits at the far end of the bar, after the Filter button —
+   the Library's order, so the two bars read the same left to right. */
+.sl-sort { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.sl-sort__label { font-size: 12.5px; color: var(--ds-text-muted); }
+.sl-sort select {
+    height: 34px; padding: 0 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--radius-md, 8px);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+    font: inherit; font-size: 13px; cursor: pointer;
+}
+.sl-sort select:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
 /* Chips clear of the bar that SET them: butted against it they read as a second
    row of the control rather than as its result. Scoped to the page's own chip
    row (not `.sl-flat`'s, which is inside a bucket) — the row lives above the
@@ -486,20 +513,29 @@
        as a stray attribute and `indexOf` still matched most queries — which is
        how it survived being screenshotted. `replace` takes a str and returns a
        str, so the concatenation stays plain and `| safe` emits it once. #}
+    {# What the model CONTAINS goes in the card's META line, and the dialect —
+       one short label — becomes its chip. It was the other way round, and the
+       counts did not fit: the card renders three chips at 11ch each, so a model
+       with all five kinds came out as "2 datasets · 2 metrics · 2 constrai…"
+       with the rest behind a "+2". Counts are prose, a dialect is a label; each
+       now sits in the slot shaped for it.
+
+       Only what the model HAS — a zero spent a slot saying a thing is absent. #}
+    {% set _counts = [
+         m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's') if m.counts.datasets else None,
+         m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's') if m.counts.metrics else None,
+         m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's') if m.counts.constraints else None,
+         m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's') if m.counts.relationships else None,
+         m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's') if m.counts.glossary else None,
+       ] | reject('none') | list %}
     {% set _card = {
          'kind': 'data',
          'title': m.name,
          'href': '/semantic-layer/' ~ m.slug,
          'description': m.description or '',
-         'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
-         'tags': [] if _is_invalid else [
-             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's') if m.counts.datasets else None,
-             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's') if m.counts.metrics else None,
-             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's') if m.counts.constraints else None,
-             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's') if m.counts.relationships else None,
-             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's') if m.counts.glossary else None,
-         ] | reject('none') | list,
-         'attrs': ('data-tab="models" data-ft="'
+         'meta': _counts | join(' · '),
+         'tags': [] if _is_invalid else (m.dialects or []),
+         'attrs': ('data-tab="models" data-name="' ~ ((m.name or '') | lower | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;')) ~ '" data-ft="'
                    ~ ((m.name ~ ' ' ~ (m.description or '')) | lower
                       | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
                    ~ '"' ~ (' data-status="invalid"' if _is_invalid else '')),
@@ -556,6 +592,7 @@
 <div class="sl-scroll" id="metrics-list">
     {% for m in metric_rows %}
         <div class="sl-item" data-tab="all_metrics"
+             data-name="{{ (m.display_name or m.name or '') | lower }}"
              data-ft="{{ ((m.name or '') ~ ' ' ~ (m.display_name or '') ~ ' ' ~ (m.description_text or '') ~ ' ' ~ ((m.synonyms or []) | join(' '))) | lower }}"
              data-model="{{ m.facet_model }}"
              data-domain="{{ m.facet_domain }}"
@@ -641,6 +678,7 @@
 <div class="sl-scroll" id="glossary-list">
     {% for t in glossary_terms %}
         <div class="sl-item" data-tab="all_glossary"
+             data-name="{{ (t.term or '') | lower }}"
              data-ft="{{ ((t.term or '') ~ ' ' ~ (t.definition_text or '') ~ ' ' ~ ((t.see_also or []) | join(' ')) ~ ' ' ~ (t.defined_in_label or '')) | lower }}"
              data-model="{{ t.facet_model }}"
              data-source="{{ t.facet_source }}"
@@ -863,6 +901,7 @@
             facets: SL_FACETS.filter(f => present.has(f.key)),
             segments: { container: '#sl-tabs', attr: 'data-tab' },
             filterBtn: '#sl-filter-btn', menu: '#sl-filter-menu', chips: '#sl-chips',
+            sort: { el: '#sl-sort', keys: { name: 'data-name' } },
             count: { el: '#sl-count', noun: 'item' },
             noResults: '#sl-noresults',
             onApply: () => {
@@ -893,6 +932,13 @@
     //    replaceState there "walked you out of the page". replaceState for the
     //    QUERY, because pushing per keystroke would bury the page in history.
     let urlTab = new URLSearchParams(location.search).get('tab') || 'models';
+
+    // Read BEFORE anything can rewrite it. This used to run at the end of the
+    // file, by which time the engine's first apply() had already called
+    // syncUrl() with an empty box — which replaceState'd `q` straight out of
+    // the address. Reload a filtered link and you got the whole list with the
+    // query sitting in the box, describing a filter that was not applied.
+    const INITIAL_Q = new URLSearchParams(window.location.search).get('q') || '';
 
     function syncUrl() {
         const active = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
@@ -1042,6 +1088,29 @@
         });
     }
 
+    // Typed into the box before the first paint, so the engine's own apply()
+    // filters on it rather than being corrected afterwards.
+    (function () {
+        const box = document.getElementById('sl-search');
+        if (INITIAL_Q && box) {
+            box.value = INITIAL_Q;
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    })();
+
+    // "Clear all" sits in the chip row and clears the FACETS — leaving the
+    // search box holding a query the reader just asked to be rid of, so the
+    // list stayed narrowed and the button looked broken. One gesture clears
+    // the toolbar. Delegated, because the engine rebuilds that button.
+    document.getElementById('sl-chips').addEventListener('click', (e) => {
+        if (!e.target.closest('.fbar-chips__clear')) return;
+        const box = document.getElementById('sl-search');
+        if (box && box.value) {
+            box.value = '';
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    });
+
     showActiveBucket();
     refreshTabCounts();
     syncBucketState();
@@ -1052,14 +1121,6 @@
     // rather than one entry in an unfiltered list. Read once on load and typed
     // into the engine's own box, so there is one search on this page and the
     // URL is not rewritten as the reader types.
-    const initialQuery = new URLSearchParams(window.location.search).get('q');
-    if (initialQuery) {
-        const box = document.getElementById('sl-search');
-        if (box) {
-            box.value = initialQuery;
-            box.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-    }
 })();
 </script>
 {% endblock %}
