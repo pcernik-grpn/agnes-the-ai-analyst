@@ -567,6 +567,7 @@ a.cowork-plugin-row:hover { border-color: var(--ds-primary); background: var(--d
         <li><a href="#cli" title="Terminal &amp; data"><span class="hiw-toc-label">Terminal &amp; data</span><span class="hiw-toc-tick" aria-hidden="true"></span></a></li>
         <li><a href="#first-run" title="Your first session"><span class="hiw-toc-label">Your first session</span><span class="hiw-toc-tick" aria-hidden="true"></span></a></li>
         <li><a href="#privacy" title="Where your data goes"><span class="hiw-toc-label">Where your data goes</span><span class="hiw-toc-tick" aria-hidden="true"></span></a></li>
+        <li><a href="#usage" title="Your usage &amp; cost"><span class="hiw-toc-label">Your usage &amp; cost</span><span class="hiw-toc-tick" aria-hidden="true"></span></a></li>
         <li><a href="#reference" title="Reference &amp; help"><span class="hiw-toc-label">Reference &amp; help</span><span class="hiw-toc-tick" aria-hidden="true"></span></a></li>
       </ol>
       {# Only destinations the new UI actually carries. "Advanced guide"
@@ -1315,6 +1316,53 @@ a.cowork-plugin-row:hover { border-color: var(--ds-primary); background: var(--d
         <div class="hiw-priv-row">
           <span class="hiw-priv-mark" aria-hidden="true">&check;</span>
           <div><strong>You can go off the record.</strong> Run <span class="aic-code">/agnes-private</span> in Claude Code to disable telemetry for that session &mdash; nothing from it reaches the catalog.</div>
+        </div>
+      </div>
+        </div>
+      </details>
+    </section>
+
+    {# ── #usage — what the instance records about your work ──────────
+       Sits right after #privacy on purpose: privacy says what travels,
+       this says what is counted. The runbook-level SQL recipes live with
+       the `agnes-usage` data package (its Library card carries when-to-use
+       guidance); this section is the durable, linkable summary. #}
+    <section class="hiw-sec" id="usage">
+      <details class="hiw-fold">
+        <summary>
+          <div>
+            <p class="aic-eyebrow">Accountability</p>
+            <h2>Your usage &amp; cost</h2>
+            <p class="hiw-lede">{{ instance_brand_short }} keeps score of what your sessions spend &mdash; per session and per assistant turn, prompt cache included. You see your own numbers; admins see everyone&rsquo;s. Open for where to look and how to query it.</p>
+          </div>
+          <span class="aic-chev">{{ ico.icon('chevron', 20) }}</span>
+        </summary>
+        <div class="hiw-fold-body">
+      <div class="aic-card">
+        <div class="hiw-priv-row">
+          <span class="hiw-priv-mark" aria-hidden="true">&check;</span>
+          <div><strong>What&rsquo;s recorded.</strong> One row per session and one per assistant turn: input and output tokens, prompt-cache reads and writes, the model, and the surface it happened on (Claude Code, web chat, Slack&hellip;) &mdash; plus every tool and skill invocation. Uploaded sessions are counted within seconds of arriving; chat turns as they happen.</div>
+        </div>
+        <div class="hiw-priv-row">
+          <span class="hiw-priv-mark" aria-hidden="true">&check;</span>
+          <div><strong>See it on one page.</strong> <a href="/me/activity">My activity</a> shows your sessions, token totals by day and by model, and what that is worth in dollars &mdash; an estimate computed from the instance&rsquo;s model rates at read time, not a bill.</div>
+        </div>
+        <div class="hiw-priv-row">
+          <span class="hiw-priv-mark" aria-hidden="true">&check;</span>
+          <div><strong>Query it like any other data.</strong> The <span class="aic-code">agnes-usage</span> data package carries <span class="aic-code">agnes_sessions</span> and per-turn <span class="aic-code">agnes_turns</span>, with <span class="aic-code">agnes_telemetry</span> and <span class="aic-code">agnes_audit</span> beside them. Ask your admin for the package, then compare &mdash; say &mdash; chat against your local Claude Code:</div>
+        </div>
+      </div>
+      <div class="aic-term">
+        <div class="aic-term-head"><span class="aic-term-file">terminal</span><button type="button" class="aic-term-copy" data-copy="#usage-example">{{ ico.icon('doc', 13) }} Copy</button></div>
+        <pre class="aic-term-body" id="usage-example">agnes query "SELECT CASE WHEN session_file LIKE '%chat-%' THEN 'chat' ELSE 'local' END AS kind,
+  COUNT(*) AS sessions, SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+  SUM(cache_read_tokens) AS cache_read
+FROM agnes_sessions GROUP BY 1"</pre>
+      </div>
+      <div class="aic-card">
+        <div class="hiw-priv-row">
+          <span class="hiw-priv-mark is-flow" aria-hidden="true">&rarr;</span>
+          <div><strong>Counts, never content.</strong> These tables are filtered to your own rows by construction &mdash; the same query in an admin&rsquo;s hands reports the whole instance &mdash; and they carry token counts and metadata only. Transcripts stay admin-side, and <span class="aic-code">/agnes-private</span> sessions never enter the ledger at all.</div>
         </div>
       </div>
         </div>
