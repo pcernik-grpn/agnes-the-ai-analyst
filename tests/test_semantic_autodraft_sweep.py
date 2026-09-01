@@ -19,6 +19,8 @@ system-identity/surface wiring) can only run against Postgres and lives in
 
 from __future__ import annotations
 
+import pytest
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
@@ -32,6 +34,11 @@ class TestRequiresAdmin:
 
 
 class TestRequiresPostgresBackend:
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
     def test_duckdb_backend_fails_clean_with_a_typed_501(self, seeded_app):
         """A3 PG-first ratchet: on a DuckDB-backend instance the dedup
         column this sweep depends on doesn't exist, so the endpoint must

@@ -67,6 +67,7 @@ from app.api.broker_vertex import (
 )
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
+from app.chat.turn_usage import add_turn_usage
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -1154,7 +1155,12 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         # ledger and per-agent monthly budgets never fire. Running in
         # ``finally`` also catches a client disconnect mid-stream: the
         # partial body still carries ``message_start``'s input tokens.
-        collect_usage = agent_row is not None and resp.status_code == 200
+        # Turn-usage counters (app/chat/turn_usage.py) are recorded for ANY
+        # session-bound completion — the agent gate below is only for the
+        # llm_usage budget ledger. Without this, an agent-less session's
+        # bytes were never even mirrored for parsing.
+        turn_session_id = row.get("session_id") if is_completion else None
+        collect_usage = (agent_row is not None or turn_session_id is not None) and resp.status_code == 200
         collected = bytearray()
         state = {"overflow": False}
 
@@ -1174,13 +1180,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                     try:
                         if state["overflow"]:
                             logger.warning(
-                                "SSE usage recording skipped for agent %s: stream exceeded %d bytes",
-                                agent_row.get("id"),
+                                "SSE usage recording skipped for session %s: stream exceeded %d bytes",
+                                row.get("session_id"),
                                 _SSE_USAGE_COLLECT_MAX_BYTES,
                             )
                         else:
                             usage = parse_usage(bytes(collected), ctype)
-                            if usage:
+                            if usage and agent_row is not None:
                                 usage_accumulator.add(
                                     {
                                         **usage,
@@ -1192,6 +1198,8 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                                     },
                                     budget_ttl_s=budget_ttl_s,
                                 )
+                            if usage and turn_session_id:
+                                add_turn_usage(turn_session_id, usage)
                     except Exception:
                         logger.exception(
                             "llm usage recording failed for agent %s (stream already forwarded)",
@@ -1226,10 +1234,13 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # llm_usage ledger — never one synchronous write per LLM call) rather
     # than written here. Must never break the response path: any parse/add
     # failure is caught and logged, not raised.
-    if agent_row is not None and resp.status_code == 200:
+    turn_session_id = row.get("session_id") if is_completion else None
+    if (agent_row is not None or turn_session_id is not None) and resp.status_code == 200:
         try:
             usage = parse_usage(resp.content, resp.headers.get("content-type", ""))
-            if usage:
+            if usage and turn_session_id:
+                add_turn_usage(turn_session_id, usage)
+            if usage and agent_row is not None:
                 usage_accumulator.add(
                     {
                         **usage,

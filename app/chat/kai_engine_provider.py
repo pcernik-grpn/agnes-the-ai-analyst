@@ -63,9 +63,12 @@ engine's own store rather than a restore-context upload (``stage_file`` is
 deliberately not implemented).
 
 Known limitations, stated rather than implied (also in docs/cloud-chat.md):
-the engine does not surface token usage on its stream, so
-``chat.daily_anthropic_spend_usd`` / ``chat.max_session_tokens`` do not meter
-engine sessions (message-rate and concurrency caps still apply); agent
+the engine does not surface token usage on its stream, but every engine LLM
+call transits the broker, whose per-session turn counters
+(``app/chat/turn_usage.py``) hydrate the usage-less assistant frame at
+persist — so ``chat.daily_anthropic_spend_usd`` and
+``chat.max_session_tokens`` DO meter engine sessions now, from
+broker-observed (provider-reported) usage; agent
 personas and memories DO reach an engine turn — ``GET /api/kai/workspace``
 packs them into the per-session tarball (``_agent_workspace_members``) and a
 scoped agent's tools resolve to a live ``AgentPrincipal`` at

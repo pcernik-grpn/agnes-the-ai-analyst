@@ -18,6 +18,8 @@ exists to serve it.
 
 from __future__ import annotations
 
+import pytest
+
 _SUBMIT = "/api/semantic-feedback"
 _QUEUE = "/api/admin/semantic-feedback"
 
@@ -72,6 +74,11 @@ class TestTheQueueIsAdminOnly:
 class TestTheDuckDbInstanceFailsClean:
     """Not "does not work" — fails in the ONE documented way the parity
     sweeps' ``assert_pg_only_exemptions_fail_clean`` accepts."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
 
     def test_submit_answers_a_typed_501_even_with_an_empty_body(self, seeded_app):
         """The PG gate must beat body validation.

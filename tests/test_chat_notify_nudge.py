@@ -50,7 +50,9 @@ def test_nudge_is_armed_after_the_onboarding_takeover_check():
     model, so it must not start a clock. Arming has to sit after that check and
     before the runner-ready wait (a slow runner IS worth being pinged about)."""
     js = _chat_js()
-    takeover = js.index("if (await onboardingOnUserMessage(text, {}))")
+    # `rawText`, not `text`: a turn carrying a pasted attachment appends the
+    # file line to `text`, and the gap resolver matches on what was typed.
+    takeover = js.index("if (await onboardingOnUserMessage(rawText, {}))")
     armed = js.index("onboardingNoteTurnStarted()")
     ready_wait = js.index("serverReadyPromise,")
     assert takeover < armed < ready_wait

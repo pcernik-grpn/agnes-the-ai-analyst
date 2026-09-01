@@ -1687,9 +1687,16 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   cursor: pointer;
   text-align: left;
 }
-.cloud-chat-next-action:hover {
+.cloud-chat-next-action:hover:not([disabled]) {
   border-color: var(--ds-primary);
   color: var(--ds-primary);
+}
+/* Drawn mid-stream: the follow-ups are on screen the moment the trailer
+   closes, but the turn is still running and a click would submit into it.
+   Muted and inert until finalize re-renders the row enabled. */
+.cloud-chat-next-action[disabled] {
+  color: var(--ds-text-muted);
+  cursor: default;
 }
 .cloud-chat-next-action:focus-visible {
   outline: var(--ds-focus-outline);
@@ -3116,6 +3123,90 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 @keyframes cloudchat-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .cloud-chat-upload-spinner { animation: none; }
+}
+
+/* ---- Composer attachments (pasted screenshots) -------------------------
+   A wrapping chip row directly ABOVE the composer pill, inside the form.
+   Hidden (via the [hidden] attribute chat.js toggles) until something is
+   pasted, so it costs no vertical space in the common case.
+
+   `grid-column: 1 / -1` is for the DEFAULT layout only, where .cloud-chat-form
+   is a two-column grid: without it the strip would take the textarea's cell
+   and push the input into the second row. Under rail the form is display:block
+   and the property is simply inert. */
+.cloud-chat-attachments {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-1);
+}
+.cloud-chat-attachments[hidden] { display: none; }
+
+.cloud-chat-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 4px 4px 6px;
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  color: var(--ds-text-secondary);
+  font-size: var(--text-sm);
+}
+.cloud-chat-attachment[data-state="error"] {
+  border-color: var(--ds-accent-danger-line);
+  color: var(--ds-accent-danger-ink);
+  background: var(--ds-accent-danger-bg);
+}
+.cloud-chat-attachment[data-state="uploading"] { opacity: 0.75; }
+
+.cloud-chat-attachment-thumb {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  object-fit: cover;
+  background: var(--ds-surface-sunken);
+}
+/* The no-preview case (a PDF, a CSV): the extension IS the icon. */
+.cloud-chat-attachment-thumb.is-generic {
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ds-text-muted);
+}
+
+.cloud-chat-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-chat-attachment-remove {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: var(--ds-radius-pill);
+  background: transparent;
+  color: var(--ds-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+}
+.cloud-chat-attachment-remove:hover {
+  background: var(--ds-surface-sunken);
+  color: var(--ds-text-primary);
+}
+.cloud-chat-attachment-remove:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
 }
 
 /* ---- Active-conversation chrome (rail) --------------------------------

@@ -227,6 +227,31 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("Checked first, explained after."),
         {"type": "finish"},
     ],
+    # The production TAIL, reproduced. Every sandbox answer now ends with the
+    # two wire-format trailers the runner's system prompt mandates
+    # (``app/chat/runner.py::_NEXT_ACTIONS_CONTRACT``), and no other shape
+    # here emits either — so the one turn shape the client spends the most
+    # delicate code on (withhold a half-open fence, draw the chips the moment
+    # it closes, strip both before markdown) could not be exercised locally
+    # at all. ``next_actions`` comes BEFORE ``sources``, as the contract asks.
+    # Split across several deltas on purpose: at the stub's step delay that
+    # puts real time between "the chips are knowable" and ``finish``, which
+    # is exactly the window the mid-stream render exists to fill.
+    "nextactions": [
+        _text("Revenue last month was **4.2M CZK**, up 8% on the month before.\n\n"),
+        _tool_call("call_na", "Bash", {"command": 'agnes query "SELECT sum(total) FROM orders"'}),
+        _tool_output("call_na", "| revenue |\n|---|\n| 4200000 |"),
+        _text("\n\nThe growth is concentrated in the CZ market.\n\n"),
+        _text("```next_actions\n"),
+        _text("- Break revenue down by country\n"),
+        _text("- Chart the last 90 days\n"),
+        _text("```\n\n"),
+        _text("```sources\n"),
+        _text("table: orders\n"),
+        _text("assumption: paid orders only\n"),
+        _text("```"),
+        {"type": "finish"},
+    ],
     "markdown": [
         _text("Here is a table the model wrote itself:\n\n"),
         _tool_call("call_md", "Bash", {"command": "agnes catalog"}),
@@ -248,7 +273,9 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("You said something I have no script for, so here is the default turn. "),
         _tool_call("call_d", "server_info", {}),
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
-        _text("\n\nTry `interleaved`, `table`, `fail`, `approval`, `error`, `markdown` or `deliverable`."),
+        _text(
+            "\n\nTry `interleaved`, `table`, `fail`, `approval`, `error`, `markdown`, `nextactions` or `deliverable`."
+        ),
         {"type": "finish"},
     ],
 }

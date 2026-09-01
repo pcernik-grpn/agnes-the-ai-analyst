@@ -698,7 +698,7 @@ function renderFactsScopeLine(bubble) {
   _resetFactsTurnEvidence();
 }
 
-function renderNextActions(bubble, actions) {
+function renderNextActions(bubble, actions, pending = false) {
   _clearNextActions();
   if (!bubble || !actions || actions.length === 0) return;
   const row = document.createElement("div");
@@ -708,7 +708,20 @@ function renderNextActions(bubble, actions) {
     btn.type = "button";
     btn.className = "cloud-chat-next-action";
     btn.textContent = action;
+    // `pending` is the mid-stream draw: the trailer has closed but the turn
+    // has not. Showing the row there is the point — the reader learns the
+    // follow-ups exist while the tail is still arriving — but CLICKING it
+    // must not be possible yet. The click submits, submitUserMessage has no
+    // in-flight guard (typing into the composer mid-turn is already allowed
+    // and the runner buffers the second user_msg), and it calls
+    // _resetStreamingState(), which drops the stream pointers: the old
+    // turn's remaining frames — the sources verdict, the final
+    // assistant_message — would then land in a fresh bubble BELOW the new
+    // user message. Finalize re-renders this same row enabled a moment
+    // later. (Copilot review on this PR.)
+    btn.disabled = pending;
     btn.addEventListener("click", () => {
+      if (btn.disabled) return;
       const ta = $("chat-input");
       if (!ta) return;
       ta.value = action;
@@ -2192,6 +2205,11 @@ function handleFrame(frame) {
       // Co fields are optional — an older server that never sends this frame
       // degrades gracefully (renderParticipants with empty list is a no-op).
       renderParticipants(frame.participants || []);
+      // A co-session runs in an EPHEMERAL sandbox with no link to anyone's
+      // personal workspace (SR-6, prepare_ephemeral_session_dir) — so an
+      // upload has no path there. ``participant_emails`` is empty for a solo
+      // session, which makes a non-empty roster the co-drive signal.
+      ChatAttachments.setCoDrive((frame.participants || []).length > 0);
       break;
     case "full_refresh":
       // wave-2F task 3: the server couldn't confidently replay everything
@@ -2930,6 +2948,24 @@ function _renderStreamingMarkdown() {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
   } catch (_e) {
     currentAssistantBody.textContent = visible;
+  }
+  // The chips do not have to wait for the turn to end. The trailer streams
+  // inside THIS answer, so the moment its closing fence arrives the buttons
+  // are already knowable — and what sits between that moment and the
+  // `assistant_message` frame is the entire turn close: whatever the model
+  // still has to write, the SDK's ResultMessage, the manager's persist and
+  // fan-out. That was seconds of a blinking caret with nothing to show for
+  // it. Drawing here is what the kai-agent turn engine's own client does:
+  // it reads next_actions off the streaming message, not off a finished one.
+  //
+  // Idempotent by construction: renderNextActions clears the existing row
+  // before it draws, and finalize renders the identical row from the
+  // server's content — so a repaint, a seal, and the final frame all
+  // converge on one row. Guarded on a non-empty list so a paint mid-trailer
+  // (nothing parseable yet) never clears a row that is already up.
+  const streamedActions = extractNextActions(currentAssistantText).actions;
+  if (streamedActions.length) {
+    renderNextActions(currentAssistantBody.closest(".msg-bubble"), streamedActions, true);
   }
   maybeScrollToBottom();
 }
@@ -4667,7 +4703,16 @@ async function ensureWsReady() {
 }
 
 async function submitUserMessage(text) {
-  if (!text) return;
+  // Attachments pasted into the composer (§5b) ride along with this turn. They
+  // are TAKEN synchronously — the chips clear with the text, in the same tick,
+  // so the composer empties as one thing — and settled further down, once the
+  // socket is up, because by then a paste from a few seconds ago has almost
+  // always finished uploading and the wait costs nothing.
+  const pendingAttachments = ChatAttachments.count() ? ChatAttachments.take() : [];
+  // A screenshot with no words is a complete message ("what is this?" is
+  // implied by sending it), so an empty box is only empty when nothing came
+  // with it.
+  if (!text && !pendingAttachments.length) return;
   // 1. Clear the composer + hide the dashboard SYNCHRONOUSLY so the user
   //    gets immediate visual feedback that their submit was accepted.
   //    Without this they sit watching their typed "ahoj" + the
@@ -4719,6 +4764,9 @@ async function submitUserMessage(text) {
       taFailed.value = text;
       autosizeComposer();
     }
+    // Same reasoning for what was attached: the turn never started, so the
+    // screenshot belongs to the retry, not to the void.
+    ChatAttachments.restore(pendingAttachments);
     // The turn never started, so nothing is settled — hand the picker back
     // with the dashboard. Otherwise a chat backend that is down strands the
     // reader on a label they cannot change and a conversation that never
@@ -4734,10 +4782,29 @@ async function submitUserMessage(text) {
   // bubble armed to swallow this turn's tokens.
   _resetStreamingState();
   _clearNextActions();
+  // Wait for the uploads, then name the files that made it in the message
+  // itself — that line is how the agent learns a file is there at all, and
+  // rendering it means the reader can see it too.
+  const rawText = text;
+  if (pendingAttachments.length) {
+    const { ready, failed } = await ChatAttachments.settle(pendingAttachments);
+    if (failed.length) {
+      showToast(
+        failed.length === 1
+          ? `${failed[0].uploadName} didn't upload — sending without it.`
+          : `${failed.length} attachments didn't upload — sending without them.`,
+        "error",
+        { durationMs: 6000 },
+      );
+    }
+    if (ready.length) text = ChatAttachments.composeText(text, ready);
+  }
   renderMessage({ role: "user", content: text });
   lastUserText = text;
-  if (_promptHistory[_promptHistory.length - 1] !== text) {
-    _promptHistory.push(text);
+  // History stores what the user TYPED. Recalling a prompt must not re-attach
+  // a path to a file this turn already consumed.
+  if (_promptHistory[_promptHistory.length - 1] !== rawText && rawText) {
+    _promptHistory.push(rawText);
   }
   _historyPos = _promptHistory.length;
   _historyDraft = "";
@@ -4749,7 +4816,10 @@ async function submitUserMessage(text) {
   // handled) we skip the model send; the card's CTA calls submitUserMessage
   // again once the Stack is ready.
   try {
-    if (await onboardingOnUserMessage(text, {})) {
+    // rawText, not the composed text: the gap resolver matches on what the
+    // user typed ("add sales"), and an appended attachment line is not part
+    // of that sentence.
+    if (await onboardingOnUserMessage(rawText, {})) {
       $("cancel-btn").hidden = true;
       return;
     }
@@ -5412,6 +5482,410 @@ function renderCoPresence(host, participants) {
   }
   host.appendChild(btn);
 }
+
+// ---------------------------------------------------------------------------
+// §5b Composer attachments — paste a screenshot straight into the chat
+// ---------------------------------------------------------------------------
+// The "+" menu (§6 below) is the deliberate, form-filling path: open a dialog,
+// pick a file, press Upload. That is the wrong shape for the commonest thing
+// people actually attach — a screenshot they took two seconds ago, which lives
+// in the clipboard and nowhere else. Without a paste path the only route is
+// "save it to disk first, then find it in a file picker": eight clicks for a
+// gesture every other chat product answers with Cmd-V.
+//
+// So: Cmd-V anywhere on the page (outside a text field of its own, and outside
+// the upload dialogs, which have their own inputs) takes every FILE on the
+// clipboard, uploads it to the same POST /api/chat/uploads the dialogs use,
+// and parks a chip above the composer. On send, each ready chip appends one
+// line naming the file's path so the agent can open it — see composeText().
+//
+// Where the bytes go, and why the agent can read them: the endpoint writes
+// into the user's workspace ``uploads/`` directory, which WorkdirManager
+// symlinks into every session dir (app/chat/workdir.py). ``uploads/<name>``
+// therefore resolves from the sandbox's working directory, for a file pasted
+// mid-conversation as much as one uploaded before it started.
+const ChatAttachments = (() => {
+  // Mirrors MAX_CHAT_UPLOAD_BYTES in app/api/chat_uploads.py. Checked here so
+  // a 40 MB paste fails instantly against a local number instead of after the
+  // whole body has been pushed up the wire for the server to reject.
+  const MAX_BYTES = 20 * 1024 * 1024;
+  // A composer holds a handful of screenshots, not a photo album. The cap is
+  // about the strip staying readable above the pill.
+  const MAX_ITEMS = 8;
+
+  // Extension → the kind the endpoint takes. Data files (CSV/parquet/Excel)
+  // are routed to kind="data" so a pasted spreadsheet lands as one, not as a
+  // "document" the server refuses on content type.
+  const _DATA_EXTS = ["csv", "parquet", "xlsx", "xls"];
+  // Fallback extension per mime, for the clipboard entries that carry no
+  // usable name at all (a screenshot pastes as a bare "image.png" in Chrome
+  // and as nothing whatsoever in some Linux builds).
+  const _MIME_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/csv": "csv",
+  };
+
+  /** Items currently pinned above the composer, oldest first. */
+  let _items = [];
+  /** True while this conversation is co-driven — see setCoDrive(). */
+  let _coDrive = false;
+  /** Monotonic id + name disambiguator; never reset, so two screenshots
+   *  pasted inside the same second cannot collide on a filename. */
+  let _seq = 0;
+
+  // ── pure helpers (unit-tested through the node harness) ──────────────────
+
+  /** Two-digit zero pad — `String.padStart` on a number needs the cast. */
+  function _pad(n) {
+    return String(n).padStart(2, "0");
+  }
+
+  /** ``YYYYMMDD-HHMMSS`` in local time, from an explicit Date so the name
+   *  derivation is testable without freezing the clock. */
+  function stampFor(date) {
+    return (
+      String(date.getFullYear()) +
+      _pad(date.getMonth() + 1) +
+      _pad(date.getDate()) +
+      "-" +
+      _pad(date.getHours()) +
+      _pad(date.getMinutes()) +
+      _pad(date.getSeconds())
+    );
+  }
+
+  /** The upload's filename, sanitized to what the server accepts.
+   *
+   *  ``_SAFE_FILENAME_RE`` in app/api/chat_uploads.py is a REJECTION rule, not
+   *  a sanitizer: the server 400s a name it does not like rather than fixing
+   *  it. A macOS screenshot is called "Snímek obrazovky 2026-09-01 v 10.15.30.png"
+   *  in Czech and "Bildschirmfoto …" in German — every one of those dies on the
+   *  ASCII-only rule. So the name is rebuilt here: transliterable characters
+   *  are dropped to underscores, the stem is bounded, and the stamp + sequence
+   *  make it unique (two pastes of the browser's generic "image.png" would
+   *  otherwise silently overwrite each other in the workspace).
+   */
+  function safeUploadName(rawName, mime, date, seq) {
+    const name = String(rawName || "");
+    const dot = name.lastIndexOf(".");
+    let ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
+    if (!/^[a-z0-9]{1,8}$/.test(ext)) ext = _MIME_EXT[String(mime || "").toLowerCase()] || "bin";
+    let stem = (dot > 0 ? name.slice(0, dot) : name)
+      .replace(/[^A-Za-z0-9._-]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^[^A-Za-z0-9]+/, "")
+      .slice(0, 60);
+    // "image" is what a clipboard screenshot is called in every browser that
+    // names it at all — a filename that says nothing. Call it what it is.
+    if (!stem || stem.toLowerCase() === "image") stem = "pasted";
+    return `${stem}-${stampFor(date)}-${seq}.${ext}`;
+  }
+
+  /** The ``kind`` form field for this file — the same three-way split the
+   *  media dialog makes, plus the data extensions. */
+  function kindFor(name, mime) {
+    const ct = String(mime || "").toLowerCase();
+    const dot = String(name || "").lastIndexOf(".");
+    const ext = dot > 0 ? String(name).slice(dot + 1).toLowerCase() : "";
+    if (_DATA_EXTS.includes(ext)) return "data";
+    if (ct.startsWith("image/")) return "image";
+    if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return "image";
+    return "document";
+  }
+
+  /** The text actually sent for a turn that carries attachments.
+   *
+   *  One line per file, naming the path the agent can open. It is appended to
+   *  the user's own text (never replacing it) and it is what the user's bubble
+   *  renders too — a reader has to be able to see WHY the agent opened a file,
+   *  and a hidden instruction bolted onto their message is exactly the thing
+   *  that makes an answer look like it came from nowhere.
+   */
+  function composeText(text, files) {
+    const lines = files.map((f) =>
+      f.kind === "image"
+        ? `[Attached image: ${f.path} — open it with the Read tool before answering.]`
+        : `[Attached file: ${f.path} — read it from your working directory before answering.]`
+    );
+    return [String(text || "").trim(), lines.join("\n")].filter(Boolean).join("\n\n");
+  }
+
+  /** Every FILE on a clipboard/drag payload.
+   *
+   *  ``items`` first because Safari populates it for a pasted screenshot while
+   *  leaving ``files`` empty; ``files`` as the fallback for the browsers that
+   *  do the opposite. */
+  function filesFromTransfer(dt) {
+    if (!dt) return [];
+    const out = [];
+    const items = dt.items ? Array.from(dt.items) : [];
+    for (const it of items) {
+      if (it.kind !== "file") continue;
+      const f = it.getAsFile && it.getAsFile();
+      if (f) out.push(f);
+    }
+    if (!out.length && dt.files && dt.files.length) out.push(...Array.from(dt.files));
+    return out;
+  }
+
+  // ── strip rendering ──────────────────────────────────────────────────────
+
+  function _strip() {
+    return $("chat-attachments");
+  }
+
+  function _renderChip(item) {
+    const chip = document.createElement("div");
+    chip.className = "cloud-chat-attachment";
+    chip.dataset.state = item.status;
+
+    if (item.previewUrl) {
+      const img = document.createElement("img");
+      img.className = "cloud-chat-attachment-thumb";
+      img.src = item.previewUrl;
+      img.alt = "";
+      chip.appendChild(img);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "cloud-chat-attachment-thumb is-generic";
+      badge.setAttribute("aria-hidden", "true");
+      const dot = item.uploadName.lastIndexOf(".");
+      badge.textContent = dot > 0 ? item.uploadName.slice(dot + 1, dot + 5) : "file";
+      chip.appendChild(badge);
+    }
+
+    const label = document.createElement("span");
+    label.className = "cloud-chat-attachment-name";
+    // textContent: the name is user-supplied and reaches the DOM as text only.
+    label.textContent = item.uploadName;
+    label.setAttribute("data-tip", item.error || item.uploadName);
+    chip.appendChild(label);
+
+    if (item.status === "uploading") {
+      const spin = document.createElement("span");
+      spin.className = "cloud-chat-upload-spinner";
+      spin.setAttribute("aria-hidden", "true");
+      chip.appendChild(spin);
+    }
+
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "cloud-chat-attachment-remove";
+    rm.setAttribute("aria-label", `Remove ${item.uploadName}`);
+    rm.textContent = "✕";
+    rm.addEventListener("click", () => remove(item.id));
+    chip.appendChild(rm);
+
+    return chip;
+  }
+
+  function _render() {
+    const strip = _strip();
+    if (!strip) return;
+    strip.replaceChildren(..._items.map(_renderChip));
+    strip.hidden = _items.length === 0;
+  }
+
+  // ── upload ───────────────────────────────────────────────────────────────
+
+  async function _upload(item) {
+    try {
+      const fd = new FormData();
+      // The third argument is what the server sees as the filename — this is
+      // where the sanitized name (not the OS's) is bound to the upload.
+      fd.append("file", item.file, item.uploadName);
+      fd.append("kind", item.kind);
+      const res = await fetch("/api/chat/uploads", {
+        method: "POST",
+        body: fd,
+        credentials: "same-origin",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        item.status = "ready";
+        item.path = data.workspace_path || `uploads/${item.uploadName}`;
+      } else {
+        let msg = "Upload failed.";
+        if (res.status === 413) msg = "Too large — max 20 MB per attachment.";
+        else if (res.status === 415) msg = "That file type can't be attached to a chat.";
+        else {
+          try {
+            const j = await res.json();
+            if (j && j.detail) msg = String(j.detail);
+          } catch (_) {
+            /* non-JSON body — keep the generic message */
+          }
+        }
+        item.status = "error";
+        item.error = msg;
+        showToast(`${item.uploadName}: ${msg}`, "error", { durationMs: 6000 });
+      }
+    } catch (err) {
+      item.status = "error";
+      item.error = String(err);
+      showToast(`${item.uploadName}: upload failed.`, "error", { durationMs: 6000 });
+    } finally {
+      _render();
+    }
+  }
+
+  /** Attach one File: park a chip immediately, upload in the background.
+   *  Returns false when the file was rejected before any request was made. */
+  function add(file, now = new Date()) {
+    if (!file) return false;
+    if (_items.length >= MAX_ITEMS) {
+      showToast(`Up to ${MAX_ITEMS} attachments per message.`, "error");
+      return false;
+    }
+    if (file.size > MAX_BYTES) {
+      showToast(`${file.name || "That file"} is over the 20 MB attachment limit.`, "error", {
+        durationMs: 6000,
+      });
+      return false;
+    }
+    _seq += 1;
+    const uploadName = safeUploadName(file.name, file.type, now, _seq);
+    const item = {
+      id: `att-${_seq}`,
+      file,
+      uploadName,
+      kind: kindFor(file.name || uploadName, file.type),
+      status: "uploading",
+      path: null,
+      error: null,
+      previewUrl:
+        String(file.type || "").startsWith("image/") && typeof URL !== "undefined" && URL.createObjectURL
+          ? URL.createObjectURL(file)
+          : null,
+    };
+    item.promise = _upload(item);
+    _items.push(item);
+    _render();
+    return true;
+  }
+
+  function remove(id) {
+    const item = _items.find((i) => i.id === id);
+    if (item && item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    _items = _items.filter((i) => i.id !== id);
+    _render();
+  }
+
+  function count() {
+    return _items.length;
+  }
+
+  /** Hand the pending items to a send and clear the strip in the same tick —
+   *  the composer empties synchronously on submit, and a chip left hanging
+   *  above an empty box reads as "this didn't go". */
+  function take() {
+    const taken = _items;
+    _items = [];
+    _render();
+    return taken;
+  }
+
+  /** Put a taken batch back — the send never happened (chat backend down),
+   *  and the attachments belong to the user's next attempt, exactly as their
+   *  typed text does. */
+  function restore(items) {
+    if (!items || !items.length) return;
+    _items = items.concat(_items);
+    _render();
+  }
+
+  /** Wait for a taken batch's uploads to finish, then split it into the files
+   *  that made it and the ones that did not. */
+  async function settle(items) {
+    await Promise.all((items || []).map((i) => i.promise).filter(Boolean));
+    const ready = [];
+    const failed = [];
+    for (const i of items || []) {
+      (i.status === "ready" ? ready : failed).push(i);
+      if (i.previewUrl) URL.revokeObjectURL(i.previewUrl);
+    }
+    return { ready, failed };
+  }
+
+  // ── wiring ───────────────────────────────────────────────────────────────
+
+  /** Should this paste be treated as an attachment?
+   *
+   *  No when it landed in some OTHER input (a dialog's file name, the search
+   *  box) — pasting there means pasting there — and no while an upload dialog
+   *  is open, which is a deliberate flow with its own drop zone. The chat
+   *  composer itself IS an attachment target: a screenshot has no text form,
+   *  so a paste into it can only mean "take this image". */
+  function _pasteTargetsComposer(target) {
+    if (document.querySelector(".cloud-chat-upload-overlay:not([hidden])")) return false;
+    // A paste can land on a text node; the element around it is what decides.
+    const el = target && target.nodeType === 3 ? target.parentElement : target;
+    // No element at all (document, body, the page background) means the paste
+    // was aimed at the page, and on /chat the page is the conversation.
+    if (!el || !el.tagName) return true;
+    if (el.id === "chat-input") return true;
+    if (el.closest && el.closest(".cloud-chat-upload-overlay")) return false;
+    if (el.isContentEditable) return false;
+    const tag = el.tagName.toLowerCase();
+    return !(tag === "input" || tag === "textarea" || tag === "select");
+  }
+
+  function _onPaste(e) {
+    if (!_pasteTargetsComposer(e.target)) return;
+    const dt = e.clipboardData;
+    const files = filesFromTransfer(dt);
+    if (!files.length) return;
+    // Refused rather than half-done: the upload itself would succeed (it goes
+    // to the paster's own workspace), and then the message would point the
+    // agent at a path its ephemeral sandbox cannot open. Say so instead.
+    if (_coDrive) {
+      showToast(
+        "Attachments aren't available in a co-drive session — the shared sandbox can't reach your workspace.",
+        "error",
+        { durationMs: 6000 },
+      );
+      return;
+    }
+    // A clipboard can carry both (copying an image with its caption out of a
+    // document). Only swallow the event when there is no text to lose —
+    // otherwise the files attach AND the text still lands in the composer.
+    const alsoText = !!(dt && dt.getData && dt.getData("text/plain"));
+    if (!alsoText) e.preventDefault();
+    const now = new Date();
+    let added = 0;
+    for (const f of files) if (add(f, now)) added += 1;
+    if (added && document.activeElement !== $("chat-input")) $("chat-input")?.focus();
+  }
+
+  document.addEventListener("paste", _onPaste);
+
+  /** Told by the ``session_participants`` frame whether this conversation is
+   *  co-driven. Co-sessions run in an ephemeral sandbox that deliberately
+   *  links no personal workspace, so there is no ``uploads/`` to name. */
+  function setCoDrive(on) {
+    _coDrive = !!on;
+  }
+
+  return {
+    add,
+    count,
+    take,
+    restore,
+    settle,
+    setCoDrive,
+    composeText,
+    // Exposed for tests (tests/test_chat_paste_attachments_ui.py runs these
+    // under node against the shipped source).
+    _pure: { safeUploadName, kindFor, composeText, filesFromTransfer, stampFor },
+  };
+})();
 
 // ---------------------------------------------------------------------------
 // §6 "+" upload menu and file-upload dialogs

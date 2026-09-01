@@ -9,8 +9,11 @@ POST /api/chat/uploads
     - table_name: optional name for the registered table
 
   Writes the file into the caller's per-user workspace under an ``uploads/``
-  subdirectory so it reaches their chat sandbox on next spawn (this
-  endpoint enforces a per-file size cap).
+  subdirectory (this endpoint enforces a per-file size cap).  That directory
+  is symlinked into every chat session dir by ``app.chat.workdir``, so the
+  file is reachable from the sandbox as ``uploads/<name>`` relative to the
+  working directory — including in a session that was already running when
+  the upload landed.
 
   When register_as_table=true on a data file (CSV/parquet/XLSX), the file is
   also registered as a workspace-local queryable table by writing/refreshing
@@ -32,7 +35,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Up
 from pydantic import BaseModel
 
 from app.auth.access import require_resource_access
-from app.chat.workdir import _safe_email_dir
+from app.chat.workdir import UPLOADS_DIRNAME, _safe_email_dir
 from app.corpus_ingest import create_single_file_artefact
 from app.resource_types import ResourceType
 from app.utils import get_data_dir
@@ -127,9 +130,15 @@ class ChatUploadResponse(BaseModel):
 
 
 def _user_uploads_dir(email: str) -> Path:
-    """Return (and ensure) the uploads sub-directory in the user workspace."""
+    """Return (and ensure) the uploads sub-directory in the user workspace.
+
+    ``UPLOADS_DIRNAME`` comes from ``app.chat.workdir`` because that module is
+    what symlinks this directory into every chat session dir — the writer and
+    the linker must name the same directory or an upload lands somewhere the
+    agent cannot reach.
+    """
     slug = _safe_email_dir(email)
-    uploads = get_data_dir() / "users" / slug / "workspace" / "uploads"
+    uploads = get_data_dir() / "users" / slug / "workspace" / UPLOADS_DIRNAME
     uploads.mkdir(parents=True, exist_ok=True)
     return uploads
 
@@ -477,8 +486,9 @@ async def chat_upload(
             )
         else:
             hint = (
-                f"File '{safe_name}' is in your workspace uploads folder. "
-                "It will be available in your next chat sandbox session."
+                f"File '{safe_name}' is in your workspace uploads folder, "
+                f"reachable from a chat session as '{UPLOADS_DIRNAME}/{safe_name}' "
+                "relative to the working directory."
             )
         if artefact_slug:
             hint += " Saved to your Artefacts."

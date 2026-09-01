@@ -14,6 +14,8 @@ coverage_pg.py``, where a Postgres backend exists to compute it against.
 
 from __future__ import annotations
 
+import pytest
+
 _COVERAGE = "/api/admin/semantic-model/coverage"
 _TAGS = "/api/admin/semantic-model/coverage/tags"
 
@@ -54,6 +56,11 @@ class TestTheAdminGateFiresBeforeAnythingElse:
 class TestTheDuckDbInstanceFailsClean:
     """Not "does not work" — fails in the ONE documented way the parity
     sweeps' ``assert_pg_only_exemptions_fail_clean`` accepts."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
 
     def test_coverage_answers_a_typed_501(self, seeded_app):
         _assert_typed_501(seeded_app["client"].get(_COVERAGE, headers=_auth(seeded_app["admin_token"])))

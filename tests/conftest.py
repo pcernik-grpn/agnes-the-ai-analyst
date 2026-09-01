@@ -1124,6 +1124,36 @@ def shared_app(_shared_seeded_app):
 
 
 @pytest.fixture
+def duckdb_backend_pinned(monkeypatch, tmp_path, shared_app):
+    """Pin ``src.repositories.use_pg()`` to ``False`` for the current test,
+    independent of run order relative to ``tests/db_pg/`` in the same
+    pytest-xdist worker process (issue #1658).
+
+    A test that asserts a DuckDB-only outcome — most commonly the typed
+    ``501 requires_postgres_backend`` fail-clean shape on a PG-only
+    repository — normally gets that for free, since the DEFAULT (no env,
+    no overlay) resolution is DuckDB. But two things a ``tests/db_pg/``
+    fixture leaves behind do NOT reset on their own within one worker
+    process: a stale ``instance.yaml`` overlay at the frozen ``src.
+    db_state_machine._OVERLAY_PATH``, and the effects of ``importlib.
+    reload(src.repositories)``. Request this fixture (rather than relying on
+    ambient env) whenever a test's correctness depends on resolving DuckDB.
+
+    Depends on ``shared_app`` (not ``seeded_app``) so it composes with
+    either — a caller that also depends on ``seeded_app`` gets back the SAME
+    session-shared FastAPI app object, since both wrap ``_shared_seeded_app``
+    — and re-registers the app's ``RequiresPostgresBackend`` exception
+    handler so the one app instance every request in the test actually runs
+    against stays wired correctly. See ``tests/_backend_pin.py`` for the
+    full mechanism and why ambient env restore alone is not enough.
+    """
+    from tests._backend_pin import pin_duckdb_backend
+
+    pin_duckdb_backend(monkeypatch, tmp_path, app=shared_app)
+    return shared_app
+
+
+@pytest.fixture
 def seeded_app_fresh(e2e_env):
     """Same shape as ``seeded_app`` (seeded users, four role tokens,
     TestClient) but builds its OWN fresh ``create_app()`` instead of reusing

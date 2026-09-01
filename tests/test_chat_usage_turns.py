@@ -28,6 +28,7 @@ import pytest
 from app.chat.config import ChatConfig
 from app.chat.manager import ChatManager, LiveSession, SinkEntry
 from app.chat.persistence import ChatRepository
+from app.chat.turn_usage import add_turn_usage, drain_turn_usage
 from app.chat.types import SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.factory import reset_coordination_for_tests
@@ -293,9 +294,10 @@ def test_requires_postgres_backend_is_never_fatal(manager: ChatManager, monkeypa
 
 
 def test_frame_without_usage_records_nothing(manager: ChatManager, monkeypatch):
-    """The engine provider emits assistant messages with no usage at all.
-    Recording those as zero-token turns would state a measurement we never
-    made, so they are skipped."""
+    """A usage-less frame with NOTHING brokered either (no turn counters)
+    still records nothing — zeros would state a measurement nobody made.
+    (When the broker DID observe the turn, hydration fills the frame — see
+    test_engine_frame_is_hydrated_from_broker_counters.)"""
     turns = _RecordingTurnsRepo()
     _use_postgres(monkeypatch, turns)
 
@@ -306,5 +308,105 @@ def test_frame_without_usage_records_nothing(manager: ChatManager, monkeypatch):
         await _pump_one_turn(manager, live, {"type": "assistant_message", "content": "Hi"})
 
         assert turns.rows == []
+
+    asyncio.run(_run())
+
+
+_ENGINE_FRAME = {"type": "assistant_message", "content": "Hi"}  # engine provider: no usage fields at all
+
+
+def test_engine_frame_is_hydrated_from_broker_counters(manager: ChatManager, monkeypatch):
+    """The whole feature, end to end at the manager seam: a usage-less frame
+    + broker-fed counters → one fully-populated usage_turns row, tokens on
+    the persisted message (what max_session_tokens sums), and the daily
+    spend counters fed (cache-write folded into the in-bucket)."""
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        add_turn_usage(
+            s.id,
+            {
+                "model": "claude-sonnet-5",
+                "input_tokens": 11,
+                "output_tokens": 22,
+                "cache_read_tokens": 3333,
+                "cache_creation_tokens": 44,
+            },
+        )
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        await _pump_one_turn(manager, live, dict(_ENGINE_FRAME))
+
+        assert len(turns.rows) == 1, f"expected one hydrated turn row, got {turns.rows}"
+        row = turns.rows[0]
+        assert row["model"] == "claude-sonnet-5"
+        assert row["input_tokens"] == 11
+        assert row["output_tokens"] == 22
+        assert row["cache_read_tokens"] == 3333
+        assert row["cache_creation_tokens"] == 44
+        assert row["surface"] == Surface.WEB.value
+
+        messages = manager._repo.list_messages(s.id)
+        assistant = [m for m in messages if m.role == "assistant"][-1]
+        assert assistant.tokens_in == 11 and assistant.tokens_out == 22
+        assert assistant.model == "claude-sonnet-5"
+
+        assert manager._daily_token_totals("u@x") == (11 + 44, 22)
+        assert drain_turn_usage(s.id) is None, "hydration must consume the counters"
+
+    asyncio.run(_run())
+
+
+def test_frame_usage_wins_and_counters_are_discarded(manager: ChatManager, monkeypatch):
+    """The double-count guard: native-sandbox calls ride the same broker
+    route, so counters accumulate there too — but a frame that carries its
+    own usage records the FRAME's numbers, and the drained counters are
+    thrown away so they cannot leak into the next turn."""
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        add_turn_usage(s.id, {"model": "some-other-model", "input_tokens": 999, "output_tokens": 999})
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        await _pump_one_turn(manager, live, dict(_FULL_FRAME))
+
+        assert len(turns.rows) == 1
+        row = turns.rows[0]
+        assert row["input_tokens"] == 11, "the frame's own numbers must win"
+        assert row["model"] == "claude-sonnet-5"
+        assert drain_turn_usage(s.id) is None, "discarded counters must not leak into the next turn"
+
+    asyncio.run(_run())
+
+
+def test_coordination_down_leaves_engine_frame_unrecorded(manager: ChatManager, monkeypatch):
+    """Hydration is telemetry: with the coordination backend down, the turn
+    behaves exactly as before this feature — message persisted, no row, no
+    exception escaping the frame loop."""
+    from app.coordination.base import CoordinationUnavailable
+
+    turns = _RecordingTurnsRepo()
+    _use_postgres(monkeypatch, turns)
+
+    class _Down:
+        def __getattr__(self, name):
+            raise CoordinationUnavailable("down")
+
+    monkeypatch.setattr("app.chat.turn_usage.coordination", lambda: _Down())
+
+    async def _run():
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        live = _attach_live(manager, s.id, "u@x", FakeWS())
+        await manager.send_user_message(s.id, "hello")
+        await _pump_one_turn(manager, live, dict(_ENGINE_FRAME))
+
+        assert turns.rows == []
+        messages = manager._repo.list_messages(s.id)
+        assert [m.content for m in messages if m.role == "assistant"] == ["Hi"]
+        assert not live.turn_in_flight
 
     asyncio.run(_run())

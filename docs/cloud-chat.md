@@ -194,9 +194,11 @@ Per-user defaults (configurable in `/admin/server-config`):
 | On-detach policy | `pause` (`chat.on_detach`) |
 
 Token-derived caps (the spend cap and per-session token cap) are metered
-on the docker provider only — the kai-agent engine's stream carries no
-usage numbers, so engine sessions never trip them (see that provider's
-limitations below). Message-rate and concurrency caps apply everywhere.
+on both providers. The kai-agent engine's stream carries no usage numbers,
+so engine turns are metered from broker-observed usage instead: the broker
+accumulates each session's provider-reported usage and the manager folds it
+into the turn at persist (see the provider notes below). Message-rate and
+concurrency caps apply everywhere.
 
 **Session lifecycle.** What a session holds depends on the provider:
 under `docker` it is a per-session container; under `kai-agent` it is a
@@ -600,7 +602,7 @@ into the same runner frame protocol the native provider speaks, and the web
 client renders it over the existing WebSocket with no frontend changes —
 history, mid-turn reconnect replay, message-rate limits and the per-user
 concurrency cap all behave as with the native provider. (Token-derived caps
-do not — see the limitations below.)
+apply too, metered from broker-observed usage — see the limitations below.)
 
 ```yaml
 chat:
@@ -656,15 +658,16 @@ Requirements and semantics:
 Limitations specific to this provider (each also noted in the module
 docstring):
 
-- **Token-derived caps are not metered.** The engine's stream carries no
-  usage numbers, so `chat.daily_anthropic_spend_usd` and
-  `chat.max_session_tokens` never trip on engine sessions, and the admin
-  spend view reads zero for them. For the same reason an engine session's
-  exported transcript at `/admin/sessions` shows **Model: — / Tokens: —**:
-  the model and usage are unknown to Agnes, and the viewer renders that as
-  a dash rather than a made-up zero. Message-rate (`rate_messages_per_hour`)
-  and per-user concurrency caps still apply. Cost control belongs on the
-  engine's own limits and the LLM broker.
+- **Token metering is broker-observed, not stream-reported.** The engine's
+  stream still carries no usage numbers; Agnes meters engine sessions from
+  the usage the broker itself observed while forwarding the turn's LLM
+  calls. `chat.daily_anthropic_spend_usd` and `chat.max_session_tokens`
+  apply, per-turn rows land in `usage_turns`, and the admin spend view
+  counts engine sessions. Precision caveats: a completion finishing exactly
+  at a turn boundary attributes to the adjacent turn (session totals are
+  always conserved), and a multi-model turn is recorded under its last
+  model. Transcripts of turns from before this feature still show
+  **Model: — / Tokens: —**.
 - **Agent profiles and memories DO reach the engine; co-drive workspaces do
   not.** A session bound to an agent gets the agent overlay in its workspace
   tarball — the persona `CLAUDE.md` (data-access rails appended), the
@@ -740,7 +743,7 @@ agent loop and the sandbox live.
 | Workspace delivery | engine fetches a per-session tarball (`GET /api/kai/workspace`: rendered prompt + marketplace overlay + agent overlay) | user's own workspace bind-mounted, writes persist |
 | Agent profiles / memories | persona, identity skill and memories ride the tarball; scoped tools enforced live; memory writes have no channel | fully supported (incl. memory writes) |
 | Co-drive workspaces | not materialized (fail closed — see limitations) | fully supported |
-| Token spend metering (`daily_anthropic_spend_usd`, `max_session_tokens`) | not metered | metered |
+| Token spend metering (`daily_anthropic_spend_usd`, `max_session_tokens`) | metered (broker-observed usage) | metered |
 | Per-tool knobs (`per_tool_call_seconds`, `tool_calls_per_turn_budget`) | inert (engine's own policies) | enforced |
 | Pause | bookkeeping (engine keeps transcript + sandbox) | `docker pause`; lost on daemon restart/reboot |
 | Egress control | the engine's own sandbox policy | `docker_egress_mode: open / none / allowlist` |

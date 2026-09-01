@@ -1080,9 +1080,12 @@ def test_idle_watchdog_interrupts_a_wedged_turn(monkeypatch):
 
 
 def test_restore_context_appended_to_system_prompt(monkeypatch, tmp_path):
-    """When the manager staged a restored-conversation transcript, the runner
-    appends it to the CLI's stock system prompt (claude_code preset +
-    append); without the file, no system_prompt override is passed."""
+    """Everything the runner adds to the CLI's stock system prompt goes
+    through ONE append slot (claude_code preset + append): the always-on
+    ``next_actions`` trailer contract, plus the restored-conversation
+    transcript when the manager staged one. They compose — an earlier shape
+    had the restore branch own the slot outright, which is the seam where a
+    second addition silently replaces the first."""
     from app.chat import runner
 
     mod = _make_fake_sdk(monkeypatch, with_stream_event=True)
@@ -1113,8 +1116,12 @@ def test_restore_context_appended_to_system_prompt(monkeypatch, tmp_path):
     sp = client.options.system_prompt
     assert isinstance(sp, dict) and sp.get("type") == "preset" and sp.get("preset") == "claude_code"
     assert "older question" in sp.get("append", "")
+    assert "```next_actions" in sp.get("append", ""), "the trailer contract must survive a restore"
 
-    # Without the file → stock prompt untouched.
+    # Without the file → the contract alone, and no phantom transcript.
     monkeypatch.setattr(runner, "_CONTEXT_RESTORE_PATH", str(tmp_path / "absent.md"))
     _emitted2, client2 = _run_real_agent_turn(monkeypatch, mod, script, [{"type": "user_msg", "text": "hi"}])
-    assert client2.options.system_prompt is None
+    sp2 = client2.options.system_prompt
+    assert isinstance(sp2, dict) and sp2.get("preset") == "claude_code"
+    assert "```next_actions" in sp2.get("append", "")
+    assert "older question" not in sp2.get("append", "")
