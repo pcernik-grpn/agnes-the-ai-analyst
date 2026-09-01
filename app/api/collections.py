@@ -6,11 +6,7 @@ Endpoints:
   GET    /api/collections                         auth (RBAC-filtered list)
   GET    /api/collections/{collection_id}         require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}         owner or admin
-  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access("{collection_id}")
-                                                  — also accepts a ProducerPrincipal scoped to
-                                                  this collection (the corpus-extraction
-                                                  producer's own upload callback,
-                                                  app.auth.producer_token)
+  POST   /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   GET    /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}/files/{file_id}
                                                   require_collection_access("{collection_id}")
@@ -62,10 +58,8 @@ from app.auth.access import (
     can_access_collection,
     is_user_admin,
     require_collection_access,
-    require_collection_write_or_producer_access,
 )
 from app.auth.dependencies import get_current_user
-from app.auth.session_principal import ProducerPrincipal
 from app.services.journey import mark_journey
 from src.audit_helpers import log_safe
 from src.corpus_allowlist import classify
@@ -639,7 +633,7 @@ async def update_collection(
     from app.auth.session_principal import PRINCIPAL_TYPES
 
     if isinstance(user, PRINCIPAL_TYPES):
-        # A restricted principal (co-session / agent-session / producer) has no
+        # A restricted principal (co-session / agent-session) has no
         # ownership identity to check — its authority is the intersection it
         # was minted with, which conveys READ, never "rename the owner's
         # collection". Explicit per the PRINCIPAL_TYPES seam contract; without
@@ -1285,9 +1279,9 @@ def source_managing_connection(collection_id: str) -> Optional[dict]:
     or ``None`` for an ordinary collection.
 
     A collection referenced by any connection's ``config.scopes[]
-    .collection_id`` gets its content from that source's pipeline (crawl →
-    convert → [anonymize] → upload under a ``ProducerPrincipal``), so
-    interactive writes into it are refused — a hand-added file would pollute
+    .collection_id`` gets its content from that source's in-process
+    pipeline (crawl → convert → [anonymize] → ingest), so
+    HTTP writes into it are refused — a hand-added file would pollute
     the mirrored corpus, and on an anonymize-marked scope it would bypass
     the anonymizer entirely (the facts-ingest declaration gate never sees
     plain file uploads). Derived from the scope reference on purpose, not
@@ -1344,16 +1338,9 @@ async def upload_files(
     source_doc_ids: Optional[List[str]] = Form(None),
     source_sha256s: Optional[List[str]] = Form(None),
     document_dates: Optional[List[str]] = Form(None),
-    user=Depends(require_collection_write_or_producer_access("{collection_id}")),
+    user=Depends(require_collection_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
-
-    Also the corpus-extraction producer's own upload callback (TCRD-...):
-    a ``ProducerPrincipal`` scoped to THIS collection may call this too
-    (see ``require_collection_write_or_producer_access``) — every OTHER
-    collection route (read/delete/reingest/preview/raw) keeps
-    ``require_collection_access`` unchanged and still 403s that same
-    principal.
 
     Each file passes through the extension allowlist:
 
@@ -1432,25 +1419,11 @@ async def upload_files(
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
 
-    if not isinstance(user, ProducerPrincipal):
-        # Interactive callers — admins included: this is an integrity rule,
-        # not an access rule (see `source_managing_connection`).
-        managing = source_managing_connection(collection_id)
-        if managing is not None:
-            _refuse_source_managed(managing)
-
-    if isinstance(user, ProducerPrincipal):
-        # A restricted principal's identity is never stashed onto
-        # `request.state.user`, so the generic audit-fallback middleware
-        # sees no attributable caller for this mutating POST and writes
-        # nothing at all — self-audit explicitly instead, distinguishably
-        # (`client_kind="producer"`).
-        log_safe(
-            action="collection.file_add",
-            resource=collection_id,
-            client_kind="producer",
-            params={"file_count": len(files)},
-        )
+    # This is an integrity rule, not an access rule (see
+    # `source_managing_connection`).
+    managing = source_managing_connection(collection_id)
+    if managing is not None:
+        _refuse_source_managed(managing)
 
     # Positional pairing is only safe when the lists line up 1:1.
     if paths is not None and len(paths) != len(files):

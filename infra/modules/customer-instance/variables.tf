@@ -182,8 +182,7 @@ variable "prod_instance" {
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
     # default so a module bump alone never moves the existing fleet. Turning
     # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL +
-    # AGNES_SHAREPOINT_ENABLED=1 + AGNES_EXTRACTION_PRODUCER_COMMAND=<module-
-    # level var.extraction_producer_command> into the VM's app .env (env
+    # AGNES_SHAREPOINT_ENABLED=1 into the VM's app .env (env
     # overrides instance.yaml for every one of these — app/coordination/
     # factory.py's posture, mirrored by app/instance_config.py::feature_enabled
     # and app/worker/kinds.py::_extraction_producer_argv — so the
@@ -893,26 +892,13 @@ variable "kai_agent_env" {
 
 variable "extraction_worker_image" {
   description = <<-EOT
-    Full image ref (with tag) of the extraction-worker image — an app image
-    built WITH the `extraction` optional extra (`--build-arg
-    EXTRA_EXTRAS=,extraction`), which carries the document-converter backends
-    the built-in extraction pipeline needs. The operator's own infra builds
-    and publishes the variant, mirroring the `-rich` tag pattern. Pin an
-    immutable tag — the agnes-auto-upgrade tick re-pulls it every cycle.
-
-    Why a separate variable instead of the app image: docker-compose.prod.yml
-    deliberately pins the `extraction-worker` compose service to the plain app
-    image (source-less prod VMs cannot `build:`), which is built without that
-    extra — a worker started from it has the lane wired up but no converter,
-    so `corpus-extraction` refuses up front with
-    `extraction_dependencies_missing`. The module overlay re-pins the service
-    to THIS image.
-
-    Registry access: same rule as kai_agent_image — `gcloud auth
-    configure-docker` is run for a *-docker.pkg.dev host, any other private
-    registry needs pre-authenticated pull access on the VM.
-
-    Required when any instance sets `extraction_worker_enabled = true`.
+    Full image ref (with tag) of the extraction-worker image. Since the
+    2026-09-01 default-image change, EVERY standard app image already carries
+    the `extraction` optional extra (markitdown, pypdfium2) — so this is
+    normally the SAME ref as the app image; a separately built variant is no
+    longer required. Kept as its own variable so an operator can still pin
+    the worker to a different tag (e.g. hold the worker back during a canary
+    of the app).
   EOT
   type        = string
   default     = ""
@@ -920,25 +906,15 @@ variable "extraction_worker_image" {
 
 variable "extraction_producer_command" {
   description = <<-EOT
-    The extraction lane's producer command line, written verbatim as
-    AGNES_EXTRACTION_PRODUCER_COMMAND into the app .env of every instance with
-    `extraction_worker_enabled = true` (app/worker/kinds.py::
-    _extraction_producer_argv reads it with shlex.split — a JSON/YAML list is
-    NOT supported via this env var, unlike the instance.yaml
-    `extraction.producer.command` key). Module-level, not per-VM, mirroring
-    `extraction_worker_image`: the producer binary ships INSIDE that image
-    (EXTRACTION_PRODUCER_INSTALL build-arg), so its invocation command is the
-    same across every VM that runs it.
-
-    Together with `extraction_worker_enabled` this is what makes the
-    Terraform flag alone activate the `corpus-extraction` job kind end to
-    end — no applier-owned `instance.yaml` edit on the VM's data disk.
-
-    Default points at the conventional in-image path; override only if the
-    operator's producer build installs somewhere else.
+    DEPRECATED AND IGNORED (2026-09-01): the external-producer mode was
+    removed — document extraction runs IN-PROCESS inside the app image
+    (connectors/sharepoint/crawler.py), and no AGNES_EXTRACTION_PRODUCER_*
+    variable is read or rendered anymore. The variable is kept declared only
+    so existing tfvars that still set it keep planning; its value has no
+    effect. Safe to delete from tfvars at any time.
   EOT
   type        = string
-  default     = "python /opt/producer/agnes_lane.py"
+  default     = ""
 }
 
 variable "alert_webhook_url" {
