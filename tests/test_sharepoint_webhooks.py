@@ -66,10 +66,7 @@ def _config_get_value(config: dict):
 
 _ENABLED_EXTRACTION_CONFIG = {
     "sharepoint": {"enabled": True},
-    "extraction": {
-        "producer": {"command": "python -m fake_producer"},
-        "timeout_s": 60,
-    },
+    "extraction": {"timeout_s": 60},
 }
 
 
@@ -120,6 +117,21 @@ class TestNotificationDelivery:
         conn_id = _create_connection(c, token)
         _set_webhook_secret(conn_id, secret)
         return conn_id, secret
+
+    @staticmethod
+    def _stub_extraction_deps(monkeypatch):
+        """Make `_extraction_readiness`'s import probe pass regardless of
+        whether the `extraction` optional extra is installed in THIS
+        environment. The enqueue tests assert the receiver's own decision
+        (clientState, debounce, readiness ordering) — not the machine's
+        package set; without this they fail on any interpreter missing
+        pypdfium2/markitdown and pass everywhere else, which is a property
+        of the venv, not of the code under test."""
+        import sys
+        import types
+
+        monkeypatch.setitem(sys.modules, "pypdfium2", types.ModuleType("pypdfium2"))
+        monkeypatch.setitem(sys.modules, "markitdown", types.ModuleType("markitdown"))
 
     def test_unknown_connection_returns_202_with_nothing_done(self, seeded_app):
         r = seeded_app["client"].post(
@@ -194,6 +206,7 @@ class TestNotificationDelivery:
         assert not any(j["payload_json"] == {"connection_id": conn_id} for j in jobs)
 
     def test_valid_notification_enqueues_corpus_extraction(self, seeded_app, monkeypatch):
+        self._stub_extraction_deps(monkeypatch)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, secret = self._connection_with_secret(seeded_app)
 
@@ -215,6 +228,7 @@ class TestNotificationDelivery:
         assert job["run_after"] is not None
 
     def test_burst_of_notifications_collapses_onto_one_job(self, seeded_app, monkeypatch):
+        self._stub_extraction_deps(monkeypatch)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         conn_id, secret = self._connection_with_secret(seeded_app)
 
@@ -264,6 +278,7 @@ class TestNotificationDelivery:
         assert r.status_code == 413
 
     def test_secret_rotation_invalidates_the_old_clientstate(self, seeded_app, monkeypatch):
+        self._stub_extraction_deps(monkeypatch)
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
         c, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="webhook-rotation-conn")
