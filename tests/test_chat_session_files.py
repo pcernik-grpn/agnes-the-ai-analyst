@@ -502,3 +502,191 @@ def test_save_artefact_traversal_400_and_missing_404(client: TestClient) -> None
         ).status_code
         == 404
     )
+
+
+# ---------------------------------------------------------------------------
+# Preview (#1611 follow-up) — "did it build the deck I asked for?"
+#
+# The complaint that motivated these: asked for a PowerPoint, the agent built
+# one and the drawer could say nothing about it but its name and byte count.
+# A .pptx has no browser renderer, so the server sends the deck's words.
+# ---------------------------------------------------------------------------
+
+
+def _pptx_bytes(*slides: tuple[str, list[str]]) -> bytes:
+    """A minimal but structurally real .pptx — one part per slide, DrawingML
+    paragraphs and text runs, deliberately numbered out of archive order so a
+    test proves the deck is returned in SLIDE order and not zip order."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for number, (title, lines) in reversed(list(enumerate(slides, start=1))):
+            paragraphs = "".join(
+                f"<a:p><a:r><a:t>{text}</a:t></a:r></a:p>" for text in [title, *lines] if text
+            )
+            zf.writestr(
+                f"ppt/slides/slide{number}.xml",
+                '<?xml version="1.0"?><p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree>'
+                f"<p:sp><p:txBody>{paragraphs}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
+            )
+        zf.writestr("[Content_Types].xml", "<Types/>")
+    return buf.getvalue()
+
+
+def _preview(client: TestClient, path: str):
+    return client.get(f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": path})
+
+
+def test_preview_reads_a_pptx_slide_by_slide(client: TestClient, session_dir: Path) -> None:
+    """The headline case. The reader gets the deck's contents without a
+    download and without PowerPoint."""
+    (session_dir / "outputs").mkdir()
+    (session_dir / "outputs" / "engagement_type_breakdown.pptx").write_bytes(
+        _pptx_bytes(
+            ("Engagement Type Breakdown", ["Current Portfolio Overview"]),
+            ("Full Portfolio", ["All 30 engagement types", "Two-column table"]),
+        )
+    )
+
+    body = _preview(client, "outputs/engagement_type_breakdown.pptx").json()
+    assert body["kind"] == "slides"
+    assert body["source"] == "extracted"
+    assert body["truncated"] is False
+    assert [s["index"] for s in body["slides"]] == [1, 2]
+    assert body["slides"][0]["title"] == "Engagement Type Breakdown"
+    assert body["slides"][0]["lines"] == ["Current Portfolio Overview"]
+    assert body["slides"][1]["lines"] == ["All 30 engagement types", "Two-column table"]
+
+
+def test_preview_of_a_pptx_that_is_not_really_a_pptx_is_none_not_500(
+    client: TestClient, session_dir: Path
+) -> None:
+    """An agent picks the filename, so the extension is a claim, not a fact.
+    A wrong one degrades to the row's own download affordance."""
+    (session_dir / "broken.pptx").write_bytes(b"this is not a zip archive")
+
+    body = _preview(client, "broken.pptx").json()
+    assert body["kind"] == "none"
+    assert "download" in body["reason"].lower()
+
+
+def test_preview_of_a_textual_file_returns_its_own_bytes(client: TestClient, session_dir: Path) -> None:
+    (session_dir / "notes.md").write_text("# Q3\n\nRevenue up 12%.")
+
+    body = _preview(client, "notes.md").json()
+    assert body["kind"] == "text"
+    assert body["source"] == "file"
+    assert "Revenue up 12%." in body["text"]
+
+
+def test_preview_truncates_a_long_textual_file_and_says_so(client: TestClient, session_dir: Path) -> None:
+    from app.api.chat_session_files import _PREVIEW_MAX_CHARS
+
+    (session_dir / "big.csv").write_text("x" * (_PREVIEW_MAX_CHARS + 500))
+
+    body = _preview(client, "big.csv").json()
+    assert body["truncated"] is True
+    assert len(body["text"]) == _PREVIEW_MAX_CHARS
+
+
+def test_preview_points_an_image_at_the_raw_viewer_without_reading_it(
+    client: TestClient, session_dir: Path
+) -> None:
+    """The browser fetches these bytes itself — the preview endpoint must not
+    slurp a 20 MB PNG into memory just to say "it's an image"."""
+    (session_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+    body = _preview(client, "chart.png").json()
+    assert body["kind"] == "image"
+    assert body["raw_url"] == f"/api/chat/sessions/{CHAT_ID}/files/raw?path=chart.png"
+    assert body["text"] is None
+
+
+def test_preview_of_an_unpreviewable_format_says_download_it(client: TestClient, session_dir: Path) -> None:
+    (session_dir / "data.parquet").write_bytes(b"PAR1")
+
+    body = _preview(client, "data.parquet").json()
+    assert body["kind"] == "none"
+    assert ".parquet" in body["reason"]
+
+
+def test_preview_refuses_the_same_paths_the_download_route_does(client: TestClient) -> None:
+    assert _preview(client, "../secret.txt").status_code == 400
+    assert _preview(client, "/etc/passwd").status_code == 400
+    assert _preview(client, "missing.pptx").status_code == 404
+
+
+def test_preview_404s_for_a_session_the_caller_does_not_own(data_dir: Path, session_dir: Path) -> None:
+    app = _make_app(data_dir=data_dir, sessions={CHAT_ID: OTHER_USER["email"]})
+    assert TestClient(app).get(
+        f"/api/chat/sessions/{CHAT_ID}/files/preview", params={"path": "notes.md"}
+    ).status_code == 404
+
+
+def test_preview_declines_a_file_too_large_to_glance_at(client: TestClient, session_dir: Path, monkeypatch) -> None:
+    import app.api.chat_session_files as mod
+
+    monkeypatch.setattr(mod, "_PREVIEW_MAX_BYTES", 16)
+    (session_dir / "huge.md").write_text("x" * 64)
+
+    body = _preview(client, "huge.md").json()
+    assert body["kind"] == "none"
+    assert "download" in body["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Raw viewer — the ONE route in this module that does not force an attachment
+# ---------------------------------------------------------------------------
+
+
+def _raw(client: TestClient, path: str):
+    return client.get(f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": path})
+
+
+def test_raw_serves_an_allowlisted_image_inline_and_framable_by_us(
+    client: TestClient, session_dir: Path
+) -> None:
+    (session_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = _raw(client, "chart.png")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "image/png"
+    assert resp.headers["content-disposition"].startswith("inline")
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    # The app-wide default is DENY/'none'; the modal's iframe needs SELF.
+    assert resp.headers["x-frame-options"] == "SAMEORIGIN"
+    assert "frame-ancestors 'self'" in resp.headers["content-security-policy"]
+
+
+def test_raw_refuses_active_content_outright(client: TestClient, session_dir: Path) -> None:
+    """The whole reason this route can serve inline at all is that its media
+    map is closed. An agent-authored .html or .svg served inline from our own
+    origin is stored XSS against the person reading the drawer — so there is
+    no inline route for them at all, and `…/preview` shows them as source."""
+    (session_dir / "evil.html").write_text("<script>alert(1)</script>")
+    (session_dir / "evil.svg").write_text('<svg onload="alert(1)"/>')
+
+    for name in ("evil.html", "evil.svg"):
+        assert _raw(client, name).status_code == 415
+
+    body = _preview(client, "evil.html").json()
+    assert body["kind"] == "text"
+    assert body["raw_url"] is None
+    assert "<script>" in body["text"]
+
+
+def test_raw_refuses_a_pptx_rather_than_streaming_it_inline(client: TestClient, session_dir: Path) -> None:
+    (session_dir / "deck.pptx").write_bytes(_pptx_bytes(("Title", [])))
+    assert _raw(client, "deck.pptx").status_code == 415
+
+
+def test_raw_enforces_containment_and_ownership(data_dir: Path, session_dir: Path, client: TestClient) -> None:
+    assert _raw(client, "../secret.png").status_code == 400
+    assert _raw(client, "missing.png").status_code == 404
+
+    other = TestClient(_make_app(data_dir=data_dir, sessions={CHAT_ID: OTHER_USER["email"]}))
+    assert other.get(
+        f"/api/chat/sessions/{CHAT_ID}/files/raw", params={"path": "chart.png"}
+    ).status_code == 404

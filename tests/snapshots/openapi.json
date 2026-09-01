@@ -9793,6 +9793,115 @@
         "title": "SessionFileEntry",
         "type": "object"
       },
+      "SessionFilePreview": {
+        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
+        "properties": {
+          "file_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Type"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "raw_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Url"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          },
+          "slides": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SlidePreview"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slides"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "kind"
+        ],
+        "title": "SessionFilePreview",
+        "type": "object"
+      },
       "SessionFilesResponse": {
         "properties": {
           "files": {
@@ -10069,6 +10178,33 @@
           "value"
         ],
         "title": "SlackSecretBody",
+        "type": "object"
+      },
+      "SlidePreview": {
+        "description": "One slide of a ``.pptx`` preview \u2014 see ``src/office_preview.Slide``.",
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "lines": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Lines",
+            "type": "array"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "title": "SlidePreview",
         "type": "object"
       },
       "SourceRequest": {
@@ -37827,6 +37963,156 @@
           }
         },
         "summary": "Download Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/preview": {
+      "get": {
+        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``) is previewed as its own words, read straight out of the OOXML\narchive by ``src/office_preview`` \u2014 no optional extra, no conversion\nservice. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
+        "operationId": "preview_session_file_api_chat_sessions__chat_id__files_preview_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionFilePreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Session File",
+        "tags": [
+          "chat"
+        ]
+      }
+    },
+    "/api/chat/sessions/{chat_id}/files/raw": {
+      "get": {
+        "description": "Stream one session file INLINE for the browser to draw (images + PDF).\n\nThe only route in this module that does not force an attachment, which is\nwhy it serves the closed ``_PREVIEW_INLINE_MEDIA`` set and nothing else,\nwith the media type read out of that map rather than guessed from the\nfile. Any other extension is 415 pointing at ``\u2026/preview`` \u2014 this is a\nviewer, not a second download route.",
+        "operationId": "raw_session_file_api_chat_sessions__chat_id__files_raw_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Session-relative file path, as returned by the listing.",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "description": "Session-relative file path, as returned by the listing.",
+              "title": "Path",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Raw Session File",
         "tags": [
           "chat"
         ]

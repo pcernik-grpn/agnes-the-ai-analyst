@@ -24,6 +24,10 @@
      task starters). #}
   <link rel="stylesheet" href="{{ static_url('css/chat_dashboard.css') }}" />
   <link rel="stylesheet" href="/static/vendor/highlight.min.css" />
+  {# The shared file-preview modal (.fp-*) — the same surface the Library
+     uses, reused by the session-files drawer so a deck the agent just built
+     can be read without downloading it first. #}
+  <link rel="stylesheet" href="{{ static_url('css/file_preview.css') }}" />
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/highlight.min.js"></script>
   {# The anti-FOUC pre-paint for the chat sidebar's mini state was here. It
@@ -772,8 +776,9 @@
         </button>
       </header>
       <p class="cloud-chat-files-drawer-desc">
-        Files this conversation produced &mdash; deliverables first. Download a copy, or save it
-        to your <a href="/library" target="_blank" rel="noopener">Library</a> so it outlives the session.
+        Files this conversation produced &mdash; deliverables first. Open one to preview it,
+        download a copy, or save it to your <a href="/library" target="_blank" rel="noopener">Library</a>
+        so it outlives the session.
       </p>
       <div id="chat-files-status" class="cloud-chat-files-status" hidden></div>
       <ul id="chat-files-list" class="cloud-chat-files-list"></ul>
@@ -1018,5 +1023,8 @@
      also loaded by _app_rail.html; the component self-guards against running
      twice. Classic + defer so it is defined before chat.js builds any row. #}
   <script src="{{ static_url('js/components/chat_row_menu.js') }}" defer></script>
+  {# window.openFilePreview — classic + defer so it is defined before the
+     session-files drawer wires a row's Preview action. #}
+  <script src="{{ static_url('js/file_preview.js') }}" defer></script>
   <script type="module" src="{{ static_url('js/chat.js') }}"></script>
 {% endblock %}

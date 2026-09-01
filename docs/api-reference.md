@@ -1959,6 +1959,8 @@ credential-provisioning exemption in CONTRIBUTING.md.
 - /api/chat/sessions/{chat_id}/archived
 - /api/chat/sessions/{chat_id}/files
 - /api/chat/sessions/{chat_id}/files/download
+- /api/chat/sessions/{chat_id}/files/preview
+- /api/chat/sessions/{chat_id}/files/raw
 - /api/chat/sessions/{chat_id}/files/save-artefact
 - /api/chat/sessions/{chat_id}/messages
 - /api/chat/sessions/{chat_id}/permanent

@@ -3009,6 +3009,17 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* The name opens the preview modal (role="button" in chat.js), so it has
+     to look and focus like the control it is. */
+  cursor: pointer;
+}
+.cloud-chat-files-name:hover {
+  text-decoration: underline;
+}
+.cloud-chat-files-name:focus-visible {
+  outline: 2px solid var(--ds-primary);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 .cloud-chat-files-hint {
   font-size: var(--text-xs);

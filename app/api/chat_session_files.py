@@ -6,8 +6,8 @@ docker sandbox the session dir IS the container's ``/work`` (bind-mounted,
 see ``app/chat/docker_provider.py``), and skill output written through the
 ``.claude`` symlink lands in the caller's per-user workspace. Until now the
 web chat had no way to reach any of it (the only channel out was inline SVG
-in the reply). These routes give the chat UI a list / download / save-to-
-Library surface over those files.
+in the reply). These routes give the chat UI a list / preview / download /
+save-to-Library surface over those files.
 
 Scope and posture:
 
@@ -28,6 +28,12 @@ Scope and posture:
   ``application/octet-stream`` so a crafted file cannot become same-origin
   markup. Mirrors the collections raw-file posture
   (``app/api/collections.py``).
+  The ONE exception is ``…/files/raw``, the preview viewer, and it is an
+  exception by construction rather than by trust: it serves only the closed
+  ``_PREVIEW_INLINE_MEDIA`` extension map (images + PDF), takes the media
+  type FROM that map rather than from the file, and 415s everything else. An
+  agent-authored ``.html`` or ``.svg`` therefore has no inline route at all —
+  ``…/files/preview`` shows those as SOURCE text, never rendered.
 - **Provider-gated.** The host walk above is only correct for providers
   whose sandbox works directly on the host session dir (``docker``). Under
   ``chat.provider: kai-agent`` — the default — the agent runs in the
@@ -49,6 +55,7 @@ import mimetypes
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -127,6 +134,54 @@ _ACTIVE_CONTENT_TYPES = frozenset(
         "application/xml",
     }
 )
+
+#: Formats the browser draws itself, served inline as the real bytes by the
+#: ``…/files/raw`` viewer. Deliberately a CLOSED map keyed on the extension
+#: with the media type taken FROM the map — never from the file, never from
+#: ``mimetypes`` — because everything else this module serves is pinned to an
+#: attachment precisely so an agent-authored file cannot become same-origin
+#: markup. Same closed-list posture, and the same list, as the Library's
+#: ``_PREVIEW_INLINE_MEDIA`` (``app/api/collections.py``): HTML and SVG are
+#: absent on purpose and must stay absent.
+_PREVIEW_INLINE_MEDIA: dict[str, str] = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "pdf": "application/pdf",
+}
+
+#: Extensions whose bytes ARE the text of the preview. ``html``/``svg``/``xml``
+#: belong here rather than above: shown as SOURCE in a ``<pre>``, never
+#: rendered — which is the whole reason they are not in the inline map.
+_PREVIEW_TEXTUAL_EXTS: frozenset[str] = frozenset(
+    {
+        "txt",
+        "md",
+        "markdown",
+        "csv",
+        "tsv",
+        "json",
+        "jsonl",
+        "yaml",
+        "yml",
+        "log",
+        "sql",
+        "py",
+        "html",
+        "svg",
+        "xml",
+    }
+)
+
+#: Bytes pulled off disk (or through the engine) to build a preview. A glance
+#: is capped so a 2 GB deliverable cannot be read into memory to render a
+#: modal — past this the answer is "download it".
+_PREVIEW_MAX_BYTES = 25 * 1024 * 1024
+
+#: Characters returned for a textual preview.
+_PREVIEW_MAX_CHARS = 20_000
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +276,41 @@ class SaveArtefactBody(BaseModel):
 class SaveArtefactResponse(BaseModel):
     artefact_slug: str
     library_url: str
+
+
+class SlidePreview(BaseModel):
+    """One slide of a ``.pptx`` preview — see ``src/office_preview.Slide``."""
+
+    index: int
+    title: str = ""
+    lines: list[str] = []
+
+
+class SessionFilePreview(BaseModel):
+    """What to show for one session file, and how — the modal's single fetch.
+
+    ``kind`` is the client's only switch, exactly as on the Library's sibling
+    endpoint (``GET /api/collections/{id}/files/{fid}/preview``):
+
+    * ``image`` / ``pdf`` — fetch ``raw_url``, let the browser draw it.
+    * ``slides`` — ``slides`` holds the deck's text, slide by slide.
+    * ``text`` — ``text`` holds it; ``truncated`` says a glance is all this is.
+    * ``none`` — ``reason`` says why, in the words the modal shows.
+    """
+
+    path: str
+    name: str
+    kind: str
+    file_type: str | None = None
+    size_bytes: int | None = None
+    raw_url: str | None = None
+    text: str | None = None
+    slides: list[SlidePreview] | None = None
+    truncated: bool = False
+    #: ``file`` when the bytes ARE the text, ``extracted`` when this module
+    #: pulled the words out of a container format (a deck, a document).
+    source: str | None = None
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +606,238 @@ async def _download_engine_file(user: dict, chat_id: str, rel: str, cfg: object)
         media_type=_download_media_type(name),
         headers=_attachment_headers(name),
         background=BackgroundTask(handle.aclose),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Preview — "did it build the deck I asked for?" without a download
+# ---------------------------------------------------------------------------
+
+
+def _preview_ext(name: str) -> str:
+    dot = name.rfind(".")
+    return name[dot + 1 :].lower() if dot > 0 else ""
+
+
+class _TooLargeToPreview(Exception):
+    """Bytes exist but exceed ``_PREVIEW_MAX_BYTES`` — a `none` preview, not
+    an error: the row still downloads, and saying so is the useful answer."""
+
+
+async def _preview_bytes(user: dict, chat_id: str, rel: str, cfg: object) -> bytes | None:
+    """The file's bytes for preview purposes, from whichever sandbox holds
+    them. ``None`` when the path does not resolve to a readable file — the
+    same non-leaking 404 shape the download route uses."""
+    if _files_source(cfg) == "engine":
+        token = await _engine_token(user, chat_id)
+        try:
+            return await fetch_engine_file_bytes(
+                base_url=_engine_base_url(cfg),
+                chat_id=chat_id,
+                path=rel,
+                token=token,
+                max_bytes=_PREVIEW_MAX_BYTES,
+                transport=_ENGINE_TRANSPORT,
+            )
+        except EngineFileTooLarge:
+            raise _TooLargeToPreview from None
+        except EngineFilesUnavailable:
+            logger.warning("chat_session_files: engine preview unavailable for session %s", chat_id, exc_info=True)
+            raise _engine_unavailable_502() from None
+    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    if resolved.stat().st_size > _PREVIEW_MAX_BYTES:
+        raise _TooLargeToPreview
+    return await asyncio.to_thread(resolved.read_bytes)
+
+
+@router.get("/sessions/{chat_id}/files/preview", response_model=SessionFilePreview)
+async def preview_session_file(
+    chat_id: str,
+    request: Request,
+    path: str = Query(..., description="Session-relative file path, as returned by the listing."),
+    user: dict = Depends(require_chat_access),
+) -> SessionFilePreview:
+    """What to show for one session file, and how.
+
+    The point of this endpoint is the deliverable a browser cannot draw. A
+    ``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a
+    ``.docx``) is previewed as its own words, read straight out of the OOXML
+    archive by ``src/office_preview`` — no optional extra, no conversion
+    service. Images and PDFs point at the sibling ``…/raw`` viewer; textual
+    files carry their own first ``_PREVIEW_MAX_CHARS``; everything else
+    reports ``kind="none"`` with the sentence the modal shows.
+
+    Deliberately one endpoint for every format, mirroring the Library's
+    ``…/files/{id}/preview``: the client must not have to know which
+    extensions are safe to stream inline — that list is a security boundary
+    and it lives on this side.
+    """
+    user = _owned_session_or_404(request, chat_id, user)
+    rel = _validate_rel_path(path)
+    cfg = _chat_config(request)
+    name = rel.rsplit("/", 1)[-1]
+    ext = _preview_ext(name)
+
+    def out(**fields: Any) -> SessionFilePreview:
+        """Every return below is the same envelope with a different payload —
+        keep the identity fields in one place so a branch cannot forget one."""
+        return SessionFilePreview(path=rel, name=name, file_type=ext or None, **fields)
+
+    if ext in _PREVIEW_INLINE_MEDIA:
+        # Never read these here: the browser fetches the bytes itself from
+        # …/raw, which is the one route allowed to serve them inline.
+        return out(
+            kind="image" if ext != "pdf" else "pdf",
+            raw_url=("/api/chat/sessions/" + quote(chat_id, safe="") + "/files/raw?path=" + quote(rel, safe="")),
+        )
+
+    from src.office_preview import is_office_preview_ext
+
+    office_kind = is_office_preview_ext(ext)
+    if office_kind is None and ext not in _PREVIEW_TEXTUAL_EXTS:
+        return out(
+            kind="none",
+            reason=f"No preview for '.{ext or 'unknown'}' files — download it to open it.",
+        )
+
+    try:
+        data = await _preview_bytes(user, chat_id, rel, cfg)
+    except _TooLargeToPreview:
+        return out(
+            kind="none",
+            reason=(f"This file is larger than {_PREVIEW_MAX_BYTES // 1024 // 1024} MB — download it to open it."),
+        )
+    if data is None:
+        raise HTTPException(status_code=404, detail="file not found")
+
+    if office_kind == "slides":
+        from src.office_preview import pptx_slides
+
+        slides, truncated = await asyncio.to_thread(pptx_slides, data)
+        if not slides:
+            return out(
+                kind="none",
+                size_bytes=len(data),
+                reason="This presentation's slides could not be read — download it to open it.",
+            )
+        return out(
+            kind="slides",
+            size_bytes=len(data),
+            slides=[SlidePreview(index=s.index, title=s.title, lines=s.lines) for s in slides],
+            truncated=truncated,
+            source="extracted",
+        )
+
+    if office_kind == "text":
+        from src.office_preview import docx_paragraphs
+
+        text, truncated = await asyncio.to_thread(docx_paragraphs, data)
+        if not text:
+            return out(
+                kind="none",
+                size_bytes=len(data),
+                reason="This document's text could not be read — download it to open it.",
+            )
+        return out(
+            kind="text",
+            size_bytes=len(data),
+            text=text[:_PREVIEW_MAX_CHARS],
+            truncated=truncated or len(text) > _PREVIEW_MAX_CHARS,
+            source="extracted",
+        )
+
+    text = data.decode("utf-8", errors="replace")
+    return out(
+        kind="text",
+        size_bytes=len(data),
+        text=text[:_PREVIEW_MAX_CHARS],
+        truncated=len(text) > _PREVIEW_MAX_CHARS,
+        source="file",
+    )
+
+
+def _inline_headers(filename: str) -> dict[str, str]:
+    """Viewer response posture: inline, non-sniffable, framable only by us.
+
+    The app-wide defaults are ``X-Frame-Options: DENY`` + ``frame-ancestors
+    'none'``, which would block the preview modal's own PDF ``<iframe>`` —
+    same-origin framing included. Narrowed to SELF here (never wider) for
+    this one response, exactly as the Library's ``…/raw`` does;
+    ``SecurityHeadersMiddleware`` applies its defaults with ``setdefault``,
+    so these win.
+    """
+    safe = os.path.basename(filename.replace("\r", "").replace("\n", "").replace('"', "")) or "file"
+    quoted = quote(safe)
+    disposition = f'inline; filename="{safe}"' if quoted == safe else f"inline; filename*=utf-8''{quoted}"
+    return {
+        "Content-Disposition": disposition,
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
+        "X-Frame-Options": "SAMEORIGIN",
+        "Content-Security-Policy": "frame-ancestors 'self'; object-src 'none'; base-uri 'none'",
+    }
+
+
+@router.get("/sessions/{chat_id}/files/raw")
+async def raw_session_file(
+    chat_id: str,
+    request: Request,
+    path: str = Query(..., description="Session-relative file path, as returned by the listing."),
+    user: dict = Depends(require_chat_access),
+) -> Response:
+    """Stream one session file INLINE for the browser to draw (images + PDF).
+
+    The only route in this module that does not force an attachment, which is
+    why it serves the closed ``_PREVIEW_INLINE_MEDIA`` set and nothing else,
+    with the media type read out of that map rather than guessed from the
+    file. Any other extension is 415 pointing at ``…/preview`` — this is a
+    viewer, not a second download route.
+    """
+    user = _owned_session_or_404(request, chat_id, user)
+    rel = _validate_rel_path(path)
+    name = rel.rsplit("/", 1)[-1]
+    media = _PREVIEW_INLINE_MEDIA.get(_preview_ext(name))
+    if not media:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"no inline preview for '{name}' — "
+                f"GET /api/chat/sessions/{chat_id}/files/preview?path=… describes what to show instead"
+            ),
+        )
+
+    cfg = _chat_config(request)
+    if _files_source(cfg) == "engine":
+        token = await _engine_token(user, chat_id)
+        try:
+            opened = await open_engine_download(
+                base_url=_engine_base_url(cfg),
+                chat_id=chat_id,
+                path=rel,
+                token=token,
+                max_bytes=_MAX_PROXY_DOWNLOAD_BYTES,
+                transport=_ENGINE_TRANSPORT,
+            )
+        except EngineFileTooLarge:
+            raise HTTPException(status_code=413, detail="File exceeds the download size ceiling.") from None
+        except EngineFilesUnavailable:
+            logger.warning("chat_session_files: engine raw unavailable for session %s", chat_id, exc_info=True)
+            raise _engine_unavailable_502() from None
+        if opened is None:
+            raise HTTPException(status_code=404, detail="file not found")
+        iterator, handle = opened
+        return StreamingResponse(
+            iterator,
+            media_type=media,
+            headers=_inline_headers(name),
+            background=BackgroundTask(handle.aclose),
+        )
+
+    resolved = _resolve_file_or_404(user["email"], chat_id, rel)
+    return FileResponse(
+        path=str(resolved),
+        media_type=media,
+        headers=_inline_headers(resolved.name),
     )
 
 
