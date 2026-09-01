@@ -691,6 +691,11 @@
      list now; the search does the navigating. */
   .ax-one { display: flex; flex-direction: column; gap: 12px; }
   .ax-toolbar { margin-bottom: 12px; }
+  /* Who the pane is showing, where the picker used to stand. The search that
+     chose them is above the tabs, so without this the card opened on a chain
+     with no name at the top of it. */
+  .ax-simwho { font-size: 15px; font-weight: 650; color: var(--ds-text-primary); }
+  .ax-simwho:empty { display: none; }
   .ax-onebar {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   }
@@ -2563,23 +2568,27 @@
      an admin ever saw one. #}
   <p class="apg-sec-desc">Follow one person's access: which groups they are in, what those groups grant, and whether it downloads automatically.</p>
   <div class="ds-card">
+    {# No second person picker. The toolbar's search sits above the tabs and
+       already selects the person on this tab, so a "Person" dropdown here was
+       a second control for one choice, ten pixels below the first — and the
+       reader had no way to know which one the pane was listening to.
+
+       The <select> STAYS, hidden: it is where this pane keeps its selection,
+       what `loadUsers()` fills, and what the chain renders from. Only its
+       chrome is gone — the label, the paired `.ds-dropdown`, and the row that
+       held them. Hiding the pair rather than deleting it also keeps
+       `syncSimUserDropdown()` and the `?user=` deep link working untouched. #}
+    <span class="ax-simpick" hidden>
+      <select id="ax-sim-user" class="ds-dropdown-native"><option value="">Loading people…</option></select>
+      {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
+                     options=[{'value': '', 'label': 'Loading people…'}]) }}
+    </span>
     <div class="ax-simrow">
-      <div>
-        <label for="ax-sim-user">Person</label>
-        <span class="fbar-select">
-          {# Options are fetched once and the <select> rebuilt entirely
-             client-side (loadUsers() below); the paired .ds-dropdown is kept
-             in sync by syncSimUserDropdown() (see below), using
-             ds_dropdown.js's exported re-init hook (#1473). #}
-          <select id="ax-sim-user" class="ds-dropdown-native"><option value="">Loading people…</option></select>
-          {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
-                         options=[{'value': '', 'label': 'Loading people…'}]) }}
-        </span>
-      </div>
+      <span class="ax-simwho" id="ax-sim-who"></span>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
     </div>
-    <div id="ax-sim-out"><div class="ax-empty">Pick a person to see what they can use, and why.</div></div>
+    <div id="ax-sim-out"><div class="ax-empty">Search for someone above to see what they can use, and why.</div></div>
   </div>
 </div>
 
@@ -5804,8 +5813,14 @@
     history.replaceState(null, "", url);
     const out = el("ax-sim-out");
     const detailBtn = el("ax-sim-detail");
+    // The name the picker used to show. The search that chose them is above
+    // the tabs, so the pane has to say who it is answering about.
+    const whoEl = el("ax-sim-who");
+    const sel = el("ax-sim-user");
+    const chosen = sel && sel.options[sel.selectedIndex];
+    if (whoEl) whoEl.textContent = uid && chosen ? chosen.textContent.trim() : "";
     if (!uid) {
-      out.innerHTML = `<div class="ax-empty">Pick a person to see what they can use, and why.</div>`;
+      out.innerHTML = `<div class="ax-empty">Search for someone above to see what they can use, and why.</div>`;
       detailBtn.hidden = true;
       return;
     }
