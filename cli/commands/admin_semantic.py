@@ -40,7 +40,7 @@ from typing import Optional
 
 import typer
 
-from cli.client import api_delete, api_get, api_post
+from cli.client import api_delete, api_get, api_post, error_detail_object
 from src.semantic.adapters import adapter_names
 
 admin_semantic_app = typer.Typer(help="Admin: the semantic layer — documents, their sources, and its health")
@@ -237,7 +237,7 @@ def import_model(
         payload["description"] = description
     resp = api_post(_MODELS_PATH, json=payload)
     if resp.status_code == 422:
-        body = resp.json().get("detail", {})
+        body = error_detail_object(resp) or {}
         errors = body.get("errors") if isinstance(body, dict) else None
         typer.echo("Document failed schema validation:", err=True)
         for e in errors or [body]:

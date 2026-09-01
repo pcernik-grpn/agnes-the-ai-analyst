@@ -209,11 +209,11 @@ def _explore_auto(table: str, as_json: bool):
 
 
 def _explore_remote(table: str, as_json: bool):
-    from cli.client import api_get
+    from cli.client import api_get, error_detail
 
     resp = api_get(f"/api/catalog/profile/{table}")
     if resp.status_code != 200:
-        typer.echo(f"Profile not found: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Profile not found: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     if as_json:

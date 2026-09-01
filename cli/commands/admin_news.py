@@ -15,7 +15,7 @@ from pathlib import Path
 
 import typer
 
-from cli.client import api_get, api_post, api_put
+from cli.client import api_get, api_post, api_put, error_detail_object
 
 admin_news_app = typer.Typer(help="Admin: edit the /home + /news content")
 
@@ -175,7 +175,7 @@ def edit(
         json={"intro": intro_v, "content": content_v},
     )
     if resp.status_code == 409:
-        body = resp.json().get("detail") or {}
+        body = error_detail_object(resp) or {}
         typer.echo(
             f"error: version conflict: expected v{body.get('expected')}, "
             f"active draft is v{body.get('actual')} "
@@ -208,7 +208,7 @@ def publish(
     qs = "" if version is None else f"?expected_version={version}"
     resp = api_post(f"/api/admin/news/publish{qs}")
     if resp.status_code == 409:
-        body = resp.json().get("detail")
+        body = error_detail_object(resp)
         if body == "no_draft":
             typer.echo("no active draft to publish", err=True)
             raise typer.Exit(1)
@@ -236,7 +236,7 @@ def unpublish(
         typer.echo(f"version {version} not found", err=True)
         raise typer.Exit(1)
     if resp.status_code == 409:
-        typer.echo(resp.json().get("detail") or "conflict", err=True)
+        typer.echo(error_detail_object(resp) or "conflict", err=True)
         raise typer.Exit(2)
     body = _exit_on_error(resp)
     typer.echo(f"unpublished v{body['version']}")

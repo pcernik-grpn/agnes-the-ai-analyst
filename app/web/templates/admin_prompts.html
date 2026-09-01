@@ -70,7 +70,10 @@
 
   {% for card in [
       {'kind': 'install', 'title': 'Install prompt', 'sub': 'The /setup bootstrap prompt analysts paste into Claude Code.'},
-      {'kind': 'workspace', 'title': 'Workspace prompt', 'sub': 'The CLAUDE.md seeded into each analyst workspace.'}
+      {'kind': 'workspace', 'title': 'Workspace prompt', 'sub': 'The CLAUDE.md seeded into each analyst workspace.'},
+      {'kind': 'facts-extraction', 'title': 'Facts extraction prompt',
+       'sub': 'The system prompt the extraction pipeline\'s LLM facts stage sends per crawled document. Plain text (never Jinja-rendered) and not git-bindable — editor only.',
+       'no_git': True}
   ] %}
   <section class="prompt-card" data-kind="{{ card.kind }}">
     <div class="prompt-card__head">
@@ -80,7 +83,10 @@
         <div class="prompt-card__path" data-role="provenance"></div>
         <span class="prompt-badge hidden" data-role="divergence"></span>
       </div>
-      <div class="prompt-toggle" role="group" aria-label="Source mode">
+      {# A kind the API refuses to git-bind (409 not_bindable) renders no
+         mode toggle at all — the git pane markup stays (the shared JS
+         queries it unconditionally) but is unreachable. #}
+      <div class="prompt-toggle{% if card.no_git %} hidden{% endif %}" role="group" aria-label="Source mode">
         <button type="button" data-mode="editor">Editor override</button>
         <button type="button" data-mode="git">Git (from IWT repo)</button>
       </div>

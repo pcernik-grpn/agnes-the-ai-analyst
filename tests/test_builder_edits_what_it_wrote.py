@@ -158,10 +158,12 @@ def test_neither_builder_greets_an_edit_with_its_create_script():
 def test_the_package_edit_is_a_page_like_its_create():
     """Authoring was a workspace and revising was an overlay on whatever page
     you were on — one component at two sizes, which made the edit read as the
-    lesser thing. The drawer keeps the case it was built for."""
+    lesser thing. The drawer keeps the case it was built for, and nothing
+    else: the package's own page links to the builder and opens no form."""
     detail = (ROOT / "app" / "web" / "templates" / "admin_package_detail.html").read_text(encoding="utf-8")
-    assert "/edit`" in detail and "AgnesPackageDrawer.open({" not in detail.split("apd-edit-details")[1][:400], (
-        "Edit details still opens the overlay instead of the builder page"
+    assert "/edit" in detail, "the package page must link to the builder"
+    assert "AgnesPackageDrawer" not in detail, (
+        "the package page opens the form again instead of linking to the builder"
     )
     tables = (ROOT / "app" / "web" / "templates" / "admin_tables.html").read_text(encoding="utf-8")
     assert "AgnesPackageDrawer.open({" in tables, (

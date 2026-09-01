@@ -711,11 +711,38 @@ SWITCHES: tuple[Switch, ...] = (
         effect="live",
         category="product",
         editable=True,
+        lock_reason="",
         description=(
             "The whole SharePoint connector: connect wizard and admin routes, "
             "document crawling/extraction (schedule, jobs, change webhooks), and "
             "source-ACL mirroring including permission zones and the ingest gate. "
             "One flag; per-scope choices (mirrored access, anonymize) stay in the wizard."
+        ),
+    ),
+    Switch(
+        name="extraction_facts",
+        config_keys=("extraction", "facts", "enabled"),
+        env_var="AGNES_EXTRACTION_FACTS_ENABLED",
+        kind="bool",
+        default=False,
+        effect="live",
+        category="product",
+        editable=True,
+        description=(
+            "The LLM stage of the built-in extraction pipeline "
+            "(connectors/sharepoint/facts_extraction.py) — after a successful crawl, read "
+            "each newly ingested prose document and turn it into evidence-carrying graph "
+            "facts, shipped through the same POST /api/facts/ingest contract an external "
+            "producer would use. A COST switch, which is why it is off by default and "
+            "separate from `sharepoint.enabled`: this is the only stage that spends model "
+            "tokens per document — measured $0.011 for a typical ~5k-token document on the default "
+            "Haiku-class model, $0.020 when the corrective verbatim retry fires, roughly 3x "
+            "those figures on Sonnet (see "
+            "config/instance.yaml.example next to this key). Needs `facts.enabled` too: with "
+            "the fact-graph surface off the pass is skipped rather than writing claims no "
+            "endpoint would serve. Spreadsheets and CSVs are never sent (deterministic "
+            "converters own structured data), and a re-run re-extracts only documents whose "
+            "content, model, or prompt actually changed."
         ),
     ),
     Switch(

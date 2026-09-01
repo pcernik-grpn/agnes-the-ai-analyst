@@ -163,6 +163,9 @@ __all__ = [
     "ontology_drafts_repo",
     "share_requests_repo",
     "facts_ingest_runs_repo",
+    "facts_prompt_repo",
+    # Built-in extraction run observability (2026-08-31 design §7.1)
+    "extraction_runs_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -565,6 +568,21 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # transaction.
     "facts_ingest_runs": {
         PG: ("src.repositories.facts_ingest_runs_pg", "FactsIngestRunsPgRepository"),
+    },
+    # The admin override for the fact-extraction prompt — PG-only, A3
+    # ratchet: no DuckDB backend. Storage is a row in the SHARED
+    # `instance_templates` table (key `facts_extraction`), so this adds no
+    # schema of its own; a DuckDB instance simply has no override and runs
+    # the built-in default.
+    "facts_prompt": {
+        PG: ("src.repositories.facts_prompt_pg", "FactsPromptPgRepository"),
+    },
+    # Built-in extraction run observability (2026-08-31 extraction-
+    # observability-ui design §7.1) — PG-only, A3 ratchet: no DuckDB
+    # backend. Separate from "jobs" (a frozen pair that owns lifecycle and
+    # cannot grow a mutable progress column); `job_id` joins the two.
+    "extraction_runs": {
+        PG: ("src.repositories.extraction_runs_pg", "ExtractionRunsPgRepository"),
     },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
@@ -997,6 +1015,23 @@ def facts_ingest_runs_repo() -> Any:
     §7.2/§13.2 source card). PG-only — raises ``RequiresPostgresBackend``
     on a DuckDB-backed instance."""
     return _build("facts_ingest_runs")
+
+
+def facts_prompt_repo() -> Any:
+    """The admin override for the fact-extraction prompt (stored in the
+    shared ``instance_templates`` table, key ``facts_extraction``). PG-only
+    — raises ``RequiresPostgresBackend`` on a DuckDB-backed instance, which
+    ``connectors.sharepoint.facts_prompt`` reads as "no override here" and
+    answers with the built-in default."""
+    return _build("facts_prompt")
+
+
+def extraction_runs_repo() -> Any:
+    """Per-run state for the built-in extraction pipeline (2026-08-31
+    extraction-observability-ui design §7.1) — what is running now, and the
+    last N runs' outcomes. PG-only — raises ``RequiresPostgresBackend`` on a
+    DuckDB-backed instance."""
+    return _build("extraction_runs")
 
 
 def sso_config_repo() -> Any:

@@ -17,6 +17,12 @@ What this suite pins — the two rules the shape exists to encode:
 
 And the boundary that makes it safe: a reader who cannot manage the resource
 gets none of it — not the block, and not the editor component behind it.
+
+On the data package the cluster is now DOOR-ONLY. It carried "Edit details",
+which opened the create/edit form as a drawer over a reading page — a third
+chrome for a form that is also the builder page and was also a drawer on the
+admin grid. One write surface means this page offers the way to it, not a copy
+of it.
 """
 
 from __future__ import annotations
@@ -95,19 +101,27 @@ class TestTheMacroIsTheOneIdiom:
 
 
 class TestOnlyACallerWhoCanManageSeesIt:
-    def test_an_admin_gets_the_cluster_and_the_editor(self, seeded_app) -> None:
+    def test_an_admin_gets_the_door_and_no_editor(self, seeded_app) -> None:
+        """The cluster, its one door — and NOT the form behind it.
+
+        A reading page that also edits is how the package ended up with three
+        editors. The door names where the writing happens; the admin page it
+        opens carries the reach and freshness read-out you want in front of you
+        before you change who receives a package.
+        """
         c = seeded_app["client"]
         slug = _a_package_slug(seeded_app)
         html = c.get(f"/catalog/p/{slug}", headers=_auth(seeded_app["admin_token"])).text
         assert "data-manage" in html
-        assert 'id="pkg-edit-btn"' in html
-        assert "js/components/package_drawer.js" in html
-        assert "css/package_drawer.css" in html
+        assert "detail-manage__door" in html, "the way to the builder must still be here"
+        assert 'id="pkg-edit-btn"' not in html, "no editor on a reading page"
+        assert "js/components/package_drawer.js" not in html
+        assert "css/package_drawer.css" not in html
 
     def test_an_analyst_gets_neither(self, seeded_app) -> None:
-        """Not just the block: the editor component and its sheet must not be
-        served either. A reader who cannot manage the package should never
-        download the form for doing so."""
+        """Not the block, and not the door. Nobody gets the form here any more
+        (see the admin case above), so what this pins for the analyst is that
+        the governance chrome itself is absent."""
         c = seeded_app["client"]
         slug = _a_package_slug(seeded_app)
         r = c.get(f"/catalog/p/{slug}", headers=_auth(seeded_app["analyst_token"]))

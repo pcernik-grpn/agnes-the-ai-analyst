@@ -3,8 +3,8 @@
 ``extraction_worker_enabled`` engages, per VM, the two halves that only work
 together: a ``redis`` compose service (the multi-process coordination backend
 the startup guard requires the moment ``AGNES_ROLE=worker`` exists) and the
-``extraction-worker`` service re-pinned to the operator's producer-bundled
-image. Default OFF — a module bump alone must never move the existing fleet.
+``extraction-worker`` service re-pinned to the operator's image built with
+the ``extraction`` optional extra. Default OFF — a module bump alone must never move the existing fleet.
 
 Same read-the-template pattern as ``test_startup_chat_provider_toggle.py``.
 The invariants pinned here are each a real failure mode found while doing the

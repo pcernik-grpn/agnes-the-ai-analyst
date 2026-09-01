@@ -1202,6 +1202,10 @@ for a DIFFERENT connection 403s.
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
 - /api/admin/sharepoint/connections/{connection_id}/webhook
+- /api/admin/sharepoint/connections/{connection_id}/subscriptions/ensure
+- /api/admin/sharepoint/connections/{connection_id}/subscriptions
+- /api/admin/sharepoint/subscriptions/run-due
+- /api/admin/sharepoint/anonymization/preview
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
@@ -1295,6 +1299,11 @@ gate, shared with every other route under `/api/admin/sharepoint/*`), `409
 acl_sync_already_running` when one is already queued/running for this
 connection.
 
+`GET …/corpus-map` is the scope→collection routing map for this
+connection, in the crawler resolver's own key shape (`"<site>"` or
+`"<site>/<drive-relative folder path>"` → `collection_id`); `409
+corpus_map_ambiguous` rather than a best-guess map when two scopes collapse
+to one key with different collections.
 `POST …/subtree-sweep` (2026-08-31 plan, Task 8) is the admin "re-check
 subtrees now" trigger for the `sharepoint-subtree-sweep` job — identical
 mechanics to `POST …/acl-sync` above (same enqueue/flag-gate/dedup shape,
@@ -1335,13 +1344,23 @@ or an unparseable one is a typed absence — `{"certificate": null, "reason":
 admin trigger for the existing `corpus-extraction` job kind
 (`app/worker/kinds.py::_run_corpus_extraction`) — enqueues
 `{"connection_id": connection_id}` and returns `202
-{"job_id", "status"}`. 404s on an unknown/non-sharepoint connection before
-any other work; refuses cleanly (never a job that fails 30 minutes later in
-a worker) with `409 extraction_disabled` (the `sharepoint` switch is false) or
-`409 extraction_producer_not_configured` (no `extraction.producer.command`/
-`.module` set); a run already queued/running for the same connection is
-`409 extraction_already_running` — deduped on a stable per-connection
-idempotency key shared with the sweep below.
+{"job_id", "status"}`. An optional JSON body carries per-run overrides —
+`concurrency` (files pipelined at once, 1–16) and `timeout_s` (0–86400) —
+which ride the job payload for THIS run only; out-of-range values are
+refused with `422` rather than silently re-clamped. 404s on an
+unknown/non-sharepoint connection before any other work; refuses cleanly
+(never a job that fails 30 minutes later in a worker) with
+`409 extraction_disabled` (the `sharepoint` switch is false) or
+`409 extraction_dependencies_missing` (the `extraction` optional dependency
+extra is not installed); a run already queued/running for the same
+connection is `409 extraction_already_running` — deduped on a stable
+per-connection idempotency key shared with the sweep below.
+
+`POST /api/admin/sharepoint/anonymization/preview` is the config drawer's
+dry-run: an admin pastes a sample (≤50 000 chars) and gets back what the
+anonymizer would redact, under the instance's real pseudonym key — nothing
+is persisted, and the audit row records length and per-kind counts, never
+the text.
 
 `POST /api/admin/sharepoint/extraction/run-due` is the scheduler-driven
 sweep: fires `corpus-extraction` for every SharePoint connection whose
@@ -1382,17 +1401,61 @@ document surface is `agnes facts …`.
 
 **Graph change-notification receiver.** `POST …/webhook` (re)generates this
 connection's Microsoft Graph change-notification shared secret and returns
-`{webhook_url, secret}` — the URL and secret an operator feeds to the
-external producer's own `subscriptions.py create --url <webhook_url>` to
-actually create the Graph drive subscription (Agnes never creates, renews,
-or deletes that subscription itself). Always mints a FRESH secret; there is
-no "read the current one" verb, so a caller who needs it again calls this
-again, which also invalidates whatever subscription was signed with the old
-value. Persisted in `config.webhook_secret` — the same trust boundary
+`{webhook_url, secret}`. The secret becomes the `clientState` of every Graph
+drive subscription for this connection, and the URL is the receiver those
+subscriptions push to. Always mints a FRESH secret; there is no "read the
+current one" verb, so a caller who needs it again calls this again — which
+also invalidates whatever subscription was signed with the old value, so
+follow a rotation with `POST …/subscriptions/ensure` below (a rotation does
+not rewrite live subscriptions' `clientState`; re-creating them does).
+Persisted in `config.webhook_secret` — the same trust boundary
 `config.tenant_id`/`client_id` already sit behind, unlike the outbound
 agent-webhook secret this mirrors, which is shown once and never re-served.
 See `/api/webhooks/sharepoint/{connection_id}` below for the receiver
 itself.
+
+**Graph subscription lifecycle.** Minting a secret and answering
+notifications are only two thirds of near-real-time crawling; something has
+to tell Graph to push. `POST …/connections/{id}/subscriptions/ensure` does,
+and is the single idempotent verb: for every DISTINCT drive named by a
+confirmed scope (several scopes in one document library share one
+subscription) it creates a Graph subscription where there is none, renews the
+one on record when it is within 72h of expiring, leaves a healthy one alone,
+and deletes one whose drive has left scope. Returns the per-drive outcome
+(`created` / `renewed` / `unchanged` / `removed` / `failed`) plus counts, so
+one library failing on permissions never hides four successes. State lives in
+the connection's own `config.webhook_subscriptions` — a server-written list
+of `{drive_id, subscription_id, expires_at}`, no new table, never the secret.
+
+Refuses before touching Graph, with a body naming the fix, when
+`sharepoint.enabled` is off (`409 sharepoint_disabled` — a
+subscription pointed at a 404 receiver is dead on arrival), no secret has been
+minted (`409 webhook_secret_missing`), no public HTTPS origin is configured
+(`409 public_url_not_configured` — Graph validates the notification URL
+synchronously during create, by calling the receiver's own handshake, so
+`AGNES_BASE_URL`/`SERVER_URL` must name a publicly reachable origin), or the
+certificate does not resolve / Entra rejects it (`409
+sharepoint_cert_unresolved` / `502 sharepoint_graph_error`).
+
+`DELETE …/connections/{id}/subscriptions` is the teardown — deliberately NOT
+gated on `sharepoint.enabled`, since the moment an operator most needs
+cleanup is right after turning the receiver off. A connection with no records
+is a clean `{"removed": 0}` no-op; Graph answering `404` for a subscription
+counts as removed; a real failure keeps the record so a later call retries.
+
+`POST /api/admin/sharepoint/subscriptions/run-due` is the renewal sweep,
+shaped exactly like `extraction/run-due` (walk + per-row due-check + act, no
+second scheduling mechanism). Agnes requests a 25-day subscription against
+Graph's 30-day ceiling and renews inside 72h, so a daily sweep can miss
+several runs before anything lapses. Scheduler row
+`sharepoint-subscriptions-renew` in `services/scheduler/__main__.py`,
+registered whenever `sharepoint.enabled` is on (default cadence
+`daily 04:30`, re-timed by `SCHEDULER_SUBSCRIPTION_RENEWAL_SCHEDULE`). A
+typed no-op when the flag is off; a connection whose own preconditions fail
+lands in `errors` and the sweep continues.
+
+There is no `GET` for subscription state: it is plain server-written config,
+already returned by `GET /api/admin/source-connections/{id}`.
 
 ### `/api/webhooks/sharepoint/{connection_id}` — Graph change-notification receiver
 
@@ -1425,6 +1488,53 @@ Two request shapes on the same route, matching Graph's own contract:
 
 Admin-only wizard/system-to-system bookkeeping with no analyst CLI/MCP
 analogue — Graph is the only caller.
+
+### `/api/admin/sharepoint/connections/{connection_id}/extraction` — extraction observability (design 2026-08-31)
+
+Read-only surface (`app/api/admin_extraction.py`) behind the SharePoint source
+card's live crawl cell, its run-history drawer and its configuration drawer. No
+new page and no new nav entry — the card is the only client.
+
+- /api/admin/sharepoint/connections/{connection_id}/extraction/status
+- /api/admin/sharepoint/connections/{connection_id}/extraction/runs
+- /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}
+- /api/admin/sharepoint/connections/{connection_id}/extraction/config
+
+`GET …/extraction/status` returns the live run (if any) and the last completed
+one. Liveness is **derived, never trusted**: a worker killed outright finalizes
+nothing, so a run whose last checkpoint is older than 30 minutes comes back as
+`outcome: "stalled"` with its `stale_s`, and a run whose `jobs` row already
+ended comes back as `failed` — the stored `running` is reported separately as
+`stored_status`, so the two can never be confused. Counters are **absolute**
+(files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
+there is no fraction, no progress bar and no ETA, because the crawl enumerates
+and processes in lockstep per delta page and `files_per_s` counts only
+new+changed documents. `can_stop` is `false` — v1 has no cooperative cancel
+flag, so no Stop control is drawn.
+
+`GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
+`total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
+stored crawl report and the capped skip list (`{items, listed, total,
+truncated}` — only oversize skips keep a path, so `listed` and `total` differ
+whenever a run also refused documents it cannot name).
+
+All three read `extraction_runs`, a PG-only table (A3 ratchet), so a
+DuckDB-backed instance gets a typed `501 requires_postgres_backend` and the
+card stops polling and says why.
+
+`GET …/extraction/config` is the read-out behind the configuration drawer:
+every effective `extraction.*` value with its `origin` (`env` | `yaml` |
+`default` | `builtin`), the env var's NAME where one applies (never its value),
+and per-leaf `editable` + `lock_reason` read from the switch registry at render
+time. An env-set value is always locked — an admin edit writes YAML, which the
+environment overrides. The whole `extraction` section stays out of
+`_EDITABLE_SECTIONS` (`section_editable: false`): server-config validates the
+section name and then deep-merges, so one editable key would make the section
+that holds a producer command line admin-writable. This endpoint reads no run
+rows and therefore answers on both backends. Audited as
+`sharepoint_connection.extraction_config_read`.
+
+Admin-only display primitives with no analyst CLI/MCP analogue.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

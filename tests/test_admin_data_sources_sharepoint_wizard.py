@@ -685,6 +685,86 @@ class TestSavedSiteScopeVisibleOnReopen:
         )
         assert result["html"].count("data-spw-item=") == 1
 
+    #: Every way the tree call can fail, as (error code, HTTP status). A
+    #: saved site is local state — rebuilt from the scope row, never read
+    #: from Graph — so NONE of these can be a reason to hide it. Live run
+    #: 2026-09-01 found the original fix wired the rescue into the
+    #: `discovery_forbidden` branch alone: a real instance failing with
+    #: `cert_unresolved` still showed an empty Sites list next to a card
+    #: reading "1 scope".
+    _TREE_FAILURES = [
+        ("sharepoint_cert_unresolved", 409),
+        ("sharepoint_graph_error", 502),
+        ("feature_disabled", 409),
+    ]
+
+    @pytest.mark.parametrize("error_code,status", _TREE_FAILURES)
+    def test_saved_site_survives_every_tree_failure(self, error_code, status):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: false, status: %d, json: async () => ({
+                detail: { error: "%s", message: "the listing failed" } }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              html: document.getElementById("spw-tree").innerHTML,
+              errText: document.getElementById("spw-tree-error").textContent,
+              errShown: document.getElementById("spw-tree-error").style.display === "block",
+            }));
+            """
+            % (self._SITE_SCOPE, status, error_code)
+        )
+        assert "My Site" in result["html"], f"{error_code} must not hide the saved site"
+        assert "checked" in result["html"]
+        assert "data-spw-drill" in result["html"], "the rebuilt row stays navigable"
+        # The row being real and the listing having failed are both true —
+        # rescuing the row must never swallow the error that explains why
+        # the rest of the tree is missing.
+        assert result["errShown"] is True, f"{error_code} must still be reported"
+
+    def test_a_failure_below_the_sites_level_shows_no_site_rows(self):
+        """The rescue belongs to the sites level only. Failing while browsing
+        a drive lists drives/folders — splicing site rows in there would
+        answer a different question than the one the breadcrumb asks."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: false, status: 502, json: async () => ({
+                detail: { error: "sharepoint_graph_error", message: "boom" } }) };
+            };
+            spApi(`/api/admin/sharepoint/connections/conn-1/scopes`).then((body) => {
+              spScopes = {};
+              (body.items || []).forEach((s) => { spScopes[s.source_scope_id] = s; });
+              spSeedManualSitesFromScopes();
+            });
+            await _settle();
+            // Drilled into a drive: the level lists folders, not sites.
+            spLevel = { site_id: "s1", drive_id: "d1", item_id: null };
+            spCrumbs = [{ label: "Some Site", site_id: "s1", drive_id: null, item_id: null },
+                        { label: "Documents", site_id: "s1", drive_id: "d1", item_id: null }];
+            spLoadTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              html: document.getElementById("spw-tree").innerHTML,
+              errShown: document.getElementById("spw-tree-error").style.display === "block",
+            }));
+            """
+            % self._SITE_SCOPE
+        )
+        assert "My Site" not in result["html"]
+        assert "data-spw-item=" not in result["html"]
+        assert result["errShown"] is True
+
     def test_folder_scope_never_fabricates_a_site_row(self):
         """A folder scope's id (a Graph item id, no commas) names no site —
         the sites level must stay honestly empty rather than invent an

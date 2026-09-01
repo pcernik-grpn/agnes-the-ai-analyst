@@ -8,17 +8,6 @@
 {% import "macros/_detail.html" as detail with context %}
 {% import "macros/_trustmark.html" as _pkg_trust %}
 {{ detail.styles() }}
-{% if user.is_admin %}
-{# The shared create/edit drawer, for the rail's "Edit details". Admin-only:
-   a reader who cannot manage the package never downloads the component or
-   its sheet. #}
-{# The builder workspace's rules — package_drawer grows into it when
-   opened from "+ New". Without the sheet the two panes stack. #}
-<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
-{% endif %}
 <style>
   /* ── Tables accordion (page-local — data-package specific) ──────── */
   .pkg-table-row {
@@ -466,15 +455,15 @@
    can I use it", which is why the reader opened the page. This answers "and
    I am allowed to change it", which is true of very few of them.
 
-   "Edit details" opens the SAME shared drawer the admin package page opens —
-   one component, two lenses — so a rename happens here rather than sending
-   an admin to a third page to do it. Composition, sharing and the delivery
-   read-out stay behind the one door: they are a governance workspace, and
-   this is a reading page (see the design note in
-   docs/superpowers/specs/2026-08-18-admin-authoring-seam-design.md §4.4). #}
+   ONE door, and no editor. This page used to carry "Edit details", which
+   opened the create/edit form as a drawer over a reading page — a third
+   chrome for a form that is also a full builder page and was also a drawer
+   on the admin grid. Changing a package now happens in one place, reached
+   through the admin page, where the reach and freshness you want to see
+   before changing who gets a package are already on screen. #}
 {% if user.is_admin %}
 {{ detail.manage(
-     [{'label': 'Edit details', 'attrs': 'id="pkg-edit-btn"'}],
+     [],
      admin_href='/admin/data-packages/' ~ pkg.id,
      title='Manage this package') }}
 {% endif %}
@@ -482,33 +471,12 @@
 {% endif %}
 {{ detail.cols_close() }}
 
-{% if user.is_admin %}
-{# package_drawer builds the shared builder workspace when opened
-   from "+ New", so the shell has to be defined before it runs. #}
-<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
-<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
-{% endif %}
 <script>
 'use strict';
 (function() {
   const pkgId = {{ pkg.id | tojson }};
   const addBtn = document.getElementById('pkg-add-btn');
   const removeBtn = document.getElementById('pkg-remove-btn');
-
-  // Rail → "Edit details": the same drawer component /admin/data-packages/{id}
-  // opens, so one editor serves both lenses. Reload on save — the name is in
-  // the hero, the page title and the breadcrumb, and re-rendering three places
-  // by hand is how they drift apart.
-  const editBtn = document.getElementById('pkg-edit-btn');
-  if (editBtn && window.AgnesPackageDrawer) {
-    editBtn.addEventListener('click', function () {
-      window.AgnesPackageDrawer.open({
-        mode: 'edit',
-        pkgId: pkgId,
-        onSaved: function () { window.location.reload(); },
-      });
-    });
-  }
 
   async function call(method, url, body) {
     const opts = { method: method, credentials: 'same-origin' };

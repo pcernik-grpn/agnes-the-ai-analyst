@@ -212,3 +212,67 @@
   transition: transform var(--ds-motion-fast, 120ms) var(--ds-ease-standard, ease);
 }
 .ds-drawer__disclose[open] > summary::before { transform: rotate(45deg); }
+
+/* ── The table picker's filter strip ──────────────────────────────────────
+   Sits under the picker's search box (BuilderShell.picker's `controls` slot)
+   and narrows a ~500-row registry by source, by query mode and by "in no
+   package yet" — the three slices an admin actually works in. The controls
+   themselves are the product's own (`.fbar-toggle`, `.fbar-select` in
+   filter_toolbar.css, which every consumer of this component already links);
+   what lives here is only the strip that holds them.
+
+   It WRAPS rather than scrolls: these are toggles you tick in combination,
+   and a control that has to be scrolled back to is one you set once and
+   abandon — the reason this replaced a filter menu one level deep. */
+.pdw-pickctl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 18px 12px;
+  border-bottom: 1px solid var(--ds-border-light);
+}
+/* Each vocabulary reads as one thing: the gap inside a group is tighter than
+   the gap between groups, so "keboola | bigquery" is visibly one question and
+   the query modes beside it another. */
+.pdw-pickctl__grp {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+/* Names what the chips beside it are values OF. `internal` is both a
+   source_type and a query_mode, so without this the strip shows the same chip
+   twice, a line apart, meaning two different things. */
+.pdw-pickctl__k {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--ds-text-muted);
+  margin-right: 2px;
+}
+/* The toggles are 38px tall in the shared sheet — a comfortable size in a
+   page toolbar and too loud for a strip of eight inside a modal. */
+.pdw-pickctl .fbar-toggle,
+.pdw-pickctl .fbar-select select {
+  height: 30px;
+  font-size: 12px;
+  padding: 0 9px;
+}
+.pdw-pickctl__sort { margin-left: auto; }
+.pdw-pickctl__clear {
+  border: none;
+  background: none;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ds-primary);
+  cursor: pointer;
+}
+.pdw-pickctl__clear:hover { text-decoration: underline; }
+.pdw-pickctl__clear:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
