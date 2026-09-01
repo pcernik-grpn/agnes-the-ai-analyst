@@ -96,6 +96,7 @@ import os
 import random
 import re
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -170,6 +171,30 @@ _OVERSIZE_SAMPLE = 20
 _ERROR_SAMPLE = 200
 #: Completed items kept in the live checkpoint's `activity.recent` list.
 _RECENT_ACTIVITY_SAMPLE = 5
+#: A conversion worker is recycled after converting this many documents,
+#: whichever slot it is. Insurance against a REAL, observed failure: crash
+#: isolation (`_ConvertProcessPool`) fixed "one bad file kills the worker",
+#: but a worker that never dies just keeps running — and markitdown/
+#: pypdfium2 hold onto memory per document, so its RSS climbs without
+#: bound over a large crawl. On a live deployment this reached ~8.4 GiB
+#: across 6 slots (~22 documents each) before the container's memory
+#: cgroup started SIGKILLing whichever child allocated next, INDISCRIMINATELY
+#: — including a `.url`, a `.json` and a one-page `.docx`, files nowhere
+#: near a gigabyte on their own. At that point isolation had only turned
+#: "one bad file kills the worker" into "the worker survives but converts
+#: nothing else", which is better but still fatal to a large crawl.
+#: Configurable (``extraction.crawler.convert_recycle_after_docs``) because
+#: the right number depends on the container's own memory ceiling, not on
+#: this code; 0 disables the document-count trigger (the RSS trigger below
+#: still applies).
+_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS = 40
+#: A worker is ALSO recycled the moment its own peak RSS crosses this many
+#: MiB, whichever trigger fires first — some documents are simply heavier
+#: than others, so a fixed document count alone under-reacts to a run that
+#: draws a cluster of large files early. Configurable
+#: (``extraction.crawler.convert_recycle_rss_mb``); 0 disables it (the
+#: document-count trigger above still applies).
+_DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS
@@ -1913,13 +1938,38 @@ async def _run_blocking(pool: Optional[ThreadPoolExecutor], fn: Callable[..., An
 
 @dataclass
 class _ConvertOutcome:
-    """One conversion attempt's result, as reported by a (still-alive) child
-    over its pipe. Never carries an exception object — only plain strings —
-    so this never depends on what happens to pickle across the boundary."""
+    """One conversion attempt's result, as returned by
+    :meth:`_ConvertProcessPool.convert`.
+
+    ``detail_type`` (``type(exc).__name__``) is always safe to log and
+    persist. ``detail_message`` (``str(exc)``) may quote a fragment of the
+    document the child just read, so whether it is safe to KEEP is a
+    per-scope decision — an anonymize-marked scope's whole premise is that
+    document content never reaches storage in readable form — made by
+    :func:`_prepare_document`, which already owns the anonymize decision,
+    not by anything upstream of it.
+    """
 
     ok: bool
     markdown: str = ""
-    detail: str = ""
+    detail_type: str = ""
+    detail_message: str = ""
+
+
+@dataclass
+class _ConvertReply:
+    """The actual wire message :func:`_convert_worker_main` sends back — a
+    superset of :class:`_ConvertOutcome` carrying ``rss_bytes`` (this
+    worker's own peak RSS right after the attempt, success or failure).
+    :meth:`_ConvertProcessPool.convert` reads ``rss_bytes`` to decide
+    whether to recycle the slot (see the class docstring's "RECYCLING"
+    section) and then discards it — callers outside this module's
+    recycling logic see only the plain :class:`_ConvertOutcome`, which has
+    no business carrying a process-internal metric.
+    """
+
+    outcome: _ConvertOutcome
+    rss_bytes: int = 0
 
 
 class _ConvertCrashed(Exception):
@@ -1932,7 +1982,8 @@ class _ConvertCrashed(Exception):
     conversion exception: the file is counted as ``convert_failed`` and the
     crawl moves on. ``signal_name`` is the best identification available
     (a POSIX signal name, ``"exit code N"``, or ``"unknown"`` when the
-    worker was already gone before this call).
+    worker was already gone before this call) — never document content, so
+    it is always safe to keep and log regardless of scope.
     """
 
     def __init__(self, signal_name: str) -> None:
@@ -1940,18 +1991,36 @@ class _ConvertCrashed(Exception):
         super().__init__(f"conversion worker terminated ({signal_name})")
 
 
+def _peak_rss_bytes() -> int:
+    """This (calling) process's peak resident-set size, in bytes.
+
+    ``resource.ru_maxrss`` is kilobytes on Linux — this module's deployment
+    target, and where the memory growth this guards against was observed —
+    but bytes on macOS/BSD, where this repo's tests run; normalized here
+    once so every caller gets bytes regardless of platform. A HIGH-WATER
+    MARK, not current usage, on purpose: it never drops back down even if
+    the child frees memory afterward, which is the right signal for "has
+    this worker EVER shown itself to be a memory hog" — a transient dip
+    must not reset the recycle clock.
+    """
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak * 1024 if sys.platform == "linux" else peak
+
+
 def _convert_worker_main(conn: Connection) -> None:
     """Entry point for a dedicated conversion child process — runs ONLY
     inside a forked child, never called directly.
 
-    Loops reading ``(tmp_path_str, mime)`` off ``conn`` and replying
-    ``(True, markdown)`` or ``(False, detail)``. An ordinary Python
-    exception from :func:`convert_to_markdown` is caught HERE, exactly like
-    the pre-isolation code did, and turned into the same kind of failure —
-    only ``type(exc).__name__`` crosses back, matching this module's
-    existing discipline of never letting a conversion failure's message
-    (which may quote unconvertible bytes) leave the process that read the
-    file. A native crash bypasses this function's `try/except` entirely by
+    Loops reading ``(tmp_path_str, mime)`` off ``conn`` and replying with a
+    :class:`_ConvertReply`. An ordinary Python exception from
+    :func:`convert_to_markdown` is caught HERE, exactly like the
+    pre-isolation code did, and turned into the same kind of failure — both
+    ``type(exc).__name__`` and ``str(exc)`` cross back (see
+    :class:`_ConvertOutcome` for why sending both is safe: what to DO with
+    the message is the parent's scope-aware decision, not this function's).
+    A native crash bypasses this function's `try/except` entirely by
     definition; the parent notices this worker is gone via the pipe closing
     (``EOFError`` on its next ``recv``), not via anything sent from here.
     """
@@ -1967,13 +2036,14 @@ def _convert_worker_main(conn: Connection) -> None:
             converted = convert_to_markdown(Path(tmp_path_str), mime)
             markdown = str(getattr(converted, "markdown", "") or "")
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
+            outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
             try:
-                conn.send((False, type(exc).__name__))
+                conn.send(_ConvertReply(outcome=outcome, rss_bytes=_peak_rss_bytes()))
             except OSError:
                 return
             continue
         try:
-            conn.send((True, markdown))
+            conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_peak_rss_bytes()))
         except OSError:
             return
 
@@ -1983,12 +2053,11 @@ class _ConvertProcessPool:
     convert step of one crawl run.
 
     One process per concurrency slot (``0..size-1``), forked once (see
-    :meth:`start`) and reused for every file that slot handles for the rest
-    of the run — spawning a fresh interpreter per file would pay a full
-    cold start (plus re-importing markitdown/pypdfium2) on every single
-    document, which for a thousand-file crawl dwarfs the conversion itself.
-    Passing the temp file's PATH rather than its bytes keeps each round trip
-    to two short strings.
+    :meth:`start`) and reused — spawning a fresh interpreter per file would
+    pay a full cold start (plus re-importing markitdown/pypdfium2) on every
+    single document, which for a thousand-file crawl dwarfs the conversion
+    itself. Passing the temp file's PATH rather than its bytes keeps each
+    round trip to two short strings.
 
     Deliberately ``fork``, never ``spawn``:
 
@@ -2008,27 +2077,105 @@ class _ConvertProcessPool:
       a generic ``BrokenProcessPool`` with no per-worker detail, and a crash
       there poisons the ENTIRE pool rather than the one slot that died.
 
-    Every fork this pool ever does — the initial :meth:`start` and every
+    Every FORK this pool ever does — the initial :meth:`start` and every
     :meth:`repair` — must happen from a point the CALLER has proven is
     single-threaded (the top of a run, or a delta-page boundary once that
     page's item-concurrency ``ThreadPoolExecutor`` has been joined).
     ``fork()`` while another thread holds a C-level lock (malloc, DuckDB,
     OpenSSL, ...) can hand the child a lock that will never be released —
     this pool trusts its caller for that timing rather than re-deriving it.
+
+    RECYCLING (owner-reported, live-deployment finding, 2026-09-01): crash
+    isolation alone turns "one bad file kills the worker" into "the worker
+    SURVIVES but converts nothing else" — markitdown/pypdfium2 hold onto
+    memory per document, so a slot that never dies just keeps running, and
+    its RSS climbs without bound over a large crawl until the container's
+    memory cgroup starts SIGKILLing whichever child allocates next,
+    INDISCRIMINATELY (see :data:`_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS`). A
+    slot's process is therefore replaced after ``recycle_after_docs``
+    documents or once its peak RSS crosses ``recycle_rss_bytes``, whichever
+    comes first.
+
+    The same single-threaded-fork constraint applies to a RECYCLE as to any
+    other fork, but a recycle is decided inside :meth:`convert` itself —
+    the one method that runs on a worker THREAD, mid-page, with siblings
+    still active, i.e. never at a safe point. Three ways to reconcile that
+    were weighed:
+
+    1. Recycle only at the next :meth:`repair` (a genuine safe point).
+       Rejected: a default page is up to 200 items, so a slot could convert
+       4-5x its budget before a page boundary ever arrives — exactly the
+       "the budget is meaningless past 200" gap this exists to close.
+    2. Use ``spawn`` for a recycle's replacement only — ``spawn`` needs no
+       single-threaded window at all, since it starts a brand new
+       interpreter rather than forking this one, so it sidesteps the
+       constraint entirely. Rejected: a ``spawn``-started replacement
+       re-imports this module fresh in the new interpreter, so it would
+       stop seeing a test's ``monkeypatch.setattr(crawler,
+       "convert_to_markdown", ...)`` the moment a slot recycles mid-test —
+       the exact problem that made this class choose ``fork`` in the first
+       place — silently diverging from every OTHER worker in the pool and
+       from itself before its own first recycle.
+    3. **Chosen: pre-fork a SPARE per slot from a safe point, swap it in
+       when the budget is hit.** :meth:`start` forks both the ACTIVE worker
+       and an idle SPARE for every slot; :meth:`repair` (a safe point,
+       called after every page) tops up any slot whose spare was consumed.
+       The swap itself — retire the active, promote the spare — does no
+       ``fork()`` at all, only a termination signal to the retiree and a
+       pointer reassignment, so it is safe from ANY thread, including a
+       worker thread mid-page. The spare is forked through the same
+       ``fork`` context as everything else, so it inherits the SAME
+       monkeypatched state a test applied before the run started, keeping
+       option 2's failure mode off the table. Cost: double the idle process
+       count versus options 1/2 — acceptable, since an idle (never-yet-used)
+       spare's own memory footprint is just import overhead, not yet the
+       per-document accumulation this whole mechanism exists to bound.
+
+    A slot with no spare ready when its budget is hit (it already recycled
+    once this page, before the last :meth:`repair` had a chance to refill
+    it) simply keeps running past its budget until the next safe point —
+    bounded staleness, never unbounded growth, and never a correctness
+    issue: :meth:`convert` still returns every file's real outcome either
+    way.
+
+    The SAME swap primitive also repairs a mid-page CRASH instantly when a
+    spare happens to be ready, rather than leaving the slot down for the
+    rest of the page (the pre-recycling behavior, still exactly what
+    happens when no spare is available). The crashed file's own outcome is
+    unaffected either way — still counted ``convert_failed``, still logged
+    with its signal — only whether a DIFFERENT, later file on the same slot
+    in the same page has to wait for the next page boundary changes.
     """
 
-    def __init__(self, size: int, *, ctx: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        size: int,
+        *,
+        ctx: Optional[Any] = None,
+        recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
+        recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
+    ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
         self._size = max(1, int(size))
+        self._recycle_after_docs = max(0, int(recycle_after_docs))
+        self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
         self._procs: List[Optional[Any]] = [None] * self._size
         self._conns: List[Optional[Connection]] = [None] * self._size
+        self._doc_counts: List[int] = [0] * self._size
+        #: Pre-forked, idle standby per slot — see the class docstring's
+        #: "RECYCLING" section for why this exists.
+        self._spare_procs: List[Optional[Any]] = [None] * self._size
+        self._spare_conns: List[Optional[Connection]] = [None] * self._size
 
     def start(self) -> None:
-        """Fork every slot that is not already alive. Call only from a
+        """Fork every slot's ACTIVE worker, and a SPARE standing by for the
+        same slot, that are not already alive. Call only from a
         single-threaded context — see the class docstring."""
         for slot in range(self._size):
             if self._procs[slot] is None:
                 self._spawn(slot)
+            if self._spare_procs[slot] is None:
+                self._spawn_spare(slot)
 
     def _spawn(self, slot: int) -> None:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
@@ -2042,25 +2189,49 @@ class _ConvertProcessPool:
         child_conn.close()  # the parent only ever uses its own end
         self._procs[slot] = proc
         self._conns[slot] = parent_conn
+        self._doc_counts[slot] = 0
+
+    def _spawn_spare(self, slot: int) -> None:
+        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        proc = self._ctx.Process(
+            target=_convert_worker_main,
+            args=(child_conn,),
+            daemon=True,
+            name=f"sp-convert-{slot}-spare",
+        )
+        proc.start()
+        child_conn.close()
+        self._spare_procs[slot] = proc
+        self._spare_conns[slot] = parent_conn
 
     def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
         """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
         worker and returns its outcome, or raises :class:`_ConvertCrashed`
         when that worker died instead of answering — the caller turns that
         into the same ``convert_failed`` outcome an ordinary exception
-        would, with the signal named in the log line."""
+        would, with the signal named in the log line. Also where recycling
+        (see the class docstring) is decided and, when a spare is ready,
+        carried out — after this call's own result is already determined,
+        so a recycle never changes what THIS file's outcome was."""
         proc = self._procs[slot]
         conn = self._conns[slot]
         if proc is None or conn is None or not proc.is_alive():
-            raise _ConvertCrashed(self._exit_detail(proc))
+            detail = self._exit_detail(proc)
+            self._swap_in_spare(slot)  # best-effort recovery for the NEXT file
+            raise _ConvertCrashed(detail)
         try:
             conn.send((str(tmp_path), mime))
-            ok, payload = conn.recv()
+            reply: _ConvertReply = conn.recv()
         except (EOFError, OSError):
-            raise _ConvertCrashed(self._exit_detail(proc)) from None
-        if ok:
-            return _ConvertOutcome(ok=True, markdown=payload)
-        return _ConvertOutcome(ok=False, detail=payload)
+            detail = self._exit_detail(proc)
+            self._swap_in_spare(slot)
+            raise _ConvertCrashed(detail) from None
+        self._doc_counts[slot] += 1
+        over_doc_budget = bool(self._recycle_after_docs) and self._doc_counts[slot] >= self._recycle_after_docs
+        over_rss_ceiling = bool(self._recycle_rss_bytes) and reply.rss_bytes >= self._recycle_rss_bytes
+        if over_doc_budget or over_rss_ceiling:
+            self._swap_in_spare(slot)
+        return reply.outcome
 
     def _exit_detail(self, proc: Optional[Any]) -> str:
         if proc is None:
@@ -2078,17 +2249,49 @@ class _ConvertProcessPool:
             return f"exit code {code}"
         return "unknown"
 
+    def _swap_in_spare(self, slot: int) -> bool:
+        """Retire slot's ACTIVE process (dead from a crash, or simply past
+        its recycle budget) and promote its pre-forked SPARE in its place.
+
+        No ``fork()`` — only a termination signal to the retiree and a
+        pointer reassignment — so this is safe to call from ANY thread, at
+        ANY point in a page, unlike :meth:`_spawn`/:meth:`repair`; that is
+        what lets a slot recycle (or recover from a crash) mid-page rather
+        than only at the next page boundary. Returns ``False``, leaving the
+        slot exactly as it was, when no spare is ready yet — the caller
+        (:meth:`convert`) already handles both outcomes: a dead slot stays
+        dead until :meth:`repair`, same as before recycling existed; a
+        merely over-budget slot just keeps running past its budget.
+        """
+        spare_proc = self._spare_procs[slot]
+        spare_conn = self._spare_conns[slot]
+        if spare_proc is None or spare_conn is None or not spare_proc.is_alive():
+            return False
+        self._close_slot(slot)
+        self._procs[slot] = spare_proc
+        self._conns[slot] = spare_conn
+        self._spare_procs[slot] = None
+        self._spare_conns[slot] = None
+        self._doc_counts[slot] = 0
+        return True
+
     def repair(self) -> List[int]:
-        """Replace every dead slot with a fresh worker. Call only from a
-        point the caller has proven single-threaded (a delta-page boundary,
-        after that page's item-concurrency thread pool has been joined).
-        Returns the repaired slot indices — used by tests."""
+        """Replace every dead ACTIVE slot with a fresh worker, and top up
+        any slot whose SPARE was consumed by a mid-page recycle or crash
+        recovery. Call only from a point the caller has proven
+        single-threaded (a delta-page boundary, after that page's
+        item-concurrency thread pool has been joined). Returns the
+        repaired ACTIVE slot indices — used by tests."""
         repaired = []
         for slot, proc in enumerate(self._procs):
             if proc is None or not proc.is_alive():
                 self._close_slot(slot)
                 self._spawn(slot)
                 repaired.append(slot)
+        for slot, spare in enumerate(self._spare_procs):
+            if spare is None or not spare.is_alive():
+                self._close_spare(slot)
+                self._spawn_spare(slot)
         return repaired
 
     def _close_slot(self, slot: int) -> None:
@@ -2105,10 +2308,25 @@ class _ConvertProcessPool:
         self._procs[slot] = None
         self._conns[slot] = None
 
+    def _close_spare(self, slot: int) -> None:
+        proc = self._spare_procs[slot]
+        conn = self._spare_conns[slot]
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        self._spare_procs[slot] = None
+        self._spare_conns[slot] = None
+
     def shutdown(self) -> None:
-        """Signal every live worker to exit, then reap them all. Safe to
-        call more than once and safe to call on a pool that never started."""
-        for conn in self._conns:
+        """Signal every live worker (active AND spare) to exit, then reap
+        them all. Safe to call more than once and safe to call on a pool
+        that never started."""
+        for conn in (*self._conns, *self._spare_conns):
             if conn is not None:
                 try:
                     conn.send(None)
@@ -2116,6 +2334,7 @@ class _ConvertProcessPool:
                     pass
         for slot in range(self._size):
             self._close_slot(slot)
+            self._close_spare(slot)
 
 
 @dataclass
@@ -2140,10 +2359,21 @@ class _PreparedDocument:
     source_sha256: str = ""
     path: str = ""
     filename: str = ""
-    #: The conversion exception's message, for a "convert_failed" outcome
-    #: only — carried back so the caller (which owns the run's stats object)
-    #: can itemize it in `errors_detail`. Empty for every other outcome.
+    #: Why a ``"convert_failed"`` outcome failed — empty for every other
+    #: outcome, and gated by scope: see :func:`_prepare_document`'s
+    #: ``_convert_failure_detail`` for what this may and may not contain.
     detail: str = ""
+
+
+def _convert_failure_detail(detail_type: str, detail_message: str, *, anonymize: bool) -> str:
+    """The ``detail`` a ``"convert_failed"`` outcome is allowed to carry,
+    decided by THIS scope's anonymize flag — see :func:`_prepare_document`'s
+    docstring for the full reasoning. ``detail_message`` may quote a
+    fragment of the document a converter just failed on; ``detail_type``
+    (``type(exc).__name__``) never does and is always kept."""
+    if not anonymize and detail_message:
+        return detail_message
+    return detail_type
 
 
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
@@ -2220,14 +2450,27 @@ def _prepare_document(
     ``convert_pool=None`` (only ever a testing/unit-call default — the real
     crawl always passes one) falls back to calling the converter inline, the
     exact pre-isolation behaviour.
+
+    A ``"convert_failed"`` outcome's ``detail`` is gated by THIS scope's
+    ``anonymize`` flag (owner decision 2026-09-01, reconciling #1993's
+    per-file error detail with this module's own no-content-leaves-the-file
+    -reader rule): a plain scope keeps the exception's full message — an
+    admin on that connection can already open the document itself, so a
+    diagnosable failure beats a silent one — while an anonymize-marked
+    scope keeps only the exception's TYPE, since that scope's whole premise
+    is that document content never reaches storage in readable form, and a
+    conversion exception can quote a fragment of the very file it read. A
+    native crash's ``detail`` (the signal name) is never document content,
+    so it is kept for both.
     """
     source_sha256 = _sha256_file(tmp_path)
     try:
         if convert_pool is not None:
             outcome = convert_pool.convert(convert_slot, tmp_path, mime)
             if not outcome.ok:
-                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, outcome.detail)
-                return _PreparedDocument("convert_failed")
+                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, outcome.detail_type)
+                detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
+                return _PreparedDocument("convert_failed", detail=detail)
             markdown = outcome.markdown
         else:
             converted = convert_to_markdown(tmp_path, mime)
@@ -2241,10 +2484,11 @@ def _prepare_document(
         # continues with the next file, and this process — the one running
         # the crawl loop — was never at risk.
         logger.warning("sharepoint crawl: conversion worker crashed for %s: %s", path, exc.signal_name)
-        return _PreparedDocument("convert_failed")
+        return _PreparedDocument("convert_failed", detail=f"conversion worker crashed: {exc.signal_name}")
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
-        return _PreparedDocument("convert_failed", detail=str(exc))
+        detail = _convert_failure_detail(type(exc).__name__, str(exc), anonymize=anonymize)
+        return _PreparedDocument("convert_failed", detail=detail)
     if not markdown.strip():
         logger.info("sharepoint crawl: conversion produced no text for %s", path)
         return _PreparedDocument("convert_empty")
@@ -3104,6 +3348,34 @@ def _max_file_mb() -> int:
         return _DEFAULT_MAX_FILE_MB
 
 
+def _convert_recycle_after_docs() -> int:
+    """``extraction.crawler.convert_recycle_after_docs`` — see
+    :data:`_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS` for why this exists. 0 (or
+    negative, or unparseable) disables the document-count trigger; the RSS
+    trigger, if configured, still applies."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_recycle_after_docs", default=_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS
+
+
+def _convert_recycle_rss_bytes() -> int:
+    """``extraction.crawler.convert_recycle_rss_mb``, resolved to bytes —
+    see :data:`_DEFAULT_CONVERT_RECYCLE_RSS_MB`. 0 disables the RSS
+    trigger; the document-count trigger, if configured, still applies."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_recycle_rss_mb", default=_DEFAULT_CONVERT_RECYCLE_RSS_MB)
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_CONVERT_RECYCLE_RSS_MB
+    return mb * 1024 * 1024
+
+
 def _crawl_concurrency() -> int:
     """``extraction.crawler.concurrency`` — how many items of ONE delta page
     the crawl pipelines at a time.
@@ -3359,8 +3631,13 @@ async def _run_crawl_async(
     # runs in the single-threaded window its docstring requires. Sized to
     # the run's hard ceiling, not the governor's current (adaptive) target,
     # so a slot is always available for whatever concurrency a later page
-    # actually uses.
-    convert_pool = _ConvertProcessPool(cap)
+    # actually uses. Recycled per `_ConvertProcessPool`'s own "RECYCLING"
+    # section — resolved once, here, same as every other crawler.* knob.
+    convert_pool = _ConvertProcessPool(
+        cap,
+        recycle_after_docs=_convert_recycle_after_docs(),
+        recycle_rss_bytes=_convert_recycle_rss_bytes(),
+    )
     convert_pool.start()
     auth = GraphAuth(
         acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
