@@ -51,9 +51,21 @@ class ChatConfig:
     idle_ttl_seconds: int = 30 * 60
     per_tool_call_seconds: int = 90
     per_session_bq_scan_bytes: int = 20 * 1024**3
+    # Two per-sender spend guardrails, both summed from ``chat_messages`` tokens
+    # (input + output + cache writes; cache reads excluded — the
+    # ``src.llm_pricing.budget_tokens`` definition). ``0`` disables either one.
     daily_anthropic_spend_usd: float = 20.0
     max_session_seconds: int = 4 * 3600
-    max_session_tokens: int = 200_000
+    # CUMULATIVE tokens billed over a conversation's whole life, NOT the size of
+    # its context window. Every LLM call of an agentic turn re-sends the
+    # context, so one turn with a dozen tool calls bills several hundred
+    # thousand tokens while the context the engine compacts stays far below
+    # its limit — a value near a context window trips mid-conversation and
+    # reads as "compaction does not work" (TCRD-291; the old 200k default did
+    # exactly that once 0.95.0 started metering engine sessions). Sized as a
+    # runaway-conversation guard: ten context windows' worth of re-sent
+    # input. The cost control is ``daily_anthropic_spend_usd``.
+    max_session_tokens: int = 2_000_000
     rate_messages_per_hour: int = 100
     tool_calls_per_turn_budget: int = 50
     # How long the runner's ApprovalGate waits for the user to answer an
@@ -423,7 +435,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         per_session_bq_scan_bytes=_raw_int(raw, "per_session_bq_scan_bytes", 20 * 1024**3),
         daily_anthropic_spend_usd=_raw_float(raw, "daily_anthropic_spend_usd", 20.0),
         max_session_seconds=_raw_int(raw, "max_session_seconds", 4 * 3600),
-        max_session_tokens=_raw_int(raw, "max_session_tokens", 200_000),
+        max_session_tokens=_raw_int(raw, "max_session_tokens", 2_000_000),
         rate_messages_per_hour=_raw_int(raw, "rate_messages_per_hour", 100),
         tool_calls_per_turn_budget=_raw_int(raw, "tool_calls_per_turn_budget", 50),
         approval_timeout_seconds=_raw_int(raw, "approval_timeout_seconds", 300),

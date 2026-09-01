@@ -4878,6 +4878,28 @@ def _seed_daily_tokens_from_db_if_needed(
             pass
 
 
+#: The ``RuntimeError`` reasons ``enforce_sender_limits`` raises — one per
+#: sender-keyed guardrail. Every surface that catches a refusal keys on these
+#: strings (the Slack bot's ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader
+#: loops in app/api/chat.py), so they are named here rather than re-typed.
+SENDER_LIMIT_REASONS = frozenset({"daily_budget_exhausted", "max_session_tokens_exhausted", "rate_limit_exceeded"})
+
+
+def session_token_budget_message(used: int, cap: int) -> str:
+    """Copy for the ``max_session_tokens`` refusal frame.
+
+    Names what was exhausted — a budget of tokens billed across every turn —
+    and the next step, in words a reader who never heard of a context window
+    can act on. It is Agnes's own guardrail, so it must not be worded (or,
+    downstream, presented) as something the engine reported.
+    """
+    return (
+        f"This conversation has reached its token budget ({used:,} of {cap:,} tokens billed "
+        "across all its turns). Start a new conversation to continue, or ask an admin to "
+        "raise chat.max_session_tokens."
+    )
+
+
 async def enforce_sender_limits(
     repo: ChatRepository,
     config: ChatConfig,
@@ -4917,7 +4939,7 @@ async def enforce_sender_limits(
         input_tokens=tokens_in,
         output_tokens=tokens_out,
     )
-    if spent_usd >= config.daily_anthropic_spend_usd:
+    if config.daily_anthropic_spend_usd > 0 and spent_usd >= config.daily_anthropic_spend_usd:
         if on_limit is not None:
             await on_limit(
                 {
@@ -4929,25 +4951,26 @@ async def enforce_sender_limits(
                 }
             )
         raise RuntimeError("daily_budget_exhausted")
-    # Per-session token cap — operators set max_session_tokens in
-    # instance.yaml; previously the knob was dead config. Tokens already
-    # spent in this session are summed from chat_messages on every send;
-    # the session row itself is never UPDATEd (DuckDB 1.5.3 FK+index bug
-    # documented in persistence.py).
-    session_tokens = repo.session_total_tokens(chat_id)
-    if session_tokens >= config.max_session_tokens:
-        if on_limit is not None:
-            await on_limit(
-                {
-                    "type": "error",
-                    "kind": "max_session_tokens",
-                    "message": (
-                        f"Per-session token cap of {config.max_session_tokens} reached "
-                        f"(used {session_tokens}). Start a new chat session."
-                    ),
-                }
-            )
-        raise RuntimeError("max_session_tokens_exhausted")
+    # Per-conversation token budget — the CUMULATIVE tokens billed over the
+    # whole conversation (chat_messages tokens_in + tokens_out + cache
+    # writes, summed on every send; the session row itself is never UPDATEd
+    # — DuckDB 1.5.3 FK+index bug documented in persistence.py). This is not
+    # the context window: compaction bounds what the engine re-sends per
+    # call, and nothing but this knob bounds the sum, so the refusal must
+    # say "budget", never read as a context overflow the engine should have
+    # compacted away (TCRD-291). ``0`` disables the cap.
+    if config.max_session_tokens > 0:
+        session_tokens = repo.session_total_tokens(chat_id)
+        if session_tokens >= config.max_session_tokens:
+            if on_limit is not None:
+                await on_limit(
+                    {
+                        "type": "error",
+                        "kind": "max_session_tokens",
+                        "message": session_token_budget_message(session_tokens, config.max_session_tokens),
+                    }
+                )
+            raise RuntimeError("max_session_tokens_exhausted")
     # Per-user message-rate cap keyed on the SENDER (SR-10), enforced via
     # a coordination-backend fixed-window counter (see _msg_window_key) —
     # atomic incr-then-compare: this attempt is unconditionally counted

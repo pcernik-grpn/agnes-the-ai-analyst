@@ -80,7 +80,7 @@ async def _run_logged(
 #: forward and the api-replica producer have no local sink).
 _SENDER_LIMIT_MESSAGES = {
     "daily_budget_exhausted": "The agent's daily spend cap is reached — try again tomorrow.",
-    "max_session_tokens_exhausted": "This thread hit its session token cap — start a new thread.",
+    "max_session_tokens_exhausted": "This thread has reached its token budget — start a new thread to continue.",
     "rate_limit_exceeded": "The agent is receiving too many messages right now — try again in a few minutes.",
 }
 

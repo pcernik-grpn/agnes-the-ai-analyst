@@ -2245,6 +2245,23 @@ function chatErrorCopy(raw, kind) {
   if (/concurrency_cap/i.test(both)) {
     return "Too many conversations are running right now. Try again in a moment.";
   }
+  // Agnes's OWN sender limits (enforce_sender_limits in app/chat/manager.py),
+  // matched on the frame's kind before the agent-budget family below: they
+  // are not engine errors, so the fallback's "The engine reported:" would
+  // send the reader — and whoever they ask — to the wrong place. The
+  // per-conversation one is a budget of tokens billed across every turn,
+  // not a context limit, so the copy must not suggest the answer was too
+  // long or that the conversation should have been compacted (TCRD-291).
+  if (/max_session_tokens/i.test(both)) {
+    return "This conversation has reached its token budget, so it can't take another turn. " +
+      "Start a new conversation to keep going. An admin can raise the per-conversation budget.";
+  }
+  if (/daily_budget/i.test(both)) {
+    return "This instance has reached its daily spend cap. Try again tomorrow, or ask an admin to raise it.";
+  }
+  if (/rate_limit/i.test(both)) {
+    return "You're sending messages faster than this instance allows. Wait a few minutes and try again.";
+  }
   if (/budget|429/i.test(both)) {
     return "This instance has used its message budget for the month. An admin can raise it.";
   }
