@@ -6688,7 +6688,11 @@ async def update_table(
     # the first question after an incident, and that applies just as much to
     # who CHANGED a policy as to who previewed one.
     if "access_policy_sql" in updates:
-        audit_repo().log(
+        # `log_safe`, not a bare `audit_repo().log`: this is a SECOND write
+        # for one event, so a failure here must not fail a policy save that
+        # already landed (and is already recorded by the `update_table` row
+        # above).
+        log_safe(
             user_id=user.get("id"),
             action="access_policy.clear" if _final_access_policy_sql is None else "access_policy.set",
             resource=table_id,
@@ -7382,7 +7386,7 @@ async def preview_table_policy_all_groups(
     finally:
         analytics_conn.close()
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         action="access_policy.preview_groups",
         resource=table_id,
