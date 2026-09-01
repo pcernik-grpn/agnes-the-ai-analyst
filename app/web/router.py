@@ -2383,6 +2383,20 @@ _ENTITY_FACET_LABELS = {
 }
 
 
+def _entity_facet_token(value: str) -> str:
+    """A graph label, made safe to carry in a multi-valued row attribute.
+
+    ``|`` is the filter engine's separator for a `multi` facet
+    (``data-client="a|b"``, see ``filter_toolbar.js``'s ``facetMatch``). A
+    label containing one would split into two junk values on the row while
+    the menu offered the label whole — a filter that matches nothing, on
+    data nobody controls, failing silently. Replacing it keeps the value
+    filterable and costs one character of fidelity; the menu reads the same
+    token, so the two can never disagree.
+    """
+    return value.replace("|", " ")
+
+
 def _entity_facet_spec() -> list[tuple[str, str, str]]:
     """``(fact_type, facet_key, label)`` for each entity facet, in menu order.
 
@@ -2709,7 +2723,7 @@ async def library_page(
             # dict, so a key left on `c` is silently dropped.
             _ent = _entity_values.get(col["id"]) or {}
             for _ftype, _fkey, _flabel in _entity_facets:
-                row[f"entity_{_fkey}"] = _ent.get(_ftype) or []
+                row[f"entity_{_fkey}"] = [_entity_facet_token(v) for v in (_ent.get(_ftype) or [])]
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"

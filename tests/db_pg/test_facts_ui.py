@@ -183,6 +183,27 @@ def test_library_entity_facet_values_are_caller_scoped(seeded_app_both, state_ba
     assert "Undisclosed Bank" not in r.text
 
 
+def test_a_label_containing_the_separator_stays_filterable(seeded_app_both, state_backend, monkeypatch):
+    """`|` separates a `multi` facet's values on the row. A label carrying
+    one would split into junk while the menu offered it whole — a filter
+    that matches nothing, on data nobody controls. The row and the option
+    must agree, whatever the label."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Piped", "piped")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Smith | Sons")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    row = _re.search(r'data-client="([^"]*)"', r.text)
+    assert row and "|" not in row.group(1), "a raw pipe on the row splits the value"
+    offered = _re.findall(r'data-facet="client" value="([^"]*)"', r.text)
+    assert offered == [row.group(1)], "the menu must offer exactly what the row carries"
+
+
 def test_a_type_map_chip_deep_link_opens_that_facet(seeded_app_both, state_backend, monkeypatch):
     """`?type=<node_type>` is what the type map's chips have always linked
     to. Nothing consumed it, so every chip reloaded the same unfiltered page
