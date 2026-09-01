@@ -211,6 +211,15 @@ async def download_knowledge_artifact(
     ``/api/data/{table_id}/download``.
     """
     from src.knowledge_packaging import artifacts_dir
+    from src.repositories import file_corpora_repo
+
+    # Grants are not revoked when a collection is soft-deleted (a Library
+    # delete, or the SharePoint wizard tidying an emptied scope collection),
+    # and the grant gate above never consults deleted_at — without this
+    # liveness check a grant-holder could keep downloading a "removed"
+    # collection's artifact for as long as the file stayed on disk.
+    if file_corpora_repo().get(corpus_id) is None:
+        raise HTTPException(status_code=404, detail="collection_not_found")
 
     path = artifacts_dir() / f"{corpus_id}.duckdb"
     if not path.exists():

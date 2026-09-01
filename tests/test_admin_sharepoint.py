@@ -1009,8 +1009,25 @@ class TestAnonymizationDeclaredField:
         assert listed.json()["items"][0]["anonymization_declared"] is False
 
 
+def _add_corpus_file(collection_id: str, filename: str = "doc.md") -> str:
+    """Plant one ingested file row so a collection reads as non-empty."""
+    from src.repositories import corpus_files_repo
+
+    return corpus_files_repo().add(
+        corpus_id=collection_id,
+        filename=filename,
+        sha256="0" * 64,
+        file_type="text/markdown",
+        size_bytes=1,
+        storage_path=None,
+    )
+
+
 class TestScopeRemoval:
-    def test_removing_a_scope_drops_the_row_not_the_collection(self, seeded_app):
+    def test_removing_a_scope_keeps_a_collection_that_has_files(self, seeded_app):
+        """Deleting a collection that holds indexed data stays a separate,
+        deliberate operation — untick only drops the wizard's bookkeeping row
+        and TELLS the admin the collection stayed (``collection_kept``)."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         conn_id = _create_connection(c, token, name="remove-conn")
@@ -1021,9 +1038,14 @@ class TestScopeRemoval:
             headers=_auth(token),
         )
         collection_id = confirmed.json()["collection_id"]
+        _add_corpus_file(collection_id)
 
         deleted = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:gone"}, headers=_auth(token))
-        assert deleted.status_code == 204
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+        assert body["collection_kept"] is True
+        assert body["collection"]["id"] == collection_id
+        assert body["collection"]["slug"]
 
         listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
         assert listed.json()["items"] == []
@@ -1031,6 +1053,32 @@ class TestScopeRemoval:
         # The collection itself is untouched by unselecting the scope.
         coll = c.get(f"/api/collections/{collection_id}", headers=_auth(token))
         assert coll.status_code == 200
+
+    def test_removing_a_scope_with_an_empty_collection_deletes_it(self, seeded_app):
+        """An EMPTY scope collection holds no data, so keeping it on untick
+        only breeds orphans (observed live 2026-08-31: a 0-file collection
+        with no scope pointing at it, next to its re-tick twin)."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-empty-conn")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:empty-gone", "display_path": "Never crawled"},
+            headers=_auth(token),
+        )
+        collection_id = confirmed.json()["collection_id"]
+
+        deleted = c.delete(
+            f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:empty-gone"}, headers=_auth(token)
+        )
+        assert deleted.status_code == 200, deleted.text
+        body = deleted.json()
+        assert body["collection_kept"] is False
+        assert body["collection"] is None
+
+        coll = c.get(f"/api/collections/{collection_id}", headers=_auth(token))
+        assert coll.status_code == 404
 
     def test_removing_unknown_scope_is_404(self, seeded_app):
         c = seeded_app["client"]
@@ -1074,7 +1122,7 @@ class TestScopeRemoval:
         r = c.delete(
             f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "drive:remove-hygiene"}, headers=_auth(token)
         )
-        assert r.status_code == 204
+        assert r.status_code == 200
 
         remaining = [
             g
@@ -1083,6 +1131,103 @@ class TestScopeRemoval:
         ]
         assert len(remaining) == 1
         assert remaining[0]["group_id"] == admin_group_id
+
+
+class TestUntickRetickLifecycle:
+    """Tick → untick → re-tick must never breed a duplicate collection.
+
+    Observed live 2026-08-31: unticking and re-ticking the SAME folder left
+    an orphaned 0-file collection next to a live slug-suffixed twin, because
+    ``confirm_scope``'s idempotency was keyed on the scope row that
+    ``remove_scope`` had just deleted."""
+
+    def _confirm(self, c, token, conn_id, scope_id, path="Site / Folder"):
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": scope_id, "display_path": path},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def _untick(self, c, token, conn_id, scope_id):
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": scope_id}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _live_collections_named(self, name_fragment: str) -> list:
+        from src.repositories import file_corpora_repo
+
+        return [r for r in file_corpora_repo().list_all() if name_fragment in (r.get("name") or "")]
+
+    def test_empty_scope_cycle_restores_the_same_collection(self, seeded_app):
+        """Untick auto-deletes the empty collection; re-tick brings back the
+        SAME one — same id, same slug, exactly one live collection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-empty-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-empty")
+        self._untick(c, token, conn_id, "drive:cycle-empty")
+        again = self._confirm(c, token, conn_id, "drive:cycle-empty")
+
+        assert again["collection_id"] == first["collection_id"]
+        assert again["collection"]["slug"] == first["collection"]["slug"]
+        assert len(self._live_collections_named("cycle-empty-conn")) == 1
+
+    def test_empty_scope_cycle_survives_repeated_unticks(self, seeded_app):
+        """Three full cycles: the deterministic slug-suffix fallback in
+        ``_create_scope_collection`` absorbs only ONE collision, so anything
+        short of true re-adoption 500s by the third tick."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-thrice-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-thrice")
+        for _ in range(3):
+            self._untick(c, token, conn_id, "drive:cycle-thrice")
+            again = self._confirm(c, token, conn_id, "drive:cycle-thrice")
+            assert again["collection_id"] == first["collection_id"]
+        assert len(self._live_collections_named("cycle-thrice-conn")) == 1
+
+    def test_kept_collection_is_readopted_on_retick(self, seeded_app):
+        """A collection kept on untick (it has files) is re-adopted on
+        re-tick of the same folder — files intact, no suffixed twin."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-kept-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-kept")
+        _add_corpus_file(first["collection_id"])
+        unticked = self._untick(c, token, conn_id, "drive:cycle-kept")
+        assert unticked["collection_kept"] is True
+
+        again = self._confirm(c, token, conn_id, "drive:cycle-kept")
+        assert again["collection_id"] == first["collection_id"]
+        assert len(self._live_collections_named("cycle-kept-conn")) == 1
+
+        files = c.get(f"/api/collections/{first['collection_id']}/files", headers=_auth(token))
+        assert files.status_code == 200
+        assert len(files.json()["files"]) == 1
+
+    def test_library_delete_between_untick_and_retick_is_respected(self, seeded_app):
+        """A DELIBERATE Library delete of the kept collection is never
+        resurrected by a later re-tick — that mints a fresh collection."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="cycle-libdel-conn")
+
+        first = self._confirm(c, token, conn_id, "drive:cycle-libdel")
+        _add_corpus_file(first["collection_id"])
+        self._untick(c, token, conn_id, "drive:cycle-libdel")
+
+        deleted = c.delete(f"/api/collections/{first['collection_id']}", headers=_auth(token))
+        assert deleted.status_code == 204, deleted.text
+
+        again = self._confirm(c, token, conn_id, "drive:cycle-libdel")
+        assert again["collection_id"] != first["collection_id"]
+        assert c.get(f"/api/collections/{first['collection_id']}", headers=_auth(token)).status_code == 404
+        assert len(self._live_collections_named("cycle-libdel-conn")) == 1
 
 
 class TestNoGroupWarning:

@@ -135,3 +135,12 @@ class FileCorporaPgRepository:
                 ),
                 {"id": corpus_id},
             )
+
+    def restore(self, corpus_id: str) -> None:
+        """Clear ``deleted_at`` (soft_delete's inverse). Idempotent — see the
+        DuckDB sibling for why only automatic soft-deletes may be undone."""
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE file_corpora SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = :id"),
+                {"id": corpus_id},
+            )
