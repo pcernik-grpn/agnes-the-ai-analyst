@@ -244,6 +244,32 @@
     max-width: 68ch;
 }
 
+/* ── Time range ──────────────────────────────────────────────────────
+   One concept, one control. Activity Center answered "over what period?"
+   two different ways: Adoption with a segmented 24h/7d/30d button group,
+   Audit log and Telemetry with a labelled dropdown — sibling tabs of the
+   same section, asking the same question, in two widgets (#1956 item 12).
+
+   The dropdown wins because it is the one that scales: the option sets are
+   NOT the same across these pages and should not be forced to be — Audit log
+   needs 1h and 6h, Telemetry reaches 365d, Adoption's API accepts only
+   24h/7d/30d — and a segmented group stops being readable somewhere around
+   four items. A control that fits every page's real range is a control the
+   whole section can share.
+
+   Only the placement lives here; the dropdown itself is `ds.dropdown`, the
+   same component every other admin filter uses. Pages that already had this
+   shape keep their own `.obs-window` copy for now — converting them would be
+   churn with no visible change; this is the rule a new one should take. */
+.apg-timerange { display: inline-flex; flex-direction: column; gap: 2px; }
+.apg-timerange__label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--ds-text-secondary);
+}
+
 /* ── Toolbar ─────────────────────────────────────────────────────────
    The bar itself is `.fbar` (filter_toolbar.css) — the same component,
    the same control heights, radii and focus rings the Library runs. The
