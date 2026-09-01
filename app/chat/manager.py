@@ -4879,9 +4879,11 @@ def _seed_daily_tokens_from_db_if_needed(
 
 
 #: The ``RuntimeError`` reasons ``enforce_sender_limits`` raises — one per
-#: sender-keyed guardrail. Every surface that catches a refusal keys on these
-#: strings (the Slack bot's ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader
-#: loops in app/api/chat.py), so they are named here rather than re-typed.
+#: guardrail the send gate enforces: the sender's daily spend, the
+#: conversation's token budget, the sender's message rate. Every surface that
+#: catches a refusal keys on these strings (the Slack bot's
+#: ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader loops in app/api/chat.py),
+#: so they are named here rather than re-typed.
 SENDER_LIMIT_REASONS = frozenset({"daily_budget_exhausted", "max_session_tokens_exhausted", "rate_limit_exceeded"})
 
 
