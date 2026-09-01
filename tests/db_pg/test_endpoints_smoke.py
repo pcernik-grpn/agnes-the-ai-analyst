@@ -3265,7 +3265,7 @@ KNOWN_UNTESTED = {
     # tables) — no new schema surface to verify per-backend. Auth matrix,
     # typed cert-missing/Graph-error responses (Graph mocked via
     # httpx.MockTransport), scope->collection idempotency, the no-group
-    # warning, and the corpus-map producer handoff are all covered by
+    # warning are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
     # Bounded BFS folder search (TCRD-240) over the same live tree — never
@@ -3277,7 +3277,15 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
-    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Manual-site persistence (2026-09-01 fix) — a site added by URL under
+    # the `Sites.Selected` escape hatch is stored on the SAME EXISTING
+    # `source_connections.config` JSON column the scope rows above already
+    # use (a new `manual_sites` key, no new schema surface). Auth matrix,
+    # typed cert/Graph-error responses, idempotency-on-site-id, and removal
+    # are all covered by tests/test_admin_sharepoint.py::TestManualSites;
+    # not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/manual-sites",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/manual-sites",
     # Certificate metadata (thumbprint/subject/issuer/expiry) — derived at
     # request time from the connection's own stored PEM, no new schema
     # surface. Auth matrix + typed-absence paths covered by
@@ -3356,6 +3364,14 @@ KNOWN_UNTESTED = {
     # answers identically on both backends by construction; covered by
     # tests/test_admin_extraction.py::TestExtractionConfig.
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config",
+    # Cooperative stop (owner-frustration fix, 2026-09-01) writes to
+    # `source_connections`/`config_patch`, a frozen pre-A3 pair present on
+    # BOTH backends — unlike its `extraction/status|runs|config` siblings
+    # above it answers identically everywhere by construction, so its
+    # per-backend behaviour is not the point of a PG-only smoke sweep. RBAC,
+    # the 202 shape, the connection-row write, and the audit row are covered
+    # by tests/test_extraction_stop.py.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop",
     # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
     # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
     # "enqueues into the EXISTING jobs table, no new schema surface"
