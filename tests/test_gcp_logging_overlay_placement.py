@@ -339,3 +339,81 @@ class TestAutoUpgradeTickConverges:
             "overlay so an arm/disarm transition triggers a recreate instead "
             "of waiting for an unrelated change"
         )
+
+
+class TestOverlayCoversEveryBaseComposeService:
+    """The overlay's service list must track `docker-compose.yml`, both ways.
+
+    It did not. The list was written in #679 against the compose file of the
+    day and never revisited; `extraction-worker` (added later by the
+    three-plane wave-1 topology), `apps-runner`, `egress-proxy` and
+    `kai-agent-stub` all arrived afterwards and silently stayed on
+    `json-file`. Verified live on a customer VM: `app`, `scheduler` and
+    `caddy` shipped to Cloud Logging while `agnes-extraction-worker-1` —
+    the process that runs the connector crawls, i.e. the logs an operator
+    actually goes looking for — did not, and its history died with every
+    auto-upgrade container recreate.
+
+    The near-miss in the same list is `extract` vs `extraction-worker`:
+    two different services (a one-shot Keboola extractor under the
+    `extract` profile, and the long-running extraction lane), one of which
+    was present and not running while the other ran and was absent.
+
+    The reverse direction is the safety half, and it is the sharper of the
+    two. A compose file that names a service without an `image:`/`build:`
+    is invalid, and this overlay is engaged from file presence alone —
+    independently of which OTHER overlays a given VM loads. Naming
+    `redis` / `postgres` / `kai-agent` here (each defined only in an
+    overlay that some instances do not load: the module-written
+    `docker-compose.extraction.yml`, `docker-compose.postgres.yml` on
+    side-car backends only, `docker-compose.kai-agent.yml`) would make
+    every `docker compose` call on the instances that lack it fail to
+    parse — the fleet-freeze shape of #1557 arriving through a different
+    door. Those services need their log driver set in the overlay that
+    defines them, not here.
+    """
+
+    @staticmethod
+    def _services(path: str) -> dict:
+        import yaml
+
+        doc = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        return doc["services"]
+
+    def test_base_compose_services_are_discovered(self):
+        """Guard the guard: an empty base set would pass the check below."""
+        base = self._services("docker-compose.yml")
+        assert len(base) >= 8, f"expected the full base service list, got {sorted(base)}"
+        assert "extraction-worker" in base
+
+    def test_every_base_service_ships_to_cloud_logging(self):
+        base = set(self._services("docker-compose.yml"))
+        overlay = set(self._services(OVERLAY))
+        missing = sorted(base - overlay)
+        assert not missing, (
+            f"{OVERLAY} does not cover {missing} — these services are defined in "
+            "docker-compose.yml but keep the default json-file driver, so their "
+            "logs never leave the VM and do not survive a container recreate. "
+            "Add a `logging: driver: gcplogs` entry for each."
+        )
+
+    def test_overlay_names_no_service_the_base_compose_lacks(self):
+        base = set(self._services("docker-compose.yml"))
+        overlay = set(self._services(OVERLAY))
+        extra = sorted(overlay - base)
+        assert not extra, (
+            f"{OVERLAY} names {extra}, which docker-compose.yml does not define. "
+            "This overlay is engaged from file presence alone, so on any instance "
+            "whose COMPOSE_FILE lacks the overlay that DOES define such a service, "
+            "compose sees a service with no image/build and refuses to parse the "
+            "whole stack — every docker compose call on that VM fails. Set the log "
+            "driver in the overlay that defines the service instead."
+        )
+
+    def test_every_overlay_entry_only_sets_the_gcplogs_driver(self):
+        for name, spec in self._services(OVERLAY).items():
+            assert spec == {"logging": {"driver": "gcplogs"}}, (
+                f"{OVERLAY}: service {name!r} must carry exactly the gcplogs "
+                f"logging block and nothing else, got {spec!r} — this file is a "
+                "log-driver overlay, not a place to override service config"
+            )

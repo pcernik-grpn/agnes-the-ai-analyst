@@ -49,6 +49,77 @@ def resolve_ref(slug: str, ref: str = "HEAD") -> Optional[str]:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def read_tree(slug: str, ref: str, *, max_bytes: int) -> dict[str, str]:
+    """Every text blob at `ref` in app `slug`'s bare repo, keyed by its
+    repo-relative POSIX path — the read side of the deploy-time exposure
+    scan (``src/data_apps/deploy_check.py``).
+
+    ``git ls-tree -r -l`` lists every blob (recursing into subtrees) with
+    its declared byte size, so oversized blobs are skipped WITHOUT ever
+    reading their content; the survivors are fetched in one
+    ``git cat-file --batch`` round trip (its output arrives in the same
+    order objects were requested, so no sha->path map is needed to line the
+    two back up). A blob that isn't valid UTF-8 (a binary asset) is
+    silently dropped — this feeds a line-oriented text scan, never a
+    generic file dump. Returns ``{}`` for any git failure or an empty tree;
+    never raises (callers are expected to have already resolved `ref` via
+    `resolve_ref`, but this stays defensive regardless).
+    """
+    p = repo_path(slug)  # validates slug
+    ls = subprocess.run(
+        ["git", "-C", str(p), "ls-tree", "-r", "-l", ref],
+        capture_output=True,
+        text=True,
+    )
+    if ls.returncode != 0 or not ls.stdout:
+        return {}
+
+    # Each line: "<mode> <type> <sha> <size>\t<path>".
+    wanted: list[tuple[str, str]] = []  # (sha, path), in ls-tree's own order
+    for line in ls.stdout.splitlines():
+        meta, _, path = line.partition("\t")
+        fields = meta.split()
+        if len(fields) != 4 or fields[1] != "blob":
+            continue
+        sha, size_s = fields[2], fields[3]
+        try:
+            size = int(size_s)
+        except ValueError:
+            continue
+        if size <= max_bytes:
+            wanted.append((sha, path))
+    if not wanted:
+        return {}
+
+    cat = subprocess.run(
+        ["git", "-C", str(p), "cat-file", "--batch"],
+        input="".join(f"{sha}\n" for sha, _ in wanted).encode("utf-8"),
+        capture_output=True,
+    )
+    raw = cat.stdout
+    files: dict[str, str] = {}
+    pos = 0
+    for _sha, path in wanted:
+        nl = raw.find(b"\n", pos)
+        if nl == -1:
+            break
+        header = raw[pos:nl].decode("ascii", errors="replace").split(" ")
+        if len(header) != 3:
+            break
+        try:
+            size = int(header[2])
+        except ValueError:
+            break
+        content_start = nl + 1
+        content = raw[content_start : content_start + size]
+        pos = content_start + size + 1  # skip the record's trailing "\n"
+        try:
+            files[path] = content.decode("utf-8")
+        except UnicodeDecodeError:
+            continue  # binary content — not a text file the scan can read
+    return files
+
+
 def fast_forward_live(slug: str, sha: Optional[str] = None) -> str:
     target = sha or resolve_ref(slug, "main") or resolve_ref(slug, "HEAD")
     if not target:

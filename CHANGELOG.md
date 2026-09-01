@@ -30,6 +30,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The source card no longer reports "CRAWL — 0 documents" / "EXTRACTION — Nothing yet" on a connection that has already indexed real files.** `_sharepoint_pipeline_cell`'s crawl/extract/facts/identity counts used to resolve their "scope collections" from `facts_ingest_runs_repo().distinct_corpus_ids()` — every collection the INSTANCE had ever ingested FACTS into, a proxy that only worked once a document reached the (opt-in, off-by-default) facts stage; a crawl with `extraction.facts.enabled: false` — the common case — had always ingested documents, but the proxy returned nothing for it. The cell now reads the connection's OWN confirmed scopes (`config.scopes[].collection_id`), the same mapping the crawl itself routes documents through, so the counts are correct whether or not the facts stage has ever run. `FactsIngestRunsPgRepository.distinct_corpus_ids` is retired (PG-only, no DuckDB sibling — nothing else called it).
 - **A running SharePoint extraction can be watched and stopped.** The source card's Run row now shows live `activity` — the drive-relative path of a file currently being downloaded/converted/ingested plus the last 5 completed items with their outcomes — read straight off the crawl's own checkpoint (`GET …/extraction/status`), so a multi-hour crawl is no longer a black box between checkpoints. A new `POST /api/admin/sharepoint/connections/{id}/extraction/stop` (`202`, audited as `extraction.stop_requested`) asks a running (or about-to-start) run to stop cooperatively: it sets `config.extraction.stop_requested_at` on the connection row, which the crawl polls at the same quiescent points its `extraction.timeout_s` ceiling already checks (unconditionally between delta pages, every 10 completed items between files) and honors exactly like a timeout — `interrupted_reason: "stopped"`, a resumable run, state saved, in-flight items drained before the run ends. A stale flag left by a previous run is cleared at the start of the next one, so a stop can never reach forward and kill an unrelated run. Unlike the run-history endpoints next to it, the stop signal lives on `source_connections` (not the PG-only `extraction_runs` table), so it works on both app-state backends.
 - **A run whose worker died no longer sits at `running` forever.** A native crash or a killed worker process left `extraction_runs` stuck: the row was never finalized, so the source card kept reading it and rendering a run that could never move again, with no way to tell "in progress" from "died an hour ago" — and it carried none of the progress the dead run actually made. Only one crawl per connection runs at a time (the trigger's own idempotency dedup on the owning job), so the moment a NEW run legitimately starts for a connection, any row still `running` for it can only be a previous attempt whose worker never called back — `ExtractionRunsPgRepository.abandon_stale_running` closes every such row right before the new one opens (`_RunRecorder.start`), recording it `interrupted` with `report.interrupted_reason: "abandoned"` — a new member of the existing `timeout`/`throttled`/`stopped` vocabulary, not a new status word, and resumable for the same reason those are: a cTag is only ever written after a durable ingest, so the dead run's persisted state is never ahead of what it actually finished. Its own `report`/`progress`/counters are preserved exactly as the last checkpoint left them, never overwritten with a claim of completion the dead run never made.
+- **A deploy-time exposure check for hosted data apps, warn-first.** `POST /api/data-apps/{slug}/deploy` now runs a pure, best-effort static scan (`src/data_apps/deploy_check.py`) over the target commit before it is promoted to `agnes-live` — an exposed static-file server root (Node `express.static`/`serveStatic`/fastify-static, Python `StaticFiles`/`send_from_directory`/`app.static_folder`, nginx `root`/`alias`), the whole process environment or the injected `AGNES_TOKEN` echoed into a response, and debug mode left on. `data_apps.deploy_checks` (default `warn`) surfaces findings alongside a deploy that still runs; `block` refuses the deploy outright on any finding, including for an externally-hosted repo Agnes cannot scan at all; `off` disables the scan. `agnes app deploy` prints any findings under the `State:` line.
 
 ### Changed
 
@@ -43,6 +44,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+- **Marketplace plugin controls on `/admin/marketplaces` no longer read backwards.** The per-plugin toggle was labelled "Disabled" with checked meaning admin-disabled — an inverted control a reader could mistake for the plugin still being active while it flipped visibility off; it is now an "Enabled" toggle (checked = available to users), the same `admin_disabled` field underneath (#1956 item 14b). The "Mark as system" / "Unmark system" button gained a persistent help affordance explaining that "system" means mandatory for every user, since a bare hover tooltip on the button text was not discoverable enough (#1956 item 14a), and the DISABLED pill's tooltip now notes that a plugin marked `deprecated` upstream is auto-hidden again on every sync (#1956 item 14d).
 - **The built-in SharePoint crawler can download files again.** Microsoft
   Graph answers a file's `GET .../content` with a redirect to a
   pre-authenticated URL on a different host rather than the bytes
@@ -51,6 +53,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   now follows that redirect by hand, with a separate, unauthenticated
   request — never the Graph bearer token — to the redirect target, keeping
   the per-file size cap and partial-file cleanup intact.
+- **Container logs that never reached Cloud Logging.** The `gcplogs` overlay
+  (`docker-compose.gcp-logging.yml`, engaged by `enable_gcp_logging`) listed the
+  services the compose file had when it was written and was never revisited, so
+  every service added since — `extraction-worker`, `apps-runner`, `egress-proxy`,
+  `kai-agent-stub` — silently kept the default `json-file` driver. The gap was
+  invisible from the outside: `app`, `scheduler` and `caddy` shipped normally, so
+  an instance looked correctly configured while the connector-crawl logs an
+  operator actually goes looking for stayed on the box and died with each
+  auto-upgrade container recreate. The near-miss that hid it is that `extract`
+  (the one-shot extractor, present in the list and not running) and
+  `extraction-worker` (the long-running extraction lane, running and absent) are
+  two different services. The overlay now covers exactly the services
+  `docker-compose.yml` defines, both directions pinned by a guard — services that
+  exist only in a conditional overlay (`redis`, `postgres`, `kai-agent`) must
+  keep taking their log driver there, since naming one here would make compose
+  refuse to parse the whole stack on every instance that does not load it. Takes
+  effect on a VM at the next container recreate.
+- **A file the built-in SharePoint crawler failed to download, convert,
+  redact or ingest is retried on the next run instead of being skipped
+  forever.** A drive's delta cursor advanced past a page even when some of
+  its rows failed — correct for the page as a whole, but Microsoft Graph
+  only re-offers an item through delta when it CHANGES, so a file that
+  failed once and was never touched again would never come back around;
+  observed on a live deployment, a run where every download failed was
+  followed by one where delta reported nothing left to do, leaving a
+  fraction of the library actually indexed with no error anywhere in sight.
+  Every such failure is now recorded in the crawl's state file and retried
+  on every future run independent of what delta reports, until it either
+  succeeds or hits a bounded number of attempts — an item that keeps
+  failing (a permanently corrupt document, say) eventually stops being
+  retried, but that outcome is recorded in the run report rather than
+  silently dropped. Recovering an already-affected connection no longer
+  needs hand-editing the state file on the data disk: "Run extraction now"
+  and the `corpus-extraction` job payload both take a `resync` option that
+  forces a full re-enumeration (kept cTags still skip unchanged files).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
@@ -109,6 +146,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The SharePoint wizard's Connect step now shows the connection it is bound to.** Opening a connection from its source card ("Manage scopes", or a scope row) and then looking at step 1 gave a blank new-tenant form — empty connection name, tenant id and client id — so nothing on screen said which connection was being edited. Those values were always in the `?source_type=sharepoint` listing the drawer already fetches and the card already renders the tenant id from; step 1 was simply never told. They now load read-only, and the credential block and "Connect & validate" button — which create a *new* connection, and under a prefilled form would quietly make a duplicate — are hidden for a bound connection, as is the "Continue an existing connection" picker, which asks a question the drawer answered by being opened from that connection ("Continue to scope" now follows the bound connection rather than that picker's preselected value, so with several connections it can no longer scope the wrong source). The "+ Add source" flow is unchanged, including after the reused drawer has been bound once.
 - **The SharePoint wizard shows a saved site again when "Manage scopes" reopens.** Step 2 only rendered rows the live sites listing returned, and sites resolved by URL were kept in memory for the one wizard session — so on a `Sites.Selected` tenant (where Graph 403-forbids site discovery by design) reopening the wizard showed "Nothing here." with the confirmed site invisible, and even with discovery available a site beyond the listing's first page vanished. A saved site scope now rebuilds its own sites-level row from the scope itself (its id is the Graph site id, its display path the site name): ticked, carrying its collection badge, and still navigable into drives and folders. The rescue covers every way the listing can fail, not just the forbidden-discovery one — a missing certificate, a Graph outage or a disabled SharePoint switch left the saved site just as invisible — and is confined to the sites level, since a site row spliced into a drive or folder listing would answer a different question than the breadcrumb asks. The failure itself is still reported alongside the rows: the site is real and the rest of the tree is genuinely missing.
 
+- **A SharePoint site added by URL now survives closing the wizard.** "Add a site by URL" (the `Sites.Selected` escape hatch, since that permission 403-forbids site discovery) only ever resolved the site — the result lived in the wizard's own in-memory state, reset on every open, so an admin who ticked a folder inside it and closed the wizard had to re-paste the same URL on the next visit. The resolved site is now persisted on the connection (`POST`/`DELETE /api/admin/sharepoint/connections/{id}/manual-sites`, idempotent on the site id) and reseeded from it on reopen; a site that was only added, never confirmed as a scope, can also be forgotten again from its row.
+
 - **A non-JSON error body no longer crashes CLI error reporting.** `agnes admin config-surface` (and ~25 other command error paths) printed server errors with a bare `resp.json().get('detail', ...)`, so an HTML 403/404 from a reverse proxy — or any body that is not FastAPI's `{"detail": ...}` JSON — died with a `JSONDecodeError` traceback instead of the error. Every audited call site in `cli/commands/` now goes through `cli.client.error_detail` / `error_detail_object`, which never raise: non-JSON bodies fall back to `HTTP <status>: <body text>` (whitespace-collapsed, capped at 300 chars so a proxy's HTML page cannot flood the terminal), and structured-detail consumers (news version-conflict 409s, sync-in-progress 409, semantic-model 422) degrade to their generic message instead of a traceback.
 
 - **The SharePoint source card stops inventing numbers.** The pipeline strip's "Queue cost ~$0.02 × items" figure — a constant, not a price — is replaced by an honest "Review queue: N items" count, and the schedule label no longer claims an "external producer" runs the crawl. The run drawer now also shows the LLM entity detector's real token spend per run ("N NER tokens · not priced") read from the detector's own accounting — `{}`/absence still means "no tokens spent", which stays a different claim from a computed $0.00.
@@ -126,7 +165,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The producer corpus-map handoff endpoint.** `GET /api/admin/sharepoint/connections/{id}/corpus-map` (with its `connectors/sharepoint/corpus_map.py` builder, the wizard's "Download corpus map" link, and the producer-token grant for the route) served exactly one consumer — the retired external corpus-extraction producer. The built-in pipeline routes scopes and permission zones structurally inside the crawler and never read this map. Producer tokens keep the rest of their callback surface (`GET …/scopes`, collection file upload, facts ingest/corrections) unchanged.
 
 ### Internal
-
+- **The two health-probe event-loop guards asserted nothing, and then
+  asserted it unreliably.** Both patched `_check_db_schema` — the inner
+  read *behind* the memoized `_cached_db_schema` the endpoints await — so
+  with the loop blocked the first probe slept, filled the cache, and the
+  second returned from it for free: healthy and regressed both measured one
+  sleep (1.53s either way). They now patch the cached layer, and assert
+  **peak concurrency** instead of elapsed time. A wall-clock threshold had
+  to fit between one sleep and two while a loaded shard runner's own
+  overhead measured ~1.05s and varied — the liveness guard failed at 1.54s
+  against 0.9s and again at 2.55s against a widened 2.5s, both times with
+  `app/api/health.py` byte-identical to a passing `main`. Peak concurrency
+  is 2 off-loop and 1 when blocked, independent of machine load; verified
+  by forcing `asyncio.to_thread` inline, where both guards now fail.
 - **A git conflict marker left in `CHANGELOG.md` now fails CI.** A seventh guard in `tests/test_changelog_integrity.py` refuses any line that *is* a marker. Nothing could see this before: the released-region checksum covers released blocks only, so a marker in `[Unreleased]` passes it, and the duplicate-bullet guard compares bullets — a marker line is not one. An orphan `<<<<<<< HEAD` with no matching `=======` reached `main` exactly that way, because a union-style merge resolution keeps both sides of a *balanced* conflict and passes an unbalanced marker through as ordinary text. Matched at line start rather than as a substring, since the `[0.55.1]` section legitimately documents these markers inside backticks — pinned by its own test so a future tightening cannot fail the build on correct prose.
 
 - **Corporate Memory detection is now documented where admins can find it, ahead of the scheduled-agent rework in #1971.** `/admin/corporate-memory` gained a "How detection works" panel (the two extraction paths and their inputs, the fixed confidence-by-detection-type lookup, the currently-constant category, and where to find the two kill-switches above); `docs/corporate-memory-governance.md` gained a "How Candidates Are Detected" section, dropped its stale claim that the AI self-reports a confidence score, and fixed a wrong config key name (`auto_confidence_threshold` → `auto_publish_min_confidence`); and the remaining inert `corporate_memory.*` knobs (`sources.claude_local_md.*`, `sources.session_transcripts.confidence_base`/`max_turns_per_session`, `extraction.*`, `review_period_months`, `entity_resolution.*`) are now labeled "not yet wired" in the server-config schema and `instance.yaml.example` instead of silently implying they already do something.

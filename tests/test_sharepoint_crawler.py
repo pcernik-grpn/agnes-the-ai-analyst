@@ -516,6 +516,185 @@ class TestResume:
 
 
 # --------------------------------------------------------------------------
+# A per-item failure must not let the drive's cursor advance past it —
+# Graph's delta feed only re-offers an item when it CHANGES, so once the
+# page's deltaLink moves on, a file that failed once and nobody touched
+# again would otherwise never come back around (root-caused live: a run
+# with every download failing, followed by a run where delta reported
+# nothing left to do — 14 documents landed out of roughly 1551).
+# --------------------------------------------------------------------------
+
+
+class TestFailureRetryQueue:
+    def test_a_failed_download_is_retried_next_run_even_when_delta_reports_no_changes(self, crawl_env, monkeypatch):
+        """The core invariant: a file that failed in run N is attempted
+        again in run N+1 — regardless of what the delta feed says, since a
+        genuinely unchanged file is never re-offered by Graph."""
+        item2_recovered = {"value": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "item2" in url and not item2_recovered["value"]:
+                    return httpx.Response(404, json={})
+                return _content_response()
+            if "t=1" in url:
+                # Every run after the first: the delta feed has nothing to
+                # report — item2's failure was never a change Graph saw.
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("item1", name="f1.docx", ctag="c1"),
+                        _file_item("item2", name="f2.docx", ctag="c2"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        assert first["errors"] == 1
+        state = _state(crawl_env)
+        assert set(state["ctags"]) == {"graph:item1"}
+        assert state["failed_items"]["graph:item2"]["attempts"] == 1
+        assert not state["failed_items"]["graph:item2"].get("given_up")
+        item1_downloads = sum(1 for u in seen if u.endswith("/content") and "item1" in u)
+
+        item2_recovered["value"] = True
+        second = _run(connection, monkeypatch)
+
+        assert second["new"] == 1
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item2"
+        state = _state(crawl_env)
+        assert state["ctags"]["graph:item2"] == "c2"
+        assert "graph:item2" not in state["failed_items"]
+        assert second["item_retry_recovered"] == 1
+
+        # Requirement 2 — the successful item's cTag behaviour is
+        # unchanged: it is never re-downloaded just because a neighbour in
+        # the same original page needed a retry.
+        assert sum(1 for u in seen if u.endswith("/content") and "item1" in u) == item1_downloads
+
+    def test_an_item_that_never_failed_is_unaffected_by_the_retry_queue(self, crawl_env, monkeypatch):
+        """Baseline: with nothing to retry, behaviour is exactly the
+        pre-existing ctag fast path — the queue adds a pass, never removes
+        the common case's shortcut."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        second = _run(connection, monkeypatch)
+        assert second["unchanged"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_first
+        assert _state(crawl_env)["failed_items"] == {}
+
+    def test_a_permanently_failing_item_stops_being_retried_after_the_bound_and_stays_visible(
+        self, crawl_env, monkeypatch
+    ):
+        """Requirement 3: the bound. A corrupt file that never downloads
+        must not cost a retry forever — but giving up on it must be
+        recorded, never dropped."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["errors"] == 1
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert not entry.get("given_up")
+
+        # Retried from the queue on this run; fails again and hits the bound.
+        second = _run(connection, monkeypatch)
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 2
+        assert entry["given_up"] is True
+        assert second["item_retry_given_up"] == 1
+        assert second["retry_backlog"]["given_up"] == 1
+        assert second["retry_backlog"]["given_up_sample"][0]["attempts"] == 2
+        content_calls = sum(1 for u in seen if u.endswith("/content"))
+
+        third = _run(connection, monkeypatch)
+        # No further attempt — it stopped costing a download once given up
+        # on — but every future report still names it as stuck, not silent.
+        assert sum(1 for u in seen if u.endswith("/content")) == content_calls
+        assert third["item_retry_given_up"] == 0
+        assert third["retry_backlog"]["given_up"] == 1
+
+
+class TestForcedResync:
+    def test_resync_flag_re_enumerates_from_scratch_but_keeps_ctags(self, crawl_env, monkeypatch):
+        """Requirement 4: an operator can recover a connection whose delta
+        cursor ran past documents it never ingested without hand-editing
+        the state file on the data disk."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?token=STALE"},
+                "ctags": {"graph:item1": "ctag-1"},
+                "failed_items": {
+                    "graph:item2": {
+                        "attempts": 5,
+                        "given_up": True,
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2"},
+                        "path": "x",
+                    }
+                },
+            },
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            assert "token=STALE" not in url, "a resync must not replay the stale deltaLink"
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=fresh"})
+
+        seen = _install_graph(monkeypatch, handler)
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        report = crawler.run_builtin_crawl({"connection_id": "conn1", "resync": True})
+
+        assert any("/root/delta?%24top=" in u or "/root/delta?$top=" in u for u in seen), (
+            "a resync re-enumerates from the drive's bare delta, never the stale saved link"
+        )
+        # The re-offered item's ctag still matches — proving the full walk
+        # happened without forcing a needless re-download.
+        assert report["unchanged"] == 1
+        assert not any(u.endswith("/content") for u in seen)
+        state = _state(crawl_env)
+        assert state["delta_links"]["b!drive1"] == f"{DRIVE_DELTA}?t=fresh"
+        assert state["failed_items"] == {}
+        assert state["ctags"]["graph:item1"] == "ctag-1"
+
+
+# --------------------------------------------------------------------------
 # Anonymize-marked scopes: fail CLOSED
 # --------------------------------------------------------------------------
 
@@ -1394,7 +1573,7 @@ class TestState:
         path = crawler.state_path("conn1")
         path.write_text("{not json")
         state = crawler.load_state("conn1")
-        assert state == {"delta_links": {}, "ctags": {}}
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
 
     def test_an_unsafe_connection_id_cannot_escape_the_state_directory(self, crawl_env):
         for bad in ("../../etc/passwd", "a/b", "..", ""):
