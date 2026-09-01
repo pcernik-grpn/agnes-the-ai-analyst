@@ -11,6 +11,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.95.0] - 2026-09-01
+
+### Added
 - **`agnes app fetch <slug> <path>` — an authenticated GET against a hosted data
   app.** Prints the body, or writes it with `--output`. It exists so nobody has
   to hand a credential to an agent: writing the call by hand means reading a
