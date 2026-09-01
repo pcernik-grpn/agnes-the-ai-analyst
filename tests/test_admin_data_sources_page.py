@@ -2515,6 +2515,9 @@ function spEnableStep(n) {{ calls.push(["spEnableStep", n]); }}
 function spGoStep(n) {{ calls.push(["spGoStep", n]); }}
 function spLoadScopesThenTree() {{ calls.push(["spLoadScopesThenTree"]); }}
 function spLoadShare() {{ calls.push(["spLoadShare"]); return Promise.resolve(); }}
+// Loads the bound connection's saved values into step 1 — a collaborator
+// like the rest, recorded so the orchestration below stays asserted.
+function spBindStep1ToConnection(id) {{ calls.push(["spBindStep1ToConnection", id]); }}
 
 global.CSS = {{ escape: (s) => s }};
 const highlighted = [];
@@ -2546,6 +2549,7 @@ global.setTimeout = (fn) => fn();  // run the un-highlight synchronously, determ
         assert result["spConnId"] == "sp-conn-1"
         assert result["calls"] == [
             ["openSpWizard"],
+            ["spBindStep1ToConnection", "sp-conn-1"],
             ["spEnableStep", 2],
             ["spEnableStep", 3],
             ["spGoStep", 2],
@@ -2560,6 +2564,7 @@ global.setTimeout = (fn) => fn();  // run the un-highlight synchronously, determ
         assert result["spConnId"] == "sp-conn-1"
         assert result["calls"] == [
             ["openSpWizard"],
+            ["spBindStep1ToConnection", "sp-conn-1"],
             ["spEnableStep", 2],
             ["spEnableStep", 3],
             ["spGoStep", 3],
@@ -2600,7 +2605,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}
