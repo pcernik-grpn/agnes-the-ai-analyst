@@ -419,10 +419,13 @@ class TestOverlayCoversEveryBaseComposeService:
             "driver in the overlay that defines the service instead."
         )
 
-    def test_every_overlay_entry_only_sets_the_gcplogs_driver(self):
+    def test_every_overlay_entry_only_sets_the_log_driver(self):
         for name, spec in self._services(OVERLAY).items():
-            assert spec == {"logging": {"driver": "gcplogs"}}, (
-                f"{OVERLAY}: service {name!r} must carry exactly the gcplogs "
-                f"logging block and nothing else, got {spec!r} — this file is a "
-                "log-driver overlay, not a place to override service config"
+            assert set(spec) == {"logging"}, (
+                f"{OVERLAY}: service {name!r} must carry a logging block and "
+                f"nothing else, got {sorted(spec)} — this file is a log-driver "
+                "overlay, not a place to override service config"
+            )
+            assert spec["logging"]["driver"] == "fluentd", (
+                f"{OVERLAY}: service {name!r} is not forwarding to the Ops Agent"
             )
