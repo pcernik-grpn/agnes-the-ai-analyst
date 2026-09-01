@@ -138,6 +138,15 @@ POSTURE: dict[str, str] = {
     "PUT /api/admin/mcp-sources/{source_id}/secret": "mcp_source.secret.set",
     "PUT /api/admin/mcp-tools/{tool_id}": "mcp_tool.update",
     "PUT /api/admin/mcp-tools/{tool_id}/projection-map": "mcp_tool.projection_map",
+    # -- app.api.admin_extraction ----------------------------------------------
+    # A POST that mutates NOTHING — it runs the anonymizer over a pasted
+    # sample and returns the result. Cataloged rather than `exempt:` all the
+    # same, on the `access_policy.preview` precedent: an admin pastes real
+    # content into it and gets back production-matching pseudonyms, which is
+    # an attributable act even though no state changes. The handler writes
+    # its own row (`log_safe`) carrying the sample's LENGTH and the redaction
+    # counts — never the text.
+    "POST /api/admin/sharepoint/anonymization/preview": "anonymization.preview",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_remove",
     # Landed on `integration` in parallel with this wave, declared "fallback"

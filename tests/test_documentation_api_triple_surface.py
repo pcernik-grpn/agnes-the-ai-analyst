@@ -1256,6 +1256,18 @@ _EXEMPT: dict[str, str] = {
         "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "
         "the acl-sync exemption right above; no analyst CLI/MCP analogue"
     ),
+    # The config drawer's "Preview redaction" panel: paste a sample, see what
+    # the anonymizer would do to it before a crawl runs over thousands of
+    # documents. Same exemption class as the drawer it lives in — an admin
+    # page's own data. Deliberately NOT given a CLI/MCP surface: it processes
+    # admin-pasted document content under the instance's production pseudonym
+    # key, and an analyst-facing tool that redacts arbitrary text is a
+    # different product decision from an admin sanity-checking their own
+    # extraction configuration.
+    "/api/admin/sharepoint/anonymization/preview": (
+        "anonymization dry-run over an admin-pasted sample for the config drawer's "
+        "preview panel — admin display primitive, nothing persisted, no analyst CLI/MCP analogue"
+    ),
     # Ontology builder (spec §13.2) — admin-only builder-shell CRUD + the two
     # draft state-machine actions + dry-run. No analyst CLI/MCP analogue: the
     # ontology is consumed as a semantic model, which has its own surface.

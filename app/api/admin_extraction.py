@@ -32,6 +32,12 @@ Surface (all gated by ``Depends(require_admin)``):
       A5 — the effective extraction configuration with an ORIGIN and a lock
       state per leaf, plus the per-scope rows. Cataloged (not exempt): it
       discloses credential env-var NAMES and the per-scope audience mapping.
+  POST /api/admin/sharepoint/anonymization/preview
+      Run this instance's REAL anonymizer over a pasted sample and return
+      what it would redact — the answer to "what will a crawl over ten
+      thousand documents do to mine?" that no amount of configuration
+      documentation can give. Cataloged; the sample text itself is never
+      logged and never stored.
 
 **PG-only, and honest about it.** ``extraction_runs`` is a post-A3 table, so
 resolving its repository on a DuckDB-backed instance raises the typed
@@ -64,8 +70,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from app.auth.access import require_admin
+from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +550,75 @@ def _detector_row() -> Dict[str, Any]:
     return row
 
 
+def _deterministic_tier_rows() -> List[Dict[str, Any]]:
+    """The deterministic identifier tiers and the operator's custom terms.
+
+    These belong next to the detector row rather than in a page of their
+    own: "which detector" and "which shapes" are one question an admin asks
+    once, before a crawl. The preview panel below the drawer is what turns
+    the answer from a claim into something they can check.
+
+    The custom-term row reports a COUNT, not the terms. They are ordinary
+    admin-readable config, but they are also the very words an operator
+    considered sensitive enough to redact; a read-out that prints them into
+    every config drawer render (and every screenshot of one) earns nothing
+    the count does not.
+    """
+    from src.anonymization import CustomTermError, compile_custom_terms, rules_from_config
+
+    rows = [
+        _config_row(
+            f"Detect {name}",
+            ("extraction", "anonymization", "detect", key),
+            default=True,
+            note=note,
+        )
+        for key, name, note in (
+            (
+                "phones",
+                "phone numbers",
+                "international (+CC / 00CC) and the Czech 3-3-3 grouping. A bare nine-digit "
+                "run is deliberately not matched — that shape is an order number at least as often",
+            ),
+            (
+                "ibans",
+                "IBANs",
+                "mod-97 validated, so an IBAN-shaped product code is not redacted — and a "
+                "typo'd or OCR-mangled account number is not either",
+            ),
+            (
+                "national_ids",
+                "national ids",
+                "Czech birth number (rodné číslo), slashed or solid; the date field and the "
+                "mod-11 check must both pass",
+            ),
+        )
+    ]
+
+    row = _config_row("Custom terms", ("extraction", "anonymization", "custom_terms"), default=[])
+    try:
+        terms = rules_from_config().custom_terms
+        # Compiled, not just counted: validation lives in the compiler, and
+        # a row that reported "3 term(s)" for three terms no crawl can use
+        # would be the reassuring kind of wrong this drawer exists to avoid.
+        compile_custom_terms(terms)
+        count = len(terms)
+    except CustomTermError as exc:
+        # A configured term that cannot compile is the operator's own value
+        # being wrong, and every crawl over an anonymize-marked scope will
+        # drop its documents until it is fixed. The drawer says so here
+        # rather than letting the run report be the first hint.
+        row["value"] = "invalid"
+        row["note"] = f"unusable — {exc}"
+        return [*rows, row]
+    row["value"] = f"{count} term(s)"
+    row["note"] = (
+        "literal text redacted as TERM_<hmac>; the terms themselves are not printed here. "
+        "Regular expressions are refused — see docs/anonymization.md"
+    )
+    return [*rows, row]
+
+
 def _extraction_config_rows() -> List[Dict[str, Any]]:
     """The effective ``extraction`` block, one row per leaf (design §6.2).
 
@@ -599,6 +676,7 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
             default="every 200 delta rows",
             note="a code constant, shown so nobody hunts for the knob",
         ),
+        *_deterministic_tier_rows(),
     ]
 
 
@@ -649,5 +727,208 @@ async def extraction_config(
         "section_lock_reason": None
         if section_editable
         else "The `extraction` section is not admin-writable on this instance.",
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Anonymization preview — see what a crawl would redact, before running one.
+#
+# The config drawer above can tell an admin WHICH tiers are on. It cannot
+# tell them what those tiers will do to THEIR documents, and that is the
+# question actually being asked before a crawl over thousands of files:
+# "does this catch our case numbers? does it eat our product codes?" This
+# endpoint answers it by running the real anonymizer — the same key
+# resolution, the same tier ordering, the same detector choice — over one
+# pasted sample.
+#
+# Three properties make it safe to expose:
+#
+# * **Nothing is persisted.** No collection row, no extraction run, no
+#   stored sample. The only write is the audit row, and that row carries
+#   counts, never content.
+# * **The response cannot carry an original.** It returns the redacted text
+#   (which by construction no longer holds what was redacted) plus the
+#   pseudonyms and per-kind counts. `AnonymizeResult.pseudonyms` is
+#   deliberately a list of tokens, not a mapping from originals.
+# * **No fake key.** An instance with no resolvable key gets a 409 naming
+#   `extraction.anonymization.hmac_key_env`, never a preview computed under
+#   a throwaway key — a pseudonym an admin cannot reproduce in production is
+#   worse than no preview at all.
+# ---------------------------------------------------------------------------
+
+#: Ceiling on one pasted sample. A preview is for a representative page or
+#: two, not a corpus: the regex tiers are linear but the LLM detector chunks
+#: at 30k characters a call, so an unbounded paste is an unbounded bill.
+#: Above this the answer is 413 — with the limit named, so the admin trims
+#: rather than guesses.
+_PREVIEW_MAX_CHARS = 50_000
+
+_PREVIEW_DETECTORS = ("regex", "llm")
+
+
+class AnonymizationPreviewRequest(BaseModel):
+    """Body for ``POST /anonymization/preview``.
+
+    ``detector`` defaults to ``regex`` — never to the instance's configured
+    value. The panel names which one it is asking for, and the LLM tier
+    spends tokens per call: a default that quietly followed configuration
+    would bill an admin for opening a drawer.
+    """
+
+    text: str
+    detector: Optional[str] = None
+
+
+def _preview_key() -> bytes:
+    """This instance's real anonymization key, or a 409 that names the knob.
+
+    Delegates to ``app.worker.kinds._resolve_anonymization_key`` — the one
+    owner of that resolution, including the allowlist check on the
+    admin-writable env-var NAME. The key value never leaves this function:
+    the raised detail is the resolver's own message, which names the
+    variable, never its contents.
+    """
+    from app.worker.kinds import AnonymizationKeyError, _resolve_anonymization_key
+
+    try:
+        return str(_resolve_anonymization_key()).encode("utf-8")
+    except AnonymizationKeyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "anonymization_key_unavailable",
+                "message": str(exc),
+                "config_key": "extraction.anonymization.hmac_key_env",
+            },
+        ) from exc
+
+
+@router.post("/anonymization/preview")
+async def preview_anonymization(
+    request: AnonymizationPreviewRequest,
+    user: dict = Depends(require_admin),
+):
+    """Redact a pasted sample with this instance's real anonymizer.
+
+    Body: ``{text, detector?: "regex" | "llm"}``. Returns the redacted text,
+    the per-kind counts, the distinct pseudonyms produced, and — for the
+    ``llm`` detector — that call's own token usage, so the cost of the tier
+    is visible at the moment it is being evaluated rather than at the end of
+    a thousand-document crawl.
+
+    Errors are specific because each one has a different fix: ``413`` (too
+    long — trim), ``409`` (no key — set the env var this names), ``400``
+    (the instance's ``custom_terms`` are unusable — fix the config), ``502``
+    (the LLM tier could not answer — the same fail-closed posture a crawl
+    takes, never a silent downgrade to regex-only).
+
+    Audited under ``anonymization.preview`` with the sample's LENGTH and the
+    redaction counts. The text itself is never written to the audit trail,
+    never logged, and never stored anywhere else: an admin pasting a real
+    document into a preview box must not thereby file it into the system
+    they are previewing.
+    """
+    text = request.text or ""
+    if not text.strip():
+        raise HTTPException(status_code=422, detail="text_required: paste a sample to preview")
+    if len(text) > _PREVIEW_MAX_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "preview_text_too_long",
+                "message": (
+                    f"the sample is {len(text)} characters; the preview accepts at most "
+                    f"{_PREVIEW_MAX_CHARS}. Paste a representative page rather than the whole document."
+                ),
+                "limit": _PREVIEW_MAX_CHARS,
+            },
+        )
+
+    choice = (request.detector or "regex").strip().lower()
+    if choice not in _PREVIEW_DETECTORS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown_detector: {choice!r} — expected one of {', '.join(_PREVIEW_DETECTORS)}",
+        )
+
+    key = _preview_key()
+
+    from src.anonymization import CustomTermError, anonymize_markdown
+
+    detector: Any = None
+    usage: Dict[str, Any] = {}
+    llm: Any = None
+    # An empty tuple in an `except` clause matches nothing, which is exactly
+    # the semantics wanted on the regex path: the LLM module is not imported
+    # at all there, so its exception type must not have to exist to write
+    # the handler.
+    detection_unavailable: tuple = ()
+    if choice == "llm":
+        from src.anonymization_ner import DetectionUnavailable, LLMDetector, hybrid_detector
+
+        detection_unavailable = (DetectionUnavailable,)
+        llm = LLMDetector()
+        detector = hybrid_detector(llm)
+
+    try:
+        result = anonymize_markdown(text, key=key, detector=detector)
+    except CustomTermError as exc:
+        # The operator's own custom_terms are unusable. A 400 rather than a
+        # 500: nothing is broken, a value they wrote is, and the message
+        # says which entry and why.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "custom_terms_invalid",
+                "message": str(exc),
+                "config_key": "extraction.anonymization.custom_terms",
+            },
+        ) from exc
+    except detection_unavailable as exc:
+        # The same fail-closed posture the crawl takes: the LLM tier could
+        # not answer, so there is no answer — never a preview silently
+        # computed from the regex tier alone under an "llm" label.
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "detector_unavailable",
+                "message": (
+                    f"the LLM detector could not answer: {exc}. A crawl treats this the same "
+                    "way — the document is counted in anonymize_failed and dropped, never "
+                    "ingested with a redaction that quietly degraded to regex-only."
+                ),
+            },
+        ) from exc
+
+    if llm is not None:
+        usage = dict(llm.last_usage)
+
+    counts = dict(result.counts)
+    log_safe(
+        user_id=user.get("id"),
+        action="anonymization.preview",
+        resource="extraction.anonymization",
+        params={
+            # Length, never content. The sample is an admin-pasted document
+            # and the audit trail is the one place it must never land.
+            "chars": len(text),
+            "detector": choice,
+            "counts_by_kind": counts,
+            "replaced": result.replaced,
+        },
+    )
+
+    return {
+        "detector": choice,
+        "redacted_text": result.text,
+        "counts_by_kind": counts,
+        "replaced": result.replaced,
+        # Tokens only — never the values behind them. See the block comment
+        # above: this response is incapable of echoing an original back.
+        "entities": [{"kind": kind, "pseudonym": token} for kind, token in result.pseudonyms],
+        # `{}` for the regex tier means NO tokens were spent — a different
+        # claim from "$0.00", the same distinction the run card draws.
+        "usage": usage,
         "as_of": datetime.now(timezone.utc).isoformat(),
     }

@@ -166,6 +166,134 @@ tier sends every crawled document to the model — on the order of **~$5 per
 1,000 documents** at the default Haiku-class model — so an operator opts in
 when the extra recall is worth that per-corpus bill.
 
+## Deterministic identifier tiers
+
+Neither detector above finds a phone number, a bank account or a birth
+number, because none of them is a *name* — they are decided from characters
+alone, which makes them the wrong job for a name detector and the right job
+for a shape pass. Three such tiers run before entity substitution:
+
+```yaml
+extraction:
+  anonymization:
+    detect:
+      phones: true          # PHONE_<hmac>
+      ibans: true           # IBAN_<hmac>
+      national_ids: true    # ID_<hmac>
+```
+
+**All three default to ON, and that default is the recommendation.** They
+cost nothing per document (no model, no network), they are exact by
+construction, and each guards an identifier whose disclosure is more severe
+than a name's. Turn one off only for a corpus where that shape is noise
+rather than identity.
+
+The pseudonyms use the same per-instance HMAC key as `PERSON_` /
+`COMPANY_` / `EMAIL_`, so a phone number tokenizes identically in every
+document of an instance and never correlates across instances.
+
+The tiers run **IBAN → national id → phone**, and that order is load-bearing:
+a grouped IBAN (`CZ65 0800 0000 1920 0014 5399`) contains a run that reads
+as an international phone number, so the IBAN has to be consumed whole
+first. The other order shreds it into a redacted fragment and a surviving
+one.
+
+What each tier matches, and what it deliberately does not:
+
+| Tier | Matches | Deliberately does **not** |
+|---|---|---|
+| `phones` | `+CC…` / `00CC…` (8–15 digits, any of space/NBSP/`.`/`-`/parens as separators) and the Czech 3-3-3 grouping `776 041 900` | a **bare nine-digit run** (`776041900`) — that shape is an order number or an account reference at least as often as a phone |
+| `ibans` | both written forms — solid (`CZ6508000000192000145399`) and grouped in fours — **validated with the ISO 13616 mod-97 checksum** | anything failing the checksum, which also means a **typo'd or OCR-mangled** account number is not redacted |
+| `national_ids` | Czech birth number (rodné číslo): `760419/0341`, `760419 / 0341`, and the slash-less ten-digit form. Date field **and** mod-11 check (with the pre-1985 remainder-10 allowance) must both pass | the slash-less **nine-digit** (pre-1954) form, which carries no checksum and is indistinguishable from any other nine-digit number |
+
+Canonicalization unifies the written forms: `+420 776 041 900` and
+`+420776041900` are one token; `760419/0341` and `7604190341` are one token;
+a grouped and a solid IBAN are one token. A **national** phone form and an
+**international** one are NOT unified (`776 041 900` ≠ `+420 776 041 900`) —
+that would require assuming a default country, and an anonymizer that
+guesses a country prefix produces a pseudonym that is wrong in exactly the
+corpus where it matters.
+
+## Custom terms — the vocabulary only you have
+
+```yaml
+extraction:
+  anonymization:
+    custom_terms:
+      - "Projekt Fénix"
+      - "ACME-*"
+```
+
+Redacted as `TERM_<hmac>`. No general detector can know a project codename,
+an internal system, or a site name; this list is where the operator supplies
+them.
+
+Entries are **literal text**, matched case-insensitively and on word
+boundaries. A `.` is a dot, not "any character". One trailing `*` is allowed
+and means "followed by more word characters" (`ACME-*` catches `ACME-1234`),
+compiled as a bounded run rather than an unbounded quantifier.
+
+**Regular expressions are refused.** A pattern from config runs over every
+document of every crawl, where one badly written quantifier is a denial of
+service (security playbook §5), so an entry carrying regex metacharacters is
+rejected *by name* with a message saying which character and why. Also
+refused: an entry under 2 characters (it would redact most of a document),
+one over 128 characters, more than 200 entries, and any of the anonymizer's
+own placeholder words.
+
+An unusable entry **fails**, it is not skipped — the crawl counts the
+document in `anonymize_failed` and drops it, and the preview panel below
+answers `400` naming the bad entry. Silently dropping a term an operator
+added would leave them believing something is redacted that is not, which is
+the one failure mode this whole feature exists to prevent.
+
+## Preview: see the redaction before the crawl
+
+Configuration can say which tiers are on. It cannot say what they will do to
+*your* documents — and that is the question actually being asked before a
+crawl over thousands of files ("does it catch our case numbers? does it eat
+our product codes?").
+
+`/admin/data-sources` → the source card's **config drawer** → **Preview
+redaction**: paste a sample, press the button, see the redacted text and a
+per-kind count of what changed.
+
+The same drawer lists each tier's effective state and the number of
+configured custom terms above the panel (the terms themselves are not
+printed — they are the words an operator considered sensitive enough to
+redact). A `custom_terms` list that cannot compile shows as `invalid` with
+the compiler's own message, because until it is fixed every anonymized
+document of every crawl is dropped, and the run report should not be the
+first place that surfaces.
+
+The panel calls `POST /api/admin/sharepoint/anonymization/preview`
+(admin-only), body `{"text": "...", "detector": "regex" | "llm"}`. It runs
+the **real** anonymizer: this instance's real key resolution, the configured
+tiers, the configured custom terms — so a pseudonym in the preview is the
+pseudonym a crawl will produce.
+
+Four things are true of it by construction:
+
+- **Nothing is persisted.** No collection row, no extraction run, no stored
+  sample. The one write is the audit row (`anonymization.preview`), and that
+  row carries the sample's *length* and the redaction counts, never its
+  text.
+- **The response cannot echo an original.** It returns the redacted text
+  plus the pseudonyms and counts — a list of tokens, never a mapping back to
+  what they replaced.
+- **No fake key.** An instance with no resolvable key answers `409` naming
+  `extraction.anonymization.hmac_key_env` rather than previewing under a
+  throwaway key. A pseudonym an admin cannot reproduce in production is
+  worse than no preview.
+- **`detector: "llm"` spends real tokens**, one call per 30k-character
+  chunk, and the response returns that call's own usage so the cost is
+  visible while the tier is being evaluated. It defaults to `regex`
+  regardless of what the instance is configured for — opening a drawer must
+  not bill anyone.
+
+Samples are capped at 50,000 characters (`413` above that, with the limit
+named).
+
 ## Badge semantics: requested vs. declared
 
 Two different things share the word "anonymize" on the UI, and the wizard
@@ -271,7 +399,14 @@ still make "declared" wrong; there is currently no mechanism in Agnes to
 catch that. What Agnes refuses is the declaration being *absent* for a
 corpus it knows was supposed to get one, not a false declaration.
 
-**Detection is not exhaustive.** Neither tier finds every identifier: the
-regex tier is patterns, and the LLM tier is a reader with a reader's
-misses. An anonymized scope is materially safer than an un-anonymized one;
-it is not a guarantee that nothing identifying survived.
+**Detection is not exhaustive.** No tier finds every identifier: the regex
+tier is patterns, the LLM tier is a reader with a reader's misses, and the
+deterministic identifier tiers above are honest about the shapes they
+refuse (a bare nine-digit run, a checksum-failing IBAN, a nine-digit birth
+number) precisely because matching them would redact ordinary order numbers
+across the corpus. Addresses, case numbers, VAT ids, account numbers in
+national (non-IBAN) format and passport numbers are still **not** detected
+at all. An anonymized scope is materially safer than an un-anonymized one;
+it is not a guarantee that nothing identifying survived — which is what the
+preview panel is for: check a real sample of *your* documents before
+trusting a crawl over thousands of them.

@@ -1286,6 +1286,19 @@ CATALOG: dict[str, AuditEvent] = {
         "encrypted in the vault (fingerprint only, never the key value). Write-once — there "
         "is no automatic rotation.",
     ),
+    # -- Anonymization preview (POST /api/admin/sharepoint/anonymization/
+    # preview). Cataloged for the same reason `access_policy.preview` is: an
+    # admin pastes real content into it, and the instance's real pseudonym
+    # key produces real, production-matching tokens — so "who previewed,
+    # when, and how much" is a question worth being able to answer. The row
+    # records the sample's LENGTH and the per-kind redaction counts; the
+    # sample text itself is never written to the trail.
+    "anonymization.preview": AuditEvent(
+        "anonymization.preview",
+        "read",
+        "An admin previewed what the anonymizer would redact in a pasted sample "
+        "(length and counts recorded; the sample text itself is never stored).",
+    ),
 }
 
 

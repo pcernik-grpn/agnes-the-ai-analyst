@@ -1268,17 +1268,10 @@ sharepoint:
 #
 # This block carries no switch of its own — the connector's on/off state
 # lives on `sharepoint.enabled` above. Its leaves ARE editable from
-# /admin/server-config (`producer.command`/`.module`/`.env_passthrough`,
-# `schedule`, `timeout_s`), reversing this section's original
-# deploy-time-only stance. `producer.command` and `producer.module` each
-# still honor their own deploy-time env var
-# (AGNES_EXTRACTION_PRODUCER_COMMAND / AGNES_EXTRACTION_PRODUCER_MODULE)
-# AHEAD of a value set here or via the panel — a Terraform-provisioned
-# instance shows those two leaves read-only in the panel ("set by
-# deployment (Terraform)") and a save touching one 409s
-# (`field_locked_by_deployment`) instead of persisting a value the running
-# process would never read. `schedule`/`timeout_s`/`env_passthrough` carry
-# no such override and are always plain writable instance data.
+# /admin/server-config (`schedule`, `timeout_s`), and none carries a
+# deploy-time env override anymore: the AGNES_EXTRACTION_PRODUCER_* locks
+# were removed together with the external producer mode (the built-in
+# in-process pipeline is the only pipeline).
 #
 # Flipping `sharepoint.enabled` above is NOT, by itself, enough to run the
 # extraction-worker compose service. That service sets AGNES_ROLE=worker
@@ -1291,10 +1284,8 @@ sharepoint:
 # boot the worker container.
 extraction:
   # How many `corpus-extraction` jobs the extraction lane runs at once
-  # (Stage 1 of Agnes-owned extraction parallelism — before this, the ONLY
-  # parallelism was inside the external producer's own `--workers` flag;
-  # this made multiple SharePoint CONNECTIONS extract strictly one-at-a-
-  # time). Different connections only — the per-connection idempotency key
+  # (Stage 1 of Agnes-owned extraction parallelism). Different connections
+  # only — the per-connection idempotency key
   # (app/api/admin_sharepoint.py::_extraction_idempotency_key) still
   # prevents two jobs for the SAME connection from ever coexisting,
   # unaffected by this setting. AGNES_EXTRACTION_CONCURRENCY (env) overrides
@@ -1304,38 +1295,14 @@ extraction:
   # out-of-[1, 8]-range values are clamped/defaulted with a logged warning,
   # never a crash.
   #
-  # SIZING: each slot is a FULL producer subprocess — its own crawl workers
-  # plus an LLM pass — not a lightweight thread. The `extraction-worker`
-  # compose service's default 4g/2cpu (AGNES_EXTRACTION_WORKER_MEM_LIMIT/
-  # _CPUS in docker-compose.yml) assumes exactly ONE concurrent producer
-  # run; raising `concurrency` without raising those two env vars in lock
-  # step risks OOM/CPU starvation under N concurrent producers.
+  # SIZING: each slot is a FULL in-process crawl — its own file pipeline
+  # (`crawler.concurrency` below) plus any LLM stages — and the two knobs
+  # MULTIPLY against the same tenant and the same container budget: two
+  # concurrent crawls at `crawler.concurrency: 6` is twelve files in
+  # flight. The `extraction-worker` compose service's default 4g/2cpu
+  # (AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS in docker-compose.yml)
+  # assumes ONE concurrent run.
   concurrency: 1
-  producer:
-    # Full command line for the producer entrypoint, e.g.:
-    #   command: "python -m your_producer.run"
-    # OR, when the worker image installed it as a package (see the
-    # Dockerfile's EXTRACTION_PRODUCER_INSTALL build-arg):
-    #   module: your_producer.run
-    # `command` wins when both are set. Either form MAY be a YAML list
-    # instead of a string, taken verbatim (no shell-splitting needed then).
-    #
-    # Both also have an env override — AGNES_EXTRACTION_PRODUCER_COMMAND /
-    # AGNES_EXTRACTION_PRODUCER_MODULE — which wins over the yaml value here,
-    # same env-overrides-instance.yaml posture as `sharepoint.enabled` above.
-    # This is what lets a deploy-time mechanism (e.g. a Terraform module rendering
-    # /opt/agnes/.env) activate the producer without an applier-owned edit
-    # of this file on the VM's data disk. Unlike the yaml key, the env
-    # override for `command` is ALWAYS a plain string split with
-    # `shlex.split` — a YAML/JSON list is not supported via env.
-    command: ""
-    module: ""
-    # OPTIONAL escape hatch: extra env var NAMES to forward to the producer
-    # from this process's own environment, beyond the curated non-secret
-    # allowlist below (PATH/locale/timezone/tempdir/TLS/proxy vars). Empty
-    # by default. Only the NAMES listed here are copied — this is not a way
-    # back to forwarding the whole environment.
-    env_passthrough: []
   # OPTIONAL: a single instance-wide cadence (TCRD-226) — "every Nm"/"every
   # Nh", "daily HH:MM[,HH:MM,...]" (UTC), or "cron <5-field expr>" (UTC) —
   # driving a scheduler row (`extraction-run-due`, see
@@ -1349,7 +1316,7 @@ extraction:
   # `sharepoint.enabled` above. An admin can still trigger a one-off run at
   # any time via `POST /api/admin/sharepoint/connections/{id}/extract`
   # regardless of this setting (subject to the same
-  # sharepoint.enabled/producer-configured gate).
+  # sharepoint.enabled + installed-dependencies gate).
   # SCHEDULER_EXTRACTION_SCHEDULE overrides this at the environment level.
   schedule: ""
   # Wall-clock bound on ONE extraction run, in seconds. This is the only
@@ -1463,6 +1430,56 @@ extraction:
     # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
     # the recall is worth that per-corpus bill.
     detector: "regex"
+    # Deterministic identifier tiers — the shapes a *name* detector cannot
+    # find, because they are not names: they are decided from characters
+    # alone. Each runs before entity substitution and each is individually
+    # toggleable here. ALL THREE DEFAULT TO ON, and the default is the
+    # recommendation: they cost nothing per document (no model, no network),
+    # they are exact by construction, and each guards an identifier whose
+    # disclosure is more severe than a name's. Turn one off only for a
+    # corpus where that shape is noise rather than identity.
+    #
+    #   phones       — international (+CC / 00CC, 8-15 digits) and the Czech
+    #                  3-3-3 grouping ("776 041 900"). A BARE nine-digit run
+    #                  is deliberately not matched: it is an order or
+    #                  account number at least as often as a phone.
+    #   ibans        — validated with the ISO 13616 mod-97 checksum, so an
+    #                  IBAN-shaped product code is not redacted (and, the
+    #                  other way round, a typo'd or OCR-mangled account
+    #                  number is not either).
+    #   national_ids — Czech birth number (rodné číslo), both "760419/0341"
+    #                  and the slash-less ten-digit form; the date field and
+    #                  the mod-11 check must both pass.
+    #
+    # Pseudonyms are PHONE_<hmac> / IBAN_<hmac> / ID_<hmac>, under the same
+    # per-instance key as PERSON_/COMPANY_/EMAIL_.
+    detect:
+      phones: true
+      ibans: true
+      national_ids: true
+    # The operator's OWN vocabulary — a project codename, an internal system
+    # name, a partner, a site — redacted as TERM_<hmac>. Nothing else can
+    # know these, which is why the list exists.
+    #
+    # Entries are LITERAL text, matched case-insensitively and on word
+    # boundaries. A '.' is a dot, not "any character". One trailing '*' is
+    # allowed and means "followed by more word characters" ("ACME-*" catches
+    # "ACME-1234"). REGULAR EXPRESSIONS ARE REFUSED — a pattern from config
+    # runs over every document of every crawl, where one badly written
+    # quantifier is a denial of service — and an entry carrying regex
+    # metacharacters is rejected by name, not silently ignored.
+    #
+    # An unusable entry FAILS rather than being skipped: the crawl counts
+    # the document in `anonymize_failed` and drops it, and the preview panel
+    # in the extraction config drawer answers 400 naming the bad entry.
+    # Silently dropping a term an operator added would leave them believing
+    # something is redacted that is not.
+    #
+    # Test yours before a crawl: /admin/data-sources -> the source card's
+    # config drawer -> "Preview redaction".
+    custom_terms: []
+    #   - "Projekt Fénix"
+    #   - "ACME-*"
   # Scan transcription (OCR) for PDFs with no usable text layer.
   #
   # A scanned or photographed PDF converts to nothing today: the text route

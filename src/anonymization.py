@@ -14,7 +14,7 @@ conflict"; the alias-unification prefix heuristic) are ported from
 What it produces
 ----------------
 
-Three kinds of substitution, applied in this order:
+Substitutions are applied in this order, and the order is a contract:
 
 1. **URLs** collapse to a fixed ``**URL**`` marker. A URL names a host, not a
    party, so it is deliberately *not* identity-bearing: two documents citing
@@ -23,8 +23,24 @@ Three kinds of substitution, applied in this order:
    join key a person has, so it earns a stable token rather than a marker —
    and replacing the whole address as one unit is what stops a local part
    (usually a person's name) surviving next to a redacted domain.
-3. **Entities** (persons, companies) become ``PERSON_<hmac>`` /
+3. **Deterministic identifier tiers**, each individually toggleable
+   (:class:`DeterministicRules`) and each defaulting to ON: IBANs
+   (``IBAN_<hmac>``), national ids (``ID_<hmac>``), phone numbers
+   (``PHONE_<hmac>``) — in that order, because the wider shape has to win.
+   A grouped IBAN (``CZ65 0800 0000 1920 0014 5399``) contains a run that
+   reads as an international phone number to the phone tier, so the IBAN
+   tier consumes it first; the other order shreds the IBAN into a redacted
+   fragment plus a surviving one.
+4. **Admin-supplied custom terms** become ``TERM_<hmac>`` — the operator's
+   own vocabulary (a project codename, an internal system, a partner name)
+   no general detector can be expected to know. Literal text only; see
+   :func:`compile_custom_terms` for why config may not carry a regex.
+5. **Entities** (persons, companies) become ``PERSON_<hmac>`` /
    ``COMPANY_<hmac>``.
+
+Steps 3–5 run after 1–2 on purpose: an email's local part is often a name or
+a number, and collapsing the whole address first means the later tiers never
+see — and never half-rewrite — its pieces.
 
 ``<hmac>`` is the first six hex characters of
 ``hmac_sha256(key, normalize(entity))``. Six hex characters is 24 bits: wide
@@ -51,22 +67,42 @@ import hashlib
 import hmac
 import re
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Literal
 
 __all__ = [
     "AnonymizeResult",
+    "CustomTermError",
+    "DEFAULT_RULES",
     "Detector",
+    "DeterministicRules",
     "Entity",
     "EntityKind",
+    "PLACEHOLDER_PREFIXES",
+    "PLACEHOLDER_WORDS",
+    "PSEUDONYM_DIGEST_CHARS",
+    "PSEUDONYM_PREFIXES",
     "RegexDetector",
     "anonymize_markdown",
+    "compile_custom_terms",
     "normalize",
     "pseudonym",
+    "rules_from_config",
 ]
 
 PERSON: Literal["person"] = "person"
 COMPANY: Literal["company"] = "company"
+
+#: Kinds produced by the deterministic tiers. Not part of ``EntityKind``:
+#: a *detector* never reports these — they are decided from characters
+#: alone, before any detector runs.
+EMAIL = "email"
+PHONE = "phone"
+IBAN = "iban"
+NATIONAL_ID = "national_id"
+TERM = "term"
+URL = "url"
 
 EntityKind = Literal["person", "company"]
 
@@ -94,9 +130,22 @@ class AnonymizeResult:
     """The anonymized document plus how many substitutions produced it."""
 
     text: str
-    #: Total substitutions made — URL collapses + email tokens + entity tokens.
+    #: Total substitutions made — URL collapses + every token kind below.
     #: Counts *occurrences*, not distinct entities.
     replaced: int
+    #: Occurrences per kind (``"url"``, ``"email"``, ``"iban"``,
+    #: ``"national_id"``, ``"phone"``, ``"term"``, ``"person"``,
+    #: ``"company"``). Only kinds that actually fired appear. Same accounting
+    #: as ``replaced``, split — which is what a preview surface renders and
+    #: what a crawl report can total without re-deriving anything.
+    counts: dict[str, int] = field(default_factory=dict)
+    #: The distinct pseudonyms this document produced, as ``(kind,
+    #: pseudonym)`` sorted pairs. Deliberately NOT the values behind them:
+    #: this is the one field a preview endpoint may echo back to a caller,
+    #: so it must be incapable of carrying an original. URLs have no
+    #: pseudonym (they collapse to a fixed marker) and are absent here,
+    #: though they are counted above.
+    pseudonyms: list[tuple[str, str]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -106,8 +155,28 @@ class AnonymizeResult:
 #: URLs are collapsed, never tokenized — see the module docstring.
 URL_PLACEHOLDER = "**URL**"
 
-#: The word a pseudonym starts with, before its ``_<digest>`` tail.
-PSEUDONYM_PREFIXES: dict[str, str] = {PERSON: "PERSON", COMPANY: "COMPANY", "email": "EMAIL"}
+#: The word a pseudonym starts with, before its ``_<digest>`` tail. Every
+#: kind this module can substitute has an entry — the placeholder screen,
+#: the reserved-word list and the "already anonymized" recognizer are all
+#: derived from this ONE mapping, so a new tier cannot be added without its
+#: token becoming un-rewritable in the same edit.
+PSEUDONYM_PREFIXES: dict[str, str] = {
+    PERSON: "PERSON",
+    COMPANY: "COMPANY",
+    EMAIL: "EMAIL",
+    PHONE: "PHONE",
+    IBAN: "IBAN",
+    NATIONAL_ID: "ID",
+    TERM: "TERM",
+}
+
+#: The bare prefixes a pseudonym can start with — ``{"PERSON", …, "TERM"}``.
+PLACEHOLDER_PREFIXES: frozenset[str] = frozenset(PSEUDONYM_PREFIXES.values())
+
+#: Every word this module inserts, prefixes plus the URL marker's word. The
+#: screen ``src/anonymization_ner.py`` keeps on its own side must agree with
+#: this set (``tests/test_anonymization.py`` pins that they do).
+PLACEHOLDER_WORDS: frozenset[str] = PLACEHOLDER_PREFIXES | {"URL"}
 
 #: How much of the HMAC digest is kept.
 PSEUDONYM_DIGEST_CHARS = 6
@@ -121,10 +190,14 @@ ALIAS_MAX_SUFFIX = 3
 
 #: Bare words that may never be treated as an entity, because rewriting an
 #: already-inserted placeholder into another placeholder helps nobody.
-_RESERVED_WORDS = frozenset({"PERSON", "COMPANY", "EMAIL", "URL"})
+_RESERVED_WORDS = PLACEHOLDER_WORDS
 
-#: An already-inserted pseudonym, so a second pass can recognize (and skip) it.
-_PSEUDONYM_TOKEN_RE = re.compile(r"^(?:PERSON|COMPANY|EMAIL)_[0-9a-f]{%d}$" % PSEUDONYM_DIGEST_CHARS)
+#: An already-inserted pseudonym, so a second pass can recognize (and skip)
+#: it. Derived from :data:`PLACEHOLDER_PREFIXES` rather than spelled out, so
+#: the re-anonymization no-op property extends to a new tier automatically.
+_PSEUDONYM_TOKEN_RE = re.compile(
+    r"^(?:%s)_[0-9a-f]{%d}$" % ("|".join(sorted(PLACEHOLDER_PREFIXES)), PSEUDONYM_DIGEST_CHARS)
+)
 
 # Pragmatic rather than RFC-complete: it matches what documents actually
 # contain. Linear-time by construction — "@" is disjoint from the local-part
@@ -148,6 +221,397 @@ _URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"'()\[\]]{1,2000}")
 
 #: Sentence punctuation a URL at the end of a sentence would otherwise swallow.
 _URL_TRAILING_PUNCTUATION = ".,;:!?"
+
+
+# --------------------------------------------------------------------------
+# deterministic identifier tiers
+#
+# The default detector's own docstring lists "phone numbers, birth numbers /
+# national IDs, IBANs" among what it cannot find, because none of them is a
+# NAME — they are decided from characters alone. That makes them the wrong
+# job for a detector and the right job for a shape pass, which is what this
+# block is: three tiers that run before entity substitution, each
+# individually toggleable, each ON by default because it is cheap,
+# deterministic, and guards a high-severity identifier.
+#
+# Every regex here is written the same defensive way as the URL/email ones
+# above (security playbook §5): a candidate is matched by ONE unambiguous
+# bounded run, then *validated* in Python. Packing the validation into the
+# pattern is what makes a phone/IBAN regex backtrack, and a document is
+# untrusted input.
+# --------------------------------------------------------------------------
+
+#: Separators that may appear inside a written phone number or IBAN. NBSP
+#: is in the list because it is what a word processor inserts between the
+#: groups of a phone number, and a detector that only knew ASCII space
+#: would miss exactly the documents that came out of one.
+_NUMBER_SEPARATORS = " \u00a0\u202f.-"
+
+#: An international phone candidate: a ``+`` or ``00`` prefix followed by a
+#: single bounded run of digits, separators and parentheses. One greedy
+#: character class, so there is nothing for the engine to backtrack over;
+#: :func:`_phone_canonical` decides whether the run is really a number.
+_PHONE_INTERNATIONAL_RE = re.compile(r"(?<![\w+])(?:\+|00)[\d ()\u00a0\u202f.\-]{6,28}")
+
+#: The Czech national form, written in the 3-3-3 grouping that is the only
+#: reason it is safely distinguishable from an order or account number: a
+#: bare nine-digit run is NOT matched (see the module's limits in
+#: ``docs/anonymization.md``). Leading digit 2–9 — no Czech subscriber
+#: number starts with 0 or 1.
+_PHONE_CZ_RE = re.compile(r"(?<![\w+])[2-9]\d{2}[ \u00a0\u202f.\-]\d{3}[ \u00a0\u202f.\-]\d{3}(?![\d\-])")
+
+#: Fewest / most digits an international number may carry. E.164 caps a
+#: subscriber number at 15 digits including the country code; below 8 the
+#: run is a version string, a range, or an amount far more often than it is
+#: a number anyone could dial.
+_PHONE_MIN_DIGITS = 8
+_PHONE_MAX_DIGITS = 15
+
+#: IBAN, in its two written forms, as two branches that cannot both match
+#: at one position: solid (no separators at all) or grouped in fours. The
+#: grouped branch's separator is MANDATORY inside the repetition and its
+#: group size is fixed, so there is exactly one way to split any candidate.
+_IBAN_RE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:"
+    r"[A-Z]{2}\d{2}[A-Za-z0-9]{11,30}"
+    r"|"
+    r"[A-Z]{2}\d{2}(?:[ \u00a0\u202f][A-Za-z0-9]{4}){2,7}(?:[ \u00a0\u202f][A-Za-z0-9]{1,3})?"
+    r")"
+    r"(?![A-Za-z0-9])"
+)
+
+#: Czech birth number (rodné číslo): ``YYMMDD/XXX`` (pre-1954, three-digit
+#: serial) or ``YYMMDD/XXXX`` (four digits, mod-11 checked). The slash form
+#: is matched on its shape; the slash-LESS ten-digit form is matched only
+#: when it passes the checksum, because ten consecutive digits is also what
+#: a Czech bank account number looks like.
+_NATIONAL_ID_SLASHED_RE = re.compile(r"(?<![\w/])(\d{6})\s?/\s?(\d{3,4})(?![\w/])")
+_NATIONAL_ID_SOLID_RE = re.compile(r"(?<![\w/])\d{10}(?![\w/])")
+
+
+def _digits(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _phone_canonical(candidate: str) -> str | None:
+    """The E.164-ish form a phone candidate hashes under, or ``None``.
+
+    ``None`` means "this run is not a phone number" and the text is left
+    exactly as it was — the validation the regex deliberately does not do.
+
+    Canonicalization is what makes ``+420 776 041 900`` and
+    ``+420776041900`` one token. It does NOT unify a national form with an
+    international one (``776 041 900`` vs ``+420 776 041 900``): that would
+    require assuming a default country, and an anonymizer that guesses a
+    country prefix produces a pseudonym that is wrong in the one corpus
+    where it matters. Two tokens for one phone is a documented limit, not a
+    silent one.
+    """
+    digits = _digits(candidate)
+    if not digits:
+        return None
+    if candidate.lstrip().startswith("+"):
+        national = digits
+    elif digits.startswith("00"):
+        national = digits[2:]
+    else:
+        # A bare national run — only the 3-3-3 Czech branch reaches here, and
+        # it is fixed at nine digits by its own pattern. Canonicalized as it
+        # was written, with no country prefix invented for it.
+        return digits
+    if not _PHONE_MIN_DIGITS <= len(national) <= _PHONE_MAX_DIGITS:
+        return None
+    return "+" + national
+
+
+def _iban_checksum_ok(candidate: str) -> bool:
+    """ISO 13616 mod-97: rearrange, letters → digits, remainder must be 1.
+
+    Required rather than advisory. ``[A-Z]{2}\\d{2}`` plus a dozen
+    alphanumerics is a shape a product code or a document reference can
+    also wear, and a mod-97 check costs nothing to run. The cost is on the
+    other side and is documented: an OCR-mangled or typo'd account number
+    fails the check and is therefore NOT redacted.
+    """
+    compact = "".join(candidate.split()).upper()
+    if not (15 <= len(compact) <= 34) or not compact[:2].isalpha() or not compact[2:4].isdigit():
+        return False
+    rearranged = compact[4:] + compact[:4]
+    total = 0
+    for char in rearranged:
+        if char.isdigit():
+            total = (total * 10 + int(char)) % 97
+        elif "A" <= char <= "Z":
+            total = (total * 100 + (ord(char) - 55)) % 97
+        else:
+            return False
+    return total == 1
+
+
+#: How many trailing groups a candidate may shed before it is abandoned.
+#: A grouped IBAN written in prose runs straight into the next word, and
+#: the "four alphanumerics after a space" shape a real group has is one an
+#: ordinary word also has ("... 5399 they said"). Rather than teach the
+#: pattern about words, the checksum decides: shed the last group and ask
+#: again, at most this many times.
+_IBAN_MAX_SHED_GROUPS = 3
+
+
+def _iban_prefix(candidate: str) -> str | None:
+    """The longest leading part of ``candidate`` that is a valid IBAN.
+
+    ``None`` when no prefix validates, which is the ordinary answer for a
+    product code or document reference wearing the same shape.
+    """
+    if _iban_checksum_ok(candidate):
+        return candidate
+    separators = [m.start() for m in re.finditer(r"[ \u00a0\u202f]", candidate)]
+    for cut in reversed(separators[-_IBAN_MAX_SHED_GROUPS:]):
+        head = candidate[:cut]
+        if _iban_checksum_ok(head):
+            return head
+    return None
+
+
+#: Month field of a Czech birth number. +50 marks a woman; +20 and +70 are
+#: the exhausted-range offsets in use since 2004.
+_RC_MONTH_OFFSETS = (0, 20, 50, 70)
+
+
+def _national_id_canonical(digits: str) -> str | None:
+    """The canonical form of a Czech birth number, or ``None`` if it is not
+    one. Canonical = the digits alone, so ``760419/0343`` and
+    ``7604190343`` are one token.
+
+    Two independent checks, both required: the date field has to be a real
+    date under one of the four month offsets, and a ten-digit number has to
+    satisfy the mod-11 rule (with the pre-1985 remainder-10 allowance, which
+    was legal and is still on documents held today).
+    """
+    if len(digits) not in (9, 10) or not digits.isdigit():
+        return None
+    month = int(digits[2:4])
+    if not any(1 <= month - offset <= 12 for offset in _RC_MONTH_OFFSETS):
+        return None
+    day = int(digits[4:6])
+    if not 1 <= day <= 31:
+        return None
+    if len(digits) == 10:
+        remainder = int(digits[:9]) % 11
+        if remainder == 10:
+            # Legacy allowance: numbers issued before 1985 could end in 0
+            # where the modulus said 10.
+            if digits[9] != "0":
+                return None
+        elif remainder != int(digits[9]):
+            return None
+    return digits
+
+
+# --------------------------------------------------------------------------
+# admin-supplied custom terms
+# --------------------------------------------------------------------------
+
+
+class CustomTermError(ValueError):
+    """A configured ``extraction.anonymization.custom_terms`` entry is not
+    usable. Raised, never skipped: silently dropping a term an operator
+    added would leave them believing something is redacted that is not,
+    which is the single failure mode this whole module exists to avoid.
+    """
+
+
+#: Punctuation a literal term may contain. Everything else that is not a
+#: letter or a digit is refused — which is what turns "config may not carry
+#: a regex" from a hope into a check. `.` is a LITERAL dot here, not "any
+#: character"; the error message says so.
+_CUSTOM_TERM_PUNCTUATION = frozenset(" .,-_'’&/@#:+")
+
+#: A term shorter than this redacts far more than an operator intends (a
+#: one-character term matches somewhere in almost every document), and one
+#: longer than this is a sentence rather than an identifier.
+_CUSTOM_TERM_MIN_CHARS = 2
+_CUSTOM_TERM_MAX_CHARS = 128
+
+#: How many terms one instance may configure. The compiled alternation is
+#: walked at every position of every document, so its size is a per-crawl
+#: cost an operator should have to opt into deliberately rather than
+#: discover.
+_CUSTOM_TERM_MAX_COUNT = 200
+
+#: Word characters a trailing ``*`` may stand for. Bounded on purpose: an
+#: unbounded quantifier over untrusted text is the ReDoS shape the security
+#: playbook §5 forbids, and no identifier this is for has a 64-character
+#: tail.
+_CUSTOM_TERM_WILDCARD_CHARS = 64
+
+
+def _validate_custom_term(raw: object, *, index: int) -> tuple[str, bool]:
+    """One configured term → ``(literal, has_wildcard)``, or raise.
+
+    The rejection messages name the term, the offending character, and what
+    the field actually accepts, because the operator reading them is
+    looking at a preview panel or a failed crawl and needs to know which of
+    their entries to fix.
+    """
+    where = f"extraction.anonymization.custom_terms[{index}]"
+    if not isinstance(raw, str):
+        raise CustomTermError(f"{where}: expected a string, got {type(raw).__name__}")
+    term = raw.strip()
+    wildcard = term.endswith("*")
+    if wildcard:
+        term = term[:-1].strip()
+    if len(term) < _CUSTOM_TERM_MIN_CHARS:
+        raise CustomTermError(
+            f"{where}: {raw!r} is too short — a custom term needs at least "
+            f"{_CUSTOM_TERM_MIN_CHARS} characters before any trailing '*', or it redacts "
+            "most of the document"
+        )
+    if len(term) > _CUSTOM_TERM_MAX_CHARS:
+        raise CustomTermError(f"{where}: longer than {_CUSTOM_TERM_MAX_CHARS} characters")
+    for char in term:
+        if char.isalnum() or char in _CUSTOM_TERM_PUNCTUATION:
+            continue
+        raise CustomTermError(
+            f"{where}: {raw!r} contains {char!r}, which custom_terms does not accept. "
+            "Entries are LITERAL text (a '.' matches a dot, not any character), optionally "
+            "with one trailing '*' meaning 'followed by more word characters'. Regular "
+            "expressions are refused on purpose — a pattern from config runs over every "
+            "document of every crawl, where one badly written quantifier is a denial of "
+            "service."
+        )
+    if term.upper() in PLACEHOLDER_WORDS or _PSEUDONYM_TOKEN_RE.match(term):
+        raise CustomTermError(
+            f"{where}: {raw!r} is a redaction placeholder this anonymizer inserts itself. "
+            "Redacting it again would rewrite an already-anonymized document."
+        )
+    return term, wildcard
+
+
+def compile_custom_terms(terms: Sequence[object]) -> re.Pattern[str] | None:
+    """Compile configured literal terms into one linear-time alternation.
+
+    ``None`` when there is nothing to match. Longest term first, so a term
+    that is a prefix of another can never win over it — the same
+    longest-first single-alternation discipline the entity pass uses.
+
+    Matching is case-insensitive (an operator writing ``Projekt Fénix``
+    means the ALL-CAPS heading too) and word-bounded, and every term is
+    ``re.escape``d, so the compiled pattern contains no operator-supplied
+    metacharacter at all. A trailing ``*`` becomes a BOUNDED ``\\w{0,N}``
+    run rather than an unbounded quantifier.
+    """
+    if not terms:
+        return None
+    if all(isinstance(term, str) for term in terms):
+        # The ordinary path: a config-resolved tuple of strings, compiled
+        # once per distinct term list rather than once per document. A crawl
+        # runs this for every file of a corpus, and building a 200-branch
+        # alternation ten thousand times is pure waste.
+        return _compiled_custom_terms(tuple(terms))  # type: ignore[arg-type]
+    return _compile_custom_terms_uncached(tuple(terms))
+
+
+@lru_cache(maxsize=8)
+def _compiled_custom_terms(terms: tuple[str, ...]) -> re.Pattern[str] | None:
+    return _compile_custom_terms_uncached(terms)
+
+
+def _compile_custom_terms_uncached(terms: tuple[object, ...]) -> re.Pattern[str] | None:
+    if len(terms) > _CUSTOM_TERM_MAX_COUNT:
+        raise CustomTermError(
+            f"extraction.anonymization.custom_terms: {len(terms)} entries exceeds the "
+            f"{_CUSTOM_TERM_MAX_COUNT}-term ceiling"
+        )
+    compiled: list[tuple[str, bool]] = []
+    for index, raw in enumerate(terms):
+        compiled.append(_validate_custom_term(raw, index=index))
+    if not compiled:
+        return None
+    compiled.sort(key=lambda pair: len(pair[0]), reverse=True)
+    branches = [
+        re.escape(literal) + (r"\w{0,%d}" % _CUSTOM_TERM_WILDCARD_CHARS if wildcard else "")
+        for literal, wildcard in compiled
+    ]
+    return re.compile(r"(?<!\w)(?:" + "|".join(branches) + r")(?!\w)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DeterministicRules:
+    """Which deterministic tiers run, and what extra literals they redact.
+
+    All three built-in tiers default to **ON**. They are deterministic (no
+    model, no network, no per-document cost), they are exact by
+    construction (a validated IBAN is an IBAN), and each one guards an
+    identifier whose disclosure is more severe than a name's — a phone
+    number, a bank account, a national id. An operator turning one off is
+    making a considered trade for a corpus where that shape is noise; an
+    operator who never touches the block gets the safe answer.
+    """
+
+    phones: bool = True
+    ibans: bool = True
+    national_ids: bool = True
+    #: Compiled from ``extraction.anonymization.custom_terms``. Kept as the
+    #: raw strings rather than a compiled pattern so this stays a plain,
+    #: comparable, hashable value; compilation happens per call, where the
+    #: validation error can be reported to whoever asked.
+    custom_terms: tuple[str, ...] = ()
+
+
+#: What an instance that configures nothing gets.
+DEFAULT_RULES = DeterministicRules()
+
+
+def rules_from_config() -> DeterministicRules:
+    """Read ``extraction.anonymization.detect`` + ``custom_terms``.
+
+    Lives here, not in the caller, for one reason: the crawl calls
+    ``anonymize_markdown`` with a key and a detector and nothing else, so a
+    tier toggle resolved in the caller would apply to whichever caller had
+    been taught about it. Resolving it at the point of substitution means
+    the crawl, the preview endpoint and any future caller are configured by
+    the same keys automatically.
+
+    A missing config package or an unreadable overlay yields the defaults —
+    tiers ON, no custom terms — which is the safe direction: an instance
+    whose config cannot be read must not silently redact LESS. A malformed
+    ``custom_terms`` entry is the one thing that raises rather than
+    defaulting, because it is a positive instruction that could not be
+    honored (see :class:`CustomTermError`).
+    """
+    try:
+        from app.instance_config import get_value
+    except Exception:  # noqa: BLE001 — no config package: built-in defaults
+        return DEFAULT_RULES
+
+    def _flag(name: str) -> bool:
+        try:
+            value = get_value("extraction", "anonymization", "detect", name, default=True)
+        except Exception:  # noqa: BLE001 — unreadable config: safe default
+            return True
+        return True if value is None else bool(value)
+
+    try:
+        raw_terms = get_value("extraction", "anonymization", "custom_terms", default=None)
+    except Exception:  # noqa: BLE001
+        raw_terms = None
+    if raw_terms is None:
+        terms: tuple[str, ...] = ()
+    elif isinstance(raw_terms, (list, tuple)):
+        terms = tuple(str(term) for term in raw_terms)
+    else:
+        raise CustomTermError(
+            f"extraction.anonymization.custom_terms: expected a list of strings, got {type(raw_terms).__name__}"
+        )
+
+    return DeterministicRules(
+        phones=_flag("phones"),
+        ibans=_flag("ibans"),
+        national_ids=_flag("national_ids"),
+        custom_terms=terms,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -552,10 +1016,14 @@ class RegexDetector:
       way the list does not cover.
     * **Names split across markup** — bold/italic markers, a soft hyphen or a
       line break inside a name break the run.
-    * **Identifiers that are not names but identify anyway**: phone numbers,
-      birth numbers / national IDs, IBANs, account numbers, addresses, case
-      numbers, VAT ids. None are detected. If your corpus contains them,
-      this detector is not sufficient on its own.
+    * **Identifiers that are not names but identify anyway**: addresses,
+      account numbers in national (non-IBAN) format, case numbers, VAT ids,
+      passport numbers. None are detected HERE. Phone numbers, IBANs and
+      Czech birth numbers are handled — but by the deterministic tiers that
+      run before this detector (:class:`DeterministicRules`), not by it: a
+      shape decidable from characters alone is the wrong job for a name
+      heuristic. If your corpus carries any of the shapes still on the list
+      above, this detector is not sufficient on its own.
     * **Non-Latin scripts** are effectively untouched, as is any language
       whose orthography does not capitalize proper nouns.
 
@@ -753,19 +1221,54 @@ def _resolve_pseudonyms(entities: Iterable[Entity], *, key: bytes) -> dict[str, 
     return {text: pseudonym(key, kind, canonicals[kind][normalized[text]]) for text, kind in kinds.items()}
 
 
+def _count_real_substitutions(
+    pattern: re.Pattern[str],
+    replace: Callable[[re.Match[str]], str],
+    text: str,
+) -> tuple[str, int]:
+    """``pattern.subn`` that counts only the matches actually rewritten.
+
+    The validated tiers deliberately return the matched text unchanged when
+    validation fails (a run that looked like an IBAN and is not), and
+    ``re.subn`` would count that as a substitution. A counter that inflates
+    on the rejects is worse than no counter: the whole point of the preview
+    surface is that the number next to a kind is what was really redacted.
+    """
+    replacements = 0
+
+    def _wrapper(match: re.Match[str]) -> str:
+        nonlocal replacements
+        out = replace(match)
+        if out != match.group(0):
+            replacements += 1
+        return out
+
+    return pattern.sub(_wrapper, text), replacements
+
+
 def anonymize_markdown(
     text: str,
     *,
     key: bytes,
     detector: Detector | None = None,
+    rules: DeterministicRules | None = None,
 ) -> AnonymizeResult:
     """Anonymize one markdown document under this instance's pseudonym key.
 
-    URLs collapse to ``**URL**``; email addresses and detected person/company
-    entities become stable ``EMAIL_<hmac>`` / ``PERSON_<hmac>`` /
-    ``COMPANY_<hmac>`` pseudonyms. The same entity under the same key always
-    yields the same token, in every document and on every run; a different key
-    yields a disjoint token space.
+    URLs collapse to ``**URL**``; email addresses, the deterministic
+    identifier tiers, the operator's custom terms and the detected
+    person/company entities become stable ``EMAIL_<hmac>`` / ``IBAN_<hmac>``
+    / ``ID_<hmac>`` / ``PHONE_<hmac>`` / ``TERM_<hmac>`` / ``PERSON_<hmac>``
+    / ``COMPANY_<hmac>`` pseudonyms — in the order the module docstring
+    fixes. The same value under the same key always yields the same token, in
+    every document and on every run; a different key yields a disjoint token
+    space.
+
+    Running this over its own output is a **no-op**: every token it inserts
+    is screened out of every later pass (:data:`PLACEHOLDER_WORDS`,
+    :data:`_PSEUDONYM_TOKEN_RE`), so a document that is anonymized twice —
+    by a re-crawl, a retry, or an admin pasting an anonymized sample into
+    the preview panel — is unchanged the second time.
 
     Markdown structure is preserved: only matched spans are rewritten, so
     headings, emphasis, lists, tables and link syntax survive verbatim (a
@@ -777,8 +1280,13 @@ def anonymize_markdown(
     :param detector: entity detection override; defaults to
         :class:`RegexDetector`. Read that class's docstring for what the
         default will and will not find.
+    :param rules: which deterministic tiers run and what custom terms they
+        redact. ``None`` — the default, and what the crawl passes — resolves
+        them from instance config via :func:`rules_from_config`; pass an
+        explicit :class:`DeterministicRules` to pin them.
     :raises ValueError: if ``key`` is empty.
     :raises TypeError: if ``key`` is not bytes.
+    :raises CustomTermError: if configured custom terms are unusable.
     """
     if isinstance(key, str):
         raise TypeError("anonymization key must be bytes, not str")
@@ -787,8 +1295,19 @@ def anonymize_markdown(
     if not key:
         raise ValueError("anonymization key must not be empty")
     key = bytes(key)
+    rules = rules_from_config() if rules is None else rules
 
-    replaced = 0
+    counts: dict[str, int] = {}
+    minted: dict[str, str] = {}
+
+    def _mint(kind: str, canonical: str) -> str:
+        token = pseudonym(key, kind, canonical)
+        minted[token] = kind
+        return token
+
+    def _record(kind: str, count: int) -> None:
+        if count:
+            counts[kind] = counts.get(kind, 0) + count
 
     # Shape detectors first — nothing about them depends on what a detector
     # reported. URLs precede emails, because a URL may carry an "@" in its
@@ -798,25 +1317,88 @@ def anonymize_markdown(
         return URL_PLACEHOLDER + whole[len(_trim_url(whole)) :]
 
     text, url_count = _URL_RE.subn(_replace_url, text)
-    replaced += url_count
+    _record(URL, url_count)
 
     def _replace_email(match: re.Match[str]) -> str:
-        return pseudonym(key, "email", normalize(match.group(0)))
+        return _mint(EMAIL, normalize(match.group(0)))
 
     text, email_count = _EMAIL_RE.subn(_replace_email, text)
-    replaced += email_count
+    _record(EMAIL, email_count)
+
+    # IBAN before the id and phone tiers — see the module docstring: a
+    # grouped IBAN carries a run the phone tier would otherwise claim.
+    if rules.ibans:
+
+        def _replace_iban(match: re.Match[str]) -> str:
+            whole = match.group(0)
+            candidate = _iban_prefix(whole)
+            if candidate is None:
+                return whole
+            return _mint(IBAN, "".join(candidate.split()).upper()) + whole[len(candidate) :]
+
+        text, iban_count = _count_real_substitutions(_IBAN_RE, _replace_iban, text)
+        _record(IBAN, iban_count)
+
+    if rules.national_ids:
+
+        def _replace_slashed_id(match: re.Match[str]) -> str:
+            canonical = _national_id_canonical(match.group(1) + match.group(2))
+            return match.group(0) if canonical is None else _mint(NATIONAL_ID, canonical)
+
+        def _replace_solid_id(match: re.Match[str]) -> str:
+            canonical = _national_id_canonical(match.group(0))
+            return match.group(0) if canonical is None else _mint(NATIONAL_ID, canonical)
+
+        text, slashed = _count_real_substitutions(_NATIONAL_ID_SLASHED_RE, _replace_slashed_id, text)
+        text, solid = _count_real_substitutions(_NATIONAL_ID_SOLID_RE, _replace_solid_id, text)
+        _record(NATIONAL_ID, slashed + solid)
+
+    if rules.phones:
+
+        def _replace_phone(match: re.Match[str]) -> str:
+            whole = match.group(0)
+            trimmed = whole.rstrip(_NUMBER_SEPARATORS + ")")
+            canonical = _phone_canonical(trimmed)
+            if canonical is None:
+                return whole
+            return _mint(PHONE, canonical) + whole[len(trimmed) :]
+
+        text, international = _count_real_substitutions(_PHONE_INTERNATIONAL_RE, _replace_phone, text)
+        text, national = _count_real_substitutions(_PHONE_CZ_RE, _replace_phone, text)
+        _record(PHONE, international + national)
+
+    term_pattern = compile_custom_terms(rules.custom_terms)
+    if term_pattern is not None:
+        text, term_count = term_pattern.subn(lambda m: _mint(TERM, normalize(m.group(0))), text)
+        _record(TERM, term_count)
 
     entities = (detector or _DEFAULT_DETECTOR)(text)
-    pseudonyms = _resolve_pseudonyms(entities, key=key)
-    if not pseudonyms:
-        return AnonymizeResult(text=text, replaced=replaced)
+    entity_pseudonyms = _resolve_pseudonyms(entities, key=key)
+    if entity_pseudonyms:
+        kinds_by_text = _entity_kinds(entities)
 
-    # One pass over a single alternation, longest entity first, so a shorter
-    # entity can never match inside a pseudonym a longer one just produced:
-    # the replacement text is never rescanned.
-    ordered = sorted(pseudonyms, key=len, reverse=True)
-    pattern = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(entity) for entity in ordered) + r")(?!\w)")
-    text, entity_count = pattern.subn(lambda match: pseudonyms[match.group(0)], text)
-    replaced += entity_count
+        # One pass over a single alternation, longest entity first, so a
+        # shorter entity can never match inside a pseudonym a longer one just
+        # produced: the replacement text is never rescanned.
+        ordered = sorted(entity_pseudonyms, key=len, reverse=True)
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(entity) for entity in ordered) + r")(?!\w)")
 
-    return AnonymizeResult(text=text, replaced=replaced)
+        def _replace_entity(match: re.Match[str]) -> str:
+            found = match.group(0)
+            token = entity_pseudonyms[found]
+            # Bookkeeping only — the token itself was already resolved above,
+            # because alias unification needs the whole document's entity set
+            # before it can say what any one form hashes under.
+            kind = kinds_by_text.get(found, PERSON)
+            minted[token] = kind
+            _record(kind, 1)
+            return token
+
+        text = pattern.sub(_replace_entity, text)
+
+    return AnonymizeResult(
+        text=text,
+        replaced=sum(counts.values()),
+        counts=counts,
+        pseudonyms=sorted({(kind, token) for token, kind in minted.items()}),
+    )

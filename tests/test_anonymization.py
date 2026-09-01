@@ -15,9 +15,12 @@ import pytest
 
 from src.anonymization import (
     AnonymizeResult,
+    CustomTermError,
+    DeterministicRules,
     Entity,
     RegexDetector,
     anonymize_markdown,
+    compile_custom_terms,
     normalize,
 )
 
@@ -351,3 +354,467 @@ def test_pathological_input_stays_fast(hostile: str):
     start = time.monotonic()
     anonymize_markdown(hostile, key=KEY)
     assert time.monotonic() - start < 2.0, "anonymizer took too long — not linear-time"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic identifier tiers (phones, IBANs, national ids)
+#
+# What these pin is precision as much as recall. Each tier's whole claim is
+# "decidable from characters alone", so a test that only proved it catches
+# the identifier — and never that it leaves an invoice number alone — would
+# be passing a detector that redacts the corpus into uselessness.
+# ---------------------------------------------------------------------------
+
+PHONE_TOKEN = re.compile(r"PHONE_[0-9a-f]{6}")
+IBAN_TOKEN = re.compile(r"IBAN_[0-9a-f]{6}")
+ID_TOKEN = re.compile(r"ID_[0-9a-f]{6}")
+TERM_TOKEN = re.compile(r"TERM_[0-9a-f]{6}")
+
+# A valid Czech IBAN (mod-97 checks out) in both written forms.
+IBAN_GROUPED = "CZ65 0800 0000 1920 0014 5399"
+IBAN_SOLID = "CZ6508000000192000145399"
+# A valid Czech birth number (date field + mod-11 both pass).
+RC_SLASHED = "760419/0341"
+RC_SOLID = "7604190341"
+
+NO_DETECTOR = fixed_detector([])
+
+
+def anon(text: str, *, key: bytes = KEY, **rule_kwargs) -> AnonymizeResult:
+    """Anonymize with the entity detector silenced and rules PINNED.
+
+    Explicit rules, never the config-resolved default: these tests are about
+    the tiers themselves, and a test whose behaviour depended on whatever
+    `instance.yaml` the runner happened to have would be testing the
+    environment.
+    """
+    return anonymize_markdown(
+        text,
+        key=key,
+        detector=NO_DETECTOR,
+        rules=DeterministicRules(**rule_kwargs),
+    )
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "+420 776 041 900",
+        "+420776041900",
+        "+420-776-041-900",
+        "00420 776 041 900",
+        "+1 (555) 123-4567",
+        "+44 20 7123 4567",
+        "776 041 900",
+        "776.041.900",
+    ],
+)
+def test_phone_numbers_are_tokenized(written: str):
+    result = anon(f"Volejte na {written}, prosím.")
+    assert written not in result.text
+    assert PHONE_TOKEN.search(result.text)
+    assert result.counts["phone"] == 1
+
+
+def test_the_two_ways_of_writing_one_international_number_share_a_token():
+    result = anon("+420 776 041 900 a +420776041900")
+    tokens = set(PHONE_TOKEN.findall(result.text))
+    assert len(tokens) == 1, "one number written two ways must be one pseudonym"
+
+
+def test_a_national_and_an_international_form_are_two_tokens():
+    # A documented limit, pinned so it cannot change silently: unifying them
+    # would mean assuming a default country.
+    result = anon("776 041 900 a +420 776 041 900")
+    assert len(set(PHONE_TOKEN.findall(result.text))) == 2
+
+
+@pytest.mark.parametrize(
+    "not_a_phone",
+    [
+        "Faktura 2026001234 byla uhrazena.",
+        "Objednávka 900123456 je vyřízena.",
+        "Verze 1.2.3 vyšla včera.",
+        "Rozsah 100-200 kusů.",
+    ],
+)
+def test_ordinary_numbers_are_not_phone_numbers(not_a_phone: str):
+    assert anon(not_a_phone).text == not_a_phone
+
+
+def test_phone_keeps_trailing_sentence_punctuation():
+    result = anon("Volejte +420 776 041 900.")
+    assert result.text.endswith(".")
+
+
+@pytest.mark.parametrize("written", [IBAN_GROUPED, IBAN_SOLID])
+def test_ibans_are_tokenized(written: str):
+    result = anon(f"Platbu pošlete na {written} do pátku.")
+    assert written not in result.text
+    assert IBAN_TOKEN.search(result.text)
+    assert result.counts["iban"] == 1
+
+
+def test_grouped_and_solid_iban_share_a_token():
+    result = anon(f"{IBAN_GROUPED} = {IBAN_SOLID}")
+    assert len(set(IBAN_TOKEN.findall(result.text))) == 1
+
+
+def test_an_iban_runs_into_the_next_word_without_eating_it():
+    # The grouped shape ("four alphanumerics after a space") is also the
+    # shape of an ordinary word, so the checksum — not the pattern — has to
+    # decide where the account number ends.
+    result = anon(f"Účet {IBAN_GROUPED} they said dnes.")
+    assert "they said dnes." in result.text
+    assert IBAN_TOKEN.search(result.text)
+
+
+def test_an_iban_shaped_string_that_fails_the_checksum_is_left_alone():
+    # The other half of the mod-97 trade, pinned deliberately: a product code
+    # is not redacted, and (documented) neither is a mangled account number.
+    fake = "AB12 CDEF GHIJ KLMN OPQR"
+    assert anon(f"Kód {fake} zde.").text == f"Kód {fake} zde."
+
+
+def test_the_phone_tier_never_shreds_a_grouped_iban():
+    # The ordering contract: IBAN consumes the whole account number before
+    # the phone tier can claim the "0000 1920 0014 5399" run inside it.
+    result = anon(f"IBAN {IBAN_GROUPED}.")
+    assert "phone" not in result.counts
+    assert result.counts["iban"] == 1
+
+
+@pytest.mark.parametrize("written", [RC_SLASHED, "760419 / 0341", RC_SOLID])
+def test_czech_birth_numbers_are_tokenized(written: str):
+    result = anon(f"Rodné číslo {written} je v žádosti.")
+    assert "760419" not in result.text
+    assert ID_TOKEN.search(result.text)
+    assert result.counts["national_id"] == 1
+
+
+def test_slashed_and_solid_birth_numbers_share_a_token():
+    result = anon(f"{RC_SLASHED} = {RC_SOLID}")
+    assert len(set(ID_TOKEN.findall(result.text))) == 1
+
+
+@pytest.mark.parametrize(
+    "not_an_id",
+    [
+        "Účet 7604190342 je jiný.",  # ten digits, mod-11 fails
+        "Číslo 769919/0341 neexistuje.",  # month 99 is not a month
+        "Kód 776041900 je devítimístný.",  # nine digits, no checksum to check
+    ],
+)
+def test_numbers_that_are_not_birth_numbers_are_left_alone(not_an_id: str):
+    assert anon(not_an_id).text == not_an_id
+
+
+@pytest.mark.parametrize(
+    ("off", "text", "kind"),
+    [
+        ({"phones": False}, "+420 776 041 900", "phone"),
+        # `phones` off too: with the IBAN tier disabled, the digit run inside
+        # a grouped account number is no longer claimed by anything ahead of
+        # the phone tier. Pinned as its own test below rather than hidden.
+        ({"ibans": False, "phones": False}, IBAN_GROUPED, "iban"),
+        ({"national_ids": False}, RC_SLASHED, "national_id"),
+    ],
+)
+def test_each_tier_can_be_turned_off_individually(off: dict, text: str, kind: str):
+    assert anon(text, **off).text == text
+    assert kind not in anon(text, **off).counts
+    # ...and with the default rules the same text IS redacted.
+    assert anon(text).counts[kind] == 1
+
+
+def test_turning_the_iban_tier_off_hands_its_digits_to_the_phone_tier():
+    # Known and accepted: the tiers are ordered so the wider shape wins, and
+    # removing the wider one exposes the narrower match underneath. It errs
+    # toward MORE redaction, never less — the safe direction — but it is
+    # surprising enough to pin as documented behaviour rather than leave for
+    # someone to discover.
+    result = anon(IBAN_GROUPED, ibans=False)
+    assert PHONE_TOKEN.search(result.text)
+    assert "iban" not in result.counts
+
+
+def test_the_tiers_default_to_on():
+    from src.anonymization import DEFAULT_RULES
+
+    assert (DEFAULT_RULES.phones, DEFAULT_RULES.ibans, DEFAULT_RULES.national_ids) == (True, True, True)
+    assert DEFAULT_RULES.custom_terms == ()
+
+
+# ---------------------------------------------------------------------------
+# Custom terms
+# ---------------------------------------------------------------------------
+
+
+def test_a_custom_term_is_tokenized():
+    result = anon("Projekt Fénix začal v květnu.", custom_terms=("Projekt Fénix",))
+    assert "Fénix" not in result.text
+    assert TERM_TOKEN.search(result.text)
+    assert result.counts["term"] == 1
+
+
+def test_a_custom_term_matches_regardless_of_case_and_keeps_one_token():
+    result = anon("Projekt Fénix a PROJEKT FÉNIX", custom_terms=("projekt fénix",))
+    assert len(set(TERM_TOKEN.findall(result.text))) == 1
+    assert result.counts["term"] == 2
+
+
+def test_a_custom_term_respects_word_boundaries():
+    result = anon("Acme a Acmerica", custom_terms=("Acme",))
+    assert "Acmerica" in result.text
+    assert result.counts["term"] == 1
+
+
+def test_a_trailing_wildcard_covers_the_identifier_family():
+    result = anon("ACME-1234 a ACME-9 a ACME", custom_terms=("ACME-*",))
+    assert "ACME-1234" not in result.text and "ACME-9" not in result.text
+    # The bare "ACME" is NOT covered: the literal part is "ACME-".
+    assert result.text.endswith("ACME")
+    assert len(set(TERM_TOKEN.findall(result.text))) == 2
+
+
+def test_a_longer_term_wins_over_a_shorter_one_it_contains():
+    result = anon("Projekt Fénix", custom_terms=("Fénix", "Projekt Fénix"))
+    assert result.counts["term"] == 1
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        r"\d{3}",
+        "(foo|bar)",
+        "^start",
+        "end$",
+        "a.*b",
+        "[A-Z]+",
+        "x{2,}",
+    ],
+)
+def test_regex_from_config_is_refused(unsafe: str):
+    # Security playbook §5: a pattern from config runs over every document of
+    # every crawl. It is refused BY NAME, never quietly treated as a literal
+    # that happens to match nothing.
+    with pytest.raises(CustomTermError) as excinfo:
+        compile_custom_terms([unsafe])
+    assert "custom_terms" in str(excinfo.value)
+    assert repr(unsafe) in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "rejected",
+    ["a", "", "   ", "*", "x" * 129],
+)
+def test_terms_that_would_redact_too_much_or_too_little_are_refused(rejected: str):
+    with pytest.raises(CustomTermError):
+        compile_custom_terms([rejected])
+
+
+def test_a_placeholder_word_may_not_be_a_custom_term():
+    for word in ("PERSON", "EMAIL", "TERM", "URL", "ID"):
+        with pytest.raises(CustomTermError):
+            compile_custom_terms([word])
+
+
+def test_a_non_string_term_is_refused_by_position():
+    with pytest.raises(CustomTermError) as excinfo:
+        compile_custom_terms(["fine", 42])
+    assert "custom_terms[1]" in str(excinfo.value)
+
+
+def test_too_many_terms_are_refused():
+    with pytest.raises(CustomTermError):
+        compile_custom_terms([f"term{i:04d}" for i in range(201)])
+
+
+def test_no_terms_compiles_to_nothing():
+    assert compile_custom_terms([]) is None
+
+
+def test_dots_in_a_term_are_literal_dots():
+    pattern = compile_custom_terms(["a.s.co"])
+    assert pattern is not None
+    assert pattern.search("a.s.co") is not None
+    assert pattern.search("axsxco") is None
+
+
+# ---------------------------------------------------------------------------
+# Ordering, accounting and the re-anonymization no-op
+# ---------------------------------------------------------------------------
+
+MIXED_DOC = (
+    "Kontakt: jan.novak@example.com, https://example.com/a.\n"
+    f"Tel +420 776 041 900, účet {IBAN_GROUPED}, RČ {RC_SLASHED}.\n"
+    "Projekt Fénix vede Ing. Jan Novák.\n"
+)
+
+
+def test_every_tier_fires_and_is_counted_separately():
+    result = anonymize_markdown(
+        MIXED_DOC,
+        key=KEY,
+        rules=DeterministicRules(custom_terms=("Projekt Fénix",)),
+    )
+    assert result.counts["url"] == 1
+    assert result.counts["email"] == 1
+    assert result.counts["iban"] == 1
+    assert result.counts["national_id"] == 1
+    assert result.counts["phone"] == 1
+    assert result.counts["term"] == 1
+    assert result.replaced == sum(result.counts.values())
+
+
+def test_re_anonymizing_the_output_changes_nothing():
+    # The property the whole placeholder screen exists for: a re-crawl, a
+    # retry, or an admin pasting an already-anonymized sample into the
+    # preview panel must be a no-op, not a second layer of tokens.
+    rules = DeterministicRules(custom_terms=("Projekt Fénix",))
+    once = anonymize_markdown(MIXED_DOC, key=KEY, rules=rules)
+    twice = anonymize_markdown(once.text, key=KEY, rules=rules)
+    assert twice.text == once.text
+    assert twice.replaced == 0
+    assert twice.counts == {}
+
+
+def test_the_result_reports_pseudonyms_and_never_their_originals():
+    result = anonymize_markdown(
+        MIXED_DOC,
+        key=KEY,
+        rules=DeterministicRules(custom_terms=("Projekt Fénix",)),
+    )
+    kinds = {kind for kind, _ in result.pseudonyms}
+    assert {"email", "iban", "national_id", "phone", "term"} <= kinds
+    # URLs collapse to a marker, so they are counted but have no pseudonym.
+    assert "url" not in kinds
+    for _, token in result.pseudonyms:
+        assert token in result.text
+        assert re.fullmatch(r"[A-Z]+_[0-9a-f]{6}", token)
+
+
+def test_the_new_prefixes_are_screened_out_of_the_entity_pass():
+    # A pseudonym must never be re-detected as a name by the entity tier.
+    detector = fixed_detector([("PHONE_1a2b3c", "person"), ("IBAN_1a2b3c", "company")])
+    text = "PHONE_1a2b3c a IBAN_1a2b3c."
+    assert anonymize_markdown(text, key=KEY, detector=detector).text == text
+
+
+def test_the_ner_placeholder_screen_knows_every_prefix_this_module_inserts():
+    # Two independent screens by design (see anonymization_ner's comment) —
+    # which only works while they say the same thing. This is the pin that
+    # makes a new tier here fail loudly there rather than leak a token the
+    # model may report as a name.
+    from src.anonymization import PLACEHOLDER_WORDS
+    from src.anonymization_ner import _PLACEHOLDER_BARE, _PLACEHOLDER_RE
+
+    assert _PLACEHOLDER_BARE == PLACEHOLDER_WORDS
+    for prefix in PLACEHOLDER_WORDS - {"URL"}:
+        assert _PLACEHOLDER_RE.match(f"{prefix}_1a2b3c"), f"NER screen misses {prefix}_ tokens"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "+" + "1" * 5000,
+        "0" * 5000,
+        ("CZ65 " + "0800 " * 2000),
+        ("760419/0341 " * 2000),
+        ("+420 776 041 900 " * 2000),
+    ],
+)
+def test_pathological_identifier_input_stays_fast(hostile: str):
+    # Security playbook §5, for the new tiers: every one of them is a single
+    # bounded run plus a Python-side validator, precisely so there is nothing
+    # for the engine to backtrack over.
+    import time
+
+    start = time.monotonic()
+    anonymize_markdown(hostile, key=KEY, detector=NO_DETECTOR, rules=DeterministicRules())
+    assert time.monotonic() - start < 2.0, "identifier tiers took too long — not linear-time"
+
+
+def test_custom_terms_matching_stays_fast_with_a_full_list():
+    import time
+
+    terms = tuple(f"kodove-jmeno-{i:04d}" for i in range(200))
+    hostile = "kodove-jmeno-0199 " * 2000
+    start = time.monotonic()
+    anonymize_markdown(hostile, key=KEY, detector=NO_DETECTOR, rules=DeterministicRules(custom_terms=terms))
+    assert time.monotonic() - start < 3.0, "custom-term alternation took too long"
+
+
+# ---------------------------------------------------------------------------
+# Config resolution
+#
+# `anonymize_markdown` resolves these itself rather than making every caller
+# pass them, which is what lets the crawl pick up a new toggle without being
+# taught about it. That convenience is only safe while the defaults are the
+# safe ones, so this is what pins them.
+# ---------------------------------------------------------------------------
+
+
+def _stub_get_value(overrides: dict):
+    def get_value(*keys, default=None):
+        return overrides.get(tuple(keys), default)
+
+    return get_value
+
+
+def test_config_resolution_defaults_every_tier_on(monkeypatch):
+    import app.instance_config as instance_config
+    from src.anonymization import rules_from_config
+
+    monkeypatch.setattr(instance_config, "get_value", _stub_get_value({}))
+    rules = rules_from_config()
+    assert (rules.phones, rules.ibans, rules.national_ids) == (True, True, True)
+    assert rules.custom_terms == ()
+
+
+def test_config_resolution_reads_each_toggle(monkeypatch):
+    import app.instance_config as instance_config
+    from src.anonymization import rules_from_config
+
+    monkeypatch.setattr(
+        instance_config,
+        "get_value",
+        _stub_get_value(
+            {
+                ("extraction", "anonymization", "detect", "phones"): False,
+                ("extraction", "anonymization", "detect", "ibans"): True,
+                ("extraction", "anonymization", "detect", "national_ids"): False,
+                ("extraction", "anonymization", "custom_terms"): ["Projekt Fénix"],
+            }
+        ),
+    )
+    rules = rules_from_config()
+    assert (rules.phones, rules.ibans, rules.national_ids) == (False, True, False)
+    assert rules.custom_terms == ("Projekt Fénix",)
+
+
+def test_an_unreadable_config_still_redacts(monkeypatch):
+    # The safe direction: an instance whose config cannot be read must not
+    # silently redact LESS than one whose config is fine.
+    import app.instance_config as instance_config
+    from src.anonymization import rules_from_config
+
+    def explode(*_keys, **_kw):
+        raise RuntimeError("overlay unreadable")
+
+    monkeypatch.setattr(instance_config, "get_value", explode)
+    rules = rules_from_config()
+    assert (rules.phones, rules.ibans, rules.national_ids) == (True, True, True)
+
+
+def test_custom_terms_that_is_not_a_list_is_refused(monkeypatch):
+    import app.instance_config as instance_config
+    from src.anonymization import rules_from_config
+
+    monkeypatch.setattr(
+        instance_config,
+        "get_value",
+        _stub_get_value({("extraction", "anonymization", "custom_terms"): "Projekt Fénix"}),
+    )
+    with pytest.raises(CustomTermError):
+        rules_from_config()

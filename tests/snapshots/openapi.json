@@ -458,6 +458,31 @@
         "title": "AnalyticsMigrateRequest",
         "type": "object"
       },
+      "AnonymizationPreviewRequest": {
+        "description": "Body for ``POST /anonymization/preview``.\n\n``detector`` defaults to ``regex`` \u2014 never to the instance's configured\nvalue. The panel names which one it is asking for, and the LLM tier\nspends tokens per call: a default that quietly followed configuration\nwould bill an admin for opening a drawer.",
+        "properties": {
+          "detector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detector"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "AnonymizationPreviewRequest",
+        "type": "object"
+      },
       "AppliedRequest": {
         "description": "CLI audit event after the analyst's workspace has been extracted.",
         "properties": {
@@ -31175,6 +31200,70 @@
         "summary": "Decide Share Request",
         "tags": [
           "share-requests"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/anonymization/preview": {
+      "post": {
+        "description": "Redact a pasted sample with this instance's real anonymizer.\n\nBody: ``{text, detector?: \"regex\" | \"llm\"}``. Returns the redacted text,\nthe per-kind counts, the distinct pseudonyms produced, and \u2014 for the\n``llm`` detector \u2014 that call's own token usage, so the cost of the tier\nis visible at the moment it is being evaluated rather than at the end of\na thousand-document crawl.\n\nErrors are specific because each one has a different fix: ``413`` (too\nlong \u2014 trim), ``409`` (no key \u2014 set the env var this names), ``400``\n(the instance's ``custom_terms`` are unusable \u2014 fix the config), ``502``\n(the LLM tier could not answer \u2014 the same fail-closed posture a crawl\ntakes, never a silent downgrade to regex-only).\n\nAudited under ``anonymization.preview`` with the sample's LENGTH and the\nredaction counts. The text itself is never written to the audit trail,\nnever logged, and never stored anywhere else: an admin pasting a real\ndocument into a preview box must not thereby file it into the system\nthey are previewing.",
+        "operationId": "preview_anonymization_api_admin_sharepoint_anonymization_preview_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnonymizationPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Anonymization",
+        "tags": [
+          "admin"
         ]
       }
     },
