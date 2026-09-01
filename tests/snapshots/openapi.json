@@ -9859,7 +9859,7 @@
         "type": "object"
       },
       "SessionFilePreview": {
-        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
+        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``sheets`` \u2014 ``sheets`` holds the workbook's cells, sheet by sheet.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
         "properties": {
           "file_type": {
             "anyOf": [
@@ -9905,6 +9905,20 @@
               }
             ],
             "title": "Reason"
+          },
+          "sheets": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SheetPreview"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheets"
           },
           "size_bytes": {
             "anyOf": [
@@ -10159,6 +10173,36 @@
           "is_everyone"
         ],
         "title": "ShareTargetResponse",
+        "type": "object"
+      },
+      "SheetPreview": {
+        "description": "One worksheet of an ``.xlsx`` preview \u2014 see ``src/office_preview.Sheet``.\n\n``rows`` is rectangular (every row padded to the widest), so the client\nrenders a grid without re-deriving the column count. ``truncated`` is per\nsheet: one small tab can sit beside a 50 000-row export in the same\nworkbook, and a modal-wide \"showing the first rows\" would be wrong about\nthe small one.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "rows": {
+            "default": [],
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SheetPreview",
         "type": "object"
       },
       "SkillEntry": {
@@ -13477,7 +13521,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.94.0"
+    "version": "0.95.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -38674,7 +38718,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/preview": {
       "get": {
-        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``) is previewed as its own words, read straight out of the OOXML\narchive by ``src/office_preview`` \u2014 no optional extra, no conversion\nservice. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
+        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``, and an ``.xlsx``) is previewed as its own content, read\nstraight out of the OOXML archive by ``src/office_preview`` \u2014 no optional\nextra, no conversion service. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
         "operationId": "preview_session_file_api_chat_sessions__chat_id__files_preview_get",
         "parameters": [
           {

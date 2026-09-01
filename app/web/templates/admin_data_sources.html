@@ -1610,13 +1610,13 @@
          never travel through conversation) and the certificate choice. #}
       <section class="ds-drawer__pane is-on" data-spw-pane="1">
         <div class="sp-existing" id="spw-existing" hidden style="margin-bottom:14px;">
-          <div class="ds-field">
+          <div class="ds-field" id="spw-existing-picker">
             <label for="spw-existing-select">Continue an existing connection</label>
             <select id="spw-existing-select" class="ds-dropdown-native"></select>
             {{ ds.dropdown(id='spw-existing-select-dd', target='spw-existing-select', aria_label='Existing SharePoint connection', options=[]) }}
           </div>
           <button type="button" class="btn btn-secondary" id="spw-existing-btn">Continue to scope &rarr;</button>
-          <div class="ds-wor"><span>or connect a new tenant</span></div>
+          <div class="ds-wor" id="spw-new-tenant-sep"><span>or connect a new tenant</span></div>
         </div>
 
         <div class="ds-field">
@@ -1633,7 +1633,7 @@
           <input type="text" id="spw-client" placeholder="app registration client id" autocomplete="off" spellcheck="false">
         </div>
 
-        <div class="ds-field">
+        <div class="ds-field" id="spw-credential-field">
           <label for="spw-cert-choice">Credential</label>
           <select id="spw-cert-choice" class="ds-dropdown-native">
             <option value="upload" selected>Upload certificate</option>
@@ -6131,6 +6131,13 @@ let spUniquePerms = {};
 // the ONLY way the sites level can populate there). Merged into every
 // sites-level render so an added site survives navigating away and back.
 let spManualSites = {};
+// True while the drawer is bound to an EXISTING connection (opened from a
+// card, not from "+ Add source"). Step 1 then SHOWS that connection instead
+// of offering a blank new-tenant form — see spBindStep1ToConnection.
+let spBoundToExisting = false;
+// The in-flight `?source_type=sharepoint` listing openSpWizard already
+// starts, reused by the binding below so it costs no second request.
+let spConnListPromise = null;
 
 function spEsc(s) {
   return String(s == null ? "" : s)
@@ -6192,11 +6199,22 @@ function openSpWizard() {
   document.getElementById("spw-client-secret").value = "";
   document.getElementById("spw-cert-status").style.display = "none";
   document.getElementById("spw-connect-error").style.display = "none";
+  // The drawer is reused, so the bound presentation must be undone here or
+  // it would survive into the next "+ Add source" and make connecting a new
+  // tenant impossible (read-only fields carrying someone else's values).
+  spBoundToExisting = false;
+  ["spw-name", "spw-tenant", "spw-client"].forEach((id) => {
+    document.getElementById(id).readOnly = false;
+  });
+  document.getElementById("spw-credential-field").style.display = "";
+  document.getElementById("spw-new-tenant-sep").style.display = "";
+  document.getElementById("spw-existing-picker").style.display = "";
   spSetCertChoice("upload");
   spGoStep(1);
 
   const sel = document.getElementById("spw-existing-select");
-  spApi(SP_CONN_API + "?source_type=sharepoint").then((rows) => {
+  spConnListPromise = spApi(SP_CONN_API + "?source_type=sharepoint");
+  spConnListPromise.then((rows) => {
     rows = Array.isArray(rows) ? rows : [];
     const existing = document.getElementById("spw-existing");
     if (!rows.length) { existing.hidden = true; return; }
@@ -6227,10 +6245,54 @@ function openSpWizard() {
    alone. Mirrors the "Continue an existing connection" step-1 button's own
    click handler below, without needing the (async) existing-connections
    list to have loaded first — the caller already knows the id. */
+/* Step 1 for a wizard bound to an EXISTING connection: show that
+   connection instead of a blank form for a new one. Reported from a live
+   instance (2026-09-01) — managing scopes and then looking at the Connect
+   step gave an empty Connection name / Tenant ID / Client ID, so nothing
+   on screen said which connection was being edited. The values were always
+   in the `?source_type=sharepoint` listing the drawer already fetches (the
+   source card renders the tenant id from it); step 1 was simply never told.
+
+   Read-only on purpose: the SharePoint card offers no connection editor,
+   and `spw-connect-btn` POSTs a NEW connection — so a prefilled, editable
+   form under it would silently create a duplicate instead of saving an
+   edit. Showing the truth is this fix; an editor is a separate feature.
+   The credential block and that button are hidden here for the same
+   reason: both belong to creating a tenant, not to reading one. */
+function spBindStep1ToConnection(connId) {
+  spBoundToExisting = true;
+  document.getElementById("spw-credential-field").style.display = "none";
+  document.getElementById("spw-new-tenant-sep").style.display = "none";
+  document.getElementById("spw-connect-btn").style.display = "none";
+  // "Continue an existing connection" asks a question already answered —
+  // this drawer was opened FROM one. The block around it stays (it carries
+  // "Continue to scope", the way back to step 2, which reads spConnId
+  // rather than the hidden picker while bound).
+  document.getElementById("spw-existing-picker").style.display = "none";
+  document.getElementById("spw-existing").hidden = false;
+  ["spw-name", "spw-tenant", "spw-client"].forEach((id) => {
+    document.getElementById(id).readOnly = true;
+  });
+  // Reuses openSpWizard's in-flight listing — no second request. A failure
+  // leaves the fields empty rather than blocking the wizard: step 2 is what
+  // the caller came for, and it does not depend on any of this.
+  return (spConnListPromise || Promise.resolve([]))
+    .then((rows) => {
+      const row = (Array.isArray(rows) ? rows : []).find((c) => c.id === connId);
+      if (!row) return;
+      const config = row.config || {};
+      document.getElementById("spw-name").value = row.name || "";
+      document.getElementById("spw-tenant").value = config.tenant_id || "";
+      document.getElementById("spw-client").value = config.client_id || "";
+    })
+    .catch(() => {});
+}
+
 function openSpWizardForConnection(connId, opts) {
   opts = opts || {};
   openSpWizard();
   spConnId = connId;
+  spBindStep1ToConnection(connId);
   spEnableStep(2);
   spEnableStep(3);
   spLevel = { site_id: null, drive_id: null, item_id: null };
@@ -6276,7 +6338,10 @@ function spGoStep(step) {
     b.classList.toggle("is-now", n === step);
     b.classList.toggle("is-done", n < step);
   });
-  document.getElementById("spw-connect-btn").style.display = step === 1 ? "" : "none";
+  // Never on a bound connection: that button creates a NEW connection, and
+  // step 1 there is a read-only view of the one already being edited.
+  document.getElementById("spw-connect-btn").style.display =
+    step === 1 && !spBoundToExisting ? "" : "none";
   document.getElementById("spw-scope-continue-btn").style.display = step === 2 ? "" : "none";
   document.getElementById("spw-finish-btn").style.display = step === 3 ? "" : "none";
   document.getElementById("spw-done-btn").style.display = "none";
@@ -6305,7 +6370,10 @@ function spConnectErr(msg) {
 }
 
 document.getElementById("spw-existing-btn").addEventListener("click", () => {
-  const id = document.getElementById("spw-existing-select").value;
+  // While bound the picker is hidden, so its value is whatever the listing
+  // happened to preselect — the connection this drawer was opened for is
+  // the only right answer.
+  const id = spBoundToExisting ? spConnId : document.getElementById("spw-existing-select").value;
   if (!id) return;
   spConnId = id;
   spEnableStep(2);

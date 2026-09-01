@@ -86,8 +86,9 @@ default turn, which names the others.
 | Type this          | You get                                                        |
 | ------------------ | -------------------------------------------------------------- |
 | `interleaved`      | text → tool → text → tool → text; an MCP envelope and a 6-row table. The #1504 shape. |
+| `wall`             | six CONSECUTIVE calls, three failing, before the first sentence — the #1974 shape: the tool-call group, the failure diagnosis on the header line, and an internal endpoint that must stay text |
 | `table`            | a 400-row result, to see the preview cap and the "show all rows" route |
-| `fail`             | a tool that fails with `tool-output-error` — red card, auto-opened |
+| `fail`             | a tool that fails with `tool-output-error` — red card, its error on the header line |
 | `approval`         | a `tool-approval-request`; the turn blocks until you Allow or Deny |
 | `error`            | a mid-turn engine `error` event after partial text             |
 | `markdown`         | a tool returning a markdown table, rendered as a real table    |
