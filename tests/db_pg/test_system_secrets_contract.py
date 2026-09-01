@@ -49,6 +49,28 @@ def test_system_secret_round_trip_both_backends(_env):
     assert repo.get("SLACK_BOT_TOKEN") is None
 
 
+def test_insert_if_absent_is_write_once_both_backends(_env):
+    """The write-once sibling of ``upsert`` (src/anonymization_key.py's
+    per-instance HMAC key): the FIRST caller creates the row and every later
+    one is a no-op that leaves the stored value untouched. This is what makes
+    two workers provisioning concurrently converge on one key instead of
+    clobbering each other."""
+    from src.repositories import system_secrets_repo
+
+    repo = system_secrets_repo()
+
+    assert repo.insert_if_absent("anonymization/hmac_key", "first") is True
+    assert repo.get("anonymization/hmac_key") == "first"
+
+    # Second call: reports it did not create the row, and does NOT overwrite.
+    assert repo.insert_if_absent("anonymization/hmac_key", "second") is False
+    assert repo.get("anonymization/hmac_key") == "first"
+
+    # upsert remains the deliberate replace path for the scopes that want it.
+    repo.upsert("anonymization/hmac_key", "third")
+    assert repo.get("anonymization/hmac_key") == "third"
+
+
 def test_system_secret_absent_returns_none_both_backends(_env):
     from src.repositories import system_secrets_repo
 

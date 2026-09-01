@@ -1269,6 +1269,23 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
     ),
+    # -- 2026-09-01 owner decision: the anonymize-in-front pipeline's
+    # per-instance HMAC key (design spec §9.2) is generated and stored by
+    # Agnes itself when no operator-minted env key is configured, instead of
+    # failing closed forever. Cataloged because it is a once-per-instance,
+    # irreversible security event: the key is write-once (a second key
+    # orphans every pseudonym written under the first), so the row is the
+    # durable record of WHEN this instance's pseudonym space came into
+    # existence and WHICH key (by fingerprint — never the value) it uses.
+    # Written by src/anonymization_key.py with no actor: no user asks for
+    # provisioning; a run that needs a key triggers it.
+    "anonymization.key_provisioned": AuditEvent(
+        "anonymization.key_provisioned",
+        "system",
+        "Agnes generated this instance's per-instance anonymization HMAC key and stored it "
+        "encrypted in the vault (fingerprint only, never the key value). Write-once — there "
+        "is no automatic rotation.",
+    ),
 }
 
 

@@ -201,6 +201,8 @@ import time
 from datetime import UTC
 
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind, register_kind
+from src.anonymization_key import ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
+from src.anonymization_key import AnonymizationKeyError as _AnonymizationKeyError
 from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
@@ -1160,66 +1162,37 @@ def _extraction_timeout_seconds() -> int:
         return _DEFAULT_EXTRACTION_TIMEOUT_S
 
 
-class AnonymizationKeyError(RuntimeError):
-    """At least one selected scope is ``anonymize=true`` but no per-instance
-    HMAC key resolves (design spec §9.2's pseudonym scheme —
-    ``PERSON_<hmac(key, ...)>`` etc., never a fixed marker). Raised rather
-    than silently omitting the key: falling back to a shared or absent key
-    defeats the "tokens never correlate across tenants" guarantee the key
-    exists for, so the job fails clean instead of running with a weaker
-    guarantee than the wizard promised."""
-
-
-_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT = "AGNES_ANONYMIZATION_HMAC_KEY"
+# The per-instance anonymization HMAC key (spec §9.2) is resolved — and, as
+# of owner decision 2026-09-01, PROVISIONED — by ``src/anonymization_key.py``.
+# The error type and the default env NAME are re-exported here because this
+# module is where both have always been imported from
+# (``connectors/sharepoint/crawler.py``, the worker tests); moving the
+# implementation must not move the import path out from under those callers.
+AnonymizationKeyError = _AnonymizationKeyError
+_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT = ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
 
 
 def _resolve_anonymization_key() -> str:
-    """Resolve this instance's per-instance anonymization HMAC key (spec
-    §9.2): an admin-configurable env var NAME
-    (``extraction.anonymization.hmac_key_env``, default
-    ``AGNES_ANONYMIZATION_HMAC_KEY``), checked against
-    :func:`src.orchestrator_security.is_producer_key_env_allowed` BEFORE the
-    value is read. The env var NAME is admin-writable config, so without a
-    gate an admin could point ``hmac_key_env`` at an unrelated instance
-    secret (``ANTHROPIC_API_KEY``, ``JWT_SECRET_KEY``, ...) and have it used
-    as if it were the anonymization key.
+    """Resolve this instance's per-instance anonymization HMAC key (spec §9.2).
 
-    Deliberately uses ``is_producer_key_env_allowed`` — a SEPARATE, narrower
-    allowlist from ``is_token_env_allowed`` (the connector-ATTACH `token_env`
-    gate) — NOT the same function the SharePoint certificate resolver uses.
-    Sharing the certificate's allowlist would additionally make this key a
-    legal `token_env` for a connector-written `_remote_attach` row (a
-    SECOND, unrelated consumer of that allowlist in ``src/orchestrator.py``
-    / ``src/db.py``), letting a malicious connector exfiltrate the resolved
-    key value via ``ATTACH ... TOKEN`` to a connector-chosen URL (RBAC
-    review, 2026-08-28). See ``_PRODUCER_KEY_ENVS``'s docstring in
-    ``src/orchestrator_security.py`` for the full trust-boundary argument.
+    A thin delegate to :func:`src.anonymization_key.resolve_or_provision_key`
+    — the single owner of that resolution, including the allowlist gate on
+    the admin-writable env var NAME (a security control that must have
+    exactly one implementation) and, when no operator key is configured, the
+    write-once generate-and-store path that makes the key zero-ops.
 
-    Raises :class:`AnonymizationKeyError` (never returns a fallback/empty
-    key) when the name is disallowed or unset — see that class's docstring
-    for why.
+    Precedence, unchanged at the top and extended below it: an
+    operator-minted env key (``extraction.anonymization.hmac_key_env``,
+    allowlist-checked) always wins; otherwise the vault-stored instance key;
+    otherwise one is generated and stored; otherwise
+    :class:`AnonymizationKeyError`, never a fallback or empty key.
+
+    Kept as a module-level function with this exact name/signature because
+    ``connectors/sharepoint/crawler.py`` imports it by name.
     """
-    from app.instance_config import get_value
-    from src.orchestrator_security import is_producer_key_env_allowed
+    from src.anonymization_key import resolve_or_provision_key
 
-    env_name = str(get_value("extraction", "anonymization", "hmac_key_env", default="") or "").strip()
-    env_name = env_name or _ANONYMIZATION_HMAC_KEY_ENV_DEFAULT
-
-    if not is_producer_key_env_allowed(env_name):
-        raise AnonymizationKeyError(
-            f"extraction.anonymization.hmac_key_env={env_name!r} is not an allowed anonymization "
-            f"key variable. Use the default name, {_ANONYMIZATION_HMAC_KEY_ENV_DEFAULT}, or leave "
-            "hmac_key_env empty."
-        )
-
-    value = os.environ.get(env_name)
-    if not value:
-        raise AnonymizationKeyError(
-            f"{env_name} is not set on the server, so the per-instance anonymization key cannot "
-            "be resolved. At least one selected scope is marked anonymize=true — set "
-            f"{env_name} (see docs/anonymization.md) or unmark the scope in the connect wizard."
-        )
-    return value
+    return resolve_or_provision_key().decode("utf-8")
 
 
 def _run_corpus_extraction(payload: dict) -> dict:

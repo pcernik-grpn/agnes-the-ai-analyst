@@ -1424,19 +1424,27 @@ extraction:
   # CLOSED for those scopes: a document that cannot be anonymized is
   # counted in the run report and dropped, never ingested raw.
   anonymization:
-    # Name of the env var holding the per-instance HMAC key — checked
+    # OPTIONAL — leave empty unless you want to mint the key yourself.
+    # With this empty and no AGNES_ANONYMIZATION_HMAC_KEY in the
+    # environment, Agnes generates this instance's HMAC key on first use
+    # and stores it encrypted in its own vault (needs AGNES_VAULT_KEY set;
+    # see docs/anonymization.md). That key is WRITE-ONCE and never rotated
+    # automatically — a second key orphans every pseudonym already written.
+    # Set this only to name the env var holding an operator-minted key,
+    # which then takes precedence over the stored one. The name is checked
     # against ITS OWN allowlist before the value is read (the name here is
     # admin-writable config, so an unlisted name is refused rather than
-    # silently read). This is a SEPARATE, narrower allowlist from the
+    # silently read). That is a SEPARATE, narrower allowlist from the
     # SharePoint certificate's (AGNES_REMOTE_ATTACH_TOKEN_ENVS) —
     # deliberately, so this key can never be referenced as a `token_env` on
     # a connector-written `_remote_attach` row (see
     # src/orchestrator_security.py's `_PRODUCER_KEY_ENVS`). Empty (or the
-    # default name itself) uses AGNES_ANONYMIZATION_HMAC_KEY; any other
+    # default name itself) means AGNES_ANONYMIZATION_HMAC_KEY; any other
     # name is refused. Different instances MUST use different keys, or the
     # same person pseudonymizes identically across tenants. A connection
-    # with an anonymize-marked scope and no resolvable key fails the
-    # extraction job clean rather than running without a key.
+    # with an anonymize-marked scope and no resolvable key (no env key and
+    # no usable vault) still fails the extraction job clean rather than
+    # running without a key.
     hmac_key_env: ""
     # Which entity detector the anonymize pass uses.
     #

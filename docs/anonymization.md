@@ -48,14 +48,42 @@ other than this crawl still carries the caller's own `anonymization`
 declaration — see *What Agnes records* below; the declaration is a claim
 Agnes stores, not something it can verify.
 
-## Configuring the key
+## The key: nothing to configure (owner decision, 2026-09-01)
 
-`config/instance.yaml`, under the existing `extraction:` block:
+**There is normally nothing to set up.** The first time a run actually
+needs the key, Agnes generates one (`secrets.token_bytes(32)`), stores it
+encrypted in its own secret vault, and reuses it from then on
+(`src/anonymization_key.py`). The only prerequisite is the one every
+Agnes secret already has: a stable `AGNES_VAULT_KEY` on the server.
+
+Resolution order, strictly:
+
+| # | Source | When it applies |
+|---|---|---|
+| 1 | `$<hmac_key_env>` (default `AGNES_ANONYMIZATION_HMAC_KEY`) | an operator minted their own key — always wins |
+| 2 | the vault-stored instance key | no env key, one was stored earlier |
+| 3 | a freshly generated + stored key | no env key, none stored, `AGNES_VAULT_KEY` set |
+| 4 | fail closed (named error) | no env key and no usable vault |
+
+Provisioning is **write-once**: an existing key is never overwritten, two
+workers provisioning concurrently converge on one key, and there is no
+rotate/regenerate command. That is deliberate — rotating this key rewrites
+every pseudonym, so `PERSON_<hmac(k1, …)>` and `PERSON_<hmac(k2, …)>`
+become different nodes and everything already ingested stops referring to
+the same person as everything ingested afterwards. Losing or regenerating
+the key by accident is a data-integrity bug, not an inconvenience. One
+cataloged audit row (`anonymization.key_provisioned`) records when the key
+came into existence, by fingerprint (`sha256(key)[:12]`) — the value never
+appears in a log, an audit row, or the UI.
+
+### Minting your own key instead
+
+Set `hmac_key_env` only if you want to supply the key yourself:
 
 ```yaml
 extraction:
   anonymization:
-    hmac_key_env: ""   # empty = use the default name below
+    hmac_key_env: ""   # empty = the default name, AGNES_ANONYMIZATION_HMAC_KEY
 ```
 
 `hmac_key_env` names the environment variable holding the key — checked
@@ -74,7 +102,7 @@ allowlists never share membership — see `src/orchestrator_security.py`'s
 `_PRODUCER_KEY_ENVS` for the full reasoning.
 
 Generate a random value once per instance and never reuse it across
-deployments:
+deployments (this is the same shape Agnes generates for itself):
 
 ```bash
 python3 -c "import secrets; print(secrets.token_hex(32))"
@@ -109,9 +137,11 @@ use does not wear it out). If it is ever truly compromised, rotating it is
 a *reset*: plan to re-run extraction over the full corpus so the graph is
 rebuilt in the new token space.
 
-A connection with an anonymize-marked scope and no resolvable key fails the
-`corpus-extraction` job cleanly (a named error, not a silent run without a
-key) — set the variable, or unmark the scope in the connect wizard.
+A connection with an anonymize-marked scope and **no** resolvable key — no
+env key *and* no usable vault — still fails the `corpus-extraction` job
+cleanly (a named error, not a silent run without a key). The error names
+both fixes: set `AGNES_VAULT_KEY` and let Agnes generate the key, or set
+the env variable yourself. Or unmark the scope in the connect wizard.
 
 ## Choosing a detector
 
