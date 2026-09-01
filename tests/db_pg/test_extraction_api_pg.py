@@ -62,11 +62,24 @@ def test_a_live_run_surfaces_with_absolute_counters(tmp_path, monkeypatch, pg_en
 
     repo = _repo()
     run_id = repo.start(connection_id=conn_id)
+    activity = {
+        "phase": "crawl",
+        "current_path": "Reports/q3.docx",
+        "current_started_at": "2026-09-01T00:00:00+00:00",
+        "recent": [{"path": "Reports/q2.docx", "outcome": "new"}],
+    }
     repo.checkpoint(
         run_id,
         files_seen=400,
         files_done=400,
-        progress={"new": 12, "unchanged": 388, "http_429": 4, "throttle_wait_s": 38.0, "elapsed_s": 391.0},
+        progress={
+            "new": 12,
+            "unchanged": 388,
+            "http_429": 4,
+            "throttle_wait_s": 38.0,
+            "elapsed_s": 391.0,
+            "activity": activity,
+        },
     )
 
     body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
@@ -78,8 +91,11 @@ def test_a_live_run_surfaces_with_absolute_counters(tmp_path, monkeypatch, pg_en
     assert running["throttle_wait_s"] == 38.0
     # The card's "as of" caption reads this, not the response's own `as_of`.
     assert running["checkpoint_at"]
-    # No stop control is offered: v1 has no cooperative cancel flag.
-    assert body["can_stop"] is False
+    # What the crawl is touching RIGHT NOW (owner-frustration fix, 2026-09-01).
+    assert running["activity"] == activity
+    # A cooperative stop (`POST .../extraction/stop`) always exists — it
+    # lives on `source_connections`, not this PG-only table.
+    assert body["can_stop"] is True
 
 
 def test_a_stale_running_run_reports_stalled_with_its_age(tmp_path, monkeypatch, pg_engine):

@@ -781,11 +781,21 @@ vault-first then the server's `SHAREPOINT_CERT_PRIVATE_KEY` env var) and
 never reach a command line, because there is none. The run is bounded by
 `extraction.timeout_s` — checked between files and between delta pages,
 and on expiry the crawl persists its resumable state and fails the job
-with `interrupted_reason: "timeout"`; that is the only deliberate stop
-mechanism v1 has. An exhausted 429 budget stops a run the same way, as
-`interrupted_reason: "throttled"` — those two reasons, and only those two,
-mean the persisted state describes exactly what was ingested, so a reader
-may promise that the next run resumes. Off by default (`sharepoint.enabled` — a registered switch,
+with `interrupted_reason: "timeout"`. An exhausted 429 budget stops a run
+the same way, as `interrupted_reason: "throttled"`. So does an admin
+cooperative stop (`POST .../extraction/stop`,
+`connectors.sharepoint.crawler.request_stop`) — a signal written to the
+connection row's own `config.extraction.stop_requested_at`, which works on
+both app-state backends, and polled by the crawl at the SAME two points the
+timeout already checks (unconditionally between delta pages, every 10
+completed items between files), recording `interrupted_reason: "stopped"`.
+A stale flag left over from a previous run is cleared at the START of the
+next one, so a stop can never reach forward past the run it was meant for.
+Those three reasons, and only those three, mean the persisted state
+describes exactly what was ingested, so a reader may promise that the next
+run resumes. The live checkpoint also carries an `activity` block (current
+in-flight path, last 5 completed items) so a running crawl is no longer a
+black box between checkpoints. Off by default (`sharepoint.enabled` — a registered switch,
 `AGNES_SHAREPOINT_ENABLED`) and additive: an instance that never sets
 `sharepoint.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
 backends ship as the `extraction` optional extra; the admin trigger
@@ -950,6 +960,67 @@ optional and gate the relevant connectors/providers.
 ```
 
 ---
+
+## Unstructured-document extraction: engine vs. connector
+
+The document pipeline (crawl → convert → anonymize → ingest → facts) is
+built in-process, and SharePoint is its first — currently only — file
+source. The seams between what is SOURCE-AGNOSTIC and what is
+SharePoint's are deliberate, and they are the map for the next file
+connector (OneDrive, S3, GCS, …). Today's packaging does not fully match
+those seams — several engine modules live under `connectors/sharepoint/`
+for historical reasons — so this section records which is which, before
+a second connector makes the distinction load-bearing.
+
+**Engine (source-agnostic — a new file connector reuses ALL of this):**
+
+| Concern | Where | Contract |
+|---|---|---|
+| Convert to markdown | `connectors/sharepoint/convert.py`, `pdf_structure.py`, `scan_ocr.py` | bytes + filename → markdown; knows nothing about the source |
+| Anonymize | `src/anonymization*.py` | markdown → redacted markdown, fail-closed; per-scope flag decided by the caller |
+| Ingest | `POST /api/collections/{id}/files` internals, `corpus_files` repos | collection + stable_id + markdown; source-neutral idempotence |
+| Facts extraction | `connectors/sharepoint/facts_extraction.py`, `facts_prompt.py` | reads ingested markdown from collections; no source types anywhere |
+| Run observability | `extraction_runs` (PG), `app/api/admin_extraction.py` | keyed by `connection_id` only — any connector's runs land here |
+| Cooperative stop | `config.extraction.stop_requested_at` on `source_connections` | generic column, generic endpoint mechanics |
+| Configuration | instance-wide `extraction.*` (timeouts, concurrency, LLM stages) | not namespaced per source |
+| Cost accounting | stage-keyed `usage` (`ner`/`ocr`/`facts`), `src/llm_pricing.py` | per run, source-blind |
+| UI | the data-sources card's Run / Run history / activity / preview panels | render the generic endpoints above |
+
+**Connector (SharePoint-specific — a new source writes its own):**
+
+- `graph_client.py` — transport, auth, throttling detection.
+- `crawler.py`'s enumeration half — Graph delta, deltaLink/cTag resume,
+  scope walking, zone routing inputs.
+- `acl_sync.py`, `subscriptions.py`, `settings.py` — ACL mirroring,
+  webhook lifecycle, tenant settings.
+- The connect wizard (tenant, certificate, scope picking) — connector
+  UX is inherently per-source, exactly like Keboola's or Databricks's.
+
+**What a second file connector costs.** OneDrive: nearly nothing — it IS
+Microsoft Graph drives (same delta API; scopes select users/groups
+instead of sites). S3/GCS: a new enumerator (LIST + ETag in the cTag
+role, no ACLs or webhooks in v1) and nothing else — convert onward is
+untouched.
+
+**The refactor that waits for the second connector.** When one arrives,
+extract in this order — not before (an interface designed against one
+implementation gets the seams wrong):
+
+1. Move the engine modules above out of `connectors/sharepoint/` into
+   `src/extraction/` (mechanical; imports only).
+2. Lift `crawler.py`'s orchestration (bounded thread pool, run recorder,
+   stop checks, activity tracking, AIMD governor) over a small
+   `FileSource` interface: `enumerate/delta`, `download`, `stable_id`,
+   `path` — the four things the SharePoint crawler actually consumes
+   from Graph.
+3. Re-home the generic endpoints under `/api/admin/extraction/*`,
+   keeping the `/api/admin/sharepoint/*` paths as aliases.
+
+Until then, the one rule that keeps the door open: **new
+extraction-engine work must not take a SharePoint dependency** — no
+Graph types in convert/facts/run-recording signatures, no
+`sharepoint.`-namespaced config for engine concerns, and run state stays
+keyed on `connection_id` alone.
 
 ## Extending the Platform
 
