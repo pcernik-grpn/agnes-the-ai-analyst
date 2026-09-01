@@ -25,7 +25,7 @@ Map changed paths → in-scope reviewers:
 |---|---|
 | `agnes-reviewer-rules` | always |
 | `agnes-reviewer-adversarial` | only when `--adversarial` was passed |
-| `agnes-reviewer-architecture` | `src/orchestrator.py`, `src/db.py`, `connectors/*/extractor.py`, `connectors/*/extract_init.py`, new `connectors/**` |
+| `agnes-reviewer-architecture` | `src/orchestrator.py`, `src/db.py`, `src/parquet_publish.py`, `src/ingest/tabular.py`, `connectors/*/extractor.py`, `connectors/*/extract_init.py`, `connectors/*/*transform*.py`, `connectors/*/*incremental*.py`, `connectors/*/*parquet*.py`, `connectors/*/*partition*.py`, `connectors/jira/organizations.py`, `connectors/keboola/storage_api.py`, new `connectors/**` |
 | `agnes-reviewer-rbac` | `app/api/`, `app/auth/`, `app/resource_types.py` |
 | `agnes-reviewer-parity` | `src/repositories/`, `src/db.py`, `migrations/`, `tests/db_pg/` |
 
