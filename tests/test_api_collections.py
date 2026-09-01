@@ -1859,10 +1859,25 @@ class TestTieredAudienceDocumentText:
         return cid, top_group
 
     def _upload(self, seeded_app, cid: str, filename: str, body: bytes, ctype: str) -> str:
+        """Uploads ride the PRODUCER's scoped credential: the collection is
+        scope-managed (`_tiered_collection` references it from
+        `config.scopes`), so an interactive upload is 409
+        `collection_source_managed` by design — audience-tiered documents
+        only ever arrive through the pipeline."""
+        from app.api.collections import source_managing_connection
+        from app.auth.producer_token import mint_producer_token
+
+        conn = source_managing_connection(cid)
+        if conn is None:
+            # Plain (unmanaged) collection — the interactive path is the
+            # normal one (`test_plain_collection_regression_unchanged`).
+            token = seeded_app["admin_token"]
+        else:
+            token = mint_producer_token(connection_id=conn["id"], collection_ids=[cid], ttl_seconds=3600)
         r = seeded_app["client"].post(
             f"/api/collections/{cid}/files",
             files={"files": (filename, io.BytesIO(body), ctype)},
-            headers=_auth(seeded_app["admin_token"]),
+            headers=_auth(token),
         )
         assert r.status_code in (200, 201, 422), r.text
         return r.json()[0]["file_id"]
@@ -2232,6 +2247,103 @@ class TestProducerUploadAccess:
         assert resp.status_code == 403
 
 
+class TestSourceManagedCollections:
+    """A collection referenced by a source connection's confirmed scope is
+    fed by that source's pipeline — an interactive upload into it is refused
+    with a typed 409 (`collection_source_managed`), for ADMINS TOO: this is
+    an integrity rule, not an access rule, and the likeliest accidental
+    uploader is the admin who confirmed the scope. A hand-added file would
+    pollute the crawled corpus and, on an anonymize-marked scope, bypass the
+    anonymizer entirely (the facts-ingest declaration gate never sees plain
+    file uploads). The producer's own scoped credential keeps working, and a
+    collection orphaned by unticking its scope becomes an ordinary editable
+    collection again."""
+
+    def _seed_managed(self, seeded_app, *, corpus_name: str, connection_id: str, connection_name="Corp SharePoint"):
+        from src.repositories import source_connections_repo
+
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": corpus_name}, headers=_auth(seeded_app["admin_token"]))
+        assert cr.status_code == 201, cr.text
+        corpus_id = cr.json()["id"]
+        source_connections_repo().create(
+            id=connection_id,
+            name=connection_name,
+            source_type="sharepoint",
+            config={
+                "tenant_id": "tenant-1",
+                "client_id": "client-1",
+                "scopes": [
+                    {
+                        "source_scope_id": "site,abc,def",
+                        "display_path": "Corp Site",
+                        "anonymize": False,
+                        "collection_id": corpus_id,
+                    }
+                ],
+            },
+        )
+        return corpus_id
+
+    def _upload(self, seeded_app, corpus_id: str, token: str):
+        return seeded_app["client"].post(
+            f"/api/collections/{corpus_id}/files",
+            files={"files": ("notes.txt", io.BytesIO(b"hello world"), "text/plain")},
+            headers=_auth(token),
+        )
+
+    def test_admin_upload_into_source_managed_collection_is_409(self, seeded_app):
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Admin", connection_id="conn-sm-1")
+        resp = self._upload(seeded_app, corpus_id, seeded_app["admin_token"])
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "collection_source_managed"
+        assert detail["connection"] == "Corp SharePoint"
+
+    def test_granted_member_upload_is_also_409(self, seeded_app):
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Member", connection_id="conn-sm-2")
+        _seed_collection_grant(corpus_id, "analyst1")
+        resp = self._upload(seeded_app, corpus_id, seeded_app["analyst_token"])
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "collection_source_managed"
+
+    def test_producer_upload_still_passes(self, seeded_app):
+        from app.auth.producer_token import mint_producer_token
+
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Producer", connection_id="conn-sm-3")
+        token = mint_producer_token(connection_id="conn-sm-3", collection_ids=[corpus_id], ttl_seconds=3600)
+        resp = self._upload(seeded_app, corpus_id, token)
+        assert resp.status_code == 201, resp.text
+
+    def test_orphaned_collection_is_editable_again(self, seeded_app):
+        """Unticking the scope orphans the collection — from then on it is an
+        ordinary collection and manual uploads work, which is also what makes
+        the wizard's 409 hint ('unselect the scope first') honest."""
+        from src.repositories import source_connections_repo
+
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Orphan", connection_id="conn-sm-4")
+        repo = source_connections_repo()
+        row = repo.get("conn-sm-4")
+        repo.update("conn-sm-4", config={**row["config"], "scopes": []})
+        resp = self._upload(seeded_app, corpus_id, seeded_app["admin_token"])
+        assert resp.status_code == 201, resp.text
+
+    def test_move_into_source_managed_collection_is_409(self, seeded_app):
+        c = seeded_app["client"]
+        managed_id = self._seed_managed(seeded_app, corpus_name="Managed Move Target", connection_id="conn-sm-5")
+        cr = c.post("/api/collections", json={"name": "Move Source"}, headers=_auth(seeded_app["admin_token"]))
+        source_id = cr.json()["id"]
+        up = self._upload(seeded_app, source_id, seeded_app["admin_token"])
+        file_id = up.json()[0]["file_id"]
+        resp = c.post(
+            f"/api/collections/{source_id}/files/{file_id}/move",
+            json={"target_collection_id": managed_id},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "collection_source_managed"
+
+
 # ---------------------------------------------------------------------------
 # SharePoint source-ACL ingest gate (2026-08-31 plan, Task 5 —
 # connectors/sharepoint/ingest_gate.py) wired into this upload endpoint —
@@ -2274,6 +2386,18 @@ def _seed_sharepoint_scope(corpus_id: str, *, connection_id: str) -> None:
 
 
 class TestSharePointIngestGateUpload:
+    """The uploader here is the PRODUCER's scoped credential — since the
+    source-managed gate (`TestSourceManagedCollections` above), an
+    interactive upload into a scope-referenced collection is refused
+    outright with 409, so the exclusion gate's real caller is the only one
+    that can reach it."""
+
+    @staticmethod
+    def _producer_token(connection_id: str, corpus_id: str) -> str:
+        from app.auth.producer_token import mint_producer_token
+
+        return mint_producer_token(connection_id=connection_id, collection_ids=[corpus_id], ttl_seconds=3600)
+
     def test_upload_under_excluded_subtree_is_refused_and_stores_nothing(self, seeded_app, monkeypatch):
         monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
         c = seeded_app["client"]
@@ -2292,7 +2416,7 @@ class TestSharePointIngestGateUpload:
                 ("files", ("ok.md", io.BytesIO(b"fine"), "text/markdown")),
             ],
             data={"paths": ["Secret/doc.docx", "open/ok.md"]},
-            headers=_auth(seeded_app["admin_token"]),
+            headers=_auth(self._producer_token("conn-gate-1", corpus_id)),
         )
         assert resp.status_code == 403, resp.text
         detail = resp.json()["detail"]
@@ -2317,7 +2441,7 @@ class TestSharePointIngestGateUpload:
             f"/api/collections/{corpus_id}/files",
             files={"files": ("ok.md", io.BytesIO(b"fine"), "text/markdown")},
             data={"paths": "open/ok.md"},
-            headers=_auth(seeded_app["admin_token"]),
+            headers=_auth(self._producer_token("conn-gate-2", corpus_id)),
         )
         assert resp.status_code == 201, resp.text
 
@@ -2334,6 +2458,6 @@ class TestSharePointIngestGateUpload:
             f"/api/collections/{corpus_id}/files",
             files={"files": ("doc.docx", io.BytesIO(b"secret bytes"), "application/octet-stream")},
             data={"paths": "Secret/doc.docx"},
-            headers=_auth(seeded_app["admin_token"]),
+            headers=_auth(self._producer_token("conn-gate-3", corpus_id)),
         )
         assert resp.status_code == 201, resp.text

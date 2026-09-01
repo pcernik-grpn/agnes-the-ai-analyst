@@ -306,7 +306,22 @@
    leads with what is in the artefact, then offers to grow it. On a one-file
    artefact growing it is a real change of shape (file → collection), so the
    drop zone says so before the reader acts, instead of surprising them with
-   a promoted "collection" afterwards. #}
+   a promoted "collection" afterwards.
+
+   A source-managed collection (referenced by a connection's confirmed
+   scope) renders a note instead of the drop zone: the upload endpoint
+   refuses interactive callers with 409 collection_source_managed, so
+   offering the affordance would be a control that can only fail. #}
+{% if source_managed_by %}
+{{ detail.section_open('Add files', icon='file') }}
+  <p class="drop__note">
+    Content here is managed by the <strong>{{ source_managed_by }}</strong>
+    source connection — files arrive through its pipeline, not manual
+    upload. To hand-manage this collection, unselect its scope in the
+    connect wizard first.
+  </p>
+{{ detail.section_close() }}
+{% else %}
 {{ detail.section_open('Add files', icon='file') }}
   <label class="drop" id="lib-drop">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V6M8 10l4-4 4 4"/><path d="M20 16v2a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-2"/></svg>
@@ -325,6 +340,7 @@
     </p>
   {% endif %}
 {{ detail.section_close() }}
+{% endif %}
 
 {{ detail.aside_open() }}
 {# The rail's content is redesign-only: on the legacy path there is no

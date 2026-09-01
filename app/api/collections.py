@@ -78,6 +78,7 @@ from src.repositories import (
     corpus_file_sources_repo,
     corpus_files_repo,
     file_corpora_repo,
+    source_connections_repo,
     table_registry_repo,
 )
 
@@ -1139,6 +1140,46 @@ def _preflight_source_anchored_batch(
             seen_targets[target] = idx
 
 
+def source_managing_connection(collection_id: str) -> Optional[dict]:
+    """The source connection whose confirmed scope feeds ``collection_id``,
+    or ``None`` for an ordinary collection.
+
+    A collection referenced by any connection's ``config.scopes[]
+    .collection_id`` gets its content from that source's pipeline (crawl →
+    convert → [anonymize] → upload under a ``ProducerPrincipal``), so
+    interactive writes into it are refused — a hand-added file would pollute
+    the mirrored corpus, and on an anonymize-marked scope it would bypass
+    the anonymizer entirely (the facts-ingest declaration gate never sees
+    plain file uploads). Derived from the scope reference on purpose, not
+    from a column on the collection row: any connector that writes
+    ``scopes[].collection_id`` (SharePoint today, future file sources alike)
+    gets the protection with no schema change, and a collection orphaned by
+    unticking its scope reverts to an ordinary editable collection, which is
+    what makes the 409's "unselect the scope first" hint honest.
+    """
+    for row in source_connections_repo().list():
+        for scope in (row.get("config") or {}).get("scopes") or []:
+            if scope.get("collection_id") == collection_id:
+                return row
+    return None
+
+
+def _refuse_source_managed(connection: dict) -> None:
+    name = connection.get("name") or connection.get("id") or "a source connection"
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "error": "collection_source_managed",
+            "connection": name,
+            "message": (
+                f"This collection is fed by the '{name}' source connection — its content "
+                "arrives through that source's pipeline, not manual upload. Unselect the "
+                "scope in the connect wizard first if you really need to hand-manage it."
+            ),
+        },
+    )
+
+
 @router.post("/{collection_id}/files", status_code=201)
 async def upload_files(
     collection_id: str,
@@ -1236,6 +1277,13 @@ async def upload_files(
     corpus = file_corpora_repo().get(collection_id)
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
+
+    if not isinstance(user, ProducerPrincipal):
+        # Interactive callers — admins included: this is an integrity rule,
+        # not an access rule (see `source_managing_connection`).
+        managing = source_managing_connection(collection_id)
+        if managing is not None:
+            _refuse_source_managed(managing)
 
     if isinstance(user, ProducerPrincipal):
         # A restricted principal's identity is never stashed onto
@@ -1580,6 +1628,15 @@ async def move_file(
         # 404, not 403 — same reason as everywhere else here: never confirm the
         # existence of a collection the caller can't reach.
         raise HTTPException(status_code=404, detail="target_not_found")
+
+    # Moving INTO a source-managed collection is the same pollution as
+    # uploading into it — refused for every interactive caller (a producer
+    # never reaches this route at all; its principal 403s on the path
+    # dependency). Moving OUT of one stays allowed: pulling a file from a
+    # mirror is an admin's judgment call, and the next crawl reconciles.
+    managing = source_managing_connection(target_id)
+    if managing is not None:
+        _refuse_source_managed(managing)
 
     if not cf_repo.move_to_corpus(file_id, target_id):
         raise HTTPException(status_code=404, detail="file_not_found")
