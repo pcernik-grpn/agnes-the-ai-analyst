@@ -180,6 +180,8 @@ A caller in `sales-cz`/`sales-de` gets their row-level slice; a caller in neithe
 
 The modal is a plain SQL textarea plus a required note field ("why does this policy exist" — mandatory whenever a non-empty body is saved, so the next admin who finds forty lines of SQL knows whether it's a legal requirement or a hunch), an inline preview runner (persona = one user's email, or an ad-hoc comma-separated group list — see below), and recent edit history, each entry with a restore action and a collapsed line diff against the previous saved version (and, for the newest entry, against the currently stored policy) so an admin can see WHAT changed before deciding to restore it. A rejected save renders inline rather than as an auto-dismissing toast, on purpose — a security-invariant refusal has to stay legible while you re-read the SQL.
 
+The editor has two tabs. **Builder** assembles row rules and column masks and compiles them server-side (`POST /api/admin/registry/{id}/policy/compile`) into the SQL that actually gets stored; **Advanced SQL** is that same body, editable by hand. The stored artifact is always SQL — there is no reverse-compiler from SQL back into rules — so when the body in the box is not what the Builder's rules describe (a policy written on the Advanced SQL tab, a restored revision, a hand edit), the Builder says so outright ("this policy was written as SQL and cannot be shown as rules") and points at the Advanced SQL tab, rather than showing its own empty rule set as if the table were unfiltered. Saving from that state stores the SQL unchanged; adding a rule there **replaces** the SQL policy with the rules, and asks for an explicit confirmation first.
+
 ### CLI
 
 ```bash

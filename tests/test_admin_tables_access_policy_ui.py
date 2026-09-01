@@ -1034,3 +1034,121 @@ class TestDiffAlgorithmUnderNode:
         big = "\\n".join(f"line{i}" for i in range(500))
         result = self._run(f"_apDiffLines('{big}', '{big}x')")
         assert result is None
+
+
+# ── #1979 reviewer finding 1: the Builder tab must not describe a policy it
+# cannot represent ────────────────────────────────────────────────────────
+#
+# The Builder starts empty on every open (there is no reverse-compiler from
+# stored SQL back into rules), so a policy authored on the Advanced SQL tab
+# used to render as "No row rules — every caller sees every row" while a real
+# restrictive policy was being enforced. Authorship is TRACKED
+# (`_apSqlFromBuilder`), never re-derived by parsing SQL.
+
+
+def test_builder_says_when_a_policy_cannot_be_shown_as_rules(seeded_app):
+    """A stored policy the builder did not author renders an explicit
+    "cannot be shown as rules" block in the Builder tab, with a control that
+    hands the admin to the Advanced SQL tab — not the empty-rules copy."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert 'id="apNotRepresentableNotice"' in body
+    assert "function _apRenderRepresentationNotice" in body
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "cannot be shown as rules" in fn
+    # A stored policy is "enforced as written"; SQL typed into the box but not
+    # saved yet is not enforced at all, and must not claim to be.
+    assert "It is enforced as" in fn
+    assert "It is what Save policy will store" in fn
+    assert "Advanced SQL" in fn
+    assert "apSwitchTab(\\'sql\\')" in fn or 'apSwitchTab(\\"sql\\")' in fn
+
+
+def test_the_not_representable_notice_uses_the_existing_warn_block(seeded_app):
+    """Mirrors #apFlagDisabledNotice / #apInterlockWarning — the same
+    design-system warn block, no inline colours, no new component."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    at = body.index('id="apNotRepresentableNotice"')
+    tag = body[body.rindex("<div", 0, at) : body.index(">", at) + 1]
+    assert 'class="form-hint form-hint--warn"' in tag, tag
+    assert "color" not in tag and "background" not in tag, f"the notice must style through the shared class: {tag}"
+
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "style=" not in fn, "the notice body must not carry inline styles"
+
+
+def test_builder_authorship_is_tracked_not_reparsed(seeded_app):
+    """No SQL→rules parser: the modal remembers whether a compile put the
+    current body in the box. Open-with-a-stored-policy = not authored here;
+    a successful compile = authored here; a hand edit = not authored here."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apBuilderDescribesSql" in body
+
+    opener = body[body.index("function openAccessPolicyModal") : body.index("function closeAccessPolicyModal")]
+    assert "_apStoredSqlAtOpen" in opener
+    assert "_apSqlFromBuilder = !_apStoredSqlAtOpen" in opener
+    assert "_apRenderRepresentationNotice()" in opener
+
+    compile_fn = body[body.index("async function _apCompileNow") : body.index("function _apRenderCompileWarnings")]
+    assert "_apSqlFromBuilder = true" in compile_fn
+
+    edited = body[body.index("function apSqlEdited") : body.index("function _apSqlFiltersOrMasksNothing")]
+    assert "_apSqlFromBuilder = false" in edited
+    assert "_apRenderRepresentationNotice()" in edited
+
+
+def test_empty_rules_copy_is_suppressed_when_the_builder_cannot_show_the_policy(seeded_app):
+    """"No row rules — every caller sees every row" is only true when these
+    rules ARE the policy; the notice replaces it otherwise."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRowRules") : body.index("function _apAddRowRule")]
+    assert "No row rules — every caller sees every row." in renderer
+    head = renderer[: renderer.index("No row rules")]
+    assert "_apBuilderDescribesSql()" in head, "the empty-rules copy must be gated on the builder describing the body"
+
+
+def test_save_skips_the_filters_nothing_gate_when_re_saving_an_untouched_policy(seeded_app):
+    """#1430's "filters nothing → Save anyway?" gate judges what the admin
+    authored. Re-saving, verbatim, a stored policy the builder never authored
+    (the #1979 case) must not be second-guessed by it."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apSqlIsUntouchedStoredPolicy" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "if (sql && !_apSqlIsUntouchedStoredPolicy() && _apSqlFiltersOrMasksNothing(sql))" in fn
+
+
+def test_save_confirms_before_builder_rules_replace_a_hand_written_policy(seeded_app):
+    """The one destructive path: the admin adds a rule while a SQL-authored
+    policy is stored, and saving would overwrite that SQL with the rules."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apBuilderWouldReplaceStoredSql" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "_apBuilderWouldReplaceStoredSql()" in fn
+    assert "REPLACE the SQL policy" in fn
+    assert "confirmModal(" in fn
+    assert "Replace policy" in fn
+    # The replace question is asked BEFORE the no-op nudge: it is the
+    # destructive one.
+    assert fn.index("_apBuilderWouldReplaceStoredSql()") < fn.index("_apSqlFiltersOrMasksNothing(sql)")
+
+
+def test_builder_warns_inline_before_rules_replace_a_stored_sql_policy(seeded_app):
+    """Not only at save time — the Builder tab says so while the admin is
+    still editing, in the same warn block."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "_apBuilderWouldReplaceStoredSql()" in fn
+    assert "REPLACE the SQL policy" in fn
+
+
+def test_switching_back_to_the_builder_refreshes_the_representation_state(seeded_app):
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    fn = body[body.index("function apSwitchTab") : body.index("var _AP_MASK_LABELS")]
+    assert "_apRenderRepresentationNotice()" in fn

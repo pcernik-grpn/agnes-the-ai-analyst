@@ -3714,6 +3714,15 @@
                 </div>
 
                 <div data-ap-panel="builder" id="apBuilder">
+                    <!-- #1979 (reviewer finding 1): the Builder has no
+                         reverse-compiler from stored SQL back into rules, so
+                         a policy authored on the Advanced SQL tab used to
+                         render below as "No row rules -- every caller sees
+                         every row" while a real restrictive policy was being
+                         enforced. Filled by _apRenderRepresentationNotice()
+                         -- same warn block as #apInterlockWarning above. -->
+                    <div class="form-hint form-hint--warn" id="apNotRepresentableNotice"
+                         style="display:none;" role="status"></div>
                     <!-- Task A (access-policy-builder-ux Slice 2): repeatable row rules,
                          ABOVE the column list — the flagship no-SQL row scope. Every
                          change re-assembles row_rules/row_combine and feeds them into the
@@ -5757,11 +5766,17 @@
         // The stored artifact is always SQL (never a structured spec, per
         // policy/compile's own docstring), so there is nothing to reverse-
         // compile a saved policy's row filter back into — the row-rule
-        // builder always starts empty, same as _apMaskState above.
+        // builder always starts empty, same as _apMaskState above. Which is
+        // exactly why a stored policy is, by construction, NOT what the rules
+        // on screen describe (#1979): the builder says so rather than
+        // reporting its own empty state as the policy.
         _apRowRules = [];
         _apRowCombine = 'and';
+        _apStoredSqlAtOpen = String(table.access_policy_sql || '').trim();
+        _apSqlFromBuilder = !_apStoredSqlAtOpen;
         _apRenderCompileWarnings([]);
         _apRenderRowRules();
+        _apRenderRepresentationNotice();
         _apRenderInterlockWarning();
         _apLoadHistory(table.id);
         apSwitchTab('builder');
@@ -5898,6 +5913,10 @@
            still protects against saving unchanged stale output from the box. */
         if (tab === 'sql') {
             _apFlushPendingCompile();
+        } else {
+            // #1979: the Advanced tab may have been hand-edited since the
+            // Builder was last on screen.
+            _apRenderRepresentationNotice();
         }
     }
 
@@ -5925,6 +5944,17 @@
     var _AP_ROW_OPS_NO_VALUE = ['in_caller_groups', 'eq_caller_email', 'eq_caller_id'];
     let _apRowRules = [];
     let _apRowCombine = 'and';
+
+    /* #1979: is what sits in #apSql right now what these rules describe?
+       TRACKED, never re-derived -- reverse-parsing arbitrary policy SQL back
+       into builder rules is a general SQL parser this modal deliberately does
+       not have. The box is builder-authored only while a compile put it
+       there; a stored policy loaded on open, a restored revision, or hand-
+       typed SQL is not. `_apStoredSqlAtOpen` is what the table already
+       enforced when the modal opened, which is what "re-saving it unchanged"
+       and "replacing it with rules" are both measured against. */
+    let _apSqlFromBuilder = true;
+    let _apStoredSqlAtOpen = '';
 
     // Real schema + samples for the builder (Task 2's endpoint) — fetched
     // once per modal open, independent of which tab is showing.
@@ -6054,8 +6084,13 @@
         var combineSelect = document.getElementById('apRowCombine');
         var disabled = !_apTable || !_apIsEligible(_apTable);
         if (!_apRowRules.length) {
-            list.innerHTML = '<div class="form-hint" style="margin:0 0 8px; padding:0;">'
-                + 'No row rules — every caller sees every row.</div>';
+            // #1979: never claim "every caller sees every row" while a policy
+            // this builder cannot represent is what would actually be saved.
+            // #apNotRepresentableNotice above carries that state instead.
+            list.innerHTML = _apBuilderDescribesSql()
+                ? '<div class="form-hint" style="margin:0 0 8px; padding:0;">'
+                  + 'No row rules — every caller sees every row.</div>'
+                : '';
         } else {
             list.innerHTML = _apRowRules.map(function(rule, i) {
                 var colId = 'ap-rr-col-' + i;
@@ -6119,6 +6154,70 @@
         }
         var addBtn = document.getElementById('apAddRuleBtn');
         if (addBtn) addBtn.disabled = disabled;
+    }
+
+    /* #1979 — does the builder describe what is in the SQL box? An empty
+       box (a table with no policy) is described by an empty rule set; anything
+       else only when a compile put it there. No SQL is parsed: authorship is
+       recorded at the two moments it can change (a compile lands, the admin
+       types). */
+    function _apBuilderDescribesSql() {
+        return !_apCurrentSql() || _apSqlFromBuilder;
+    }
+
+    function _apCurrentSql() {
+        var el = document.getElementById('apSql');
+        return el ? String(el.value || '').trim() : '';
+    }
+
+    /* Save would re-store, verbatim, the policy this table already enforces
+       and that the builder never authored — nothing about it is the admin's
+       edit, so #1430's "this filters nothing" nudge has no authored body to
+       judge and must not fire on it. */
+    function _apSqlIsUntouchedStoredPolicy() {
+        return !!_apStoredSqlAtOpen && !_apSqlFromBuilder && _apCurrentSql() === _apStoredSqlAtOpen;
+    }
+
+    /* The one destructive path in this modal: builder-authored SQL is about
+       to overwrite a stored policy the builder did not write. */
+    function _apBuilderWouldReplaceStoredSql() {
+        return !!_apStoredSqlAtOpen && _apSqlFromBuilder && _apCurrentSql() !== _apStoredSqlAtOpen;
+    }
+
+    /* The Builder tab's honesty block. Static strings only — no policy text
+       is ever interpolated in here, so innerHTML carries nothing off the wire.
+       Re-renders the row list only when it is EMPTY (its "no row rules" copy
+       flips with this state); an empty list holds no focusable input, so this
+       can never steal focus from a value the admin is typing. */
+    function _apRenderRepresentationNotice() {
+        var el = document.getElementById('apNotRepresentableNotice');
+        if (!el) return;
+        if (_apBuilderWouldReplaceStoredSql()) {
+            el.innerHTML = 'These rules will REPLACE the SQL policy currently saved on this table when you '
+                + 'press Save policy — the stored SQL is overwritten, not merged. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Show the SQL</button>';
+            el.style.display = '';
+        } else if (_apBuilderDescribesSql()) {
+            el.innerHTML = '';
+            el.style.display = 'none';
+        } else if (_apSqlIsUntouchedStoredPolicy()) {
+            el.innerHTML = 'This policy was written as SQL and cannot be shown as rules. It is enforced as '
+                + 'written — view or edit it on the Advanced SQL tab. Adding a rule here replaces it. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Open Advanced SQL</button>';
+            el.style.display = '';
+        } else {
+            // Hand-written (or restored) SQL that is not yet saved: same
+            // honesty, but it is not "enforced as written" — nothing is
+            // enforced until Save policy.
+            el.innerHTML = 'The SQL on the Advanced SQL tab was written by hand and cannot be shown as rules. '
+                + 'It is what Save policy will store — view or edit it there. Adding a rule here replaces it. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Open Advanced SQL</button>';
+            el.style.display = '';
+        }
+        if (!_apRowRules.length) _apRenderRowRules();
     }
 
     function _apAddRowRule() {
@@ -6236,6 +6335,10 @@
             var body = await r.json();
             if (mySeq !== _apCompileSeq) return;
             document.getElementById('apSql').value = body.sql || '';
+            // #1979: the box now holds what these rules describe — until the
+            // admin types over it (apSqlEdited) or the modal reopens.
+            _apSqlFromBuilder = true;
+            _apRenderRepresentationNotice();
             _apRenderCompileWarnings(body.warnings);
             _apHideSaveError();
         } catch (err) {
@@ -6300,6 +6403,10 @@
         // The admin is taking over the SQL; any queued or in-flight builder
         // compile is now stale and must not overwrite their edits.
         _apCancelPendingCompile();
+        // #1979: and the rules on the Builder tab no longer describe the body
+        // that would be saved, so that tab has to stop implying they do.
+        _apSqlFromBuilder = false;
+        _apRenderRepresentationNotice();
         if (!_apCompileError) return;
         _apCompileError = null;
         _apHideSaveError();
@@ -6337,7 +6444,26 @@
             return;
         }
 
-        if (sql && _apSqlFiltersOrMasksNothing(sql)) {
+        // #1979: the one destructive path — builder rules overwriting a SQL
+        // policy the builder never authored. Asked BEFORE the no-op nudge
+        // below: losing a hand-written policy is the bigger surprise. (Both
+        // can fire on the same save; replacing a real policy with one that
+        // filters nothing is exactly the case that earns two questions.)
+        if (sql && _apBuilderWouldReplaceStoredSql()) {
+            var replace = await confirmModal({
+                message: 'The rules in the Builder will REPLACE the SQL policy currently saved on this '
+                    + 'table. The stored SQL is overwritten, not merged — the previous version stays '
+                    + 'in this table\'s policy history. Continue?',
+                confirmText: 'Replace policy',
+            });
+            if (!replace) return;
+        }
+
+        // #1979: skipped while the box still holds, verbatim, the stored
+        // policy the builder never authored — re-saving what is already
+        // enforced (to fix its note, say) is not the admin authoring a no-op
+        // policy, and this heuristic would be judging a body they never wrote.
+        if (sql && !_apSqlIsUntouchedStoredPolicy() && _apSqlFiltersOrMasksNothing(sql)) {
             var proceed = await confirmModal({
                 message: 'This policy does not filter any rows or mask any columns — everyone with '
                     + 'access to this table will see everything. Save anyway?',
