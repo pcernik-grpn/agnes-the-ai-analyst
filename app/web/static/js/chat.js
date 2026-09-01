@@ -4753,18 +4753,33 @@ function _renderFactClaimsPreview(result) {
   return wrap;
 }
 
+/** Box-drawing characters (U+2500–U+257F) — the signature of a CONSOLE table.
+ *  `agnes query` defaults to `--format table`, which is a rich box table, and
+ *  `agnes catalog` / `agnes describe` print the same way, so this is among the
+ *  most common tool results in the product. Run through renderMarkdownSafe it
+ *  came out as one mangled paragraph: marked collapses the newlines, and the
+ *  column alignment IS the content. A <pre> keeps it.
+ *
+ *  Deliberately not a pipe-and-dash test: a markdown table is pipes and
+ *  dashes too, and that one really does belong in marked. */
+const _CONSOLE_TABLE_RE = /[\u2500-\u257F]/;
+
 /** Build the preview block for a tool result. The CLI tools route
  *  most JSON / table output via agnes which speaks Markdown — so
  *  result strings often contain `|---|---|` table markup that
  *  marked.parse() can render natively. We:
  *
  *  1. unwrap an MCP text envelope down to its payload;
- *  2. attempt to extract a tabular preview from a parsed JSON result
- *     (array of objects, or a {columns, rows} shape);
- *  3. fall back to running ``marked.parse`` over a string result so
+ *  2. attempt to extract a tabular preview from the result AS AN OBJECT —
+ *     parsing it first when it arrived as JSON text, which is what a CLI
+ *     tool's stdout is (array of objects, or a {columns, rows} shape);
+ *  3. keep console output — a rich box table, the shape `agnes query`
+ *     prints by default — in a monospace <pre>, since its alignment is
+ *     the content and markdown would collapse it;
+ *  4. fall back to running ``marked.parse`` over a string result so
  *     embedded Markdown tables get rendered as real <table>s with the
  *     `.ds-table` sort+sticky-header enhancement; and
- *  4. render everything else as a formatted, highlighted JSON block —
+ *  5. render everything else as a formatted, highlighted JSON block —
  *     shown directly: the collapsed card's header is the one click.
  *
  *  Returns a DOM element ready to append, or null if the result is
@@ -4805,11 +4820,37 @@ function _renderToolResultPreview(result, toolName, isError) {
     return wrap;
   }
 
-  // Already-tabular JSON shapes — render a real <table> preview.
-  const table = _coerceToTablePreview(result);
+  // The payload as an OBJECT when it can be one — which for a string means
+  // parsing it. This is the path most turns actually take and the one the
+  // table renderer was missing: the workspace prompt teaches the agent to
+  // reach data through `agnes query` over **Bash**, whose stdout is a string,
+  // so the object-shaped check below never saw it and a 400-row answer
+  // rendered as a single line of JSON in a paragraph, the rest behind "Show
+  // full result". (`agnes query --json` prints `[{col: val}, …]`; `POST
+  // /api/query` answers `{columns, rows}` — both shapes _coerceToTablePreview
+  // already knew, simply never handed to it.)
+  //
+  // Narrow by construction: parsing decides nothing on its own. The only
+  // strings whose rendering changes are the ones that ALSO coerce to a table
+  // below; CLI prose, a markdown table and a JSON string of any other shape
+  // fall through to the string path exactly as before. The parse is also what
+  // the semantic-validation notice reads, on both routes, so it happens once.
+  const parsed = _asToolResultObject(result);
+  const payload = parsed && typeof parsed === "object" ? parsed : null;
+
+  // Already-tabular shapes — render a real <table> preview.
+  const table = payload ? _coerceToTablePreview(payload) : null;
   if (table) {
-    _appendSemanticValidationNotice(table, result);
+    _appendSemanticValidationNotice(table, payload);
     return table;
+  }
+
+  // A console table — alignment, not markup. Monospace in a <pre>, with the
+  // same preview/full split the markdown path uses, so a long catalog listing
+  // still can't push the answer off the screen. Sliced on LINES rather than
+  // characters: a table cut mid-row reads as corrupt output.
+  if (typeof result === "string" && _CONSOLE_TABLE_RE.test(result)) {
+    return _renderConsoleTableResult(result);
   }
 
   // String result. Most agnes CLI tool output is Markdown-ish; let
@@ -4853,17 +4894,11 @@ function _renderToolResultPreview(result, toolName, isError) {
       det.appendChild(full);
       wrap.appendChild(det);
     }
-    // `agnes query`'s real stdout is exactly this: JSON text on a Bash tool
-    // call, never pre-parsed into an object the way an MCP tool's result
-    // is — so the object-shaped check above never sees it, and this is the
-    // path most turns actually take (the workspace prompt teaches `agnes
-    // query "<SQL>"` over Bash first). Parse defensively; anything that
-    // isn't the query response shape leaves this a no-op.
-    try {
-      _appendSemanticValidationNotice(wrap, JSON.parse(result));
-    } catch (_) {
-      // Not JSON (the common case for ordinary CLI text output) — fine.
-    }
+    // `agnes query`'s real stdout is JSON text on a Bash tool call, never
+    // pre-parsed into an object the way an MCP tool's result is — so a
+    // soft-enforce warning on it is only reachable through the parse above.
+    // `payload` is null for ordinary CLI text output, which this no-ops on.
+    _appendSemanticValidationNotice(wrap, payload);
     return wrap;
   }
 
@@ -4875,6 +4910,69 @@ function _renderToolResultPreview(result, toolName, isError) {
   wrap.className = "cloud-chat-tool-result is-json";
   wrap.appendChild(_jsonPanel("Result", result, "cloud-chat-tool-json"));
   _appendSemanticValidationNotice(wrap, result);
+  return wrap;
+}
+
+/** Wire a capped preview to a control that grows it IN PLACE.
+ *
+ *  What this replaces rendered the preview and then, behind a toggle, a SECOND
+ *  copy of the same payload starting over from its first row — so "Show full
+ *  output" on a 22-line listing showed you lines 1-12, then lines 1-22
+ *  underneath, the first twelve of them twice. There is one payload, so there
+ *  is one element: `paint(expanded)` repaints it, `meta(expanded)` is the line
+ *  above it (null while there is nothing left to report), and the control says
+ *  how to get back.
+ *
+ *  Also strictly cheaper than the shape it replaces, which built the full
+ *  table eagerly at construction: nothing beyond the preview is built until
+ *  someone asks for it.
+ *
+ *  Returns `[metaEl, button]`; `metaEl` is null when no `meta` was given (the
+ *  sources row is inline and has nowhere to put a block-level line), so a
+ *  caller that wants only the control can ignore it. */
+function _expandInPlace({ paint, meta, expandLabel, collapseLabel, className }) {
+  const metaEl = meta ? document.createElement("p") : null;
+  if (metaEl) metaEl.className = "cloud-chat-tool-result-meta";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className || "cloud-chat-tool-result-more";
+  let expanded = false;
+  const sync = () => {
+    paint(expanded);
+    if (metaEl) {
+      const line = meta(expanded);
+      metaEl.textContent = line || "";
+      metaEl.hidden = !line;
+    }
+    btn.textContent = expanded ? collapseLabel : expandLabel;
+    btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+  };
+  btn.onclick = () => {
+    expanded = !expanded;
+    sync();
+  };
+  sync();
+  return [metaEl, btn];
+}
+
+/** Console output whose alignment carries the meaning: the whole thing, in a
+ *  <pre> that scrolls. No markdown and no syntax highlighting — there is no
+ *  language here to highlight, only columns to keep straight.
+ *
+ *  Deliberately UNCAPPED, unlike the table preview next to it. A line cap here
+ *  bought nothing and cost a click: the block is already bounded on screen by
+ *  its own `max-height` (chat.css → .cloud-chat-tool-console), so capping the
+ *  CONTENT as well only meant the reader had to ask for the rest of something
+ *  that was going to be behind a scrollbar either way. The cost is a text node
+ *  — a long dump is one string, not the hundreds of elements a long table is,
+ *  which is why the table still caps and this does not. */
+function _renderConsoleTableResult(result) {
+  const wrap = document.createElement("div");
+  wrap.className = "cloud-chat-tool-result is-console";
+  const pre = document.createElement("pre");
+  pre.className = "cloud-chat-tool-console";
+  pre.textContent = result.replace(/\s+$/, "");
+  wrap.appendChild(pre);
   return wrap;
 }
 
@@ -4970,36 +5068,43 @@ function _coerceToTablePreview(result) {
 
   const tableWrap = document.createElement("div");
   tableWrap.className = "cloud-chat-table-wrap";
-  tableWrap.appendChild(_buildResultTable(columns, preview));
   wrap.appendChild(tableWrap);
+  // Filled by the expansion's own repaint below when there is one, so the
+  // preview table is built once rather than built and immediately replaced.
+  if (total <= preview.length) tableWrap.appendChild(_buildResultTable(columns, preview));
 
-  // The expansion is a REAL table too — the same shape the preview showed,
-  // just all of it (capped so a huge result can't flood the DOM). It used to
-  // be a JSON dump, which contradicted the preview right above it.
+  // The expansion is the SAME table, grown: one <table> that gains its rows,
+  // not a preview with a second full copy stacked under it (see
+  // _expandInPlace). Still capped, so a huge result can't flood the DOM.
   if (total > preview.length) {
-    const meta = document.createElement("p");
-    meta.className = "cloud-chat-tool-result-meta";
-    meta.textContent = `Showing ${preview.length} of ${total} rows.`;
-    wrap.appendChild(meta);
-    const det = document.createElement("details");
-    det.className = "cloud-chat-tool-result-full";
-    const sum = document.createElement("summary");
     const shown = Math.min(total, _TOOL_RESULT_FULL_ROWS_MAX);
-    sum.textContent = total > _TOOL_RESULT_FULL_ROWS_MAX
-      ? `Show first ${shown} of ${total} rows`
-      : `Show all ${total} rows`;
-    det.appendChild(sum);
-    const fullWrap = document.createElement("div");
-    fullWrap.className = "cloud-chat-table-wrap";
-    fullWrap.appendChild(_buildResultTable(columns, rows.slice(0, _TOOL_RESULT_FULL_ROWS_MAX)));
-    det.appendChild(fullWrap);
-    wrap.appendChild(det);
-    enhanceTables(det);
+    const [meta, more] = _expandInPlace({
+      paint: (expanded) => {
+        tableWrap.replaceChildren(
+          _buildResultTable(columns, expanded ? rows.slice(0, _TOOL_RESULT_FULL_ROWS_MAX) : preview)
+        );
+        enhanceTables(tableWrap);
+      },
+      // Expanded there is nothing left to report unless the cap actually
+      // dropped rows — in which case saying so is the point.
+      meta: (expanded) =>
+        expanded
+          ? (total > _TOOL_RESULT_FULL_ROWS_MAX ? `Showing ${shown} of ${total} rows.` : null)
+          : `Showing ${preview.length} of ${total} rows.`,
+      expandLabel: total > _TOOL_RESULT_FULL_ROWS_MAX
+        ? `Show first ${shown} of ${total} rows`
+        : `Show all ${total} rows`,
+      collapseLabel: "Show less",
+    });
+    wrap.appendChild(meta);
+    wrap.appendChild(more);
 
     // Past the cap the table genuinely drops rows — keep a route to ALL of
-    // them (the old JSON dump had them; the cap must not lose data). Built
-    // lazily on first open so a huge dump costs no memory or DOM until
-    // asked for, and via textContent so the payload can never execute.
+    // them (the cap must not lose data). This one stays a <details> rather
+    // than growing in place, because unlike the expansion above it is
+    // genuinely ADDITIONAL content and not a second copy of what is already
+    // on screen. Built lazily on first open so a huge dump costs no memory or
+    // DOM until asked for, and via textContent so it can never execute.
     if (total > _TOOL_RESULT_FULL_ROWS_MAX) {
       const rawDet = document.createElement("details");
       rawDet.className = "cloud-chat-tool-result-full";

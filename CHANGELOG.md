@@ -54,6 +54,33 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **A tool card in web chat shows what the tool actually returned.** Three
+  content bugs in the tool-call renderer, all of them hitting the results
+  analysts see most. (1) A tabular result that arrived as a JSON **string** —
+  which is what `agnes query` over Bash returns, the path the workspace prompt
+  teaches first — never reached the table renderer: a 400-row answer rendered
+  as one line of JSON inside a paragraph, the rest behind "Show full result".
+  It now renders as the real table the object-shaped path always did, capped
+  with "Showing 5 of 400 rows." Narrow by construction: only a string that both
+  parses and coerces to a table changes, so CLI prose, markdown tables and
+  JSON strings of any other shape keep their existing rendering. (2) A console
+  table — `agnes query`'s default `--format table`, and how `agnes catalog` /
+  `agnes describe` print — was fed through markdown, which collapsed the
+  newlines and destroyed the column alignment that *is* the content; it now
+  renders in a monospace `<pre>` that scrolls sideways, capped in lines. (3) A
+  `command` / `sql` arg rendered as escaped JSON (`{"command": "agnes query
+  \"SELECT * FROM orders\""}`), making the reader undo the escaping to reach
+  the statement they opened the card for; it now renders as a code block in its
+  own language, unescaped and untruncated, with any remaining args still on the
+  JSON panel — and it renders THERE ONLY. A collapsed step no longer repeats
+  the command on its header line, where it was the single longest thing in a
+  settled transcript: the same string beside every row of a six-step run is
+  most of what made the trail feel crowded. A collapsed step is now a verb and
+  an outcome; a failed one keeps its diagnosis on that line, which is the one
+  case where something other than the verb is worth reading without expanding.
+  (`_summarizeArgs`, which existed only to fill that slot, is deleted rather
+  than left unused.) Display only — the renderer has no path back to the model, so
+  nothing here changes what an agent sees or answers.
 - **A code panel inside a chat tool card wears the card's own surface.** The
   panel rules already asked for it, but `.cloud-chat-messages details
   pre.code-block-wrap` out-ranked them (0,2,2 vs 0,1,1) and repainted every

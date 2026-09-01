@@ -335,10 +335,12 @@ def test_mcp_envelope_unwraps_to_its_payload():
         # renderToolCallEnd gets frame.result, the raw wire string.
         "string_envelope": '{"content": [{"type": "text", "text": "{\\"status\\": \\"ok\\"}"}]}',
         "markdown_string": "| a | b |\n|---|---|\n| 1 | 2 |",
-        # A JSON string that is NOT an envelope must survive as a string:
-        # parsing every JSON-shaped result here would re-route unrelated
-        # tools (`agnes … --json`) through the table/JSON panel, a far wider
-        # behaviour change than unwrapping an envelope.
+        # A JSON string that is NOT an envelope must survive as a string
+        # THROUGH THIS FUNCTION: unwrapping is about envelopes only. The
+        # decision to parse `agnes … --json` output lives one layer out, in
+        # _tabularToolResult, and is narrowed to strings that coerce to a
+        # table — see test_a_tabular_result_that_arrived_as_text_still_
+        # becomes_a_table.
         "json_string_not_envelope": '{"rows": 3, "table": "orders"}',
         "json_scalar_string": "123",
     }
@@ -363,13 +365,194 @@ def test_mcp_envelope_unwraps_to_its_payload():
     )
 
 
+def test_a_tabular_result_that_arrived_as_text_still_becomes_a_table():
+    """The path most turns actually take: the agent reaches data through `agnes
+    query` over **Bash**, whose stdout is a string, so the object-shaped check
+    never saw it and a 400-row answer rendered as one line of JSON in a
+    paragraph. The preview now tests the payload AS AN OBJECT, parsing a string
+    first — through the SAME `_asToolResultObject` the fact_claims route uses,
+    not a second near-copy of it.
+
+    Narrow by construction: parsing decides nothing on its own. Only a payload
+    that ALSO coerces to a table renders differently, so a markdown table, CLI
+    prose and a JSON string of any other shape keep what they had."""
+    js = _read(CHAT_JS)
+    preview = js[
+        js.index("function _renderToolResultPreview") : js.index(
+            "/** Console output whose alignment carries the meaning"
+        )
+    ]
+    assert "const parsed = _asToolResultObject(result);" in preview, "reuse the existing parser, do not clone it"
+    assert "const table = payload ? _coerceToTablePreview(payload) : null;" in preview, (
+        "the table decision — and the whole behaviour change — stays with _coerceToTablePreview"
+    )
+    assert "_appendSemanticValidationNotice(table, payload)" in preview, (
+        "the notice reads the PARSED payload, not the string it arrived as"
+    )
+    assert "JSON.parse(result)" not in preview, (
+        "one parse per result: the string branch's notice reads the same `payload`"
+    )
+
+    # The parse itself, executed: `_asToolResultObject` composed with the
+    # narrowing at the call site must accept the two real query shapes and
+    # reject everything the string path still owns.
+    fn = js[js.index("function _unwrapMcpEnvelope") : js.index("/** Build the preview block")]
+    cases = {
+        # `agnes query --json` prints exactly this
+        "json_string_array": json.dumps([{"a": 1, "b": 2}, {"a": 3, "b": 4}]),
+        # `POST /api/query` answers exactly this
+        "json_string_colrows": json.dumps({"columns": ["c"], "rows": [[1]]}),
+        "object": {"columns": ["c"], "rows": [[1]]},
+        "markdown_table": "| a | b |\n|---|---|\n| 1 | 2 |",
+        "cli_prose": "no rows found",
+        "json_scalar_string": "123",
+        "number": 42,
+    }
+    script = (
+        fn
+        + "\nconst narrow = (v) => { const p = _asToolResultObject(v);"
+        + ' return p && typeof p === "object" ? p : null; };\n'
+        + f"process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)})"
+        + ".map(([k, v]) => [k, narrow(v)]))));\n"
+    )
+    res = json.loads(_node_run(script))
+    assert res["json_string_array"] == [{"a": 1, "b": 2}, {"a": 3, "b": 4}], "parsed, so it can reach the table"
+    assert res["json_string_colrows"] == {"columns": ["c"], "rows": [[1]]}
+    assert res["object"] == cases["object"], "an object result is handed straight through"
+    assert res["markdown_table"] is None, "marked keeps markdown tables"
+    assert res["cli_prose"] is None
+    assert res["json_scalar_string"] is None, "`123` parses, but a number is not a table"
+    assert res["number"] is None
+
+
+def test_console_output_keeps_its_alignment():
+    """`agnes query` defaults to `--format table` — a rich box table — and
+    `agnes catalog`/`describe` print the same way. Run through marked it came
+    out as one mangled paragraph: newlines collapsed, and the column alignment
+    IS the content. Box-drawing characters route it to a <pre> instead.
+
+    Deliberately not a pipe/dash test: a markdown table is pipes and dashes
+    too, and marked should keep that one."""
+    js = _read(CHAT_JS)
+    assert "const _CONSOLE_TABLE_RE = /[\\u2500-\\u257F]/;" in js, "box-drawing range, nothing wider"
+    script = (
+        js[js.index("const _CONSOLE_TABLE_RE") : js.index("/** Build the preview block")]
+        + "const cases = {"
+        + '  rich_table: "\\u250f\\u2501\\u2513\\n\\u2503 a \\u2503",'
+        + '  record_view: "\\u2500\\u2500\\u2500 row 1 \\u2500\\u2500\\u2500\\n  id : 1",'
+        + '  markdown_table: "| a | b |\\n|---|---|\\n| 1 | 2 |",'
+        + '  ascii_plus_table: "+---+\\n| a |\\n+---+",'
+        + '  prose: "no rows found",'
+        + "};"
+        + "process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(cases)"
+        + ".map(([k, v]) => [k, _CONSOLE_TABLE_RE.test(v)]))));"
+    )
+    res = json.loads(_node_run(script))
+    assert res["rich_table"] is True
+    assert res["record_view"] is True, "the psql-style wide-table fallback is aligned output too"
+    assert res["markdown_table"] is False, "marked keeps markdown tables"
+    assert res["ascii_plus_table"] is False, "+---+ is ambiguous with markdown — left on the markdown path"
+    assert res["prose"] is False
+
+    fn = js[js.index("function _renderConsoleTableResult") : js.index("/** Append a small advisory note")]
+    css = _read(CHAT_CSS)
+    assert "pre.textContent =" in fn, "plain text — no markdown, no highlighting"
+    assert "_expandInPlace" not in fn, (
+        "no line cap and no 'show all' step: the block is already bounded on screen by its "
+        "own max-height, so capping the content too only put it behind a click"
+    )
+    assert fn.count('className = "cloud-chat-tool-console"') == 1, "one <pre>, holding all of it"
+
+    # Bounded by the scroll region rather than by a content cap — which is the
+    # whole reason the cap could go.
+    console_css = css[css.index(".cloud-chat-tool-console {") :]
+    console_css = console_css[: console_css.index("}")]
+    assert "max-height:" in console_css and "overflow: auto;" in console_css
+
+
+def test_the_console_pre_does_not_reflow():
+    """A wrapped column is a broken column: the <pre> scrolls sideways."""
+    css = _read(CHAT_CSS)
+    rule = css[
+        css.index(".cloud-chat-tool-console {") : css.index(".cloud-chat-tool-result-full .cloud-chat-tool-console")
+    ]
+    assert "white-space: pre;" in rule, "never pre-wrap — that destroys the alignment"
+    assert "overflow: auto;" in rule
+
+
+def test_a_tool_card_code_panel_wears_the_card_surface():
+    """The panel rules ask for `background: transparent` over the panel's own
+    --ds-surface, but `.cloud-chat-messages details pre.code-block-wrap`
+    outranks them (0,2,2 vs 0,1,1) and repainted every panel --ds-code-bg — a
+    dark slab dropped into a light card, for what is usually one line of shell.
+    The correcting selectors must keep out-ranking it, and must NOT drag the
+    --ds-code-* tokens onto that surface: every value in that family is tuned
+    against the near-black --ds-code-bg."""
+    css = _read(CHAT_CSS)
+    assert ".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {" in css, (
+        "three classes, so the card's own intent wins the cascade"
+    )
+    rule = css[
+        css.index(".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {") : css.index(
+            ".cloud-chat-tool-console {"
+        )
+    ]
+    assert "background: var(--ds-surface-dim);" in rule, (
+        "a quiet tint sized to the code — not the transcript's slab, and not nothing "
+        "at all: the hover copy button needs somewhere to sit"
+    )
+    assert "--ds-code-bg" not in rule, "the dark code surface must not follow the panel"
+    # Geometry as well as paint. The shared rule's --space-3 padding and
+    # --space-2 margin used to nest inside the panel's own, which is most of
+    # why one line of shell painted a box five lines tall.
+    assert "margin: 0;" in rule, "no nested margin — the panel owns the spacing"
+    assert "display: inline-block;" in rule and "max-width: 100%;" in rule, (
+        "the tint sizes to the code, not to the reading column, and still stops at it"
+    )
+    assert '[class*="hljs-"]' in rule and "color: inherit;" in rule, (
+        "hljs token colours fall back to the card's ink instead of being remapped"
+    )
+
+
 def test_show_all_rows_is_a_table_not_json():
     js = _read(CHAT_JS)
     assert "function _buildResultTable" in js
     body = js[js.index("function _coerceToTablePreview") : js.index("// ---------- Data-app split-pane preview")]
     assert "Show all rows (JSON)" not in body, "the expansion is a table now"
     assert "_TOOL_RESULT_FULL_ROWS_MAX" in body, "a DOM cap must exist for huge results"
-    assert body.count("_buildResultTable(") == 2, "preview and expansion share one builder"
+    assert "tableWrap.replaceChildren(" in body, (
+        "the expansion replaces the preview's rows in the SAME wrapper rather than appending a second table under it"
+    )
+    assert "fullWrap" not in body, "a second table wrapper is the duplication this replaced"
+
+
+def test_expanding_a_capped_preview_grows_it_instead_of_copying_it():
+    """The old shape rendered the preview and then, behind a toggle, a second
+    copy of the same payload starting over from its first row — so "Show full
+    output" on a 22-line listing showed lines 1-12, then lines 1-22 underneath,
+    the first twelve of them twice. Both the console preview and the table
+    preview did it. There is one payload, so there is one element.
+
+    Also strictly cheaper: nothing past the preview is built until asked for,
+    where the table's full copy used to be built eagerly at construction."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _expandInPlace") : js.index("/** Console output whose alignment carries the meaning")]
+    assert "paint(expanded)" in fn, "one element, repainted — not two rendered"
+    assert 'setAttribute("aria-expanded"' in fn, "a control that is not a <details> must say so itself"
+    assert "metaEl.hidden = !line" in fn, (
+        "expanded, 'Showing 12 of 22' is stale — it reports the cap only while one applies"
+    )
+
+    # The table is the caller that still needs it. A long console dump is one
+    # text node and simply scrolls (test_console_output_keeps_its_alignment);
+    # a long table is hundreds of elements, so it still earns a cap.
+    table = js[js.index("function _coerceToTablePreview") : js.index("// ---------- Data-app split-pane preview")]
+    assert "_expandInPlace({" in table
+    # The over-cap raw-JSON route IS additional content (the rows the table
+    # drops), so it stays a real disclosure.
+    assert 'rawDet.className = "cloud-chat-tool-result-full"' in table, (
+        "past the cap the dropped rows must still be reachable"
+    )
 
 
 # ── streaming: markdown renders as it arrives ────────────────────────────────
@@ -800,7 +983,7 @@ def test_a_failed_card_puts_its_diagnosis_on_the_header_as_plain_text():
     assert "innerHTML" not in setter
 
     preview = js[js.index("function _renderToolResultPreview") : js.index("function _appendSemanticValidationNotice")]
-    err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular JSON shapes")]
+    err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular shapes")]
     assert "pre.textContent = result" in err_branch, "an error body renders as text"
     assert "renderMarkdownSafe" not in err_branch, (
         "markdown on an error string only adds a clickable internal URL (#1974)"
