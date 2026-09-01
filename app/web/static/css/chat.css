@@ -720,6 +720,26 @@ body.chat-page-body main { margin: 0; padding: 0; }
   color: var(--ds-text-muted);
   font-family: var(--ds-font);
 }
+/* A table / metric chip is an <a> to the thing it names (chat.js _claimHref).
+   It keeps the chip's own state colour — the verified/unverified signal is what
+   the row is FOR, and repainting it link-blue would trade that for a second
+   statement of "this is clickable" that the pointer and hover already make.
+
+   No `color` declaration here, deliberately. `color: inherit` looked like the
+   way to keep the state ink and did the opposite: this selector is (0,2,1) to
+   `.msg-source-chip.is-ok`'s (0,2,0), so it WON and every linked chip took the
+   surrounding text colour instead. Nothing needs to be said about colour at
+   all — the state rules are author-level, so they already outrank the UA's
+   default anchor blue. (Copilot review on #1985.) */
+a.msg-source-chip.is-link {
+  cursor: pointer;
+  text-decoration: none;
+}
+a.msg-source-chip.is-link:hover,
+a.msg-source-chip.is-link:focus-visible {
+  border-color: var(--ds-primary);
+  text-decoration: underline;
+}
 .msg-source-flag {
   font-family: var(--ds-font);
   font-weight: var(--font-semibold);
@@ -1143,7 +1163,8 @@ pre.code-block-wrap code .hljs-deletion {
    (chat.js renderToolCallStart), COLLAPSED to its header line by
    default; expanding shows the formatted-JSON args and result
    panels directly (only oversize payloads keep a nested toggle).
-   A failed call opens itself. */
+   A failed call stays collapsed too and carries its diagnosis on the
+   header line instead (see .cloud-chat-tool-summary.is-error). */
 .cloud-chat-tool {
   margin: var(--space-2) auto;
   padding: var(--space-3) var(--space-4);
@@ -1178,6 +1199,77 @@ pre.code-block-wrap code .hljs-deletion {
    longest line instead of the reading column. */
 .cloud-chat-tool.is-replayed {
   border-left-color: var(--ds-border);
+}
+
+/* ---- Tool-call group --------------------------------------------------
+   A RUN of consecutive tool calls, folded into one <details> (chat.js →
+   "Tool-call groups"). The header is the whole run — status, what is
+   happening or how many steps it took, how many failed — and the cards sit
+   inside it unchanged. A run of one is never wrapped, so this markup only
+   exists where it saves the reader something.
+
+   The header borrows the card's own vocabulary deliberately: same dim
+   surface, same 3px status edge, same chevron. A group is a card-shaped
+   thing standing for cards, and giving it a second visual language would
+   read as a different kind of object. */
+.cloud-chat-tool-group {
+  margin: var(--space-2) auto;
+  max-width: var(--chat-reading-width);
+}
+summary.cloud-chat-tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+  list-style: none;
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--ds-border);
+  border-left: 3px solid var(--ds-border);
+  border-radius: var(--radius-md);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-secondary);
+  font-size: var(--text-sm);
+}
+summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
+.cloud-chat-tool-group.is-running > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-info-line); }
+.cloud-chat-tool-group.is-done    > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-success-line); }
+.cloud-chat-tool-group.is-error   > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-danger-line); }
+.cloud-chat-tool-group-icon {
+  flex: 0 0 auto;
+  font-size: var(--text-md);
+  line-height: 1;
+}
+.cloud-chat-tool-group.is-running .cloud-chat-tool-group-icon { color: var(--ds-accent-info-line); }
+.cloud-chat-tool-group.is-done    .cloud-chat-tool-group-icon { color: var(--ds-accent-success-line); }
+.cloud-chat-tool-group.is-error   .cloud-chat-tool-group-icon { color: var(--ds-accent-danger-line); }
+.cloud-chat-tool-group-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--font-medium);
+  color: var(--ds-text-primary);
+}
+.cloud-chat-tool-group-meta {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  color: var(--ds-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.cloud-chat-tool-group[open] > .cloud-chat-tool-group-head .cloud-chat-tool-chevron {
+  transform: rotate(90deg);
+}
+/* Inside the group the cards are already inside the reading column, so they
+   drop their own centering and indent under the header instead — the run
+   reads as a list belonging to the line above it. */
+.cloud-chat-tool-group-body {
+  padding-left: var(--space-4);
+}
+.cloud-chat-tool-group-body > .cloud-chat-tool {
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
 }
 
 .cloud-chat-tool-head {
@@ -1236,6 +1328,25 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   white-space: nowrap;
   font-family: var(--font-mono, ui-monospace, monospace);
   color: var(--ds-text-muted);
+}
+/* On a FAILED card this slot carries the diagnosis instead of the args sketch
+   (chat.js _setToolCardError): an error message is prose, so it drops the mono
+   face the args summary needs, and takes the danger ink the card's edge and
+   icon already use. */
+.cloud-chat-tool-summary.is-error {
+  font-family: inherit;
+  color: var(--ds-accent-danger-ink);
+}
+/* A failed call's expanded output — plain text, never markdown (an internal
+   endpoint in an error must not render as a link), so it needs the wrapping a
+   <pre> does not do on its own. */
+.cloud-chat-tool-error-body {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
 }
 .cloud-chat-tool-meta {
   flex: 0 0 auto;
@@ -3377,8 +3488,18 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-thread-head
 html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-messages {
   position: absolute; inset: 0; z-index: 1;
   /* Top / bottom padding clears the floating header + composer so the first
-     and last turns aren't hidden under them; horizontal padding unchanged. */
-  padding: 88px var(--space-6) 116px;
+     and last turns aren't hidden under them; horizontal padding unchanged.
+
+     The bottom half is MEASURED, not assumed. It was a flat 116px, which is
+     one line of composer plus clearance — so a composer grown to its 220px cap
+     sat on top of the conversation, translucent band and all, exactly while
+     the reader was writing a long reply to something they needed to keep
+     reading (#1974). chat.js publishes the composer's real height as
+     `--chat-composer-h` on the shell (see _syncComposerHeightVar) and growth
+     now shrinks the scroll region instead. The fallback reproduces the old
+     value for the frame before the first measurement: 56px of resting
+     composer + 64px of clearance. */
+  padding: 88px var(--space-6) calc(var(--chat-composer-h, 56px) + var(--space-12));
 }
 html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main > #chat-form {
   position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;

@@ -306,6 +306,27 @@ A group is one object with two sides — an audience, and a bundle of what that 
 
 The second lens, **Simulate a person** (`/admin/access?lens=simulate`), walks one person's membership → grant → tier and names what is *not* shared with them.
 
+#### View a page as them (read-only)
+
+The Simulate lens explains a person's access; **View a page as them →** shows
+it. It opens Agnes with that person's effective access for the rest of the
+browser session — their Library, their catalog, their empty states — behind a
+persistent banner that names them and carries the exit button.
+
+It is a *view*, never a "become user". The rules, and where they live:
+
+| Rule | Where it is enforced |
+|---|---|
+| Entering requires an admin, an interactive browser session, and a `web_csrf` double-submit token on a POST | `POST /admin/view-as` (`app/web/router.py`) |
+| Every non-GET/HEAD request is refused with a typed `view_as_read_only` 403, WebSocket handshakes included — by method, never a route list | `app/middleware/view_as_readonly.py` |
+| The Admin god-mode short-circuit is suppressed for the viewed identity, so authority is that person's **explicit grants** and viewing as another admin confers nothing | `app.auth.access.is_user_admin` + `app.auth.elevation.elevation_paused` |
+| The ticket carries no authority, is signed and expires (30 min), dies with the browser session, and is bound to the admin who minted it | `app/auth/view_as.py` |
+| Entry and exit are audited (`view_as.start` / `view_as.end`), and every row written while viewing is attributed to the **viewer** with `params.viewed_as` naming the target | `src/audit_context.py::apply_view_as_attribution` |
+
+Deliberately browser-only: there is no CLI command and no MCP tool for it.
+Leaving is `POST /admin/view-as/exit` (the banner's button) — the one
+non-GET the read-only guard lets through, and all it does is clear the cookie.
+
 Retired URLs, all 308 onto the workspace: `/admin/grants` and `/admin/groups` → `/admin/access`; `/admin/groups/{id}` → `/admin/access?group=<id>` (unknown ids still 404). `/admin/tables`' per-row *Manage access* arrives as `/admin/access?resource=<type>:<id>`, which pre-filters the grant tree; the older `#table:<id>` fragment is rewritten to it.
 
 The one editor rule has two deliberate exceptions, both *transposes* rather than copies: a data package's **Share** panel answers "which groups get this package", and `/admin/users/{id}` answers "which groups is this person in". The user detail page also toggles Admin-group membership when an operator switches a user between admin and non-admin — there's no four-level hierarchy, just admin / non-admin — and lists that user's **effective access** (each row links to the granting group in the workspace) and their **access tokens**, so an offboarding runs on one page.

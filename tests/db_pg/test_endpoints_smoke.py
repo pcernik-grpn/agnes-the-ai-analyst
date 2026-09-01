@@ -2128,6 +2128,59 @@ class TestUpgradeFreezeSmoke:
 # Route-coverage guard
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Read-only view-as
+# ---------------------------------------------------------------------------
+
+
+class TestViewAsSmoke:
+    """The two view-as routes, on both backends.
+
+    Behavioural depth lives in tests/test_view_as_readonly.py (the read-only
+    guard, narrowing, ticket binding, audit attribution, the banner). What is
+    worth re-asserting HERE is the part that is backend-shaped: entering and
+    exiting both write an audit row through the frozen DuckDB/Postgres pair,
+    and these are the gates that must refuse before any of that is reached.
+    """
+
+    COVERED_ROUTES = {
+        "POST /admin/view-as",
+        "POST /admin/view-as/exit",
+    }
+
+    def test_a_non_admin_cannot_enter(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "admin1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_analyst_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_an_automation_credential_cannot_enter(self, seeded_app_both):
+        """A PAT has no browser to show the banner in and no cookie jar to exit
+        with, so the mode would be invisible state on an automation token — the
+        route refuses even for a real admin."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "analyst1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_exiting_without_a_csrf_token_is_refused(self, seeded_app_both):
+        """Exit mounts no auth dependency by design (get_current_user resolves
+        to the TARGET while the mode is on), so its CSRF check is the gate that
+        has to hold."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as/exit",
+            data={"csrf_token": "", "next": "/me/profile"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+
 KNOWN_UNTESTED = {
     # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
     # admin-gated, behaviorally covered outside this parameter-free smoke
@@ -2294,6 +2347,16 @@ KNOWN_UNTESTED = {
     "GET /api/jobs/{job_id}",
     "GET /api/collections/{collection_id}",
     "DELETE /api/collections/{collection_id}",
+    # Collection metadata edit — needs a real collection_id AND a JSON body
+    # whose meaning depends on which keys are PRESENT (`{"description": null}`
+    # clears; an omitted key is left alone), so a parameter-free sweep can say
+    # nothing about it. Adds no migration, and `file_corpora.update` is
+    # parity-covered by tests/db_pg/test_file_corpora_contract.py. Behaviour
+    # covered in tests/test_api_collections.py::TestUpdateCollection — the
+    # owner-or-admin gate (a mere grant-holder gets 403), presence-based
+    # clearing, slug normalisation + 409 collision, the source-managed 409,
+    # nothing-to-update / nameless 400s, and the 404/401 paths.
+    "PATCH /api/collections/{collection_id}",
     "POST /api/collections/{collection_id}/files",
     "GET /api/collections/{collection_id}/files",
     "DELETE /api/collections/{collection_id}/files/{file_id}",
@@ -3053,6 +3116,7 @@ KNOWN_UNTESTED = {
     "POST /api/memory-domain-suggestions",
     "POST /api/memory/admin/approve",
     "POST /api/memory/admin/batch",
+    "POST /api/memory/admin/bulk-reject",
     "POST /api/memory/admin/bulk-update",
     "POST /api/memory/admin/contradictions",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve",
@@ -3265,7 +3329,7 @@ KNOWN_UNTESTED = {
     # tables) — no new schema surface to verify per-backend. Auth matrix,
     # typed cert-missing/Graph-error responses (Graph mocked via
     # httpx.MockTransport), scope->collection idempotency, the no-group
-    # warning, and the corpus-map producer handoff are all covered by
+    # warning are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
     # Bounded BFS folder search (TCRD-240) over the same live tree — never
@@ -3277,7 +3341,15 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes",
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes",
-    "GET /api/admin/sharepoint/connections/{connection_id}/corpus-map",
+    # Manual-site persistence (2026-09-01 fix) — a site added by URL under
+    # the `Sites.Selected` escape hatch is stored on the SAME EXISTING
+    # `source_connections.config` JSON column the scope rows above already
+    # use (a new `manual_sites` key, no new schema surface). Auth matrix,
+    # typed cert/Graph-error responses, idempotency-on-site-id, and removal
+    # are all covered by tests/test_admin_sharepoint.py::TestManualSites;
+    # not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/manual-sites",
+    "DELETE /api/admin/sharepoint/connections/{connection_id}/manual-sites",
     # Certificate metadata (thumbprint/subject/issuer/expiry) — derived at
     # request time from the connection's own stored PEM, no new schema
     # surface. Auth matrix + typed-absence paths covered by
@@ -3356,6 +3428,14 @@ KNOWN_UNTESTED = {
     # answers identically on both backends by construction; covered by
     # tests/test_admin_extraction.py::TestExtractionConfig.
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config",
+    # Cooperative stop (owner-frustration fix, 2026-09-01) writes to
+    # `source_connections`/`config_patch`, a frozen pre-A3 pair present on
+    # BOTH backends — unlike its `extraction/status|runs|config` siblings
+    # above it answers identically everywhere by construction, so its
+    # per-backend behaviour is not the point of a PG-only smoke sweep. RBAC,
+    # the 202 shape, the connection-row write, and the audit row are covered
+    # by tests/test_extraction_stop.py.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop",
     # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
     # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
     # "enqueues into the EXISTING jobs table, no new schema surface"

@@ -32,6 +32,17 @@ Surface (all gated by ``Depends(require_admin)``):
       A5 — the effective extraction configuration with an ORIGIN and a lock
       state per leaf, plus the per-scope rows. Cataloged (not exempt): it
       discloses credential env-var NAMES and the per-scope audience mapping.
+  POST /api/admin/sharepoint/connections/{id}/extraction/stop
+      Cooperative stop (owner-frustration fix, 2026-09-01: "I can't stop
+      it") — sets ``config.extraction.stop_requested_at`` on the connection
+      row (``connectors.sharepoint.crawler.request_stop``), which the crawl
+      itself polls at the same quiescent points its timeout already checks.
+      Works on BOTH app-state backends (``source_connections``/
+      ``config_patch`` predate the A3 Postgres-only ratchet) — unlike the
+      rest of this module, it is never gated behind ``extraction_runs``.
+      Always ``202`` once the connection exists: a stop requested while
+      nothing is visibly running simply waits for the next run to consume
+      (and clear) it.
   POST /api/admin/sharepoint/anonymization/preview
       Run this instance's REAL anonymizer over a pasted sample and return
       what it would redact — the answer to "what will a crawl over ten
@@ -45,8 +56,9 @@ resolving its repository on a DuckDB-backed instance raises the typed
 turns into a clean ``501 requires_postgres_backend``. These handlers let it
 surface rather than improvising an empty-but-healthy-looking answer — the
 card stops polling on a 501 and says why (design §4.4). ``…/extraction/config``
-reads no run rows and therefore answers on BOTH backends: configuration is
-knowable without a database.
+and ``…/extraction/stop`` read/write no run rows and therefore answer on BOTH
+backends: configuration, and the stop signal, are both knowable and settable
+without a database that can show run history.
 
 **Liveness is DERIVED, never trusted.** A SIGKILLed worker finalizes
 nothing, so a row can say ``running`` forever. ``status`` therefore reports
@@ -99,21 +111,29 @@ OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 #: way out, so the next run skips what this one already ingested.
 #:
 #: This is deliberately keyed on the REASON, not on the outcome word. A
-#: timeout and a tenant-throttle abort both finalize as ``failed`` — correctly,
-#: because the job did not finish its corpus and an operator should see it —
-#: yet both cost re-work rather than coverage. Gating the "next run resumes"
-#: copy on ``outcome == "interrupted"`` withheld it from exactly the two
-#: cases that have earned it, which is how an operator ends up re-running a
-#: four-hour crawl out of doubt.
+#: timeout, a tenant-throttle abort, and an admin-requested stop all finalize
+#: as ``failed`` — correctly, because the job did not finish its corpus and
+#: an operator should see it — yet all three cost re-work rather than
+#: coverage. Gating the "next run resumes" copy on ``outcome ==
+#: "interrupted"`` withheld it from exactly the cases that have earned it,
+#: which is how an operator ends up re-running a four-hour crawl out of doubt.
 #:
-#: The crawl's own vocabulary is ``"timeout"`` | ``"throttled"`` | ``"error"``
-#: | ``None``, classified in one place on its side (``_STOP_REASONS`` /
-#: ``_stop_reason()``): the named values are exactly the stops that leave
-#: consistent state on disk. ``"error"`` is deliberately absent from the set
-#: below, and an unknown reason claims nothing — a new stop has to be
-#: vouched for here explicitly before this surface will promise anything
-#: about it.
-RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled"})
+#: The crawl's own vocabulary is ``"timeout"`` | ``"stopped"`` |
+#: ``"throttled"`` | ``"error"`` | ``None``, classified in one place on its
+#: side (``_STOP_REASONS`` / ``_stop_reason()``): the named values are
+#: exactly the stops that leave consistent state on disk. ``"abandoned"``
+#: is the one member of this set the crawl process itself never sets — it
+#: is written by ``ExtractionRunsPgRepository.abandon_stale_running``, from
+#: an ENTIRELY different (later) process, when a NEW run for the same
+#: connection finds a still-``running`` row left behind by a worker that
+#: died outright (a native crash, a killed process) — resumable for the
+#: exact same reason a self-detected stop is: the per-item cTag write only
+#: ever happens after a durable ingest, so a dead run's persisted state is
+#: never ahead of what it actually finished. ``"error"`` is deliberately
+#: absent from the set below, and an unknown reason claims nothing — a new
+#: stop has to be vouched for here explicitly before this surface will
+#: promise anything about it.
+RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped", "abandoned"})
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -150,10 +170,13 @@ def _age_s(value: Any, *, now: Optional[datetime] = None) -> Optional[float]:
 def _job_status(job_id: Optional[str]) -> Optional[str]:
     """This run's job status, when the run knows its job id.
 
-    Best-effort by construction: nothing supplies ``job_id`` today (the
-    worker hands the crawl the job's payload, not its id), and a lookup
-    failure is a missing signal, not an error — the checkpoint-age fallback
-    below still answers.
+    Best-effort by construction: a run triggered outside the worker (a test,
+    a manual payload) may still have no ``job_id`` — the worker's own
+    dispatcher merges the claimed job's id in
+    (``app/worker/kinds.py::_payload_for_handler``), but nothing forces every
+    caller of ``run_builtin_crawl`` through it — and a lookup failure is a
+    missing signal, not an error: the checkpoint-age fallback below still
+    answers.
     """
     if not job_id:
         return None
@@ -275,6 +298,13 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         # `{}` means NO tokens were spent, which is a different claim from
         # "$0.00" — the card must keep the two tellable apart (design §7.2).
         "usage": run.get("usage") or {},
+        # What the crawl is touching RIGHT NOW (owner-frustration fix,
+        # 2026-09-01: "I can't see what's happening in the extraction") —
+        # `CrawlStats.activity_snapshot()`, riding the SAME checkpoint this
+        # whole projection already reads. `live` collapses to `report` for a
+        # FINISHED run (nothing is in flight any more, honestly `None` here)
+        # and to `progress` for a running one — no separate lookup needed.
+        "activity": live.get("activity"),
     }
 
 
@@ -306,11 +336,86 @@ async def extraction_status(
         "running": _run_out(running, now=now) if running else None,
         "last_completed": _run_out(last_completed, now=now) if last_completed else None,
         "runs_total": repo.count_for_connection(connection_id),
-        # v1 has no cooperative cancel flag in the crawl, so there is no
-        # honest Stop control to draw. Stated as data rather than left for
-        # the template to assume — a button without a mechanism is a lie.
-        "can_stop": False,
+        # `POST …/extraction/stop` (below) always exists and always works —
+        # the flag lives on `source_connections`, not on this PG-only table
+        # — so there is now an honest Stop control to draw whenever a run is
+        # actually active. Stated as data rather than left for the template
+        # to infer: a button without a mechanism would be a lie, and this is
+        # the field that says the mechanism exists.
+        "can_stop": True,
         "as_of": now.isoformat(),
+    }
+
+
+@router.post("/connections/{connection_id}/extraction/stop", status_code=202)
+async def request_extraction_stop(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Cooperative stop (owner-frustration fix, 2026-09-01: "je to strašný
+    blackbox, nevidím co se děje v extrakci a nemůžu jí stopnout" — "it's a
+    total black box, I can't see what's happening in the extraction and I
+    can't stop it").
+
+    Sets ``config.extraction.stop_requested_at`` on the connection row
+    (:func:`connectors.sharepoint.crawler.request_stop`) — the SAME JSON
+    column the extraction dispatch bookkeeping already lives in, carried
+    forward on every generic connection edit
+    (``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``). The crawl polls it at the
+    same quiescent points its own timeout already checks (between delta
+    pages always, between files every 10 completed items) and raises
+    ``CrawlStopped`` there, which records the run exactly like a timeout —
+    ``interrupted_reason: "stopped"``, resumable, state saved.
+
+    Works on BOTH app-state backends: unlike every other route in this
+    module, this one touches no ``extraction_runs`` row, so it is never
+    gated behind the A3 Postgres-only ratchet — a DuckDB-backed instance can
+    request a stop exactly as a Postgres-backed one can.
+
+    Always ``202`` once the connection exists, whether or not a run is
+    visibly active: a stop requested with nothing running simply waits on
+    the connection row until the next run starts, at which point it is
+    consumed (or, if unconsumed, cleared) — see ``note`` in the response
+    when this instance can tell no run is currently active. ``404`` for an
+    unknown or non-SharePoint connection. Deliberately NOT gated on
+    ``sharepoint.enabled`` — this module's whole surface reads/writes
+    observability state rather than running a crawl, the same posture its
+    GET siblings already take (an admin can still see run history after
+    disabling the connector; they can equally still stop a run already in
+    flight from before it was disabled).
+    """
+    _sharepoint_connection_or_404(connection_id)
+    from connectors.sharepoint.crawler import request_stop
+
+    stop_requested_at = request_stop(connection_id)
+
+    note: Optional[str] = None
+    try:
+        from src.repositories import extraction_runs_repo
+
+        if extraction_runs_repo().get_running(connection_id) is None:
+            note = (
+                "no run currently appears active — the flag will be honored by the next "
+                "run to start, and cleared unconsumed if that run never comes"
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort liveness hint only
+        # A DuckDB-backed instance (or any other repo hiccup) cannot say
+        # whether a run is LIVE — `extraction_runs` is PG-only (A3) — but the
+        # stop signal itself is unaffected: it lives on `source_connections`,
+        # which both backends have always had.
+        logger.debug("extraction stop: could not check run liveness for %s: %s", connection_id, exc)
+        note = "run activity cannot be checked on this backend, but the stop flag applies to any run in progress or about to start"
+
+    # No explicit `log_safe` here — the route is declared in
+    # `src.audit_posture.POSTURE` (`extraction.stop_requested`), and the
+    # fallback middleware already carries everything this event needs
+    # (the caller, the connection id via the resource's path params, the
+    # response status). Writing a second row here would say nothing the
+    # middleware doesn't already say.
+    return {
+        "connection_id": connection_id,
+        "stop_requested_at": stop_requested_at,
+        "note": note,
     }
 
 
@@ -350,6 +455,14 @@ async def extraction_run_detail(
     The skip list carries ``listed`` alongside ``total``: only oversize
     skips keep a path, so a run that refused 27 documents and can name 20 of
     them says exactly that instead of implying the list is the whole story.
+
+    The per-file error detail (download/convert/ingest failures — a path, a
+    reason, an upstream status code when known, and a message) lives at
+    ``report.errors_detail``, same ``{items, total, listed, truncated}``
+    envelope. It rides inside ``report`` rather than getting its own
+    top-level key or column because it is exactly as itemizable as the rest
+    of a run's numbers, never a separate concern — the source card's
+    error-count line fetches this endpoint on first expand to render it.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
@@ -628,7 +741,9 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
     pointer at an executable at worst.
     """
     return [
-        _config_row("Enabled (whole connector)", ("sharepoint", "enabled"), env_var="AGNES_SHAREPOINT_ENABLED", default=False),
+        _config_row(
+            "Enabled (whole connector)", ("sharepoint", "enabled"), env_var="AGNES_SHAREPOINT_ENABLED", default=False
+        ),
         _config_row(
             "Schedule",
             ("extraction", "schedule"),

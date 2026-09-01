@@ -117,6 +117,22 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 15 * 60
 #: server-side, this value only labels the card.
 _APPROVAL_TIMEOUT_FALLBACK_SECONDS = 300
 
+#: Tools whose approval request is answered here instead of shown to the user.
+#:
+#: The engine asks for approval on ``AskUserQuestion``, whose entire effect is
+#: to render a multiple-choice card back to the same person being asked. Gating
+#: it put a shield card — with the question's raw JSON sitting behind it — in
+#: front of every clarifying-question turn: the user approved being asked, and
+#: only then got to read the question. Nothing is mutated, nothing leaves the
+#: session, and the decision carries no information, so it is made here (#1974).
+#:
+#: Deliberately a NAMED SET, never a "read-only tools" rule. Whether a tool
+#: mutates is a property of the tool, not of its name, and an approval gate that
+#: infers is a gate that eventually infers wrong in the unsafe direction. A tool
+#: joins this set one at a time, on the same argument: no effect beyond the
+#: asking user's own screen.
+_AUTO_APPROVED_TOOLS = frozenset({"AskUserQuestion"})
+
 
 def _default_mint(user_email: str, session_id: str) -> tuple[str, int]:
     """Mint the engine session JWT via the host wiring's own helper.
@@ -454,12 +470,20 @@ class KaiEngineHandle:
         except Exception:  # noqa: BLE001 - a failed stop must not kill the handle
             logger.warning("kai engine handle: stop failed for %s", self._chat_id, exc_info=True)
 
-    async def _post_approval(self, request_id: str, decision: str) -> None:
+    async def _post_approval(self, request_id: str, decision: str, *, silent: bool = False) -> None:
         """Forward a web approval decision, then resolve the card.
 
         ``request_id`` is the engine's ``toolCallId`` verbatim (that is what
         the approval_request frame carried). ``allow_session`` collapses to a
         plain allow — the engine's wire contract has no per-session grant.
+
+        ``silent`` suppresses the closing ``approval_resolved`` frame, for the
+        one caller that answered an approval NO CARD was ever raised for (see
+        ``_AUTO_APPROVED_TOOLS``). That frame retires a card; sent for a card
+        the client never saw, it is a resolution of nothing. The error frame
+        below is NOT silenced: a decision that failed to reach the engine
+        leaves the tool call hanging either way, which the reader has to be
+        told about. (Copilot review on #1985.)
         """
         approved = decision in ("allow", "allow_session")
         try:
@@ -486,6 +510,8 @@ class KaiEngineHandle:
         state = self._turn_state
         if state is not None:
             state.pending_approvals.discard(request_id)
+        if silent:
+            return
         self.stdout.feed_frame(
             {
                 "type": "approval_resolved",
@@ -655,6 +681,24 @@ class KaiEngineHandle:
             )
         elif etype == "tool-approval-request":
             tool_call_id = str(event.get("toolCallId", ""))
+            if state.tool_names.get(tool_call_id, "") in _AUTO_APPROVED_TOOLS:
+                # Answered here, with no card and no pending entry: the user
+                # never sees an approval step for a tool whose only effect is
+                # to put a question in front of them (#1974). Not added to
+                # `pending_approvals` precisely because nothing was raised —
+                # the resolution frames below retire cards, and there is none.
+                # `silent=True` for the same reason: `_post_approval` would
+                # otherwise close with an `approval_resolved` of its own, which
+                # is the exact orphan this branch exists to avoid.
+                #
+                # Ahead of the `approvals_enabled` kill-switch below on
+                # purpose. That switch exists so tool calls do not sit waiting
+                # on a human who is not there; this call waits on nobody, and
+                # denying it would only cost the agent the ability to ask a
+                # clarifying question on exactly the instances that turned
+                # human round-trips off.
+                self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
+                return
             state.pending_approvals.add(tool_call_id)
             # No-args tools send "" (not "{}"): the client only renders the
             # command block when there is something to show. indent=2 keeps

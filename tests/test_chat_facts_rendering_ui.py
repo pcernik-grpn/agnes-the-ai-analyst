@@ -205,7 +205,7 @@ def test_both_tool_card_paths_pass_the_tool_name_through():
     fact_claims card to a raw JSON dump."""
     js = _read(CHAT_JS)
     live = js[js.index("function renderToolCallEnd") : js.index("function _collapseFinishedToolCalls")]
-    assert "_renderToolResultPreview(result, toolName)" in live
+    assert "_renderToolResultPreview(result, toolName, isError)" in live
     assert "wrap.dataset.tool" in live, "the reliable tool name — frame.tool is often the call id, not the name"
     assert '_bareToolName(toolName) === "fact_claims"' in live
     assert "_recordFactClaimsEvidence(" in live

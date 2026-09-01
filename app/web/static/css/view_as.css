@@ -1,0 +1,89 @@
+/* =====================================================================
+ * view_as.css — the read-only "viewing as <someone>" banner.
+ *
+ * Rendered by `_view_as_banner.html`, which `base_ds.html` includes on every
+ * page. The one requirement the design has to meet is that the mode can never
+ * be forgotten: it is fixed to the top of the viewport, spans the full width,
+ * and pushes nothing — it sits above the rail and the page's own chrome so it
+ * cannot be scrolled away from or covered by a sticky header.
+ *
+ * Amber (the `--ds-accent-warn-*` vocabulary) rather than danger red: nothing
+ * is broken and nothing is at risk while the session is read-only. It reads as
+ * "you are somewhere unusual", which is exactly the state.
+ *
+ * `--ds-*` tokens throughout, and it must work in every theme.
+ * ===================================================================== */
+
+.view-as-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* Above the rail (100) and page chrome, below modals (1000): a dialog the
+     admin opened must still be readable, and the banner is already
+     unmissable at the top of every page. */
+  z-index: 950;
+  background: var(--ds-accent-warn-bg);
+  color: var(--ds-accent-warn-ink);
+  border-bottom: 1px solid var(--ds-accent-warn-line);
+  box-shadow: var(--ds-shadow-sm);
+  font-family: var(--ds-font);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.view-as-banner__inner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+}
+
+.view-as-banner__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-accent-warn-line);
+  flex-shrink: 0;
+}
+
+.view-as-banner__text {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.view-as-banner__note {
+  opacity: 0.85;
+}
+
+.view-as-banner__exit {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.view-as-banner__button {
+  border: 1px solid var(--ds-accent-warn-line);
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  color: var(--ds-accent-warn-ink);
+  font: inherit;
+  font-weight: 600;
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background var(--ds-motion-fast) var(--ds-ease-standard);
+}
+
+.view-as-banner__button:hover,
+.view-as-banner__button:focus-visible {
+  background: var(--ds-surface-dim);
+}
+
+/* Give the page back the strip the fixed banner covers. Scoped to the
+   banner's own presence via :has(), so a page with no banner is untouched —
+   there is no body class to set and no page to update. */
+body:has(.view-as-banner) {
+  padding-top: 38px;
+}

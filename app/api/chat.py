@@ -585,10 +585,21 @@ async def reissue_ticket(
         raise HTTPException(404)
     ticket = _issue_ticket(chat_id, user["email"])
     log_safe(user_id=user["id"], action="chat.session.ticket", resource=f"session:{chat_id}")
+    # #1973: whether an answer is being written RIGHT NOW. A browser that
+    # reloaded mid-answer reloads history that ends on its own question (the
+    # reply is persisted only when the turn ends) and then waits on a socket
+    # whose attach can take seconds — for that window the page looked idle,
+    # which is what invited the second reload that produced duplicate
+    # questions and stuck sessions. Read straight off the manager, and
+    # deliberately not fatal: a replica with no ChatManager (api role) still
+    # mints tickets, it just reports False and the client behaves as before.
+    mgr = getattr(request.app.state, "chat_manager", None)
+    turn_in_flight = bool(mgr is not None and mgr.is_turn_in_flight(chat_id))
     return {
         "id": chat_id,
         "ws_ticket": ticket,
         "ws_url": f"/api/chat/sessions/{chat_id}/stream?ticket={ticket}",
+        "turn_in_flight": turn_in_flight,
     }
 
 
@@ -747,11 +758,21 @@ async def ws_stream(ws: WebSocket, chat_id: str, ticket: str, last_seq: int = 0)
                     # ws_stream closes the WS with 4404, and the user sees
                     # "Disconnected" before the runner has a chance to boot.
                     text = frame.get("text", "")
+                    # #1973: an opaque per-submit id from the client. The
+                    # manager records it only once the message is persisted, so
+                    # the retry below still covers a booting sandbox while a
+                    # genuine re-delivery of the same submit can never land a
+                    # second copy of the question in the transcript. Absent on
+                    # an older client — the manager treats that as today.
+                    raw_cmid = frame.get("client_msg_id")
+                    client_msg_id = raw_cmid[:128] if isinstance(raw_cmid, str) and raw_cmid else None
                     for _ in range(60):  # up to 30 s total at 0.5 s ticks
                         try:
                             # Thread sender_email so per-sender budgets (SR-10)
                             # and departed-participant replay-skip (SR-11) work.
-                            await mgr.send_user_message(chat_id_v, text, sender_email=user_email)
+                            await mgr.send_user_message(
+                                chat_id_v, text, sender_email=user_email, client_msg_id=client_msg_id
+                            )
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)
@@ -865,11 +886,18 @@ async def ws_join(ws: WebSocket, session_id: str, ticket: str, last_seq: int = 0
                 kind = frame.get("type")
                 if kind == "user_msg":
                     text = frame.get("text", "")
+                    # Same per-submit idempotency key as ws_stream (#1973) — a
+                    # co-driver's client reloads and reconnects exactly like the
+                    # owner's does.
+                    raw_cmid = frame.get("client_msg_id")
+                    client_msg_id = raw_cmid[:128] if isinstance(raw_cmid, str) and raw_cmid else None
                     for _ in range(60):
                         try:
                             # Thread sender_email so per-sender budgets (SR-10)
                             # and departed-participant replay-skip (SR-11) work.
-                            await mgr.send_user_message(session_id, text, sender_email=participant_email)
+                            await mgr.send_user_message(
+                                session_id, text, sender_email=participant_email, client_msg_id=client_msg_id
+                            )
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)

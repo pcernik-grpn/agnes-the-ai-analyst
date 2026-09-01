@@ -6,8 +6,7 @@ Every route on this router is gated FIRST by the module-level
 admin surface answers ``409 feature_disabled`` when the single ``sharepoint``
 switch (``app/switches.py``) is off, before any per-route auth even runs. On
 top of that, most individual routes are also gated by ``Depends(require_admin)``
-(a couple by ``Depends(require_admin_or_producer_connection(...))`` for the
-corpus-extraction producer's own callback reads — see those routes' own
+(see those routes' own
 docstrings).
 
 Surface:
@@ -24,6 +23,20 @@ Surface:
                                                                 (``?q=``, ``?mode=``) over the
                                                                 same tree — never Graph's own
                                                                 ``/search`` (TCRD-240).
+  POST   /api/admin/sharepoint/connections/{id}/manual-sites — resolve a site by URL (the
+                                                                same ``Sites.Selected`` escape
+                                                                hatch as ``?site_url=`` above)
+                                                                AND persist it on the
+                                                                connection's own
+                                                                ``config.manual_sites``, so it
+                                                                survives a wizard reopen
+                                                                (2026-09-01 bug: the tree
+                                                                endpoint alone only ever
+                                                                resolved, never stored).
+                                                                Idempotent on the resolved
+                                                                site id.
+  DELETE /api/admin/sharepoint/connections/{id}/manual-sites — forget one site added by URL
+                                                                (``?site_id=``).
   GET    /api/admin/sharepoint/connections/{id}/scopes       — list the connection's
                                                                 confirmed scope rows,
                                                                 enriched with collection +
@@ -39,24 +52,6 @@ Surface:
                                                                 removes the row, leaves any
                                                                 already-created collection
                                                                 alone.
-  GET    /api/admin/sharepoint/connections/{id}/corpus-map   — producer handoff: the
-                                                                ``{"<site>"|"<site>/<folder path>":
-                                                                collection_id}`` mapping
-                                                                ``ship_to_agnes.py --corpus-map``
-                                                                consumes, in the producer
-                                                                resolver's own key shape. 409
-                                                                ``corpus_map_ambiguous`` rather
-                                                                than a best-guess map. Per-scope
-                                                                ``anonymize`` is NOT in this shape —
-                                                                a producer that needs it reads the
-                                                                sibling ``GET .../scopes`` endpoint
-                                                                instead (each row already carries
-                                                                ``anonymize``). Agnes's own
-                                                                ``corpus-extraction`` job handler
-                                                                (``app/worker/kinds.py``) builds an
-                                                                anonymize-scoped mapping the same
-                                                                way, for the same reason: this
-                                                                endpoint's contract does not move.
   GET    /api/admin/sharepoint/connections/{id}/certificate  — read-only certificate metadata
                                                                 (thumbprint, subject/issuer, expiry)
                                                                 derived at request time from the
@@ -150,12 +145,11 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.access import require_admin, require_admin_or_producer_connection
+from app.auth.access import require_admin
 from app.auth.public_url import public_base_url
-from app.auth.session_principal import ProducerPrincipal
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
-from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, active_zone_rows, zone_rows
+from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL, zone_rows
 from connectors.sharepoint.graph_client import (
     SharePointGraphError,
     build_folder_matcher,
@@ -169,7 +163,6 @@ from connectors.sharepoint.graph_client import (
     probe_unique_permissions,
     search_folders,
 )
-from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
     corpus_file_events_repo,
@@ -192,7 +185,7 @@ def _require_sharepoint_enabled() -> None:
     (``app/api/sharepoint_webhooks.py``'s ``require_sharepoint_enabled`` in
     ``app/auth/access.py``, which 404s because Graph is an unauthenticated
     caller that never had a route to discover), every route here already
-    requires admin (or a scoped producer credential) — a reachable,
+    requires admin — a reachable,
     authenticated caller being told a KNOWN feature is off is exactly what
     409 means elsewhere in this module (``extraction_disabled``,
     ``acl_sync_already_running``, ...).
@@ -301,6 +294,15 @@ class ScopeRemovalOut(BaseModel):
     collection: Optional[ScopeCollectionRef] = None
 
 
+class AddManualSiteBody(BaseModel):
+    """The URL an admin pasted into "Add a site by URL" (step 2) — the SAME
+    input :func:`browse_tree`'s ``?site_url=`` already resolves, just carried
+    in a POST body instead of a query param so this call can also persist the
+    result (see :func:`add_manual_site`)."""
+
+    site_url: str = Field(..., min_length=1)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -337,8 +339,18 @@ class ScopeRemovalOut(BaseModel):
 #: ``retired_scope_collections`` (2026-08-31) is the fourth: the
 #: untick tombstones :func:`remove_scope` writes so :func:`confirm_scope`
 #: can re-adopt a scope's previous collection on re-tick instead of minting
-#: a duplicate.
-SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = ("scopes", "extraction", "webhook_secret", "retired_scope_collections")
+#: a duplicate. ``manual_sites`` (2026-09-01) is the fifth: the sites an
+#: admin added by URL under the ``Sites.Selected`` escape hatch
+#: (:func:`add_manual_site` / :func:`remove_manual_site`) — without this the
+#: wizard forgot every one of them the moment the connection was next edited
+#: through the generic form, forcing a re-paste of the same URL.
+SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = (
+    "scopes",
+    "extraction",
+    "webhook_secret",
+    "retired_scope_collections",
+    "manual_sites",
+)
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -459,6 +471,11 @@ async def _annotate_unique_permissions(token: str, drive_id: str, items: List[Di
 def _scopes(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     scopes = (row.get("config") or {}).get("scopes")
     return list(scopes) if isinstance(scopes, list) else []
+
+
+def _manual_sites(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sites = (row.get("config") or {}).get("manual_sites")
+    return list(sites) if isinstance(sites, list) else []
 
 
 async def _resolved_token(row: Dict[str, Any]) -> str:
@@ -977,6 +994,84 @@ async def browse_tree(
         ) from exc
 
 
+@router.post("/connections/{connection_id}/manual-sites", status_code=201)
+async def add_manual_site(
+    connection_id: str,
+    body: AddManualSiteBody,
+    _user: dict = Depends(require_admin),
+):
+    """Resolve a site by URL AND persist it on the connection (2026-09-01 bug
+    report): ``GET .../tree?site_url=`` (the ``Sites.Selected`` escape hatch
+    documented on :func:`browse_tree`) only ever RESOLVED a site — the result
+    lived in the wizard's own client-side ``spManualSites`` and was reset
+    every time the wizard opened, forcing the admin to re-paste the same URL
+    on every visit. This route reuses the exact same validation
+    (:func:`_parse_site_url`) and resolution (``get_site_by_path``) as that
+    query param, then stores the result on ``config.manual_sites`` — a plain
+    list of ``{id, name, web_url}`` rows, the same normalized shape
+    ``get_site_by_path`` already returns — so a reopen (or a page reload) can
+    read it straight back from the connection listing instead of losing it.
+
+    Idempotent on the resolved site id: adding the same site twice (the same
+    URL, or two URLs that resolve to the same site) replaces its row in
+    place rather than appending a duplicate — the same "storage anchor is
+    the id, not what the admin typed" principle the confirmed-scope
+    collections use (module docstring).
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    hostname, site_path = _parse_site_url(body.site_url)  # typed 422 before any token resolution
+    token = await _resolved_token(row)
+    try:
+        site = await get_site_by_path(token, hostname, site_path)
+    except SharePointGraphError as exc:
+        # Same classification as `browse_tree`'s own `?site_url=` branch —
+        # a Graph 403 here is a permission verdict on a NAMED site, never an
+        # outage.
+        if exc.status_code == 403:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "sharepoint_site_not_granted",
+                    "message": (
+                        "Graph refused this site (HTTP 403): the app registration has no grant on it. "
+                        "Grant the app access to this site (Sites.Selected), or check the URL."
+                    ),
+                },
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "sharepoint_graph_error", "message": str(exc)},
+        ) from exc
+
+    manual_sites = [s for s in _manual_sites(row) if s.get("id") != site["id"]]
+    manual_sites.append(site)
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
+    new_config = {**(row.get("config") or {}), "manual_sites": manual_sites}
+    source_connections_repo().update(connection_id, config=new_config)
+    return site
+
+
+@router.delete("/connections/{connection_id}/manual-sites", status_code=204)
+async def remove_manual_site(
+    connection_id: str,
+    site_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Forget one site previously added by URL (see :func:`add_manual_site`).
+    Purely local bookkeeping — unlike a confirmed scope, a manual site owns
+    no collection and no grants, so there is nothing else to reconcile."""
+    row = _sharepoint_connection_or_404(connection_id)
+    manual_sites = _manual_sites(row)
+    remaining = [s for s in manual_sites if s.get("id") != site_id]
+    if len(remaining) == len(manual_sites):
+        raise HTTPException(status_code=404, detail="manual_site_not_found")
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
+    new_config = {**(row.get("config") or {}), "manual_sites": remaining}
+    source_connections_repo().update(connection_id, config=new_config)
+
+
 # Real library scale (measured, 2026-08-29): 443k files / 97,899 folders in
 # ONE library. The previous caps (depth 10 / visited 2000) made a
 # whole-library search almost always `truncated` right at the top — safe,
@@ -1091,7 +1186,7 @@ async def search_tree(
 @router.get("/connections/{connection_id}/scopes")
 async def list_scopes(
     connection_id: str,
-    user=Depends(require_admin_or_producer_connection("{connection_id}")),
+    user: dict = Depends(require_admin),
 ):
     """The wizard's step-2/3 source of truth: every confirmed scope row,
     enriched with its collection and current group grants, plus this
@@ -1100,22 +1195,9 @@ async def list_scopes(
     rather than have it vanish the moment it dissolves; see :func:`_zone_out`
     for the exact projection).
 
-    Also the corpus-extraction producer's own callback read (TCRD-...):
-    a ``ProducerPrincipal`` scoped to THIS connection may call this too
-    (see ``require_admin_or_producer_connection``) — self-audited here
-    (``sharepoint_connection.scopes_read``, ``client_kind="producer"``)
-    since a restricted principal's identity is never stashed onto
-    ``request.state.user``, so the generic audit-fallback middleware would
-    otherwise see no attributable caller and write nothing at all.
     """
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
-    if isinstance(user, ProducerPrincipal):
-        log_safe(
-            action="sharepoint_connection.scopes_read",
-            resource=connection_id,
-            client_kind="producer",
-        )
     return {
         "items": [_scope_out(s, declared, row) for s in _scopes(row)],
         "zones": [_zone_out(z) for z in zone_rows(row)],
@@ -1425,55 +1507,6 @@ async def remove_scope(
     }
 
 
-@router.get("/connections/{connection_id}/corpus-map")
-async def corpus_map(
-    connection_id: str,
-    user=Depends(require_admin_or_producer_connection("{connection_id}")),
-):
-    """Scope→collection routing map (spec §13.2 / item 3). Keys are in the
-    crawl resolver's OWN shape — ``"<site display name>"`` or
-    ``"<site display name>/<drive-relative folder path>"`` — built by the
-    shared translation in ``connectors/sharepoint/corpus_map.py``, so this
-    endpoint and anything else reasoning about scope routing cannot drift.
-    The earlier flat ``{source_scope_id: collection_id}`` shape was
-    unusable for routing: the resolver matches keys against crawler rows'
-    site/path components, which a Graph scope id never equals.
-
-    Every ACTIVE permission zone (2026-08-31 plan, Task 3/7 —
-    ``connectors/sharepoint/acl_sync.py``'s ``config["acl_zones"]``) folds in
-    as an ADDITIONAL, NESTED key under its parent scope's own key (a zone's
-    ``display_path`` always extends its parent's) — see
-    ``connectors/sharepoint/corpus_map.py``'s module docstring for why the
-    producer's resolver MUST match these longest-prefix-first, and why a
-    resolver that gets that wrong still fails closed rather than leaking
-    zone content (the ingest gate, 2026-08-31 plan, Task 5). A DISSOLVED
-    zone is never mapped — its content re-homes to the parent scope.
-
-    ``409 corpus_map_ambiguous`` when the confirmed scopes/zones cannot form
-    an unambiguous map (e.g. a site scope plus a drive scope of the same
-    site) — never a best-guess map.
-
-    Deliberately does NOT carry ``anonymize`` — a caller that needs to know
-    WHICH scopes to anonymize reads ``GET .../scopes`` instead (each row
-    already carries ``anonymize``); the built-in crawl reads the same flag
-    off the scope rows directly."""
-    row = _sharepoint_connection_or_404(connection_id)
-    try:
-        mapping = producer_corpus_map(_scopes(row), active_zone_rows(row))
-    except CorpusMapError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "corpus_map_ambiguous", "message": str(exc)},
-        ) from exc
-    if isinstance(user, ProducerPrincipal):
-        log_safe(
-            action="sharepoint_connection.corpus_map_read",
-            resource=connection_id,
-            client_kind="producer",
-        )
-    return mapping
-
-
 @router.get("/connections/{connection_id}/certificate")
 async def certificate(
     connection_id: str,
@@ -1573,6 +1606,17 @@ class ExtractionRunOptions(BaseModel):
         le=86400,
         description="Hard ceiling for this one run, seconds (0 = unbounded).",
     )
+    resync: Optional[bool] = Field(
+        None,
+        description=(
+            "Drop this connection's persisted deltaLinks and item-failure queue before "
+            "running, so every drive re-enumerates from scratch (already-ingested files "
+            "are not re-downloaded — cTags are kept). The supported recovery path for a "
+            "connection whose delta cursor ran past documents it never actually ingested."
+        ),
+    )
+
+
 # --- Graph subscription lifecycle -------------------------------------------
 #
 # The secret-minting endpoint above is only half of what near-real-time
@@ -1763,7 +1807,10 @@ async def trigger_extraction(
     ``{"connection_id": connection_id}``, the exact payload shape that
     handler documents. An optional :class:`ExtractionRunOptions` body adds
     the handler's per-run overrides (``concurrency``, ``timeout_s``) for
-    THIS run only — configured values stay untouched.
+    THIS run only — configured values stay untouched — plus ``resync``, the
+    supported alternative to hand-editing the crawl state file on the data
+    disk when a connection's delta cursor ran past documents it never
+    ingested: see ``connectors.sharepoint.crawler._apply_resync``.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
@@ -1797,6 +1844,8 @@ async def trigger_extraction(
             payload["concurrency"] = options.concurrency
         if options.timeout_s is not None:
             payload["timeout_s"] = options.timeout_s
+        if options.resync:
+            payload["resync"] = True
 
     job = jobs_repo().enqueue(
         "corpus-extraction",
