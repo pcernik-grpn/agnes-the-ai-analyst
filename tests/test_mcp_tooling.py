@@ -3,19 +3,26 @@ output-size guard shared by the HTTP foundation and CLI stdio MCP servers."""
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
 
 from src.mcp_tooling import (
     DEFAULT_MAX_OUTPUT_CHARS,
+    DEFAULT_SEARCH_MAX_CHARS,
     MAX_OUTPUT_CHARS_ENV,
+    SEARCH_MAX_CHARS_ENV,
+    SEARCH_TEXT_FLOOR,
     MCPOutputTooLarge,
+    compact_search_results,
     ensure_output_size,
     ensure_query_output_size,
     max_output_chars,
     progressive_tool,
+    search_max_chars,
     summarize_docstring,
+    wire_size,
 )
 
 
@@ -208,3 +215,193 @@ class TestEnsureQueryOutputSize:
     def test_a_non_dict_payload_is_not_a_crash(self, monkeypatch):
         monkeypatch.setenv(MAX_OUTPUT_CHARS_ENV, "100000")
         assert ensure_query_output_size([1, 2, 3]) == [1, 2, 3]
+
+
+# ── search-result compaction (TCRD-287) ────────────────────────────────────────
+
+
+def _chunk(i: int, text_len: int = 3_200) -> dict:
+    """One ``knowledge_search`` chunk hit the size the ingest chunker emits."""
+    return {
+        "chunk_id": f"ch_{i:04d}",
+        "corpus_id": "col_0123456789abcdef",
+        "file_id": f"cf_{i:04d}",
+        "filename": f"report-{i}.pdf",
+        "ordinal": i,
+        "section_path": "1 > 1.2",
+        # Non-ASCII on purpose: a Czech document is what the incident carried,
+        # and `ensure_ascii=False` vs `True` changes the measured size 6×.
+        "text": ("Příliš žluťoučký kůň úpěl ďábelské ódy. " * 200)[:text_len],
+        "score": round(1.0 / (1 + i), 4),
+        "confidence": "high",
+        "matched_on": "body",
+        "type": "chunk",
+    }
+
+
+def _incident_payload(k: int = 10) -> dict:
+    """Ten 3.2k-char chunks — the ~52k-char response the chat engine refused."""
+    return {"query": "kůň", "results": [_chunk(i) for i in range(k)], "retrieval": "hybrid"}
+
+
+class TestSearchBudget:
+    def test_default_is_the_file_read_ceiling(self):
+        assert DEFAULT_SEARCH_MAX_CHARS == 20_000
+        assert search_max_chars() == DEFAULT_SEARCH_MAX_CHARS
+
+    def test_env_override_and_garbage_fallback(self, monkeypatch):
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "5000")
+        assert search_max_chars() == 5000
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "lots")
+        assert search_max_chars() == DEFAULT_SEARCH_MAX_CHARS
+
+    def test_wire_size_matches_fastmcp_serialization(self):
+        """FastMCP puts ``pydantic_core.to_json(result, indent=2)`` on the wire;
+        the budget must be measured against THAT text, not the compact form —
+        and unicode must not be escaped, or a Czech chunk looks six times bigger
+        than what the client actually receives."""
+        import pydantic_core
+
+        payload = _incident_payload(2)
+        assert wire_size(payload) == len(pydantic_core.to_json(payload, fallback=str, indent=2).decode())
+        assert wire_size(payload) < len(json.dumps(payload, indent=2))  # ensure_ascii would inflate
+
+
+class TestCompactSearchResults:
+    def test_fitting_payload_is_returned_untouched_and_identical(self):
+        payload = _incident_payload(1)
+        assert compact_search_results(payload, "knowledge_search", budget=20_000) is payload
+        assert "truncated" not in payload
+
+    def test_the_incident_payload_fits_the_default_budget(self):
+        """The bug: ten chunks → ~52k chars → the engine refused the result.
+        After compaction the wire text is inside the budget, every hit is
+        still there, and the model is told what happened."""
+        payload = _incident_payload()
+        # Ten chunker-sized hits are ~35k chars on the wire (the incident's 52k
+        # carried fifteen) — well over the budget either way.
+        assert wire_size(payload) > 30_000
+        out = compact_search_results(payload, "knowledge_search")
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert len(out["results"]) == 10  # shortened, not dropped
+        assert "10 of 10 results carry shortened text" in out["truncated_note"]
+        assert "collection_file_read" in out["truncated_note"]
+        assert "knowledge_search" in out["truncated_note"]
+        assert "dropped" not in out["truncated_note"]
+
+    def test_shortened_hits_are_marked_and_identifiers_survive(self):
+        payload = _incident_payload()
+        out = compact_search_results(payload, "knowledge_search", budget=20_000)
+        for before, after in zip(payload["results"], out["results"]):
+            assert after["truncated"] is True
+            assert after["truncated_fields"] == ["text"]
+            assert after["text"].endswith("…")
+            assert before["text"].startswith(after["text"][:-1])
+            assert len(after["text"]) < len(before["text"])
+            # Everything a follow-up call needs is byte-identical.
+            for key in ("chunk_id", "corpus_id", "file_id", "filename", "ordinal", "score", "matched_on"):
+                assert after[key] == before[key]
+
+    def test_input_payload_is_never_mutated(self):
+        payload = _incident_payload()
+        snapshot = json.dumps(payload, sort_keys=True)
+        compact_search_results(payload, "knowledge_search", budget=5_000)
+        assert json.dumps(payload, sort_keys=True) == snapshot
+
+    def test_drops_lowest_ranked_hits_only_after_text_is_at_the_floor(self):
+        payload = _incident_payload()
+        out = compact_search_results(payload, "knowledge_search", budget=3_000)
+        kept = out["results"]
+        assert 0 < len(kept) < 10
+        # Ranked order preserved, cut from the tail.
+        assert [h["chunk_id"] for h in kept] == [h["chunk_id"] for h in payload["results"][: len(kept)]]
+        assert all(len(h["text"]) <= SEARCH_TEXT_FLOOR + 1 for h in kept)  # floor + the mark
+        assert f"{10 - len(kept)} lower-ranked result(s) of 10 were dropped" in out["truncated_note"]
+        assert wire_size(out) <= 3_000
+
+    def test_every_prose_field_is_covered_not_just_chunk_text(self):
+        """A table card with a long imported description, a metric, a glossary
+        term — the other hit types the combined search interleaves."""
+        payload = {
+            "query": "revenue",
+            "results": [
+                {
+                    "type": "table",
+                    "table_id": "t1",
+                    "name": "orders",
+                    "description": "d" * 5_000,
+                    "score": 1.0,
+                    "pivot_hint": "structured data — query with SQL via `agnes query`, table id: t1",
+                },
+                {"type": "metric", "id": "m1", "name": "mrr", "description": "m" * 5_000, "score": 0.9},
+                {"type": "glossary", "id": "g1", "term": "MRR", "definition": "g" * 5_000, "score": 0.8},
+                {"type": "knowledge", "id": "k1", "title": "note", "snippet": "s" * 5_000, "score": 0.7},
+            ],
+            "retrieval": "hybrid",
+        }
+        out = compact_search_results(payload, "knowledge_search", budget=4_000)
+        assert wire_size(out) <= 4_000
+        fields = {h["type"]: h.get("truncated_fields") for h in out["results"]}
+        assert fields == {
+            "table": ["description"],
+            "metric": ["description"],
+            "glossary": ["definition"],
+            "knowledge": ["snippet"],
+        }
+        # The pivot hint is an instruction, not prose — untouched.
+        assert out["results"][0]["pivot_hint"].endswith("table id: t1")
+
+    def test_zero_budget_disables(self):
+        payload = _incident_payload()
+        assert compact_search_results(payload, "knowledge_search", budget=0) is payload
+
+    def test_env_budget_is_read_at_call_time(self, monkeypatch):
+        payload = _incident_payload()
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "0")
+        assert compact_search_results(payload, "knowledge_search") is payload
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "8000")
+        assert wire_size(compact_search_results(payload, "knowledge_search")) <= 8000
+
+    def test_non_search_shapes_pass_through(self):
+        assert compact_search_results("plain", "x", budget=10) == "plain"
+        big_no_results = {"blob": "x" * 5_000}
+        assert compact_search_results(big_no_results, "x", budget=100) is big_no_results
+        big_results_not_a_list = {"results": "x" * 5_000}
+        assert compact_search_results(big_results_not_a_list, "x", budget=100) is big_results_not_a_list
+
+    def test_empty_result_hint_is_never_cut(self):
+        """The empty-result ``hint`` is the other half of the search UX contract
+        (an empty result must not read as an access problem); it lives outside
+        ``results`` and passes through whole."""
+        hint = "Searched 3 collection(s) and 40 table(s) … whole word … no wildcard … " * 3
+        payload = {"query": "q", "results": [], "retrieval": "hybrid", "searched_collections": 3, "hint": hint}
+        assert compact_search_results(payload, "knowledge_search", budget=20_000) is payload
+
+    def test_deterministic(self):
+        payload = _incident_payload()
+        a = compact_search_results(payload, "knowledge_search", budget=6_000)
+        b = compact_search_results(payload, "knowledge_search", budget=6_000)
+        assert a == b
+
+    def test_cuts_as_little_as_the_budget_requires(self):
+        """The cap is the LARGEST that fits, not the first power-of-two below
+        it: at k=10 a halving cut left 40% of the budget idle (12.6k of 20k)
+        and every passage at 800 chars when ~1.5k would have fit."""
+        payload = _incident_payload()
+        out = compact_search_results(payload, "knowledge_search")
+        used = wire_size(out)
+        assert DEFAULT_SEARCH_MAX_CHARS * 0.9 < used <= DEFAULT_SEARCH_MAX_CHARS
+        # One more character per field and it would not fit.
+        text_len = len(out["results"][0]["text"]) - 1  # minus the mark
+        assert text_len > 1_200
+        from src.mcp_tooling import _apply_cap, _with_results
+
+        one_more = _with_results(
+            payload,
+            "knowledge_search",
+            _apply_cap(payload["results"], text_len + 1),
+            total=10,
+            budget=DEFAULT_SEARCH_MAX_CHARS,
+        )
+        assert wire_size(one_more) > DEFAULT_SEARCH_MAX_CHARS
