@@ -6,8 +6,11 @@
       "content": "NPS is calculated using a rolling 90-day window, not quarterly snapshots.",
       "user_quote": "Not quite. We use a rolling 90-day NPS, not quarterly. The current score should be around 52.",
       "domain": "product",
-      "entities": ["NPS"],
-      "base_confidence": 0.90
+      "entities": [
+        "NPS"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     },
     {
       "detection_type": "unprompted_definition",
@@ -15,8 +18,11 @@
       "content": "MAU retention = percentage of users active in month N who were also active in month N-1.",
       "user_quote": "Also, FYI, our retention metric is defined as the percentage of users who are active in month N who were also active in month N-1. We call it MAU retention.",
       "domain": "product",
-      "entities": ["MAU retention"],
-      "base_confidence": 0.90
+      "entities": [
+        "MAU retention"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

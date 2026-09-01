@@ -328,38 +328,39 @@ credential-bearing URL.
 
 #### Reverse-proxy access logs — MCP SSE `?token=`
 
-The MCP SSE transport accepts the bearer token as a `?token=` query parameter,
-a fallback for clients that cannot set an `Authorization` header on a GET. When
-a client uses it, the token — a long-lived PAT, not a single-use code — lands in
-the access log of every intermediary that records request URIs (CWE-598). Agnes
-logs a one-time warning naming this the first time the fallback is used, so
-check your logs for it.
+The MCP SSE transport can accept the bearer token as a `?token=` query
+parameter, a fallback for a client that cannot set an `Authorization` header
+on a GET. **Off by default since the #1656 audit follow-up** — a request that
+carries only `?token=` is refused exactly like an unauthenticated request
+(`401`) unless an operator opts back in. Most instances need no action: an
+upgrade from an older release that never wrote this setting picks up the new,
+safe default automatically. If you (or an earlier config export) ever
+explicitly saved `true` here, that value persists across upgrades and the
+fallback stays on until you flip it — check its `effective` value on
+`/admin/server-config`.
 
-Two ways to handle it, in order of preference:
+Every connection snippet Agnes hands out on the MCP connect page is
+header-based already — the `?token=` snippet was removed in the 2026-07-24
+audit follow-up — so nothing in a typical fleet needs the parameter.
 
-1. **Turn the fallback off.** Every connection snippet Agnes hands out on the
-   MCP connect page is header-based — the `?token=` snippet was removed in the
-   2026-07-24 audit follow-up — so unless you have a hand-rolled client, nothing
-   in your fleet needs the parameter. Set `mcp.allow_query_param_token: false`
-   in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=false`); the
-   parameter is then ignored and such requests get a 401. This removes the
-   exposure rather than containing it. Default is `true` so an upgrade never
-   breaks a client that still relies on it — check for the one-time warning in
-   your logs before flipping it.
+Turn it on (`mcp.allow_query_param_token: true` in `/admin/server-config`, or
+`AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) only for a documented client that
+genuinely cannot set the header. When enabled and a client actually uses it,
+the token — a long-lived PAT, not a single-use code — lands in the access log
+of every intermediary that records request URIs (CWE-598); Agnes logs a
+one-time warning naming this the first time the fallback fires, so check your
+logs for it. Prefer containing the exposure over carrying it indefinitely:
 
-   **Write `false`, `off`, `no`, or `0` — nothing else disables it.** Agnes's
-   flag parser treats every unrecognized string as truthy, so `disabled`,
-   `disable`, or `n` leave the fallback **on** with no error. That convention is
-   harmless for flags whose default is inert, but this one defaults to
-   permissive, so a typo silently keeps the exposure you were trying to remove.
-   Confirm the change took by reading the flag's `effective` value back from
-   `/admin/server-config` rather than trusting the save.
-2. **Keep it and redact.** If a client genuinely cannot set the header, add a
-   proxy rule that drops or masks the `token` query parameter for
-   `/api/mcp/*`, as above for the OAuth callback. Note this only covers *your*
-   proxy — the token still travels in the URL and can be captured anywhere else
-   on the path, so treat any PAT used this way as exposed and rotate it if the
-   log retention worries you.
+- Add a proxy rule that drops or masks the `token` query parameter for
+  `/api/mcp/*`, as above for the OAuth callback. This only covers *your*
+  proxy — the token still travels in the URL and can be captured anywhere else
+  on the path, so treat any PAT used this way as exposed and rotate it if the
+  log retention worries you.
+- **Write `true`/`false` (or `on`/`off`, `yes`/`no`, `1`/`0`) — Agnes's flag
+  parser treats every unrecognized string as truthy**, so a typo like
+  `disabled` or `n` when turning it back off leaves it **enabled** with no
+  error. Confirm any change took by reading the flag's `effective` value back
+  from `/admin/server-config` rather than trusting the save.
 
 #### VPN/intranet-only instances — MCP connector reachability
 

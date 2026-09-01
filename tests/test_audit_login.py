@@ -336,6 +336,22 @@ def test_every_session_minting_ROUTE_audits_its_own_success_path():
                     out.add(fn.attr)
         return out
 
+    # These routes mint a fresh session cookie/token but are not completing a
+    # NEW sign-in — the caller already holds a valid session
+    # (`require_session_token`), and the mint is a side effect of a
+    # different, already-audited action. Calling `audit_login_success` there
+    # would misrepresent the event in the trail (e.g. a password change
+    # would show up as a fresh login). Each entry names the action that
+    # already covers the real event.
+    MINTS_A_SESSION_FOR_A_DIFFERENT_ALREADY_AUDITED_REASON = {
+        # password_change (issue #1676 remainder): the caller is already
+        # signed in. The fresh cookie replaces the one this same call's
+        # session_revoked_before bump just invalidated, so the browser that
+        # changed its own password isn't logged out by its own request —
+        # the event is audited as `password_changed`, not a sign-in.
+        "password.py::password_change",
+    }
+
     offenders = []
     for path in sorted(Path("app/auth/providers").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -346,8 +362,11 @@ def test_every_session_minting_ROUTE_audits_its_own_success_path():
             # `_set_login_cookie` itself is the helper, not a sign-in route.
             if node.name.startswith("_"):
                 continue
+            key = f"{path.name}::{node.name}"
+            if key in MINTS_A_SESSION_FOR_A_DIFFERENT_ALREADY_AUDITED_REASON:
+                continue
             if names & MINTERS and not (names & AUDITORS):
-                offenders.append(f"{path.name}::{node.name}")
+                offenders.append(key)
 
     assert not offenders, (
         "these routes complete a sign-in without recording it: "
