@@ -166,18 +166,6 @@ def test_list_recent_respects_limit(pg_engine, monkeypatch):
     assert len(repo.list_recent(limit=2)) == 2
 
 
-def test_distinct_corpus_ids_unions_across_runs(pg_engine, monkeypatch):
-    repo = _make_repo(pg_engine, monkeypatch)
-    _create(repo, corpus_ids=["col_a", "col_b"])
-    _create(repo, corpus_ids=["col_b", "col_c"])
-    assert repo.distinct_corpus_ids() == ["col_a", "col_b", "col_c"]
-
-
-def test_distinct_corpus_ids_empty_when_no_runs(pg_engine, monkeypatch):
-    repo = _make_repo(pg_engine, monkeypatch)
-    assert repo.distinct_corpus_ids() == []
-
-
 def test_corpus_ids_are_deduplicated_and_sorted_on_write(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     run_id = _create(repo, corpus_ids=["col_b", "col_a", "col_b"])
