@@ -29,6 +29,7 @@ from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
 from app.chat.replay import append_frame
 from app.chat.sources import verdict as sources_verdict
+from app.chat.turn_usage import drain_turn_usage
 from app.chat.types import RELAY_PROTOCOL_VERSION, ChatSession, SessionState, Surface
 from app.chat.workdir import WorkdirManager
 from app.coordination.base import CoordinationUnavailable
@@ -723,6 +724,39 @@ class ChatManager:
                 live.chat_id,
                 exc_info=True,
             )
+
+    def _hydrate_frame_usage(self, live: LiveSession, frame: dict) -> None:
+        """Fill a usage-less assistant frame from the broker-observed turn
+        counters (``app/chat/turn_usage.py``).
+
+        The engine provider emits frames with no usage at all, while every
+        LLM call of the turn transited the broker, which accumulated the
+        provider-reported usage per session. Draining ALWAYS (destructively)
+        and hydrating only a frame with no usage of its own gives two
+        properties at once: a frame that carries numbers wins (the native
+        provider's self-report), and the discarded drain is the double-count
+        guard — native-sandbox calls ride the same broker route, so their
+        counters accumulate too and must not leak into a later turn.
+
+        Runs BEFORE ``append_message``, so one hydration point feeds every
+        existing consumer unchanged: the persisted ``chat_messages`` tokens
+        (what ``max_session_tokens`` sums), the daily spend counters, and
+        the ``usage_turns`` row. ``drain_turn_usage`` never raises; a
+        coordination outage leaves the frame untouched and the turn records
+        exactly as before this feature existed.
+        """
+        drained = drain_turn_usage(live.chat_id)
+        if drained is None:
+            return
+        token_fields = ("tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens")
+        if any(frame.get(field_name) is not None for field_name in token_fields):
+            return  # the frame's own usage wins; drained counters are discarded
+        frame["tokens_in"] = drained["input_tokens"]
+        frame["tokens_out"] = drained["output_tokens"]
+        frame["cache_read_tokens"] = drained["cache_read_tokens"]
+        frame["cache_creation_tokens"] = drained["cache_creation_tokens"]
+        if not frame.get("model") and drained.get("model"):
+            frame["model"] = drained["model"]
 
     @staticmethod
     def _msg_window_key(sender: str) -> str:
@@ -2419,6 +2453,10 @@ class ChatManager:
                 if not frame.get("attended"):
                     await self._resolve_if_unattended(live, frame)
             if ftype == "assistant_message":
+                # Broker-observed usage: drain once per turn, hydrate a
+                # usage-less frame BEFORE persist so chat_messages, the
+                # daily counters and usage_turns all see one set of numbers.
+                self._hydrate_frame_usage(live, frame)
                 self._repo.append_message(
                     session_id=live.chat_id,
                     role="assistant",
