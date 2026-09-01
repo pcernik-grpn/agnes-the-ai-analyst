@@ -54,6 +54,29 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **The SOURCES row says each thing once.** Three repetitions turned an
+  answer's provenance into noise. Every chip spelled its CATEGORY as a word,
+  so five cited tables meant reading "table" five times — it is a glyph now,
+  with the word on the chip's `aria-label` and tooltip. Every unverified chip
+  shouted `UNVERIFIED` in amber, which inverted the row's salience: the model
+  names more than it queries, so the common case became the dominant colour
+  and a genuinely checked source had no way to look calm. Verified is now the
+  quiet state (base chip, green glyph), unverified is carried in a dashed
+  border — both in `--ds-accent-*-ink`, not `-line`: the `-line` tokens are
+  tuned for a border on its own tinted fill, and on the chip's plain surface
+  they measured 2.94:1 and 1.41:1, below the 3:1 WCAG asks of a meaningful
+  graphic. The ink pair measures 6.36:1 / 6.88:1 in light and 9.68:1 / 11.2:1
+  in dark, and the category glyph inherits the chip's ink rather than naming a
+  third colour. The word is summarised once at the end of the row as
+  "N unverified" — counted over every reference, not just the visible ones.
+  And an `assumption` — a caveat about method, with nothing to open — left the
+  pill vocabulary it shared with two links for its own `Assumes` line. Past
+  four references the rest fold behind "+N more" (the same grow-in-place
+  control the tool results use) instead of wrapping the row onto a third line;
+  below four there is no control and nothing changes. Sources stay VISIBLE by
+  default rather than collapsing behind a summary: "shows you where each
+  answer came from" is the product's claim, and hiding it would make checking
+  an answer cost two clicks on every turn.
 - **A tool step sits closer to the sentence it belongs to.** The messages
   column is a flex column with a uniform 20px `gap`, and a step added 8px of
   its own margin on top — so it stood 28px from the prose above it, WIDER than

@@ -158,6 +158,81 @@ def test_a_broken_diagram_keeps_its_source_on_screen():
 # ── the two defects measuring found ─────────────────────────────────────────
 
 
+def test_the_sources_row_says_each_thing_once():
+    """Three separate repetitions made the row read as noise. Each chip spelled
+    its CATEGORY as a word (five tables meant reading "table" five times); each
+    unverified chip shouted UNVERIFIED, so the common case — the model names
+    more than it queries — became the row's dominant colour and a genuinely
+    checked source had no way to look calm; and an `assumption`, which is a
+    caveat about method with nothing to open, sat in the same pill vocabulary
+    as two links.
+
+    Category is now a glyph, the verdict is summarised once for the row, and
+    assumptions have their own line. Nothing was dropped: the category word and
+    the verdict both ride the chip's accessible name."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+
+    assert "_CLAIM_ICON" in fn and "msg-source-icon" in fn, "category rides a glyph"
+    assert "msg-source-kind" not in fn, "the category word is off the chip's face"
+    assert 'chip.setAttribute("aria-label"' in fn, (
+        "what left the face must not leave the chip — the category and verdict ride the name"
+    )
+    assert "`${kindWord} ${c.ref}, unverified`" in fn
+
+    # The verdict, once for the row rather than per chip.
+    assert "const unverified = refs.filter((c) => c.verified === false).length;" in fn
+    assert "`${unverified} unverified`" in fn
+    # Counted over ALL references, not just the visible ones — a count that
+    # changed when you expanded the row would be worse than none.
+    assert "refs.filter" in fn and "chips.slice" in fn
+
+    # Verified is the calm state: it adds nothing to the base chip.
+    css = _read(CHAT_CSS)
+    ok = re.search(r"\.msg-source-chip\.is-ok \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert ok is None, "a verified chip wears the base chip — no fill of its own"
+
+    assert ".msg-assumptions {" in css, "assumptions are prose on their own line, not a chip"
+
+
+def test_the_source_chip_states_use_ink_not_line_tokens():
+    """`--ds-accent-*-line` is tuned for a border sitting on its OWN tinted
+    fill. The chip has no tint — it is plain --ds-surface-dim — so on it the
+    success line measured 2.94:1 and the warn line 1.41:1: a state marker you
+    cannot see, below even the 3:1 that WCAG 1.4.11 asks of a meaningful
+    graphic, let alone the 4.5:1 the 10px text owes.
+
+    The `-ink` pair measures 6.36:1 / 6.88:1 here and 9.68:1 / 11.2:1 in dark.
+    The rule, not the numbers, is what this guards: nothing on this row may
+    carry state in a `-line` token. (A percentage mix toward transparent was
+    the other candidate and is worse than either — the ink token flips
+    lightness between themes, so one percentage lands in two different places.)
+    """
+    css = _code_only(_read(CHAT_CSS))
+    row = css[css.index(".msg-source-chip {") : css.index(".msg-assumptions {")]
+    assert "-line)" not in row, "a --ds-accent-*-line token on the sources row — invisible on an untinted chip"
+    assert "color-mix" not in row, "a transparent mix resolves differently per theme"
+    assert "var(--ds-accent-success-ink)" in row and "var(--ds-accent-warn-ink)" in row
+
+    # The glyph inherits rather than naming a third colour, so it cannot fall
+    # out of sync with the ink beside it.
+    icon = re.search(r"\.msg-source-icon \{(.*?)\}", css, re.DOTALL)
+    assert icon and "color: inherit;" in icon.group(1)
+
+
+def test_a_long_source_row_caps_before_it_wraps():
+    """Past the cap the rest fold behind "+N more" rather than wrapping the row
+    to a second and third line. Under it there is no control at all — the
+    common answer is untouched."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert "const _SOURCES_VISIBLE = 4;" in js
+    assert "if (chips.length <= _SOURCES_VISIBLE) {" in fn, "no control below the cap"
+    assert "_expandInPlace({" in fn, (
+        "the same grow-in-place control the tool results use — not a second copy of the list"
+    )
+
+
 def test_the_sources_label_is_not_set_in_the_muted_tone():
     """Measured at 3.93:1 against the bubble with --ds-text-muted — under WCAG
     AA at 10px. This row exists to be read."""
@@ -169,12 +244,24 @@ def test_the_sources_label_is_not_set_in_the_muted_tone():
 
 
 def test_the_unverified_flag_is_not_shrunk_below_the_chip():
-    """`font-size: 0.85em` of --text-xs measured 8.5px — the one word on the row
-    that has to be legible, set smaller than everything around it."""
+    """`font-size: 0.85em` of --text-xs measured 8.5px — the one phrase on the
+    row that has to be legible, set smaller than everything around it.
+
+    The flag used to sit INSIDE a chip, where inheriting was parity and any
+    font-size at all was the shrink. It is now the row's own summary — said
+    once instead of repeated per chip — so it has to set a size, and parity is
+    asserted directly: the same token the chips use."""
     css = _read(CHAT_CSS)
-    block = re.search(r"\.msg-source-flag \{(.*?)\}", _code_only(css), re.DOTALL)
-    assert block, ".msg-source-flag moved — re-point this guard"
-    assert "font-size" not in block.group(1)
+    flag = re.search(r"\.msg-source-flag \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert flag, ".msg-source-flag moved — re-point this guard"
+    chip = re.search(r"\.msg-source-chip \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert chip, ".msg-source-chip moved — re-point this guard"
+    size = re.search(r"font-size: (var\(--[a-z-]+\));", flag.group(1))
+    assert size, "the flag must state its own size now that it is not inside a chip"
+    assert f"font-size: {size.group(1)};" in chip.group(1), "the flag is set smaller than the chips it summarises"
+    assert not re.search(r"font-size: [\d.]+em", flag.group(1)), (
+        "no relative font-size — an em multiple of the chip's --text-xs is how it got to 8.5px"
+    )
 
 
 # ── prompt contract ─────────────────────────────────────────────────────────

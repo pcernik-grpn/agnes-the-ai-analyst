@@ -761,19 +761,73 @@ body.chat-page-body main { margin: 0; padding: 0; }
   color: var(--ds-text-secondary);
   background: var(--ds-surface-dim);
 }
-.msg-source-kind {
-  font-family: var(--ds-font);
-  color: var(--ds-text-muted);
+/* The chips hold the row's own list, so the label and the trailing controls
+   stay put while the list grows. */
+.msg-sources-list {
+  display: contents;
 }
-.msg-source-chip.is-ok {
-  border-color: var(--ds-accent-success-line);
-  background: var(--ds-accent-success-bg);
+/* The category, as a glyph instead of a repeated word (chat.js _CLAIM_ICON).
+   The word rides the chip's aria-label and tooltip. */
+.msg-source-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  /* Follows the chip's own ink rather than carrying a third colour. The glyph
+     is the only thing on the chip that states the category now, so it is a
+     meaningful graphic under WCAG 1.4.11 and owes 3:1 — inheriting an ink that
+     already clears 4.5:1 as text satisfies that by construction, in both
+     themes, with no second value to keep in sync. */
+  color: inherit;
+}
+.msg-source-icon svg {
+  width: 12px;
+  height: 12px;
+}
+/* VERIFIED is the calm state, deliberately: it wears the base chip and adds
+   nothing. It used to be painted success-green, which — with unverified in
+   amber — made a row of sources into a traffic light where nothing was
+   neutral. Green on the routine case also spent the strongest signal the row
+   has on its least surprising outcome. */
+/* -ink, NOT -line. The `-line` tokens are tuned for borders sitting on their
+   own tinted fill; on the chip's plain --ds-surface-dim the success line
+   measured 2.94:1 and the warn line 1.41:1 — a state marker you cannot see.
+   The -ink pair measures 6.36:1 and 6.88:1 here, and 9.68:1 / 11.2:1 in dark. */
+.msg-source-chip.is-ok .msg-source-icon {
   color: var(--ds-accent-success-ink);
 }
+/* Unverified stays marked, and now carries it in the BORDER rather than in a
+   fill plus a shouted word: dashed reads as provisional at a glance, and the
+   count says it once for the whole row (.msg-source-flag). */
 .msg-source-chip.is-unverified {
-  border-color: var(--ds-accent-warn-line);
-  background: var(--ds-accent-warn-bg);
+  border-style: dashed;
+  border-color: var(--ds-accent-warn-ink);
   color: var(--ds-accent-warn-ink);
+}
+/* "+3 more" / "Show fewer" — the same link-shaped control the tool results
+   use, sized to sit on this row. */
+.msg-source-more {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: var(--text-xs);
+  color: var(--ds-primary);
+  cursor: pointer;
+}
+.msg-source-more:hover,
+.msg-source-more:focus-visible {
+  text-decoration: underline;
+}
+/* Assumptions are prose about method, not references — no chip, no border,
+   and their own line so they stop competing with the things you can open. */
+.msg-assumptions {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 6px;
+}
+.msg-assumption {
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
 }
 .msg-source-chip.is-none {
   border-style: dashed;
@@ -800,14 +854,27 @@ a.msg-source-chip.is-link:focus-visible {
   border-color: var(--ds-primary);
   text-decoration: underline;
 }
+/* The verdict for the whole row, said once at the end of it — it used to be a
+   badge repeated inside every unverified chip. No longer inside a chip, so it
+   owns its own type and spacing. */
 .msg-source-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-family: var(--ds-font);
+  font-size: var(--text-xs);
   font-weight: var(--font-semibold);
   text-transform: uppercase;
-  /* NO font-size shrink here. `0.85em` of the chip's own --text-xs came out at
-     8.5px measured — the one word on this row that must be readable, set
-     smaller than everything around it. Caps + weight carry the emphasis. */
+  /* NO font-size shrink relative to the chips. `0.85em` of the chip's own
+     --text-xs came out at 8.5px measured — the one phrase on this row that
+     must be readable, set smaller than everything around it. Caps + weight
+     carry the emphasis. */
   letter-spacing: 0.03em;
+  color: var(--ds-accent-warn-ink);
+}
+.msg-source-flag svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* Mermaid output. Inserted WITHOUT the markdown sanitizer (its <style> block
@@ -877,7 +944,9 @@ a.msg-source-chip.is-link:focus-visible {
 .msg-body pre.code-block-wrap,
 .cloud-chat-messages details pre.code-block-wrap {
   position: relative;
-  margin: var(--space-2) 0;
+  /* --space-3, matching the table above it: a code block is an object in the
+     prose flow, and 8px left it crowding the sentence that introduced it. */
+  margin: var(--space-3) 0;
   padding: var(--space-3);
   background: var(--ds-code-bg);
   color: var(--ds-code-ink);

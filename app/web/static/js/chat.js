@@ -633,6 +633,17 @@ function _bubbleHasFigure(bubble) {
   return false;
 }
 
+//: The category icon a chip wears instead of spelling its category out. With
+//: five tables cited, "table" was read five times; the glyph says it in a
+//: fraction of the width, and the WORD survives in the chip's aria-label and
+//: tooltip, so nothing is lost to a screen reader.
+const _CLAIM_ICON = { table: "table", metric: "chart-line" };
+
+//: How many references the row shows before the rest fold behind "+N more".
+//: Four covers the overwhelming majority of answers outright — under it there
+//: is no control at all and nothing about the row changes.
+const _SOURCES_VISIBLE = 4;
+
 function renderSourcesChips(bubble, verdict) {
   if (!verdict) return;
   const claims = verdict.claims || [];
@@ -648,6 +659,17 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
+  // Provenance is part of the MESSAGE, so it sits above the actions row (time,
+  // copy, ask again) — which on a history reload is already in the bubble by
+  // the time this runs. Same two-sided rule the actions row and the follow-up
+  // suggestions follow: each appender places itself relative to whatever is
+  // already there, so the tail reads the same however the pieces arrive.
+  const place = (node) => {
+    const actionsRow = bubble.querySelector(":scope > .msg-actions");
+    if (actionsRow) bubble.insertBefore(node, actionsRow);
+    else bubble.appendChild(node);
+  };
+
   const wrap = document.createElement("div");
   wrap.className = "msg-sources";
 
@@ -661,39 +683,97 @@ function renderSourcesChips(bubble, verdict) {
     none.className = "msg-source-chip is-none";
     none.textContent = "none declared";
     wrap.appendChild(none);
-    bubble.appendChild(wrap);
+    place(wrap);
     return;
   }
 
-  for (const c of claims) {
-    // A table or metric claim is a link to the thing it names; an assumption
-    // has nothing to open and stays a <span> (see _claimHref).
+  // An assumption is not a source in the same sense: it is a caveat about
+  // method with nothing to open, and chipping it beside two links made both
+  // harder to read. It gets its own line below, as the prose it is.
+  const refs = claims.filter((c) => c.kind !== "assumption");
+  const assumptions = claims.filter((c) => c.kind === "assumption");
+
+  const list = document.createElement("span");
+  list.className = "msg-sources-list";
+  wrap.appendChild(list);
+
+  const chips = refs.map((c) => {
+    // A table or metric claim is a link to the thing it names; anything with
+    // no target stays a <span> (see _claimHref).
     const href = _claimHref(c);
     const chip = document.createElement(href ? "a" : "span");
     if (href) chip.href = href;
     // Three states, and the middle one is the point of the whole feature:
     // verified (a tool call supports it), unverified (the answer named
-    // something nothing ran touched), and neutral (an assumption, which there
-    // is nothing to check against).
+    // something nothing ran touched), and neutral (nothing to check against).
     const state = c.verified === true ? "is-ok" : c.verified === false ? "is-unverified" : "is-neutral";
     chip.className = `msg-source-chip ${state}${href ? " is-link" : ""}`;
-    const kind = document.createElement("span");
-    kind.className = "msg-source-kind";
-    kind.textContent = _CLAIM_LABEL[c.kind] || c.kind;
-    chip.appendChild(kind);
+    const iconName = _CLAIM_ICON[c.kind];
+    if (iconName) {
+      const icon = document.createElement("span");
+      icon.className = "msg-source-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.appendChild(iconEl(iconName));
+      chip.appendChild(icon);
+    }
     chip.appendChild(document.createTextNode(c.ref));
+    // The category and the verdict left the chip's FACE; they must not leave
+    // the chip. Both ride the accessible name, and the verdict keeps the
+    // tooltip it always had.
+    const kindWord = _CLAIM_LABEL[c.kind] || c.kind;
     if (c.verified === false) {
       chip.title = "No tool call in this turn touched this — the answer named it, nothing ran on it.";
-      const mark = document.createElement("span");
-      mark.className = "msg-source-flag";
-      mark.textContent = "unverified";
-      chip.appendChild(mark);
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}, unverified`);
     } else if (c.verified === true) {
       chip.title = "A tool call in this turn used this.";
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}, verified`);
+    } else {
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}`);
     }
-    wrap.appendChild(chip);
+    return chip;
+  });
+
+  if (chips.length <= _SOURCES_VISIBLE) {
+    list.replaceChildren(...chips);
+  } else {
+    const [, more] = _expandInPlace({
+      paint: (expanded) => list.replaceChildren(...(expanded ? chips : chips.slice(0, _SOURCES_VISIBLE))),
+      expandLabel: `+${chips.length - _SOURCES_VISIBLE} more`,
+      collapseLabel: "Show fewer",
+      className: "msg-source-more",
+    });
+    wrap.appendChild(more);
   }
-  bubble.appendChild(wrap);
+
+  // The verdict, said ONCE. It used to be shouted on every unverified chip,
+  // which inverted the salience of the whole row: the model names more than
+  // it queries, so the exception colour became the row's dominant colour and
+  // the genuinely-checked sources had no way to look calm. The chips still
+  // differ (dashed, amber ink); only the WORD is summarised.
+  const unverified = refs.filter((c) => c.verified === false).length;
+  if (unverified) {
+    const flag = document.createElement("span");
+    flag.className = "msg-source-flag";
+    flag.title = "No tool call in this turn touched these — the answer named them, nothing ran on them.";
+    flag.appendChild(iconEl("triangle-alert"));
+    flag.appendChild(document.createTextNode(`${unverified} unverified`));
+    wrap.appendChild(flag);
+  }
+  place(wrap);
+
+  if (assumptions.length) {
+    const row = document.createElement("div");
+    row.className = "msg-assumptions";
+    const alabel = document.createElement("span");
+    alabel.className = "msg-sources-label";
+    alabel.textContent = "Assumes";
+    row.appendChild(alabel);
+    const text = document.createElement("span");
+    text.className = "msg-assumption";
+    text.textContent = assumptions.map((c) => c.ref).join("; ");
+    row.appendChild(text);
+    place(row);
+  }
 }
 
 // ---------- Next-actions block ---------------------------------------------
