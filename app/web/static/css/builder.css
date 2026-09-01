@@ -260,7 +260,11 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
    is a document and wants its column back. */
 .ag-work { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--ds-surface); border-top: 1px solid var(--ds-border); min-height: 520px; flex: 1 1 auto; }
 .ag-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.ag-pane--cfg { border-left: 1px solid var(--ds-border); background: var(--ds-surface-sunken); }
+/* `--ds-surface-dim`, not `--ds-surface-sunken`: the configuration pane is
+   the quieter HALF of a two-pane workspace, not a well pressed into a page,
+   and sunken read as a grey slab beside the white conversation. Dim is the
+   lighter of the two in every theme. */
+.ag-pane--cfg { border-left: 1px solid var(--ds-border); background: var(--ds-surface-dim); }
 /* Prose does not want the full width of a wide monitor even when the pane
    has it: the conversation keeps a readable measure and centres, while the
    pane around it still spans. */

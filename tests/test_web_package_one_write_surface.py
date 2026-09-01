@@ -1,30 +1,36 @@
-"""Creating a Data Package: one shared right-side drawer, opened in place.
+"""Writing a Data Package: ONE surface, reached from three places.
 
-Three things had gone wrong with the create form, and all three are the same
-mistake — the form was page furniture on /admin/tables rather than a component:
+The form itself was already a single component — but it was mounted in three
+chromes, and which one you got depended on where you noticed the package:
 
-  * it was a centred modal carrying the tallest form in the admin surface
-    (name, slug, description, lifecycle, category, icon, colour, cover image
-    AND a group-access matrix), so on a laptop its footer sat over its own
-    last field. Setup flows in this product come from the right;
-  * the Packages lens — where "+ New package" belongs — had no copy of it, so
-    its button LINKED to `/admin/tables?new_package=1`: asking for a new
-    package on the Data packages tab switched you to the Tables tab;
-  * the native `<select>`, colour input and file input inside it were
-    undressed browser chrome next to fields that were not.
+  * a full builder PAGE (`/admin/data-packages/new|{id}/edit`), from the
+    Library's "+ New";
+  * a right-side DRAWER over the admin grid, for both "+ New package" and the
+    per-row "Edit";
+  * a third copy of the same drawer opened from the Library's own package
+    detail page, a READING page.
 
-What this suite pins:
+Plus the package's own admin page carried two more editors of its own — an
+add-tables drawer and a share drawer, each writing directly.
 
-  * the Packages lens opens the drawer in place — a button, not a link out;
-  * /admin/tables no longer carries the create MARKUP, only the component and
-    the two entry points that name it (`?new_package=1` from the legacy
-    catalog CTA, and the chip-input's `chip-create`);
-  * both consumers link the shared drawer chrome AND the component, since a
-    consumer that links one without the other renders an unstyled form or no
-    form at all;
-  * the controls the shared field rules do not cover are dressed in the shared
-    sheet (`.fbar-select`, `.ds-drawer__color`, `.ds-drawer__file`), not left
-    native and not re-invented per page.
+So one object had four ways in, three looked like different products, and the
+page whose job is "who does this actually reach" was also the page that changed
+it. What this suite pins:
+
+  * the admin grid LINKS to the builder for both verbs, and no longer carries
+    the drawer at all;
+  * the package's own page writes NOTHING — every verb on it is a link to the
+    builder — while keeping the read-out a builder cannot hold;
+  * the builder returns you to the lens that sent you (`?from=`), against a
+    whitelist, because that value lands in a `location.href`;
+  * the drawer survives for exactly one case: mid-sentence on /admin/tables,
+    assigning a table to a package that does not exist yet, where losing the
+    page you are on is the whole cost;
+  * the retired add-tables drawer's PICKER controls moved into the builder
+    rather than dying with it — the consolidation must not cost the better
+    picker;
+  * the controls the shared field rules do not cover stay dressed in the
+    shared sheet, not re-invented per page.
 """
 
 from __future__ import annotations
@@ -81,28 +87,48 @@ class TestTheComponentExists:
         assert "fbar-seg" in src
 
 
-class TestThePackagesLensOpensItInPlace:
-    def test_new_package_is_a_button_not_a_link_to_another_lens(self, seeded_app) -> None:
+class TestThePackagesLensSendsYouToTheBuilder:
+    def test_new_package_goes_to_the_builder_and_says_where_it_came_from(self, seeded_app) -> None:
         c = seeded_app["client"]
         html = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        assert "data-adp-new-package>+ New package</button>" in " ".join(html.split())
-        # The bug this replaced: creating a package moved you to the Tables lens.
+        assert "/admin/data-packages/new?from=admin" in html
+        # The bug this replaced twice over: creating a package moved you to the
+        # Tables lens, and then it opened a second chrome for the same form.
         assert "/admin/tables?new_package=1" not in html
+        assert "data-adp-new-package" not in html
 
-    def test_the_empty_state_opens_the_same_drawer(self, seeded_app) -> None:
+    def test_the_empty_state_goes_to_the_same_place(self, seeded_app) -> None:
         """An instance with no packages is exactly where "+ New package" matters
-        most, and its CTA was the same cross-lens link."""
+        most, and its CTA has been wrong twice before — first a cross-lens link,
+        then a second copy of the form."""
         src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        empty_block = src[src.index("No Data Packages yet") : src.index("Memory Domains")]
-        assert "data-adp-new-package" in empty_block
+        # Both bounds searched FORWARD from the empty state: "Memory Domains"
+        # also appears in a comment above it, and slicing to the first
+        # occurrence silently produced an empty string that asserted nothing.
+        start = src.index("No Data Packages yet")
+        empty_block = src[start : src.index("Memory Domains", start)]
+        assert empty_block, "the slice must actually contain the empty state"
+        assert "/admin/data-packages/new?from=admin" in empty_block
         assert "new_package=1" not in empty_block
 
-    def test_the_lens_links_the_chrome_and_the_component(self, seeded_app) -> None:
+    def test_editing_a_row_goes_to_the_builder_too(self, seeded_app) -> None:
+        """Create was a page and edit was an overlay, so the edit read as the
+        lesser of two things that are the same thing."""
+        c = seeded_app["client"]
+        # A row to carry the control — the grid renders none on a bare instance.
+        pkg_id = seeded_app_package_id(seeded_app)
+        html = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
+        assert f"/admin/data-packages/{pkg_id}/edit?from=admin" in html
+        assert "data-adp-edit-package" not in html
+
+    def test_the_lens_no_longer_carries_the_drawer_at_all(self, seeded_app) -> None:
+        """Not just the entry points: the component and its two sheets are ~50 kB
+        this page has no use for once both verbs leave."""
         c = seeded_app["client"]
         html = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        assert "css/drawer.css" in html
-        assert "css/package_drawer.css" in html
-        assert "js/components/package_drawer.js" in html
+        assert "js/components/package_drawer.js" not in html
+        assert "css/package_drawer.css" not in html
+        assert "css/drawer.css" not in html
 
     def test_suggest_by_bucket_still_crosses_deliberately(self, seeded_app) -> None:
         """Not every cross-lens link was a slip: that flow reads the table
@@ -135,21 +161,14 @@ class TestTheTablesLensKeepsTheEntryPointsAndDropsTheMarkup:
         assert "chipHost: host" in html
 
 
-class TestThePackagePageEditsItsOwnPackage:
-    """The package's own page could not edit the package.
+class TestThePackagePageReadsAndDoesNotWrite:
+    """`/admin/data-packages/{id}` is a read-out now.
 
-    `/admin/data-packages/{id}` is the surface whose whole docstring is "ONE
-    package, end to end", yet renaming it, re-describing it or retiring it
-    meant following an "Edit details…" LINK to `/admin/tables?edit_package=`
-    — the Tables lens, a page about something else — where a legacy centred
-    modal did the work. The drawer that already owns *creating* a package now
-    owns editing one too, so the verb happens on the object you are standing
-    on, exactly as create already does.
-
-    The legacy modal on /admin/tables is deliberately NOT retired here: it is
-    still the only surface carrying composition + the RBAC matrix, and
-    `?edit_package=` still routes to it. This pins the new door, not the old
-    one's removal.
+    It held three editors: an add-tables drawer, a share drawer writing grants
+    on every click, and the create/edit form opened as a fourth chrome for the
+    same fields. What it keeps is what a builder cannot hold — per-table mode
+    and freshness, the reach arithmetic, the per-group people counts — and
+    every verb on it is a link to the one surface that writes.
     """
 
     def test_the_component_carries_an_edit_mode(self) -> None:
@@ -164,17 +183,43 @@ class TestThePackagePageEditsItsOwnPackage:
         src = COMPONENT.read_text()
         assert "slug.disabled" in src
 
-    def test_the_package_page_opens_the_drawer_instead_of_linking_out(self, seeded_app) -> None:
+    def test_every_verb_on_the_page_is_a_link_to_the_builder(self, seeded_app) -> None:
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
         pkg_id = seeded_app_package_id(seeded_app)
         html = c.get(f"/admin/data-packages/{pkg_id}", headers=_auth(token)).text
         assert "/admin/tables?edit_package=" not in html, (
-            "the package page must edit in place, not send the admin to the Tables lens"
+            "the package page must not send the admin to the Tables lens"
         )
-        assert "js/components/package_drawer.js" in html
-        assert "css/package_drawer.css" in html
-        assert "css/drawer.css" in html
+        assert f"/admin/data-packages/{pkg_id}/edit" in html
+        # No editor of its own, in any of its three former forms.
+        assert "js/components/package_drawer.js" not in html
+        assert 'id="apd-add-drawer"' not in html
+        assert 'id="apd-share-drawer"' not in html
+        assert "ds-drawer" not in html
+
+    def test_it_keeps_the_read_out_a_builder_cannot_hold(self, seeded_app) -> None:
+        """The reason this page survives the consolidation at all. Removing the
+        editors must not take the facts with them: per-table mode and freshness,
+        and the delivery arithmetic under Sharing."""
+        c = seeded_app["client"]
+        pkg_id = seeded_app_package_id(seeded_app)
+        html = c.get(f"/admin/data-packages/{pkg_id}", headers=_auth(seeded_app["admin_token"])).text
+        assert 'id="apd-delivery"' in html, "shared != delivered is this page's whole point"
+        assert 'id="apd-share-rows"' in html
+        assert "At a glance" in html
+        assert "Freshness" in html
+
+    def test_the_builder_hands_back_the_lens_that_sent_it(self, seeded_app) -> None:
+        """`?from=` is request input that lands in a `location.href`, so it is
+        resolved against a whitelist server-side. An unknown value must fall
+        back, never be echoed."""
+        c = seeded_app["client"]
+        auth = _auth(seeded_app["admin_token"])
+        assert '"/admin/data-packages"' in c.get("/admin/data-packages/new?from=admin", headers=auth).text
+        assert '"/library"' in c.get("/admin/data-packages/new", headers=auth).text
+        evil = c.get("/admin/data-packages/new?from=https://evil.example.com", headers=auth).text
+        assert "evil.example.com" not in evil
 
 
 def seeded_app_package_id(seeded_app) -> str:
@@ -322,3 +367,110 @@ class TestTheTableListFollowsTheSourceStructure:
         src = COMPONENT.read_text()
         assert "SOURCE_LABELS" in src
         assert "'/api/admin/source-connections'" in src, "project names come from the connections"
+
+
+class TestThePickerKeptWhatTheRetiredDrawerHad:
+    """The add-tables drawer this change deleted had the better picker.
+
+    It filtered ~500 registered tables by source, by query mode and by "in no
+    package yet", and sorted them five ways; the builder's picker had a search
+    box and a project › bucket tree. Consolidating onto one write surface must
+    not quietly cost the controls that made composing a large package
+    possible, so they moved into the builder.
+    """
+
+    def test_the_picker_filters_by_source_and_by_query_mode(self) -> None:
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "pickerFacets" in src
+        assert "'source_type'" in src and "'query_mode'" in src
+        # Multi-select: "the Keboola tables AND the BigQuery ones" is one
+        # question, not two visits.
+        assert "matchesFilters" in src
+        assert "list.splice(at, 1)" in src, "a chosen facet must be un-choosable"
+
+    def test_a_facet_group_says_what_it_is_a_group_of(self) -> None:
+        """`internal` is a value of BOTH vocabularies — a source_type and a
+        query_mode — so an unlabelled strip renders the same chip twice, a line
+        apart, meaning two different things."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "pdw-pickctl__k" in src
+        css = (STATIC / "css" / "package_drawer.css").read_text(encoding="utf-8")
+        assert ".pdw-pickctl__k" in css
+
+    def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
+        """Membership spans every OTHER package, so the client cannot derive
+        it — and a filter that silently believes everything is unpackaged is
+        worse than no filter."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "packaged: !!t.packaged" in src
+        assert "pickerUnpackagedOnly" in src
+
+    def test_the_registry_endpoint_supplies_that_flag(self, seeded_app) -> None:
+        c = seeded_app["client"]
+        body = c.get("/api/admin/registry", headers=_auth(seeded_app["admin_token"])).json()
+        for row in body["tables"]:
+            assert "packaged" in row, f"{row['id']} carries no packaged flag"
+            assert isinstance(row["packaged"], bool)
+
+    def test_a_member_of_this_package_is_never_offered_as_unpackaged(self) -> None:
+        """A table the registry no longer lists is still shown (a row you
+        cannot see is a row you cannot remove) — and it is in THIS package by
+        definition, so the fallback row must not claim otherwise."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        fallback = src[src.index("st.registry.push({") : src.index("st.registry.push({") + 400]
+        assert "packaged: true" in fallback
+
+    def test_the_toggle_is_offered_only_when_it_narrows_something(self) -> None:
+        """On a fresh instance every row is unpackaged, and a control that
+        hides nothing is a control that lies."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "unpackagedN < (st ? st.registry.length : 0)" in src
+
+    def test_the_sorts_came_across_including_the_stale_first_one(self) -> None:
+        src = COMPONENT.read_text(encoding="utf-8")
+        for value in ("name_asc", "name_desc", "synced_asc", "synced_desc", "rows_desc"):
+            assert f"'{value}'" in src, value
+
+    def test_a_second_open_starts_unfiltered(self) -> None:
+        """Same reasoning the query already followed: inheriting the last
+        visit's narrowing hides rows for a reason nobody remembers."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        opener = src[src.index("function openPicker()") : src.index("function closePicker()")]
+        assert "resetPickerFilters()" in opener
+
+    def test_the_strip_is_an_opt_in_slot_on_the_shared_shell(self) -> None:
+        """Every other builder's picker must render exactly as before."""
+        shell = (STATIC / "js" / "components" / "builder_shell.js").read_text(encoding="utf-8")
+        assert "(o.controls || '')" in shell, "the slot must be optional, not required"
+
+
+class TestTheGridsTableStaysInsideThePage:
+    """The five-column package table outgrows its column below ~1400px.
+
+    `.data-table-wrap` is a bare <div> that nine admin templates wrap a table
+    in, and no sheet defines it — so when the table's ~1105px of min-content
+    exceeded the available width it simply ran out of the page: "Shared with"
+    and "Actions" off the right edge, and the whole document scrolling
+    sideways. The wrapper is named for containing exactly this.
+    """
+
+    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        assert ".data-table-wrap { overflow-x: auto; }" in src
+
+    def test_the_narrow_columns_keep_their_floor(self) -> None:
+        """The two cells that were cramped: a nowrap chip rendered narrower
+        than its own text, and a category on two lines."""
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        assert "min-width: 92px" in src and "min-width: 148px" in src
+        # Scoped to a 5-column row, so the 3-column Memory Domains table below
+        # — same classes, no Tables or Category column — is untouched.
+        assert "tr:has(> :nth-child(5))" in src
+
+    def test_the_chip_is_capped_by_its_cell_not_by_a_fraction_of_it(self) -> None:
+        """`max-width: 60%` of a ~100px column was 41px of pill around 58px of
+        text, so the words hung outside their own tint."""
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        chip = src[src.index("  .adp-chip {") : src.index("  .adp-chip svg")]
+        assert "max-width: 100%" in chip
+        assert "max-width: 60%" not in chip

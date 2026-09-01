@@ -23,28 +23,24 @@
          both were previously legible only by counting rows in a panel. They
          are now `.apg-strip--warn` bands above the columns, each carrying
          the control that fixes it.
-     (c) A DRAWER, not a modal, for both flows. `.ds-drawer` (css/drawer.css)
-         is the product's answer wherever a flow is more than one decision:
-         Add-tables is search → filter → sort → pick several → confirm, and a
-         centred card sized for one decision either outgrows the viewport or
-         scrolls its own header away. The drawer is full-height by
-         construction and keeps the package visible behind it, which is the
-         context you are adding to.
-     (d) THE ADD-TABLES PICKER carries the product's own toolbar — `.fbar` +
-         filter_toolbar.js, the same engine the Library and My Stack run on.
-         A substring filter is not a way to work three hundred registered
-         tables; source, mode and "in no package yet" are what an admin
-         actually slices by, and multi-select with a live count is what makes
-         bundling twelve tables one action rather than twelve.
+     (c) EVERY VERB LEAVES. "+ Add tables", "Edit access" and "Edit
+         details…" are links to /admin/data-packages/{id}/edit — the builder,
+         which is the one surface that writes a package. This page carried two
+         drawers of its own (add tables, share) and opened the create/edit
+         form as a third; one object with three chromes meant the same form
+         looked like a different product depending on where you found it, and
+         each copy drifted from the others. What is left here is what a
+         builder cannot hold: per-table mode and freshness, the reach
+         arithmetic, and the per-group people counts.
 
    NO TAB STRIP. `_admin_tabs.html` is deliberately not included: the strip
    offers a lateral move between LENSES, and offering it while you are one
    level below them invites you to leave the package you opened without
    noticing.
 
-   Composition writes `/api/admin/data-packages/{id}/tables`; sharing writes
-   the same `/api/admin/grants` rows a group's Access tab does — this page
-   and that one are two ends of one relationship and cannot disagree. #}
+   This page WRITES NOTHING. Composition and grants are the builder's, and
+   the same grants are also editable from each group's Access workspace —
+   one relationship, two ends, and now exactly two. #}
 
 {% block title %}{{ pkg.name }} — Data — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--full{% endblock %}
@@ -72,26 +68,16 @@
 {% endblock %}
 
 {% block head_extra %}
-{# Three shared sheets, no page-local copies of any of them:
-     drawer.css         the ONE right-side drawer chrome (head/body/foot)
-     filter_toolbar.css `.fbar` search + filter menu + sort, and the chips
-     section_card.css   `.dsec-empty`, the quiet "nothing here" block
-     ds_dropdown.css    the sort control's paper-theme form (#1055) — the
-                        native <select> it is paired with hides there, so a
-                        `.ds-dropdown-native` shipped without its twin would
-                        be an invisible control on the theme this page is
-                        being drawn for #}
-{# The builder workspace's rules — package_drawer grows into it when
-   opened from "+ New". Without the sheet the two panes stack. #}
-<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/drawer.css') }}">
-{# package_drawer.css dresses the fields of the shared create/edit drawer.
-   Linked here because this page now opens that component for "Edit details"
-   instead of sending the admin to the Tables lens for it. #}
-<link rel="stylesheet" href="{{ static_url('css/package_drawer.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+{# ONE shared sheet: `.dsec-empty`, the quiet "nothing here" block.
+
+   The drawer chrome, the filter toolbar, the builder workspace and the
+   dropdown sheet all left with the drawers they dressed. This page READS a
+   package — what it carries, how fresh it is, who it reaches — and every
+   verb on it now leaves for /admin/data-packages/{id}/edit, the one surface
+   that writes a package. It carried two drawers of its own (add tables,
+   share) plus a third copy of the create/edit form, which is how one object
+   ended up with three chromes that each looked like a different product. #}
 <link rel="stylesheet" href="{{ static_url('css/section_card.css') }}">
-<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
   /* ── Two columns: the work, then the standing facts ────────────────
      The left column is everything you ACT on (compose, share); the right
@@ -117,73 +103,8 @@
     margin-left: 6px; font-size: 11px; padding: 1px 6px; border-radius: 5px;
     background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
   }
-  .apd-rm {
-    border: none; background: none; cursor: pointer; padding: 4px 6px;
-    color: var(--ds-text-muted); font-size: 15px; line-height: 1; border-radius: var(--ds-radius-btn);
-  }
-  .apd-rm:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
-  .apd-rm:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
-
-  /* ── The remove control belongs to the row under the cursor ────────────
-     A ✕ on every row at rest reads as a column of destructive buttons and
-     makes the list feel like a demolition form; it also draws the eye to
-     the one thing on each row nobody came here to do. It appears on the
-     row you are pointing at instead.
-
-     Three details make that safe rather than merely tidier:
-
-       · `opacity`, not `display`/`visibility` — the cell keeps its width,
-         so no row twitches sideways as the pointer crosses it.
-       · `pointer-events: none` while transparent. An invisible button that
-         still takes clicks is a trap, and this one deletes something.
-       · `@media (hover: hover)` — a touch device has no hover state, so
-         hiding the control there would hide it for good. On those inputs it
-         stays visible, which is the correct behaviour, not a fallback.
-     Keyboard reaches it regardless: `:focus-visible` reveals it, and
-     `pointer-events` never affects focus. */
-  @media (hover: hover) {
-    .ds-table tbody tr .apd-rm,
-    .apd-share-row .apd-rm {
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity var(--ds-motion-fast) var(--ds-ease-standard);
-    }
-    .ds-table tbody tr:hover .apd-rm,
-    .ds-table tbody tr:focus-within .apd-rm,
-    .apd-share-row:hover .apd-rm,
-    .apd-share-row:focus-within .apd-rm,
-    .apd-rm:focus-visible {
-      opacity: 1;
-      pointer-events: auto;
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .ds-table tbody tr .apd-rm,
-      .apd-share-row .apd-rm { transition: none; }
-    }
-  }
   .apd-missing { color: var(--ds-accent-danger-ink); font-size: 12px; }
   .apd-nil { color: var(--ds-text-muted); }
-
-  /* The selection column is a checkbox wide and no wider — `.ds-table` sizes
-     columns from their content, and a header cell with a word in it would
-     give the checkbox a 60px column of its own. */
-  .ds-table th.apd-check,
-  .ds-table td.apd-check { width: 1%; padding-right: 0; }
-  .apd-check input { width: 15px; height: 15px; accent-color: var(--ds-primary); display: block; }
-  .ds-table tbody tr.is-picked > td { background: var(--ds-primary-light); }
-
-  /* The selection bar appears only while something is selected, between the
-     section head and the table it acts on — a bulk action floating in a
-     toolbar that is always there reads as a page-level verb, and this one
-     applies to exactly the rows that are ticked. */
-  .apd-selbar {
-    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-    margin: 0 0 10px; padding: 8px 12px;
-    background: var(--ds-primary-light); border-radius: var(--ds-radius-btn);
-    font-size: 13px; font-weight: 600; color: var(--ds-primary-dark);
-  }
-  .apd-selbar[hidden] { display: none; }
-  .apd-selbar__end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 
   /* ── Sharing rows ────────────────────────────────────────────────── */
   .apd-share-row {
@@ -214,18 +135,6 @@
   .apd-ava.is-everyone { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .apd-share-row .apd-g-name { font-weight: 600; font-size: 13.5px; color: var(--ds-text-primary); }
   .apd-share-row .apd-g-sub { font-size: 12px; color: var(--ds-text-muted); }
-  .apd-tier {
-    margin-left: auto; display: inline-flex; padding: 2px; flex: 0 0 auto;
-    background: var(--ds-surface-sunken); border-radius: var(--ds-radius-btn);
-  }
-  .apd-tier button {
-    border: none; background: transparent; padding: 4px 11px; cursor: pointer;
-    font-size: 12px; font-weight: 600; border-radius: 7px; color: var(--ds-text-muted);
-  }
-  .apd-tier button.on { background: var(--ds-surface); color: var(--ds-text-primary); box-shadow: var(--ds-shadow-sm); }
-  .apd-tier button.on.auto { color: var(--ds-primary-dark); }
-  .apd-tier button:focus-visible { outline: var(--ds-focus-outline); outline-offset: -1px; }
-
   /* ── Delivery read-out ───────────────────────────────────────────────
      Shared ≠ delivered. Sits INSIDE the Sharing panel, under the rows that
      cause it, so the claim and its consequence are read together. */
@@ -248,55 +157,6 @@
   .apd-fact__v { color: var(--ds-text-primary); font-weight: 600; text-align: right; min-width: 0; }
   .apd-fact__v.is-warn { color: var(--ds-accent-warn-ink); }
 
-  /* ── Picker rows — one anatomy for both drawers ──────────────────────
-     A checkbox, an identity, and (in the share drawer) the tier control. The
-     whole row is the label, so the name is as big a target as the box. */
-  .apd-pick {
-    display: flex; align-items: center; gap: 10px;
-    padding: 9px 8px; border-radius: var(--ds-radius-btn);
-    border-bottom: 1px solid var(--ds-border-light); font-size: 13px;
-  }
-  label.apd-pick { cursor: pointer; }
-  label.apd-pick:hover { background: var(--ds-surface-dim); }
-  .apd-pick:last-child { border-bottom: none; }
-  .apd-pick input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--ds-primary); flex: 0 0 auto; }
-  .apd-pick__txt { min-width: 0; flex: 1 1 auto; }
-  /* Two LINES, not one run of text: the name is what the eye scans down the
-     column, and inline-flowing its metadata after it meant a long bucket name
-     pushed the next row's name out of alignment. The sub-line ellipsises
-     rather than wrapping, so a row is one height whatever it carries. */
-  .apd-pick__name { display: block; font-weight: 600; color: var(--ds-text-primary); overflow-wrap: anywhere; }
-  .apd-pick__sub {
-    display: block; font-size: 11.5px; color: var(--ds-text-muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .apd-pick[hidden] { display: none; }
-
-  /* The picker's toolbar sits at the top of the drawer body and stays there
-     while the list scrolls under it — a filter you have to scroll back up to
-     change is a filter you set once and abandon. */
-  .apd-pickbar {
-    position: sticky; top: -18px; z-index: 2;
-    margin: -18px -22px 0; padding: 18px 22px 10px;
-    background: var(--ds-surface);
-  }
-  .apd-pickbar .fbar { margin: 0; }
-  .apd-pickbar .fbar-chips { margin: 8px 0 0; }
-  .apd-pickcount { margin: 10px 0 0; font-size: 12.5px; color: var(--ds-text-muted); }
-  .apd-pickcount b { color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
-
-  /* ── Toast ───────────────────────────────────────────────────────── */
-  .apd-toast {
-    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(12px);
-    padding: 9px 16px; border-radius: var(--ds-radius-btn); font-size: 13px; font-weight: 600;
-    box-shadow: var(--ds-shadow-md); opacity: 0; pointer-events: none;
-    transition: opacity .18s, transform .18s; z-index: 1300;
-    background: var(--ds-surface); border: 1px solid var(--ds-border); color: var(--ds-text-primary);
-  }
-  .apd-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-  .apd-toast.ok { border-color: var(--ds-accent-success-line); color: var(--ds-accent-success-ink); }
-  .apd-toast.fail { border-color: var(--ds-accent-danger-line); color: var(--ds-accent-danger-ink); }
-  @media (prefers-reduced-motion: reduce) { .apd-toast { transition: none; } }
 </style>
 {% endblock %}
 
@@ -313,8 +173,8 @@
 {# ── The two conditions a reader must meet BEFORE acting ──────────────
    Both are states that strand analysts, and both used to be readable only
    by counting rows in a panel further down. Each carries the control that
-   fixes it, so meeting the problem and solving it is one motion. The share
-   band is hidden client-side the moment a grant is written. #}
+   fixes it — and that control is a link to the builder, the one surface
+   that writes a package. #}
 {# ── Arrival context: "you came here to fix THIS person's access" ─────
    Rendered only on a ?from=simulate&user= arrival (see the route). Info,
    not warning: it is orientation, and the two warn strips below must keep
@@ -352,7 +212,7 @@
     receives, and an empty one delivers nothing however it is shared.
   </span>
   <span class="apg-strip__end">
-    <button type="button" class="btn btn-primary btn-sm" data-apd-open="add">+ Add tables</button>
+    <a class="btn btn-primary btn-sm" href="/admin/data-packages/{{ pkg.id | urlencode }}/edit">+ Add tables</a>
   </span>
 </div>
 {% endif %}
@@ -362,7 +222,7 @@
     group and it appears in their Library.
   </span>
   <span class="apg-strip__end">
-    <button type="button" class="btn btn-primary btn-sm" data-apd-open="share">+ Share with a group</button>
+    <a class="btn btn-primary btn-sm" href="/admin/data-packages/{{ pkg.id | urlencode }}/edit">+ Share with a group</a>
   </span>
 </div>
 
@@ -374,42 +234,28 @@
         <h2 class="apg-sechead__title">Tables</h2>
         <span class="apg-sechead__count" id="apd-count">{{ tables|length }} in this package</span>
         <span class="apg-sechead__end">
-          <button type="button" class="btn btn-primary btn-sm" data-apd-open="add">+ Add tables</button>
+          <a class="btn btn-primary btn-sm" href="/admin/data-packages/{{ pkg.id | urlencode }}/edit">+ Add tables</a>
         </span>
       </div>
 
-      {# Bulk removal, on exactly the rows that are ticked. #}
-      <div class="apd-selbar" id="apd-selbar" hidden role="status">
-        <span id="apd-selcount">0 selected</span>
-        <span class="apd-selbar__end">
-          <button type="button" class="btn btn-secondary btn-sm" id="apd-selclear">Clear</button>
-          <button type="button" class="btn btn-danger btn-sm" id="apd-selremove">Remove from package</button>
-        </span>
-      </div>
-
+      {# No selection bar and no per-row remove control: what a package
+         carries is chosen in the builder's picker, where the whole registry
+         is in view. Two places to remove a table meant two confirmation
+         dialogs and two reload-and-settle dances, one of them always the
+         poorer. #}
       {% if tables %}
       <div class="apd-tablewrap">
       <table class="ds-table" id="apd-tables">
         <thead>
           <tr>
-            <th class="apd-check">
-              <input type="checkbox" id="apd-selall" aria-label="Select every table in this package">
-            </th>
             <th>Table</th>
             <th>Mode</th>
             <th>Synced</th>
-            {# No header text — the column is one icon button per row, and
-               each carries its own aria-label naming the table it removes. #}
-            <th aria-label="Remove from package"></th>
           </tr>
         </thead>
         <tbody>
           {% for t in tables %}
-          <tr data-table-row="{{ t.id }}">
-            <td class="apd-check">
-              <input type="checkbox" data-pick-row="{{ t.id }}"
-                     aria-label="Select {{ t.name }}">
-            </td>
+          <tr>
             {# Bucket rides UNDER the name rather than in a column of its own.
                Five columns did not fit the left column's content box, and the
                one that had to give was the bucket: it identifies a table but
@@ -428,11 +274,6 @@
                 {%- elif t.age_minutes < 2880 %}{{ (t.age_minutes // 60) }} h
                 {%- else %}{{ (t.age_minutes // 1440) }} d{% endif %} ago
               {% else %}<span class="apd-nil">never</span>{% endif %}
-            </td>
-            <td style="text-align: right;">
-              <button type="button" class="apd-rm" data-remove="{{ t.id }}"
-                      title="Remove {{ t.name }} from this package"
-                      aria-label="Remove {{ t.name }} from this package">✕</button>
             </td>
           </tr>
           {% endfor %}
@@ -453,7 +294,7 @@
         <h2 class="apg-sechead__title">Sharing</h2>
         <span class="apg-sechead__count">who can use this package</span>
         <span class="apg-sechead__end">
-          <button type="button" class="btn btn-secondary btn-sm" data-apd-open="share">+ Share with a group</button>
+          <a class="btn btn-secondary btn-sm" href="/admin/data-packages/{{ pkg.id | urlencode }}/edit">Edit access</a>
         </span>
       </div>
       <div id="apd-share-rows"></div>
@@ -539,14 +380,11 @@
         How analysts find this package in their Library — its name, icon, category
         and description are what they read before adding it.
       </p>
-      {# Edits in place. This used to be a LINK to `/admin/tables?edit_package=`
-         — the package's own page could not edit the package, because the only
-         editor was page furniture on the Tables lens. The create drawer grew
-         an edit mode (js/components/package_drawer.js), so the verb now happens
-         on the object you are standing on, exactly as create already does.
-         Reload on save: the hero, the "Appears as" copy and the status chip all
-         render server-side from the row this just changed. #}
-      <button type="button" class="btn btn-secondary btn-sm" id="apd-edit-details">Edit details…</button>
+      {# A LINK to the builder, like every other verb on this page. It was a
+         button opening the create/edit form as a drawer over this page, which
+         made the same form the Library opens as a full page read as a lesser
+         thing here. #}
+      <a class="btn btn-secondary btn-sm" href="/admin/data-packages/{{ pkg.id | urlencode }}/edit">Edit details&hellip;</a>
       {# "Open analyst page" — an honest label where the old view-as wording
          claimed a preview: the reader arrives as THEMSELVES (admin chrome
          swapped for the reading page, manage cluster still visible), not as
@@ -560,398 +398,100 @@
   </div>
 </div>
 
-{# ── Add-tables drawer ──────────────────────────────────────────────────
-   The shared drawer chrome (css/drawer.css), no steps strip: this is one
-   decision made many times, not a sequence. Rows are SERVER-rendered so the
-   toolbar can be a plain FilterToolbar over real DOM — the same engine the
-   Library runs on, rather than a second filter implementation living in this
-   page's script. #}
-<div class="ds-drawer ds-drawer--wide" id="apd-add-drawer" role="dialog" aria-modal="true"
-     aria-labelledby="apd-add-title" hidden>
-  <div class="ds-drawer__backdrop" data-apd-close></div>
-  <div class="ds-drawer__panel">
-    <div class="ds-drawer__head">
-      <div class="ds-drawer__head-main">
-        <h2 class="ds-drawer__title" id="apd-add-title">Add tables</h2>
-        <p class="ds-drawer__sub">A table reaches analysts only through a package. Pick the ones <strong>{{ pkg.name }}</strong> should carry.</p>
-      </div>
-      <button type="button" class="ds-drawer__x" data-apd-close aria-label="Close">&times;</button>
-    </div>
-
-    <div class="ds-drawer__body">
-      <div class="apd-pickbar">
-        <div class="fbar" role="group" aria-label="Search, filter and sort registered tables">
-          <div class="fbar__search" role="search">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>
-            <input type="search" id="apd-add-search" placeholder="Search tables…" autocomplete="off"
-                   aria-label="Search registered tables">
-          </div>
-
-          {# Categories, each revealing its options in a secondary popover —
-             the same `.fbar-cat` component the Library's Filter menu uses.
-             Only vocabularies with something in them render, so the menu can
-             never offer a filter that matches nothing. #}
-          <div class="fbar-filter">
-            <button type="button" class="fbar-filter__btn" id="apd-add-filter-btn" aria-haspopup="true" aria-expanded="false">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
-              Filter
-              <span class="fbar-filter__n" hidden>0</span>
-            </button>
-            <div class="fbar-menu fbar-menu--cats" id="apd-add-filter-menu" role="menu" aria-label="Filter tables" hidden>
-              {% for facet_key, cat_label in [('source', 'Source'), ('mode', 'Query mode'), ('bucket', 'Bucket')] %}
-              {% set options = candidate_facets.get(facet_key) or [] %}
-              {% if options %}
-              <div class="fbar-cat" data-cat="{{ facet_key }}">
-                <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
-                  <span class="fbar-cat__label">{{ cat_label }}</span>
-                  <span class="fbar-cat__end">
-                    <span class="fbar-cat__n" data-cat-count="{{ facet_key }}" hidden>0</span>
-                    <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </span>
-                </button>
-                <div class="fbar-cat__pop" hidden>
-                  {% for value, n in options %}
-                  <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ facet_key }}" value="{{ value }}"><span class="fbar-menu__opt-text">{{ value }}</span><span class="fbar-menu__opt-n">{{ n }}</span></label>
-                  {% endfor %}
-                </div>
-              </div>
-              {% endif %}
-              {% endfor %}
-              <div class="fbar-menu__foot">
-                <button type="button" data-fbar-clear>Clear</button>
-                <button type="button" data-fbar-done>Done</button>
-              </div>
-            </div>
-          </div>
-
-          {# The one condition worth surfacing at rest. "In no package" is the
-             pile this whole page exists to drain — a table nobody has bundled
-             reaches nobody — so it rides the bar as a pressed-state button
-             rather than one level deep in the menu. #}
-          {% set _unpackaged_n = candidate_tables | rejectattr('packaged') | list | length %}
-          {% if _unpackaged_n and _unpackaged_n < candidate_tables|length %}
-          <button type="button" class="fbar-toggle" id="apd-add-unpackaged"
-                  data-facet="unpackaged" data-facet-value="1" aria-pressed="false"
-                  aria-label="In no package — tables no analyst can pull yet">
-            <span>In no package</span>
-            <span class="fbar-toggle__n">{{ _unpackaged_n }}</span>
-          </button>
-          {% endif %}
-
-          {# The real control is the <select> — FilterToolbar listens to it —
-             with the custom dropdown as its same-container twin, which is
-             what paper renders in its place (#1055). Same pattern as the
-             Library's sort. #}
-          <div class="fbar-select">
-            <select id="apd-add-sort" aria-label="Sort tables" class="ds-dropdown-native">
-              <option value="name_asc">Name A–Z</option>
-              <option value="name_desc">Name Z–A</option>
-              <option value="source_asc">Source A–Z</option>
-              <option value="bucket_asc">Bucket A–Z</option>
-              <option value="synced_desc">Recently synced</option>
-              <option value="synced_asc">Least recently synced</option>
-              <option value="rows_desc">Most rows first</option>
-            </select>
-            {{ ds.dropdown(
-              id='apd-add-sort-dd', target='apd-add-sort',
-              aria_label='Sort tables', selected='name_asc',
-              options=[
-                {'value': 'name_asc', 'label': 'Name A–Z'},
-                {'value': 'name_desc', 'label': 'Name Z–A'},
-                {'value': 'source_asc', 'label': 'Source A–Z'},
-                {'value': 'bucket_asc', 'label': 'Bucket A–Z'},
-                {'value': 'synced_desc', 'label': 'Recently synced'},
-                {'value': 'synced_asc', 'label': 'Least recently synced'},
-                {'value': 'rows_desc', 'label': 'Most rows first'},
-              ],
-            ) }}
-          </div>
-        </div>
-        <div class="fbar-chips" id="apd-add-chips" hidden></div>
-        <p class="apd-pickcount"><span id="apd-add-count"></span></p>
-      </div>
-
-      <div id="apd-add-list">
-        {% for t in candidate_tables %}
-        {# Every filterable fact rides the row as a data-* attribute; the
-           engine reads them off the DOM and never asks the server again. #}
-        <label class="apd-pick" data-pick-table="{{ t.id }}"
-               data-search="{{ (t.name ~ ' ' ~ t.bucket ~ ' ' ~ t.source_type) | lower }}"
-               data-name="{{ t.name | lower }}"
-               data-source="{{ t.source_type }}"
-               data-mode="{{ t.mode.word }}"
-               data-bucket="{{ t.bucket }}"
-               data-rows="{{ t.rows }}"
-               data-synced="{{ t.last_sync }}"
-               data-unpackaged="{{ '' if t.packaged else '1' }}">
-          <input type="checkbox" value="{{ t.id }}">
-          <span class="apd-pick__txt">
-            <span class="apd-pick__name">{{ t.name }}</span>
-            <span class="apd-pick__sub">
-              {{ t.source_type or '—' }}{% if t.bucket %} · {{ t.bucket }}{% endif %} · {{ t.mode.label }}
-              {%- if t.rows %} · {{ '{:,}'.format(t.rows) }} rows{% endif %}
-              {%- if t.age_minutes is none %} · never synced
-              {%- elif t.age_minutes < 60 %} · synced {{ t.age_minutes }} min ago
-              {%- elif t.age_minutes < 2880 %} · synced {{ (t.age_minutes // 60) }} h ago
-              {%- else %} · synced {{ (t.age_minutes // 1440) }} d ago{% endif %}
-            </span>
-          </span>
-          {# No per-row "in no package" badge. On a fresh instance that is
-             almost every row, and a marker on 450 of 458 rows distinguishes
-             nothing — the toolbar's toggle carries the count and narrows the
-             list to them, which is the useful form of the same fact. #}
-        </label>
-        {% endfor %}
-      </div>
-      <div class="dsec-empty" id="apd-add-none" hidden>
-        <strong>No table matches</strong>
-        Try a different search, or clear the filters.
-      </div>
-      {% if not candidate_tables %}
-      <div class="dsec-empty">
-        <strong>Nothing left to add</strong>
-        Every registered table is already in this package.
-      </div>
-      {% endif %}
-    </div>
-
-    <div class="ds-drawer__foot">
-      <span id="apd-add-selected" class="ds-drawer__hint">Nothing selected</span>
-      <span class="ds-drawer__foot-gap"></span>
-      <button type="button" class="btn btn-secondary" data-apd-close>Cancel</button>
-      <button type="button" class="btn btn-primary" id="apd-add-save" disabled>Add selected</button>
-    </div>
-  </div>
-</div>
-
-{# ── Share drawer ───────────────────────────────────────────────────────
-   Every group on the instance, each with the tier it holds. Writes land
-   immediately — a group list is a set of independent decisions, not a form
-   with a Save, and the drawer stays open so setting up three groups is one
-   visit. #}
-<div class="ds-drawer" id="apd-share-drawer" role="dialog" aria-modal="true"
-     aria-labelledby="apd-share-title" hidden>
-  <div class="ds-drawer__backdrop" data-apd-close></div>
-  <div class="ds-drawer__panel">
-    <div class="ds-drawer__head">
-      <div class="ds-drawer__head-main">
-        <h2 class="ds-drawer__title" id="apd-share-title">Share {{ pkg.name }}</h2>
-        <p class="ds-drawer__sub">
-          <strong>Optional</strong> shows it in members' Library for them to add;
-          <strong>Automatic</strong> puts it in their workspace on the next sync.
-        </p>
-      </div>
-      <button type="button" class="ds-drawer__x" data-apd-close aria-label="Close">&times;</button>
-    </div>
-    <div class="ds-drawer__body">
-      <p class="ds-drawer__lede">Changes save as you make them.</p>
-      <div id="apd-share-picker"></div>
-    </div>
-    <div class="ds-drawer__foot">
-      <span class="ds-drawer__foot-gap"></span>
-      <button type="button" class="btn btn-primary" data-apd-close>Done</button>
-    </div>
-  </div>
-</div>
-
-<div class="apd-toast" id="apd-toast" role="status" aria-live="polite"></div>
-
-<script src="{{ static_url('js/filter_toolbar.js') }}"></script>
-{# NOT deferred: the click handler below is wired at parse time and would
-   otherwise reference window.AgnesPackageDrawer before it exists. #}
-{# package_drawer builds the shared builder workspace when opened
-   from "+ New", so the shell has to be defined before it runs. #}
-<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
-<script src="{{ static_url('js/components/package_drawer.js') }}"></script>
-<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
+{# The page's whole script: two read-outs the server cannot render on its own.
+
+   It used to be ~600 lines, because the page also WROTE — grants, tiers,
+   table membership — each with its own optimistic render, a `dirty` flag, a
+   debounced reload and a toast, plus the "recounting…" state that existed
+   only because a client-side edit could not recompute a reach that is a UNION
+   over group memberships. All of it left with the drawers: writing a package
+   happens in the builder, and this page reads server truth exactly once. #}
 (function () {
   "use strict";
 
-  const PKG_ID     = {{ pkg.id | tojson }};
-  const PKG_NAME   = {{ pkg.name | tojson }};
-  const GROUPS     = {{ all_groups | tojson }};
-  // Live sharing state — the server's answer, then whatever we write.
-  let SHARING      = {{ sharing | tojson }};
-  const DELIVERY   = {{ delivery | tojson }};
-  const GRANTS_API = "/api/admin/grants";
-  const PKG_API    = "/api/admin/data-packages/" + encodeURIComponent(PKG_ID);
+  {# Rendered here rather than in Jinja because both read-outs are built from
+     the same rows in two different shapes, and the delivery sentences branch
+     six ways — that is a script's job, not a template's. #}
+  const SHARING  = {{ sharing | tojson }};
+  const DELIVERY = {{ delivery | tojson }};
 
   const $ = (id) => document.getElementById(id);
 
-  // "Edit details…" — the shared create/edit drawer, opened over this page.
-  // A full reload on save rather than a patch of the DOM: the name shows in
-  // the hero, the breadcrumb, the "Appears as" block and the page title, and
-  // re-rendering four places by hand is how they drift apart.
-  /* Editing on purpose goes to the builder PAGE, not an overlay: authoring a
-     package was a workspace and revising it was a drawer on top of whatever
-     you were looking at — the same component at two sizes, which made the
-     edit read as the lesser thing. The drawer keeps the case it was built for
-     (mid-sentence on /admin/tables), and this button leaves. */
-  const editBtn = $("apd-edit-details");
-  if (editBtn) {
-    editBtn.addEventListener("click", () => {
-      window.location.href = `/admin/data-packages/${encodeURIComponent(PKG_ID)}/edit`;
-    });
-  }
-  const toastEl = $("apd-toast");
-
-  // A grant change moves numbers this page CANNOT re-derive client-side: the
-  // population reached is a UNION of group memberships (overlaps are not
-  // knowable from member counts alone), and who has pulled is a users table
-  // away. So rather than run a stale-state fiction — which had the delivery
-  // panel announcing "sharing changed" while At a glance still printed the
-  // old reach on the same screen — a change simply reloads, and every number
-  // on the page stays server-truth.
-  //
-  // The same applies to REMOVING a table: the panel's own count is exact
-  // client-side, but "Tables", "Source" and "Freshness" in At a glance are
-  // all derived from the member set, and updating only the count left the
-  // two halves of one screen disagreeing.
-  //
-  // Not reloaded while a drawer is OPEN: setting up three groups would reload
-  // out from under the second one. DEBOUNCED, so removing four tables in a
-  // row costs one reload after the last, not four.
-  let dirty = false;
-  let settleTimer = null;
-  function drawerOpen() { return !!document.querySelector(".ds-drawer.is-open"); }
-  function settle() {
-    if (!dirty || drawerOpen()) return;
-    clearTimeout(settleTimer);
-    settleTimer = setTimeout(() => window.location.reload(), 600);
-  }
-
-  function toast(msg, ok) {
-    toastEl.textContent = msg;
-    toastEl.className = "apd-toast show " + (ok ? "ok" : "fail");
-    clearTimeout(toastEl._t);
-    toastEl._t = setTimeout(() => { toastEl.className = "apd-toast"; }, 3500);
-  }
   function esc(s) {
     return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
                           .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
   function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
-  function grantOf(groupId) { return SHARING.find((s) => s.group_id === groupId); }
-  function groupOf(groupId) { return GROUPS.find((g) => g.id === groupId); }
 
-  // ── Drawers ───────────────────────────────────────────────────────
-  // `hidden` and `.is-open` together: the attribute keeps the drawer out of
-  // the accessibility tree while closed (drawer.css only governs display),
-  // the class is the sheet's own open vocabulary.
-  function openDrawer(id) {
-    const d = $(id);
-    if (!d) return;
-    d.hidden = false;
-    d.classList.add("is-open");
-    document.body.style.overflow = "hidden";
-    const focusable = d.querySelector("input, button:not([disabled])");
-    if (focusable) focusable.focus();
-  }
-  function closeDrawers() {
-    document.querySelectorAll(".ds-drawer.is-open").forEach((d) => {
-      d.classList.remove("is-open");
-      d.hidden = true;
-    });
-    document.body.style.overflow = "";
-    settle();
-  }
-
-  // ── Sharing rows ──────────────────────────────────────────────────
+  /* ── Sharing rows ──────────────────────────────────────────────────
+     Who reaches this package, and on what tier. The tier is a WORD now, not
+     a segmented control: this page states the grant, the builder changes it. */
   function renderShareRows() {
     const host = $("apd-share-rows");
+    if (!host) return;
     if (!SHARING.length) {
       host.innerHTML =
         '<p class="apg-sec-desc" style="margin:0;">' +
         "Shared with nobody — no analyst can see this package yet." +
         "</p>";
-    } else {
-      // The group the admin arrived from leads the list and is marked, so
-      // the block answers "where does Finance sit here" first and "who else
-      // reaches this" second. Without it the page threw away the filter the
-      // admin had applied and showed an undifferentiated list.
-      const fromGroup = {{ (group_ctx.group_id | tojson) if group_ctx else "null" }};
-      const ordered = fromGroup
-        ? SHARING.slice().sort((a, b) =>
-            (b.group_id === fromGroup ? 1 : 0) - (a.group_id === fromGroup ? 1 : 0))
-        : SHARING;
-      host.innerHTML = ordered.map((s) => {
-        const auto = s.requirement === "required";
-        const isFrom = fromGroup && s.group_id === fromGroup;
-        const sub = s.is_everyone
-          ? "the whole company — every account, automatically"
-          : plural(s.member_count || 0, "member", "members");
-        return `
-        <div class="apd-share-row${isFrom ? " is-from" : ""}" data-share-group="${esc(s.group_id)}">
-          <div class="apd-ava ${s.is_everyone ? "is-everyone" : ""}"
-               role="img" aria-label="Group">${AgnesKindGlyph.get("group")}</div>
-          <div class="apd-share-row__txt">
-            <div class="apd-g-name">${esc(s.group_name)}${
-              isFrom ? ` <span class="apd-g-from">you came from here</span>` : ""}</div>
-            <div class="apd-g-sub">${esc(sub)}</div>
-          </div>
-          <div class="apd-tier" role="group" aria-label="Access tier for ${esc(s.group_name)}">
-            <button type="button" data-tier="available" title="available"
-                    class="${auto ? "" : "on"}">Optional</button>
-            <button type="button" data-tier="required" title="required"
-                    class="${auto ? "on auto" : ""}">Automatic</button>
-          </div>
-          <button type="button" class="apd-rm" data-unshare="${esc(s.group_id)}"
-                  title="Stop sharing with ${esc(s.group_name)}"
-                  aria-label="Stop sharing with ${esc(s.group_name)}">✕</button>
-        </div>`;
-      }).join("");
+      return;
     }
-    renderDelivery();
-    // "Shared with N groups" in At a glance is the same fact — keep them
-    // in step or the page contradicts itself on the same screen.
-    const gf = $("apd-fact-groups");
-    gf.textContent = plural(SHARING.length, "group", "groups");
-    gf.classList.toggle("is-warn", SHARING.length === 0);
-    // The alarm band above the columns is the same fact once more.
-    const note = $("apd-unshared-note");
-    if (note) note.hidden = SHARING.length > 0;
-    // Reach is a UNION over group memberships — not derivable here once a
-    // grant moves. It must not keep printing the server's pre-edit number
-    // beside a delivery panel that has already changed; it goes quiet until
-    // the reload brings the real one back.
-    if (dirty) $("apd-fact-reach").textContent = "recounting…";
+    // The group the admin arrived from leads the list and is marked, so the
+    // block answers "where does Finance sit here" first and "who else reaches
+    // this" second. Without it the page threw away the filter the admin had
+    // applied and showed an undifferentiated list.
+    const fromGroup = {{ (group_ctx.group_id | tojson) if group_ctx else "null" }};
+    const ordered = fromGroup
+      ? SHARING.slice().sort((a, b) =>
+          (b.group_id === fromGroup ? 1 : 0) - (a.group_id === fromGroup ? 1 : 0))
+      : SHARING;
+    host.innerHTML = ordered.map((s) => {
+      const isFrom = fromGroup && s.group_id === fromGroup;
+      const who = s.is_everyone
+        ? "the whole company — every account"
+        : plural(s.member_count || 0, "member", "members");
+      const tier = s.requirement === "required"
+        ? "gets it automatically"
+        : "can add it themselves";
+      return `
+      <div class="apd-share-row${isFrom ? " is-from" : ""}" data-share-group="${esc(s.group_id)}">
+        <div class="apd-ava ${s.is_everyone ? "is-everyone" : ""}"
+             role="img" aria-label="Group">${AgnesKindGlyph.get("group")}</div>
+        <div class="apd-share-row__txt">
+          <div class="apd-g-name">${esc(s.group_name)}${
+            isFrom ? ` <span class="apd-g-from">you came from here</span>` : ""}</div>
+          <div class="apd-g-sub">${esc(who)} · ${esc(tier)}</div>
+        </div>
+      </div>`;
+    }).join("");
   }
 
+  /* ── Delivery read-out ─────────────────────────────────────────────
+     Shared ≠ delivered, and every branch here is a state in which the two
+     come apart. Server truth throughout — nothing on this page edits it. */
   function renderDelivery() {
+    const host = $("apd-delivery");
+    if (!host) return;
     const autoCount = SHARING.filter((s) => s.requirement === "required").length;
-    const optCount = SHARING.length - autoCount;
     const lines = [];
 
     if (!SHARING.length) {
       lines.push(['none', "Nothing is delivered — share it with a group first."]);
-    } else if (dirty) {
-      // Mid-edit inside the drawer: state what is TRUE (the tiers just set),
-      // never a reach the page can no longer compute. The reload on close
-      // restores the full read-out.
-      if (autoCount) {
-        lines.push(['auto',
-          `<b>${autoCount}</b> group${autoCount === 1 ? " gets" : "s get"} it automatically.`]);
-      }
-      if (optCount) {
-        lines.push(['none',
-          `<b>${optCount}</b> group${optCount === 1 ? " can" : "s can"} add it themselves.`]);
-      }
     } else if (DELIVERY.nothing_to_deliver) {
       // Nothing in this package has ever synced, so there is nothing on the
       // server for anyone to pull. Reporting "not yet delivered" here blamed
-      // the analyst for the server's state; the fix the admin needs is on
-      // the source, not on the person.
+      // the analyst for the server's state; the fix the admin needs is on the
+      // source, not on the person.
       lines.push(['stale',
         `Nothing to deliver yet — <b>no table in this package has ever synced</b>. Grants are in place; the data is not.`]);
-      lines.push(['none',
-        `<a href="/admin/sync">Check the sync →</a>`]);
+      lines.push(['none', `<a href="/admin/sync">Check the sync →</a>`]);
     } else if (DELIVERY.withheld) {
       // A lifecycle status overrides the grant arithmetic. `draft` is hidden
       // from analysts and `coming-soon` is undeliverable (both enforced in
       // app/services/stack_resolver.py), so reporting "N people get this
-      // automatically" here would restate the exact claim that gate exists
-      // to stop. Say what the grants WOULD do, and why they currently do not.
+      // automatically" here would restate the exact claim that gate exists to
+      // stop. Say what the grants WOULD do, and why they currently do not.
       const would = DELIVERY.auto_people + DELIVERY.optional_only;
       if (DELIVERY.withheld === 'hidden') {
         lines.push(['stale',
@@ -981,400 +521,21 @@
         lines.push(['none',
           `<b>${DELIVERY.optional_only}</b> more can add it themselves from their Library.`]);
       }
+      // Stated only when there is a mix; on an all-automatic package the two
+      // lines above already say it.
+      if (autoCount && autoCount !== SHARING.length) {
+        lines.push(['none',
+          `<b>${autoCount}</b> of ${SHARING.length} groups have it automatically.`]);
+      }
     }
-    $("apd-delivery").innerHTML = lines.map(([kind, html]) =>
+    host.innerHTML = lines.map(([kind, html]) =>
       `<div class="apd-d-line"><span class="apd-dot apd-dot--${kind}"></span><span>${html}</span></div>`
     ).join("");
   }
 
-  // ── Grant writes — the same rows a group's Access tab writes ───────
-  async function createGrant(group, requirement) {
-    const r = await fetch(GRANTS_API, {
-      method: "POST", credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        group_id: group.id, resource_type: "data_package",
-        resource_id: PKG_ID, requirement,
-      }),
-    });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
-    const created = await r.json();
-    SHARING.push({
-      grant_id: created.id, group_id: group.id, group_name: group.name,
-      requirement, member_count: group.member_count, is_everyone: group.is_everyone,
-    });
-    SHARING.sort((a, b) => (a.is_everyone === b.is_everyone)
-      ? a.group_name.localeCompare(b.group_name) : (a.is_everyone ? -1 : 1));
-    dirty = true;
-  }
-  async function updateGrant(grant, requirement) {
-    const r = await fetch(`${GRANTS_API}/${encodeURIComponent(grant.grant_id)}`, {
-      method: "PUT", credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requirement }),
-    });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
-    grant.requirement = requirement;
-    dirty = true;
-  }
-  async function deleteGrant(grant) {
-    const r = await fetch(`${GRANTS_API}/${encodeURIComponent(grant.grant_id)}`, {
-      method: "DELETE", credentials: "include",
-    });
-    if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`);
-    SHARING.splice(SHARING.indexOf(grant), 1);
-    dirty = true;
-  }
-
-  // ── Share picker ──────────────────────────────────────────────────
-  function renderSharePicker() {
-    $("apd-share-picker").innerHTML = GROUPS.map((g) => {
-      const grant = grantOf(g.id);
-      const sub = g.is_everyone
-        ? "the whole company — every account, automatically"
-        : plural(g.member_count, "member", "members");
-      return `
-      <div class="apd-pick" data-pick-group="${esc(g.id)}">
-        <input type="checkbox" ${grant ? "checked" : ""} aria-label="Share with ${esc(g.name)}">
-        <span class="apd-pick__txt">
-          <span class="apd-pick__name">${esc(g.name)}</span>
-          <span class="apd-pick__sub">${esc(sub)}</span>
-        </span>
-        <div class="apd-tier" role="group" aria-label="Access tier for ${esc(g.name)}">
-          <button type="button" data-tier="available"
-                  class="${grant && grant.requirement !== "required" ? "on" : ""}">Optional</button>
-          <button type="button" data-tier="required"
-                  class="${grant && grant.requirement === "required" ? "on auto" : ""}">Automatic</button>
-        </div>
-      </div>`;
-    }).join("");
-  }
-
-  // ── Add-tables drawer: the shared toolbar over server-rendered rows ──
-  // FilterToolbar owns search, the facet menu, the "In no package" toggle and
-  // the sort; this page owns only what is specific to PICKING — the running
-  // selection and what the foot says about it. A selection survives filtering
-  // (the checkbox stays checked on a hidden row), so narrowing to Keboola,
-  // ticking four, then narrowing to BigQuery and ticking two adds six.
-  const addList = $("apd-add-list");
-  function selectedIds() {
-    return Array.from(addList.querySelectorAll("input:checked")).map((i) => i.value);
-  }
-  // Cancel means cancel: a selection abandoned once must not be waiting to be
-  // confirmed the next time the drawer opens.
-  function resetAddSelection() {
-    addList.querySelectorAll("input:checked").forEach((i) => { i.checked = false; });
-  }
-  function renderAddSelection() {
-    const n = selectedIds().length;
-    $("apd-add-selected").textContent = n ? plural(n, "table selected", "tables selected") : "Nothing selected";
-    $("apd-add-save").disabled = n === 0;
-    $("apd-add-save").textContent = n ? `Add ${n}` : "Add selected";
-  }
-
-  if (window.FilterToolbar && addList) {
-    window.FilterToolbar.init({
-      rows: "#apd-add-list .apd-pick",
-      search: { el: "#apd-add-search", attr: "data-search" },
-      facets: [
-        { key: "source", attr: "data-source", label: "Source" },
-        { key: "mode", attr: "data-mode", label: "Query mode" },
-        { key: "bucket", attr: "data-bucket", label: "Bucket" },
-        { key: "unpackaged", attr: "data-unpackaged", label: "In no package",
-          toggle: true, control: "#apd-add-unpackaged" },
-      ],
-      filterBtn: "#apd-add-filter-btn",
-      menu: "#apd-add-filter-menu",
-      chips: "#apd-add-chips",
-      // `data-synced` is an ISO timestamp, which sorts lexicographically —
-      // no parse, and a never-synced row (empty string) sorts first ascending,
-      // which is the order that surfaces the tables nobody is syncing.
-      sort: { el: "#apd-add-sort",
-              keys: { name: "data-name", source: "data-source",
-                      bucket: "data-bucket", synced: "data-synced", rows: "data-rows" },
-              numeric: ["rows"] },
-      count: { el: "#apd-add-count", noun: "table" },
-      noResults: "#apd-add-none",
-    });
-  }
-
-  async function addTables(ids) {
-    let added = 0;
-    for (const id of ids) {
-      const r = await fetch(PKG_API + "/tables", {
-        method: "POST", credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ table_id: id }),
-      });
-      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
-      added += 1;
-    }
-    return added;
-  }
-
-  // ── Table selection, in the package's own list ─────────────────────
-  function pickedRows() {
-    return Array.from(document.querySelectorAll("[data-pick-row]:checked"));
-  }
-  function renderRowSelection() {
-    const picked = pickedRows();
-    const bar = $("apd-selbar");
-    if (!bar) return;
-    bar.hidden = picked.length === 0;
-    $("apd-selcount").textContent = plural(picked.length, "table selected", "tables selected");
-    document.querySelectorAll("[data-table-row]").forEach((tr) => {
-      const box = tr.querySelector("[data-pick-row]");
-      tr.classList.toggle("is-picked", !!(box && box.checked));
-    });
-    const all = $("apd-selall");
-    if (all) {
-      const total = document.querySelectorAll("[data-pick-row]").length;
-      all.checked = total > 0 && picked.length === total;
-      all.indeterminate = picked.length > 0 && picked.length < total;
-    }
-  }
-
-  async function removeTable(id) {
-    const r = await fetch(PKG_API + "/tables/" + encodeURIComponent(id), {
-      method: "DELETE", credentials: "include",
-    });
-    if (!r.ok && r.status !== 404) throw new Error(`HTTP ${r.status}`);
-    const row = document.querySelector(`[data-table-row="${CSS.escape(id)}"]`);
-    if (row) row.remove();
-  }
-
-  // ── Wiring ────────────────────────────────────────────────────────
-  document.addEventListener("click", async (e) => {
-    // -- open / close drawers
-    const opener = e.target.closest("[data-apd-open]");
-    if (opener) {
-      if (opener.dataset.apdOpen === "share") { renderSharePicker(); openDrawer("apd-share-drawer"); }
-      else { resetAddSelection(); renderAddSelection(); openDrawer("apd-add-drawer"); }
-      return;
-    }
-    if (e.target.closest("[data-apd-close]")) { closeDrawers(); return; }
-
-    // -- remove one table
-    const rm = e.target.closest("[data-remove]");
-    if (rm) {
-      /* Confirm first. The bulk path always did and the single-row ✕ did
-         not, which is the wrong way round for a control that sits on every
-         row and is one mis-aimed click from the tier buttons beside it.
-         The dialog names the TABLE and the CONSEQUENCE — analysts stop
-         receiving it — rather than asking "are you sure": what makes this
-         safe to confirm is knowing the table stays registered and can be
-         added back, which "are you sure" cannot tell you. */
-      const row = rm.closest("[data-table-row]");
-      const nameEl = row && row.querySelector("strong");
-      const name = nameEl ? nameEl.textContent.trim() : "this table";
-      const ok = window.confirmModal
-        ? await window.confirmModal({
-            title: `Remove ${name} from ${PKG_NAME}?`,
-            message: "Analysts who receive this package stop receiving the table "
-              + "on their next sync. The table stays registered, so it can be "
-              + "added back — and anything granted to them another way is untouched.",
-            confirmText: "Remove table",
-          })
-        : true;
-      if (!ok) return;
-      rm.disabled = true;
-      try {
-        await removeTable(rm.dataset.remove);
-        const left = document.querySelectorAll("[data-table-row]").length;
-        $("apd-count").textContent = left + " in this package";
-        renderRowSelection();
-        toast("Removed from this package", true);
-        dirty = true;
-        settle();
-      } catch (err) {
-        rm.disabled = false;
-        toast("Could not remove: " + err.message, false);
-      }
-      return;
-    }
-
-    // -- bulk removal
-    if (e.target.closest("#apd-selremove")) {
-      const btn = e.target.closest("#apd-selremove");
-      const picked = pickedRows();
-      if (!picked.length) return;
-      const ok = window.confirmModal
-        ? await window.confirmModal({
-            title: "Remove " + plural(picked.length, "table", "tables") + " from " + PKG_NAME + "?",
-            message: "Analysts who receive this package stop receiving them on their "
-              + "next sync. The tables stay registered, so they can be added back.",
-            confirmText: "Remove " + plural(picked.length, "table", "tables"),
-          })
-        : true;
-      if (!ok) return;
-      btn.disabled = true;
-      let done = 0;
-      try {
-        for (const box of picked) { await removeTable(box.dataset.pickRow); done += 1; }
-        toast(plural(done, "table removed", "tables removed"), true);
-      } catch (err) {
-        toast("Could not remove: " + err.message, false);
-      } finally {
-        btn.disabled = false;
-        $("apd-count").textContent = document.querySelectorAll("[data-table-row]").length + " in this package";
-        renderRowSelection();
-        dirty = true;
-        settle();
-      }
-      return;
-    }
-    if (e.target.closest("#apd-selclear")) {
-      document.querySelectorAll("[data-pick-row]").forEach((b) => { b.checked = false; });
-      renderRowSelection();
-      return;
-    }
-
-    // -- save the add-tables selection
-    if (e.target.closest("#apd-add-save")) {
-      const btn = e.target.closest("#apd-add-save");
-      const ids = selectedIds();
-      if (!ids.length) return;
-      btn.disabled = true;
-      try {
-        const n = await addTables(ids);
-        toast(plural(n, "table added", "tables added"), true);
-        // The new rows carry sync state the picker doesn't hold, and the
-        // At-a-glance facts are derived from the whole member set — the same
-        // reason a removal settles. One round-trip, always right.
-        dirty = true;
-        closeDrawers();
-      } catch (err) {
-        btn.disabled = false;
-        toast("Could not add: " + err.message, false);
-      }
-      return;
-    }
-
-    // -- stop sharing (row ✕)
-    const un = e.target.closest("[data-unshare]");
-    if (un) {
-      const grant = grantOf(un.dataset.unshare);
-      if (!grant) return;
-      /* The more consequential of the two removals: taking a table out of a
-         package narrows what a group receives, but un-sharing takes the
-         whole package away from everyone in that group at once. It gets the
-         same confirmation, worded as who loses what. */
-      const ok = window.confirmModal
-        ? await window.confirmModal({
-            title: `Stop sharing ${PKG_NAME} with ${grant.group_name}?`,
-            message: "Everyone in that group loses this package and every table in "
-              + "it on their next sync, unless another group they belong to also "
-              + "has it. Sharing it again restores them.",
-            confirmText: "Stop sharing",
-          })
-        : true;
-      if (!ok) return;
-      try {
-        await deleteGrant(grant);
-        toast(`No longer shared with ${grant.group_name}`, true);
-      } catch (err) {
-        toast("Could not save: " + err.message, false);
-      }
-      renderShareRows();
-      settle();
-      return;
-    }
-
-    // -- tier toggle, on a row OR in the drawer
-    const tierBtn = e.target.closest("[data-tier]");
-    if (tierBtn) {
-      const host = tierBtn.closest("[data-share-group], [data-pick-group]");
-      if (!host) return;
-      const groupId = host.dataset.shareGroup || host.dataset.pickGroup;
-      const group = groupOf(groupId);
-      const requirement = tierBtn.dataset.tier;
-      const grant = grantOf(groupId);
-      try {
-        if (!grant) {
-          // Picking a tier on an unshared group is itself the decision to
-          // share — no reason to make the reader tick a box first.
-          await createGrant(group, requirement);
-          const box = host.querySelector('input[type="checkbox"]');
-          if (box) box.checked = true;
-        } else if (grant.requirement !== requirement) {
-          await updateGrant(grant, requirement);
-        } else {
-          return;
-        }
-        toast(requirement === "required"
-          ? `${group.name}: automatic — lands in members' workspaces on the next sync`
-          : `${group.name}: optional — members add it themselves`, true);
-      } catch (err) {
-        toast("Could not save: " + err.message, false);
-      }
-      renderShareRows();
-      if ($("apd-share-drawer").classList.contains("is-open")) renderSharePicker();
-      return;
-    }
-  });
-
-  document.addEventListener("change", async (e) => {
-    // Add-tables picker: the running selection.
-    if (e.target.closest("#apd-add-list")) { renderAddSelection(); return; }
-
-    // The package's own table list: per row, and the header's select-all.
-    if (e.target.matches("#apd-selall")) {
-      // Select-all means "everything I can currently see", which on this
-      // table is everything — the list is not filtered. Kept explicit so it
-      // stays right if it ever is.
-      const on = e.target.checked;
-      document.querySelectorAll("[data-pick-row]").forEach((b) => { b.checked = on; });
-      renderRowSelection();
-      return;
-    }
-    if (e.target.matches("[data-pick-row]")) { renderRowSelection(); return; }
-
-    // Share drawer: share (default Optional) / stop sharing.
-    const pick = e.target.closest("[data-pick-group]");
-    if (!pick || !e.target.matches('input[type="checkbox"]')) return;
-    const box = e.target;
-    const group = groupOf(pick.dataset.pickGroup);
-    box.disabled = true;
-    try {
-      const grant = grantOf(group.id);
-      if (box.checked && !grant) {
-        await createGrant(group, "available");
-        toast(`Shared with ${group.name} (optional)`, true);
-      } else if (!box.checked && grant) {
-        await deleteGrant(grant);
-        toast(`No longer shared with ${group.name}`, true);
-      }
-    } catch (err) {
-      box.checked = !box.checked;
-      toast("Could not save: " + err.message, false);
-    } finally {
-      box.disabled = false;
-      renderShareRows();
-      renderSharePicker();
-    }
-  });
-
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && drawerOpen()) closeDrawers();
-  });
-
-  // Deferred to DOMContentLoaded on purpose. This inline block lives in the
-  // page's content, and `_app_scripts.html` — which loads
-  // static/js/kind_glyph.js, the source of `window.AgnesKindGlyph` — is
-  // included at the END of the body by base_ds.html. Calling straight through
-  // therefore threw `ReferenceError: AgnesKindGlyph is not defined` on the
-  // first row, and because `renderDelivery()` is invoked from INSIDE
-  // `renderShareRows()`, one missing glyph silently took out the Sharing
-  // list, the "Shared with N groups" fact, the delivery read-out and row
-  // selection — while the sidebar (server-rendered) kept saying "Shared with
-  // 3 groups". The page contradicted itself on one screen.
-  //
-  // It only reproduced on a package that IS shared: the throw is inside
-  // `SHARING.map`, so an unshared package rendered fine and the empty state's
-  // "Shared with nobody" was mistaken for the truth.
   document.addEventListener("DOMContentLoaded", () => {
     renderShareRows();
-    renderRowSelection();
+    renderDelivery();
   });
 })();
 </script>

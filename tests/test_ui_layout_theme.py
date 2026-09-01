@@ -2580,9 +2580,9 @@ class TestSharedDetailLayout:
         made "manage this package" a menu item that navigated to
         `/admin/tables?edit_package=` — the Tables lens, a page about something
         else. Managing the thing you are standing on now has its own labelled
-        home in the rail (`detail.manage`), and it edits in place through the
-        shared drawer. The overflow menu keeps only what it always promised:
-        the actions a READER has that are not what they came to do.
+        home in the rail (`detail.manage`), whose one door opens the admin
+        page. The overflow menu keeps only what it always promised: the actions
+        a READER has that are not what they came to do.
 
         The invariant the old test was really protecting is unchanged and still
         asserted here — the action is offered in exactly one place, and the
@@ -2592,7 +2592,10 @@ class TestSharedDetailLayout:
         self._package("menu-detail-pkg")
         text = web_client.get("/catalog/p/menu-detail-pkg", cookies=admin_cookie).text
         assert "data-manage" in text, "the rail must carry the governance cluster"
-        assert 'id="pkg-edit-btn"' in text, "and its in-place editor"
+        assert "detail-manage__door" in text, "and its one way out to Admin"
+        # Not an editor: a reading page that also writes is how the package
+        # ended up with three of them.
+        assert 'id="pkg-edit-btn"' not in text
         # Neither of the two older spellings survives, so it is offered once.
         assert 'class="detail-edit-icon"' not in text
         assert "Edit package metadata" not in text

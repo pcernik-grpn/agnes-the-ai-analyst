@@ -4872,6 +4872,13 @@ async def list_registry(
       - `rows` / `file_size_bytes`: the last successful sync's row count /
         parquet size, so the dashboard's "Rows" / "Size" columns aren't
         silently blank for tables that DID sync.
+      - `packaged`: is this table in ANY data package. A table in no package
+        reaches nobody — the product's central distribution rule — so it is
+        the one condition worth filtering a registry by, and the package
+        builder's picker offers it as a toggle. One batched membership read,
+        like the sync_state join above; False for every row if that read
+        fails, since a filter that silently claims everything is unpackaged
+        is worse than one that offers nothing.
     """
     repo = table_registry_repo()
     tables = repo.list_all()
@@ -4909,6 +4916,17 @@ async def list_registry(
         t["last_sync_display"] = str(ls)[:16] if ls else None  # "YYYY-MM-DD HH:MM"
         t["rows"] = state.get("rows") if state else None
         t["file_size_bytes"] = state.get("file_size_bytes") if state else None
+
+    packaged: set = set()
+    try:
+        from src.repositories import data_packages_repo
+
+        for ids in data_packages_repo().list_member_ids_bulk().values():
+            packaged.update(ids)
+    except Exception:
+        logger.exception("Failed to read data-package membership for registry")
+    for t in tables:
+        t["packaged"] = t.get("id") in packaged
 
     return {"tables": tables, "count": len(tables)}
 
