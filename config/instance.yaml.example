@@ -1219,6 +1219,16 @@ data_apps:
                                 # runtime image with it and extending that
                                 # list from what actually failed; otherwise
                                 # every hosted app crash-loops.
+  # Deploy-time exposure scan (#1946): a pure, best-effort static scan
+  # (src/data_apps/deploy_check.py) over the target commit before it is
+  # promoted to `agnes-live` — an exposed static-file root, the whole
+  # process environment echoed into a response, the injected AGNES_TOKEN
+  # echoed back, etc. `warn` (default) surfaces findings alongside a deploy
+  # that still runs; `block` refuses the deploy outright on any finding;
+  # `off` skips the scan. A repo_mode=external app's source never reaches
+  # Agnes, so it can't be scanned — `block` refuses those deploys too
+  # rather than silently exempting them from the operator's own policy.
+  deploy_checks: warn          # warn | block | off
 
 
 # --- Fact graph over Collections (optional) ---

@@ -4430,6 +4430,18 @@
             "description": "Files of one delta page pipelined at once for this run (1 = sequential).",
             "title": "Concurrency"
           },
+          "resync": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested.",
+            "title": "Resync"
+          },
           "timeout_s": {
             "anyOf": [
               {
@@ -4443,18 +4455,6 @@
             ],
             "description": "Hard ceiling for this one run, seconds (0 = unbounded).",
             "title": "Timeout S"
-          },
-          "resync": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested.",
-            "title": "Resync"
           }
         },
         "title": "ExtractionRunOptions",

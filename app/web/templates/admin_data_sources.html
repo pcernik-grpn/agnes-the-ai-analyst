@@ -2511,7 +2511,7 @@ function _sharepointFactsHtml(row) {
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Document extraction running inside Agnes (TCRD-226) — the built-in crawl→convert→anonymize→ingest lane.">In-Agnes extraction</span>
     <span class="ds-src__fact-v">${inAgnesParts.join(" · ")}</span>
-    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" ${extractionReady ? "" : "disabled"} onclick="toggleSpRunOptsRow('${row.id}')">Run extraction now</button></span>
+    <span class="ds-src__fact-a"><button type="button" id="ext-inagnes-btn-${row.id}" class="btn btn-secondary" data-extraction-ready="${extractionReady ? "1" : "0"}" ${extractionReady ? "" : "disabled"} onclick="toggleSpRunOptsRow('${row.id}')">Run extraction now</button></span>
   </div>
   <div class="ds-rotate-row" id="ds-sp-runopts-row-${row.id}">
     <label class="field-hint" for="ds-sp-runopts-conc-${row.id}">Files in parallel (1–16, blank = configured)</label>
@@ -7460,6 +7460,29 @@ function _extRenderCrawlCell(connId, status) {
   el.innerHTML = `${_extDot(run.outcome)}<span class="ext-sub">${_extEsc(label)} · ${_extNum(run.files_done)} files</span>`;
 }
 
+/* The "In-Agnes extraction" fact row's own trigger button is server-
+   rendered ONCE from `config.extraction.last_run_at` dispatch bookkeeping —
+   that row's job is cadence/last-dispatch, not live run state, so it has no
+   reason to grow its own poll. But its one verb, "Run extraction now", must
+   never stay offered while a run is already in flight: the server can only
+   ever answer that click with `409 extraction_already_running`. Reusing the
+   SAME status this script already polls for the Run row above (rather than
+   opening a second live-state channel for one button) keeps that promise.
+   `data-extraction-ready` remembers the server's own capability gate
+   (producer configured, `sharepoint.enabled`) so a run ending restores that
+   verdict instead of blindly re-enabling a button that was never allowed to
+   begin with. */
+function _extRenderInAgnesButton(connId, status) {
+  const btn = document.getElementById(`ext-inagnes-btn-${connId}`);
+  if (!btn) return;
+  const ready = btn.dataset.extractionReady === "1";
+  const running = !!(status && status.running);
+  btn.disabled = !ready || running;
+  btn.title = running
+    ? "An extraction is already running for this connection — see the Run row above, or stop it there."
+    : "";
+}
+
 function _extRunLine(run) {
   const bits = [];
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
@@ -7739,6 +7762,7 @@ function _extRender(connId) {
       false,
     );
     _extRenderCrawlCell(connId, null);
+    _extRenderInAgnesButton(connId, null);
     return;
   }
 
@@ -7759,6 +7783,7 @@ function _extRender(connId) {
   block.hidden = false;
   block.innerHTML = _extRunRowHtml(connId, st);
   _extRenderCrawlCell(connId, st.data);
+  _extRenderInAgnesButton(connId, st.data);
 }
 
 async function _extFetchOne(connId) {
