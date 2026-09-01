@@ -18,7 +18,14 @@ the bodies instead of conflicting. The visible damage is one of:
 * the *same bullet listed twice* under ``## [Unreleased]`` with every
   heading unique — what is left when someone "resolves" the previous shape
   by concatenating the two duplicate groups' bodies, which merges the
-  headings but keeps both copies of the bullets they shared.
+  headings but keeps both copies of the bullets they shared; or
+* — #1918 — a bullet written straight INTO an already-released block. None of
+  the shapes above are disturbed: no heading repeats, version order holds, no
+  group or bullet is duplicated, because the bullet lands under an existing
+  heading exactly once. This struck twice in one day during a merge train. A
+  released block is the permanent record of what shipped under a tag; a
+  GitHub Release generated from a mutated block describes a version that
+  never existed.
 
 This exact corruption struck four times during the 2026-08 remediation
 program. ``scripts/release_cut.py`` already refuses to *cut* on top of a
@@ -26,14 +33,29 @@ duplicated heading (:func:`assert_no_duplicate_headings`), but that only fires
 on the days a cut runs; a corrupt ``main`` can sit undetected until then. This
 test makes the invariant a fast, every-push CI check over the committed file.
 
-Assertions (pure file parse, no I/O beyond reading ``CHANGELOG.md``):
+Assertions (pure file parse, no I/O beyond reading ``CHANGELOG.md`` and
+``pyproject.toml``):
 
 1. exactly one ``## [Unreleased]`` heading;
 2. no duplicate ``## [X.Y.Z]`` version headings anywhere;
 3. version sections appear in strictly descending semver order after
    ``[Unreleased]``;
 4. no ``### <Group>`` heading repeats inside ``## [Unreleased]``;
-5. no *bullet* repeats inside ``## [Unreleased]``.
+5. no *bullet* repeats inside ``## [Unreleased]``;
+6. the RELEASED region (everything from the first ``## [X.Y.Z]`` heading to
+   EOF) matches the sha256 ``scripts/release_cut.py`` stamps into
+   ``pyproject.toml``'s ``[tool.agnes] released_changelog_sha256`` at every
+   cut (:func:`assert_released_region_unchanged`) — the #1918 fix.
+
+Guards 1-5 are SHAPE guards, deliberately scoped to ``[Unreleased]`` (see each
+docstring for why: released history legitimately carries 18 duplicate
+``###`` headings and 30 duplicate bullets as shipped damage no merge of
+*pending* bullets can reach or worsen). Guard 6 is an IMMUTABILITY guard: it
+does not look at shape at all, only whether the released region's bytes
+changed since the last cut. The two are orthogonal — a released section can
+fail every shape check forever (legacy) while still passing guard 6, and a
+perfectly-shaped released section fails guard 6 the moment one character in
+it changes.
 
 The parsing / dup-heading logic is imported from ``scripts.release_cut`` (the
 E1 daily-cut module) rather than re-implemented, so this guard and the cut
@@ -51,11 +73,16 @@ from scripts.release_cut import (
     DuplicateHeadingError,
     _unreleased_bounds,
     assert_no_duplicate_headings,
+    cut_changelog,
     find_version_headings,
     parse_version,
+    read_released_checksum,
+    released_region_sha256,
+    write_released_checksum,
 )
 
 CHANGELOG_PATH = Path(__file__).resolve().parents[1] / "CHANGELOG.md"
+PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 
 # ---------------------------------------------------------------------------
@@ -224,14 +251,64 @@ def assert_no_duplicate_unreleased_bullets(changelog_text: str) -> None:
     )
 
 
+def assert_released_region_unchanged(changelog_text: str, pyproject_text: str) -> None:
+    """The RELEASED region (everything from the first ``## [X.Y.Z]`` heading
+    to EOF) must match the digest ``scripts/release_cut.py`` stamps into
+    ``pyproject.toml``'s ``[tool.agnes] released_changelog_sha256`` at every
+    cut.
+
+    This is the guard #1918 exists for. The five guards above are SHAPE
+    guards, scoped to ``[Unreleased]`` on purpose (see their docstrings) —
+    none of them notice a bullet a bad merge wrote INTO an already-released
+    block, because a bullet landing under an existing heading disturbs no
+    heading count, no version order, and creates no duplicate. A released
+    block is the permanent record of what shipped under a tag; a GitHub
+    Release generated from a mutated block describes a version that never
+    existed. This struck twice in one day during a merge train.
+
+    ``cut_changelog``'s own docstring guarantees everything from the heading
+    *after* the one it renames onward is preserved byte-for-byte — which is
+    exactly what makes one whole-region hash sufficient rather than a hash
+    per version block: the region legitimately changes on exactly one
+    occasion (a cut growing a freshly-released block at its top), and
+    ``plan_release_cut`` recomputes and re-stores this same digest in the
+    same write that performs that change. So the stored and live digests can
+    only disagree via an out-of-band edit to already-released history.
+
+    NOTE — deviation from the issue's acceptance criteria: a single
+    whole-region hash can tell WHETHER released history changed but cannot
+    NAME which of the ~625 released blocks it landed in; the message below
+    can only point at the region as a whole. Naming the specific block would
+    need a digest-per-block manifest (~625 entries) kept in sync forever —
+    deliberately not built here.
+    """
+    live = released_region_sha256(changelog_text)
+    stored = read_released_checksum(pyproject_text)
+    assert live == stored, (
+        "CHANGELOG.md's RELEASED region (everything from the first '## [X.Y.Z]' heading "
+        "to EOF) no longer matches the checksum recorded in pyproject.toml's [tool.agnes] "
+        "released_changelog_sha256 — a RELEASED block changed after it shipped "
+        "(docs/RELEASING.md § CHANGELOG merge hazards). Find the drift with "
+        "`git diff origin/main -- CHANGELOG.md` — it should only ever show new bullets under "
+        "'## [Unreleased]'. If this edit to released history is deliberate and reviewed, "
+        "rebaseline with `python scripts/release_cut.py --rebaseline`. "
+        f"(stored={stored!r}, live={live!r})"
+    )
+
+
 # ---------------------------------------------------------------------------
-# the real committed CHANGELOG must satisfy all five
+# the real committed CHANGELOG must satisfy all six
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def changelog_text() -> str:
     return CHANGELOG_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def pyproject_text() -> str:
+    return PYPROJECT_PATH.read_text(encoding="utf-8")
 
 
 def test_exactly_one_unreleased_heading(changelog_text: str) -> None:
@@ -253,6 +330,11 @@ def test_no_duplicate_unreleased_subsections(changelog_text: str) -> None:
 
 def test_no_duplicate_unreleased_bullets(changelog_text: str) -> None:
     assert_no_duplicate_unreleased_bullets(changelog_text)
+
+
+def test_released_region_matches_the_stored_checksum(changelog_text: str, pyproject_text: str) -> None:
+    # the sixth guard: IMMUTABILITY, not shape — see assert_released_region_unchanged
+    assert_released_region_unchanged(changelog_text, pyproject_text)
 
 
 def test_block_extractor_finds_bullets_in_a_known_fixture() -> None:
@@ -321,8 +403,13 @@ _GOOD = """# Changelog
 
 
 def test_good_fixture_passes_every_guard() -> None:
-    """The synthetic well-formed fixture passes all five (proves the guards
-    fire on the corruption, not indiscriminately)."""
+    """The synthetic well-formed fixture passes all five SHAPE guards (proves
+    the guards fire on the corruption, not indiscriminately).
+
+    The sixth (immutability) guard needs a paired pyproject digest, not just
+    changelog text, so its own "good" case lives among the teeth tests below
+    (``test_a_release_cut_output_still_passes_the_guard``) instead of here.
+    """
     assert_single_unreleased(_GOOD)
     assert_no_duplicate_headings(_GOOD)
     assert_versions_strictly_descending(_GOOD)
@@ -380,6 +467,8 @@ def test_interleaved_unreleased_groups_are_caught() -> None:
 def test_duplicate_subsection_in_a_released_section_is_ignored() -> None:
     """The fourth guard is scoped to ``[Unreleased]`` — legacy duplication in
     shipped sections (18 of them carry it) must not fail the build."""
+    # shape guards stay Unreleased-only; released-history IMMUTABILITY is the
+    # separate sixth guard (assert_released_region_unchanged), not this one.
     corrupt = _GOOD.replace(
         "- a shipped change",
         "- a shipped change\n\n### Added\n\n- a legacy duplicate in released history",
@@ -514,8 +603,65 @@ def test_duplicate_bullet_in_a_released_section_is_ignored() -> None:
     """Scoped to ``[Unreleased]``, like the subsection guard above: 30
     bullets in shipped history are exact duplicates of another bullet in the
     same released section, and no merge of pending bullets can reach them."""
+    # shape guards stay Unreleased-only; released-history IMMUTABILITY is the
+    # separate sixth guard (assert_released_region_unchanged), not this one.
     corrupt = _GOOD.replace(
         "- a shipped change\n",
         f"- a shipped change\n{_WRAPPED_BULLET}{_WRAPPED_BULLET}",
     )
     assert_no_duplicate_unreleased_bullets(corrupt)
+
+
+# --- sixth guard: released history must not change (#1918) -----------------
+
+# A standalone pyproject.toml stub — the digest these tests bake into it is
+# always computed FOR the paired _GOOD-derived text, never borrowed from the
+# real repo's pyproject.toml (whose digest covers the real CHANGELOG.md, an
+# unrelated document).
+_PYPROJECT_STUB = '[project]\nname = "x"\nversion = "0.89.0"\n'
+
+
+def test_bullet_injected_into_a_released_block_is_caught() -> None:
+    """The #1918 shape: a bullet added straight into an already-released
+    ``### Added`` group. Every shape guard above stays green on this — no
+    heading repeats, order holds, nothing is duplicated — which is exactly
+    why #1918 needed a guard that isn't a shape guard."""
+    corrupt = _GOOD.replace(
+        "- a shipped change\n",
+        "- a shipped change\n- a bullet a bad merge slipped into shipped history\n",
+    )
+    good_pyproject = write_released_checksum(_PYPROJECT_STUB, released_region_sha256(_GOOD))
+
+    assert_single_unreleased(corrupt)
+    assert_no_duplicate_headings(corrupt)
+    assert_versions_strictly_descending(corrupt)
+    assert_no_duplicate_unreleased_subsections(corrupt)
+    assert_no_duplicate_unreleased_bullets(corrupt)
+
+    with pytest.raises(AssertionError, match="RELEASED"):
+        assert_released_region_unchanged(corrupt, good_pyproject)
+
+
+def test_blank_line_change_inside_a_released_block_is_caught() -> None:
+    """Even whitespace-only drift inside a released block must be caught —
+    the checksum is over raw bytes, not a normalized/whitespace-collapsed
+    view like the bullet-block comparison the fifth guard uses."""
+    corrupt = _GOOD.replace(
+        "## [0.88.0] - 2026-08-24\n\n### Fixed",
+        "## [0.88.0] - 2026-08-24\n\n\n### Fixed",
+    )
+    good_pyproject = write_released_checksum(_PYPROJECT_STUB, released_region_sha256(_GOOD))
+
+    with pytest.raises(AssertionError, match="RELEASED"):
+        assert_released_region_unchanged(corrupt, good_pyproject)
+
+
+def test_a_release_cut_output_still_passes_the_guard() -> None:
+    """The one legitimate way released history grows: a cut. Cutting
+    ``_GOOD`` through the real ``cut_changelog`` and recomputing the digest
+    the way ``plan_release_cut`` does must NOT trip the guard — proves the
+    checksum tracks "changed since the last cut", not "changed at all"."""
+    cut = cut_changelog(_GOOD, "0.90.0", date="2026-08-26")
+    cut_pyproject = write_released_checksum(_PYPROJECT_STUB, released_region_sha256(cut))
+
+    assert_released_region_unchanged(cut, cut_pyproject)

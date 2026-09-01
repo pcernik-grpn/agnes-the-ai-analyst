@@ -18,11 +18,20 @@ is the cut logic as pure functions over file contents, so the workflow and a
 human both call the exact same code the unit tests pin — no divergent shell
 implementation to drift from the tests.
 
+Every cut also stamps a sha256 of the RELEASED region of ``CHANGELOG.md``
+(everything from the first ``## [X.Y.Z]`` heading onward) into
+``pyproject.toml``'s ``[tool.agnes] released_changelog_sha256`` — a second
+guard, orthogonal to the duplicate-heading one above, for a merge that writes
+a bullet INTO an already-released block instead of racing on the heading
+itself (#1918). ``tests/test_changelog_integrity.py`` checks the live
+CHANGELOG against that stored digest on every push.
+
 Usage::
 
     scripts/release_cut.py --dry-run --json      # plan only, no writes
     scripts/release_cut.py                        # apply (minor bump)
     scripts/release_cut.py --bump patch            # emergency hotfix cut
+    scripts/release_cut.py --rebaseline            # re-stamp the checksum after a deliberate, reviewed edit to released history — cuts nothing
 
 Exit codes: ``0`` success (including the no-op case: an empty ``[Unreleased]``
 is not an error, it just means there is nothing to cut today), ``1`` a real
@@ -35,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import re
 import sys
@@ -45,6 +55,8 @@ UNRELEASED_HEADING = "## [Unreleased]"
 _VERSION_HEADING_RE = re.compile(r"^## \[(\d+\.\d+\.\d+)\]")
 _PYPROJECT_VERSION_RE = re.compile(r'^(version\s*=\s*")([^"]+)(")', re.MULTILINE)
 _SERVER_JSON_VERSION_RE = re.compile(r'("version"\s*:\s*")([^"]+)(")')
+_TOOL_AGNES_HEADING_RE = re.compile(r"^\[tool\.agnes\][ \t]*\n", re.MULTILINE)
+_RELEASED_CHECKSUM_RE = re.compile(r'^(released_changelog_sha256\s*=\s*")([0-9a-f]{64})(")', re.MULTILINE)
 
 # Keep-a-Changelog subsection order used for a freshly opened [Unreleased].
 DEFAULT_SUBSECTIONS = ("Added", "Changed", "Fixed", "Removed", "Internal")
@@ -274,6 +286,95 @@ def cut_changelog(changelog_text: str, new_version: str, *, date: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# released-region immutability checksum (CHANGELOG.md <-> pyproject.toml)
+#
+# #1918: every guard above is scoped to [Unreleased] on purpose (see their
+# docstrings) — none of them notice a bullet a bad merge wrote INTO an
+# already-released block, since a well-placed bullet under an existing
+# heading disturbs no ordering and creates no duplicate. A released block is
+# the permanent record of what shipped under a tag, so this is a second,
+# orthogonal guard: not "is [Unreleased] well-formed" but "did released
+# history change since it was cut".
+# ---------------------------------------------------------------------------
+
+
+def released_region(changelog_text: str) -> str:
+    """The RELEASED slice of ``CHANGELOG.md``: from the first version heading
+    that is not ``[Unreleased]`` to end of file.
+
+    Reuses :func:`find_version_headings`, so it copes with the legacy
+    em-dash headings (``## [0.11.4] — 2026-04-27Some title...``) the same
+    way every other guard in this module does. Returns ``""`` when no
+    released heading exists yet (a brand-new CHANGELOG with only
+    ``[Unreleased]``) — there is nothing released yet to protect.
+    """
+    lines = _lines(changelog_text)
+    for index, version in find_version_headings(changelog_text):
+        if version != "Unreleased":
+            return "".join(lines[index:])
+    return ""
+
+
+def released_region_sha256(changelog_text: str) -> str:
+    """sha256 hex digest of :func:`released_region` — the value stamped into
+    ``pyproject.toml``'s ``[tool.agnes] released_changelog_sha256`` at every
+    cut and checked against on every push (``tests/test_changelog_integrity.py``).
+
+    One hash over the *whole* released region, not one per version block:
+    :func:`cut_changelog`'s own docstring already guarantees everything from
+    the heading after the one it renames onward is preserved byte-for-byte,
+    so the region as a whole only ever legitimately changes by growing a
+    freshly-cut block at its top — an event ``plan_release_cut`` recomputes
+    and re-stores this same digest for, in the same write. A single hash can
+    therefore tell WHETHER released history changed, just not WHICH of its
+    many blocks — naming the specific block would need a digest-per-block
+    manifest kept in sync forever, deliberately not built.
+    """
+    return hashlib.sha256(released_region(changelog_text).encode("utf-8")).hexdigest()
+
+
+def read_released_checksum(pyproject_text: str) -> str | None:
+    """The ``[tool.agnes] released_changelog_sha256`` value, or ``None`` when
+    unset (a checkout that predates this guard, or a hand-edited
+    ``pyproject.toml`` that dropped the key)."""
+    match = _RELEASED_CHECKSUM_RE.search(pyproject_text)
+    return match.group(2) if match else None
+
+
+def write_released_checksum(pyproject_text: str, digest: str) -> str:
+    """Set (or create) ``[tool.agnes] released_changelog_sha256 = "<digest>"``.
+
+    Mirrors :func:`bump_pyproject_version`: targeted line surgery rather than
+    a tomllib round-trip, so nothing else in the file gets reformatted. When
+    the key already exists only its value changes in place; when
+    ``[tool.agnes]`` exists without the key, the key is appended right under
+    the heading; otherwise a fresh table is appended at end of file.
+    """
+    match = _RELEASED_CHECKSUM_RE.search(pyproject_text)
+    if match:
+        return (
+            pyproject_text[: match.start()] + match.group(1) + digest + match.group(3) + pyproject_text[match.end() :]
+        )
+
+    # json.dumps, not a hand-written f'"{digest}"' literal: a TOML basic
+    # string shares JSON's quoting/escaping for this plain-ASCII-hex value,
+    # and building the quotes this way (rather than splicing literal `"`
+    # characters around an interpolated value) is what keeps this line out
+    # of tests/test_security_audit_20260805.py's hand-quoted-identifier
+    # ratchet — the shape it bans is exactly `"{value}"`, regardless of
+    # whether the quoted thing is a SQL identifier or, as here, a TOML value.
+    line = f"released_changelog_sha256 = {json.dumps(digest)}\n"
+
+    heading = _TOOL_AGNES_HEADING_RE.search(pyproject_text)
+    if heading:
+        insert_at = heading.end()
+        return pyproject_text[:insert_at] + line + pyproject_text[insert_at:]
+
+    prefix = pyproject_text if pyproject_text.endswith("\n") else pyproject_text + "\n"
+    return prefix + "\n[tool.agnes]\n" + line
+
+
+# ---------------------------------------------------------------------------
 # the plan
 # ---------------------------------------------------------------------------
 
@@ -290,6 +391,7 @@ class ReleaseCutPlan:
     changelog_text: str | None = None
     pyproject_text: str | None = None
     server_json_text: str | None = None
+    released_changelog_sha256: str | None = None
 
     def as_json(self) -> dict:
         return {
@@ -298,6 +400,7 @@ class ReleaseCutPlan:
             "version": self.version,
             "bullets": list(self.bullets),
             "date": self.date,
+            "released_changelog_sha256": self.released_changelog_sha256,
         }
 
 
@@ -327,7 +430,12 @@ def plan_release_cut(
 
     new_version = BUMPERS[bump](previous_version)
     new_changelog = cut_changelog(changelog_text, new_version, date=date)
-    new_pyproject = bump_pyproject_version(pyproject_text, new_version)
+    # The just-cut block is now part of the released region, so the digest
+    # covering it is computed AFTER the rename — this is what keeps the
+    # stored checksum and tests/test_changelog_integrity.py's live guard in
+    # agreement the moment this plan is written to disk (#1918).
+    digest = released_region_sha256(new_changelog)
+    new_pyproject = write_released_checksum(bump_pyproject_version(pyproject_text, new_version), digest)
     new_server_json = bump_server_json_version(server_json_text, new_version) if server_json_text is not None else None
 
     return ReleaseCutPlan(
@@ -339,6 +447,7 @@ def plan_release_cut(
         changelog_text=new_changelog,
         pyproject_text=new_pyproject,
         server_json_text=new_server_json,
+        released_changelog_sha256=digest,
     )
 
 
@@ -349,6 +458,40 @@ def plan_release_cut(
 
 def _today_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _rebaseline(args: argparse.Namespace) -> int:
+    """``--rebaseline``: accept the current ``CHANGELOG.md`` released region
+    as ground truth and rewrite only the stored checksum. Cuts nothing.
+
+    The documented escape hatch for a deliberate, reviewed edit to
+    already-released history (docs/RELEASING.md § CHANGELOG merge hazards)
+    — the live guard in ``tests/test_changelog_integrity.py`` would
+    otherwise flag that edit forever.
+    """
+    try:
+        changelog_text = args.changelog.read_text(encoding="utf-8")
+        pyproject_text = args.pyproject.read_text(encoding="utf-8")
+        assert_no_duplicate_headings(changelog_text)
+    except (ChangelogFormatError, OSError) as exc:
+        print(f"release_cut: {exc}", file=sys.stderr)
+        return 1
+
+    digest = released_region_sha256(changelog_text)
+    new_pyproject = write_released_checksum(pyproject_text, digest)
+
+    if args.json:
+        print(json.dumps({"rebaseline": True, "released_changelog_sha256": digest}, indent=2))
+    else:
+        print(f"release_cut: --rebaseline released_changelog_sha256 = {digest}")
+
+    if args.dry_run:
+        return 0
+
+    args.pyproject.write_text(new_pyproject, encoding="utf-8")
+    if not args.json:
+        print(f"release_cut: wrote {args.pyproject}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -365,7 +508,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--date", default=None, help="YYYY-MM-DD, default: today (UTC)")
     parser.add_argument("--dry-run", action="store_true", help="compute and print the plan, write nothing")
     parser.add_argument("--json", action="store_true", help="machine-readable plan on stdout")
+    parser.add_argument(
+        "--rebaseline",
+        action="store_true",
+        help=(
+            "recompute [tool.agnes] released_changelog_sha256 in pyproject.toml from the current "
+            "CHANGELOG.md and rewrite only that value — cuts nothing. Use after a deliberate, "
+            "reviewed edit to already-released history."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.rebaseline:
+        return _rebaseline(args)
 
     date = args.date or _today_utc()
 
