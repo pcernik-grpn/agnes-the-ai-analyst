@@ -1266,6 +1266,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **The nightly `/catalog` smoke follows the Library's Knowledge/Capabilities shell (#1940).** `scripts/e2e/smoke_catalog.sh` still asserted a "Plugins" section on the folded landing; since the library redesign plugins live under the Capabilities tab, so the nightly failed on markup that no longer exists. The script now asserts the tab strip on landing, switches to Capabilities, and exercises the Plugins band's disclosure there (bands ship expanded now, so the click asserts the collapse).
+
 - **The stack-membership docs agree on which mode is the default again.** `StackResolver.stack()` forks on `features.stack_auto_membership` — auto-membership (an `available` grant is in the stack with no subscription) has been the default since Wave 0 (0.83.25), classic (subscribe-to-join) is the explicit opt-out — but the prose had drifted both ways: `docs/RBAC.md` and the resolver's algorithm comments still called classic "the default", while `src/rbac.py::can_access_table` and several resolver docstrings described auto-membership as unconditional, with no mention that a classic instance 403s an unsubscribed available grant. All of them (plus CLAUDE.md's sync-RBAC paragraph) now state the same thing: two modes, auto by default, explicit `false` wins — and `docs/RBAC.md` names the symptom of running classic without realizing it (403 `table_not_in_stack` on an `available` grant until the member subscribes). Docs only; behavior unchanged.
 
 - **One Alembic head again (`0091_merge_semantic_facts`).** The semantic-layer

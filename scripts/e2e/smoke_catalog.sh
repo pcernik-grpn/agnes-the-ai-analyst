@@ -44,21 +44,22 @@ agent-browser --session "$SESSION" screenshot "$ARTIFACTS_DIR/catalog-landing.pn
 # section disclosures actually work. (This script's previous life asserted
 # catalog_unified.html's kind tabs; that template is gone.)
 #
-# Unlike those retired kind tabs (always rendered, hidden only when a kind
-# had zero rows), a folded-Library section doesn't exist in the DOM at all
-# until it holds at least one row (app/web/router.py builds `grouped` by
-# appending — a kind with zero items never gets a key). Plugins is the one
-# kind a bare, freshly-seeded instance is GUARANTEED to have: the built-in
-# marketplace is seeded unconditionally on every boot and granted to
+# Since the library redesign (Knowledge / Capabilities tabbed shell,
+# ek/library-redesign, baseline commit c9a0478e), the landing opens on the
+# Knowledge tab and plugin content lives under Capabilities — "Plugins" is
+# NOT on the landing anymore (issue #1940 caught this script still
+# asserting it). What the landing does guarantee: the tab strip renders
+# both tabs unconditionally (app/web/router.py `library_tabs`), and the
+# Capabilities count is ≥ 1 on a bare, freshly-seeded instance because the
+# built-in marketplace is seeded on every boot and granted to
 # Admin/Everyone (app/main.py → src.marketplace.seed_builtin_marketplace).
-# Recipes carries no such bundled seed — it's pure admin-curated content —
-# so it never renders here. Do not resurrect a "Recipes" needle without
-# first seeding a recipe *and* a RECIPE resource_grants row for the e2e
-# user; asserting it against this fixture is what made the smoke fail
-# nightly from 2026-08-21 rather than catch anything (issues #1497 et al).
+# Knowledge, by contrast, is legitimately empty here ("Nothing in
+# Knowledge yet") — do not assert any Knowledge-side row without seeding
+# one first; that shape of fixture-blind needle is what made this smoke
+# fail nightly from 2026-08-21 (issues #1497 et al).
 echo "→ snapshot landing — the folded Library, availability filter pre-applied"
 SNAPSHOT="$(agent-browser --session "$SESSION" snapshot -i)"
-for NEEDLE in "Not added yet" Plugins; do
+for NEEDLE in "Not added yet" Capabilities; do
   if ! grep -qi "$NEEDLE" <<<"$SNAPSHOT"; then
     echo "::error::'${NEEDLE}' missing from the folded /catalog landing (library scope view)."
     echo "$SNAPSHOT" | head -40
@@ -66,21 +67,37 @@ for NEEDLE in "Not added yet" Plugins; do
   fi
 done
 
-# Sections ship collapsed; the toggle is a real button carrying
-# aria-expanded, so the accessibility snapshot exposes the flip as an
-# [expanded] marker — assert on that, not on row text a seeded instance
-# may or may not have.
-echo "→ click the Plugins section toggle"
-agent-browser --session "$SESSION" click '[data-sec-toggle=plugin]'
+# Switch to the Capabilities tab: the tab buttons carry data-own="<key>"
+# inside #lib-tabs (library.html renders them from `library_tabs`); the
+# seeded built-in marketplace guarantees the Plugins section band renders
+# there.
+echo "→ click the Capabilities tab"
+agent-browser --session "$SESSION" click '#lib-tabs [data-own=capabilities]'
 agent-browser --session "$SESSION" wait 500
 
-echo "→ verify the Plugins section expanded"
+echo "→ verify the Plugins section is visible under Capabilities"
 SNAPSHOT="$(agent-browser --session "$SESSION" snapshot -i)"
-if ! grep -qiE '\[[^]]*expanded[^]]*\].*plugin|plugin[^\n]*\[[^]]*expanded' <<<"$SNAPSHOT" \
-   && ! grep -qiE 'expanded' <<<"$SNAPSHOT"; then
-  echo "::error::Clicking the Plugins section toggle didn't expand it."
+if ! grep -qi "Plugins" <<<"$SNAPSHOT"; then
+  echo "::error::'Plugins' missing after switching to the Capabilities tab."
   echo "$SNAPSHOT" | head -40
   exit 1
 fi
 
-echo "✓ /catalog smoke passed (folded Library)."
+# Section disclosures still respond to clicks. Bands now ship EXPANDED
+# (library.html renders the group toggle with aria-expanded="true"), so
+# the click collapses it; the accessibility snapshot exposes the flip as
+# an [expanded=false] marker on the toggle button, whose accessible name
+# carries the band label ("Plugins …").
+echo "→ click the Plugins section toggle (collapse)"
+agent-browser --session "$SESSION" click '[data-sec-toggle=plugin]'
+agent-browser --session "$SESSION" wait 500
+
+echo "→ verify the Plugins section collapsed"
+SNAPSHOT="$(agent-browser --session "$SESSION" snapshot -i)"
+if ! grep -qiE 'plugins[^][]*\[[^]]*expanded=false' <<<"$SNAPSHOT"; then
+  echo "::error::Clicking the Plugins section toggle didn't collapse it."
+  echo "$SNAPSHOT" | head -40
+  exit 1
+fi
+
+echo "✓ /catalog smoke passed (folded Library, Capabilities tab)."
