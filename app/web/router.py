@@ -3600,8 +3600,9 @@ async def library_page(
         for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
             from app.web.semantic_layer_view import model_of, object_counts, source_label
 
+            _model = model_of(_m)
             try:
-                _counts = object_counts(model_of(_m))
+                _counts = object_counts(_model)
             except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
                 _counts = {}
             _meta = " · ".join(
@@ -3609,10 +3610,20 @@ async def library_page(
                 for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
                 if _counts.get(k)
             )
+            # #1955: the row's own `description` column is empty for every
+            # model a sync wrote (the importer never projected the
+            # document's model-level description onto it) so this fell back
+            # to "" — an imported model rendered with no subtitle even
+            # though its document has one. Fall back to the document's own
+            # description. `_model` is the SAME `model_of(_m)` already
+            # computed above for `_counts` — a dict unwrap of `document_json`,
+            # itself already fetched whole by `list_all()` above — so this is
+            # a dict lookup, not an extra query or document parse.
+            _description = _m.get("description") or _model.get("description") or ""
             _add_shared_row(
                 item_id=_m["id"],
                 title=_m.get("name") or _slug,
-                description=_m.get("description") or "",
+                description=_description,
                 href=f"/semantic-layer/{quote(str(_slug))}",
                 glyph="data",
                 type_key="semantic_model",
@@ -4531,6 +4542,29 @@ async def semantic_layer_list(
             for cat, items in sorted(by_category.items())
         ]
 
+    # #1956 item 1: the metrics sidebar's "All / <model slugs>" filter reads
+    # `category`, which `src/semantic/projection.py` sets to the owning
+    # model's own name for every document-projected metric. `glossary_terms`
+    # has no equivalent per-model column — `project_document` stamps every
+    # term from a call with the SAME `(source, source_ref)` regardless of
+    # which of a multi-model document's models it came from (see
+    # `src/semantic/importer.py`'s module docstring, step 5), so a document
+    # declaring more than one model cannot be told apart here. `source` is
+    # the finest attribution a glossary row actually carries — the same
+    # provenance the term's own source badge already renders — so that is
+    # what this buckets by; true per-model glossary attribution is tracked
+    # as a #1956 follow-up, not invented here.
+    glossary_categories: list[dict] = []
+    if active_tab == "all_glossary":
+        by_source: dict[str, int] = {}
+        for t in glossary_repo().list(limit=500):
+            src = t.get("source") or "manual"
+            by_source[src] = by_source.get(src, 0) + 1
+        glossary_categories = [
+            {"key": src, "label": source_label(src), "count": n}
+            for src, n in sorted(by_source.items(), key=lambda kv: source_label(kv[0]))
+        ]
+
     tab_counts = {
         "models": len(models),
         "all_metrics": len(visible_metrics),
@@ -4556,6 +4590,7 @@ async def semantic_layer_list(
         metric_categories=metric_categories,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
+        glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 

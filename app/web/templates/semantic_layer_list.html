@@ -539,6 +539,23 @@
         <div class="sl-sidebar-search">
           <input id="glossary-search" type="search" placeholder="Search glossary…" autocomplete="off" aria-label="Search glossary">
         </div>
+        {# #1956 item 1: mirrors the metrics sidebar's category nav above —
+           same markup, same classes. Glossary terms carry no per-MODEL
+           attribution (unlike a document-projected metric's `category`), so
+           this buckets by the term's own `source` instead — the coarser
+           provenance a glossary row actually has (see the router). #}
+        <nav class="sl-cat-nav" aria-label="Glossary sources">
+          <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
+            <span>All</span>
+            <span class="sl-cat-n">{{ glossary_count }}</span>
+          </button>
+          {% for cat in glossary_categories %}
+          <button type="button" class="sl-cat-btn" data-cat="{{ cat.key | lower }}">
+            <span>{{ cat.label }}</span>
+            <span class="sl-cat-n">{{ cat.count }}</span>
+          </button>
+          {% endfor %}
+        </nav>
       </div>
       {% endif %}
     </div>
@@ -694,7 +711,12 @@
 
     // ── Metrics: filter + category ──
     const metricFilter = document.getElementById('metric-filter');
-    const catBtns = document.querySelectorAll('.sl-cat-btn');
+    // Scoped to the metrics sidebar: `.sl-cat-btn` is the same reused
+    // component the glossary sidebar's source nav renders below, and only
+    // one of the two sidebars exists in the DOM at a time (server-picked by
+    // `active_tab`) — but scoping here keeps each nav's wiring honest even
+    // if that ever changes.
+    const catBtns = document.querySelectorAll('#sidebar-metrics .sl-cat-btn');
     const metricsTitle = document.getElementById('metrics-title');
     const metricsShown = document.getElementById('metrics-shown');
     let activeCat = '__all__';
@@ -742,7 +764,33 @@
     const gList = document.getElementById('glossary-list');
     const gInput = document.getElementById('glossary-search');
     const gShown = document.getElementById('glossary-shown');
+    // Own bucket state and button set (#1956 item 1) — the glossary list is
+    // fetched client-side (unlike the server-rendered metrics list), so the
+    // source facet is a client-side hide/show over whatever `loadGlossary`
+    // most recently rendered, the same layering `applyMetrics` does over its
+    // server-rendered rows.
+    const glossaryCatBtns = document.querySelectorAll('#sidebar-glossary .sl-cat-btn');
+    let activeGlossarySource = '__all__';
     let gTimer;
+
+    function applyGlossaryFacet() {
+        let n = 0;
+        document.querySelectorAll('#glossary-list .sl-term[data-cat]').forEach(item => {
+            const show = activeGlossarySource === '__all__' || item.dataset.cat === activeGlossarySource;
+            item.hidden = !show;
+            if (show) n++;
+        });
+        if (gShown) gShown.textContent = String(n);
+    }
+
+    glossaryCatBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            glossaryCatBtns.forEach(b => b.classList.remove('is-active'));
+            btn.classList.add('is-active');
+            activeGlossarySource = btn.dataset.cat;
+            applyGlossaryFacet();
+        });
+    });
 
     function renderTerm(t) {
         const letter = (t.term || '?')[0];
@@ -751,7 +799,12 @@
         // which are often rich HTML, and esc() would render those tags as
         // visible text. Falls back to the stored column.
         const definition = t.definition_text || t.definition;
-        return '<button type="button" class="sl-term">' +
+        // `data-cat`: same attribute name and matching convention the
+        // metrics tab's `.sl-item[data-cat]` uses for its category facet —
+        // here the term's own `source` (#1956 item 1), lower-cased the same
+        // way the sidebar buttons' `data-cat` is.
+        const cat = String(t.source || 'manual').toLowerCase();
+        return '<button type="button" class="sl-term" data-cat="' + esc(cat) + '">' +
             '<div class="sl-term__head">' +
             '<div class="sl-term__letter">' + esc(letter) + '</div>' +
             '<div class="sl-term__name">' + esc(t.term) + '</div>' +
@@ -773,8 +826,12 @@
             if (!r.ok) throw new Error('HTTP ' + r.status);
             const data = await r.json();
             const terms = data.terms || [];
-            if (gShown) gShown.textContent = String(q ? terms.length : data.count);
             gList.innerHTML = terms.length ? terms.map(renderTerm).join('') : '<div class="sl-empty">No terms found.</div>';
+            // Re-applies the active source bucket to the freshly rendered
+            // list and sets `gShown` from what actually stayed visible —
+            // the search text and the source facet narrow together, not as
+            // two independent counts.
+            applyGlossaryFacet();
         } catch (e) {
             gList.innerHTML = '<div class="sl-empty">Could not load glossary: ' + esc(e.message) + '</div>';
         }
