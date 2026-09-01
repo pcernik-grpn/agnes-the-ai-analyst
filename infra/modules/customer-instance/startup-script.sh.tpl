@@ -988,17 +988,18 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 #      and the job queue itself lives in Postgres — nothing here belongs on
 #      the data disk.
 #
-#   2. The `extraction-worker` service re-pinned to the producer-bundled
-#      image. The base docker-compose.yml hides the service behind the
+#   2. The `extraction-worker` service turned always-on, with NO image
+#      override. The base docker-compose.yml hides the service behind the
 #      `extraction-worker` compose profile; `profiles: !reset []` in the
 #      overlay clears that, so the OVERLAY's presence in COMPOSE_FILE is the
 #      entire switch — no --profile plumbing through the startup/upgrade/
-#      applier scripts, all of which disagree about profile handling.
-#      docker-compose.prod.yml pins the service to the plain app image
-#      (source-less VMs can't `build:`), which is built without the
-#      `extraction` optional extra — the re-pin to
-#      $${AGNES_EXTRACTION_WORKER_IMAGE} (below, via .env) is what actually
-#      puts a document converter on the lane.
+#      applier scripts, all of which disagree about profile handling. The
+#      image itself is left to fall through to docker-compose.prod.yml's own
+#      pin, which already points this service at the same AGNES_IMAGE_REPO/
+#      AGNES_TAG as app/scheduler: the built-in extraction pipeline needs
+#      nothing bundled that image does not already carry, so following the
+#      app's own tag is correct — a separate producer-bundled image variant
+#      existed only for the retired external-producer mode.
 #
 # The coordination declaration rides .env (AGNES_COORDINATION_BACKEND +
 # AGNES_REDIS_URL, written into the .env heredoc below) and NOT
@@ -1025,12 +1026,9 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 # already in .env here). On an instance still running the frozen DuckDB
 # app-state backend the app will refuse to start with a named error —
 # migrate the backend first, then enable this flag.
-EXTRACTION_IMAGE="${extraction_worker_image}"
-EXTRACTION_IMAGE_HOST="$${EXTRACTION_IMAGE%%/*}"
-case "$EXTRACTION_IMAGE_HOST" in
-    *-docker.pkg.dev) gcloud auth configure-docker "$EXTRACTION_IMAGE_HOST" --quiet \
-        || echo "WARN: gcloud auth configure-docker $EXTRACTION_IMAGE_HOST failed — the extraction-worker image pull will likely fail below" >&2 ;;
-esac
+# No registry auth to arrange here: the worker pulls the same image as
+# app/scheduler, already authenticated above (IMAGE_HOST / gcloud auth
+# configure-docker, further up this script).
 
 # Quoted heredoc: the $${...} below are resolved by docker compose from
 # /opt/agnes/.env at `compose up` time, not by this shell.
@@ -1049,10 +1047,12 @@ services:
       timeout: 3s
       retries: 12
   extraction-worker:
-    image: $${AGNES_EXTRACTION_WORKER_IMAGE}
     # Clears the base compose's `profiles: ["extraction-worker"]` so the
     # service is always-on whenever this overlay is in COMPOSE_FILE. No
-    # mem_limit/cpus here — the base service already interpolates
+    # `image:` here — docker-compose.prod.yml already pins this service to
+    # the same AGNES_IMAGE_REPO/AGNES_TAG as app/scheduler, and the built-in
+    # extraction pipeline needs nothing that image does not already carry.
+    # No mem_limit/cpus here either — the base service already interpolates
     # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env.
     profiles: !reset []
     # Additive merge on top of the base service's `app: service_healthy`.
@@ -1356,19 +1356,17 @@ KAI_BROKER_MCP_ENABLED=true
 %{ if extraction_worker_enabled ~}
 AGNES_COORDINATION_BACKEND=redis
 AGNES_REDIS_URL=redis://redis:6379/0
-AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
-# The app-side gates for the `corpus-extraction` job kind
-# (app/instance_config.py::feature_enabled, app/worker/kinds.py::
-# _extraction_producer_argv) both check an env override before
-# instance.yaml — the SAME env-overrides-yaml posture as
-# AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
-# what makes this flag alone activate the lane end to end, with no
-# applier-owned instance.yaml edit on the VM's data disk. The whole
-# SharePoint connector — not just extraction — shares the ONE `sharepoint`
-# switch (2026-09-01 flag consolidation), so this line also turns on the
-# connect wizard, admin routes, and ACL mirroring on this VM.
+# The app-side gate for the `corpus-extraction` job kind is the single
+# `sharepoint` switch (app/instance_config.py::feature_enabled) — env
+# overrides instance.yaml, the SAME posture as AGNES_COORDINATION_BACKEND/
+# AGNES_REDIS_URL above — so this line is what makes this flag alone
+# activate the lane end to end, with no applier-owned instance.yaml edit on
+# the VM's data disk. The whole SharePoint connector — not just extraction —
+# shares this ONE `sharepoint` switch (2026-09-01 flag consolidation), so it
+# also turns on the connect wizard, admin routes, and ACL mirroring on this
+# VM.
 AGNES_SHAREPOINT_ENABLED=1
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE

@@ -182,22 +182,25 @@ variable "prod_instance" {
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
     # default so a module bump alone never moves the existing fleet. Turning
     # it on writes AGNES_COORDINATION_BACKEND=redis + AGNES_REDIS_URL +
-    # AGNES_SHAREPOINT_ENABLED=1 into the VM's app .env (env
-    # overrides instance.yaml for every one of these — app/coordination/
-    # factory.py's posture, mirrored by app/instance_config.py::feature_enabled
-    # and app/worker/kinds.py::_extraction_producer_argv — so the
+    # AGNES_SHAREPOINT_ENABLED=1 into the VM's app .env (env overrides
+    # instance.yaml for every one of these — app/coordination/factory.py's
+    # posture, mirrored by app/instance_config.py::feature_enabled — so the
     # applier-owned /data/state/instance.yaml is never touched) and engages a
     # module-owned docker-compose.extraction.yml overlay carrying the `redis`
-    # service and the worker re-pin. This is what makes the flag alone
-    # activate the `corpus-extraction` job kind end to end — no per-VM SSH
-    # edit of instance.yaml required. AGNES_SHAREPOINT_ENABLED gates the
-    # WHOLE SharePoint connector (2026-09-01 flag consolidation), not just
-    # extraction, so this also turns on the connect wizard, admin routes, and
-    # ACL mirroring on this VM. The multi-process startup guard
-    # (app/startup_guards.py) then requires the instance to already run the
-    # Postgres app-state backend and boots refuse loudly on a DuckDB
-    # instance — deliberate: migrate the backend first, then flip this.
-    # Requires the module-level extraction_worker_image (validated below).
+    # service and an always-on `extraction-worker`. The worker carries no
+    # image override any more: the built-in document pipeline (owner decision
+    # 2026-08-31 — connectors/sharepoint/crawler.py, one pipeline) needs
+    # nothing bundled that the app image does not already carry, so the
+    # service falls through to docker-compose.prod.yml's own pin and simply
+    # follows AGNES_IMAGE_REPO/AGNES_TAG like app/scheduler. This is what
+    # makes the flag alone activate the `corpus-extraction` job kind end to
+    # end — no per-VM SSH edit of instance.yaml required. AGNES_SHAREPOINT_
+    # ENABLED gates the WHOLE SharePoint connector (2026-09-01 flag
+    # consolidation), not just extraction, so this also turns on the connect
+    # wizard, admin routes, and ACL mirroring on this VM. The multi-process
+    # startup guard (app/startup_guards.py) then requires the instance to
+    # already run the Postgres app-state backend and boots refuse loudly on a
+    # DuckDB instance — deliberate: migrate the backend first, then flip this.
     extraction_worker_enabled = optional(bool, false)
     # Worker container resource ceilings, written to /opt/agnes/.env like
     # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
@@ -892,13 +895,26 @@ variable "kai_agent_env" {
 
 variable "extraction_worker_image" {
   description = <<-EOT
-    Full image ref (with tag) of the extraction-worker image. Since the
-    2026-09-01 default-image change, EVERY standard app image already carries
-    the `extraction` optional extra (markitdown, pypdfium2) — so this is
-    normally the SAME ref as the app image; a separately built variant is no
-    longer required. Kept as its own variable so an operator can still pin
-    the worker to a different tag (e.g. hold the worker back during a canary
-    of the app).
+    Deprecated, ignored — the module no longer reads this variable.
+
+    It used to re-pin the `extraction-worker` compose service to a separate
+    image built with a bundled external document-extraction producer. That
+    external-producer mode was removed (owner decision 2026-08-31 — the
+    built-in pipeline, connectors/sharepoint/crawler.py, is the only
+    pipeline there is): the `worker` Dockerfile stage is now byte-for-byte
+    the same image as `app`/`scheduler`, and the `extraction` optional
+    extra (markitdown, pypdfium2) ships in the DEFAULT image build, so
+    there is nothing left to bundle separately. `extraction-worker` now
+    follows AGNES_IMAGE_REPO/AGNES_TAG exactly like every other service —
+    see docker-compose.prod.yml. A separately pinned worker tag drifted
+    behind the live database's migrations and crash-looped the worker
+    forever once the fleet's auto-upgrade moved the schema forward, which
+    is why this is a removal rather than a design kept as-is.
+
+    Kept declared, accepted and unused only so a root module that still
+    sets it does not fail `terraform plan` with "unsupported argument".
+    Slated for removal in a later cleanup once known consumers have
+    dropped it from their own configuration.
   EOT
   type        = string
   default     = ""
@@ -906,12 +922,19 @@ variable "extraction_worker_image" {
 
 variable "extraction_producer_command" {
   description = <<-EOT
-    DEPRECATED AND IGNORED (2026-09-01): the external-producer mode was
-    removed — document extraction runs IN-PROCESS inside the app image
-    (connectors/sharepoint/crawler.py), and no AGNES_EXTRACTION_PRODUCER_*
-    variable is read or rendered anymore. The variable is kept declared only
-    so existing tfvars that still set it keep planning; its value has no
-    effect. Safe to delete from tfvars at any time.
+    Deprecated, ignored — the module no longer reads this variable.
+
+    It used to be written verbatim as AGNES_EXTRACTION_PRODUCER_COMMAND
+    into the app .env of every instance with `extraction_worker_enabled =
+    true`, naming the external producer binary's invocation command. That
+    external-producer mode was removed (owner decision 2026-08-31); nothing
+    in the app reads AGNES_EXTRACTION_PRODUCER_COMMAND any more, and the
+    module no longer writes the line.
+
+    Kept declared, accepted and unused only so a root module that still
+    sets it does not fail `terraform plan` with "unsupported argument".
+    Slated for removal in a later cleanup once known consumers have
+    dropped it from their own configuration.
   EOT
   type        = string
   default     = ""
