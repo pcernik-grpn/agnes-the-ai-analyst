@@ -31,7 +31,13 @@ The translation, per turn (``user_msg`` stdin frame → one ``POST /api/chat``):
     finish / stream end                      assistant_message + done
 
 ``cancel`` maps to ``POST /api/chat/{id}/stop`` and ``approval_decision`` to
-``POST /api/chat/{id}/approval`` (the handle advertises
+``POST /api/chat/{id}/approval``. The stop is not only the user's Stop: the
+engine's notion of an in-flight message must never outlive this handle's, so
+every involuntary end of a turn (SSE read timeout, mid-stream failure, the
+teardown behind ``pause`` and crash-respawn) stops it upstream too. A turn
+orphaned anyway — by a process that died without running teardown at all —
+surfaces as a ``409`` on the next message, which the handle clears and retries
+once rather than passing on (the handle advertises
 ``supportsApprovalRequestedEvent`` so the engine raises approvals as events
 instead of parking them on a UI heuristic; with ``chat.approvals_enabled``
 off, the handle auto-denies each request — the same instant-deny the native
@@ -116,6 +122,13 @@ _TOKEN_REFRESH_MARGIN_SECONDS = 15 * 60
 #: manager threads to every provider); the engine enforces its own window
 #: server-side, this value only labels the card.
 _APPROVAL_TIMEOUT_FALLBACK_SECONDS = 300
+#: How long teardown will wait for the engine to accept a stop for an
+#: in-flight turn. Bounded because the alternative to a slow stop is a
+#: slow pause on every idle session, and the orphan a missed stop leaves
+#: is recoverable at the next message (see the conflict retry).
+_TEARDOWN_STOP_BUDGET_SECONDS = 5.0
+#: The engine's refusal when a chat already has a message in flight.
+_CONFLICT_STATUS = 409
 
 #: Tools whose approval request is answered here instead of shown to the user.
 #:
@@ -319,6 +332,7 @@ class KaiEngineHandle:
         posts, the frame stream, and the HTTP client — so a crashed handle
         (which the manager replaces without ever calling ``kill``) leaks
         neither an SSE-consuming orphan turn nor a connection pool."""
+        turn_in_flight = self._turn_task is not None and not self._turn_task.done()
         doomed = [t for t in [self._turn_task, *self._side_tasks] if t is not None and not t.done()]
         for task in doomed:
             task.cancel()
@@ -328,6 +342,17 @@ class KaiEngineHandle:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - teardown is best-effort
                 pass
         self._side_tasks.clear()
+        # Cancelling the turn task only stops US reading the turn; the engine
+        # keeps processing the message and will refuse the next one with a
+        # 409 conflict. `pause` is a plain teardown and the manager's
+        # crash-respawn is another, so this is the ordinary path, not an edge
+        # case. Awaited rather than spawned: side tasks are cancelled just
+        # above and the shared client closes just below.
+        if turn_in_flight and not self._stop_requested:
+            try:
+                await asyncio.wait_for(self._post_stop(), _TEARDOWN_STOP_BUDGET_SECONDS)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - teardown is best-effort
+                logger.warning("kai engine handle: teardown stop timed out for %s", self._chat_id)
         self.stdout.feed_eof()
         try:
             await self._client.aclose()
@@ -540,67 +565,91 @@ class KaiEngineHandle:
                 # answer the user already cancelled.
                 self._finish_turn(state)
                 return
-            token = await self._bearer()
-            body = {
-                "id": self._chat_id,
-                "message": {
-                    "id": str(uuid.uuid4()),
-                    "role": "user",
-                    "parts": [{"type": "text", "text": text}],
-                },
-                # Route approvals through the native event + POST /approval
-                # pair; without this the engine parks approvals on a UI
-                # heuristic this transport does not implement. Advertised
-                # even with approvals disabled — the kill-switch is applied
-                # as an instant auto-deny per request (see _translate), the
-                # same deny-with-a-message the native gate produces.
-                "supportsApprovalRequestedEvent": True,
-            }
-            async with self._client.stream(
-                "POST",
-                f"{self._base_url}/api/chat",
-                headers={"Authorization": f"Bearer {token}"},
-                json=body,
-            ) as resp:
-                if resp.status_code >= 400:
-                    await resp.aread()
-                    self._emit_turn_failure(state, self._engine_error_message(resp))
-                    return
-
-                # SSE record assembly: consecutive `data:` lines belong to ONE
-                # record, dispatched at the blank line (the CLI's SSE consumer
-                # documents the same rules) — a proxy that reflows a long
-                # payload across lines must not turn it into parse failures.
-                def _dispatch_record(lines: list[str]) -> None:
-                    payload = "\n".join(lines)
-                    if not payload or payload == "[DONE]":
-                        return
-                    try:
-                        event = json.loads(payload)
-                    except json.JSONDecodeError:
-                        state.dropped_events += 1
-                        return
-                    if isinstance(event, dict):
-                        self._translate(state, event)
-
-                data_lines: list[str] = []
-                async for line in resp.aiter_lines():
-                    if line.startswith("data:"):
-                        data_lines.append(line[len("data:") :].strip())
+            # One retry, for one cause. A 409 says the engine is holding a
+            # turn for this chat — and it is never a turn of ours, because the
+            # handle serializes its own (see `_pending_msgs`). It is an orphan
+            # from a process that died mid-turn without a stop reaching the
+            # engine, and it outlives the handle that made it: a hard
+            # container recreate never runs `pause`. Clear it and deliver the
+            # message, rather than stranding the user in a chat that refuses
+            # every further question.
+            conflict_cleared = False
+            while True:
+                token = await self._bearer()
+                body = {
+                    "id": self._chat_id,
+                    "message": {
+                        "id": str(uuid.uuid4()),
+                        "role": "user",
+                        "parts": [{"type": "text", "text": text}],
+                    },
+                    # Route approvals through the native event + POST /approval
+                    # pair; without this the engine parks approvals on a UI
+                    # heuristic this transport does not implement. Advertised
+                    # even with approvals disabled — the kill-switch is applied
+                    # as an instant auto-deny per request (see _translate), the
+                    # same deny-with-a-message the native gate produces.
+                    "supportsApprovalRequestedEvent": True,
+                }
+                async with self._client.stream(
+                    "POST",
+                    f"{self._base_url}/api/chat",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=body,
+                ) as resp:
+                    if resp.status_code == _CONFLICT_STATUS and not conflict_cleared:
+                        await resp.aread()
+                        conflict_cleared = True
+                        logger.warning(
+                            "kai engine turn for %s hit an orphaned turn; stopping it and retrying once",
+                            self._chat_id,
+                        )
+                        await self._post_stop()
                         continue
-                    if line.strip() and not line.startswith(":"):
-                        continue  # id:/event: fields — not record boundaries
-                    if not line.strip() and data_lines:
-                        record, data_lines = data_lines, []
-                        _dispatch_record(record)
-                if data_lines:
-                    # Stream closed mid-record (no trailing blank line): the
-                    # final record still counts — dropping it here would lose
-                    # whatever the engine said last.
-                    _dispatch_record(data_lines)
+                    if resp.status_code >= 400:
+                        await resp.aread()
+                        self._emit_turn_failure(state, self._engine_error_message(resp))
+                        return
+
+                    # SSE record assembly: consecutive `data:` lines belong to ONE
+                    # record, dispatched at the blank line (the CLI's SSE consumer
+                    # documents the same rules) — a proxy that reflows a long
+                    # payload across lines must not turn it into parse failures.
+                    def _dispatch_record(lines: list[str]) -> None:
+                        payload = "\n".join(lines)
+                        if not payload or payload == "[DONE]":
+                            return
+                        try:
+                            event = json.loads(payload)
+                        except json.JSONDecodeError:
+                            state.dropped_events += 1
+                            return
+                        if isinstance(event, dict):
+                            self._translate(state, event)
+
+                    data_lines: list[str] = []
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data:"):
+                            data_lines.append(line[len("data:") :].strip())
+                            continue
+                        if line.strip() and not line.startswith(":"):
+                            continue  # id:/event: fields — not record boundaries
+                        if not line.strip() and data_lines:
+                            record, data_lines = data_lines, []
+                            _dispatch_record(record)
+                    if data_lines:
+                        # Stream closed mid-record (no trailing blank line): the
+                        # final record still counts — dropping it here would lose
+                        # whatever the engine said last.
+                        _dispatch_record(data_lines)
+                break
         except asyncio.CancelledError:
             raise
         except httpx.ReadTimeout:
+            # Giving up on reading the turn has to mean giving up on the turn:
+            # the engine is still processing this message and would refuse the
+            # next one with a 409 conflict.
+            await self._post_stop()
             self._emit_turn_failure(
                 state,
                 f"no engine activity for {int(_SSE_READ_TIMEOUT_SECONDS)}s; giving up on the turn",
@@ -608,12 +657,22 @@ class KaiEngineHandle:
             return
         except Exception as exc:  # noqa: BLE001 - a failed turn ends, the handle survives
             logger.exception("kai engine turn failed for %s", self._chat_id)
+            await self._post_stop()
             self._emit_turn_failure(state, f"engine turn failed: {exc}")
             return
         self._finish_turn(state)
 
     @staticmethod
     def _engine_error_message(resp: httpx.Response) -> str:
+        if resp.status_code == _CONFLICT_STATUS:
+            # The raw body is a vendor dict down to its exceptionId: all true,
+            # none of it the answer. A conflict that survived the stop-and-
+            # retry means a turn really is running — say that, and say what
+            # the reader can do about it.
+            return (
+                "The engine is still working on the previous message in this chat. "
+                "Wait for that answer to finish, or start a new chat session."
+            )
         try:
             detail = resp.json()
             message = detail.get("message") or detail.get("error") or resp.text

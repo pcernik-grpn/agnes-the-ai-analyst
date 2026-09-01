@@ -86,6 +86,21 @@ class _GatedStream(httpx.AsyncByteStream):
         return None
 
 
+class _RaisingStream(httpx.AsyncByteStream):
+    """SSE body that dies mid-stream — a stalled engine (ReadTimeout) or a
+    dropped connection, the two ways a turn ends with the engine still on it."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def __aiter__(self):
+        yield b":ping\n\n"
+        raise self._exc
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _RawStream(httpx.AsyncByteStream):
     """SSE body from raw bytes — for wire shapes _GatedStream can't express
     (e.g. a stream that closes without the trailing blank line)."""
@@ -108,7 +123,8 @@ class FakeEngine(httpx.AsyncBaseTransport):
         self.chat_requests: list[dict] = []
         self.stop_count = 0
         self.approvals: list[dict] = []
-        #: Per-turn scripts, consumed in order. Each: {"status": int} or
+        #: Per-turn scripts, consumed in order. Each: {"status": int,
+        #: "body": dict}, {"raise": exc} or
         #: {"pre": [...], "gate": Event|None, "post": [...]}.
         self.turns: list[dict] = []
 
@@ -120,9 +136,11 @@ class FakeEngine(httpx.AsyncBaseTransport):
             spec = self.turns.pop(0) if self.turns else {"pre": [{"type": "finish"}]}
             status = spec.get("status", 200)
             if status != 200:
-                return httpx.Response(status, json={"message": "refused"})
+                return httpx.Response(status, json=spec.get("body", {"message": "refused"}))
             stream: httpx.AsyncByteStream
-            if "raw" in spec:
+            if "raise" in spec:
+                stream = _RaisingStream(spec["raise"])
+            elif "raw" in spec:
                 stream = _RawStream(spec["raw"])
             else:
                 stream = _GatedStream(spec.get("pre", []), spec.get("gate"), spec.get("post"))
@@ -269,9 +287,12 @@ def test_turn_translates_stream_to_frames():
 
 
 def test_http_refusal_emits_error_then_done():
+    # 500, not 409: a conflict is the one refusal with recovery semantics of
+    # its own (stop the orphan, retry once — see the conflict tests below), so
+    # it can no longer stand in for "any HTTP refusal".
     async def _run():
         engine = FakeEngine()
-        engine.turns = [{"status": 409}]
+        engine.turns = [{"status": 500}]
         provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
         handle = await _spawn(provider)
         await _send(handle, {"type": "user_msg", "text": "hi"})
@@ -279,7 +300,7 @@ def test_http_refusal_emits_error_then_done():
         await handle.kill()
         assert _types(frames) == ["runner_ready", "error", "done"]
         assert frames[1]["kind"] == "engine_error"
-        assert "409" in frames[1]["message"]
+        assert "500" in frames[1]["message"]
 
     asyncio.run(_run())
 
@@ -578,6 +599,173 @@ def test_mid_turn_user_msg_is_buffered_until_the_turn_ends():
         assert len(engine.chat_requests) == 2
         assert engine.chat_requests[1]["body"]["message"]["parts"][0]["text"] == "second"
         assert frames2[-1]["type"] == "done"
+
+    asyncio.run(_run())
+
+
+_CONFLICT_BODY = {
+    # The engine's refusal, in the shape a live instance returns it. The
+    # exception id is a placeholder — the point is that it never reaches a
+    # reader, not which one it was.
+    "type": "conflict",
+    "surface": "chat",
+    "message": "A message is already being processed in this chat",
+    "exceptionId": "KAI-0000000000-00000000",
+}
+
+
+def test_a_stalled_turn_stops_the_engine_before_giving_up():
+    """A turn Agnes abandons must not stay alive on the engine.
+
+    The SSE read timeout ends the turn locally — `done` goes out, the composer
+    unlocks — while the engine is still processing that message. Nothing told
+    it to stop, so the next user message in the same chat was refused
+    `409 A message is already being processed in this chat` (reported from a
+    live instance). Giving up on reading a turn has to mean giving up on the
+    turn.
+    """
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [{"raise": httpx.ReadTimeout("no data")}]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "analyse everything"})
+        frames = await _drain_until_done(handle)
+        await handle.kill()
+        errors = [f for f in frames if f["type"] == "error"]
+        assert errors and "no engine activity" in errors[0]["message"]
+        assert engine.stop_count == 1, "the abandoned turn was left running on the engine"
+
+    asyncio.run(_run())
+
+
+def test_a_turn_that_dies_on_a_dropped_connection_stops_the_engine():
+    """Same contract for the generic mid-stream failure, not just the timeout."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [{"raise": httpx.ReadError("connection reset")}]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "analyse everything"})
+        await _drain_until_done(handle)
+        await handle.kill()
+        assert engine.stop_count == 1
+
+    asyncio.run(_run())
+
+
+def test_teardown_mid_turn_stops_the_engine():
+    """`pause` is a teardown and the manager's crash-respawn is another; both
+    cancel the turn task. The engine keeps the turn either way, so the handle
+    has to stop it on the way out — otherwise the session resumes into a 409.
+    """
+
+    async def _run():
+        engine = FakeEngine()
+        gate = asyncio.Event()  # never set: the engine is still working
+        engine.turns = [{"pre": [{"type": "text-start", "id": "a"}], "gate": gate}]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "long analysis"})
+        await asyncio.sleep(0.05)
+        assert len(engine.chat_requests) == 1, "turn must be in flight for this test to mean anything"
+        await provider.pause(handle)
+        assert engine.stop_count == 1, "teardown orphaned an in-flight engine turn"
+
+    asyncio.run(_run())
+
+
+def test_teardown_between_turns_stops_nothing():
+    """The stop is for an in-flight turn only — a handle torn down while idle
+    must not fire a stop at a chat that has nothing running."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [{"pre": [{"type": "finish"}]}]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "quick one"})
+        await _drain_until_done(handle)
+        await provider.pause(handle)
+        assert engine.stop_count == 0
+
+    asyncio.run(_run())
+
+
+def test_an_orphan_turn_is_cleared_and_the_message_retried():
+    """A 409 means the engine holds a turn this handle knows nothing about.
+
+    An orphan outlives the process that made it — a hard container recreate
+    never runs `pause`. The handle serializes its own turns, so a conflict is
+    never a live turn of ours: clear it and deliver the message, rather than
+    handing the user a vendor error dict for a chat they cannot use again.
+    """
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [
+            {"status": 409, "body": _CONFLICT_BODY},
+            {"pre": [{"type": "text-start", "id": "a"}, {"type": "text-delta", "id": "a", "delta": "hi"}]},
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "next question"})
+        frames = await _drain_until_done(handle)
+        await handle.kill()
+        assert engine.stop_count == 1, "the orphan was never cleared"
+        assert len(engine.chat_requests) == 2, "the message was not retried after the stop"
+        assert "token" in _types(frames), "the retried turn's answer never reached the user"
+        assert not [f for f in frames if f["type"] == "error"], _types(frames)
+
+    asyncio.run(_run())
+
+
+def test_a_conflict_that_survives_the_stop_is_reported_once_in_plain_words():
+    """One retry, then stop trying — and say something a reader can act on.
+
+    The raw refusal (`engine refused the turn (409): {'type': 'conflict', …
+    'exceptionId': 'KAI-…'}`) is all true and none of it the answer, the same
+    failure the connector-token refusal was fixed for.
+    """
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [
+            {"status": 409, "body": _CONFLICT_BODY},
+            {"status": 409, "body": _CONFLICT_BODY},
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "next question"})
+        frames = await _drain_until_done(handle)
+        await handle.kill()
+        assert len(engine.chat_requests) == 2, "a conflict must be retried once, not in a loop"
+        errors = [f for f in frames if f["type"] == "error"]
+        assert len(errors) == 1
+        message = errors[0]["message"]
+        assert "exceptionId" not in message and "KAI-" not in message, message
+        assert "still working" in message.lower(), message
+
+    asyncio.run(_run())
+
+
+def test_a_refusal_that_is_not_a_conflict_stops_nothing_and_is_not_retried():
+    """A 500 means the turn never started — stopping or retrying it would be
+    inventing a turn the engine does not have."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [{"status": 500}]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "hello"})
+        frames = await _drain_until_done(handle)
+        await handle.kill()
+        assert engine.stop_count == 0
+        assert len(engine.chat_requests) == 1
+        assert [f for f in frames if f["type"] == "error"]
 
     asyncio.run(_run())
 
