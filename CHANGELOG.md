@@ -48,6 +48,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   now follows that redirect by hand, with a separate, unauthenticated
   request — never the Graph bearer token — to the redirect target, keeping
   the per-file size cap and partial-file cleanup intact.
+- **Container logs that never reached Cloud Logging.** The `gcplogs` overlay
+  (`docker-compose.gcp-logging.yml`, engaged by `enable_gcp_logging`) listed the
+  services the compose file had when it was written and was never revisited, so
+  every service added since — `extraction-worker`, `apps-runner`, `egress-proxy`,
+  `kai-agent-stub` — silently kept the default `json-file` driver. The gap was
+  invisible from the outside: `app`, `scheduler` and `caddy` shipped normally, so
+  an instance looked correctly configured while the connector-crawl logs an
+  operator actually goes looking for stayed on the box and died with each
+  auto-upgrade container recreate. The near-miss that hid it is that `extract`
+  (the one-shot extractor, present in the list and not running) and
+  `extraction-worker` (the long-running extraction lane, running and absent) are
+  two different services. The overlay now covers exactly the services
+  `docker-compose.yml` defines, both directions pinned by a guard — services that
+  exist only in a conditional overlay (`redis`, `postgres`, `kai-agent`) must
+  keep taking their log driver there, since naming one here would make compose
+  refuse to parse the whole stack on every instance that does not load it. Takes
+  effect on a VM at the next container recreate.
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
