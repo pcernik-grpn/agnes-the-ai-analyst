@@ -1182,6 +1182,11 @@ _EXEMPT: dict[str, str] = {
         "confirm/list/unselect a scope (site/library/folder -> collection) for the "
         "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
     ),
+    "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
+        "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
+        "hatch's other half, keeping the wizard's step-2 sites level populated across "
+        "reopens; admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/corpus-map": (
         "producer handoff: the flat {source_scope_id: collection_id} mapping "
         "ship_to_agnes.py --corpus-map consumes until crawling moves inside Agnes — "

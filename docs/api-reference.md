@@ -1194,8 +1194,16 @@ scoped callback credential (`ProducerPrincipal`, `app/auth/producer_token.py`)
 when its `connection_id` claim matches the path — a producer token minted
 for a DIFFERENT connection 403s.
 
+`POST/DELETE …/manual-sites` is the other half of the `?site_url=` escape
+hatch on `…/tree`: that browse resolves a named site but stores nothing, so
+under `Sites.Selected` — where Graph 403-forbids enumeration — the wizard
+forgot it on every reopen. The POST resolves and persists it on the
+connection (`config.manual_sites`, idempotent on the resolved site id), the
+DELETE (`?site_id=`) forgets it again.
+
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
+- /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/corpus-map
 - /api/admin/sharepoint/connections/{connection_id}/certificate
