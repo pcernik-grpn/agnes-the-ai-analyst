@@ -107,6 +107,11 @@ the stack, so registering a table needs no knowledge of which kind of project it
 is. The remembered answer is per stack and per process, so the refused request
 costs one POST per restart rather than one per table per sync. To skip the probe
 entirely, pin the format in the row's `source_query`: `{"file_type":"csv"}`.
+Both export formats serve every column as VARCHAR at the wire level; either
+way Agnes retypes the materialized parquet from the source table's real
+schema (best-effort — a schema-fetch or cast failure keeps VARCHAR rather
+than failing the sync), so the CSV fallback is not merely slower, it produces
+the same typed columns.
 
 ### Identifier validation
 

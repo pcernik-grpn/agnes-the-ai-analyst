@@ -23,6 +23,7 @@ Storage API is mocked throughout — the real client is exercised in
 tests/test_keboola_storage_api.py.
 """
 
+import importlib.util
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -276,3 +277,149 @@ def test_explicitly_pinned_parquet_also_falls_back(tmp_path, caplog):
     assert client.export_table.call_count == 1
     assert (tmp_path / "out" / "orders.parquet").exists()
     assert len(_fallback_warnings(caplog)) == 1
+
+
+# ---- 4. the CSV path retypes columns too (#1979 follow-up) -----------------
+#
+# The initial fallback fix (b16f52ffa) left the CSV branch reading
+# `all_varchar=true` and writing straight to parquet with no retype step —
+# a project on the fallback got every materialized column as VARCHAR, silently,
+# while the WARNING claimed "the data is identical". These tests pin the fix:
+# the CSV branch must apply the exact same best-effort retype the native
+# parquet branch does.
+
+_needs_kbcstorage = pytest.mark.skipif(
+    importlib.util.find_spec("kbcstorage") is None,
+    reason="requires the [server] extra (kbcstorage)",
+)
+
+
+def _client_with_real_credentials(*, parquet_supported: bool, csv_text: str) -> MagicMock:
+    """Like `_client`, but with real string `.token`/`.base` so the
+    `isinstance` guard in `_retype_best_effort` actually engages, and a CSV
+    export body the caller controls (to exercise typed-looking values)."""
+
+    def fake_prepare(table_id, *, export_filter=None, export_timeout=None):
+        if not parquet_supported:
+            raise kbs.StorageApiError(
+                f"POST {STACK}/tables/{table_id}/export-async -> HTTP 400: {FILETYPE_REJECTION_BODY}",
+                status=400,
+                body=FILETYPE_REJECTION_BODY,
+            )
+        return {
+            "job_id": 100,
+            "file_id": 200,
+            "rows": 2,
+            "file_info": {"id": 200, "url": "https://fake/x", "isSliced": False},
+            "file_type": "parquet",
+        }
+
+    def fake_export_table(table_id, dest, *, export_filter=None, export_timeout=None):
+        dest_path = Path(dest)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text(csv_text, encoding="utf-8")
+        return {"job_id": 101, "file_id": 201, "rows": 2, "bytes": dest_path.stat().st_size, "file_type": "csv"}
+
+    client = MagicMock()
+    client.base = STACK
+    client.token = "fake-token"
+    client.prepare_export.side_effect = fake_prepare
+    client.export_table.side_effect = fake_export_table
+    return client
+
+
+_TYPED_CSV = "id,amount,signup_date\n1,100.5,2024-01-01\n2,250.0,2024-02-02\n"
+
+
+def _typed_schema():
+    import pyarrow as pa
+
+    return pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("amount", pa.float64()),
+            pa.field("signup_date", pa.date32()),
+        ]
+    )
+
+
+@_needs_kbcstorage
+def test_csv_fallback_retypes_columns_same_as_parquet_path(tmp_path, monkeypatch, caplog):
+    """When the project refuses parquet and falls back to CSV, the
+    materialized parquet must come out typed — not all-VARCHAR."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from connectors.keboola.client import KeboolaClient
+
+    monkeypatch.setattr(KeboolaClient, "__init__", lambda self, **kw: None)
+    monkeypatch.setattr(KeboolaClient, "get_pyarrow_schema", lambda self, tid: _typed_schema())
+
+    client = _client_with_real_credentials(parquet_supported=False, csv_text=_TYPED_CSV)
+    with caplog.at_level(logging.WARNING, logger="connectors.keboola.extractor"):
+        result = _materialize(client, tmp_path)
+
+    parquet_path = tmp_path / "out" / "orders.parquet"
+    table = pq.read_table(parquet_path)
+    assert table.schema.field("id").type == pa.int64()
+    assert table.schema.field("amount").type == pa.float64()
+    assert table.schema.field("signup_date").type == pa.date32()
+    assert table.column("amount").to_pylist() == [100.5, 250.0]
+    assert result["rows"] == 2
+
+    # The downgrade WARNING still fires exactly once, but no longer claims
+    # the data is untouched between the two export formats.
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert "identical" not in warnings[0].getMessage().lower()
+
+
+@_needs_kbcstorage
+def test_csv_fallback_keeps_varchar_when_schema_unavailable(tmp_path, monkeypatch, caplog):
+    """Metadata API unreachable → the CSV fallback still succeeds, keeping
+    Storage API's native (all-VARCHAR) types, exactly like the parquet path's
+    existing graceful degradation. Must not raise."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from connectors.keboola.client import KeboolaClient
+
+    def raise_unreachable(self, tid):
+        raise RuntimeError("metadata API unreachable")
+
+    monkeypatch.setattr(KeboolaClient, "__init__", lambda self, **kw: None)
+    monkeypatch.setattr(KeboolaClient, "get_pyarrow_schema", raise_unreachable)
+
+    client = _client_with_real_credentials(parquet_supported=False, csv_text=_TYPED_CSV)
+    with caplog.at_level(logging.WARNING, logger="connectors.keboola.extractor"):
+        _materialize(client, tmp_path)
+
+    table = pq.read_table(tmp_path / "out" / "orders.parquet")
+    assert table.schema.field("amount").type == pa.string()
+
+    schema_warnings = [r for r in caplog.records if "schema unavailable" in r.getMessage()]
+    assert len(schema_warnings) == 1
+
+
+@_needs_kbcstorage
+def test_explicit_csv_spec_also_retypes_columns(tmp_path, monkeypatch):
+    """The explicit `{"file_type":"csv"}` pin reaches the same CSV branch as
+    the automatic downgrade, so it gets the same retype — pinning to CSV
+    trades speed for nothing else."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from connectors.keboola.client import KeboolaClient
+
+    monkeypatch.setattr(KeboolaClient, "__init__", lambda self, **kw: None)
+    monkeypatch.setattr(KeboolaClient, "get_pyarrow_schema", lambda self, tid: _typed_schema())
+
+    # Parquet is supported here — the pin, not a rejection, drives the CSV
+    # branch, and retyping must engage all the same.
+    client = _client_with_real_credentials(parquet_supported=True, csv_text=_TYPED_CSV)
+    _materialize(client, tmp_path, source_query='{"file_type":"csv"}')
+
+    assert client.prepare_export.call_count == 0
+    table = pq.read_table(tmp_path / "out" / "orders.parquet")
+    assert table.schema.field("id").type == pa.int64()
+    assert table.schema.field("amount").type == pa.float64()
