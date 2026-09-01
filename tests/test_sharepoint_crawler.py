@@ -256,7 +256,12 @@ class FakeSourceConnectionsRepo:
         return self.connection
 
 
-def _run(connection: Dict[str, Any], monkeypatch, scopes: Optional[List[str]] = None) -> Dict[str, Any]:
+def _run(
+    connection: Dict[str, Any],
+    monkeypatch,
+    scopes: Optional[List[str]] = None,
+    force_reprocess: bool = False,
+) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
         lambda: FakeSourceConnectionsRepo(connection),
@@ -264,6 +269,8 @@ def _run(connection: Dict[str, Any], monkeypatch, scopes: Optional[List[str]] = 
     payload: Dict[str, Any] = {"connection_id": connection["id"]}
     if scopes:
         payload["scopes"] = scopes
+    if force_reprocess:
+        payload["force_reprocess"] = True
     return crawler.run_builtin_crawl(payload)
 
 
@@ -517,6 +524,105 @@ class TestResume:
         messages = [r.message for r in caplog.records if "ingest failed" in r.message]
         assert messages
         assert "ingest exploded" in messages[0]
+
+
+# --------------------------------------------------------------------------
+# force_reprocess: the operator control that ignores the delta cursor
+# (admin_data_sources.html's "Re-process everything" checkbox, wired through
+# `ExtractionRunOptions.force_reprocess` -> the `corpus-extraction` job
+# payload -> here). Unlike `resync` (which only re-enumerates, keeping
+# cTags so unchanged files are still skipped), this bypasses BOTH the
+# persisted deltaLink and the cTag-equality skip for one run — but never
+# writes either off before the run starts, so an interrupted forced run
+# leaves the connection no worse off than before the box was ticked.
+# --------------------------------------------------------------------------
+
+
+class TestForceReprocess:
+    def test_force_reprocess_redownloads_an_item_whose_ctag_is_unchanged(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+
+        assert forced["unchanged"] == 0
+        assert forced["new"] == 0 and forced["changed"] == 1
+        assert sum(1 for url in seen if url.endswith("/content")) > downloads_after_first
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item1"
+
+    def test_without_force_reprocess_the_same_item_is_still_skipped(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        _install_graph(monkeypatch, handler)
+        _run(connection, monkeypatch)
+        second = _run(connection, monkeypatch, force_reprocess=False)
+
+        assert second["unchanged"] == 1
+        assert second["new"] == 0 and second["changed"] == 0
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_force_reprocess_does_not_persist_to_the_next_run(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        _install_graph(monkeypatch, handler)
+        _run(connection, monkeypatch)
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+        assert forced["changed"] == 1  # sanity: this run actually reprocessed
+
+        again = _run(connection, monkeypatch)  # no force_reprocess this time
+        assert again["unchanged"] == 1
+        assert again["new"] == 0 and again["changed"] == 0
+
+    def test_force_reprocess_ignores_the_persisted_delta_link(self, crawl_env, monkeypatch):
+        """Bypassing the cTag check alone is not enough: a real delta cursor
+        only re-offers items that changed since the last sync, so an
+        unchanged item would never even reach the cTag check. The run must
+        also start every drive from the bare delta base, exactly like a 410
+        resync does, rather than resume from the persisted deltaLink."""
+        crawler.save_state(
+            "conn1",
+            {"delta_links": {"b!drive1": f"{DRIVE_DELTA}?token=OLD"}, "ctags": {"graph:item1": "ctag-1"}},
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?token=NEW"})
+
+        seen = _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch, force_reprocess=True)
+
+        assert not any("token=OLD" in url for url in seen)
+        assert any("/root/delta?%24top=" in url or "/root/delta?$top=" in url for url in seen)
+        # `unchanged == 0` is the load-bearing assertion here: the seeded
+        # cTag matches the item Graph returns, so a run that consulted the
+        # persisted deltaLink (and thus never re-offered the item at all,
+        # the real-Graph behaviour this fake handler cannot model) OR that
+        # still applied the cTag-equality skip would both report 0 ingests.
+        # (The ingestor has no record of this stable_id yet — only the
+        # crawl state was seeded — so this lands as `new`, not `changed`.)
+        assert report["unchanged"] == 0
+        assert report["new"] == 1
+        # The freshly-observed deltaLink still lands in state — a forced run
+        # is not a permanent regression to "always full-crawl", just this
+        # one pass.
+        assert _state(crawl_env)["delta_links"]["b!drive1"] == f"{DRIVE_DELTA}?token=NEW"
 
 
 # --------------------------------------------------------------------------
