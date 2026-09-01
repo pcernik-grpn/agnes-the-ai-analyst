@@ -1049,6 +1049,22 @@
   }
   .ext-run__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; }
   .ext-run__when { color: var(--ds-text-muted); }
+  /* Per-file error detail (`<details>`, lazy-fetched on first open — see
+     `_extErrorsSummaryHtml`). The marker is hidden so the summary line reads
+     like every other `.ext-sub` line until it is clicked. */
+  .ext-errors { margin-top: 2px; }
+  .ext-errors > summary { cursor: pointer; list-style: none; }
+  .ext-errors > summary::-webkit-details-marker { display: none; }
+  .ext-errors__list {
+    list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column;
+    gap: 4px; max-height: 220px; overflow-y: auto;
+  }
+  .ext-errors__list li {
+    font-size: 11px; color: var(--ds-text-muted); padding: 4px 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface);
+  }
+  .ext-errors__list code { color: var(--ds-text-primary); }
   .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   .ext-cfg th, .ext-cfg td {
     text-align: left; padding: 6px 8px; vertical-align: top;
@@ -7285,8 +7301,10 @@ function _extRunLine(run) {
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
   if (run.bytes_downloaded_human) bits.push(`${run.bytes_downloaded_human} downloaded`);
   // NER token accounting (usage or the report's ner_usage): a token COUNT is a
-  // fact; the drawer says "not priced" rather than inventing a dollar figure
-  // until operator-configured pricing exists. Absence means "no tokens spent".
+  // fact, and `estimated_cost_usd` (src.llm_pricing.cost_usd, when the stage
+  // priced its own spend) is shown next to it. A stage that has not been
+  // priced yet says "not priced" rather than inventing a dollar figure.
+  // Absence of the whole block means "no tokens spent".
   // `usage` is keyed by stage ({ner: {...}, facts: {...}}); a flat token
   // dict (the pre-stage-keyed shape) and `run.ner_usage` stay readable so
   // rows recorded before the contract change keep rendering their spend.
@@ -7297,7 +7315,8 @@ function _extRunLine(run) {
     for (const [stage, u] of Object.entries(stages)) {
       if (u && (u.input_tokens || u.output_tokens)) {
         const tok = (u.input_tokens || 0) + (u.output_tokens || 0);
-        bits.push(`${_extNum(tok)} ${stageLabels[stage] || stage} tokens · not priced`);
+        const priceText = typeof u.estimated_cost_usd === "number" ? `$${u.estimated_cost_usd.toFixed(4)}` : "not priced";
+        bits.push(`${_extNum(tok)} ${stageLabels[stage] || stage} tokens · ${priceText}`);
       }
     }
   }
@@ -7313,6 +7332,7 @@ const EXT_STOP_REASON_TEXT = {
   timeout: "the run hit its time ceiling (extraction.timeout_s)",
   throttled: "the tenant's throttling budget was exhausted (HTTP 429)",
   stopped: "stopped by an admin",
+  abandoned: "the worker running it died (crashed or was killed) and never finished — closed when the next run started",
   error: "an unexpected error",
 };
 
@@ -7356,6 +7376,70 @@ function _extActivityHtml(activity) {
   return html;
 }
 
+/* ── Per-file error detail: a `<details>` an operator can open, never a
+   count that only means something in a container log a VM recreate has
+   already wiped. The summary line renders for free (the count already
+   rides every run payload); the itemized `path` / `reason` / `detail` /
+   `status_code` rows are fetched on first expand from A3
+   (`GET …/extraction/runs/{run_id}`, `report.errors_detail` — the same
+   `{items, total, listed, truncated}` envelope `skips` uses) and cached on
+   the element so re-opening never re-fetches. `run.id` is present on every
+   projection this renders from (A1's `running`/`last_completed`, A2's list
+   rows) — never null when `run.errors` is truthy, since a run cannot both
+   exist and have no id. ────────────────────────────────────────────────── */
+function _extErrorsSummaryHtml(connId, runId, errorCount) {
+  return `
+    <details class="ext-errors" data-conn="${_extEsc(connId)}" data-run="${_extEsc(runId)}" ontoggle="_extLoadErrorDetail(this)">
+      <summary class="ext-sub ext-danger">${_extNum(errorCount)} error${errorCount === 1 ? "" : "s"} — click to see why</summary>
+      <div class="ext-errors__body" data-loaded="0"></div>
+    </details>`;
+}
+
+async function _extLoadErrorDetail(details) {
+  if (!details.open) return;
+  const body = details.querySelector(".ext-errors__body");
+  if (!body || body.dataset.loaded === "1") return;
+  body.dataset.loaded = "1";
+  body.innerHTML = `<div class="ds-empty">Loading…</div>`;
+  const connId = details.dataset.conn;
+  const runId = details.dataset.run;
+  try {
+    const r = await fetch(
+      `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/runs/${encodeURIComponent(runId)}`,
+      { credentials: "include" },
+    );
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    body.innerHTML = _extErrorItemsHtml(data);
+  } catch (e) {
+    body.dataset.loaded = "0"; // a failed fetch may be retried on the next open
+    body.innerHTML = `<div class="ds-empty">Couldn't load the per-file detail — ${_extEsc(e && e.message)}.</div>`;
+  }
+}
+
+/* Reason slugs are shown verbatim rather than mapped to prose, unlike
+   `EXT_STOP_REASON_TEXT` above: `download_failed` / `convert_failed` /
+   `ingest_failed` are already the crawl's own vocabulary and an operator
+   reading a status code right next to one needs the exact word, not a
+   paraphrase. */
+function _extErrorItemsHtml(runDetail) {
+  const envelope = (runDetail.report && runDetail.report.errors_detail) || {};
+  const items = envelope.items || [];
+  if (!items.length) {
+    return `<div class="ds-empty">No per-file detail was recorded for this run.</div>`;
+  }
+  const rows = items.map((item) => {
+    const status = item.status_code != null ? ` · HTTP ${_extNum(item.status_code)}` : "";
+    const detail = item.detail ? `: ${_extEsc(item.detail)}` : "";
+    return `<li><code>${_extEsc(item.path || "(no path)")}</code> — ${_extEsc(item.reason || "error")}${status}${detail}</li>`;
+  });
+  const total = envelope.total || items.length;
+  const note = envelope.truncated
+    ? `<div class="ext-sub">${_extNum(total)} total — showing the ${_extNum(envelope.listed)} most recent.</div>`
+    : "";
+  return `<ul class="ext-errors__list">${rows.join("")}</ul>${note}`;
+}
+
 /* The `Run` fact row. Counters are absolute; the caption names the moment
    they were last true (the RUN's own checkpoint), which is not the same
    moment this page last asked. */
@@ -7389,6 +7473,12 @@ function _extRunRowHtml(connId, st) {
     sub += `</div>`;
     const line = _extRunLine(last);
     if (line) sub += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    // Errors before skips, deliberately: a skip is a policy DECISION (over
+    // the size cap, permissions), an error is something that FAILED. A run
+    // that erred on nearly everything and ingested nothing must not read as
+    // healthy just because its one visible warning happens to be 7 oversize
+    // files while 1,263 others failed silently underneath it.
+    if (last.errors) sub += _extErrorsSummaryHtml(connId, last.id, last.errors);
     if (last.skips_total) {
       sub += `<div class="ext-sub ext-warn">${_extNum(last.skips_total)} document${last.skips_total === 1 ? "" : "s"} not indexed — see the run</div>`;
     }
@@ -7678,13 +7768,13 @@ async function toggleExtractionDrawer(connId, segment) {
     }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const body = await r.json();
-    el.innerHTML = segment === "config" ? _extConfigHtml(body) : _extRunsHtml(body);
+    el.innerHTML = segment === "config" ? _extConfigHtml(body) : _extRunsHtml(connId, body);
   } catch (e) {
     el.innerHTML = `<div class="ds-empty">Couldn't load this ${_extEsc(segment)} — ${_extEsc(e && e.message)}.</div>`;
   }
 }
 
-function _extRunsHtml(body) {
+function _extRunsHtml(connId, body) {
   const runs = body.runs || [];
   if (!runs.length) return `<div class="ds-empty">No extraction runs recorded yet.</div>`;
   const rows = runs.map((run) => {
@@ -7695,6 +7785,9 @@ function _extRunsHtml(body) {
     const line = _extRunLine(run);
     let detail = "";
     if (line) detail += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    // Same severity-first ordering as the card's own last-run block: a
+    // failure reads before a policy skip.
+    if (run.errors) detail += _extErrorsSummaryHtml(connId, run.id, run.errors);
     if (run.skips_total) {
       const listed = run.skips_listed != null && run.skips_listed !== run.skips_total
         ? ` (${_extNum(run.skips_listed)} listed by name)`

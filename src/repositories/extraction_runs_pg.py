@@ -252,6 +252,78 @@ class ExtractionRunsPgRepository:
             )
         return _decode_row(dict(row)) if row else None
 
+    def abandon_stale_running(self, connection_id: str) -> List[str]:
+        """Close out every ``running`` row for this connection — call this
+        right before opening a NEW one (see ``_RunRecorder.start``).
+
+        Only one crawl per connection runs at a time by construction — the
+        manual/scheduled trigger's own idempotency dedup on the OWNING job
+        (``app/api/admin_sharepoint.py::trigger_extraction``) refuses a
+        second one while the first is still ``queued``/``running``. So if
+        execution has reached the point where a NEW run is legitimately
+        starting for this connection, any row still marked ``running`` is
+        not that new run — it is a previous attempt whose worker died (a
+        native crash, a killed process) without ever calling
+        :meth:`finish`. Left alone it stays ``running`` forever: the source
+        card reads the newest such row and renders a run that will never
+        move, with no way for an operator to tell "in progress" from "died
+        an hour ago".
+
+        Recorded ``interrupted`` with ``report.interrupted_reason ==
+        "abandoned"`` — a new, named member of the SAME vocabulary
+        ``report.interrupted_reason`` already carries for a stop the crawl
+        detects itself (``timeout`` / ``throttled`` / ``error``), not a new
+        top-level status word. The row's existing ``report``/``progress``/
+        ``files_seen``/``files_done`` (whatever the last checkpoint
+        captured) are left untouched — a dead run's own numbers are real
+        and are not overwritten with a claim of completion it never made.
+
+        Returns the abandoned run ids (empty when there was nothing to
+        close), so a caller that wants to log or test this can.
+        """
+        with self._engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    sa.text("SELECT id, report FROM extraction_runs WHERE connection_id = :cid AND status = :running"),
+                    {"cid": connection_id, "running": RUNNING},
+                )
+                .mappings()
+                .all()
+            )
+            abandoned: List[str] = []
+            for row in rows:
+                report = row["report"]
+                if isinstance(report, str):
+                    try:
+                        report = json.loads(report)
+                    except (ValueError, TypeError):
+                        report = {}
+                report = dict(report or {})
+                report["interrupted"] = True
+                report["interrupted_reason"] = "abandoned"
+                conn.execute(
+                    sa.text(
+                        "UPDATE extraction_runs SET "
+                        "  status = :status, "
+                        "  finished_at = :finished_at, "
+                        "  report = :report, "
+                        "  error = :error "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "id": row["id"],
+                        "status": INTERRUPTED,
+                        "finished_at": _now(),
+                        "report": json.dumps(report),
+                        "error": (
+                            "the worker that owned this run never finalized it — recorded abandoned "
+                            "when a new run started for this connection"
+                        ),
+                    },
+                )
+                abandoned.append(row["id"])
+        return abandoned
+
     def list_for_connection(
         self,
         connection_id: str,

@@ -16,6 +16,15 @@ import sqlalchemy as sa
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CORPUS_A = "col_a"
 CORPUS_B = "col_b"
+#: `scope_ids` (`app.web.router._sharepoint_pipeline_cell`) reads
+#: `config.scopes[].collection_id` — the connection's OWN confirmed scopes,
+#: not `facts_ingest_runs_repo().distinct_corpus_ids()` (retired). Every
+#: test whose assertions depend on `scope_ids` resolving to both fixture
+#: collections passes this.
+_TWO_SCOPES = [
+    {"source_scope_id": "s-a", "display_path": "A", "anonymize": False, "collection_id": CORPUS_A},
+    {"source_scope_id": "s-b", "display_path": "B", "anonymize": False, "collection_id": CORPUS_B},
+]
 
 
 def _admin_user() -> dict:
@@ -131,7 +140,10 @@ def _create_sharepoint_connection(**config_overrides) -> str:
 def test_pipeline_strip_counts_documents_extract_facts_edges(tmp_path, monkeypatch, pg_engine):
     pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
     _fixture(pg_env)
-    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=_TWO_SCOPES,
+    )
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
 
     from app.web.router import _source_pipelines
@@ -142,6 +154,36 @@ def test_pipeline_strip_counts_documents_extract_facts_edges(tmp_path, monkeypat
     assert fs["crawl"]["documents"] == 3
     assert fs["extract"] == {"indexed": 1, "processing": 1, "needs_review": 1}
     assert fs["graph"] == {"facts": 1, "edges": 1}
+
+
+def test_pipeline_strip_counts_documents_with_no_facts_ingest_run_at_all(tmp_path, monkeypatch, pg_engine):
+    """The live symptom this fixes: a connection whose crawl indexed real
+    files but never reached the (opt-in, off-by-default) facts stage used to
+    report `crawl.documents == 0` / `extract == {}` forever — `scope_ids`
+    came from `facts_ingest_runs_repo().distinct_corpus_ids()`, empty when no
+    run had ever touched a collection. It now comes from the connection's
+    OWN `config.scopes[].collection_id`, so the crawl/extract counts are
+    correct whether or not facts extraction has ever run."""
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _seed_collection(CORPUS_A)
+    _seed_corpus_file(CORPUS_A, "cf_a1", status="indexed")
+    _seed_corpus_file(CORPUS_A, "cf_a2", status="indexed")
+    _seed_corpus_file(CORPUS_A, "cf_a3", status="processing")
+    # No `facts_ingest_runs_repo().create(...)` call anywhere in this test —
+    # the old proxy would resolve `scope_ids == []` here.
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=[{"source_scope_id": "s-a", "display_path": "A", "anonymize": False, "collection_id": CORPUS_A}],
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+
+    assert fs["crawl"]["documents"] == 3
+    assert fs["extract"] == {"indexed": 2, "processing": 1}
+    assert fs["last_run"] is None  # honest: no ingest run has ever been recorded
 
 
 def test_error_badges_from_the_last_run_report_are_categorized(tmp_path, monkeypatch, pg_engine):
@@ -296,7 +338,10 @@ def test_rejection_rows_degrade_to_unresolved_when_doc_id_is_unknown(tmp_path, m
 def test_identity_row_counts_matched_groups_and_ungranted_collections(tmp_path, monkeypatch, pg_engine):
     pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
     _fixture(pg_env)
-    conn_id = _create_sharepoint_connection(cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY")
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=_TWO_SCOPES,
+    )
     monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
 
     from app.web.router import _source_pipelines
