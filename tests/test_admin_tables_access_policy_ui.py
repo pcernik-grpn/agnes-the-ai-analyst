@@ -13,9 +13,27 @@ modal's DOM, and the inline-error wiring. A full click-through needs a
 headless browser this suite doesn't run.
 """
 
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_tables.html"
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _template_text() -> str:
+    """The template carries a couple of stray NUL bytes (pre-existing,
+    unrelated to this change) that trip a plain ``read_text`` — strip them
+    the same way the diff-panel review that found this used ``grep -a``."""
+    return TEMPLATE_PATH.read_bytes().replace(b"\x00", b"").decode("utf-8")
 
 
 def test_access_column_header_present(seeded_app):
@@ -790,3 +808,229 @@ def test_new_history_styles_are_tokenized_and_not_inline(seeded_app):
     renderer = body[body.index("function _apRenderRevisions") :]
     renderer = renderer[: renderer.index("function apRestoreRevision")]
     assert "style=" not in renderer, "new history rows must not carry inline styles"
+
+
+# ── #1979 K1-sweep finding 2 (MonikaFeigler): a diff between revisions ────
+#
+# The panel already listed who/when/note + a body peek + Restore. That is a
+# CHOOSER, not a way to tell what actually changed between two saves — this
+# section adds a per-revision line diff so an admin doesn't have to load two
+# versions into the editor and eyeball them.
+
+
+def test_history_panel_ships_a_self_contained_line_diff(seeded_app):
+    """No external diff library — a policy body is a handful of SQL lines,
+    not a file worth Myers' bookkeeping. The functions live inline, next to
+    the renderer that calls them."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apDiffLines" in body
+    assert "function _apRenderDiffBody" in body
+    assert "function _apRenderRevisionDiff" in body
+    for lib in ("diff-match-patch", "jsdiff", "diff.js", "Diff.diffLines"):
+        assert lib not in body, f"unexpected external diff dependency: {lib}"
+
+
+def test_diff_is_bounded_so_a_pasted_wall_of_sql_cannot_hang_the_panel(seeded_app):
+    """The LCS table is O(n*m) time AND space — a per-side cap keeps opening
+    the history panel cheap even if a policy body is pasted from somewhere
+    unbounded."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "_AP_DIFF_MAX_LINES" in body
+    diff_fn = body[body.index("function _apDiffLines") :]
+    diff_fn = diff_fn[: diff_fn.index("function _apRenderDiffBody")]
+    assert "_AP_DIFF_MAX_LINES" in diff_fn
+    assert "return null" in diff_fn
+
+
+def test_diff_renders_a_collapsed_details_block_like_the_transpiled_preview(seeded_app):
+    """Same idiom as ``.ap-preview-transpiled`` (f2fd242e6): collapsed by
+    default, opened only when the peek isn't enough to tell two edits apart."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "<details" in render_fn and "<summary>" in render_fn
+    assert "ap-history-diff-details" in render_fn
+    assert "Diff vs previous" not in render_fn, "the label is a parameter, not hardcoded here"
+    assert "escapeHtml(label)" in render_fn
+
+
+def test_diff_escapes_both_the_removed_and_added_lines(seeded_app):
+    """Every line inserted into the diff body — from either side — goes
+    through ``escapeHtml`` before it reaches the page. A policy body is
+    admin-authored SQL, not trusted markup."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    diff_body_fn = body[body.index("function _apRenderDiffBody") :]
+    diff_body_fn = diff_body_fn[: diff_body_fn.index("function _apMappingLabel")]
+    assert "escapeHtml(prefix + op.text)" in diff_body_fn, (
+        "the single escapeHtml call must cover both add ('+') and del ('-') lines, "
+        "since op.text comes from either the old or the new side"
+    )
+
+
+def test_note_only_change_says_so_instead_of_an_empty_diff(seeded_app):
+    """Re-saving the same SQL with a clarifying note must not render an
+    empty diff block, which would read as a bug rather than as "no SQL
+    change"."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "SQL unchanged" in render_fn and "note changed" in render_fn
+    assert "oldSql === newSql" in render_fn
+
+
+def test_cleared_revision_diffs_as_all_lines_removed(seeded_app):
+    """A cleared revision's SQL is NULL. Diffed against its predecessor it
+    must show as every line removed, not silently treated as unchanged."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "!older.cleared" in render_fn
+    assert "!newer.cleared" in render_fn
+
+
+def test_oldest_revision_in_the_window_says_first_recorded_or_diffs_against_empty(seeded_app):
+    """The oldest revision the (capped) list carries has no older neighbour
+    IN THAT LIST. When the store truly holds nothing before it, say so
+    plainly rather than rendering a diff against nothing; when ``count``
+    says there is more history than this page shows, diff against an empty
+    baseline instead of silently dropping the block."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions(body)") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "First recorded version." in renderer
+    assert "_apRenderRevisionDiff(null, rev, 'Diff vs previous')" in renderer
+    assert "body.count > revisions.length" in renderer
+
+
+def test_newest_revision_also_diffs_against_the_currently_stored_policy(seeded_app):
+    """The newest saved revision and the live registry row are USUALLY
+    identical (one save writes both in the same transaction) — this only
+    renders when they diverge, per idx === 0."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions(body)") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "idx === 0" in renderer
+    assert "Diff vs current" in renderer
+    assert "_apTable.access_policy_sql" in renderer
+    assert "_apTable.policy_mapping" in renderer
+
+
+def test_policy_mapping_toggle_renders_as_a_one_line_flag_change(seeded_app):
+    """``policy_mapping`` is a boolean, not a line-diffable body — it earns
+    its own sentence rather than hiding inside (or being silently dropped
+    from) the SQL diff."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apMappingChangeLine" in body
+    mapping_fn = body[body.index("function _apMappingChangeLine") :]
+    mapping_fn = mapping_fn[: mapping_fn.index("function _apRenderRevisionDiff")]
+    assert "Policy mapping:" in mapping_fn
+    assert "ap-history-mapping-change" in mapping_fn
+    assert "escapeHtml(_apMappingLabel(" in mapping_fn
+
+
+def test_diff_styles_use_ds_tokens_not_raw_hex(seeded_app):
+    """Design-system contract, same shape as the existing history-row
+    styling test: classes only, --ds-* tokens only, no raw hex."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    for cls in (".ap-diff-add", ".ap-diff-del", ".ap-history-diff", ".ap-history-mapping-change"):
+        assert cls + " {" in body, f"missing CSS rule for {cls}"
+    block = body[body.index(".ap-history-diff-details {") :]
+    block = block[: block.index(".ap-history-first {")]
+    assert "var(--ds-" in block
+    assert "#" not in block, "raw hex colour in the new diff styles"
+    # The two semantic colours per the design-system playbook's status
+    # vocabulary — never a hand-picked green/red.
+    assert "--ds-accent-success" in block
+    assert "--ds-accent-danger" in block
+
+
+def test_audit_fallback_notes_diffing_is_unavailable_on_a_501(seeded_app):
+    """``access_policy_revisions`` is PG-only (A3). A DuckDB-backed instance
+    gets a typed 501 from the revisions endpoint, and the panel degrades to
+    the audit-derived, read-only list — which cannot diff, because
+    ``audit_log.params`` never carried a body. Say so once, not silently."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    loader = body[body.index("async function _apLoadHistory(") :]
+    loader = loader[: loader.index("function _apSqlPeek")]
+    assert "revisionsUnavailable" in loader
+    assert "rr.status === 501" in loader
+
+    fallback = body[body.index("async function _apLoadHistoryFromActivity") :]
+    fallback = fallback[: fallback.index("function _apParseAuditParams")]
+    assert "revisionsUnavailable" in fallback
+    assert "cannot store" in fallback
+    assert "ap-history-nodiff" in fallback
+    assert "apRestoreRevision(" not in fallback, "the fallback still carries no restore/diff action"
+
+
+class TestDiffAlgorithmUnderNode:
+    """Runs the SHIPPED ``_apDiffLines`` under node rather than restating
+    its rules in Python — a Python transcription would pass whatever the
+    rules happen to be, which is exactly the failure mode this class exists
+    to catch (same rationale as ``test_preview_error_names_the_reason.py``).
+    """
+
+    @staticmethod
+    def _extract_diff_snippet() -> str:
+        text = _template_text()
+        start = text.index("var _AP_DIFF_MAX_LINES")
+        end = text.index("function _apRenderRevisions(body)")
+        return text[start:end]
+
+    def _run(self, expression: str):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not available")
+        # `escapeHtml` in the shipped template goes through the DOM
+        # (`document.createElement('div').textContent = ...; .innerHTML`).
+        # This stub reproduces exactly what that round-trip does for plain
+        # text (escape &, <, >) — nothing about the DIFF LOGIC under test is
+        # reimplemented here, only the browser API it calls into.
+        shim = (
+            "var document = { createElement: function() { "
+            "  var v = ''; return { set textContent(s) { v = String(s)"
+            ".replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }, "
+            "  get innerHTML() { return v; } }; } };\n"
+        )
+        script = shim + self._extract_diff_snippet() + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    def test_a_changed_line_is_one_del_and_one_add(self):
+        ops = self._run("_apDiffLines('SELECT 1', 'SELECT 2')")
+        assert ops == [{"type": "del", "text": "SELECT 1"}, {"type": "add", "text": "SELECT 2"}]
+
+    def test_a_shared_prefix_line_survives_as_same(self):
+        ops = self._run("_apDiffLines('A\\nB', 'A\\nC')")
+        assert ops[0] == {"type": "same", "text": "A"}
+        assert {"type": "del", "text": "B"} in ops
+        assert {"type": "add", "text": "C"} in ops
+
+    def test_identical_text_has_no_add_or_del(self):
+        ops = self._run("_apDiffLines('SAME', 'SAME')")
+        assert ops == [{"type": "same", "text": "SAME"}]
+
+    def test_clearing_a_policy_diffs_as_every_line_removed_with_no_stray_add(self):
+        """Regression: `''.split('\\n')` is `['']`, not `[]` — an earlier
+        version of this diffed a cleared policy as "every line removed PLUS
+        one blank line added", which is wrong."""
+        ops = self._run("_apDiffLines('SELECT 1\\nWHERE x = 1', '')")
+        assert all(op["type"] == "del" for op in ops)
+        assert [op["text"] for op in ops] == ["SELECT 1", "WHERE x = 1"]
+
+    def test_oversized_input_returns_null_rather_than_diffing(self):
+        big = "\\n".join(f"line{i}" for i in range(500))
+        result = self._run(f"_apDiffLines('{big}', '{big}x')")
+        assert result is None

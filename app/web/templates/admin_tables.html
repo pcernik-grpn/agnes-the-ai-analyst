@@ -778,6 +778,69 @@
             margin-top: 8px;
         }
 
+        /* Per-revision diff (#1979 K1-sweep follow-up: a history list with
+           only Restore on top of it still can't say WHAT changed). Same
+           collapsed-<details> idiom as `.ap-preview-transpiled` above --
+           secondary to the row itself, opened only when the peek isn't
+           enough to tell two edits apart. */
+        .ap-history-diff-details {
+            margin-top: 8px;
+        }
+
+        .ap-history-diff-details summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-diff {
+            margin: 6px 0 0;
+            padding: 8px 10px;
+            overflow-x: auto;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border-light);
+            border-radius: 6px;
+            font-size: 11px;
+            font-family: var(--font-mono);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .ap-diff-add {
+            display: block;
+            color: var(--ds-accent-success-ink);
+            background: var(--ds-accent-success-bg);
+        }
+
+        .ap-diff-del {
+            display: block;
+            color: var(--ds-accent-danger-ink);
+            background: var(--ds-accent-danger-bg);
+        }
+
+        .ap-diff-same {
+            display: block;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-mapping-change {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--ds-text-secondary);
+        }
+
+        .ap-history-diffblock {
+            margin-top: 4px;
+        }
+
+        .ap-history-first {
+            margin-top: 4px;
+        }
+
+        .ap-history-nodiff {
+            margin-bottom: 8px;
+        }
+
         /* ── Access Policy builder tabs + column list (access-policy-builder-ux
            plan, Task 4). Builder is the default tab; Advanced SQL keeps
            today's plain textarea untouched underneath. The Builder never
@@ -6643,14 +6706,20 @@
         list.innerHTML = '';
         _apRevisions = [];
         _apHideRestoreNotice();
+        // Whether the revisions store answered a typed 501 (DuckDB backend,
+        // #1979) rather than "no revisions yet" — the fallback below uses
+        // this to say, in one line, WHY it can only list edits and not diff
+        // them: the audit trail never carried a body to diff from.
+        var revisionsUnavailable = false;
         try {
             var rr = await fetch('/api/admin/registry/' + encodeURIComponent(tableId)
                 + '/policy/revisions?limit=10', { credentials: 'same-origin' });
             if (rr.ok && _apRenderRevisions(await rr.json())) return;
+            revisionsUnavailable = rr.status === 501;
         } catch (e) {
             // Fall through to the audit-derived history below.
         }
-        await _apLoadHistoryFromActivity(tableId);
+        await _apLoadHistoryFromActivity(tableId, revisionsUnavailable);
     }
 
     // The first ~240 characters of a stored policy body. The panel is a
@@ -6659,6 +6728,115 @@
     function _apSqlPeek(sql) {
         var text = String(sql || '').replace(/\s+/g, ' ').trim();
         return text.length > 240 ? text.slice(0, 240) + '…' : text;
+    }
+
+    // ── Per-revision diff (MonikaFeigler's finding on #1979: a history
+    // panel with restore-on-top-of-a-blind-list still cannot say WHAT
+    // changed between two saves). A small, self-contained LCS line diff —
+    // no library, because a policy body is a handful of SQL lines, not a
+    // file worth Myers' bookkeeping. Bounded at `_AP_DIFF_MAX_LINES` per
+    // side: the DP table is O(n*m) time AND space, and a policy pasted from
+    // somewhere unbounded (not this editor's own textarea) must not turn
+    // "open the history panel" into a multi-second hang.
+    var _AP_DIFF_MAX_LINES = 400;
+
+    // Returns an array of {type: 'same'|'add'|'del', text} describing how
+    // `newText` differs from `oldText`, one line at a time, or `null` when
+    // either side exceeds the bound above (the caller renders a "too large"
+    // note instead of paying for the table).
+    function _apDiffLines(oldText, newText) {
+        // An empty string is ZERO lines, not one empty line -- '' would
+        // otherwise split() into [''] and show as a spurious "+ " (an added
+        // blank line) on top of every genuinely removed line, e.g. when
+        // diffing a cleared policy against its predecessor.
+        var a = oldText ? String(oldText).split('\n') : [];
+        var b = newText ? String(newText).split('\n') : [];
+        if (a.length > _AP_DIFF_MAX_LINES || b.length > _AP_DIFF_MAX_LINES) return null;
+        var n = a.length, m = b.length, i, j;
+        // Classic LCS length table, walked backwards so the greedy trace
+        // below always has both neighbours computed.
+        var lcs = new Array(n + 1);
+        for (i = 0; i <= n; i++) lcs[i] = new Array(m + 1).fill(0);
+        for (i = n - 1; i >= 0; i--) {
+            for (j = m - 1; j >= 0; j--) {
+                lcs[i][j] = (a[i] === b[j])
+                    ? lcs[i + 1][j + 1] + 1
+                    : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+            }
+        }
+        var ops = [];
+        i = 0; j = 0;
+        while (i < n && j < m) {
+            if (a[i] === b[j]) {
+                ops.push({ type: 'same', text: a[i] });
+                i++; j++;
+            } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+                ops.push({ type: 'del', text: a[i] });
+                i++;
+            } else {
+                ops.push({ type: 'add', text: b[j] });
+                j++;
+            }
+        }
+        while (i < n) { ops.push({ type: 'del', text: a[i] }); i++; }
+        while (j < m) { ops.push({ type: 'add', text: b[j] }); j++; }
+        return ops;
+    }
+
+    // Renders the line-diff `<pre>` body. Every line goes through
+    // `escapeHtml` before insertion — a policy body is admin-authored SQL,
+    // not trusted markup.
+    function _apRenderDiffBody(oldText, newText) {
+        var ops = _apDiffLines(oldText, newText);
+        if (!ops) {
+            return '<div class="form-hint">Diff too large to render here — use Restore to load '
+                + 'and inspect the full body instead.</div>';
+        }
+        var lines = ops.map(function(op) {
+            var cls = op.type === 'add' ? 'ap-diff-add' : (op.type === 'del' ? 'ap-diff-del' : 'ap-diff-same');
+            var prefix = op.type === 'add' ? '+ ' : (op.type === 'del' ? '- ' : '  ');
+            return '<span class="' + cls + '">' + escapeHtml(prefix + op.text) + '</span>';
+        }).join('');
+        return '<pre class="ap-history-diff">' + lines + '</pre>';
+    }
+
+    function _apMappingLabel(on) {
+        return on ? 'row/column mapping ON' : 'row/column mapping OFF';
+    }
+
+    // One always-visible line when the `policy_mapping` flag flipped between
+    // the two states being compared — a boolean toggle has no line-level
+    // diff, so it earns its own sentence rather than hiding inside the SQL
+    // block.
+    function _apMappingChangeLine(oldMapping, newMapping) {
+        if (!!oldMapping === !!newMapping) return '';
+        return '<div class="ap-history-mapping-change">Policy mapping: '
+            + escapeHtml(_apMappingLabel(oldMapping)) + ' → ' + escapeHtml(_apMappingLabel(newMapping))
+            + '</div>';
+    }
+
+    // One diff block comparing two saved states, `older` -> `newer` (both
+    // `{policy_sql, policy_note, policy_mapping, cleared}`-shaped, or
+    // `null`/`undefined` for "nothing recorded yet"). `label` is the
+    // `<summary>` text ("Diff vs previous" / "Diff vs current"). Returns
+    // '' when the two states are identical in every field this panel can
+    // compare — nothing to show.
+    function _apRenderRevisionDiff(older, newer, label) {
+        var oldSql = (older && !older.cleared) ? (older.policy_sql || '') : '';
+        var newSql = (newer && !newer.cleared) ? (newer.policy_sql || '') : '';
+        var oldNote = (older && older.policy_note) || '';
+        var newNote = (newer && newer.policy_note) || '';
+        var mappingLine = _apMappingChangeLine(older && older.policy_mapping, newer && newer.policy_mapping);
+        if (oldSql === newSql) {
+            if (oldNote === newNote && !mappingLine) return '';
+            // The most common "nothing to diff" shape: an admin re-saved
+            // the same body with a clarifying note. An empty diff block
+            // would read as a bug, not as "no SQL change".
+            var noteLine = oldNote === newNote ? '' : '<div class="form-hint">SQL unchanged — note changed.</div>';
+            return '<div class="ap-history-diffblock">' + noteLine + mappingLine + '</div>';
+        }
+        return '<details class="ap-history-diff-details"><summary>' + escapeHtml(label) + '</summary>'
+            + mappingLine + _apRenderDiffBody(oldSql, newSql) + '</details>';
     }
 
     // Renders the revision store's rows. Returns false when there is
@@ -6685,6 +6863,33 @@
                 row += '<pre class="ap-history-sql">' + escapeHtml(_apSqlPeek(rev.policy_sql)) + '</pre>'
                     + '<button type="button" class="btn btn-secondary btn-sm ap-history-restore" '
                     + 'onclick="apRestoreRevision(' + idx + ')">Restore</button>';
+            }
+            // The newest row (idx 0) additionally diffs against the policy
+            // as it stands RIGHT NOW (`_apTable`, the row this modal was
+            // opened with) — the two are usually identical (a save both
+            // updates the registry row and appends a revision in the same
+            // transaction), so this block renders only when they diverge.
+            if (idx === 0 && _apTable) {
+                var current = {
+                    policy_sql: _apTable.access_policy_sql,
+                    policy_note: _apTable.access_policy_note,
+                    policy_mapping: _apTable.policy_mapping,
+                    cleared: !_apTable.access_policy_sql,
+                };
+                row += _apRenderRevisionDiff(rev, current, 'Diff vs current');
+            }
+            // Every other row diffs against the OLDER neighbour next to it
+            // in this newest-first list. The oldest row fetched has no
+            // older neighbour here: if the store truly holds nothing before
+            // it, say so; if `count` says there is more history than this
+            // capped page shows, diff against an empty baseline instead of
+            // silently omitting the block.
+            if (idx < revisions.length - 1) {
+                row += _apRenderRevisionDiff(revisions[idx + 1], rev, 'Diff vs previous');
+            } else if (body.count > revisions.length) {
+                row += _apRenderRevisionDiff(null, rev, 'Diff vs previous');
+            } else {
+                row += '<div class="form-hint ap-history-first">First recorded version.</div>';
             }
             return row + '</div>';
         }).join('');
@@ -6760,9 +6965,14 @@
     // The audit-derived fallback (design doc §13's original "the last N
     // audit_log rows with the note"). Read-only: `audit_log.params` masks
     // the SQL body, so there is nothing here to restore FROM and these rows
-    // deliberately carry no Restore button. `since_minutes` is capped at 30
-    // days (the endpoint's own max) — an edit older than that won't show.
-    async function _apLoadHistoryFromActivity(tableId) {
+    // deliberately carry no Restore button — and, for the same reason,
+    // nothing to diff FROM either. `since_minutes` is capped at 30 days
+    // (the endpoint's own max) — an edit older than that won't show.
+    // `revisionsUnavailable` is true when the revision store answered a
+    // typed 501 (DuckDB backend) rather than "no revisions yet" — the one
+    // case worth a note, since it means diffing is unavailable on this
+    // instance for every table, not just one without history yet.
+    async function _apLoadHistoryFromActivity(tableId, revisionsUnavailable) {
         var section = document.getElementById('apHistorySection');
         var list = document.getElementById('apHistoryList');
         try {
@@ -6783,7 +6993,7 @@
                 });
             }
             if (!rows.length) return;
-            list.innerHTML = rows.map(function(row) {
+            var rowsHtml = rows.map(function(row) {
                 var params = _apParseAuditParams(row) || {};
                 var who = row.user_email || row.user_name || row.user_id || 'unknown';
                 var when = String(row.timestamp || '').slice(0, 16).replace('T', ' ');
@@ -6802,6 +7012,16 @@
                      + escapeHtml(when) + '</strong> — ' + escapeHtml(who) + ': ' + summary
                      + '</div></div>';
             }).join('');
+            // The revision store — the only source with bodies to diff — is
+            // unavailable on this backend, not merely empty for this table.
+            // Say so once, above the read-only list, rather than leaving an
+            // admin wondering why there's no "Diff vs previous" here.
+            if (revisionsUnavailable) {
+                rowsHtml = '<div class="form-hint ap-history-nodiff">This instance cannot store '
+                    + 'per-edit policy bodies, so these entries are read-only and cannot be diffed.</div>'
+                    + rowsHtml;
+            }
+            list.innerHTML = rowsHtml;
             section.style.display = '';
         } catch (e) {
             // History is a convenience surface — a failed fetch just leaves
