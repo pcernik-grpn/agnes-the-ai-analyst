@@ -19,11 +19,45 @@ minutes). It must:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
 import time
 
 import httpx
 
 import app.api.health as health_mod
+
+
+class _ConcurrencyPeak:
+    """Highest number of callers inside :meth:`track` at the same moment.
+
+    The direct form of what the two guards below actually assert — that the
+    synchronous schema read runs OFF the event loop, so two probes are inside
+    it at once. Wall-clock thresholds cannot say this reliably: the gap
+    between overlap (one sleep + overhead) and serialization (two sleeps +
+    overhead) is one sleep wide, while a loaded shard runner's ASGI/
+    thread-pool overhead alone was measured at ~1.05s and varies run to run.
+    That is what failed this guard twice at 1.54s/0.9s and again at
+    2.55s/2.5s with `app/api/health.py` byte-identical to a passing `main`.
+    Peak concurrency is 2 when off-loop and 1 when blocked, whatever the
+    machine is doing.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight = 0
+        self.value = 0
+
+    @contextlib.contextmanager
+    def track(self):
+        with self._lock:
+            self._inflight += 1
+            self.value = max(self.value, self._inflight)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._inflight -= 1
 
 
 def _reset_cache() -> None:
@@ -82,18 +116,38 @@ def test_unreachable_result_not_cached(seeded_app, monkeypatch):
 
 
 def test_health_does_not_block_event_loop(seeded_app, monkeypatch):
-    """Two concurrent probes against a slow schema read must overlap, proving
-    the synchronous DuckDB call runs off the event loop. If it blocked the
-    loop the calls would serialize to ~2x the single-call latency."""
+    """Two concurrent probes against a slow schema read must be inside it at
+    the same moment, proving the synchronous DuckDB call runs off the event
+    loop.
+
+    Two things about how this is asserted, both of them prior defects:
+
+    The slow stand-in replaces ``_cached_db_schema`` -- the memoized wrapper
+    the endpoint actually awaits -- and NOT ``_check_db_schema`` behind it.
+    Patching the inner function made this guard vacuous: with the loop
+    blocked, the first probe slept, filled the cache, and the second
+    returned from it for free, so healthy and regressed measured the SAME
+    single sleep (1.53s either way; the inner read ran twice off-loop and
+    once when blocked). It could not fail for the reason it exists.
+
+    And the assertion is peak concurrency, not elapsed time. A wall-clock
+    threshold has to fit between one sleep + overhead and two sleeps +
+    overhead, and a loaded shard runner's overhead alone measured ~1.05s
+    and varied: this guard failed at 1.54s against 0.9s, then at 2.55s
+    against a widened 2.5s, both times with ``app/api/health.py``
+    byte-identical to a passing ``main``. Peak concurrency is 2 off-loop
+    and 1 when blocked, whatever the machine is doing."""
     _reset_cache()
     app = seeded_app["client"].app
-    orig = health_mod._check_db_schema
+    orig = health_mod._cached_db_schema
+    peak = _ConcurrencyPeak()
 
     def slow():
-        time.sleep(0.5)  # simulate rebuild-lock contention on the system conn
-        return orig()
+        with peak.track():
+            time.sleep(0.5)  # simulate rebuild-lock contention on the system conn
+            return orig()
 
-    monkeypatch.setattr(health_mod, "_check_db_schema", slow)
+    monkeypatch.setattr(health_mod, "_cached_db_schema", slow)
 
     async def fire():
         transport = httpx.ASGITransport(app=app)
@@ -104,30 +158,33 @@ def test_health_does_not_block_event_loop(seeded_app, monkeypatch):
 
     elapsed, r1, r2 = asyncio.run(fire())
     assert r1.status_code == 200 and r2.status_code == 200
-    assert elapsed < 0.9, f"probes serialized ({elapsed:.2f}s) — event loop blocked"
+    assert peak.value == 2, (
+        f"probes serialized (peak concurrency {peak.value}) — event loop blocked"
+    )
+    # Secondary, deliberately loose: catches a hang, never the runner's load.
+    assert elapsed < 5.0, f"probes took {elapsed:.2f}s"
 
 
 def test_detailed_schema_check_does_not_block_event_loop(seeded_app, monkeypatch):
     """`/api/health/detailed?include=schema` must not do its synchronous PG
     round-trip on the event loop. Two concurrent authenticated probes against a
-    slow schema read must overlap, proving the read runs off the loop (via
-    `asyncio.to_thread`). If it blocked, they'd serialize to ~2x latency."""
+    slow schema read must be inside it at the same moment, proving the read
+    runs off the loop (via `asyncio.to_thread`). Asserted as peak
+    concurrency rather than elapsed time, and patched at the memoized
+    layer -- see :func:`test_health_does_not_block_event_loop` for why both
+    of those matter."""
     _reset_cache()
     app = seeded_app["client"].app
     token = seeded_app["admin_token"]
-    orig = health_mod._check_db_schema
+    orig = health_mod._cached_db_schema
+    peak = _ConcurrencyPeak()
 
-    # The sleep must dominate CI-load noise: with 0.5s the pass/fail
-    # discriminator was ~0.4s of ASGI/auth/thread-pool overhead, which loaded
-    # shard runners routinely exceed (observed 1.35-1.43s on overlapping
-    # probes vs the old 0.9s threshold). At 1.5s, overlap lands at ~1.5s +
-    # overhead while serialization is >= 3.0s, so a 2.5s threshold tolerates
-    # a full second of overhead in either direction.
     def slow():
-        time.sleep(1.5)
-        return orig()
+        with peak.track():
+            time.sleep(0.5)
+            return orig()
 
-    monkeypatch.setattr(health_mod, "_check_db_schema", slow)
+    monkeypatch.setattr(health_mod, "_cached_db_schema", slow)
 
     async def fire():
         transport = httpx.ASGITransport(app=app)
@@ -142,7 +199,10 @@ def test_detailed_schema_check_does_not_block_event_loop(seeded_app, monkeypatch
 
     elapsed, r1, r2 = asyncio.run(fire())
     assert r1.status_code == 200 and r2.status_code == 200
-    assert elapsed < 2.5, f"detailed probes serialized ({elapsed:.2f}s) — event loop blocked"
+    assert peak.value == 2, (
+        f"detailed probes serialized (peak concurrency {peak.value}) — event loop blocked"
+    )
+    assert elapsed < 5.0, f"detailed probes took {elapsed:.2f}s"
 
 
 def test_detailed_schema_check_shares_liveness_cache(seeded_app, monkeypatch):
