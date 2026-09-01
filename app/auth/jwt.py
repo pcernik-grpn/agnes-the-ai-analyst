@@ -56,11 +56,21 @@ ALGORITHM = "HS256"
 # JWT `exp` (default in create_access_token) and the `access_token` cookie
 # max_age set by every login provider (google / email / password).
 #
-# Deliberate tradeoff: session JWTs (typ="session") are trusted purely off
-# signature + exp — pat_resolver does NO per-session DB lookup or revocation
-# for them (see app/auth/pat_resolver.py). So a 30-day session means a leaked
-# cookie stays valid 30 days; the only server-side kill switch is deactivating
-# the account (users.active). Accepted for login-persistence UX.
+# A session JWT (typ="session") is trusted off signature + exp for most of its
+# life, but not unconditionally: app.auth.pat_resolver.resolve_token_to_user
+# also compares its `iat` against users.session_revoked_before (issue #1676),
+# a per-user timestamp floor bumped by users_repo().revoke_sessions(...). That
+# floor is bumped by three doors today — POST /auth/logout, a self-serve
+# password change (app/auth/providers/password.py::password_change, which
+# mints the caller a fresh cookie in the same response so the browser that
+# just changed its own password is not the collateral damage), and a
+# password reset (reset_confirm) — plus the admin-only POST /api/admin/
+# users/{user_id}/revoke-sessions (app/api/admin_user_sessions.py), which
+# ends a user's sessions without deactivating the account. So a 30-day
+# session's *default* lifetime is still 30 days, but deactivating the
+# account is no longer the only server-side kill switch — the column is
+# PG-only (A3 ratchet): on a DuckDB-backed instance revoke_sessions() is a
+# documented no-op and an old token keeps resolving for the rest of its exp.
 SESSION_TOKEN_TTL_DAYS = 30
 ACCESS_TOKEN_EXPIRE_HOURS = SESSION_TOKEN_TTL_DAYS * 24  # 720 h = 30 days (default JWT exp)
 SESSION_COOKIE_MAX_AGE_SECONDS = SESSION_TOKEN_TTL_DAYS * 24 * 3600  # 2_592_000 s

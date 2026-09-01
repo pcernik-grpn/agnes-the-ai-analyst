@@ -229,6 +229,8 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/telemetry/ask": "usage.ask",
     "POST /api/admin/telemetry/prune": "usage.prune",
     "POST /api/admin/telemetry/reprocess": "usage.reprocess",
+    # -- app.api.admin_user_sessions --------------------------------------------
+    "POST /api/admin/users/{user_id}/revoke-sessions": "user.revoke_sessions",
     # -- app.api.agent_builder -------------------------------------------------
     "POST /api/agents/{agent_id}/builder/turn": "agent.builder_turn",
     # -- app.api.agent_memory --------------------------------------------------

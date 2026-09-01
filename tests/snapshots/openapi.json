@@ -37042,6 +37042,69 @@
         ]
       }
     },
+    "/api/admin/users/{user_id}/revoke-sessions": {
+      "post": {
+        "description": "Force-end *user_id*'s live browser/API sessions, without deactivating\nthe account (issue #1676 remainder).\n\nUnrelated to the session-FILE endpoints above this one in the same\nmodule \u2014 this bumps ``users.session_revoked_before`` (PG-only column,\nA3 ratchet), the same floor ``POST /auth/logout`` and a self-serve\npassword change/reset now bump too (``app/auth/providers/password.py``).\nEvery ``typ=\"session\"`` JWT for this user whose ``iat`` predates the new\nfloor is refused on its next use by\n``app.auth.pat_resolver.resolve_token_to_user``. PATs are untouched \u2014\nthey run their own ``personal_access_tokens.revoked_at`` chain; use\n``DELETE /auth/admin/tokens/{token_id}`` for those.\n\nOn a DuckDB-backed instance ``revoke_sessions`` is a documented no-op\n(no such column exists there \u2014 frozen post-A3 schema), so this still\nanswers 200 rather than a raw failure, but the body says honestly\nwhether anything actually changed instead of claiming a revocation\nthat did not happen.",
+        "operationId": "revoke_user_sessions_api_admin_users__user_id__revoke_sessions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke User Sessions",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/users/{user_id}/sessions": {
       "get": {
         "description": "Return a paginated session list for *user_id*.\n\nEach row joins ``usage_session_summary`` (preferred, ``processed=true``)\nwith a filesystem scan of ``${SESSION_DATA_DIR}/<username>/*.jsonl`` so\nthe response surfaces sessions even when the UsageProcessor hasn't run yet\n(``processed=false`` for those rows).\n\n``processed=false`` rows carry only: ``session_file``, ``session_id``\n(extracted from the filename when possible), ``started_at`` (file mtime),\nand zeroed-out counters.",
@@ -60139,7 +60202,7 @@
         ]
       },
       "post": {
-        "description": "Change the caller's own password. Session token only (PAT rejected by\n`require_session_token`, matching `/auth/tokens` and every other door\nthat mints or rotates a credential).\n\nDouble-submit CSRF (F2) is checked FIRST, before anything else runs \u2014\nincluding the no-password-hash lookup below. A cookie-authenticated JSON\nPOST is not automatically CSRF-safe (the cookie fallback in\n`get_current_user` means an ordinary cross-site fetch would still carry\nthe session), so the caller must echo the `web_csrf` cookie value in the\n`X-CSRF-Token` header (same mechanism as `me_profile_refetch_groups`).\nChecking it first \u2014 rather than after the account-state read \u2014 closes a\nresponse-shape leak (Devin Review on PR #1548): a caller with no CSRF\ntoken would otherwise get a different status for an SSO-only account\n(400) than a password account (403 from the CSRF check), letting a\nsame-site page without the token distinguish the two account types.\nNothing here is safe to do before proving the caller sent this request\non purpose. The GET page mints the `web_csrf` cookie unconditionally \u2014\neven for an SSO-only account with no form to submit \u2014 so this ordering\nnever blocks a legitimate caller who visited it first.\n\nExisting sessions and PATs are NOT invalidated by a password change \u2014\nthis endpoint only replaces the password hash. Revoking sessions/PATs is\na separate action (`DELETE /auth/tokens/{id}`), same as every other\npassword door in this module (reset, setup, admin reset).",
+        "description": "Change the caller's own password. Session token only (PAT rejected by\n`require_session_token`, matching `/auth/tokens` and every other door\nthat mints or rotates a credential).\n\nDouble-submit CSRF (F2) is checked FIRST, before anything else runs \u2014\nincluding the no-password-hash lookup below. A cookie-authenticated JSON\nPOST is not automatically CSRF-safe (the cookie fallback in\n`get_current_user` means an ordinary cross-site fetch would still carry\nthe session), so the caller must echo the `web_csrf` cookie value in the\n`X-CSRF-Token` header (same mechanism as `me_profile_refetch_groups`).\nChecking it first \u2014 rather than after the account-state read \u2014 closes a\nresponse-shape leak (Devin Review on PR #1548): a caller with no CSRF\ntoken would otherwise get a different status for an SSO-only account\n(400) than a password account (403 from the CSRF check), letting a\nsame-site page without the token distinguish the two account types.\nNothing here is safe to do before proving the caller sent this request\non purpose. The GET page mints the `web_csrf` cookie unconditionally \u2014\neven for an SSO-only account with no form to submit \u2014 so this ordering\nnever blocks a legitimate caller who visited it first.\n\nIssue #1676 remainder: a successful change now bumps the same\n`session_revoked_before` floor `POST /auth/logout` does, so any OTHER\ncopy of the caller's session token (a second device, a synced browser\nprofile, host malware) stops working. The CALLER's own request must not\nbe the collateral damage of its own success, though \u2014 this handler sets\nthe floor FIRST and then mints and sets a fresh `access_token` cookie in\nthis same response (mirroring how every login provider mints one), so\nthe browser that just changed its password keeps working without\nneeding to sign in again. PATs are untouched either way \u2014 they run\ntheir own `personal_access_tokens.revoked_at` chain, revoked separately\nvia `DELETE /auth/tokens/{id}`, same as every other password door in\nthis module (reset, setup, admin reset).",
         "operationId": "password_change_auth_password_change_post",
         "parameters": [
           {

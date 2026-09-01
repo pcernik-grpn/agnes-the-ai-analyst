@@ -431,15 +431,17 @@ SWITCHES: tuple[Switch, ...] = (
         config_keys=("mcp", "allow_query_param_token"),
         env_var="AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN",
         kind="bool",
-        default=True,
+        default=False,
         effect="live",
         category="product",
         editable=True,
         description=(
             "Accept the MCP bearer token as a ?token= query param on SSE GET, for clients "
-            "that cannot set headers. On by default (grandfathered). The token lands in every "
-            "request log when used (CWE-598) — turn this off if all your MCP clients send the "
-            "Authorization header."
+            "that cannot set headers. OFF by default since the #1656 audit follow-up (was "
+            "grandfathered on) — the token lands in every request log when used (CWE-598), "
+            "plus browser history and proxy access logs. Turn this on only for a documented "
+            "client that genuinely cannot send the Authorization header; every connection "
+            "snippet Agnes hands out (/mcp-connect) is header-based already."
         ),
     ),
     Switch(
