@@ -151,6 +151,14 @@ def test_title_request_frames_message_as_quoted_data():
     assert req.rstrip().endswith("Title:")
 
 
+def test_title_request_keeps_braces_and_format_specs_verbatim():
+    """User text routinely carries braces (JSON, SQL templates, f-strings) —
+    the request must embed it verbatim, never run it through str.format."""
+    msg = 'Parse {"a": {"b": [1, 2]}} and render {name!r:>10} with %s and {{escaped}}'
+    req = auto_title._title_request(msg)
+    assert f"<first_message>\n{msg}\n</first_message>" in req
+
+
 def test_title_request_clips_to_the_message_cap():
     long = "x" * (auto_title._MESSAGE_CLIP_CHARS + 500)
     req = auto_title._title_request(long)
@@ -855,6 +863,41 @@ def test_auto_title_falls_back_to_the_message_when_model_yields_nothing(tmp_path
     assert persisted is not None and persisted.title == expected
     renamed = [m for m in ws.sent if m.get("type") == "session_renamed"]
     assert renamed and renamed[0]["title"] == expected
+
+
+def test_scheduling_failure_neither_fails_the_send_nor_burns_the_flag(tmp_path: Path, monkeypatch):
+    """If scheduling the title task raises (loop shutting down, repo hiccup),
+    the user message is still delivered and ``auto_title_started`` is left
+    False so the assistant_message backstop can still title the session."""
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_live_handle(manager, s.id)
+
+        def boom(live):
+            live.auto_title_started = True  # the worst case: flag set, then failure
+            raise RuntimeError("cannot schedule")
+
+        monkeypatch.setattr(manager, "_maybe_start_auto_title", boom)
+        await manager.send_user_message(s.id, "q?")  # must not raise
+        flag = manager._live[s.id].auto_title_started
+        first = manager._repo.get_first_user_message(s.id)
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return flag, first
+
+    flag, first = asyncio.run(_run())
+    assert first == "q?"
+    assert flag is False
 
 
 def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, monkeypatch):

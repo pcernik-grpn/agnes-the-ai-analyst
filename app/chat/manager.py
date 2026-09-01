@@ -2910,6 +2910,9 @@ class ChatManager:
             try:
                 self._maybe_start_auto_title(live)
             except Exception:
+                # Leave the session re-armed: a flag stuck at True here would
+                # silence the assistant_message backstop for its whole live span.
+                live.auto_title_started = False
                 logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
 
     async def deliver_approval_decision(
@@ -4196,8 +4199,11 @@ class ChatManager:
             # flag was reset by a respawn) or the session vanished.
             live.auto_title_started = True
             return
-        live.auto_title_started = True
+        # Schedule first, flag second: a create_task that raises (loop already
+        # shutting down) must not leave the flag set with no task behind it.
+        # The task cannot run before this method returns, so the order is safe.
         task = asyncio.create_task(self._run_auto_title(live))
+        live.auto_title_started = True
         live.tasks.append(task)
 
     async def _run_auto_title(self, live: LiveSession) -> None:

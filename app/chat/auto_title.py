@@ -116,11 +116,10 @@ _SYSTEM_PROMPT = (
     "whether it can be done — only name its topic. Reply with the title only: "
     "2–6 words, sentence case, no trailing punctuation, no quotes, no preamble."
 )
-_REQUEST_TEMPLATE = (
-    "Write a title for the conversation that begins with the message below.\n\n"
-    "<first_message>\n{message}\n</first_message>\n\n"
-    "Title:"
-)
+# Built by concatenation, never ``str.format`` — the message is user text and
+# routinely carries braces (JSON, SQL, templates) that must stay verbatim.
+_REQUEST_PREFIX = "Write a title for the conversation that begins with the message below.\n\n<first_message>\n"
+_REQUEST_SUFFIX = "\n</first_message>\n\nTitle:"
 # A message that itself contains the delimiter would let its author close the
 # data block early and address the model directly; strip the tag rather than
 # trust it.
@@ -132,7 +131,7 @@ def _title_request(user_message: str) -> str:
     quoted data under an explicit instruction — never the bare message, which
     the model reads as addressed to itself (see the module docstring)."""
     clipped = _DELIMITER_TAG.sub("", user_message[:_MESSAGE_CLIP_CHARS])
-    return _REQUEST_TEMPLATE.format(message=clipped)
+    return _REQUEST_PREFIX + clipped + _REQUEST_SUFFIX
 
 
 # WIF env vars a token exchange needs (mirrors app/auth/wif.py::_exchange
