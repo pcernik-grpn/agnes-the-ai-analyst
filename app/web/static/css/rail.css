@@ -2405,6 +2405,13 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        same value reads as the mark sitting high in its own row. */
     html[data-ui-layout="rail"] .rail-logo-row {
         padding-bottom: 8px;
+        /* The band the toggle centres on moves with the padding — see the
+           note on these two at the top of this file. The toggle is hidden at
+           this breakpoint today, so nothing reads them here yet; they are set
+           anyway so the invariant holds by construction rather than by that
+           happening to stay true. */
+        --rail-logo-row-pt: 6px;
+        --rail-logo-row-pb: 8px;
     }
 
     /* The collapsed/expanded rail-width preference has no meaning below

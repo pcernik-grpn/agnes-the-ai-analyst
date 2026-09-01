@@ -45,15 +45,14 @@
      collapses. The head closes up above them — a toolbar is part of the
      header block, not the first paragraph of the page. */
   .admin-main .page-header--plain:has(+ .page-toolbar) { padding-bottom: 10px; }
-  /* Spans the `.page-toolbar` row (components.css) so the buttons stay pinned
-     to its right edge; the row itself owns the gap down to the content. */
+  /* The gap below is `.page-toolbar`'s (components.css); this only lays the
+     buttons out inside it. */
   .aov-bar {
     display: flex;
     align-items: center;
     justify-content: flex-end;
     gap: var(--space-2);
     flex-wrap: wrap;
-    flex: 1 1 auto;
   }
 
   /* ── The setup panel ─────────────────────────────────────────────────

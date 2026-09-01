@@ -414,14 +414,20 @@
    Audit-log links — got no gap at all and their first stat card sat flush
    against the buttons (#1956 item 9).
 
+   It owns the GAP and nothing else — deliberately a plain block, not a flex
+   row. A flex row is the tempting version and it is wrong: a toolbar block
+   may hold more than one block-level child (semantic_layer_detail.html emits
+   its badges AND its tab strip), and making them flex items lays them out
+   side by side, which puts a six-item tab strip on the far right of the row
+   with its rule spanning only the tabs. As a block wrapper every child keeps
+   the layout it had before this existed; each page's own bar keeps its own
+   `display: flex` internally.
+
    `:not(:has(*))` rather than `:empty`: the block renders a newline even when
    a page leaves it undefined, so the box is never truly empty and `:empty`
-   would leave 20px of dead air on every page without a toolbar. */
-.page-toolbar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-    margin: 0 0 var(--space-5);
-}
-.page-toolbar:not(:has(*)) { display: none; }
+   would leave 20px of dead air on every page without a toolbar. Zeroing the
+   MARGIN rather than setting `display: none` is deliberate too — a toolbar
+   that one day emits bare text with no element would still render, where
+   `display: none` would silently swallow it. */
+.page-toolbar { margin: 0 0 var(--space-5); }
+.page-toolbar:not(:has(*)) { margin-block-end: 0; }

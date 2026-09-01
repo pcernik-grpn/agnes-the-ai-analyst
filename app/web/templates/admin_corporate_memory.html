@@ -162,24 +162,18 @@
             min-width: 0;
             overflow-x: auto;
             overflow-y: hidden;
-            /* A visible scrollbar, not an overlay one. macOS draws overlay
-               scrollbars only while the user is already scrolling, so a strip
-               that overflows looked identical to one that did not — there was
-               nothing on screen to say more tabs existed. Declaring the
-               `::-webkit-scrollbar` geometry below opts this element out of
-               overlay mode and gives the strip a permanent 6px rail.
+            /* No scrollbar styling here, deliberately. A non-overlay bar
+               would occupy 6px INSIDE this box, which pushes the tabs' content
+               bottom 6px above `.tab-nav`'s own bottom edge — and that edge is
+               what `.tab-row`'s rule sits on and what each tab's
+               `margin-bottom: -2px` underline is aimed at. The affordance
+               would therefore break the alignment above precisely when the
+               strip overflows, which is the only state it exists for.
 
-               Deliberately NOT paired with the standard `scrollbar-width` /
-               `scrollbar-color`: Chrome honours one model or the other, and
-               setting `scrollbar-width` makes it drop the `::-webkit-*` rules
-               and go back to an overlay bar — which is the bug. Firefox and
-               the rest fall through to their own always-visible default. */
-        }
-        .tab-nav::-webkit-scrollbar { height: 6px; }
-        .tab-nav::-webkit-scrollbar-track { background: transparent; }
-        .tab-nav::-webkit-scrollbar-thumb {
-            background: var(--ds-border);
-            border-radius: 3px;
+               It is also no longer needed: the actions that were genuinely
+               unreachable have left this lane entirely, so what remains behind
+               an overflow is tabs, each of which is a destination the reader
+               can also reach by scrolling — not a verb that had disappeared. */
         }
 
         .tab-btn {
@@ -912,9 +906,12 @@
             }
 
             /* Narrow: the actions take their own line under the tabs rather
-               than competing with them for a ~360px row. */
-            .tab-row { flex-wrap: wrap; }
-            .tab-actions { width: 100%; padding-bottom: var(--space-3); }
+               than competing with them for a ~360px row. The rule moves to the
+               tab lane with them — left on `.tab-row` it would be drawn under
+               the BUTTONS, which is not what the tabs' underline aims at. */
+            .tab-row { flex-wrap: wrap; border-bottom: none; }
+            .tab-nav { border-bottom: 2px solid var(--border); }
+            .tab-actions { width: 100%; padding: var(--space-3) 0 0; }
 
             .batch-bar {
                 flex-wrap: wrap;

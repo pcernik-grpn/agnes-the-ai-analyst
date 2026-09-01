@@ -46,11 +46,13 @@
 .obs-topbar-right { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
 .obs-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--obs-muted); display: block; margin-bottom: 2px; }
-.obs-window select { padding: 6px 8px; border: 1px solid var(--obs-border); border-radius: 6px; background: var(--obs-bg); font: inherit; }
-/* 38px is the height of the control it stands beside — `.ds-dropdown-btn`,
-   the design-system dropdown the paper skin renders in place of the native
-   `<select>`. Given as a number because no control-height token exists yet;
-   if one lands, this is the line that should take it. */
+/* 38px on the native select too, so the row has ONE control height rather
+   than one per theme: the paper skin hides this select and renders a 38px
+   `.ds-dropdown-btn` in its place, so a 35px value here is correct only in
+   the themes where the native control is the visible one. Given as a number
+   because no control-height token exists yet; if one lands, these are the
+   lines that should take it. */
+.obs-window select { padding: 6px 8px; min-height: 38px; border: 1px solid var(--obs-border); border-radius: 6px; background: var(--obs-bg); font: inherit; }
 .obs-live { display: flex; align-items: center; gap: 6px; min-height: 38px;
   font-size: 13px; color: var(--obs-muted); cursor: pointer; }
 .obs-live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ds-text-disabled); transition: background 0.2s; }
