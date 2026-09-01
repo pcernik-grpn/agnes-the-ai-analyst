@@ -163,9 +163,18 @@ _THROTTLE_BURST_429S = 2
 _THROTTLE_BURST_WAIT_S = 30.0
 #: Largest skipped files kept in the report.
 _OVERSIZE_SAMPLE = 20
+#: Per-file errors kept ON THE STATS OBJECT while the crawl runs. Matches
+#: ``extraction_runs_pg._SKIPS_CAP`` (200) — the value the persisted row
+#: itself is capped to at ``finish()`` — so the in-memory sample and the
+#: stored one never disagree about how many are honestly kept.
+_ERROR_SAMPLE = 200
 #: Completed items kept in the live checkpoint's `activity.recent` list.
 _RECENT_ACTIVITY_SAMPLE = 5
-#: Delta page size asked of Graph — also the state-checkpoint granularity.
+#: Delta page size asked of Graph — also the RESUME-STATE checkpoint
+#: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
+#: here, load-bearing for the resume contract. The run recorder's PROGRESS
+#: checkpoint (`files_done`/`checkpoint_at`, `_RunRecorder.maybe_checkpoint`)
+#: is a separate, more frequent cadence — see the constants below.
 _DELTA_PAGE_SIZE = 200
 #: How many passes a single item is retried through the failure queue (see
 #: the module docstring's "a per-item failure never advances past itself")
@@ -174,6 +183,15 @@ _DELTA_PAGE_SIZE = 200
 #: run rather than forever; crossing it is recorded, never silent — see
 #: :func:`_note_retry`.
 _MAX_ITEM_RETRY_ATTEMPTS = 5
+#: How often `_RunRecorder.maybe_checkpoint` is allowed to write PROGRESS
+#: (never the resume state above) between delta-page boundaries: at most
+#: once per this many seconds, or once per `_PROGRESS_CHECKPOINT_EVERY_
+#: ITEMS` newly finished items, whichever comes first. A page can span many
+#: minutes of real download/convert/anonymize/ingest work once downloads
+#: actually succeed, and without this an operator watches "0 files
+#: processed" for that whole window despite the crawl demonstrably working.
+_PROGRESS_CHECKPOINT_INTERVAL_S = 5.0
+_PROGRESS_CHECKPOINT_EVERY_ITEMS = 10
 #: Streaming download chunk.
 _DOWNLOAD_CHUNK = 1 << 20
 
@@ -483,6 +501,11 @@ class _RunRecorder:
         self.job_id = job_id
         self.run_id: Optional[str] = None
         self._repo: Any = None
+        # Bookkeeping for `maybe_checkpoint` — a SEPARATE, rate-limited
+        # sibling of `checkpoint`, never the crawl's own resume state.
+        self._progress_lock = threading.Lock()
+        self._last_progress_at = 0.0
+        self._last_progress_items_done = 0
 
     def _resolve(self) -> Any:
         if self._repo is None:
@@ -491,9 +514,44 @@ class _RunRecorder:
             self._repo = extraction_runs_repo()
         return self._repo
 
-    def start(self) -> None:
+    def start(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        # Measured from here, not from process epoch: a run whose first
+        # delta page takes a while must not have its very first item
+        # trigger `maybe_checkpoint` purely because "now - 0" is huge.
+        # ``clock`` is a test seam only — production never passes one.
+        self._last_progress_at = clock()
         try:
-            self.run_id = self._resolve().start(
+            repo = self._resolve()
+        except Exception as exc:  # noqa: BLE001 — recording is never load-bearing
+            self.run_id = None
+            logger.info(
+                "sharepoint crawl: run recording unavailable for connection %s (%s) — crawling anyway",
+                self.connection_id,
+                type(exc).__name__,
+            )
+            return
+        # BEFORE opening this run's own row: only one crawl per connection
+        # runs at a time (the trigger's own idempotency dedup on the owning
+        # job), so a row still `running` here cannot be us — it is a
+        # previous worker's crawl that died without ever calling `finish`.
+        # Closing it now is what stops the source card from reading a
+        # run that will never move again (see `abandon_stale_running`).
+        try:
+            abandoned = repo.abandon_stale_running(self.connection_id)
+            if abandoned:
+                logger.warning(
+                    "sharepoint crawl: closed %d abandoned run row(s) for connection %s before starting a new one",
+                    len(abandoned),
+                    self.connection_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — never blocks the new run
+            logger.debug(
+                "sharepoint crawl: could not sweep abandoned runs for connection %s (%s) — continuing",
+                self.connection_id,
+                type(exc).__name__,
+            )
+        try:
+            self.run_id = repo.start(
                 connection_id=self.connection_id,
                 job_id=self.job_id,
                 phase="crawl",
@@ -522,6 +580,42 @@ class _RunRecorder:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("sharepoint crawl: run checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def maybe_checkpoint(self, stats: "CrawlStats", *, clock: Callable[[], float] = time.monotonic) -> None:
+        """A RATE-LIMITED sibling of :meth:`checkpoint`, called after every
+        item — not just at the delta-page boundary.
+
+        A delta PAGE is up to :data:`_DELTA_PAGE_SIZE` (200) items, and once
+        downloads actually succeed (as opposed to failing instantly), one
+        page can be many minutes of real download/convert/anonymize/ingest
+        work. `checkpoint` alone left an operator watching `files_done: 0`
+        for that whole window even while the crawl was demonstrably
+        working — the same "unverified renders healthy" failure the status
+        guard elsewhere in this module exists to avoid, just for PROGRESS
+        instead of OUTCOME.
+
+        Fires at most once per :data:`_PROGRESS_CHECKPOINT_INTERVAL_S`
+        seconds or :data:`_PROGRESS_CHECKPOINT_EVERY_ITEMS` newly finished
+        items, whichever comes first, so a slow single file (elapsed time)
+        and a fast run of small ones (item count) both get seen. Writes to
+        the exact same destination `checkpoint` does
+        (`files_seen`/`files_done`/`progress`/`checkpoint_at`) — never the
+        crawl's own resume state (`deltaLink`/cTags in the state file),
+        which still persists only at the page boundary in `_crawl_drive`
+        and is unaffected by this.
+        """
+        if not self.run_id:
+            return
+        now = clock()
+        with self._progress_lock:
+            items_since = stats.items_done - self._last_progress_items_done
+            due = (now - self._last_progress_at) >= _PROGRESS_CHECKPOINT_INTERVAL_S
+            due = due or items_since >= _PROGRESS_CHECKPOINT_EVERY_ITEMS
+            if not due:
+                return
+            self._last_progress_at = now
+            self._last_progress_items_done = stats.items_done
+        self.checkpoint(stats)
 
     def finish(
         self,
@@ -648,6 +742,37 @@ def _record_status_for(exc: BaseException) -> str:
     return "failed"
 
 
+#: A run that finished WITHOUT raising still owes the operator an honest
+#: outcome word: fewer than this many per-file errors is a stray blip — a
+#: run that otherwise found nothing new/changed to do (a healthy, idle
+#: steady-state pass) must not have its status flipped by one transient
+#: fault. At or above it, with zero documents actually landed, the run did
+#: not accomplish anything and calling it `"done"` — the production incident
+#: this guards against recorded 1263 per-file errors and 0 ingested
+#: documents, reported as `done` — is the exact unverified-renders-healthy
+#: failure this whole recorder exists to avoid.
+_UNPRODUCTIVE_RUN_MIN_ERRORS = 5
+
+
+def _ingested_nothing_despite_errors(stats: "CrawlStats") -> bool:
+    """True for a run that completed (no exception) but accomplished
+    nothing: at least :data:`_UNPRODUCTIVE_RUN_MIN_ERRORS` per-file errors
+    and zero new/changed documents.
+
+    Deliberately narrow. `errors` only counts a fault the crawl could not
+    recover from (download/convert/ingest failure, or a whole scope it could
+    not read) — the routine skip reasons (`permission_skips`,
+    `excluded_subtree_skips`, oversize, `anonymize_failed`) are deliberate
+    decisions, not failures, and never count here, so a normal run that
+    politely skipped a great many documents is not mistaken for a broken
+    one. `new`/`changed` are zero-checked rather than compared to `errors`
+    as a ratio: with both at zero, everything this run attempted to land
+    failed by construction — "erred on almost everything" needs no separate
+    ratio once nothing landed at all.
+    """
+    return stats.errors >= _UNPRODUCTIVE_RUN_MIN_ERRORS and stats.new == 0 and stats.changed == 0
+
+
 # --------------------------------------------------------------------------
 # Run report
 # --------------------------------------------------------------------------
@@ -716,6 +841,12 @@ class CrawlStats:
     oversize_files: int = 0
     oversize_bytes: int = 0
     oversize_largest: List[Dict[str, Any]] = field(default_factory=list)
+    #: Itemized per-file faults this run could not recover from — download,
+    #: convert, or ingest — bounded the same way ``oversize_largest`` is.
+    #: ``anonymize_failed`` and the routine skip reasons are deliberate
+    #: decisions, not failures, and never land here; only the reasons that
+    #: also bump :attr:`errors` do. See :meth:`note_error`.
+    errors_detail: List[Dict[str, Any]] = field(default_factory=list)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -828,6 +959,20 @@ class CrawlStats:
             self.oversize_largest.sort(key=lambda e: -int(e["size"]))
             del self.oversize_largest[_OVERSIZE_SAMPLE:]
 
+    def note_error(self, path: str, reason: str, *, detail: str = "", status_code: Optional[int] = None) -> None:
+        """One per-file fault, itemized — the difference between a bare
+        error COUNT and a diagnosable run. Callers still call :meth:`add`
+        for the ``errors``/``convert_failed`` counters themselves; this only
+        appends the row a caller who can name a path is able to give.
+        ``detail`` must already be a caller-composed, safe-to-log string
+        (a status code and an upstream error body/exception message, never a
+        token, a certificate, or file content) — this method does not scrub
+        it further.
+        """
+        with self._lock:
+            self.errors_detail.append({"path": path, "reason": reason, "detail": detail, "status_code": status_code})
+            del self.errors_detail[_ERROR_SAMPLE:]
+
     def enter_item_activity(self, path: str) -> int:
         """One file's download/convert/ingest pipeline STARTING, for the
         live ``activity`` checkpoint block. Returns a token to pass back to
@@ -872,6 +1017,8 @@ class CrawlStats:
         interrupted: bool = False,
         interrupted_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
+        from src.repositories.extraction_runs_pg import cap_skips
+
         elapsed = max(time.monotonic() - self.started, 1e-6)
         processed = self.new + self.changed
         return {
@@ -941,6 +1088,15 @@ class CrawlStats:
                 "bytes_human": human_bytes(self.oversize_bytes),
                 "largest": list(self.oversize_largest),
             },
+            # The itemized counterpart to the bare `errors` count above —
+            # same envelope `extraction_runs.skips` uses (`items`/`listed`/
+            # `total`/`truncated`), reused rather than reinvented so the two
+            # "how much did we not index, and can we name it" surfaces never
+            # drift on shape. `total` can exceed `listed`: a scope-level
+            # fault (the caller's own `scope_errors` list) bumps `errors`
+            # but has no single file to name, so it is counted here without
+            # a row of its own.
+            "errors_detail": cap_skips(list(self.errors_detail), total=self.errors),
         }
 
 
@@ -1984,6 +2140,10 @@ class _PreparedDocument:
     source_sha256: str = ""
     path: str = ""
     filename: str = ""
+    #: The conversion exception's message, for a "convert_failed" outcome
+    #: only — carried back so the caller (which owns the run's stats object)
+    #: can itemize it in `errors_detail`. Empty for every other outcome.
+    detail: str = ""
 
 
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
@@ -2084,7 +2244,7 @@ def _prepare_document(
         return _PreparedDocument("convert_failed")
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
-        return _PreparedDocument("convert_failed")
+        return _PreparedDocument("convert_failed", detail=str(exc))
     if not markdown.strip():
         logger.info("sharepoint crawl: conversion produced no text for %s", path)
         return _PreparedDocument("convert_empty")
@@ -2262,9 +2422,21 @@ async def _process_item(
             outcome_label = "throttled"
             raise
         except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
+            # `SharePointGraphError.status_code` is the upstream HTTP status,
+            # documented safe to log (Entra/Graph error bodies never carry a
+            # credential); the other two exception types carry no status.
+            status_code = getattr(exc, "status_code", None)
+            detail = str(exc)
             stats.add(errors=1)
+            stats.note_error(path, "download_failed", detail=detail, status_code=status_code)
             outcome_label = "download_failed"
-            logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
+            logger.warning(
+                "sharepoint crawl: download failed for %s: %s status=%s detail=%s",
+                path,
+                type(exc).__name__,
+                status_code,
+                detail,
+            )
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
@@ -2288,6 +2460,7 @@ async def _process_item(
 
         if prepared.outcome == "convert_failed":
             stats.add(convert_failed=1, errors=1)
+            stats.note_error(path, "convert_failed", detail=prepared.detail)
             outcome_label = "convert_failed"
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
@@ -2321,9 +2494,18 @@ async def _process_item(
                 source_sha256=prepared.source_sha256,
             )
         except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
+            status_code = getattr(exc, "status_code", None)
+            detail = str(exc)
             stats.add(errors=1)
+            stats.note_error(path, "ingest_failed", detail=detail, status_code=status_code)
             outcome_label = "ingest_failed"
-            logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
+            logger.warning(
+                "sharepoint crawl: ingest failed for %s: %s status=%s detail=%s",
+                path,
+                type(exc).__name__,
+                status_code,
+                detail,
+            )
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
@@ -2467,18 +2649,20 @@ async def _process_page(
     concurrency: int = 1,
     stop_watcher: Optional["_StopWatcher"] = None,
     convert_pool: Optional[_ConvertProcessPool] = None,
+    recorder: Optional["_RunRecorder"] = None,
 ) -> None:
     """Run ONE delta page's rows, up to ``concurrency`` items at a time.
 
-    The page is the unit of the resume contract, and this function is what
+    The page is the unit of the RESUME contract, and this function is what
     keeps that true under parallelism:
 
     * every item's cTag is still written by the item itself, right after its
       own durable ingest — a slow neighbour cannot delay it, and a fast
       neighbour cannot claim it;
     * this function does not return until every worker has finished, so the
-      caller's ``deltaLink`` persist + recorder checkpoint still happen after
-      *all* of the page's rows, never in the middle of it;
+      caller's ``deltaLink`` persist + the unconditional recorder checkpoint
+      it makes afterward still happen after *all* of the page's rows, never
+      in the middle of it;
     * the deadline is re-checked before each item is picked up, so an expired
       budget stops FEEDING the pool and then drains it, rather than starting
       work it has no time to finish;
@@ -2546,6 +2730,8 @@ async def _process_page(
             # is exactly as safe to resume from as the deadline check above.
             if stop_watcher is not None:
                 stop_watcher.maybe_check_item_boundary(stats.items_done)
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
         return
 
     if not items:
@@ -2623,6 +2809,8 @@ async def _process_page(
                 except CrawlStopped as exc:
                     aborts.append(exc)
                     return
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
 
     try:
         # `gather` without `return_exceptions` would cancel the peers on the
@@ -2855,6 +3043,7 @@ async def _crawl_drive(
             concurrency=governor.current(),
             stop_watcher=stop_watcher,
             convert_pool=convert_pool,
+            recorder=recorder,
         )
         if convert_pool is not None:
             # Safe HERE: `_process_page` has already joined this page's own
@@ -2885,10 +3074,12 @@ async def _crawl_drive(
             next_link = page.get("@odata.nextLink")
             save_state(connection_id, state)
             url = _require_graph_url(str(next_link)) if next_link else None
-        # The SAME checkpoint boundary, a second destination — no new write
-        # loop and no new frequency (design §7.1). It runs after the state
-        # file, so a recorder failure can never cost the crawl its resume
-        # point.
+        # The SAME state-checkpoint boundary, a second destination (design
+        # §7.1) — and, unlike `_process_page`'s per-item `maybe_checkpoint`
+        # calls above, UNCONDITIONAL: every page's final numbers are
+        # durably recorded even if the rate limiter would otherwise have
+        # withheld a write. Runs after the state file, so a recorder
+        # failure can never cost the crawl its resume point.
         if recorder is not None:
             recorder.checkpoint(stats)
 
@@ -3024,15 +3215,33 @@ def _detector_usage(detector: Any) -> Dict[str, Any]:
 
     ``{}`` means "no tokens were spent" — the regex tier, or no anonymize
     scope in the run — which the UI keeps distinct from a computed $0.00.
-    Never raises: usage is observability, not a gate."""
+    When tokens WERE spent, ``estimated_cost_usd`` is priced through
+    ``src.llm_pricing.cost_usd`` — the one place a token count becomes USD
+    (mirroring ``connectors.sharepoint.facts_extraction._Report.render``'s
+    own pricing of its stage, the same field name and rounding). Never
+    raises: usage is observability, not a gate."""
     llm = getattr(detector, "llm", None)
     usage = getattr(llm, "total_usage", None)
     if not isinstance(usage, dict):
         return {}
-    model = getattr(llm, "model", None)
     out: Dict[str, Any] = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
-    if out and model:
+    if not out:
+        return {}
+    model = getattr(llm, "model", None)
+    if model:
         out["model"] = str(model)
+        from src.llm_pricing import cost_usd
+
+        out["estimated_cost_usd"] = round(
+            cost_usd(
+                model=str(model),
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+                cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+            ),
+            4,
+        )
     return out
 
 
@@ -3324,7 +3533,30 @@ async def _run_crawl_async(
         run_usage["ocr"] = ocr_usage
     if facts_usage:
         run_usage["facts"] = facts_usage
-    recorder.finish(stats, status="done", report=report, usage=run_usage)
+    if _ingested_nothing_despite_errors(stats):
+        # Same status vocabulary a crash already uses (`failed` /
+        # `interrupted` / `done`) — no new word is minted here. A run that
+        # errored on (almost) everything and landed nothing is at least as
+        # bad as a crash, and the JOB itself still completed (no exception
+        # propagates from here): `extraction_runs.status` and the job's own
+        # lifecycle are allowed to disagree by design (see
+        # `ExtractionRunsPgRepository`'s module docstring) — this is exactly
+        # the case that split them.
+        status = "failed"
+        finish_error = (
+            f"{stats.errors} file(s) errored and 0 documents were ingested this run — "
+            "see report.errors_detail for the per-file causes"
+        )
+        logger.warning(
+            "sharepoint crawl: connection %s — %d errors and 0 new/changed documents; "
+            "recording this run as failed rather than done",
+            connection_id,
+            stats.errors,
+        )
+    else:
+        status = "done"
+        finish_error = None
+    recorder.finish(stats, status=status, report=report, usage=run_usage, error=finish_error)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",
@@ -3397,9 +3629,13 @@ def run_builtin_crawl(payload: dict) -> dict:
 
     An optional ``job_id`` in the payload is recorded on the run row
     (``extraction_runs.job_id``) so the card can join a run to its job's
-    lifecycle. Nothing supplies it today — the worker hands this handler the
-    job's PAYLOAD, not its id — so the column is honestly null rather than
-    guessed, and the liveness check falls back to checkpoint age.
+    lifecycle. ``app/worker/kinds.py::dispatch_job`` merges the claimed job's
+    own id in before calling this handler's caller (``_run_corpus_
+    extraction``), since ``JobKind.handler`` only ever sees the payload, not
+    the job row — see ``_payload_for_handler`` there. A payload built outside
+    the worker (a test, a manual trigger) may simply omit it; the column is
+    then honestly null rather than guessed, and the liveness check falls
+    back to checkpoint age.
     """
     connection_id = payload.get("connection_id")
     if not connection_id:
