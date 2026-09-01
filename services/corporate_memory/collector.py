@@ -713,7 +713,32 @@ def collect_all(dry_run: bool = False) -> dict:
         instance_config = load_instance_config()
     except (ValueError, FileNotFoundError):
         instance_config = {}
+
+    # issue #1971 Part 6: corporate_memory.sources.claude_local_md.enabled
+    # was documented but never read — the collector ran unconditionally
+    # regardless. Read fresh on every call (not cached), matching the live-
+    # read contract corporate_memory.sources.session_transcripts.enabled
+    # already has in services/session_processors/verification.py.
+    cm_config_early = instance_config.get("corporate_memory") or {} if instance_config else {}
+    claude_local_md_config = (cm_config_early.get("sources") or {}).get("claude_local_md") or {}
+    if claude_local_md_config.get("enabled", True) is False:
+        logger.info(
+            "CLAUDE.local.md collection disabled via corporate_memory.sources.claude_local_md.enabled — skipping run"
+        )
+        stats["skipped"] = True
+        return stats
+
     ai_config = instance_config.get("ai") if instance_config else None
+    # issue #1971 Part 6: corporate_memory.extraction.model was documented
+    # but never read — mirrors the extraction.facts.model precedent (a
+    # per-feature override layered on the shared ai: block, not a second
+    # independent source of truth). A copy, never a mutation of the caller's
+    # own ai_config dict — instance_config is process-shared cache state in
+    # some call paths.
+    extraction_config = cm_config_early.get("extraction") or {}
+    model_override = extraction_config.get("model")
+    if model_override and ai_config:
+        ai_config = {**ai_config, "model": model_override}
     extractor = create_extractor_from_env_or_config(ai_config)
 
     # Determine initial status for new items based on approval mode (#1573:
@@ -723,7 +748,7 @@ def collect_all(dry_run: bool = False) -> dict:
     # (configurable via corporate_memory.confidence.base, unrelated to the
     # per-item detection_type variance the user_verification path has) — so
     # it's computed once per run, not per item.
-    governance_config = instance_config.get("corporate_memory", {})
+    governance_config = cm_config_early
     item_confidence = compute_confidence("claude_local_md") if governance_config else None
     initial_status = resolve_initial_status(governance_config, confidence=item_confidence)
 
@@ -774,6 +799,12 @@ def collect_all(dry_run: bool = False) -> dict:
     # Step 7: Run sensitivity check on NEW items only
     # Items with IDs that existed before already passed the check
     final_items: dict[str, dict] = {}
+    # issue #1971 Part 6: corporate_memory.extraction.sensitivity_check was
+    # documented but never read — an operator had no way to turn off the
+    # per-item LLM safety check (e.g. to cut cost on a low-risk instance).
+    # Default stays True: an operator who never sets this keeps today's
+    # behavior exactly.
+    sensitivity_check_enabled = extraction_config.get("sensitivity_check", True)
 
     for item_id, item in processed_items.items():
         if item_id in existing_ids:
@@ -801,8 +832,9 @@ def collect_all(dry_run: bool = False) -> dict:
                 )
                 continue
 
-            # New item - run sensitivity check
-            if check_sensitivity(extractor, item):
+            # New item - run sensitivity check (unless the operator turned
+            # it off via corporate_memory.extraction.sensitivity_check)
+            if not sensitivity_check_enabled or check_sensitivity(extractor, item):
                 final_items[item_id] = item
                 stats["items_new"] += 1
                 logger.info("Added new knowledge item: id=%s", item_id)
