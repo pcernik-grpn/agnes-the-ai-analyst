@@ -3600,8 +3600,9 @@ async def library_page(
         for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
             from app.web.semantic_layer_view import model_of, object_counts, source_label
 
+            _model = model_of(_m)
             try:
-                _counts = object_counts(model_of(_m))
+                _counts = object_counts(_model)
             except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
                 _counts = {}
             _meta = " · ".join(
@@ -3609,10 +3610,20 @@ async def library_page(
                 for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
                 if _counts.get(k)
             )
+            # #1955: the row's own `description` column is empty for every
+            # model a sync wrote (the importer never projected the
+            # document's model-level description onto it) so this fell back
+            # to "" — an imported model rendered with no subtitle even
+            # though its document has one. Fall back to the document's own
+            # description. `_model` is the SAME `model_of(_m)` already
+            # computed above for `_counts` — a dict unwrap of `document_json`,
+            # itself already fetched whole by `list_all()` above — so this is
+            # a dict lookup, not an extra query or document parse.
+            _description = _m.get("description") or _model.get("description") or ""
             _add_shared_row(
                 item_id=_m["id"],
                 title=_m.get("name") or _slug,
-                description=_m.get("description") or "",
+                description=_description,
                 href=f"/semantic-layer/{quote(str(_slug))}",
                 glyph="data",
                 type_key="semantic_model",

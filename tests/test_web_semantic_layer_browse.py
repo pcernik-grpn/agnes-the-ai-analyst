@@ -1404,6 +1404,46 @@ class TestLibrarySemanticSection:
         assert "Semantic models" in body
         assert 'href="/semantic-layer/retail"' in body
 
+    def test_imported_model_with_a_blank_row_description_falls_back_to_the_document(self, seeded_app):
+        """#1955: a row whose own ``description`` column is blank (every
+        model a sync wrote before the import-time projection existed, or one
+        written by a sync path outside it) used to render with no subtitle
+        even though its document carries a description. The Library row
+        falls back to the document's own model-level description."""
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "kb_retail",
+                    "description": "Imported from Keboola: retail domain.",
+                    "datasets": [{"name": "orders", "fields": []}],
+                }
+            ]
+        }
+        _seed_document("kb_retail", doc, source="keboola_metastore")
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert "Imported from Keboola: retail domain." in body
+
+    def test_a_rows_own_description_is_not_overridden_by_the_document(self, seeded_app):
+        """The row's own ``description`` column wins when both exist — the
+        fallback is only for a blank column, never a silent override of a
+        value the row already carries."""
+        from src.repositories import semantic_model_repo
+
+        row = _seed_model()  # stored description: "Retail domain: orders and customers."
+        semantic_model_repo().update_document(
+            row["id"],
+            name=row["name"],
+            description="Hand-edited row description.",
+            document=row["document"],
+            document_json=row["document_json"],
+            spec_version=row["spec_version"],
+            content_hash=row["content_hash"],
+            validated_at=None,
+        )
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert "Hand-edited row description." in body
+        assert "Retail domain: orders and customers." not in body
+
     def test_the_footer_aside_is_gone(self, seeded_app):
         _seed_metric()
         _seed_model()

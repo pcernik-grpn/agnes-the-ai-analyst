@@ -36,6 +36,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+- **An imported semantic model's Library row shows a description again.** The Library's "Semantic models" section rendered the stored row's `description` column, which every semantic-source sync wrote as empty — so an imported model showed only its slug as a subtitle even when its document carried a description, and the row couldn't be hand-repaired since `PUT /api/admin/semantic-models/{id}` refuses a source-owned model. The row now falls back to the document's own model-level description when the stored column is blank, and a freshly-synced model's row is written with that description from now on (closes #1955).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
