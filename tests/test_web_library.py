@@ -970,24 +970,26 @@ def test_data_app_detail_shows_no_error_row_when_healthy(seeded_app, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def test_library_renders_without_a_type_map_when_the_graph_is_empty(seeded_app):
-    """The facts feature is off by default, so this is the ordinary case: the
-    Library must look exactly as it did before this wiring existed."""
+def test_the_library_carries_no_type_map_at_all(seeded_app):
+    """It headed the Knowledge tab and now heads /admin/ontology.
+
+    A reader here wants their own documents; node-type counts describe what was
+    pulled *out* of documents, which is a question about the extraction pass —
+    so it belongs on the page of the person who configured that pass. What the
+    Library keeps is the part a reader can act on: the same vocabulary, as the
+    Client / Industry / Offering / Document type facets.
+
+    Asserted against a live page AND the template, because the two failure
+    modes differ: a stale context key renders nothing and looks fine, while
+    leftover markup renders an empty block above the list.
+    """
     r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200, r.text
     assert 'id="lib-typemap"' not in r.text
-
-
-def test_the_type_map_block_starts_hidden_and_follows_the_active_tab():
-    """Two failure modes this guards, both invisible in a screenshot: the map
-    flashing on Capabilities before the first apply(), and it never hiding at
-    all because nothing drives it. `data-lib-tabpane` was a guess that did not
-    exist — the real mechanism is the page's own onApply chain."""
-    src = (Path("app/web/templates/library.html")).read_text(encoding="utf-8")
-    assert '<div id="lib-typemap" hidden>' in src, "must start hidden — no flash on the wrong tab"
-    assert "function syncTypeMap()" in src
-    assert "syncTypeMap();" in src, "must be joined to the onApply chain, or nothing drives it"
-    assert "data-lib-tabpane" not in src, "that attribute was never a real hook"
+    src = Path("app/web/templates/library.html").read_text(encoding="utf-8")
+    assert "lib-typemap" not in src
+    assert "syncTypeMap" not in src
+    assert "type_map.css" not in src, "the stylesheet goes with the block it styled"
 
 
 def test_the_type_map_helper_fails_soft_on_every_axis():

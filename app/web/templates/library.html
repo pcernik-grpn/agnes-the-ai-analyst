@@ -600,7 +600,6 @@
 {% block body_attrs %}class="library-page"{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="{{ static_url('css/type_map.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
@@ -766,14 +765,12 @@
     }
   .library-page .lib-new__btn { height: 32px; font-size: 13px; }
 
-  /* Chips: the detail behind the Filter badge, so they read as a caption on the
-     list rather than as a second toolbar. */
-  .library-page .fbar-chip {
-    height: 24px; padding: 0 4px 0 9px; font-size: 12px; font-weight: 500;
-    background: transparent; border-color: var(--ds-border);
-    color: var(--ds-text-secondary);
-  }
-  .library-page .fbar-chip b, .library-page .fbar-chip strong { color: var(--ds-text-primary); font-weight: 600; }
+  /* No page-local chip treatment, deliberately. This page used to quieten the
+     component — transparent fill, muted text, its own height — which made the
+     Library's chips a different control from the ones on /admin/access, and
+     killed the component's own :hover into the bargain: same specificity,
+     later in the document. One chip design, defined once, in
+     filter_toolbar.css. */
 
   /* ══ Row metadata, one step quieter than the name ═════════════════════
      The name is the thing being scanned; owner, sharing and the action are how
@@ -2055,16 +2052,14 @@
 {% endblock %}
 
 {% block page_surface %}
-{# Type map — the head of the Knowledge tab (TCRD-250). Self-contained
-   macro + its own CSS; renders nothing when the graph is empty or the
-   facts feature is off, so the Library is unchanged without it. #}
-{% from "macros/_type_map.html" import type_map %}
-{% if library_type_map %}
-<div id="lib-typemap" hidden>
-  {{ type_map(library_type_map, library_type_map | sum(attribute="count"), base_url="/library",
-            actionable=library_type_map_actionable) }}
-</div>
-{% endif %}
+{# The type map ("What the graph knows") is NOT here. It headed the Knowledge
+   tab, where it answered a question no analyst was asking: a reader on this
+   page wants their documents, and node-type counts describe what was pulled
+   OUT of documents. It now heads /admin/ontology — beside the controls that
+   would fix a bad number, on the page of the person who configured the pass
+   that produced it. The vocabulary it described reaches this page as the
+   Client / Industry / Offering / Document type facets instead, where it is
+   something you can act on. #}
 <section class="lib-section">
   {# ── Toolbar — a FLOATING DOCK pinned to the bottom of the viewport rather
        than a strip between the header and the list. The Library is a scrolling
@@ -3452,7 +3447,7 @@
         buttons: '.fbar-view__btn', tableWrap: '.lib-tablewrap',
         grid: '.fbar-grid', storageKey: 'lib-view', card: buildCard,
       },
-      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); syncTypeMap(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
+      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
     });
 
     // The engine's segment value starts at the `all` wildcard, which is not a
@@ -3680,12 +3675,6 @@
   //: cross-cutting refresh rather than inventing a second mechanism.
   //: Starts `hidden` in the markup so it never flashes on Capabilities
   //: before the engine's first apply().
-  function syncTypeMap() {
-    const el = document.getElementById('lib-typemap');
-    if (!el) return;
-    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
-    el.hidden = !seg || seg.getAttribute('data-own') !== 'knowledge';
-  }
   function refreshTabCounts() {
     const base = libRowsMatching(null, true);
     document.querySelectorAll('#lib-tabs [data-seg-count]').forEach(badge => {
@@ -3792,34 +3781,6 @@
   //    writing it to COLLAPSE_KEY would silently rewrite a preference the
   //    caller set by clicking. Server-validated against the real section
   //    keys, so this is one of ours or empty.
-  // ── Type-map deep link: a chip in "What the graph knows" arrives as
-  //    /library?type=<node_type>, resolved server-side to the entity facet
-  //    that answers it. Open the Filter menu on that category, so the chip
-  //    lands the reader in the vocabulary — which client, which offering —
-  //    rather than filtering to "anything with a client", a slice nobody
-  //    asked for. Server-validated against the categories that actually
-  //    rendered, so this is one of ours or empty.
-  const OPEN_FACET = {{ (library_open_facet or '') | tojson }};
-  if (OPEN_FACET) {
-    const openFacetMenu = () => {
-      const btn = document.getElementById('lib-filter-btn');
-      const cat = document.querySelector('.fbar-cat[data-cat="' + OPEN_FACET + '"]');
-      if (!btn || btn.disabled || !cat) return;
-      if (btn.getAttribute('aria-expanded') !== 'true') btn.click();
-      const catBtn = cat.querySelector('.fbar-cat__btn');
-      if (catBtn && catBtn.getAttribute('aria-expanded') !== 'true') catBtn.click();
-      // `preventScroll`: focusing the first value is for the keyboard, not a
-      // reason to yank a freshly-loaded page down past its own heading.
-      const first = cat.querySelector('input[data-facet]');
-      if (first) first.focus({ preventScroll: true });
-    };
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', openFacetMenu, { once: true });
-    } else {
-      openFacetMenu();
-    }
-  }
-
   const OPEN_SEC = {{ (library_open_section or '') | tojson }};
   if (OPEN_SEC) {
     const sec = document.querySelector('[data-lib-sec="' + OPEN_SEC + '"]');

@@ -52,29 +52,6 @@ def test_a_type_links_to_its_filtered_view_when_a_base_url_is_given(render):
     assert 'href="/library?type=service_offering"' in html
 
 
-def test_only_actionable_types_are_links_when_the_set_is_given(render):
-    """A chip is advertised as a way in. When the caller names which types
-    the destination can act on, the rest render as static chips rather than
-    links back to the same unfiltered page."""
-    html = render(
-        types=[{"type": "client", "count": 3}, {"type": "engagement", "count": 4}],
-        total=7,
-        base_url="/library",
-        actionable=["client"],
-    )
-    assert 'href="/library?type=client"' in html
-    assert "?type=engagement" not in html
-    assert "tmap-chip--static" in html, "the unfaceted type still shows its count"
-
-
-def test_an_empty_actionable_set_links_nothing(render):
-    """Distinct from omitting it: "nothing here is actionable" is a real
-    answer (the graph has types, the page has no facets for them), and an
-    empty list must not be read as "no opinion"."""
-    html = render(types=[{"type": "client", "count": 3}], total=3, base_url="/library", actionable=[])
-    assert "<a " not in html
-
-
 def test_without_a_base_url_chips_are_not_links(render):
     html = render(types=[{"type": "client", "count": 1}], total=1)
     assert "<a " not in html

@@ -322,7 +322,7 @@
       // stopPropagation: the document-level "click outside closes the menu"
       // listener would otherwise fire on this same event and shut the popover
       // being opened (the chip row sits outside the menu).
-      edit.addEventListener('click', function (e) { e.stopPropagation(); openCategory(f.key); });
+      edit.addEventListener('click', function (e) { e.stopPropagation(); openCategory(f.key, true); });
       var x = document.createElement('button');
       x.type = 'button';
       x.className = 'fbar-chip__x';
@@ -536,11 +536,26 @@
     // click does, so a filter is edited where it was applied. A TOGGLE facet has
     // no category row and no submenu: it sits in the menu itself, so opening the
     // menu and focusing its checkbox is the whole affordance.
-    function openCategory(key) {
+    //: Opening the menu from a CHIP is a different request from opening it from
+    //: the Filter button. The button means "narrow this list" and the whole
+    //: vocabulary belongs on screen; a chip means "change THIS one", and
+    //: answering that with eleven categories makes the reader find their way
+    //: back to the filter they were already pointing at. `only` therefore
+    //: renders the menu with just that category — its siblings, the toggles
+    //: above them and the footer are all hidden by `.fbar-menu--single`.
+    function openCategory(key, only) {
       if (!menuEl) return;
       openMenu(true);
+      menuEl.classList.toggle('fbar-menu--single', !!only);
+      if (only) menuEl.setAttribute('data-single-cat', key); else menuEl.removeAttribute('data-single-cat');
       var cat = qs('.fbar-cat[data-cat="' + key + '"]', menuEl);
-      qsa('.fbar-cat', menuEl).forEach(function (c) { setCatOpen(c, c === cat); });
+      qsa('.fbar-cat', menuEl).forEach(function (c) {
+        // In single mode the one category is not a collapsed row to expand —
+        // it IS the menu, so its options show in place rather than in a
+        // popover beside a list that is not there.
+        c.classList.toggle('is-single', !!only && c === cat);
+        setCatOpen(c, c === cat);
+      });
       // A long category opens with the caret in its search field: the reader came
       // here to change a selection they can name, and on that list finding the
       // value is the work. Short ones focus the first option, as before.
@@ -921,6 +936,14 @@
     function openMenu(open) {
       if (!menuEl || !filterBtn) return;
       menuEl.hidden = !open;
+      // Closing always drops single mode: the next opener decides the form, and
+      // a menu that stayed narrowed would answer the Filter button with one
+      // category (see openCategory).
+      if (!open) {
+        menuEl.classList.remove('fbar-menu--single');
+        menuEl.removeAttribute('data-single-cat');
+        qsa('.fbar-cat', menuEl).forEach(function (c) { c.classList.remove('is-single'); });
+      }
       filterBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
       if (open) clampMenuHeight(); else menuEl.style.maxHeight = '';
     }

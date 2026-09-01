@@ -4083,30 +4083,6 @@ async def library_page(
     # land on the tab that HOLDS that section, or the reader follows "back" to
     # a page where their row is filtered out. Validated against our own keys,
     # so what reaches the page's JS is never caller text.
-    #: The type map's chips link to ``?type=<node_type>``. Resolve it to the
-    #: entity facet that answers it, so landing here opens that vocabulary
-    #: instead of the unfiltered page — the chips have advertised themselves
-    #: as "a way in" since they shipped, and nothing consumed the parameter.
-    #: A type with no facet resolves to nothing AND is rendered unlinked
-    #: (see `actionable` in the type_map call), so no chip promises a filter
-    #: the page cannot apply.
-    #: The node types whose chip is a real link: an entity facet exists for
-    #: the type AND its category actually rendered for this caller. Resolved
-    #: here rather than in the template so the fact-type -> facet-key mapping
-    #: lives in exactly one place (`_ENTITY_FACET_LABELS`).
-    _rendered_cats = {k for k, _lbl, _opts in library_entity_cats}
-    library_type_map_actionable = [
-        fact_type for fact_type, facet_key, _lbl in _entity_facets if facet_key in _rendered_cats
-    ]
-    _requested_type = request.query_params.get("type") or ""
-    library_open_facet = next(
-        (facet_key for fact_type, facet_key, _lbl in _entity_facets if fact_type == _requested_type),
-        "",
-    )
-    # ...but only if that category actually rendered; a facet whose values are
-    # all invisible to this caller has no submenu to open.
-    if _requested_type not in library_type_map_actionable:
-        library_open_facet = ""
     _requested_tab = request.query_params.get("tab")
     _requested_section = request.query_params.get("section")
     if _requested_tab in _tab_counts:
@@ -4178,8 +4154,6 @@ async def library_page(
         library_owners=library_owners,
         library_tags=library_tags,
         library_entity_cats=library_entity_cats,
-        library_open_facet=library_open_facet,
-        library_type_map_actionable=library_type_map_actionable,
         #: The kind. Left out for a long time because "the list is already
         #: GROUPED by type into these very sections" — true of one flat list of
         #: eight kinds, but a tab now holds several and grouping is not
@@ -4236,9 +4210,6 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
-        # TCRD-250: node types with live, caller-scoped counts at the head
-        # of the Knowledge tab. Empty list = render nothing, see helper.
-        library_type_map=_library_type_map(user),
         # Has this reader already taken Agnes to their tools? The foot banner
         # asked everyone forever, including the people who had finished
         # (#1956 item 2). Two signals, because either one alone misses a real
@@ -10004,6 +9975,14 @@ async def admin_ontology_page(
     ctx = _build_context(request, user=user)
     ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
     ctx["pg_backend"] = use_pg()
+    #: What the extraction pass actually produced, on the page of the person who
+    #: configured it. It used to head the Library, where it answered a question
+    #: no analyst was asking — a reader there wants their documents, and the
+    #: node-type counts describe what was pulled OUT of documents. Here it is
+    #: the answer to "did the crawl work, and what did it find", next to the
+    #: controls that would fix a bad number. Static chips: this page has no
+    #: filter for them to drive.
+    ctx["library_type_map"] = _library_type_map(user)
     return templates.TemplateResponse(request, "ontology_builder.html", ctx)
 
 

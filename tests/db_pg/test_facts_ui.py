@@ -204,44 +204,47 @@ def test_a_label_containing_the_separator_stays_filterable(seeded_app_both, stat
     assert offered == [row.group(1)], "the menu must offer exactly what the row carries"
 
 
-def test_a_type_map_chip_deep_link_opens_that_facet(seeded_app_both, state_backend, monkeypatch):
-    """`?type=<node_type>` is what the type map's chips have always linked
-    to. Nothing consumed it, so every chip reloaded the same unfiltered page
-    — this pins the consumer."""
+def test_the_type_map_is_not_on_the_library(seeded_app_both, state_backend, monkeypatch):
+    """The node-type counts describe what was pulled OUT of documents, which is
+    a setup question — did the crawl work, what did it find — asked by whoever
+    configured extraction. On the Library they headed a page whose reader wants
+    their documents, and their chips were a filter-shaped control that only
+    opened a menu. The vocabulary reaches analysts as entity facets instead."""
     if state_backend != "pg":
         pytest.skip("PG-only assertion")
     monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
     s = seeded_app_both
-    corpus_id = _new_corpus("Deep Link", "deep-link")
-    file_id = _new_file(corpus_id)
-    _seed_entity(corpus_id, file_id, "service_offering", "Warehouse migration")
-
-    r = s["client"].get("/library?type=service_offering", headers=_admin_headers(s))
-    assert 'OPEN_FACET = "offering"' in r.text
-    # An unknown or unfaceted type resolves to nothing rather than to a
-    # category that does not exist.
-    r2 = s["client"].get("/library?type=engagement", headers=_admin_headers(s))
-    assert 'OPEN_FACET = ""' in r2.text
-    r3 = s["client"].get("/library", headers=_admin_headers(s))
-    assert 'OPEN_FACET = ""' in r3.text
-
-
-def test_a_type_map_chip_is_a_link_only_where_the_page_can_act_on_it(seeded_app_both, state_backend, monkeypatch):
-    """A chip advertises itself as a way in. A node type the Library has no
-    facet for gets a static chip rather than a link back to the same page."""
-    if state_backend != "pg":
-        pytest.skip("PG-only assertion")
-    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
-    s = seeded_app_both
-    corpus_id = _new_corpus("Mixed Types", "mixed-types")
+    corpus_id = _new_corpus("No Map", "no-map")
     file_id = _new_file(corpus_id)
     _seed_entity(corpus_id, file_id, "client", "Parts Authority")
-    _seed_entity(corpus_id, file_id, "engagement", "engagement:acme")
 
     r = s["client"].get("/library", headers=_admin_headers(s))
-    assert 'href="/library?type=client"' in r.text
-    assert 'href="/library?type=engagement"' not in r.text
-    assert "tmap-chip--static" in r.text, "the unfaceted type still renders, just not as a link"
+    assert r.status_code == 200
+    assert "What the graph knows" not in r.text
+    assert 'id="lib-typemap"' not in r.text
+    # …while the vocabulary it described is still reachable, as a filter.
+    assert 'data-facet="client" value="Parts Authority"' in r.text
+
+
+def test_the_type_map_is_on_the_ontology_admin_page(seeded_app_both, state_backend, monkeypatch):
+    """Where the counts are actionable: the reader configuring extraction, next
+    to the controls that fix a bad number."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Mapped", "mapped")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+
+    r = s["client"].get("/admin/ontology", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert "What this ontology has extracted" in r.text
+    assert ">client<" in r.text
+    # Static: this page has no list for a type to narrow, so a chip that looked
+    # clickable would promise a filter that does not exist here.
+    assert "?type=client" not in r.text
+    assert "tmap-chip--static" in r.text
 
 
 # ---------------------------------------------------------------------------
