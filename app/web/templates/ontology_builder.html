@@ -163,6 +163,7 @@
         <div class="ont-sec-body">
           <div id="ont-edge-rows"></div>
           <button type="button" class="ont-add-btn" id="ont-add-edge">+ Add relationship type</button>
+          <p class="ont-hint">Description: what the relationship MEANS — the lever for telling two similarly-shaped edge types apart when their names and endpoints alone are not enough.</p>
         </div>
       </div>
 
@@ -334,6 +335,11 @@
 
   // ---- Create tab: name + paste/upload import (fills draft, never applies) --
 
+  function _importValidationError(text) {
+    if (!(text || '').trim()) return 'Paste an ontology YAML or upload a file before importing.';
+    return null;
+  }
+
   function wireCreateTab() {
     document.getElementById('ont-name-input').addEventListener('change', function (e) {
       draft.name = e.target.value || draft.name;
@@ -342,13 +348,29 @@
     document.getElementById('ont-file').addEventListener('change', function (e) {
       var f = e.target.files && e.target.files[0];
       if (!f) return;
+      // Import reads #ont-paste SYNCHRONOUSLY; FileReader is async. Without
+      // this, a user who picks a file and immediately clicks Import can hit
+      // the empty-textarea path for a file that has not finished loading.
+      var importBtn = document.getElementById('ont-import-btn');
+      importBtn.disabled = true;
       var reader = new FileReader();
-      reader.onload = function () { document.getElementById('ont-paste').value = reader.result; };
+      reader.onload = function () {
+        document.getElementById('ont-paste').value = reader.result;
+        importBtn.disabled = false;
+      };
+      reader.onerror = function () {
+        importBtn.disabled = false;
+        toast('Could not read the selected file', false);
+      };
       reader.readAsText(f);
     });
     document.getElementById('ont-import-btn').addEventListener('click', function () {
       var text = document.getElementById('ont-paste').value;
-      if (!text.trim()) return;
+      var validationError = _importValidationError(text);
+      if (validationError) {
+        toast(validationError, false);
+        return;
+      }
       fetch('/api/admin/ontology/drafts/' + encodeURIComponent(draft.id) + '/import', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
@@ -462,19 +484,24 @@
 
   // ---- Section 3: relationship types ----------------------------------
 
+  function _edgeRowHtml(name, spec) {
+    spec = spec || {};
+    var checked = spec.evidence_required === false ? '' : 'checked';
+    return '<div class="ont-row" data-name="' + esc(name) + '">' +
+      '<input type="text" class="ont-name" data-field="rename" value="' + esc(name) + '" placeholder="relationship name">' +
+      '<input type="text" class="ont-desc" data-field="description" value="' + esc(spec.description || '') + '" placeholder="what this relationship means">' +
+      '<input type="text" class="ont-src" data-field="src" value="' + esc(spec.src || '') + '" placeholder="src type">' +
+      '<input type="text" class="ont-dst" data-field="dst" value="' + esc(spec.dst || '') + '" placeholder="dst type">' +
+      '<label class="ont-evreq"><input type="checkbox" data-field="evidence_required" ' + checked + '> evidence required</label>' +
+      '<button type="button" class="ont-row-del" data-action="del-edge">✕</button>' +
+      '</div>';
+  }
+
   function renderEdgeRows() {
     var host = document.getElementById('ont-edge-rows');
     var names = Object.keys(draft.edge_types || {}).sort();
     host.innerHTML = names.map(function (name) {
-      var spec = draft.edge_types[name] || {};
-      var checked = spec.evidence_required === false ? '' : 'checked';
-      return '<div class="ont-row" data-name="' + esc(name) + '">' +
-        '<input type="text" class="ont-name" data-field="rename" value="' + esc(name) + '" placeholder="relationship name">' +
-        '<input type="text" class="ont-src" data-field="src" value="' + esc(spec.src || '') + '" placeholder="src type">' +
-        '<input type="text" class="ont-dst" data-field="dst" value="' + esc(spec.dst || '') + '" placeholder="dst type">' +
-        '<label class="ont-evreq"><input type="checkbox" data-field="evidence_required" ' + checked + '> evidence required</label>' +
-        '<button type="button" class="ont-row-del" data-action="del-edge">✕</button>' +
-        '</div>';
+      return _edgeRowHtml(name, draft.edge_types[name]);
     }).join('') || '<p class="ont-hint">No relationship types yet.</p>';
 
     Array.prototype.forEach.call(host.querySelectorAll('.ont-row'), function (row) {
@@ -485,6 +512,11 @@
         draft.edge_types[newName] = draft.edge_types[name];
         delete draft.edge_types[name];
         renderEdgeRows(); renderFreeze(); scheduleSave();
+      });
+      row.querySelector('[data-field="description"]').addEventListener('change', function (e) {
+        draft.edge_types[name] = draft.edge_types[name] || {};
+        draft.edge_types[name].description = e.target.value;
+        scheduleSave();
       });
       row.querySelector('[data-field="src"]').addEventListener('change', function (e) {
         draft.edge_types[name] = draft.edge_types[name] || {};
@@ -557,6 +589,10 @@
       });
   }
 
+  function sampleDuplicate(sample, collectionId, fileId) {
+    return (sample || []).filter(function (d) { return d.collection_id === collectionId && d.file_id === fileId; })[0] || null;
+  }
+
   function wireDocumentSample() {
     var collSel = document.getElementById('ont-collection-select');
     var fileSel = document.getElementById('ont-file-select');
@@ -574,11 +610,16 @@
     });
     document.getElementById('ont-add-doc').addEventListener('click', function () {
       var cid = collSel.value, fid = fileSel.value;
-      if (!cid || !fid) return;
+      if (!cid || !fid) {
+        toast('Pick a collection and a document first', false);
+        return;
+      }
       var collName = (collectionsCache.filter(function (c) { return c.id === cid; })[0] || {}).name || cid;
       var fileName = fileSel.options[fileSel.selectedIndex].textContent;
-      var already = (draft.document_sample || []).some(function (d) { return d.collection_id === cid && d.file_id === fid; });
-      if (already) return;
+      if (sampleDuplicate(draft.document_sample, cid, fid)) {
+        toast('"' + fileName + '" is already in the sample', false);
+        return;
+      }
       draft.document_sample = (draft.document_sample || []).concat([{ collection_id: cid, file_id: fid, name: collName + ' / ' + fileName }]);
       renderSampleList(); renderFreeze(); scheduleSave();
     });

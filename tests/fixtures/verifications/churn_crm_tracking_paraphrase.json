@@ -4,10 +4,14 @@
       "detection_type": "confirmation",
       "title": "Forecasted churn tracking requirements",
       "content": "Forecasted churn needs to be tracked on orders: capture the reason a client may leave so it feeds into internal reporting.",
-      "user_quote": "Right, forecasted churn needs to be tracked on orders — capture the reason a client may leave so it feeds into internal reporting.",
+      "user_quote": "Right, forecasted churn needs to be tracked on orders \u2014 capture the reason a client may leave so it feeds into internal reporting.",
       "domain": "operations",
-      "entities": ["churn", "orders"],
-      "base_confidence": 0.90
+      "entities": [
+        "churn",
+        "orders"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

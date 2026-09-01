@@ -14,10 +14,12 @@ invalid_token`` there:
 - ``/api/mcp`` (this module, SSE) sits behind Agnes ``_AuthMiddleware``
   below. It accepts any credential ``resolve_token_to_user`` accepts —
   in practice a PAT (the ``/mcp-connect`` snippets issue one) or a session
-  JWT — in the ``Authorization: Bearer`` header, or in the ``?token=`` query
-  param for clients that cannot set headers on an SSE GET (operator-
-  disablable; see ``_query_param_token_allowed``). A restricted principal
-  (co-session / agent-session) is refused by design.
+  JWT — in the ``Authorization: Bearer`` header. A ``?token=`` query-param
+  fallback exists for a client that cannot set headers on an SSE GET, but is
+  OFF by default (issue #1656; see ``_query_param_token_allowed``) — an
+  operator opts back in only for a documented client that genuinely cannot
+  send the header. A restricted principal (co-session / agent-session) is
+  refused by design.
 - ``/api/mcp/http`` (``app/api/mcp_streamable.py``, Streamable-HTTP) sits
   behind the MCP SDK's own bearer middleware, whose verifier is
   ``app.auth.mcp_oauth.AgnesMCPOAuthProvider``. It accepts an OAuth 2.1
@@ -125,9 +127,16 @@ del _name
 def _query_param_token_allowed() -> bool:
     """Whether the ``?token=`` auth fallback is accepted on SSE GET.
 
+    OFF by default (#1656 audit follow-up) — a token in the query string is
+    captured by every request-logging intermediary (reverse proxy, uvicorn
+    access log, SIEM) and by browser history (CWE-598). An operator opts back
+    in only for a documented client that genuinely cannot set the
+    Authorization header; every connection snippet Agnes hands out
+    (``/mcp-connect``) is header-based already.
+
     Resolved per request rather than cached at import: the value lives in the
-    ``/admin/server-config`` overlay, and an operator who turns the fallback off
-    after an incident should not have to restart the process for it to take
+    ``/admin/server-config`` overlay, and an operator who flips the fallback
+    on (or back off) should not have to restart the process for it to take
     effect. ``feature_enabled`` reads the deep-merged config, which is itself
     cached, so this is not a per-request disk hit.
     """
@@ -137,7 +146,7 @@ def _query_param_token_allowed() -> bool:
         "mcp",
         "allow_query_param_token",
         env_var="AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN",
-        default=True,
+        default=False,
     )
 
 
@@ -176,10 +185,12 @@ class _AuthMiddleware:
 
         # Fallback: ?token= query param for clients that can't set headers on SSE GET.
         #
-        # Operator-disablable since the 2026-08-05 audit (F-3). Default stays ON
-        # so no existing SSE client breaks, but an operator whose clients all
-        # send the Authorization header can remove the exposure outright instead
-        # of relying on the reverse proxy to redact the parameter from its logs.
+        # OFF by default since the #1656 audit follow-up — a token in the query
+        # string is captured by every request-logging intermediary (reverse
+        # proxy, uvicorn access log, SIEM) and by browser history (CWE-598).
+        # An operator whose fleet includes a client that genuinely cannot set
+        # the Authorization header opts back in explicitly via
+        # mcp.allow_query_param_token / AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN.
         if not auth.lower().startswith("bearer ") and _query_param_token_allowed():
             from urllib.parse import parse_qs
 
@@ -189,10 +200,9 @@ class _AuthMiddleware:
                 auth = f"bearer {t}"
                 # CWE-598: a token in the query string is captured by every
                 # request-logging intermediary (reverse proxy, uvicorn access
-                # log, SIEM). We keep the fallback for header-incapable SSE GET
-                # clients, but warn once so operators configure log redaction /
-                # prefer the Authorization header. (Full fix — a short-lived
-                # header-exchanged connect ticket — is tracked as a follow-up.)
+                # log, SIEM). The fallback is opt-in (see above); warn once so
+                # an operator who enabled it configures log redaction / moves
+                # the client to the Authorization header when they can.
                 _warn_query_param_token_once()
 
         if not auth.lower().startswith("bearer "):

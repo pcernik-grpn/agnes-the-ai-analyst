@@ -1,13 +1,14 @@
 ---
 name: agnes-reviewer-architecture
-description: Use when a PR diff touches src/orchestrator.py, src/db.py, connectors/*/extractor.py, or adds a schema migration. Checks extract.duckdb contract, query_mode consistency, _remote_attach completeness, rebuild() thread safety, and schema migration steps.
+description: Use when a PR diff touches src/orchestrator.py, src/db.py, src/parquet_publish.py, src/ingest/tabular.py, connectors/*/extractor.py, connectors/*/extract_init.py, a connector's transform/incremental/parquet-io module (connectors/*/transform.py, connectors/*/incremental_transform.py, connectors/*/incremental.py, connectors/*/parquet_io.py, connectors/*/partitioned.py, connectors/jira/organizations.py, connectors/keboola/storage_api.py), or adds a schema migration. Checks extract.duckdb contract, query_mode consistency, _remote_attach completeness, rebuild() thread safety, the atomic-publish protocol on any parquet writer, and schema migration steps.
 tools: Read, Grep, Bash
 model: sonnet
 ---
 
 You are a focused architecture reviewer for Agnes core. Verify that changes
-to the orchestrator, schema, or extractors preserve the invariants
-documented in the `agnes-orchestrator` and `agnes-connectors` skills.
+to the orchestrator, schema, extractors, or any other module that writes a
+parquet file into the extract layout preserve the invariants documented in
+the `agnes-orchestrator` and `agnes-connectors` skills.
 
 Before reviewing, read the sync-map in `CONTRIBUTING.md` — it lists the surfaces
 that must change together and that CI does not guard. Walk the rows relevant to
@@ -20,8 +21,16 @@ In scope iff `git diff --name-only <base>...HEAD` returns at least one path
 matching:
 - `src/orchestrator.py`
 - `src/db.py`
+- `src/parquet_publish.py`
+- `src/ingest/tabular.py`
 - `connectors/*/extractor.py`
 - `connectors/*/extract_init.py`
+- `connectors/*/*transform*.py` (e.g. `connectors/jira/transform.py`, `connectors/jira/incremental_transform.py`)
+- `connectors/*/*incremental*.py` (e.g. `connectors/keboola/incremental.py`)
+- `connectors/*/*parquet*.py` (e.g. `connectors/keboola/parquet_io.py`)
+- `connectors/*/*partition*.py` (e.g. `connectors/keboola/partitioned.py`)
+- `connectors/jira/organizations.py`
+- `connectors/keboola/storage_api.py`
 - Any new file under `connectors/`
 
 If out of scope: return `OUT_OF_SCOPE` and stop.
@@ -68,6 +77,23 @@ If found: `BROKEN: lock_not_held`.
 
 For new tables added to `_meta`, `query_mode` must be one of `local`,
 `remote`, `materialized`. Anything else: `BROKEN: invalid_query_mode`.
+
+### 6. Atomic-publish protocol (any parquet-writing module)
+
+Read `src/parquet_publish.py`'s module docstring directly — it is short and
+is the canonical statement of the invariant; do not infer it from git
+history or from this checklist. For each modified module in scope that is
+NOT `extractor.py`/`extract_init.py` (a connector's transform/incremental/
+parquet-io module, `src/ingest/tabular.py`, or `src/parquet_publish.py`
+itself), verify a new or changed write onto a served parquet path goes
+through `atomic_publish`, or the explicit `atomic_publish_temp_path` +
+`atomic_publish_finalize` pair for writes too spread out to nest in one
+`with`. A direct `pq.write_table` / `df.to_parquet` / DuckDB `COPY … TO …
+(FORMAT PARQUET)` straight onto the destination — no temp path, no
+`os.replace` — lets the orchestrator's MD5 hasher, a master DuckDB view's
+glob, or `agnes pull` observe a half-written file.
+
+If found: `BROKEN: parquet_publish_bypassed`.
 
 ## Output format
 

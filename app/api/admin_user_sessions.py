@@ -1,11 +1,16 @@
-"""Admin endpoints for per-user session files.
+"""Admin endpoints for per-user session files, plus one unrelated "session"
+concern that happens to share the noun and the URL family.
 
 Endpoints:
 - GET  /api/admin/users/{user_id}/sessions            — paginated session list
 - GET  /api/admin/users/{user_id}/sessions/download-all — bulk ZIP download
 - GET  /api/admin/users/{user_id}/sessions/{session_file:path}/download — single JSONL
+- POST /api/admin/users/{user_id}/revoke-sessions       — end the user's live
+  AUTH sessions (issue #1676 remainder) — NOT the JSONL transcript files
+  above. See :func:`revoke_user_sessions`'s docstring for the distinction.
 
-All admin-gated. Both download endpoints write audit_log rows.
+All admin-gated. Both download endpoints and revoke-sessions write audit_log
+rows.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from fastapi.responses import StreamingResponse
 
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
+from src.audit_helpers import log_safe
 
 from src.repositories import (
     audit_repo,
@@ -422,4 +428,55 @@ def list_user_activity(
     return {
         "rows": rows,
         "pagination": {"limit": limit, "offset": offset, "total": int(total)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/users/{user_id}/revoke-sessions
+# ---------------------------------------------------------------------------
+
+
+@router.post("/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(
+    user_id: str,
+    user: dict = Depends(require_admin),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Force-end *user_id*'s live browser/API sessions, without deactivating
+    the account (issue #1676 remainder).
+
+    Unrelated to the session-FILE endpoints above this one in the same
+    module — this bumps ``users.session_revoked_before`` (PG-only column,
+    A3 ratchet), the same floor ``POST /auth/logout`` and a self-serve
+    password change/reset now bump too (``app/auth/providers/password.py``).
+    Every ``typ="session"`` JWT for this user whose ``iat`` predates the new
+    floor is refused on its next use by
+    ``app.auth.pat_resolver.resolve_token_to_user``. PATs are untouched —
+    they run their own ``personal_access_tokens.revoked_at`` chain; use
+    ``DELETE /auth/admin/tokens/{token_id}`` for those.
+
+    On a DuckDB-backed instance ``revoke_sessions`` is a documented no-op
+    (no such column exists there — frozen post-A3 schema), so this still
+    answers 200 rather than a raw failure, but the body says honestly
+    whether anything actually changed instead of claiming a revocation
+    that did not happen.
+    """
+    target = _resolve_user(user_id, conn)
+
+    from src.repositories import use_pg
+
+    users_repo().revoke_sessions(user_id)
+    backend_supports_revocation = use_pg()
+
+    log_safe(
+        user_id=user.get("id"),
+        action="user.revoke_sessions",
+        resource=f"users/{user_id}",
+        params={"target_email": target.get("email"), "backend_supports_revocation": backend_supports_revocation},
+    )
+
+    return {
+        "user_id": user_id,
+        "revoked": backend_supports_revocation,
+        "backend_supports_revocation": backend_supports_revocation,
     }
