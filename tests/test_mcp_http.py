@@ -107,11 +107,28 @@ class TestAuthMiddleware:
         # Reset after the request — no leak into the next context.
         assert _current_user_id.get() == ""
 
-    def test_query_param_token_passes_through(self, seeded_app):
-        """?token= fallback also reaches the inner app when valid."""
+    def test_query_param_token_rejected_by_default(self, seeded_app):
+        """#1656 audit follow-up: the ?token= fallback is now OFF by default.
+
+        A request carrying ONLY ?token= must be refused exactly like a fully
+        unauthenticated request — same 401 shape, same `no_token` reason as
+        `test_no_token_returns_401` above — and the token must never be
+        echoed back in the response.
+        """
+        tok = seeded_app["analyst_token"]
+        r = seeded_app["client"].get(f"/api/mcp/sse?token={tok}")
+        assert r.status_code == 401
+        assert r.json()["reason"] == "no_token", "must read exactly like a fully missing credential"
+        assert tok not in r.text, "the token must never be echoed back"
+
+    def test_query_param_token_passes_through_when_explicitly_enabled(self, seeded_app, monkeypatch):
+        """Off by default (#1656) does not mean gone: the escape hatch still
+        works for an operator who explicitly opts back in."""
         import asyncio
 
         from app.api.mcp_http import _AuthMiddleware
+
+        monkeypatch.setenv("AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN", "true")
 
         tok = seeded_app["analyst_token"]
         reached = []
@@ -128,20 +145,25 @@ class TestAuthMiddleware:
             "headers": [],
         }
         asyncio.run(middleware(scope, None, None))
-        assert reached, "?token= param did not reach inner app"
+        assert reached, "?token= param did not reach inner app with the fallback explicitly enabled"
 
-    def test_query_param_token_still_yields_an_authorization_header(self, seeded_app):
+    def test_query_param_token_still_yields_an_authorization_header(self, seeded_app, monkeypatch):
         """Every foundation tool gets its credential from `headers_fn()`, and
         the facts tools additionally resolve a caller out of it
         (`_facts_caller`). Both would break for a `?token=`-authenticated SSE
         session if the middleware left that path without an Authorization
         header — so pin that it normalizes the query param into the same
         `_current_token` the header path sets, which is what `_headers()`
-        synthesizes from (raised as a question in review on #1652)."""
+        synthesizes from (raised as a question in review on #1652).
+
+        Requires explicitly enabling the fallback now that it defaults to
+        off (#1656)."""
         import asyncio
 
         from app.api.mcp.foundation_tools import _facts_caller
         from app.api.mcp_http import _AuthMiddleware, _headers
+
+        monkeypatch.setenv("AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN", "true")
 
         tok = seeded_app["analyst_token"]
         seen: dict = {}
@@ -162,14 +184,50 @@ class TestAuthMiddleware:
         assert seen["headers"]["Authorization"] == f"Bearer {tok}"
         assert seen["caller_id"] == "analyst1", "facts tools must authenticate a ?token= session"
 
-    def test_query_param_token_can_be_disabled(self, seeded_app, monkeypatch):
-        """`mcp.allow_query_param_token=false` turns the fallback off (401).
+    def test_query_param_token_explicit_enable_warns_once(self, seeded_app, monkeypatch):
+        """Explicit enable => accepted, AND the CWE-598 warning fires exactly
+        once per process even across multiple requests (module-level latch).
 
-        F-3, 2026-08-05 audit: a token in the query string lands in every
-        request log (CWE-598). The fallback stays ON by default so no existing
-        SSE client breaks, but an operator whose clients all send the header
-        can eliminate the exposure outright rather than relying on proxy log
-        redaction.
+        `monkeypatch` reverts both the warned-flag and the patched logger
+        after the test, so this cannot leak the "already warned" state into
+        another test.
+        """
+        import asyncio
+
+        import app.api.mcp_http as mod
+
+        monkeypatch.setenv("AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN", "true")
+        monkeypatch.setattr(mod, "_query_param_token_warned", False)
+        warnings: list = []
+        monkeypatch.setattr(mod.logger, "warning", lambda *a, **k: warnings.append((a, k)))
+
+        tok = seeded_app["analyst_token"]
+        reached = []
+
+        async def _inner_app(scope, receive, send):
+            reached.append(True)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/mcp/sse",
+            "query_string": f"token={tok}".encode(),
+            "headers": [],
+        }
+        middleware = mod._AuthMiddleware(_inner_app)
+        asyncio.run(middleware(scope, None, None))
+        asyncio.run(middleware(scope, None, None))
+
+        assert len(reached) == 2, "?token= must be accepted on every request once explicitly enabled"
+        assert len(warnings) == 1, f"CWE-598 warning must fire exactly once per process, fired {len(warnings)}x"
+
+    def test_query_param_token_can_be_disabled(self, seeded_app, monkeypatch):
+        """`mcp.allow_query_param_token=false` keeps the fallback off (401).
+
+        F-3, 2026-08-05 audit / #1656 follow-up: a token in the query string
+        lands in every request log (CWE-598). Off is the default since the
+        #1656 follow-up; this pins that an explicit `false` — e.g. an
+        operator's saved config from before the flip — still rejects it.
         """
         import asyncio
 
@@ -225,6 +283,41 @@ class TestAuthMiddleware:
         asyncio.run(middleware(scope, None, None))
 
         assert reached, "header auth broke when the query-param fallback was disabled"
+
+    def test_header_pat_still_works_on_both_transports_with_fallback_off(self, seeded_app):
+        """Regression pin for cb1c4407b (PAT works on both HTTP transports):
+        a header-based PAT keeps authenticating the SSE transport (this
+        module) AND the Streamable-HTTP transport (app/api/mcp_streamable.py)
+        now that the query-param fallback defaults to off (#1656). The two
+        mechanisms are independent, but this pins that flipping one did not
+        regress the other. See tests/test_mcp_transport_auth_parity.py for
+        the fuller per-transport credential matrix cb1c4407b introduced.
+        """
+        import asyncio
+
+        from app.api.mcp_http import _AuthMiddleware
+        from app.auth.mcp_oauth import AgnesMCPOAuthProvider
+        from tests.test_mcp_transport_auth_parity import _mint_pat
+
+        pat, _ = _mint_pat()
+        reached = []
+
+        async def _inner_app(scope, receive, send):
+            reached.append(True)
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/mcp/sse",
+            "query_string": b"",
+            "headers": [(b"authorization", f"Bearer {pat}".encode())],
+        }
+        asyncio.run(_AuthMiddleware(_inner_app)(scope, None, None))
+        assert reached, "header PAT must still authenticate the SSE transport"
+
+        verified = asyncio.run(AgnesMCPOAuthProvider().load_access_token(pat))
+        assert verified is not None, "header PAT must still authenticate the streamable transport"
+        assert verified.subject == "analyst1"
 
 
 # ── tool registration ────────────────────────────────────────────────────────────

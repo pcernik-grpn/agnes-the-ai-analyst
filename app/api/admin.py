@@ -1163,13 +1163,14 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
     "mcp": {
         "allow_query_param_token": {
             "kind": "bool",
-            "default": _flag_default("mcp", "allow_query_param_token", True),
+            "default": _flag_default("mcp", "allow_query_param_token", False),
             "hint": (
                 "Accept an MCP access token in the `?token=` query string as "
-                "well as the Authorization header. Convenient for clients that "
-                "cannot set headers, but a URL travels through proxy logs, "
-                "browser history and Referer headers, so turn it off once every "
-                "client you use sends the header."
+                "well as the Authorization header. OFF by default (#1656 audit "
+                "follow-up) — a URL travels through proxy logs, browser history "
+                "and Referer headers (CWE-598). Turn it on only for a client "
+                "that genuinely cannot set the Authorization header; every "
+                "connection snippet Agnes hands out is header-based already."
             ),
         },
         "session_pool": {
