@@ -4232,6 +4232,12 @@ class ChatManager:
                         getattr(self._config, "vertex_region", ""),
                     ),
                 )
+            except asyncio.CancelledError:
+                # Teardown (``kill`` cancels ``live.tasks``): stop here, never
+                # fall through to the fallback + persist below. CancelledError
+                # is a BaseException so ``except Exception`` would not catch
+                # it anyway — this makes the intent explicit.
+                raise
             except Exception:
                 logger.exception(
                     "auto-title model call crashed for %s; falling back to the first message",
@@ -4262,6 +4268,8 @@ class ChatManager:
                     "auto-title: ws.send_json failed for %s; title still persisted",
                     live.chat_id,
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("auto-title task crashed for %s", live.chat_id)
 

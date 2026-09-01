@@ -738,6 +738,7 @@ async def _wait_for_frame(ws: _FakeWS, ftype: str) -> None:
         if any(m.get("type") == ftype for m in ws.sent):
             return
         await asyncio.sleep(0.05)
+    raise AssertionError(f"no {ftype!r} frame within 3s; frames seen: {[m.get('type') for m in ws.sent]}")
 
 
 def test_first_user_message_triggers_auto_title_before_any_reply(tmp_path: Path, monkeypatch):
