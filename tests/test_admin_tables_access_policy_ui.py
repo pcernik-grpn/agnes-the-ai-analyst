@@ -464,3 +464,68 @@ def test_opening_the_sql_tab_runs_a_queued_compile_instead_of_dropping_it(seeded
     flush = flush[: flush.index("function _apScheduleCompile")]
     assert "clearTimeout(_apCompileTimer)" in flush
     assert "_apCompileNow();" in flush, "the queued compile must actually run"
+
+
+# ── K1-sweep finding 4 (#1979): surface access_policies.enabled in the modal ──
+#
+# The flag only gates ATTACHING a policy (``PUT /registry/{id}``'s
+# ``access_policy_sql`` setter) — enforcement of an already-saved policy
+# always runs, and the read-only authoring endpoints (``policy/columns``,
+# ``policy/compile``, ``policy/preview``) are never gated (see their own
+# docstrings in ``app/api/admin.py``). Before this, the modal opened
+# regardless and only the server-side save 422'd — friction, not a dead
+# end, but discoverable only after typing a policy. These tests pin the
+# notice + disabled Save button that make the flag state visible up front.
+
+
+def test_flag_off_shows_a_notice_and_disables_save(seeded_app):
+    """Default test env carries no ``AGNES_ACCESS_POLICIES_ENABLED`` — same
+    as this instance's own default (off) — so the notice must render and
+    the Save button must be disabled without any extra setup."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apFlagDisabledNotice"' in body
+    assert "attaching or editing a policy is disabled" in body
+    assert "enforcement of any already-saved policy keeps running" in body
+    assert "/admin/server-config" in body
+    assert "AGNES_ACCESS_POLICIES_ENABLED" in body
+    assert 'id="apSaveBtn" onclick="apSavePolicy()" disabled' in body
+
+
+def test_flag_off_leaves_the_editor_and_preview_usable(seeded_app):
+    """Only Save is blocked — the textarea stays readable/editable (so an
+    admin can still view an existing policy) and the Preview button is not
+    disabled, matching the backend (``policy/preview`` is not gated)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert '<textarea class="form-textarea" id="apSql"' in body
+    assert "apSql" in body and "disabled" not in body[body.index('id="apSql"') : body.index('id="apSql"') + 200]
+    assert 'onclick="apRunPreview()">Preview</button>' in body
+
+
+def test_flag_off_the_access_chip_still_opens_the_modal(seeded_app):
+    """The notice must be discoverable — the Access-column chip flow keeps
+    calling ``openAccessPolicyModal`` regardless of the flag; the modal
+    itself decides what to show, not the chip."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "function renderAccessPolicyChip" in body
+    assert "openAccessPolicyModal(" in body
+
+
+def test_flag_on_is_zero_visual_change(seeded_app, monkeypatch):
+    """With the flag on, neither the notice nor the disabled attribute may
+    render — this is the "zero visual change" contract."""
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apFlagDisabledNotice"' not in body
+    assert 'id="apSaveBtn" onclick="apSavePolicy()">Save policy</button>' in body

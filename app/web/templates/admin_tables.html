@@ -3534,6 +3534,22 @@
                 </button>
             </div>
             <div class="modal-body">
+                {% if not access_policies_enabled %}
+                <!-- K1-sweep finding 4 (#1979): the flag only gates ATTACHING
+                     a policy (PUT /registry/{id}'s access_policy_sql setter,
+                     app/api/admin.py) -- enforcement of an existing one keeps
+                     running. Server-rendered (like facts_enabled/
+                     studio_enabled elsewhere on this page), so ON renders
+                     neither this div nor the Save button's disabled
+                     attribute below -- zero visual change. -->
+                <div class="form-hint form-hint--warn" id="apFlagDisabledNotice">
+                    Table access policies are off on this instance — attaching or editing a policy is disabled,
+                    but enforcement of any already-saved policy keeps running. Enable
+                    <code>access_policies.enabled</code> in
+                    <a href="/admin/server-config">/admin/server-config</a> (or set <code>AGNES_ACCESS_POLICIES_ENABLED=1</code>)
+                    to make changes.
+                </div>
+                {% endif %}
                 <div class="form-hint form-hint--warn" id="apInterlockWarning" style="display:none;">
                     <!-- Filled by _apRenderInterlockWarning() — mirrors the
                          onEditBqAccessModeChange() pattern: computed and
@@ -3668,7 +3684,7 @@
                 <button class="btn btn-danger btn-sm" id="apClearBtn" onclick="apClearPolicy()" style="display:none;">Clear policy</button>
                 <div style="display:flex; gap:10px;">
                     <button class="btn btn-secondary" onclick="closeAccessPolicyModal()">Cancel</button>
-                    <button class="btn btn-primary" id="apSaveBtn" onclick="apSavePolicy()">Save policy</button>
+                    <button class="btn btn-primary" id="apSaveBtn" onclick="apSavePolicy()"{% if not access_policies_enabled %} disabled{% endif %}>Save policy</button>
                 </div>
             </div>
         </div>
