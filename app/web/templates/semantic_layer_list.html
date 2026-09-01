@@ -473,11 +473,19 @@
        three visible chips saying a thing is ABSENT, which pushed the real counts
        behind a "+2" and left the survivors truncated mid-word ("0 constrai…").
        A model with two datasets and two metrics now says exactly that. #}
-    {# `data-ft` on the card is the search index the toolbar reads. Without it
-       the box on this tab matched nothing and reported "0 of 2" for a model
-       that is right there — worse than the no-search state it replaced. Same
-       fields the flat tabs index: the name you would type, and the description
-       you might remember instead. #}
+    {# `data-tab` is the bucket this row belongs to and `data-ft` the search
+       index — the two things every row on this page must declare.
+
+       Escaped with `replace`, not `| e`. The macro emits this whole string
+       with `| safe`, so the VALUE has to be escaped here — but `escape`
+       returns Markup, and Jinja's `~` escapes the PLAIN side whenever either
+       operand is Markup, so the quotes of this very string came out as `&#34;`
+       and the attribute was malformed. (`| string` does not undo it either:
+       that filter is `soft_str`, and Markup is a str subclass, so it passes
+       straight through.) It LOOKED fine — the browser read the mangled value
+       as a stray attribute and `indexOf` still matched most queries — which is
+       how it survived being screenshotted. `replace` takes a str and returns a
+       str, so the concatenation stays plain and `| safe` emits it once. #}
     {% set _card = {
          'kind': 'data',
          'title': m.name,
@@ -491,8 +499,10 @@
              m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's') if m.counts.relationships else None,
              m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's') if m.counts.glossary else None,
          ] | reject('none') | list,
-         'attrs': ('data-ft="' ~ ((m.name ~ ' ' ~ (m.description or '')) | lower | e) ~ '"'
-                   ~ (' data-status="invalid"' if _is_invalid else '')),
+         'attrs': ('data-tab="models" data-ft="'
+                   ~ ((m.name ~ ' ' ~ (m.description or '')) | lower
+                      | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
+                   ~ '"' ~ (' data-status="invalid"' if _is_invalid else '')),
        } %}
     {% if m.is_imported or _is_invalid %}
     {% call fbar_card(_card) %}
@@ -941,7 +951,14 @@
         });
         const counts = {};
         document.querySelectorAll(ROWS).forEach(r => {
-            const tab = r.getAttribute('data-tab') || 'models';
+            // No default bucket here, deliberately. A fallback is what let this
+            // break silently: the model cards carried no `data-tab`, so the
+            // ENGINE hid them on any other segment and never brought them
+            // back, while this count assumed them into the models bucket and
+            // cheerfully reported "2" over an empty grid. A row that declares
+            // no bucket is now counted nowhere, which is visible.
+            const tab = r.getAttribute('data-tab');
+            if (!tab) return;
             if (q && !((r.getAttribute('data-ft') || '').includes(q))) return;
             for (const attr in sel) {
                 if (!sel[attr].includes(r.getAttribute(attr) || '')) return;

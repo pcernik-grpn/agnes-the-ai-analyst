@@ -1325,8 +1325,8 @@ class TestFlatProjectionTabsFold:
             # The strip is a segmented control now — buckets of one filtered
             # set — so the count rides its own badge instead of the label, and
             # it moves as the reader narrows.
-            assert ">Metrics<" in body, tab
-            assert ">Glossary<" in body, tab
+            assert ">All metrics<" in body, tab
+            assert ">All glossary<" in body, tab
             assert 'data-seg-count="all_metrics"' in body, tab
 
     def test_all_metrics_tab_lists_a_metric_with_no_document_behind_it(self, seeded_app):

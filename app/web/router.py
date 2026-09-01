@@ -4518,8 +4518,8 @@ _SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
 #: tab lists and the one piece of the old vocabulary worth keeping.
 _SEMANTIC_LAYER_LIST_TAB_LABELS = {
     "models": "Semantic models",
-    "all_metrics": "Metrics",
-    "all_glossary": "Glossary",
+    "all_metrics": "All metrics",
+    "all_glossary": "All glossary",
 }
 
 

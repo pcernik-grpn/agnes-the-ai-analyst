@@ -113,8 +113,8 @@ class TestCatalogSemanticsContent:
         # The keys stay `all_*` — they are in bookmarks and in the 308 above —
         # but the LABELS dropped the "All", which said nothing beside a count
         # badge and read as a filter state on tabs that have none.
-        assert ">Metrics<" in body
-        assert ">Glossary<" in body
+        assert ">All metrics<" in body
+        assert ">All glossary<" in body
 
         # Server-rendered metrics list: category grouping + row content.
         assert "revenue" in body
@@ -1580,4 +1580,39 @@ class TestTheAnswerIsAnnounced:
         block = tpl.split("@media (max-width: 560px) {", 1)[1].split("}", 1)[0]
         assert "overflow-x: auto" in block
         assert "padding-right" in block, "a sliver of the next tab is the only cue it scrolls"
+
+
+class TestEveryRowDeclaresItsBucket:
+    """The bug this pins, which was invisible in the count and obvious on
+    screen: the model cards carried no `data-tab`, so the engine hid them the
+    moment another segment was chosen and never brought them back — while the
+    tab badge, which defaulted a missing attribute to `models`, cheerfully
+    reported "2" over an empty grid. Switch to All metrics, switch back, and
+    the page said there were two models while showing none.
+    """
+
+    def test_a_model_card_declares_its_bucket(self, seeded_app):
+        _seed_model()
+        body = seeded_app["client"].get(
+            "/semantic-layer", headers=_auth(seeded_app["admin_token"])
+        ).text
+        card = body.split('<article class="fbar-card"', 1)[1].split(">", 1)[0]
+        assert 'data-tab="models"' in card, card
+        # Real quotes, not `&#34;`. `escape` returns Markup and Jinja's `~`
+        # escapes the plain side when either operand is Markup, so building this
+        # attribute string with `| e` mangled its own quotes and the browser
+        # read the value as a stray attribute — which still matched most
+        # searches, which is how it survived a screenshot.
+        assert "&#34;" not in card, card
+
+    def test_the_count_does_not_default_a_missing_bucket(self):
+        """The fallback is what made the failure silent. A row that declares no
+        bucket must be counted nowhere — which is visible — rather than
+        counted somewhere the engine will not show it."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        fn = tpl.split("function refreshTabCounts()", 1)[1].split("\n    }", 1)[0]
+        assert "|| 'models'" not in fn
+        assert "if (!tab) return;" in fn
 
