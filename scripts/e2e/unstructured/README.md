@@ -29,7 +29,7 @@ not instead of them. Run this pack when you need to know whether a
   what `uv pip install ".[dev,server]"` already gives you).
 - For probe 03 (visibility): two non-admin persona accounts with issued
   bearer tokens, and one of them's Agnes group id.
-- For probe 05 (extraction): `extraction.enabled` on, and a SharePoint
+- For probe 05 (extraction): `sharepoint.enabled` on, and a SharePoint
   connection id already registered on the instance.
 
 Nothing here needs a checkout of the producer pipeline (crawl/convert/
@@ -66,7 +66,7 @@ python scripts/e2e/unstructured/01_smoke_instance.py      # always run first
 python scripts/e2e/unstructured/02_ingest_gates.py
 python scripts/e2e/unstructured/03_visibility_probes.py   # needs TOKEN_A/_B (+ GROUP_A for full coverage)
 python scripts/e2e/unstructured/04_anonymization_probe.py # needs AGNES_E2E_PLANTED
-python scripts/e2e/unstructured/05_extraction_seam.py     # needs extraction.enabled + a connection id
+python scripts/e2e/unstructured/05_extraction_seam.py     # needs sharepoint.enabled + a connection id
 ```
 
 Each script is standalone and idempotent — run any subset, in any order,
@@ -118,8 +118,8 @@ pass before you spend time chasing a false failure.
 | `403 anonymization_not_declared` on a batch you did NOT expect to be anonymize-marked | A stale SharePoint scope from a prior test run, or a real connection's scope config | `GET /api/admin/sharepoint/connections/{id}/scopes` — check `anonymize` per row |
 | `501 requires_postgres_backend` on any facts endpoint | The instance is DuckDB-backed | Facts is PG-only by design (A3 ratchet) — point the pack at a PG-backed instance, or expect 02/03/04's facts-dependent checks to SKIP/fail clean, never crash |
 | `404` on every `/api/facts/*` call | `facts.enabled` is off | Check via 01's flag report, or `POST /api/admin/server-config` with `{"facts": {"enabled": true}}` |
-| 05 SKIPs with "extraction.enabled is off" | Feature flag off by default | `instance.yaml`'s `extraction:` block, or `AGNES_EXTRACTION_ENABLED=1` |
-| 05 fails with `extraction_dependencies_missing` | `extraction.enabled` is on but the `extraction` optional extra is not installed on this process | `pip install 'agnes[extraction]'` (or an image built with `--build-arg EXTRA_EXTRAS=,extraction`) |
+| 05 SKIPs with "sharepoint.enabled is off" | Feature flag off by default | `instance.yaml`'s `extraction:` block, or `AGNES_SHAREPOINT_ENABLED=1` |
+| 05 fails with `extraction_dependencies_missing` | `sharepoint.enabled` is on but the `extraction` optional extra is not installed on this process | `pip install 'agnes[extraction]'` (or an image built with `--build-arg EXTRA_EXTRAS=,extraction`) |
 | 03 SKIPs "full plant-based probes" | `AGNES_E2E_GROUP_A` not set | Only the baseline 404-parity check runs; set the group id for full S1/S2/S3 coverage |
 | 03's setup step times out waiting for indexing | Ingestion pipeline (chunking) is stalled or slow on this instance | Check worker logs / job queue depth; retry with a longer wait by editing `_INDEX_TIMEOUT_SECONDS` locally, or investigate the instance directly |
 | 04 reports a leak | A real finding — the planted string reached an Agnes surface | Confirm which surface (facts claims / collections search / preview / raw) from the check's detail column, then trace whether the anonymize pass actually ran on that document, or whether an un-anonymized upload bypassed the connect-wizard scope entirely |

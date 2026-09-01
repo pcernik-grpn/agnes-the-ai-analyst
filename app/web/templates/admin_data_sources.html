@@ -2509,13 +2509,13 @@ function _spRejectionReasonText(reason) {
 
    The enabled sentence names BOTH configuration sources, because the gate
    honours a deploy-time env override ahead of instance.yaml
-   (AGNES_EXTRACTION_ENABLED). An admin on an env-configured instance told
+   (AGNES_SHAREPOINT_ENABLED). An admin on an env-configured instance told
    to edit instance.yaml would edit a file that is not deciding this — the
    API's own 409 message says both, and this copy is the same sentence one
    layer up. */
 const EXTRACTION_UNREADY_REASON_TEXT = {
   extraction_disabled:
-    "Extraction is disabled on this instance — set extraction.enabled: true in instance.yaml (or AGNES_EXTRACTION_ENABLED) first.",
+    "The SharePoint connector is disabled on this instance — set sharepoint.enabled: true in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
   extraction_dependencies_missing:
     "The extraction dependencies are not installed on this instance — install the extra (pip install 'agnes[extraction]') and restart.",
 };

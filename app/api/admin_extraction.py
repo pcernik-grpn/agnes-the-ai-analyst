@@ -551,7 +551,7 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
     pointer at an executable at worst.
     """
     return [
-        _config_row("Enabled", ("extraction", "enabled"), env_var="AGNES_EXTRACTION_ENABLED", default=False),
+        _config_row("Enabled (whole connector)", ("sharepoint", "enabled"), env_var="AGNES_SHAREPOINT_ENABLED", default=False),
         _config_row(
             "Schedule",
             ("extraction", "schedule"),

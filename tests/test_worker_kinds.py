@@ -574,7 +574,7 @@ class TestCorpusExtractionHandler:
     Since the owner decision of 2026-08-31 the built-in pipeline is the ONLY
     pipeline: the handler is a thin delegate to
     ``connectors.sharepoint.crawler.run_builtin_crawl`` and owns exactly two
-    responsibilities of its own — the ``extraction.enabled`` gate, and
+    responsibilities of its own — the ``sharepoint.enabled`` gate, and
     passing the payload through unchanged. Everything the removed external
     mode used to be tested for here (argv construction, the curated child
     env, ``env_passthrough``, subprocess timeout/exit handling, the
@@ -584,7 +584,7 @@ class TestCorpusExtractionHandler:
     survived.
     """
 
-    _ENABLED_CONFIG = {"extraction": {"enabled": True, "timeout_s": 60}}
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}, "extraction": {"timeout_s": 60}}
 
     @pytest.fixture(autouse=True)
     def _clear_extraction_env_var(self, monkeypatch):

@@ -318,7 +318,7 @@ class TestRunsDrawer:
                 "duration_s": 2.0,
                 "files_done": 0,
                 "skips_total": 0,
-                "error": "CrawlError: extraction.enabled is false — refusing to run",
+                "error": "CrawlError: sharepoint.enabled is false — refusing to run",
             },
         ],
         "total": 7,
@@ -334,7 +334,7 @@ class TestRunsDrawer:
 
     def test_a_failed_row_shows_its_refusal_verbatim(self):
         out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
-        assert "extraction.enabled is false" in out["html"]
+        assert "sharepoint.enabled is false" in out["html"]
 
     def test_only_the_interrupted_row_gets_the_resume_reassurance(self):
         """A crash must never carry copy telling an operator its work was
@@ -343,7 +343,7 @@ class TestRunsDrawer:
         html = out["html"]
         assert html.count("the next run resumes") == 1
         # …and it sits in the interrupted row, above the failed one.
-        assert html.index("the next run resumes") < html.index("extraction.enabled is false")
+        assert html.index("the next run resumes") < html.index("sharepoint.enabled is false")
 
     def test_untruncated_history_is_named_not_silently_dropped(self):
         out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
@@ -548,13 +548,13 @@ class TestConfigDrawer:
     _CONFIG = {
         "effective": [
             {
-                "key": "extraction.enabled",
+                "key": "sharepoint.enabled",
                 "label": "Enabled",
                 "value": True,
                 "origin": "env",
-                "env_name": "AGNES_EXTRACTION_ENABLED",
+                "env_name": "AGNES_SHAREPOINT_ENABLED",
                 "editable": False,
-                "lock_reason": "set by the environment (AGNES_EXTRACTION_ENABLED)",
+                "lock_reason": "set by the environment (AGNES_SHAREPOINT_ENABLED)",
                 "note": None,
             },
             {
@@ -603,7 +603,7 @@ class TestConfigDrawer:
 
     def test_every_row_shows_its_origin(self):
         html = self._html()
-        assert "env AGNES_EXTRACTION_ENABLED" in html
+        assert "env AGNES_SHAREPOINT_ENABLED" in html
         assert "built-in default" in html
         assert "built in" in html
 

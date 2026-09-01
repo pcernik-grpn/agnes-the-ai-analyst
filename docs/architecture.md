@@ -759,9 +759,9 @@ with `interrupted_reason: "timeout"`; that is the only deliberate stop
 mechanism v1 has. An exhausted 429 budget stops a run the same way, as
 `interrupted_reason: "throttled"` — those two reasons, and only those two,
 mean the persisted state describes exactly what was ingested, so a reader
-may promise that the next run resumes. Off by default (`extraction.enabled` — a registered switch,
-`AGNES_EXTRACTION_ENABLED`) and additive: an instance that never sets
-`extraction.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
+may promise that the next run resumes. Off by default (`sharepoint.enabled` — a registered switch,
+`AGNES_SHAREPOINT_ENABLED`) and additive: an instance that never sets
+`sharepoint.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
 backends ship as the `extraction` optional extra; the admin trigger
 refuses with `409 extraction_dependencies_missing` when it is absent.
 
@@ -777,7 +777,7 @@ deployment multi-process, requiring Postgres app-state, explicit
 `JWT_SECRET_KEY`/`SESSION_SECRET`, and `coordination.backend: redis` (same
 as any other role-split process; see
 [`DEPLOYMENT.md#multi-process`](DEPLOYMENT.md#multi-process)). Flipping
-`extraction.enabled` and starting the profile is not sufficient on its
+`sharepoint.enabled` and starting the profile is not sufficient on its
 own — `app/startup_guards.py::validate_deployment` refuses to boot
 otherwise.
 

@@ -250,16 +250,16 @@ class TestExtractionConfig:
     def test_env_set_value_is_reported_as_env_and_locked(self, seeded_app, monkeypatch):
         """An admin edit writes YAML, which the environment overrides —
         offering the edit would be offering a change that does nothing."""
-        monkeypatch.setenv("AGNES_EXTRACTION_ENABLED", "1")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "1")
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-config-env")
         rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
         by_key = {r["key"]: r for r in rows if r["key"]}
-        enabled = by_key["extraction.enabled"]
+        enabled = by_key["sharepoint.enabled"]
         assert enabled["origin"] == "env"
-        assert enabled["env_name"] == "AGNES_EXTRACTION_ENABLED"
+        assert enabled["env_name"] == "AGNES_SHAREPOINT_ENABLED"
         assert enabled["editable"] is False
-        assert "AGNES_EXTRACTION_ENABLED" in enabled["lock_reason"]
+        assert "AGNES_SHAREPOINT_ENABLED" in enabled["lock_reason"]
 
     def test_no_producer_command_row_is_rendered(self, seeded_app):
         """The built-in pipeline has no producer command; rendering one an

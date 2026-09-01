@@ -99,7 +99,7 @@ distribution mirror, and the api-role write conversions) map onto:
 - ``corpus-extraction``    (EXTRACTION — its own lane, spec §7.5 / §16
   step 7 of docs/superpowers/specs/2026-08-27-fact-graph-over-collections-
   design.md) — document extraction for one SharePoint connection. Off by
-  default (``extraction.enabled: false``, ``config/instance.yaml
+  default (``sharepoint.enabled: false``, ``config/instance.yaml
   .example``). A thin delegate like every other handler here: the whole
   crawl -> convert -> (anonymize) -> ingest pipeline runs IN-PROCESS from
   ``connectors.sharepoint.crawler.run_builtin_crawl`` (owner decision
@@ -1232,7 +1232,7 @@ def _run_corpus_extraction(payload: dict) -> dict:
     crawl state, its per-scope -> per-collection routing, its fail-closed
     anonymization and its oversize/permission/convert-failure accounting all
     live in ``connectors.sharepoint.crawler``. This handler owns exactly one
-    thing the crawler does not: the ``extraction.enabled`` gate.
+    thing the crawler does not: the ``sharepoint.enabled`` gate.
 
     Owner decision 2026-08-31: the built-in pipeline is the ONLY pipeline.
     The external-producer subprocess this handler used to shell out to — and
@@ -1260,7 +1260,7 @@ def _run_corpus_extraction(payload: dict) -> dict:
     connection's crawl state, so the job result and the state file can never
     disagree about what a run did).
 
-    No-op guard: raises (so the job fails cleanly) when ``extraction.enabled``
+    No-op guard: raises (so the job fails cleanly) when ``sharepoint.enabled``
     is false — the same "off unless explicitly turned on" posture as
     ``ducklake-maintenance``'s backend check, just failing instead of
     silently returning, since a ``corpus-extraction`` job only ever exists

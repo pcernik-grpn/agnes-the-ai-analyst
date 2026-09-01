@@ -70,7 +70,7 @@ Surface:
                                                                 kind (TCRD-226). Refuses BEFORE
                                                                 enqueueing (typed 409, never a job
                                                                 that fails 30 minutes later in a
-                                                                worker) when ``extraction.enabled``
+                                                                worker) when ``sharepoint.enabled``
                                                                 is off or the ``extraction`` extra
                                                                 is not installed — see
                                                                 ``_extraction_readiness``.
@@ -734,7 +734,7 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     job is queued rather than 30 minutes later when a worker claims it and
     the handler raises.
 
-    Two gates. ``extraction.enabled`` is the one
+    Two gates. ``sharepoint.enabled`` is the one
     ``app/worker/kinds.py::_run_corpus_extraction`` itself checks. The second
     is the ``extraction`` optional dependency extra: since the built-in
     pipeline became the only pipeline (owner decision 2026-08-31) the crawl
@@ -746,11 +746,8 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
 
     The first gate already honors a deploy-time env override ahead of
     ``instance.yaml`` — ``AGNES_SHAREPOINT_ENABLED`` (via ``feature_enabled``
-    below) — and the producer gate honors ``AGNES_EXTRACTION_PRODUCER_COMMAND``
-    / ``AGNES_EXTRACTION_PRODUCER_MODULE`` (inside
-    :func:`app.worker.kinds._extraction_producer_argv`, called below) — so
-    this function and the handler it mirrors see the identical truth
-    regardless of which source (env or yaml) an instance configures
+    below) — so this function and the handler it mirrors see the identical
+    truth regardless of which source (env or yaml) an instance configures
     through.
 
     Returns ``(True, None)`` when usable, or ``(False, {"error": ...,
@@ -1567,7 +1564,7 @@ async def trigger_extraction(
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
     worker) when the feature isn't usable: ``409 extraction_disabled``
-    (``extraction.enabled`` is false) or ``409
+    (``sharepoint.enabled`` is false) or ``409
     extraction_dependencies_missing`` (the ``extraction`` optional
     dependency extra is not installed) — see :func:`_extraction_readiness`.
 
@@ -1722,7 +1719,7 @@ async def run_due_extraction(
     default posture as ``sharepoint.enabled``).
 
     A clean, typed no-op (never an error) when the feature isn't usable —
-    ``extraction.enabled`` is false, the ``extraction`` extra is missing, or
+    ``sharepoint.enabled`` is false, the ``extraction`` extra is missing, or
     no schedule is configured — since this endpoint, once registered, fires
     UNCONDITIONALLY on its own cadence; the JOB HANDLER
     (``_run_corpus_extraction``) raises on the same conditions because a
