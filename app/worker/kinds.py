@@ -479,10 +479,41 @@ def _run_session_collector(payload: dict) -> None:
 def _run_corporate_memory(payload: dict) -> None:
     """Wrap ``services.corporate_memory.collector.collect_all`` — the
     body behind ``POST /api/admin/run-corporate-memory``. Called with
-    the same ``dry_run=False`` default as that endpoint."""
-    from services.corporate_memory.collector import collect_all
+    the same ``dry_run=False`` default as that endpoint.
 
-    collect_all(dry_run=False)
+    issue #1971 Part 3: ``collect_all``'s return value used to be discarded
+    entirely here — the scheduled collector ran every night with no durable
+    trace of what it did. Now its stats feed one ``memory_detection_runs``
+    row via the best-effort writer (never raises; degrades to a warning log
+    line on a DuckDB-backed instance, where the table doesn't exist). The
+    collector consults no editable policy (issue #1971 Part 2 left its
+    structurally different prompt on the built-in default), so
+    ``policy_text`` is omitted — the row's ``policy_fingerprint`` is
+    ``NULL``, distinct from an empty-but-real policy.
+    """
+    from datetime import datetime
+
+    from services.corporate_memory.collector import collect_all
+    from src.memory_detection_logging import record_detection_run
+
+    started_at = datetime.now(UTC)
+    stats = collect_all(dry_run=False) or {}
+    errors = stats.get("errors") or []
+    record_detection_run(
+        source="claude_local_md",
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        sessions_scanned=stats.get("users_scanned", 0),
+        items_proposed=stats.get("items_extracted", 0),
+        items_filtered=stats.get("items_filtered", 0),
+        items_inserted=stats.get("items_db_inserted", 0),
+        # The collector's LLM path proposes no scope label — Part 2 left it
+        # on its built-in prompt (structurally incompatible output schema),
+        # so nothing here is ever routed to the engagement-scoped domain.
+        items_routed_side_domain=0,
+        dry_run=False,
+        error="; ".join(str(e) for e in errors) if errors else None,
+    )
 
 
 def _run_jira_refresh(payload: dict) -> None:

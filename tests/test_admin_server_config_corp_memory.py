@@ -92,24 +92,30 @@ def test_corp_memory_session_transcripts_enabled_and_detection_types_are_live(se
     assert "Live" in sess["fields"]["detection_types"]["hint"]
 
 
-def test_corp_memory_session_transcripts_confidence_and_turns_marked_not_wired(seeded_app):
-    """confidence_base and max_turns_per_session are siblings of the two
-    knobs #1957 wired, but stayed inert — the hint must say so honestly
-    rather than implying they already do something (#1971)."""
+def test_corp_memory_session_transcripts_confidence_base_removed_max_turns_now_live(seeded_app):
+    """issue #1971 Part 6: confidence_base was a dead duplicate of
+    confidence.base['user_verification.<detection_type>'] and never read —
+    removed rather than left as a misleading knob. max_turns_per_session
+    WAS wired in the same pass — its hint must say "Live", not "#1971"."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     sess = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["session_transcripts"]
-    assert "#1971" in sess["fields"]["confidence_base"]["hint"]
-    assert "#1971" in sess["fields"]["max_turns_per_session"]["hint"]
+    assert "confidence_base" not in sess["fields"]
+    assert "Live" in sess["fields"]["max_turns_per_session"]["hint"]
 
 
-def test_corp_memory_claude_local_md_marked_not_wired(seeded_app):
+def test_corp_memory_claude_local_md_now_live(seeded_app):
+    """issue #1971 Part 6: sources.claude_local_md.enabled was documented
+    but never read — now wired (a False value skips the whole collector
+    run). confidence_base was a dead duplicate, removed."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     claude_local_md = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["claude_local_md"]
-    assert "#1971" in claude_local_md["hint"]
+    assert "confidence_base" not in claude_local_md["fields"]
+    assert "Live" in claude_local_md["hint"]
+    assert "Live" in claude_local_md["fields"]["enabled"]["hint"]
 
 
 def test_corp_memory_distribution_mode_hint_describes_real_enforcement(seeded_app):
@@ -124,28 +130,35 @@ def test_corp_memory_distribution_mode_hint_describes_real_enforcement(seeded_ap
     assert "select_distributable_items" in hint
 
 
-def test_corp_memory_extraction_and_review_period_and_entity_resolution_marked_not_wired(seeded_app):
+def test_corp_memory_review_period_and_entity_resolution_still_marked_not_wired(seeded_app):
     """The remaining known-inert corporate_memory knobs (#1971) must say so
     rather than silently implying they already take effect."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     fields = r.json()["known_fields"]["corporate_memory"]
-    assert "#1971" in fields["extraction"]["hint"]
     assert "#1971" in fields["review_period_months"]["hint"]
     assert "#1971" in fields["entity_resolution"]["hint"]
+    assert "#1971" in fields["extraction"]["fields"]["contradiction_check"]["hint"]
+    assert "#1971" in fields["contradiction_detection"]["hint"]
 
 
-def test_corp_memory_extraction_section_present(seeded_app):
+def test_corp_memory_extraction_model_and_sensitivity_check_now_live(seeded_app):
+    """issue #1971 Part 6: extraction.model (a per-feature override of the
+    global ai.model, mirroring extraction.facts.model) and
+    extraction.sensitivity_check are now read; extraction.contradiction_check
+    stays unwired (see the dedicated 'still not wired' test above)."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     extraction = r.json()["known_fields"]["corporate_memory"]["extraction"]
     assert extraction["kind"] == "object"
     assert "model" in extraction["fields"]
+    assert "Live" in extraction["fields"]["model"]["hint"]
     assert "sensitivity_check" in extraction["fields"]
     assert extraction["fields"]["sensitivity_check"]["kind"] == "bool"
     assert extraction["fields"]["sensitivity_check"]["default"] is True
+    assert "Live" in extraction["fields"]["sensitivity_check"]["hint"]
 
 
 def test_corp_memory_confidence_base_is_map_of_floats(seeded_app):
