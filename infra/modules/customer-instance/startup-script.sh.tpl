@@ -1370,7 +1370,6 @@ AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
 # switch (2026-09-01 flag consolidation), so this line also turns on the
 # connect wizard, admin routes, and ACL mirroring on this VM.
 AGNES_SHAREPOINT_ENABLED=1
-AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}

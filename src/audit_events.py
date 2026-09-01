@@ -698,6 +698,16 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin confirmed a SharePoint site/library/folder as an ingested scope.",
     ),
+    "sharepoint_connection.manual_site_add": AuditEvent(
+        "sharepoint_connection.manual_site_add",
+        "mutation",
+        "An admin added a SharePoint site by URL, persisting it on the connection.",
+    ),
+    "sharepoint_connection.manual_site_remove": AuditEvent(
+        "sharepoint_connection.manual_site_remove",
+        "mutation",
+        "An admin removed a SharePoint site previously added by URL.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",
@@ -1048,11 +1058,6 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin read a SharePoint connection's observed content-changes feed.",
     ),
-    "sharepoint_connection.corpus_map_read": AuditEvent(
-        "sharepoint_connection.corpus_map_read",
-        "read",
-        "The SharePoint connection's scope-to-collection corpus map was read.",
-    ),
     "sharepoint_connection.scopes_read": AuditEvent(
         "sharepoint_connection.scopes_read", "read", "An admin read a SharePoint connection's configured scopes."
     ),
@@ -1140,6 +1145,12 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_connection.extract",
         "mutation",
         "A document extraction was started for one SharePoint connection.",
+    ),
+    # -- Cooperative stop (owner-frustration fix, 2026-09-01) -----------------
+    "extraction.stop_requested": AuditEvent(
+        "extraction.stop_requested",
+        "mutation",
+        "An admin requested a running (or about-to-run) extraction crawl stop at its next quiescent point.",
     ),
     "run_sharepoint_extraction": AuditEvent(
         "run_sharepoint_extraction",

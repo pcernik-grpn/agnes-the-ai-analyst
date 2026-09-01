@@ -4,7 +4,7 @@ Covers: admin gating on every route, the typed "certificate unresolved"
 error (surface absence rather than fail, per spec) vs. a real Graph browse
 with the Graph transport mocked, scope->collection creation idempotency
 (re-confirming a scope reuses the same collection), the no-group ("indexed
-but invisible") warning, and the producer-handoff corpus-map endpoint.
+but invisible") warning.
 
 2026-09-01: the whole router is gated by the single ``sharepoint`` switch
 (``app/api/admin_sharepoint.py``'s module-level ``_require_sharepoint_enabled``
@@ -110,10 +110,6 @@ class TestAuthGating:
             json={"source_scope_id": "x", "display_path": "x"},
             headers=_auth(seeded_app["analyst_token"]),
         )
-        assert r.status_code == 403
-
-    def test_corpus_map_requires_admin(self, seeded_app):
-        r = seeded_app["client"].get(f"{BASE}/nope/corpus-map", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 403
 
     def test_changes_requires_auth(self, seeded_app):
@@ -365,6 +361,192 @@ class TestSiteByUrl:
         r = c.get(f"{BASE}/{conn_id}/tree", params={"site_id": "s1"}, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 502, r.text
         assert r.json()["detail"]["error"] == "sharepoint_graph_error"
+
+
+class TestManualSites:
+    """Persistence for a site added by URL (2026-09-01 bug report): the
+    ``Sites.Selected`` escape hatch (``?site_url=`` on ``.../tree``) only
+    ever RESOLVED a site — the result lived in the wizard's own in-memory
+    ``spManualSites`` and vanished the moment the wizard was reopened,
+    forcing the admin to re-paste the same URL every time. These two routes
+    store the resolved site on the connection's own ``config.manual_sites``
+    so it survives a reopen, same idempotent-on-id contract as a confirmed
+    scope's collection."""
+
+    def _mock_graph(self, monkeypatch, handler):
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def full_handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-abc"})
+            return handler(request)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(full_handler), timeout=10)
+        )
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/X"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_delete_requires_admin(self, seeded_app):
+        r = seeded_app["client"].delete(
+            f"{BASE}/nope/manual-sites", params={"site_id": "x"}, headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/X"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_adding_a_site_by_url_persists_it_on_the_connection(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200, json={"id": "s-by-url", "displayName": "Project Hub", "webUrl": "https://contoso/x"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-persist")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json() == {"id": "s-by-url", "name": "Project Hub", "web_url": "https://contoso/x"}
+
+        # Persisted on the connection's own config, readable via the generic
+        # listing the wizard already fetches on every page load.
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == [
+            {"id": "s-by-url", "name": "Project Hub", "web_url": "https://contoso/x"}
+        ]
+
+    def test_adding_the_same_site_twice_is_idempotent(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "s-dup", "displayName": "Dup Site", "webUrl": "https://contoso/dup"})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-idempotent")
+
+        for _ in range(2):
+            r = c.post(
+                f"{BASE}/{conn_id}/manual-sites",
+                json={"site_url": "https://contoso.sharepoint.com/sites/Dup"},
+                headers=_auth(token),
+            )
+            assert r.status_code == 201, r.text
+
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == [{"id": "s-dup", "name": "Dup Site", "web_url": "https://contoso/dup"}]
+
+    def test_malformed_site_url_is_a_typed_422(self, seeded_app, monkeypatch):
+        self._mock_graph(monkeypatch, lambda request: httpx.Response(500))
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-bad-url")
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "http://contoso.sharepoint.com/sites/X"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_site_url"
+
+    def test_not_granted_site_is_a_typed_error(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": {"code": "accessDenied"}})
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-not-granted")
+        r = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/NotGranted"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_site_not_granted"
+
+    def test_removing_a_manual_site(self, seeded_app, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"id": "s-remove", "displayName": "Remove Me", "webUrl": "https://contoso/rm"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-remove")
+        c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/Remove"},
+            headers=_auth(token),
+        )
+
+        r = c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "s-remove"}, headers=_auth(token))
+        assert r.status_code == 204, r.text
+
+        listed = c.get("/api/admin/source-connections", headers=_auth(token))
+        row = next(row for row in listed.json() if row["id"] == conn_id)
+        assert row["config"]["manual_sites"] == []
+
+    def test_removing_unknown_manual_site_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-remove-404")
+        r = c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "nope"}, headers=_auth(token))
+        assert r.status_code == 404
+
+    def test_delete_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].delete(
+            f"{BASE}/does-not-exist/manual-sites", params={"site_id": "x"}, headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_add_and_remove_are_audited(self, seeded_app, monkeypatch):
+        from src.repositories import audit_repo
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"id": "s-audit", "displayName": "Audit Site", "webUrl": "https://contoso/audit"}
+            )
+
+        self._mock_graph(monkeypatch, handler)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="manual-site-audit")
+
+        c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/Audit"},
+            headers=_auth(token),
+        )
+        c.delete(f"{BASE}/{conn_id}/manual-sites", params={"site_id": "s-audit"}, headers=_auth(token))
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.manual_site_add", limit=10)
+        assert any(conn_id in (row.get("resource") or "") for row in rows)
+        rows, _ = audit_repo().query(action="sharepoint_connection.manual_site_remove", limit=10)
+        assert any(conn_id in (row.get("resource") or "") for row in rows)
 
 
 class TestSubfolderBrowsing:
@@ -1832,200 +2014,6 @@ class TestWebhookSecretRotation:
         assert first != second
 
 
-class TestCorpusMap:
-    def test_corpus_map_keys_are_producer_resolver_shaped(self, seeded_app):
-        """Keys must be what the producer's corpus_for() resolver matches
-        against crawler rows: the site display name, with the document-
-        library segment DROPPED for folder scopes — never the raw scope id
-        (which matches no row) and never display_path verbatim."""
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        conn_id = _create_connection(c, token, name="map-conn")
-
-        # Folder scope (item id): breadcrumb carries the library segment.
-        r1 = c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={
-                "source_scope_id": "01SO3DIHVJLOMDRMYCA5B37XU577X4KL57",
-                "display_path": "Site One/Documents/Project Kemp",
-            },
-            headers=_auth(token),
-        )
-        # Site scope (composite id): bare site name is the key.
-        r2 = c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={
-                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
-                "display_path": "Site Two",
-            },
-            headers=_auth(token),
-        )
-
-        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert mapping.status_code == 200
-        assert mapping.json() == {
-            "Site One/Project Kemp": r1.json()["collection_id"],
-            "Site Two": r2.json()["collection_id"],
-        }
-
-    def test_corpus_map_ambiguous_scopes_are_409(self, seeded_app):
-        """A site scope plus a drive scope of the same site collapse to the
-        same key with different collections — a typed 409, never a
-        best-guess map."""
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        conn_id = _create_connection(c, token, name="map-ambiguous-conn")
-
-        c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={
-                "source_scope_id": "host.sharepoint.com,f0259dd4,aaac162f",
-                "display_path": "Site One",
-            },
-            headers=_auth(token),
-        )
-        c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={
-                "source_scope_id": "b!1J0l8L5qG0WbfGdg0c3LXy8WrKo60DdB",
-                "display_path": "Site One / Documents",
-            },
-            headers=_auth(token),
-        )
-
-        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert mapping.status_code == 409, mapping.text
-        assert mapping.json()["detail"]["error"] == "corpus_map_ambiguous"
-
-    def test_corpus_map_empty_for_connection_with_no_scopes(self, seeded_app):
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        conn_id = _create_connection(c, token, name="empty-map-conn")
-        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert mapping.status_code == 200
-        assert mapping.json() == {}
-
-    def test_corpus_map_includes_active_zone_rows(self, seeded_app):
-        """2026-08-31 plan, Task 7: an active permission zone becomes an
-        ADDITIONAL, nested corpus-map key under its parent scope — the
-        external producer's resolver must match longest-prefix-first. A
-        dissolved zone is never mapped."""
-        c = seeded_app["client"]
-        token = seeded_app["admin_token"]
-        conn_id = _create_connection(c, token, name="map-zone-conn")
-
-        confirmed = c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:zone-map-1", "display_path": "Site/Documents/Team"},
-            headers=_auth(token),
-        )
-        assert confirmed.status_code == 201, confirmed.text
-        parent_collection_id = confirmed.json()["collection_id"]
-
-        from src.repositories import source_connections_repo
-
-        repo = source_connections_repo()
-        row = repo.get(conn_id)
-        zones = [
-            {
-                "zone_item_id": "zone-legal",
-                "parent_scope_id": "drive:zone-map-1",
-                "drive_id": "d1",
-                "name": "Legal",
-                "display_path": "Site/Documents/Team/Legal",
-                "rel_path": "Legal",
-                "collection_id": "col_zone_legal",
-                "detected_at": "2026-08-31T00:00:00+00:00",
-                "status": "active",
-            },
-            {
-                "zone_item_id": "zone-old",
-                "parent_scope_id": "drive:zone-map-1",
-                "drive_id": "d1",
-                "name": "Old",
-                "display_path": "Site/Documents/Team/Old",
-                "rel_path": "Old",
-                "collection_id": "col_zone_old",
-                "detected_at": "2026-08-30T00:00:00+00:00",
-                "status": "dissolved",
-            },
-        ]
-        repo.update(conn_id, config={**row["config"], "acl_zones": zones})
-
-        mapping = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert mapping.status_code == 200, mapping.text
-        assert mapping.json() == {
-            "Site/Team": parent_collection_id,
-            "Site/Team/Legal": "col_zone_legal",
-        }
-
-
-class TestProducerCorpusMapZonesUnit:
-    """Direct, DB-free coverage of ``producer_corpus_map(scopes, zones)``
-    itself (2026-08-31 plan, Task 7) — the HTTP-level equivalent lives in
-    ``TestCorpusMap.test_corpus_map_includes_active_zone_rows`` above."""
-
-    def test_zone_rows_produce_nested_keys(self):
-        from connectors.sharepoint.corpus_map import producer_corpus_map
-
-        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
-        zones = [
-            {
-                "zone_item_id": "Z",
-                "display_path": "Site/Documents/Team/Legal",
-                "collection_id": "col_z",
-                "status": "active",
-                "parent_scope_id": "root-1",
-            }
-        ]
-        m = producer_corpus_map(scopes, zones)
-        assert m["Site/Team"] == "col_p"
-        assert m["Site/Team/Legal"] == "col_z"
-
-    def test_dissolved_zone_not_mapped(self):
-        from connectors.sharepoint.corpus_map import producer_corpus_map
-
-        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
-        zones = [
-            {
-                "zone_item_id": "Z",
-                "display_path": "Site/Documents/Team/Legal",
-                "collection_id": "col_z",
-                "status": "dissolved",
-                "parent_scope_id": "root-1",
-            }
-        ]
-        m = producer_corpus_map(scopes, zones)
-        assert m == {"Site/Team": "col_p"}
-        assert "Site/Team/Legal" not in m
-
-    def test_no_zones_argument_is_backward_compatible(self):
-        """The old one-argument call shape (pre-Task-7 callers) keeps
-        working — ``zones`` defaults to empty."""
-        from connectors.sharepoint.corpus_map import producer_corpus_map
-
-        scopes = [{"source_scope_id": "root-1", "display_path": "Site", "collection_id": "col_p"}]
-        assert producer_corpus_map(scopes) == {"Site": "col_p"}
-
-    def test_colliding_zone_and_scope_keys_refuse_loudly(self):
-        """Same silent-loss class the existing scope/scope collision check
-        guards against, extended to a zone whose key collides with a
-        DIFFERENT collection than an existing scope's."""
-        from connectors.sharepoint.corpus_map import CorpusMapError, producer_corpus_map
-
-        scopes = [{"source_scope_id": "root-1", "display_path": "Site/Documents/Team", "collection_id": "col_p"}]
-        zones = [
-            {
-                "zone_item_id": "Z",
-                "display_path": "Site/Documents/Team",
-                "collection_id": "col_other",
-                "status": "active",
-            }
-        ]
-        with pytest.raises(CorpusMapError):
-            producer_corpus_map(scopes, zones)
-
-
 class TestChangesFeedFailsCleanOnDuckDB:
     """The observed-changes feed (`GET .../changes`) is PG-only —
     `corpus_file_events` has no DuckDB counterpart (A3 ratchet). The happy
@@ -2383,88 +2371,6 @@ class TestExtractionRunDue:
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["dispatched"] == []
-
-
-# ---------------------------------------------------------------------------
-# Producer-scoped callback credential (replaces forwarding the scheduler
-# secret — see app/worker/kinds.py::_agnes_producer_callback_env). A
-# ProducerPrincipal may call `.../scopes` and `.../corpus-map` for its OWN
-# `connection_id` claim; everything else on this router still requires
-# admin (or 403s off-surface before ever reaching this router at all —
-# see tests/test_producer_token.py for that gate's own coverage).
-# ---------------------------------------------------------------------------
-
-
-def _producer_token(connection_id: str, collection_ids=()) -> str:
-    from app.auth.producer_token import mint_producer_token
-
-    return mint_producer_token(connection_id=connection_id, collection_ids=list(collection_ids), ttl_seconds=3600)
-
-
-class TestProducerCallbackAccess:
-    def test_corpus_map_accepts_producer_for_its_own_connection(self, seeded_app):
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-map")
-        confirm = c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:a", "display_path": "A"},
-            headers=_auth(seeded_app["admin_token"]),
-        )
-        token = _producer_token(conn_id)
-        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert r.status_code == 200, r.text
-        # Keys are the producer resolver's crawler-row shape, not the raw
-        # source_scope_id — see connectors/sharepoint/corpus_map.py::_map_key.
-        assert r.json() == {"A": confirm.json()["collection_id"]}
-
-    def test_scopes_accepts_producer_for_its_own_connection(self, seeded_app):
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-scopes")
-        c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "drive:a", "display_path": "A"},
-            headers=_auth(seeded_app["admin_token"]),
-        )
-        token = _producer_token(conn_id)
-        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
-        assert r.status_code == 200, r.text
-        assert r.json()["items"][0]["source_scope_id"] == "drive:a"
-
-    def test_corpus_map_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-1")
-        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-2")
-        token = _producer_token(other_conn_id)
-        r = c.get(f"{BASE}/{conn_id}/corpus-map", headers=_auth(token))
-        assert r.status_code == 403
-
-    def test_scopes_rejects_producer_scoped_to_a_different_connection(self, seeded_app):
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-3")
-        other_conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-wrong-4")
-        token = _producer_token(other_conn_id)
-        r = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
-        assert r.status_code == 403
-
-    def test_scopes_post_still_403s_a_producer_token(self, seeded_app):
-        """POST .../scopes is not on the producer's fixed allowed surface —
-        refused before this router's own dependency ever runs."""
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-write")
-        token = _producer_token(conn_id)
-        r = c.post(
-            f"{BASE}/{conn_id}/scopes",
-            json={"source_scope_id": "x", "display_path": "x"},
-            headers=_auth(token),
-        )
-        assert r.status_code == 403
-
-    def test_tree_still_403s_a_producer_token(self, seeded_app):
-        c = seeded_app["client"]
-        conn_id = _create_connection(c, seeded_app["admin_token"], name="producer-conn-tree")
-        token = _producer_token(conn_id)
-        r = c.get(f"{BASE}/{conn_id}/tree", headers=_auth(token))
-        assert r.status_code == 403
 
 
 class TestExcludedSubtreeAdvisory:

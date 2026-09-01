@@ -2780,6 +2780,34 @@ class TestSharePointScopesSurviveOrdinaryEdits:
         assert r.status_code == 200, r.text
         assert r.json()["config"].get("webhook_secret") == secret
 
+    def test_editing_config_without_manual_sites_preserves_it(self, seeded_app):
+        """``config.manual_sites`` (the "add a site by URL" persistence fix,
+        ``app/api/admin_sharepoint.py::add_manual_site``/``remove_manual_
+        site``) is the FOURTH instance of this same shape of server-written
+        bookkeeping — never typed by an admin, never rendered by the generic
+        editor's form. An ordinary edit through this endpoint must not
+        silently drop a site the admin added by URL, forcing them to
+        re-paste it."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-manual-sites-preserve")
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["manual_sites"] = [{"id": "s1", "name": "Project Hub", "web_url": "https://contoso/x"}]
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("manual_sites") == [
+            {"id": "s1", "name": "Project Hub", "web_url": "https://contoso/x"}
+        ]
+
     def test_editing_config_without_acl_sync_last_run_preserves_it(self, seeded_app):
         """``config.acl_sync_last_run``/``config.acl_sync_last_success_at``
         (2026-08-30 plan, Task 4/5 — ``connectors/sharepoint/acl_sync.py::
