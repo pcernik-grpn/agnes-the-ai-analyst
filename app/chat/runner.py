@@ -1155,8 +1155,14 @@ def _delegation_mcp_server():
     return create_sdk_mcp_server("agnes-delegation", tools=[_delegate_to_agent])
 
 
-def _register_workspace_marketplace(workdir: Path) -> None:
+def _register_workspace_marketplace(workdir: Path) -> list[str]:
     """Install the workspace's shipped marketplace plugins into this project.
+
+    Returns the manifest names of the caller's stack plugins (``[]`` when
+    there is no marketplace to deliver, no ``claude`` on PATH, or the
+    manifest could not be registered/read) — the boot sequence hands this to
+    :func:`_warmup_skill_dependencies` right after, so it knows whether there
+    is anything to look for without re-reading the manifest itself.
 
     The server wrote the caller's RBAC-filtered marketplace as a plain directory
     inside the workspace (``app/chat/marketplace_payload.py``); Claude Code
@@ -1193,11 +1199,11 @@ def _register_workspace_marketplace(workdir: Path) -> None:
     manifest = tree / ".claude-plugin" / "marketplace.json"
     if not manifest.is_file():
         # No stack plugins for this user, or the operator turned delivery off.
-        return
+        return []
     claude = which("claude")
     if claude is None:
         print("marketplace: no `claude` on PATH; skipping plugin registration", file=sys.stderr, flush=True)
-        return
+        return []
 
     def _run(args: list[str], label: str) -> bool:
         try:
@@ -1219,14 +1225,116 @@ def _register_workspace_marketplace(workdir: Path) -> None:
         return True
 
     if not _run(["plugin", "marketplace", "add", str(tree)], "marketplace add"):
-        return
+        return []
     try:
         names = [p["name"] for p in json.loads(manifest.read_text(encoding="utf-8")).get("plugins", [])]
     except (OSError, ValueError, TypeError):
         print("marketplace: shipped manifest is unreadable; skipping installs", file=sys.stderr, flush=True)
-        return
+        return []
     for name in names:
         _run(["plugin", "install", f"{name}@{MARKETPLACE_NAME}", "--scope", "user"], f"install {name}")
+    return names
+
+
+def _skill_requirement_files(workdir: Path, enabled_names: list[str]) -> list[Path]:
+    """``requirements.txt`` files shipped by the caller's enabled marketplace
+    skills, found on disk in the workspace — no subprocess, no network, so
+    this is pure and unit-tests with nothing but a directory tree (#1977).
+
+    ``enabled_names`` is whatever :func:`_register_workspace_marketplace` just
+    installed (``[]`` means no stack plugins at all): an empty list is the
+    common case and short-circuits before touching disk. Beyond that gate the
+    names themselves are not cross-checked against individual plugin
+    directories — the marketplace tree at
+    ``app.chat.marketplace_payload.MARKETPLACE_TREE_SUBDIR`` is written FOR
+    this caller only (:func:`app.chat.marketplace_payload.export_marketplace_tree`
+    replaces it wholesale on every convergence), so every plugin directory
+    already on disk there is, by construction, one this caller is enabled
+    for.
+
+    A skill keeps its whole directory in that tree — the same
+    "project-scope materialization... skills keep their directory" property
+    ``app.chat.marketplace_payload.materialize_plugin_components`` documents
+    for the flattened (kai-agent) shape — so a ``requirements.txt`` sitting
+    next to a plugin's ``SKILL.md`` (at the plugin root for a single-skill
+    plugin, or under ``skills/<name>/`` for a multi-skill one) is exactly
+    where a recursive search finds it.
+    """
+    if not enabled_names:
+        return []
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_dir = workdir / MARKETPLACE_TREE_SUBDIR / "plugins"
+    if not plugins_dir.is_dir():
+        return []
+    return sorted(plugins_dir.rglob("requirements.txt"))
+
+
+async def _run_dependency_warmup(req_files: list[Path]) -> None:
+    """Detached ``pip install -r`` for every discovered skill requirements
+    file, run as ONE call so the packages a skill needs are ready before its
+    first tool call rather than mid-turn in front of the user (#1977).
+
+    Awaited only by the fire-and-forget task :func:`_warmup_skill_dependencies`
+    schedules via ``_spawn`` — never by ``amain()`` directly — so a slow
+    resolve costs nothing at boot. Failure of any kind (pip missing, a
+    package that cannot be found, no route to PyPI) is swallowed to a stderr
+    line: never surfaced to the user, never turned into a spawn failure. A
+    skill whose dependency failed to warm up simply fails its own tool call
+    the same way it always would have, without this step existing.
+    """
+    args = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--quiet",
+        "--break-system-packages",
+    ]
+    for f in req_files:
+        args += ["-r", str(f)]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            # Isolated from fd 0 for the same reason as every other in-sandbox
+            # subprocess here (_install_agnes_cli, _register_workspace_marketplace):
+            # this can run concurrently with the stdin reader once it attaches.
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc != 0:
+            print(f"skill deps warm-up: pip exited {rc} for {len(req_files)} file(s)", file=sys.stderr, flush=True)
+    except Exception as exc:  # noqa: BLE001 — best-effort; must never crash the runner
+        print(f"skill deps warm-up failed: {exc}", file=sys.stderr, flush=True)
+
+
+def _warmup_skill_dependencies(workdir: Path, enabled_names: list[str]) -> None:
+    """Kick off the detached dependency warm-up, or skip it, right after the
+    workspace's marketplace plugins are installed (#1977).
+
+    Docker-provider-only by construction: this only ever runs from inside
+    ``amain()``'s real-spawn branch, which is code that exists only because a
+    docker sandbox runs this file as its entrypoint — a kai-agent session
+    never executes ``runner.py`` at all.
+
+    Two independent reasons to do nothing, checked cheapest-first:
+    ``chat.docker_egress_mode: none`` (forwarded as ``AGNES_DOCKER_EGRESS_MODE``)
+    means there is no route to PyPI at all, so trying is pure noise — one
+    debug line and return, no filesystem walk. Otherwise, no discovered
+    ``requirements.txt`` means nothing to warm up, which is the common case
+    for a stack with no dependency-bearing skills and must cost ~nothing: no
+    log line, no task spawned.
+    """
+    egress_mode = os.environ.get("AGNES_DOCKER_EGRESS_MODE", "none").strip().lower()
+    if egress_mode == "none":
+        print("skill deps warm-up: docker_egress_mode=none, no route to PyPI — skipping", file=sys.stderr, flush=True)
+        return
+    req_files = _skill_requirement_files(workdir, enabled_names)
+    if not req_files:
+        return
+    _spawn(_run_dependency_warmup(req_files))
 
 
 async def _dispatch_frame(frame: dict, queue: "asyncio.Queue[dict]") -> None:
@@ -2243,7 +2351,11 @@ async def amain() -> None:
         # sandbox deliberately holds no PAT, and the relay routes no marketplace
         # prefix), so it 401'd behind a `check=False` subprocess (#1552). After
         # the CLI install; before the reader attaches, for the same fd-0 reason.
-        _register_workspace_marketplace(workdir)
+        installed_plugins = _register_workspace_marketplace(workdir)
+        # Best-effort, detached warm-up of any dependency a just-installed
+        # skill declares (#1977) — scheduled, never awaited, so a slow or
+        # failed pip resolve cannot delay runner_ready below.
+        _warmup_skill_dependencies(workdir, installed_plugins)
 
     _emit({"type": "runner_ready"})
     queue = await _stdin_lines()

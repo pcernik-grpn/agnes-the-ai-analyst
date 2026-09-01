@@ -1070,6 +1070,15 @@ _EXEMPT: dict[str, str] = {
     "/api/collections/{collection_id}/files/{file_id}/raw": _LIBRARY_RAW_REASON,
     "/api/studio/memory-mining/consent": _MEMORY_MINING_REASON,
     "/api/admin/memory-mining/run": _MEMORY_MINING_REASON,
+    "/api/memory/admin/bulk-reject": (
+        "admin governance action (issue #1957) — mirrors the grandfathered "
+        "/api/memory/admin/bulk-update, which carries no CLI/MCP surface "
+        "either. The Review Queue's per-item reject already has a CLI path "
+        "(`agnes admin memory reject`, via the grandfathered /admin/batch); "
+        "this endpoint only tightens the audit/scoping contract for the web "
+        "review queue's multi-select and adds no capability an analyst or "
+        "agent would invoke directly."
+    ),
     "/api/studio/suggestions": _AUTHORING_SUGGESTIONS_REASON,
     "/api/studio/suggestions/mine": _AUTHORING_SUGGESTIONS_REASON,
     "/api/admin/authoring-suggestions": _AUTHORING_SUGGESTIONS_REASON,

@@ -2294,6 +2294,16 @@ KNOWN_UNTESTED = {
     "GET /api/jobs/{job_id}",
     "GET /api/collections/{collection_id}",
     "DELETE /api/collections/{collection_id}",
+    # Collection metadata edit — needs a real collection_id AND a JSON body
+    # whose meaning depends on which keys are PRESENT (`{"description": null}`
+    # clears; an omitted key is left alone), so a parameter-free sweep can say
+    # nothing about it. Adds no migration, and `file_corpora.update` is
+    # parity-covered by tests/db_pg/test_file_corpora_contract.py. Behaviour
+    # covered in tests/test_api_collections.py::TestUpdateCollection — the
+    # owner-or-admin gate (a mere grant-holder gets 403), presence-based
+    # clearing, slug normalisation + 409 collision, the source-managed 409,
+    # nothing-to-update / nameless 400s, and the 404/401 paths.
+    "PATCH /api/collections/{collection_id}",
     "POST /api/collections/{collection_id}/files",
     "GET /api/collections/{collection_id}/files",
     "DELETE /api/collections/{collection_id}/files/{file_id}",
@@ -3053,6 +3063,7 @@ KNOWN_UNTESTED = {
     "POST /api/memory-domain-suggestions",
     "POST /api/memory/admin/approve",
     "POST /api/memory/admin/batch",
+    "POST /api/memory/admin/bulk-reject",
     "POST /api/memory/admin/bulk-update",
     "POST /api/memory/admin/contradictions",
     "POST /api/memory/admin/contradictions/{contradiction_id}/resolve",

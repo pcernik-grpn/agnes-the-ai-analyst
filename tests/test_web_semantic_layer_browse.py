@@ -1332,6 +1332,54 @@ class TestFlatProjectionTabsFold:
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
         assert 'id="glossary-list"' in body
 
+    def test_all_glossary_tab_shows_a_source_filter_mirroring_the_metrics_ones(self, seeded_app):
+        """#1956 item 1: the metrics tab offers an "All / <bucket>" sidebar
+        filter (`sl-cat-nav`); the glossary tab had only the search box.
+        Glossary terms carry no per-model attribution the way a
+        document-projected metric's ``category`` does (see the router), so
+        this mirrors the SAME component bucketed by the term's own
+        ``source`` instead — real, stored provenance, not an invented one.
+        """
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+        glossary_repo().create(id="g2", term="MRR", definition="Monthly recurring revenue.", source="ossie_git")
+        glossary_repo().create(id="g3", term="NRR", definition="Net revenue retention.", source="ossie_git")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        assert 'class="sl-cat-nav" aria-label="Glossary sources"' in body
+
+        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
+        assert 'data-cat="__all__"' in nav
+        assert ">All<" in nav
+
+        # Every term counts under "All"...
+        assert ">3<" in nav.split('data-cat="__all__"', 1)[1].split("</button>", 1)[0]
+
+        # ...and each source is its OWN, narrower bucket — the property that
+        # makes clicking one actually narrow the list rather than just
+        # relabeling the same total.
+        git_bucket = nav.split('data-cat="ossie_git"', 1)[1].split("</button>", 1)[0]
+        assert ">Git<" in git_bucket
+        assert ">2<" in git_bucket
+        manual_bucket = nav.split('data-cat="manual"', 1)[1].split("</button>", 1)[0]
+        assert ">Native<" in manual_bucket
+        assert ">1<" in manual_bucket
+
+    def test_all_glossary_tab_source_filter_only_covers_present_sources(self, seeded_app):
+        """No bucket renders for a source no stored term carries — an empty
+        bucket a click could select but that would always narrow to nothing
+        is worse than no bucket at all."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
+        assert 'data-cat="manual"' in nav
+        assert 'data-cat="ossie_git"' not in nav
+        assert 'data-cat="keboola_metastore"' not in nav
+
     def test_the_metrics_tab_consumes_the_deep_links_q(self, seeded_app):
         _seed_metric("arr")
         body = self._get(seeded_app, "/semantic-layer?tab=all_metrics&q=arr").text
@@ -1403,6 +1451,46 @@ class TestLibrarySemanticSection:
         assert 'data-lib-sec="semantic_model"' in body
         assert "Semantic models" in body
         assert 'href="/semantic-layer/retail"' in body
+
+    def test_imported_model_with_a_blank_row_description_falls_back_to_the_document(self, seeded_app):
+        """#1955: a row whose own ``description`` column is blank (every
+        model a sync wrote before the import-time projection existed, or one
+        written by a sync path outside it) used to render with no subtitle
+        even though its document carries a description. The Library row
+        falls back to the document's own model-level description."""
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "kb_retail",
+                    "description": "Imported from Keboola: retail domain.",
+                    "datasets": [{"name": "orders", "fields": []}],
+                }
+            ]
+        }
+        _seed_document("kb_retail", doc, source="keboola_metastore")
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert "Imported from Keboola: retail domain." in body
+
+    def test_a_rows_own_description_is_not_overridden_by_the_document(self, seeded_app):
+        """The row's own ``description`` column wins when both exist — the
+        fallback is only for a blank column, never a silent override of a
+        value the row already carries."""
+        from src.repositories import semantic_model_repo
+
+        row = _seed_model()  # stored description: "Retail domain: orders and customers."
+        semantic_model_repo().update_document(
+            row["id"],
+            name=row["name"],
+            description="Hand-edited row description.",
+            document=row["document"],
+            document_json=row["document_json"],
+            spec_version=row["spec_version"],
+            content_hash=row["content_hash"],
+            validated_at=None,
+        )
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert "Hand-edited row description." in body
+        assert "Retail domain: orders and customers." not in body
 
     def test_the_footer_aside_is_gone(self, seeded_app):
         _seed_metric()

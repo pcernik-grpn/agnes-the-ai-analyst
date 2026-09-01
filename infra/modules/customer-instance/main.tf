@@ -700,18 +700,6 @@ resource "google_compute_instance" "vm" {
       )
       error_message = "kai_agent_enabled=true on instance ${each.value.name} requires kai_agent_image, kai_agent_jwt_secret and kai_agent_e2b_key_secret on the module, plus kai_agent_env carrying HOST_AGENT_IDENTITY and CLOUD_LLM_PROVIDER (and the ANTHROPIC_UPSTREAM_URL/ANTHROPIC_UPSTREAM_API_KEY pair when the provider is anthropic) — the engine's env validation refuses to boot without them."
     }
-
-    # Same plan-time catch for the extraction lane: without a worker image
-    # the overlay would pin the `extraction-worker` service to an empty
-    # `image:` and `docker compose up` fails the whole boot. The image is
-    # the one thing the module cannot default — the extraction-extra variant
-    # only exists in the operator's own registry (the public app image is
-    # built without it; see docker-compose.prod.yml's extraction-worker
-    # comment).
-    precondition {
-      condition     = !each.value.extraction_worker_enabled || var.extraction_worker_image != ""
-      error_message = "extraction_worker_enabled=true on instance ${each.value.name} requires extraction_worker_image on the module — a worker image built with the `extraction` extra (--build-arg EXTRA_EXTRAS=,extraction); the plain app image has no document converter and every corpus-extraction job would refuse."
-    }
   }
 
   # Ensure VM SA has read access to required secrets BEFORE the VM boots — otherwise
