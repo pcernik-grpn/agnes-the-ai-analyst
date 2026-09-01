@@ -138,8 +138,8 @@ instance:
   #                                  # AGNES_HOME_SHOW_STATUS_FRAME.
   # custom_scripts:                  # Operator-injected HTML/JS blocks rendered into every
   #                                  # page that extends base.html. Use for feedback widgets
-  #                                  # (Marker.io), analytics (GTM, PostHog), error capture
-  #                                  # (Sentry), etc. Each entry needs name + enabled +
+  #                                  # analytics tags, error-capture snippets, etc. Each
+  #                                  # entry needs name + enabled +
   #                                  # placement + html. Admin-only; rendered with `| safe`.
   #                                  # Review the widget's privacy posture before enabling —
   #                                  # most third-party widgets capture screenshots, console

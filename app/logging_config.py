@@ -196,6 +196,22 @@ _RESERVED_RECORD_ATTRS = frozenset(
 )
 
 
+def _deployment_env() -> str:
+    """Which deployment this line came from, for a fleet-wide log view.
+
+    Read per record rather than cached: the operator scripts rewrite
+    ``/opt/agnes/.env`` between container recreates, and a value frozen at
+    import would keep labelling a rolled-forward instance with the old one.
+    Always a string — a filter must not have to distinguish "unlabelled"
+    from "field absent".
+    """
+    for var in ("AGNES_DEPLOYMENT_ENV", "RELEASE_CHANNEL"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return "unknown"
+
+
 class _JSONFormatter(logging.Formatter):
     """One JSON object per line, named the way a log collector reads them.
 
@@ -217,6 +233,7 @@ class _JSONFormatter(logging.Formatter):
             "severity": record.levelname,
             "logger": record.name,
             "service": self.service,
+            "env": _deployment_env(),
             "replica": _replica_id_safe(),
             "message": record.getMessage(),
         }

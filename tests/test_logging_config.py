@@ -314,6 +314,33 @@ def test_json_formatter_drops_unserializable_extras_without_losing_the_line():
     assert parsed["thing"] == "<opaque>"
 
 
+def test_json_formatter_tags_the_deployment_environment(monkeypatch):
+    """One dashboard serves the whole fleet only if every line says where it
+    came from — otherwise a laptop's DEBUG noise sits next to production."""
+    monkeypatch.setenv("AGNES_DEPLOYMENT_ENV", "production")
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "production"
+
+
+def test_the_deployment_environment_falls_back_to_the_release_channel(monkeypatch):
+    monkeypatch.delenv("AGNES_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.setenv("RELEASE_CHANNEL", "dev")
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "dev"
+
+
+def test_an_unlabelled_deployment_says_so_rather_than_omitting_the_field(monkeypatch):
+    """A missing key and an unknown environment must not look the same to a
+    filter — `env != "production"` has to keep matching either way."""
+    monkeypatch.delenv("AGNES_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.delenv("RELEASE_CHANNEL", raising=False)
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "unknown"
+
+
 def test_setup_logging_silences_uvicorn_access_in_prod():
     setup_logging("app")
     assert logging.getLogger("uvicorn.access").level == logging.WARNING
