@@ -1278,6 +1278,39 @@ def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
     return run_subtree_sweep(payload)
 
 
+#: Kinds whose payload gets this claimed job's own ``id`` merged in before
+#: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
+#: per-kind flag on ``JobKind``: only ``corpus-extraction`` has anywhere to
+#: put it today (``extraction_runs.job_id``), and a second consumer can add
+#: itself here without a registry shape change.
+_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction"})
+
+
+def _payload_for_handler(job: dict) -> dict:
+    """The payload a handler runs with — ``job["payload_json"]`` unchanged,
+    except for :data:`_INJECT_JOB_ID_KINDS`, which get this claimed job's own
+    ``id`` merged in as ``job_id`` when the payload does not already carry
+    one.
+
+    ``kind.handler`` (the ``JobKind`` contract, ``app/worker/registry.py``)
+    only ever receives the payload dict — never the job row — so this is the
+    one seam that can hand a handler its own job's id without widening that
+    contract for every kind. ``connectors.sharepoint.crawler.run_builtin_
+    crawl`` records it on the ``extraction_runs`` row it opens
+    (``job_id``), which is what makes a run traceable back to the job that
+    spawned it; before this it was always null, because nothing upstream of
+    here ever supplied it (see that function's own docstring).
+
+    Never mutates ``job["payload_json"]`` in place: a copy, so a payload
+    that started with no ``job_id`` does not gain one behind the caller's
+    back if it is inspected again after dispatch.
+    """
+    payload = job.get("payload_json") or {}
+    if job.get("kind") in _INJECT_JOB_ID_KINDS and isinstance(payload, dict) and not payload.get("job_id"):
+        return {**payload, "job_id": job.get("id")}
+    return payload
+
+
 def dispatch_job(job: dict) -> dict | None:
     """THE single dispatch-level entry point for running one claimed job's
     handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
@@ -1291,7 +1324,10 @@ def dispatch_job(job: dict) -> dict | None:
     ``asyncio.to_thread``) INSTEAD OF ``kind.handler(job["payload_json"])``
     directly — the one place in the whole worker that actually executes a
     claimed job, so this is also the one place audit coverage needs to
-    live (one dispatch-level wrapper, not one per kind).
+    live (one dispatch-level wrapper, not one per kind), and (see
+    :func:`_payload_for_handler`) the one place a handler's payload can be
+    enriched with the job's own id without widening ``JobKind.handler``'s
+    contract for every kind.
 
     Runs outside any HTTP request — there is no ASGI scope for
     ``src.audit_context``'s autofill to read, so ``duration_ms`` is
@@ -1302,7 +1338,7 @@ def dispatch_job(job: dict) -> dict | None:
     kind = JOB_KINDS[job["kind"]]
     t0 = time.monotonic()
     try:
-        result = kind.handler(job["payload_json"])
+        result = kind.handler(_payload_for_handler(job))
     except Exception as exc:
         log_safe(
             user_id=None,

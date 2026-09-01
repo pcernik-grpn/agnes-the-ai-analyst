@@ -150,10 +150,13 @@ def _age_s(value: Any, *, now: Optional[datetime] = None) -> Optional[float]:
 def _job_status(job_id: Optional[str]) -> Optional[str]:
     """This run's job status, when the run knows its job id.
 
-    Best-effort by construction: nothing supplies ``job_id`` today (the
-    worker hands the crawl the job's payload, not its id), and a lookup
-    failure is a missing signal, not an error — the checkpoint-age fallback
-    below still answers.
+    Best-effort by construction: a run triggered outside the worker (a test,
+    a manual payload) may still have no ``job_id`` — the worker's own
+    dispatcher merges the claimed job's id in
+    (``app/worker/kinds.py::_payload_for_handler``), but nothing forces every
+    caller of ``run_builtin_crawl`` through it — and a lookup failure is a
+    missing signal, not an error: the checkpoint-age fallback below still
+    answers.
     """
     if not job_id:
         return None
@@ -628,7 +631,9 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
     pointer at an executable at worst.
     """
     return [
-        _config_row("Enabled (whole connector)", ("sharepoint", "enabled"), env_var="AGNES_SHAREPOINT_ENABLED", default=False),
+        _config_row(
+            "Enabled (whole connector)", ("sharepoint", "enabled"), env_var="AGNES_SHAREPOINT_ENABLED", default=False
+        ),
         _config_row(
             "Schedule",
             ("extraction", "schedule"),

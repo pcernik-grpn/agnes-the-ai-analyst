@@ -450,6 +450,42 @@ class TestResume:
         assert report["errors"] == 1
         assert report["new"] == 0
         assert _state(crawl_env)["ctags"] == {}
+        # The itemized counterpart: a path, a reason, and the exception's
+        # own message — the difference between "1 error" and knowing why.
+        detail = report["errors_detail"]
+        assert detail["total"] == 1
+        assert detail["listed"] == 1
+        assert detail["truncated"] is False
+        row = detail["items"][0]
+        assert row["reason"] == "ingest_failed"
+        assert row["path"].endswith("brief.docx")
+        assert "ingest exploded" in row["detail"]
+        # RuntimeError carries no HTTP status — never invented.
+        assert row["status_code"] is None
+
+    def test_ingest_failure_logs_status_code_and_message(self, crawl_env, monkeypatch, caplog):
+        """Never just the exception's TYPE name — a status code and a
+        message, which `SharePointGraphError`'s own docstring documents as
+        safe to log (Entra/Graph error bodies, never a credential)."""
+
+        class FailingIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                raise RuntimeError("ingest exploded")
+
+        monkeypatch.setattr(crawler, "_Ingestor", FailingIngestor)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        with caplog.at_level("WARNING", logger="connectors.sharepoint.crawler"):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        messages = [r.message for r in caplog.records if "ingest failed" in r.message]
+        assert messages
+        assert "ingest exploded" in messages[0]
 
 
 # --------------------------------------------------------------------------
@@ -560,6 +596,31 @@ class TestConversion:
         assert report["convert_failed"] == 2
         assert report["new"] == 0
         assert FakeIngestor.instances[-1].ingested == []
+        detail = report["errors_detail"]
+        assert detail["total"] == 2
+        assert detail["listed"] == 2
+        assert {row["reason"] for row in detail["items"]} == {"convert_failed"}
+        assert all("markitdown said no" in row["detail"] for row in detail["items"])
+        assert all(row["status_code"] is None for row in detail["items"])
+
+    def test_an_empty_conversion_leaves_no_error_detail(self, crawl_env, monkeypatch):
+        """`convert_empty` is a benign skip (counted in `convert_failed`,
+        exactly as before), never an `errors` count and never itemized in
+        `errors_detail` — it never reached `errors` before this change and
+        must not gain a row just because a neighbouring reason did."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["errors"] == 0
+        assert report["errors_detail"] == {"items": [], "listed": 0, "total": 0, "truncated": False}
 
     def test_an_empty_conversion_is_not_ingested(self, crawl_env, monkeypatch):
         monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
@@ -789,6 +850,43 @@ class TestTransport:
             _run(_connection([_drive_scope()]), monkeypatch)
 
         assert not any("evil.example" in url for url in seen)
+
+    def test_a_persistent_download_failure_is_a_per_file_fault_not_a_crash(self, crawl_env, monkeypatch, caplog):
+        """A drive listing that succeeds but whose ONE file's `/content` GET
+        never comes back clean is counted, itemized with the upstream status
+        code, and logged with both — never a bare exception TYPE name, and
+        never fatal to the rest of the run."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(500, json={"error": {"message": "internal"}})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        with caplog.at_level("WARNING", logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 1
+        assert report["new"] == 0
+        assert FakeIngestor.instances[-1].ingested == []
+
+        detail = report["errors_detail"]
+        assert detail["total"] == 1
+        assert detail["listed"] == 1
+        row = detail["items"][0]
+        assert row["reason"] == "download_failed"
+        assert row["status_code"] == 500
+        assert row["path"].endswith("brief.docx")
+        assert row["detail"]
+
+        messages = [r.message for r in caplog.records if "download failed" in r.message]
+        assert messages
+        assert "500" in messages[0]
 
 
 # --------------------------------------------------------------------------
@@ -1654,6 +1752,64 @@ class TestRunRecording:
         assert crawler._record_status_for(KeyboardInterrupt()) == "interrupted"
         assert crawler._record_status_for(SystemExit()) == "interrupted"
 
+    def test_a_run_that_ingests_nothing_while_erroring_on_everything_is_recorded_failed(self, crawl_env, monkeypatch):
+        """The production incident this guards: a run that recorded per-file
+        errors on (almost) every item and landed 0 documents must not read
+        as `done` — the crawl itself never raised, so nothing else would
+        catch this."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(500, json={})
+            items = [_file_item(f"i{i}", ctag=f"c{i}") for i in range(6)]
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 6
+        assert report["new"] == 0
+        assert report["changed"] == 0
+        assert len(runs.finished) == 1
+        final = runs.finished[0]
+        assert final["status"] == "failed"
+        assert "6" in final["error"]
+        assert "0" in final["error"]
+
+    def test_a_lone_stray_error_amid_an_otherwise_clean_pass_still_reports_done(self, crawl_env, monkeypatch):
+        """Below the threshold, one transient per-file fault must not flip
+        an otherwise-productive run's status — only a run that accomplished
+        NOTHING earns the harsher word."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "/items/broken/" in url:
+                    return httpx.Response(500, json={})
+                return _content_response()
+            items = [_file_item("broken", ctag="c1"), _file_item("ok", name="ok.txt", ctag="c2")]
+            return httpx.Response(200, json={"value": items, "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        async def _sleep(seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(crawler, "_sleep", _sleep)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 1
+        assert report["new"] == 1
+        assert runs.finished[0]["status"] == "done"
+        assert runs.finished[0]["error"] is None
+
     def test_oversize_skips_are_listed_with_an_honest_total(self, crawl_env, monkeypatch):
         """A document over the cap is never downloaded and never appears in
         the collection — the run row is the only place it exists."""
@@ -1765,6 +1921,26 @@ class TestDetectorUsageRecording:
         assert usage["output_tokens"] == 90
         assert usage["calls"] == 2
         assert usage["model"] == "claude-haiku-4-5"
+
+    def test_detector_usage_prices_the_spend_through_the_shared_pricing_table(self):
+        """Priced via `src.llm_pricing.cost_usd` — the same single source of
+        truth `facts_extraction._Report.render` already uses for its own
+        stage — never a second, ad hoc price table."""
+        from src.llm_pricing import cost_usd
+
+        class FakeLLM:
+            model = "claude-haiku-4-5"
+            total_usage = {"input_tokens": 1200, "output_tokens": 90, "calls": 2}
+
+        def detect(text):
+            return []
+
+        detect.llm = FakeLLM()
+        usage = crawler._detector_usage(detect)
+        assert usage["estimated_cost_usd"] == round(
+            cost_usd(model="claude-haiku-4-5", input_tokens=1200, output_tokens=90), 4
+        )
+        assert usage["estimated_cost_usd"] > 0
 
     def test_no_llm_tier_reports_empty_not_zero_dollars(self):
         assert crawler._detector_usage(None) == {}
@@ -2078,6 +2254,38 @@ class TestParallelCounters:
         stats = crawler.CrawlStats()
         with pytest.raises(AttributeError):
             stats.add(nwe=1)
+
+    def test_note_error_is_bounded_with_an_honest_total(self):
+        """The in-memory sample and the persisted envelope agree: past the
+        cap, `errors_detail` says exactly how many it is NOT showing —
+        mirroring `extraction_runs.skips`' own `{items, total, listed,
+        truncated}` contract, capped at the same 200."""
+        stats = crawler.CrawlStats()
+        for i in range(250):
+            stats.add(errors=1)
+            stats.note_error(f"Reports/f{i}.docx", "download_failed", detail="HTTP 500", status_code=500)
+
+        report = stats.report(max_file_mb=50)
+        detail = report["errors_detail"]
+        assert detail["listed"] == 200
+        assert detail["total"] == 250
+        assert detail["truncated"] is True
+        assert len(detail["items"]) == 200
+        assert detail["items"][0]["reason"] == "download_failed"
+        assert detail["items"][0]["status_code"] == 500
+
+    def test_note_error_never_used_for_deliberate_skip_reasons(self):
+        """`errors_detail` is reserved for the reasons that also bump
+        `errors` (download/ingest/convert failures) — a run with zero
+        errors reports the same empty, honest envelope oversize skips do
+        with no oversize files."""
+        stats = crawler.CrawlStats()
+        assert stats.report(max_file_mb=50)["errors_detail"] == {
+            "items": [],
+            "listed": 0,
+            "total": 0,
+            "truncated": False,
+        }
 
 
 class TestParallelOrdering:

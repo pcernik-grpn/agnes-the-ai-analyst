@@ -7193,8 +7193,10 @@ function _extRunLine(run) {
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
   if (run.bytes_downloaded_human) bits.push(`${run.bytes_downloaded_human} downloaded`);
   // NER token accounting (usage or the report's ner_usage): a token COUNT is a
-  // fact; the drawer says "not priced" rather than inventing a dollar figure
-  // until operator-configured pricing exists. Absence means "no tokens spent".
+  // fact, and `estimated_cost_usd` (src.llm_pricing.cost_usd, when the stage
+  // priced its own spend) is shown next to it. A stage that has not been
+  // priced yet says "not priced" rather than inventing a dollar figure.
+  // Absence of the whole block means "no tokens spent".
   // `usage` is keyed by stage ({ner: {...}, facts: {...}}); a flat token
   // dict (the pre-stage-keyed shape) and `run.ner_usage` stay readable so
   // rows recorded before the contract change keep rendering their spend.
@@ -7205,7 +7207,8 @@ function _extRunLine(run) {
     for (const [stage, u] of Object.entries(stages)) {
       if (u && (u.input_tokens || u.output_tokens)) {
         const tok = (u.input_tokens || 0) + (u.output_tokens || 0);
-        bits.push(`${_extNum(tok)} ${stageLabels[stage] || stage} tokens · not priced`);
+        const priceText = typeof u.estimated_cost_usd === "number" ? `$${u.estimated_cost_usd.toFixed(4)}` : "not priced";
+        bits.push(`${_extNum(tok)} ${stageLabels[stage] || stage} tokens · ${priceText}`);
       }
     }
   }

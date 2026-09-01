@@ -149,6 +149,11 @@ _THROTTLE_BURST_429S = 2
 _THROTTLE_BURST_WAIT_S = 30.0
 #: Largest skipped files kept in the report.
 _OVERSIZE_SAMPLE = 20
+#: Per-file errors kept ON THE STATS OBJECT while the crawl runs. Matches
+#: ``extraction_runs_pg._SKIPS_CAP`` (200) — the value the persisted row
+#: itself is capped to at ``finish()`` — so the in-memory sample and the
+#: stored one never disagree about how many are honestly kept.
+_ERROR_SAMPLE = 200
 #: Delta page size asked of Graph — also the state-checkpoint granularity.
 _DELTA_PAGE_SIZE = 200
 #: Streaming download chunk.
@@ -463,6 +468,37 @@ def _record_status_for(exc: BaseException) -> str:
     return "failed"
 
 
+#: A run that finished WITHOUT raising still owes the operator an honest
+#: outcome word: fewer than this many per-file errors is a stray blip — a
+#: run that otherwise found nothing new/changed to do (a healthy, idle
+#: steady-state pass) must not have its status flipped by one transient
+#: fault. At or above it, with zero documents actually landed, the run did
+#: not accomplish anything and calling it `"done"` — the production incident
+#: this guards against recorded 1263 per-file errors and 0 ingested
+#: documents, reported as `done` — is the exact unverified-renders-healthy
+#: failure this whole recorder exists to avoid.
+_UNPRODUCTIVE_RUN_MIN_ERRORS = 5
+
+
+def _ingested_nothing_despite_errors(stats: "CrawlStats") -> bool:
+    """True for a run that completed (no exception) but accomplished
+    nothing: at least :data:`_UNPRODUCTIVE_RUN_MIN_ERRORS` per-file errors
+    and zero new/changed documents.
+
+    Deliberately narrow. `errors` only counts a fault the crawl could not
+    recover from (download/convert/ingest failure, or a whole scope it could
+    not read) — the routine skip reasons (`permission_skips`,
+    `excluded_subtree_skips`, oversize, `anonymize_failed`) are deliberate
+    decisions, not failures, and never count here, so a normal run that
+    politely skipped a great many documents is not mistaken for a broken
+    one. `new`/`changed` are zero-checked rather than compared to `errors`
+    as a ratio: with both at zero, everything this run attempted to land
+    failed by construction — "erred on almost everything" needs no separate
+    ratio once nothing landed at all.
+    """
+    return stats.errors >= _UNPRODUCTIVE_RUN_MIN_ERRORS and stats.new == 0 and stats.changed == 0
+
+
 # --------------------------------------------------------------------------
 # Run report
 # --------------------------------------------------------------------------
@@ -524,6 +560,12 @@ class CrawlStats:
     oversize_files: int = 0
     oversize_bytes: int = 0
     oversize_largest: List[Dict[str, Any]] = field(default_factory=list)
+    #: Itemized per-file faults this run could not recover from — download,
+    #: convert, or ingest — bounded the same way ``oversize_largest`` is.
+    #: ``anonymize_failed`` and the routine skip reasons are deliberate
+    #: decisions, not failures, and never land here; only the reasons that
+    #: also bump :attr:`errors` do. See :meth:`note_error`.
+    errors_detail: List[Dict[str, Any]] = field(default_factory=list)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -619,6 +661,20 @@ class CrawlStats:
             self.oversize_largest.sort(key=lambda e: -int(e["size"]))
             del self.oversize_largest[_OVERSIZE_SAMPLE:]
 
+    def note_error(self, path: str, reason: str, *, detail: str = "", status_code: Optional[int] = None) -> None:
+        """One per-file fault, itemized — the difference between a bare
+        error COUNT and a diagnosable run. Callers still call :meth:`add`
+        for the ``errors``/``convert_failed`` counters themselves; this only
+        appends the row a caller who can name a path is able to give.
+        ``detail`` must already be a caller-composed, safe-to-log string
+        (a status code and an upstream error body/exception message, never a
+        token, a certificate, or file content) — this method does not scrub
+        it further.
+        """
+        with self._lock:
+            self.errors_detail.append({"path": path, "reason": reason, "detail": detail, "status_code": status_code})
+            del self.errors_detail[_ERROR_SAMPLE:]
+
     def report(
         self,
         *,
@@ -626,6 +682,8 @@ class CrawlStats:
         interrupted: bool = False,
         interrupted_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
+        from src.repositories.extraction_runs_pg import cap_skips
+
         elapsed = max(time.monotonic() - self.started, 1e-6)
         processed = self.new + self.changed
         return {
@@ -688,6 +746,15 @@ class CrawlStats:
                 "bytes_human": human_bytes(self.oversize_bytes),
                 "largest": list(self.oversize_largest),
             },
+            # The itemized counterpart to the bare `errors` count above —
+            # same envelope `extraction_runs.skips` uses (`items`/`listed`/
+            # `total`/`truncated`), reused rather than reinvented so the two
+            # "how much did we not index, and can we name it" surfaces never
+            # drift on shape. `total` can exceed `listed`: a scope-level
+            # fault (the caller's own `scope_errors` list) bumps `errors`
+            # but has no single file to name, so it is counted here without
+            # a row of its own.
+            "errors_detail": cap_skips(list(self.errors_detail), total=self.errors),
         }
 
 
@@ -1501,6 +1568,10 @@ class _PreparedDocument:
     outcome: str  # "ok" | "convert_failed" | "convert_empty" | "anonymize_failed"
     markdown: str = ""
     source_sha256: str = ""
+    #: The conversion exception's message, for a "convert_failed" outcome
+    #: only — carried back so the caller (which owns the run's stats object)
+    #: can itemize it in `errors_detail`. Empty for every other outcome.
+    detail: str = ""
 
 
 def _prepare_document(
@@ -1525,7 +1596,7 @@ def _prepare_document(
         markdown = str(getattr(converted, "markdown", "") or "")
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
-        return _PreparedDocument("convert_failed")
+        return _PreparedDocument("convert_failed", detail=str(exc))
     if not markdown.strip():
         logger.info("sharepoint crawl: conversion produced no text for %s", path)
         return _PreparedDocument("convert_empty")
@@ -1625,8 +1696,20 @@ async def _process_item(
         # budget per IN-FLIGHT item, never one per remaining file.
         raise
     except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
+        # `SharePointGraphError.status_code` is the upstream HTTP status,
+        # documented safe to log (Entra/Graph error bodies never carry a
+        # credential); the other two exception types carry no status.
+        status_code = getattr(exc, "status_code", None)
+        detail = str(exc)
         stats.add(errors=1)
-        logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
+        stats.note_error(path, "download_failed", detail=detail, status_code=status_code)
+        logger.warning(
+            "sharepoint crawl: download failed for %s: %s status=%s detail=%s",
+            path,
+            type(exc).__name__,
+            status_code,
+            detail,
+        )
         return
 
     try:
@@ -1646,6 +1729,7 @@ async def _process_item(
 
     if prepared.outcome == "convert_failed":
         stats.add(convert_failed=1, errors=1)
+        stats.note_error(path, "convert_failed", detail=prepared.detail)
         return
     if prepared.outcome == "convert_empty":
         stats.add(convert_failed=1)
@@ -1666,8 +1750,17 @@ async def _process_item(
             source_sha256=prepared.source_sha256,
         )
     except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
+        status_code = getattr(exc, "status_code", None)
+        detail = str(exc)
         stats.add(errors=1)
-        logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
+        stats.note_error(path, "ingest_failed", detail=detail, status_code=status_code)
+        logger.warning(
+            "sharepoint crawl: ingest failed for %s: %s status=%s detail=%s",
+            path,
+            type(exc).__name__,
+            status_code,
+            detail,
+        )
         return
 
     if was_new:
@@ -2202,15 +2295,33 @@ def _detector_usage(detector: Any) -> Dict[str, Any]:
 
     ``{}`` means "no tokens were spent" — the regex tier, or no anonymize
     scope in the run — which the UI keeps distinct from a computed $0.00.
-    Never raises: usage is observability, not a gate."""
+    When tokens WERE spent, ``estimated_cost_usd`` is priced through
+    ``src.llm_pricing.cost_usd`` — the one place a token count becomes USD
+    (mirroring ``connectors.sharepoint.facts_extraction._Report.render``'s
+    own pricing of its stage, the same field name and rounding). Never
+    raises: usage is observability, not a gate."""
     llm = getattr(detector, "llm", None)
     usage = getattr(llm, "total_usage", None)
     if not isinstance(usage, dict):
         return {}
-    model = getattr(llm, "model", None)
     out: Dict[str, Any] = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
-    if out and model:
+    if not out:
+        return {}
+    model = getattr(llm, "model", None)
+    if model:
         out["model"] = str(model)
+        from src.llm_pricing import cost_usd
+
+        out["estimated_cost_usd"] = round(
+            cost_usd(
+                model=str(model),
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+                cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+            ),
+            4,
+        )
     return out
 
 
@@ -2473,7 +2584,30 @@ async def _run_crawl_async(
         run_usage["ocr"] = ocr_usage
     if facts_usage:
         run_usage["facts"] = facts_usage
-    recorder.finish(stats, status="done", report=report, usage=run_usage)
+    if _ingested_nothing_despite_errors(stats):
+        # Same status vocabulary a crash already uses (`failed` /
+        # `interrupted` / `done`) — no new word is minted here. A run that
+        # errored on (almost) everything and landed nothing is at least as
+        # bad as a crash, and the JOB itself still completed (no exception
+        # propagates from here): `extraction_runs.status` and the job's own
+        # lifecycle are allowed to disagree by design (see
+        # `ExtractionRunsPgRepository`'s module docstring) — this is exactly
+        # the case that split them.
+        status = "failed"
+        finish_error = (
+            f"{stats.errors} file(s) errored and 0 documents were ingested this run — "
+            "see report.errors_detail for the per-file causes"
+        )
+        logger.warning(
+            "sharepoint crawl: connection %s — %d errors and 0 new/changed documents; "
+            "recording this run as failed rather than done",
+            connection_id,
+            stats.errors,
+        )
+    else:
+        status = "done"
+        finish_error = None
+    recorder.finish(stats, status=status, report=report, usage=run_usage, error=finish_error)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",
@@ -2520,9 +2654,13 @@ def run_builtin_crawl(payload: dict) -> dict:
 
     An optional ``job_id`` in the payload is recorded on the run row
     (``extraction_runs.job_id``) so the card can join a run to its job's
-    lifecycle. Nothing supplies it today — the worker hands this handler the
-    job's PAYLOAD, not its id — so the column is honestly null rather than
-    guessed, and the liveness check falls back to checkpoint age.
+    lifecycle. ``app/worker/kinds.py::dispatch_job`` merges the claimed job's
+    own id in before calling this handler's caller (``_run_corpus_
+    extraction``), since ``JobKind.handler`` only ever sees the payload, not
+    the job row — see ``_payload_for_handler`` there. A payload built outside
+    the worker (a test, a manual trigger) may simply omit it; the column is
+    then honestly null rather than guessed, and the liveness check falls
+    back to checkpoint age.
     """
     connection_id = payload.get("connection_id")
     if not connection_id:
