@@ -1391,6 +1391,40 @@ async def lifespan(app):
         except Exception as e:
             logger.warning("Could not seed canonical memory domains: %s", e)
 
+        # Seed the dedicated engagement-scoped memory domain (issue #1971
+        # Part 5) — same idempotent mechanism as the six canonical domains
+        # above, tracked as its own seed since it's an RBAC/distribution
+        # bucket, not a content-taxonomy value. Nobody is granted access to
+        # it by default: that absence of a grant IS the RBAC scoping the
+        # design relies on (agnes-side callers gate memory-domain bundle/
+        # manifest access on resource_grants; see app/api/sync.py's
+        # _build_memory_domains_section and app/api/memory.py's
+        # _build_per_domain_markdown).
+        try:
+            from src.db import ENGAGEMENT_SCOPED_DOMAIN_SEED
+
+            _esd_id, _esd_slug, _esd_name, _esd_icon, _esd_color = ENGAGEMENT_SCOPED_DOMAIN_SEED
+            memory_domains_repo().ensure_seed(
+                domain_id=_esd_id,
+                slug=_esd_slug,
+                name=_esd_name,
+                icon=_esd_icon,
+                color=_esd_color,
+            )
+        except Exception as e:
+            logger.warning("Could not seed engagement-scoped memory domain: %s", e)
+
+        # Seed the memory-curator agent profile (issue #1971) — config +
+        # identity for the corporate-memory detectors' editable detection
+        # policy. Insert-if-absent (see ensure_memory_curator_agent_profile),
+        # so an admin's edited policy text is never reset on reboot.
+        try:
+            from app.services.memory_curator_profile import ensure_memory_curator_agent_profile
+
+            ensure_memory_curator_agent_profile()
+        except Exception as e:
+            logger.warning("Could not seed memory-curator agent profile: %s", e)
+
         # Seed (or re-bake) the built-in marketplace from the wheel bundle. Runs
         # after system-groups are ensured so the RBAC seed can look up Admin/Everyone.
         # Non-fatal: a missing bundle dir only means the plugin cache is empty.

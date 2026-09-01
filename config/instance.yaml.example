@@ -827,7 +827,10 @@ ai:
 #   auto_publish_min_confidence: 0.80
 #
 #   # Default review period for approved/mandatory items (months).
-#   # Not yet wired (#1971) — no scheduled job reads this or expires items yet.
+#   # Not yet wired (#1971) — no scheduled job reads this or expires items
+#   # yet. Real item expiry is a standalone feature (see
+#   # docs/ADR-corporate-memory-v1.md -> "Knowledge Freshness & Expiry"),
+#   # out of scope for #1971's detection-observability/routing work.
 #   review_period_months: 6
 #
 #   # Notify every Admin-group member's desktop when a collection run
@@ -837,22 +840,23 @@ ai:
 #   # --- V1 Context Engineering ---
 #
 #   sources:
-#     # Not yet wired (#1971): the nightly collector always runs regardless
-#     # of enabled, and always scores items from confidence.base.claude_local_md
-#     # below, not confidence_base here.
 #     claude_local_md:
+#       # Live — false skips the nightly collector run entirely (no LLM
+#       # call, no catalog refresh).
 #       enabled: true
-#       confidence_base: 0.50
+#       # DEAD — remove if present. The collector has only ever scored
+#       # items from confidence.base.claude_local_md below; this key was
+#       # never read. Use that one.
 #     session_transcripts:
 #       # Live — read fresh on every verification-processor run (every 15
 #       # minutes): false skips session-transcript extraction entirely.
 #       enabled: true
-#       # Not yet wired (#1971) — extracted items are scored from
-#       # confidence.base['user_verification.<detection_type>'] below.
-#       confidence_base: 0.60
-#       # Not yet wired (#1971) — the truncation window is the hardcoded
-#       # MAX_TURNS_PER_SESSION constant in
-#       # services/verification_detector/detector.py (100).
+#       # DEAD — remove if present. Extracted items are scored from
+#       # confidence.base['user_verification.<detection_type>'] below; this
+#       # key was never read.
+#       # Live — the per-session truncation window, read fresh on every
+#       # run. Falls back to the built-in default (100) when unset or not a
+#       # positive integer.
 #       max_turns_per_session: 100
 #       # Live — extracted items whose detection_type isn't listed here are
 #       # dropped before dedup/insert.
@@ -861,12 +865,24 @@ ai:
 #         - confirmation
 #         - unprompted_definition
 #
-#   # Not yet wired (#1971): the collector and verification processor build
-#   # their LLM extractor from the top-level ai.* section, and both run their
-#   # sensitivity/contradiction checks unconditionally.
 #   extraction:
+#     # Live — per-feature override of the top-level ai.model for BOTH
+#     # extraction paths (mirrors the extraction.facts.model override
+#     # elsewhere in this file). Unset uses whatever model the ai: block
+#     # configures; only the model changes, credentials/provider are still
+#     # the shared ai: block's.
 #     model: "claude-haiku-4-5-20251001"
+#     # Live (collector path only) — false skips the per-item LLM
+#     # sensitivity check entirely (a cost switch; the item is still
+#     # added, just not LLM-vetted). The session-transcript path has no
+#     # equivalent check to gate.
 #     sensitivity_check: true
+#     # Still not wired — contradiction_module.detect_and_record() runs
+#     # unconditionally on the session-transcript path today (the collector
+#     # runs no contradiction check at all). Out of scope for issue #1971;
+#     # contradiction_detection.enabled/max_candidates below are likewise
+#     # still unread — both are one coherent future "wire contradiction
+#     # config" pass, not two.
 #     contradiction_check: true
 #
 #   confidence:
@@ -898,12 +914,18 @@ ai:
 #         user_verification: 0.40       # user-verified facts never fall below 0.40
 #         default: 0.0
 #
+#   # Still not wired — see the extraction.contradiction_check note above;
+#   # this is the other half of the same unwired knob.
 #   contradiction_detection:
 #     enabled: true
 #     max_candidates: 10
 #
-#   # Not yet wired (#1971) — no extraction or resolution path reads this
-#   # section yet; entity names are extracted freeform per item instead.
+#   # Still not wired — no extraction or resolution path reads this
+#   # section; entity names are extracted freeform per item instead. The
+#   # matching logic already exists and is unit-tested
+#   # (services/corporate_memory/entities.py::resolve_and_merge) but is
+#   # never called from either extraction path. Out of scope for issue
+#   # #1971 (detection observability/routing, not entity tagging).
 #   entity_resolution:
 #     enabled: true
 #     entities:

@@ -19,6 +19,15 @@ that moderation gate is the entire safety property this identity exists to
 preserve. Admin-promoting it would let a compromised or malfunctioning
 drafting session write semantic models straight to the flat query tables
 projection reads, unreviewed.
+
+``memory-curator@system.local`` is a different shape of identity: it owns no
+sandbox and runs no chat turn. It exists purely so the ``memory-curator``
+agent profile (issue #1971 — corporate-memory detection as an editable,
+observable "agent") has an OWNER, because ``agents.owner_user_id`` is
+NOT NULL and the profile is config/identity for the EXISTING direct LLM
+calls the verification detector already makes, never a spawned agent
+runtime. See ``app/services/memory_curator_profile.py`` for the profile
+itself and the policy-text accessor.
 """
 
 from __future__ import annotations
@@ -67,5 +76,48 @@ def ensure_semantic_drafter_user(conn: Optional[object] = None) -> dict:
             logger.exception("system-plugin fanout failed for semantic-drafter user")
         user = users.get_by_email(SEMANTIC_DRAFTER_USER_EMAIL)
         logger.info("Seeded semantic-drafter service user: %s", SEMANTIC_DRAFTER_USER_EMAIL)
+
+    return user
+
+
+# Identity of the synthetic user that owns the seeded ``memory-curator``
+# agent profile (see ``app/services/memory_curator_profile.py``). Never
+# added to the Admin group — it needs no authority of its own, since nothing
+# ever authenticates AS it; ``agents.owner_user_id`` is simply NOT NULL and
+# this row is what satisfies that constraint for a profile nobody personally
+# owns.
+MEMORY_CURATOR_USER_EMAIL = "memory-curator@system.local"
+MEMORY_CURATOR_USER_NAME = "Memory Curator"
+
+
+def ensure_memory_curator_user(conn: Optional[object] = None) -> dict:
+    """Idempotently provision the memory-curator service user.
+
+    Same shape as :func:`ensure_semantic_drafter_user` — ``conn`` is accepted
+    for signature stability but unused, since every read/write goes through
+    the ``src.repositories`` factory and therefore works unchanged on either
+    the DuckDB or Postgres backend.
+    """
+    from src.repositories import user_curated_subscriptions_repo, users_repo
+
+    users = users_repo()
+    user = users.get_by_email(MEMORY_CURATOR_USER_EMAIL)
+    if not user:
+        user_id = str(uuid.uuid4())
+        users.create(
+            id=user_id,
+            email=MEMORY_CURATOR_USER_EMAIL,
+            name=MEMORY_CURATOR_USER_NAME,
+            password_hash=None,
+        )
+        # Same mandatory-tier fanout every other user-create path gets —
+        # soft-fail so a fanout hiccup never blocks provisioning the
+        # identity itself.
+        try:
+            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
+        except Exception:
+            logger.exception("system-plugin fanout failed for memory-curator user")
+        user = users.get_by_email(MEMORY_CURATOR_USER_EMAIL)
+        logger.info("Seeded memory-curator service user: %s", MEMORY_CURATOR_USER_EMAIL)
 
     return user
