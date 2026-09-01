@@ -9,6 +9,8 @@ classification.
 """
 
 from __future__ import annotations
+
+import pathlib
 import pytest
 
 import io
@@ -516,3 +518,41 @@ def test_chip_label_keeps_a_name_that_ends_in_a_number(seeded_app):
     js = seeded_app["client"].get("/static/js/filter_toolbar.js").text
     assert "var span = opt.querySelector('.fbar-menu__opt-text');" in js
     assert "if (!span) txt = txt.replace(/\\s+\\d+\\s*$/, '');" in js
+
+
+# ---------------------------------------------------------------------------
+# The filter menu's own height. Entity facets took the Library from five
+# categories to nine (eleven on a fully-granted instance), which is what broke
+# the assumption the CSS opt-out below was written on.
+# ---------------------------------------------------------------------------
+
+_TOOLBAR_CSS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/css/filter_toolbar.css"
+_TOOLBAR_JS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/js/filter_toolbar.js"
+
+
+def test_a_category_menu_is_not_exempt_from_the_height_cap():
+    """`.fbar-menu--cats` used to set `overflow: visible; max-height: none`,
+    because a popover positioned `absolute` inside it was clipped. The popover
+    has been `position: fixed` since collision detection moved into the JS, so
+    the exemption bought nothing and cost the menu its scrolling — with nine
+    categories, Clear/Done sat below the fold of a 720px window."""
+    css = _TOOLBAR_CSS.read_text(encoding="utf-8")
+    assert ".fbar-menu--cats { overflow: visible; max-height: none; }" not in css
+    assert "position: fixed" in css.split(".fbar-cat__pop {")[1].split("}")[0], (
+        "the popover must stay `fixed` — it is what lets the menu scroll without clipping it"
+    )
+
+
+def test_the_menu_is_clamped_to_the_room_below_its_trigger():
+    """A CSS `max-height` is a limit on height and says nothing about where the
+    menu starts, so a toolbar partway down the page can still push the footer
+    off-screen. The clamp measures live rects, like every other coordinate in
+    this component, and must run when the menu opens and whenever the anchor
+    moves."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "function clampMenuHeight()" in js
+    assert "innerHeight" in js.split("function clampMenuHeight()")[1][:600]
+    opener = js.split("function openMenu(open)")[1][:400]
+    assert "clampMenuHeight()" in opener, "the clamp must run on open"
+    replacer = js.split("function replaceOpenSubmenu()")[1][:400]
+    assert "clampMenuHeight()" in replacer, "…and again when the page moves or resizes under it"

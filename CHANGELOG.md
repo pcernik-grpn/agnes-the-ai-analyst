@@ -10,6 +10,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ## [Unreleased]
 
+### Fixed
+
+- **A long filter menu no longer runs off the bottom of the window.** The category menu opted out of the base menu's height cap — an exemption written when its popovers were positioned `absolute` and got clipped, which stopped being true once collision detection moved into the JS and made them `position: fixed`. With the Library's four new entity categories (nine on a default instance, eleven on a fully-granted one), Clear and Done sat below the fold of a 720px-tall window. The menu now scrolls, and is clamped to the room actually below its trigger rather than to a share of the viewport that ignores where it starts.
+
 ### Added
 
 ### Changed

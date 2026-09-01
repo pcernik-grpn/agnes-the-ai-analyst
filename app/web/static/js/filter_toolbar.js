@@ -503,6 +503,10 @@
     // inside an ancestor as well as the window.
     function replaceOpenSubmenu() {
       if (!menuEl) return;
+      // The menu's own room below the trigger changes with the same events, so
+      // re-clamp before re-placing — otherwise a resize leaves the menu the
+      // height the OLD viewport allowed.
+      clampMenuHeight();
       var open = qs('.fbar-cat.is-open', menuEl);
       if (open) placeSubmenu(open);
     }
@@ -859,10 +863,35 @@
     }
 
     // ── menu open/close ──
+    //: The menu is capped by CSS at a share of the viewport (`max-height: 60vh`),
+    //: which is a limit on its HEIGHT and says nothing about where it starts. A
+    //: toolbar sits partway down the page, so a menu that is comfortably under
+    //: 60vh can still end below the fold — which is what happened when the
+    //: Library's filter menu grew entity facets: nine categories, and Clear/Done
+    //: off the bottom of the window. Clamp to the room actually below the
+    //: trigger, measured from live rects like every other coordinate in this
+    //: component, and let the CSS cap stand when it is the smaller of the two.
+    //: Only ever REDUCES the height, so a short menu is untouched.
+    var MENU_EDGE = 8;   //: keep this clear of the viewport's bottom edge
+
+    function clampMenuHeight() {
+      if (!menuEl || menuEl.hidden) return;
+      menuEl.style.maxHeight = '';
+      var top = menuEl.getBoundingClientRect().top;
+      var room = Math.round(global.innerHeight - top - MENU_EDGE);
+      var css = parseFloat(global.getComputedStyle(menuEl).maxHeight);
+      if (!isFinite(css) || room < css) {
+        // Never collapse to nothing on a very short window: below this the menu
+        // is unusable either way, and a scrollable 160px is the better failure.
+        menuEl.style.maxHeight = Math.max(160, room) + 'px';
+      }
+    }
+
     function openMenu(open) {
       if (!menuEl || !filterBtn) return;
       menuEl.hidden = !open;
       filterBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) clampMenuHeight(); else menuEl.style.maxHeight = '';
     }
 
     // ── wiring ──
