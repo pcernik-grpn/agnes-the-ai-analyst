@@ -36,6 +36,32 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+- **An anonymize-marked SharePoint scope stored the real filename and
+  folder path unredacted.** Only the document body ever went through the
+  anonymizer; the source file name and its folder path — routinely the
+  single most re-identifying string in a document — were persisted and
+  served as-is (`/raw`, `/preview`, the chunk index, search, the
+  corpus-file listing). The built-in crawler now anonymizes the filename
+  and each path segment individually, under the same per-instance key and
+  detector as the body, before either is stored — the `/` separator
+  structure is kept so prefix matching and folder-scoped browsing keep
+  working over the anonymized tree. See `docs/anonymization.md` for what
+  this does and does not cover (a retroactive-cleanup gap in
+  `connectors/sharepoint/acl_sync.py` is tracked separately, #2011).
+- **A name split across a markdown line wrap was only half-redacted.** The
+  anonymizer's name-run detector treated a newline as a hard break, so
+  PDF/DOCX→markdown conversion — which wraps lines constantly — routinely
+  left the first half of a wrapped person or company name unredacted (e.g.
+  `"Northwind\nLogistics Holding a.s."` redacted only `"Logistics Holding
+  a.s."`). A single line break inside a name run is now treated like a
+  space; a blank line (a genuine paragraph boundary) still ends the run.
+- **Two different people sharing a surname could be merged into one
+  pseudonym.** A bare surname mention ("Smith") that inflection-matched
+  more than one full name in the same document ("John Smith" and "Mary
+  Smith") used to bridge them into a single `PERSON_<hmac>` token, silently
+  attributing both people's mentions to one identity. An ambiguous bare
+  surname now stays unlinked from either full name rather than guessing
+  which one it means.
 - **The built-in SharePoint crawler can download files again.** Microsoft
   Graph answers a file's `GET .../content` with a redirect to a
   pre-authenticated URL on a different host rather than the bytes

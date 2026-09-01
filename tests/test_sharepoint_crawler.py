@@ -490,6 +490,139 @@ class TestAnonymizeFailClosed:
         assert report["anonymize_failed"] == 0
         assert FakeIngestor.instances[-1].ingested[0]["markdown"] == "PERSON_abc met PERSON_def"
 
+    def test_an_anonymized_scope_also_redacts_the_stored_filename_and_path(self, crawl_env, monkeypatch):
+        # A stub that behaves like a real anonymizer (a deterministic
+        # function of its input, unlike the other tests' constant-return
+        # stubs), so the test can assert on the SHAPE of what gets stored —
+        # not just that it changed.
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            name="Northwind Logistics Merger Brief.docx",
+                            parent_path="/drives/b!drive1/root:/Client Files/Northwind Deal",
+                        )
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 0
+        row = FakeIngestor.instances[-1].ingested[0]
+        # Every segment went through the SAME anonymization as the body,
+        # under the same key — the "/" structure survives, only its content
+        # doesn't (the stub above wraps rather than replaces its input
+        # precisely so this test can see EACH segment was passed through
+        # separately, not the whole path as one string). The leaf keeps the
+        # SOURCE extension (`.docx`); `filename` is always the converted
+        # markdown's own name (`.md`).
+        assert row["path"] == (
+            "REDACTED[Client Files]/REDACTED[Northwind Deal]/REDACTED[Northwind Logistics Merger Brief].docx"
+        )
+        assert row["filename"] == "REDACTED[Northwind Logistics Merger Brief].md"
+
+    def test_an_anonymized_scope_leaks_no_fragment_of_the_real_name_through_the_real_anonymizer(
+        self, crawl_env, monkeypatch
+    ):
+        # No stub this time — `crawler.anonymize_markdown` is left wired to
+        # the real `src.anonymization.anonymize_markdown` (the `_key`
+        # autouse fixture already provides a resolvable HMAC key), so this is
+        # the end-to-end proof the unit-level shape assertion above cannot
+        # give: the crawl's own regex detector actually catches the folder
+        # and file name and no raw fragment of either reaches storage.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            name="Northwind Logistics Merger Brief.docx",
+                            parent_path="/drives/b!drive1/root:/Client Files/Northwind Deal",
+                        )
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 0
+        row = FakeIngestor.instances[-1].ingested[0]
+        for leaked in ("Northwind", "Logistics", "Merger", "Brief", "Client", "Files", "Deal"):
+            assert leaked not in row["path"], row["path"]
+            assert leaked not in row["filename"], row["filename"]
+        assert row["filename"].endswith(".md")
+        assert row["path"].endswith(".docx")
+
+    def test_the_same_real_folder_anonymizes_to_the_same_prefix_for_two_files(self, crawl_env, monkeypatch):
+        # Prefix matching / corpus-map routing over the ANONYMIZED tree only
+        # keeps working if two files under the same real folder still share
+        # one anonymized folder prefix — this is what per-segment (not
+        # whole-path) anonymization, under one deterministic key, buys.
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("item1", name="alpha.docx", parent_path="/drives/b!drive1/root:/Northwind Deal"),
+                        _file_item("item2", name="beta.docx", parent_path="/drives/b!drive1/root:/Northwind Deal"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        rows = FakeIngestor.instances[-1].ingested
+        prefixes = {row["path"].rsplit("/", 1)[0] for row in rows}
+        assert len(rows) == 2
+        assert len(prefixes) == 1, rows
+
+    def test_identity_anonymization_failure_is_fail_closed_like_body_failure(self, crawl_env, monkeypatch):
+        # The body anonymizes fine; the filename/path anonymization (the
+        # LATER calls `_anonymize_identity` makes) is what fails here — the
+        # document must still be dropped and counted, exactly as a body
+        # failure already is.
+        calls = {"n": 0}
+
+        def _anonymize(text, *, key, detector=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return AnonymizeResult("safe body")
+            raise RuntimeError("identity anonymizer blew up")
+
+        monkeypatch.setattr(crawler, "anonymize_markdown", _anonymize)
+        _install_graph(monkeypatch, self._handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        assert report["anonymize_failed"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
     def test_a_document_that_cannot_be_anonymized_is_never_ingested_raw(self, crawl_env, monkeypatch):
         def _boom(text, *, key, detector=None):
             raise RuntimeError("anonymizer blew up")
@@ -1353,7 +1486,12 @@ class TestDetectorChoice:
         _install_graph(monkeypatch, handler)
         _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
 
-        assert seen == ["hybrid-sentinel"]
+        # One call for the body, one for the filename stem, one per folder
+        # segment (`_file_item()`'s default path is one folder deep,
+        # "Reports") — the exact count is `_anonymize_identity`'s business,
+        # not this test's; what this test pins is that EVERY call, whatever
+        # its count, carries the SAME configured detector.
+        assert seen and set(seen) == {"hybrid-sentinel"}
 
     def test_no_detector_is_built_when_nothing_in_the_run_anonymizes(self, crawl_env, monkeypatch):
         """The LLM tier costs money per document — an instance that has it
