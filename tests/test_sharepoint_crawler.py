@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -913,6 +917,345 @@ class TestConversion:
 
         assert report["convert_failed"] == 1
         assert FakeIngestor.instances[-1].ingested == []
+
+
+class TestConversionCrashIsolation:
+    """A native crash inside the converter (observed on a live deployment:
+    a `trap int3` abort inside libpdfium.so, reached via pypdfium2) used to
+    take the ENTIRE worker process down with it — nothing in this module
+    could ever catch it, because by the time it happened nothing here was
+    running: the process itself was simply gone one line later. Conversion
+    now runs in a dedicated child process per concurrency slot
+    (`crawler._ConvertProcessPool`), so a crash there costs exactly the one
+    file it was converting, never this process.
+
+    `os.kill(os.getpid(), signal.SIGABRT)` inside the fake converter below
+    MUST run inside a forked child — if process isolation regressed to the
+    old thread-pool call, this whole test process would abort instead of
+    the assertions below ever running, which is itself the strongest
+    possible proof these tests fail against the pre-isolation code.
+    """
+
+    @staticmethod
+    def _crash_on_marker(marker: bytes) -> Callable[[Path, str], Any]:
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == marker:
+                os.kill(os.getpid(), signal.SIGABRT)
+            return ConvertResult("# converted fine")
+
+        return _convert
+
+    @staticmethod
+    def _two_item_handler(monkeypatch, *, crash_item_id: str = "crash") -> None:
+        """One item whose downloaded bytes are the crash marker, one
+        ordinary — told apart by item id, which Graph's own content URL
+        always carries (``.../items/<id>/content``)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if f"/items/{crash_item_id}/content" in url:
+                    return httpx.Response(200, content=b"CRASH-ME")
+                return httpx.Response(200, content=b"fine-bytes")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(crash_item_id, name="bad.pdf", ctag="c1"),
+                        _file_item("ok", name="ok.txt", ctag="c2"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+    def test_a_signal_crash_is_counted_convert_failed_and_the_run_continues(self, crawl_env, monkeypatch, caplog):
+        # Concurrency 1: the crashed and the healthy file share the SAME
+        # (repaired) slot, back to back — the strongest version of "the run
+        # continues with the next file".
+        _at_concurrency(monkeypatch, 1)
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash_on_marker(b"CRASH-ME"))
+        self._two_item_handler(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # Reaching this line at all proves the crash cost one file, not this
+        # (the crawl's own) process.
+        assert report["convert_failed"] == 1
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("bad.pdf" in m and "SIGABRT" in m for m in messages), messages
+
+    def test_a_crash_on_one_slot_does_not_affect_a_sibling_on_another_slot(self, crawl_env, monkeypatch):
+        # Concurrency > item count: crash and success run on DIFFERENT
+        # worker processes at the same time — proves the isolation is
+        # per-slot, not "the whole pool is down until the next page".
+        _at_concurrency(monkeypatch, 4)
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash_on_marker(b"CRASH-ME"))
+        self._two_item_handler(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+    def test_a_crash_and_an_ordinary_conversion_error_are_both_convert_failed_alongside_a_success(
+        self, crawl_env, monkeypatch
+    ):
+        _at_concurrency(monkeypatch, 1)
+
+        def _convert(path: Path, mime: str) -> Any:
+            content = Path(path).read_bytes()
+            if content == b"CRASH-ME":
+                os.kill(os.getpid(), signal.SIGABRT)
+            if content == b"BOOM-ME":
+                raise RuntimeError("markitdown said no")
+            return ConvertResult("# converted fine")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "/items/crash/content" in url:
+                    return httpx.Response(200, content=b"CRASH-ME")
+                if "/items/boom/content" in url:
+                    return httpx.Response(200, content=b"BOOM-ME")
+                return httpx.Response(200, content=b"fine-bytes")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("crash", name="bad.pdf", ctag="c1"),
+                        _file_item("boom", name="boom.docx", ctag="c2"),
+                        _file_item("ok", name="ok.txt", ctag="c3"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # An ordinary exception behaves exactly as it did before process
+        # isolation existed — same counter, same "not fatal" outcome — right
+        # alongside a signal crash, in the same page.
+        assert report["convert_failed"] == 2
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+
+class TestConvertProcessPoolRecycling:
+    """`_ConvertProcessPool` recycling — the OOM guard for a crash survivor
+    that just keeps running: markitdown/pypdfium2 hold onto memory per
+    document, so a slot that never recycles grows without bound over a
+    large crawl. Observed on a live deployment: ~8.4 GiB across 6 slots
+    (~22 documents each) before the container's memory cgroup started
+    SIGKILLing whichever child allocated next, indiscriminately — including
+    files nowhere near a gigabyte.
+
+    Drives `_ConvertProcessPool` directly (not through a full crawl), the
+    same way `TestActivityBookkeeping` drives `CrawlStats` directly — the
+    mechanism under test is a pool method, not the whole pipeline.
+    """
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_a_slot_is_recycled_after_its_document_budget(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=3, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            for _ in range(3):
+                outcome = pool.convert(0, f, "text/plain")
+                assert outcome.ok
+            # The 3rd conversion crossed the budget and swapped in the
+            # pre-forked SPARE — a genuinely different process, promoted
+            # without this (the test's own, multi-threaded pytest) thread
+            # ever calling fork().
+            assert pool._procs[0].pid != first_pid
+            # ...and the slot keeps converting normally afterwards, on a
+            # fresh document budget.
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_a_slot_is_recycled_when_its_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            # Inflate THIS (child) process's RSS on purpose, deterministically
+            # — the point of testing the trigger in isolation, rather than
+            # waiting on a real multi-hundred-document crawl to grow one
+            # organically.
+            _hog = bytearray(20 * 1024 * 1024)  # noqa: F841 — the allocation is the point
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # A document budget nothing in this test could reach, so only the
+        # RSS trigger can plausibly be what recycles the slot.
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1000, recycle_rss_bytes=5 * 1024 * 1024)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+            assert pool._procs[0].pid != first_pid
+        finally:
+            pool.shutdown()
+
+    def test_recycling_does_not_regress_crash_isolation(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == b"CRASH-ME":
+                os.kill(os.getpid(), signal.SIGABRT)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=2, recycle_rss_bytes=0)
+        pool.start()
+        try:
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            f_crash = self._write(tmp_path, "bad.txt", b"CRASH-ME")
+
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 1/2
+            pid_before_recycle = pool._procs[0].pid
+            assert pool.convert(0, f_ok, "text/plain").ok  # doc 2/2 -> recycles
+            assert pool._procs[0].pid != pid_before_recycle, "the slot should now be the pre-forked spare"
+
+            # The RECYCLED (spare-promoted) process crashes on this file —
+            # isolation must still catch it exactly like before recycling
+            # ever existed: this file counts as convert_failed, the parent
+            # survives, and the pool names the real signal.
+            with pytest.raises(crawler._ConvertCrashed) as exc_info:
+                pool.convert(0, f_crash, "text/plain")
+            assert exc_info.value.signal_name == "SIGABRT"
+
+            # And the pool recovers at the next safe point, same as any
+            # other crash.
+            pool.repair()
+            assert pool.convert(0, f_ok, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+
+class TestConvertChildMemoryLimit:
+    """The per-child RLIMIT_AS ceiling (`_install_memory_limit`) and the
+    operator-facing wording that distinguishes ITS failures from an
+    external-pressure SIGKILL — a second, live-deployment finding on top of
+    recycling: recycling holds the STEADY STATE down, but a single
+    pathological document (an .xlsx openpyxl loads whole into memory, in
+    one observed case) can still spike ONE worker past the container's own
+    ceiling in isolation, and the kernel's OOM killer then SIGKILLs
+    whichever child happens to be allocating at that moment — not
+    necessarily the file that caused it.
+    """
+
+    def test_memory_error_is_worded_as_the_files_own_limit(self, crawl_env, monkeypatch):
+        """A `MemoryError` from `convert_to_markdown` — whether raised by
+        the RLIMIT_AS ceiling for real or (as simulated here, portably) by
+        the converter itself — is counted convert_failed with a detail
+        that names the cause plainly and attributes it to THIS file, never
+        a bare `MemoryError` a reader has to already know the mechanism to
+        interpret."""
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(MemoryError())
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+
+    def test_a_sigkill_crash_is_worded_as_external_pressure_not_the_files_fault(self):
+        detail = crawler._convert_crash_detail("SIGKILL")
+        assert "SIGKILL" in detail
+        assert "may not be this file's fault" in detail
+
+    def test_a_non_sigkill_crash_is_worded_as_a_plain_crash(self):
+        detail = crawler._convert_crash_detail("SIGABRT")
+        assert detail == "conversion worker crashed: SIGABRT"
+        assert "may not be this file's fault" not in detail
+
+    def test_installing_a_tiny_limit_never_raises_out_of_the_child(self, tmp_path, monkeypatch):
+        """`_install_memory_limit` is best-effort by design (RLIMIT_AS is
+        not settable on every platform, notably macOS, where this repo's
+        own tests run) — a platform that refuses the syscall must still
+        convert normally, not lose the whole child to an unhandled
+        exception raised while merely trying to install its own safety
+        net."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        # 1 MiB: far below what even a bare Python interpreter maps, so on
+        # a platform that DOES enforce this it would fail every real
+        # conversion too -- the point here is only that installing it does
+        # not crash the worker outright.
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=1024 * 1024)
+        pool.start()
+        try:
+            assert pool._procs[0].is_alive()
+        finally:
+            pool.shutdown()
+
+    @staticmethod
+    def _current_vsz_bytes() -> int:
+        """This (the TEST) process's own current virtual memory size, from
+        /proc/self/status -- Linux only, which is fine since every caller
+        is itself gated to Linux. A freshly forked child's own baseline
+        starts at approximately this, so it calibrates the test below
+        against whatever THIS runner's actual baseline happens to be,
+        rather than a guessed constant that could be a false positive (too
+        tight, tripped by ordinary interpreter overhead on a heavier CI
+        image) or a false negative (too loose to ever exercise the
+        ceiling) on a machine this test has never seen."""
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+        raise RuntimeError("VmSize not found in /proc/self/status")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
+    def test_a_runaway_allocation_is_capped_on_linux(self, tmp_path, monkeypatch):
+        """The REAL enforcement, not a simulation — only meaningful (and
+        only run) on Linux, this module's deployment target and where the
+        memory pressure this guards against was observed. A conversion
+        that tries to allocate well past a tight, real RLIMIT_AS ceiling
+        gets a genuine MemoryError, attributed to the file that caused it,
+        not a SIGKILL that could be blamed on an innocent sibling."""
+        baseline = self._current_vsz_bytes()
+        limit = baseline + 100 * 1024 * 1024  # headroom over THIS runner's own baseline
+        over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
+
+        def _convert(path, mime):
+            data = bytearray(over_allocation)
+            data[0] = 1
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=limit)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert not outcome.ok
+            assert outcome.detail_type == "MemoryError"
+        finally:
+            pool.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -2454,8 +2797,18 @@ class TestParallelOrdering:
 
     def test_a_slow_item_does_not_hold_its_neighbours_ctags_hostage(self, crawl_env, monkeypatch):
         """cTags are per ITEM (written right after that item's own ingest),
-        the page boundary is per PAGE. One slow convert must delay only the
-        latter."""
+        the page boundary is per PAGE. One slow item must delay only the
+        latter.
+
+        The slowness lives in ``ingest``, not ``convert_to_markdown``:
+        convert now runs in a dedicated child PROCESS per concurrency slot
+        (see ``_ConvertProcessPool``), which gets its own private, frozen
+        COPY of every Python object at fork time — a busy-wait there could
+        never observe cTags the PARENT writes later. ``ingest`` is
+        unaffected: it still runs on the crawl's own item-concurrency thread
+        pool, in this process, which is exactly what the invariant under
+        test — a cTag is never held for a neighbour — is about.
+        """
         _at_concurrency(monkeypatch, 4)
         shared: Dict[str, Any] = {"delta_links": {}, "ctags": {}}
         monkeypatch.setattr(crawler, "load_state", lambda cid: shared)
@@ -2468,18 +2821,20 @@ class TestParallelOrdering:
             with crawler._state_lock:
                 return dict(shared["ctags"])
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            if path.suffix == ".slow":
-                # Stay in flight until the NEIGHBOURS' cTags have landed. If
-                # a cTag were held until the page boundary this would time
-                # out with an empty map, which is the regression to catch.
-                deadline = time.monotonic() + 10
-                while len(_peek()) < 3 and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                observed["ctags"] = _peek()
-            return ConvertResult("# converted")
+        class _SlowIngestor(FakeIngestor):
+            def ingest(self, *, stable_id: str, **kwargs: Any) -> Any:
+                if stable_id == "graph:slow":
+                    # Stay in flight until the NEIGHBOURS' cTags have landed.
+                    # If a cTag were held until the page boundary this would
+                    # time out with an empty map, which is the regression to
+                    # catch.
+                    deadline = time.monotonic() + 10
+                    while len(_peek()) < 3 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    observed["ctags"] = _peek()
+                return super().ingest(stable_id=stable_id, **kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _SlowIngestor)
 
         items = [_file_item("slow", name="slow.slow", ctag="c-slow")] + _many_items(3)
         _install_graph(monkeypatch, _one_page(items))
@@ -2496,18 +2851,29 @@ class TestParallelOrdering:
         """Not the event loop's default executor, whose min(32, cpu+4) ceiling
         would silently cap a configured concurrency above it — the knob has to
         mean what it says. Twelve items that only make progress once all
-        twelve are inside the blocking step: a smaller pool cannot get there."""
+        twelve are inside the blocking step: a smaller pool cannot get there.
+
+        The barrier lives in ``ingest``, not ``convert_to_markdown``: convert
+        now runs in a dedicated child PROCESS per slot, each with its own
+        private copy of any Python object post-fork, so a
+        ``threading.Barrier`` split twelve ways across twelve separate
+        processes would never see all twelve parties arrive. ``ingest`` is
+        unaffected — it still runs on the crawl's own item-concurrency
+        thread pool, which is exactly what this test is sizing.
+        """
         _at_concurrency(monkeypatch, 12)
         barrier = threading.Barrier(12, timeout=15)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            barrier.wait()  # BrokenBarrierError -> counted as convert_failed
-            return ConvertResult("# converted")
+        class _BarrierIngestor(FakeIngestor):
+            def ingest(self, **kwargs: Any) -> Any:
+                barrier.wait()  # BrokenBarrierError -> counted as an ingest error
+                return super().ingest(**kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _BarrierIngestor)
         _install_graph(monkeypatch, _one_page(_many_items(12)))
         report = _run(_connection([_drive_scope()]), monkeypatch)
 
+        assert report["errors"] == 0
         assert report["convert_failed"] == 0
         assert report["new"] == 12
         assert report["max_in_flight"] == 12
@@ -2685,17 +3051,28 @@ class TestConcurrencyOneIsTheOldPath:
         assert parallel["concurrency"]["requested"] == 6
 
     def test_sequential_runs_the_pipeline_inline_with_no_worker_thread(self, crawl_env, monkeypatch):
-        """At 1 there is no executor in the picture at all — the convert and
-        ingest calls happen on the crawl's own thread, exactly as before."""
+        """At 1 there is no THREAD executor in the picture at all for the
+        item-level pipeline — ``ingest`` happens on the crawl's own thread,
+        exactly as before.
+
+        ``convert_to_markdown`` is deliberately NOT part of this claim any
+        more: it now always runs in its dedicated child PROCESS (see
+        ``_ConvertProcessPool``), even at concurrency 1 — that isolation, not
+        which thread calls it, is what survives a native crash. There is
+        nothing left to prove about its thread identity; what "1 == the old
+        path" still means is that no `ThreadPoolExecutor` exists for the
+        REST of the pipeline, which ``ingest`` below stands in for.
+        """
         _at_concurrency(monkeypatch, 1)
         threads: List[int] = []
         main = threading.get_ident()
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
-            threads.append(threading.get_ident())
-            return ConvertResult("# converted")
+        class _ThreadRecordingIngestor(FakeIngestor):
+            def ingest(self, **kwargs: Any) -> Any:
+                threads.append(threading.get_ident())
+                return super().ingest(**kwargs)
 
-        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_Ingestor", _ThreadRecordingIngestor)
         _install_graph(monkeypatch, _one_page(_many_items(4)))
         _run(_connection([_drive_scope()]), monkeypatch)
 
@@ -3124,6 +3501,23 @@ class TestLiveActivity:
         assert all(entry["outcome"] == "new" for entry in activity["recent"])
 
     def test_recent_activity_is_capped_at_five(self, crawl_env, monkeypatch):
+        """The cap-and-newest-first MECHANISM is pinned exactly and
+        deterministically by
+        ``TestActivityBookkeeping::test_recent_is_capped_and_newest_first``
+        below, which drives ``enter``/``exit_item_activity`` directly in a
+        fixed order. This test is the integration half: a REAL crawl, at
+        this instance's default concurrency (6), exercises it end to end.
+
+        Six real workers finish 8 trivial items in whatever order they
+        actually complete — not dispatch order — so asserting an exact
+        finishing position here would pin a race, not a behavior (confirmed
+        empirically: the SAME non-determinism reproduces identically on the
+        pre-process-isolation code, so it is not something conversion
+        running in a child process introduced). What the checkpoint
+        actually promises, and what this asserts, is the cap itself and
+        that the LAST item enumerated is never silently dropped from it —
+        the one thing a real crawl adds over the deterministic unit test.
+        """
         runs = _install_runs_repo(monkeypatch)
         _install_graph(monkeypatch, _one_page(_many_items(8)))
 
@@ -3131,9 +3525,8 @@ class TestLiveActivity:
 
         activity = runs.checkpoints[-1]["progress"]["activity"]
         assert len(activity["recent"]) == 5
-        # Newest first: the LAST item processed (f7, sequential concurrency
-        # 1) is at the front.
-        assert activity["recent"][0]["path"].endswith("f7.docx")
+        paths = {entry["path"] for entry in activity["recent"]}
+        assert "Reports/f7.docx" in paths, "the last item enumerated must never be silently dropped"
 
     def test_activity_is_absent_from_a_finished_runs_stored_report(self, crawl_env, monkeypatch):
         """`report()` (the FINAL, stored shape) is a separate dict from the
