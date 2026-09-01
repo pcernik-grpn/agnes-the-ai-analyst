@@ -813,7 +813,8 @@ ai:
 #   # below to pick a realistic cutoff per source type.
 #   auto_publish_min_confidence: 0.80
 #
-#   # Default review period for approved/mandatory items (months)
+#   # Default review period for approved/mandatory items (months).
+#   # Not yet wired (#1971) — no scheduled job reads this or expires items yet.
 #   review_period_months: 6
 #
 #   # Notify every Admin-group member's desktop when a collection run
@@ -823,18 +824,33 @@ ai:
 #   # --- V1 Context Engineering ---
 #
 #   sources:
+#     # Not yet wired (#1971): the nightly collector always runs regardless
+#     # of enabled, and always scores items from confidence.base.claude_local_md
+#     # below, not confidence_base here.
 #     claude_local_md:
 #       enabled: true
 #       confidence_base: 0.50
 #     session_transcripts:
+#       # Live — read fresh on every verification-processor run (every 15
+#       # minutes): false skips session-transcript extraction entirely.
 #       enabled: true
+#       # Not yet wired (#1971) — extracted items are scored from
+#       # confidence.base['user_verification.<detection_type>'] below.
 #       confidence_base: 0.60
+#       # Not yet wired (#1971) — the truncation window is the hardcoded
+#       # MAX_TURNS_PER_SESSION constant in
+#       # services/verification_detector/detector.py (100).
 #       max_turns_per_session: 100
+#       # Live — extracted items whose detection_type isn't listed here are
+#       # dropped before dedup/insert.
 #       detection_types:
 #         - correction
 #         - confirmation
 #         - unprompted_definition
 #
+#   # Not yet wired (#1971): the collector and verification processor build
+#   # their LLM extractor from the top-level ai.* section, and both run their
+#   # sensitivity/contradiction checks unconditionally.
 #   extraction:
 #     model: "claude-haiku-4-5-20251001"
 #     sensitivity_check: true
@@ -873,6 +889,8 @@ ai:
 #     enabled: true
 #     max_candidates: 10
 #
+#   # Not yet wired (#1971) — no extraction or resolution path reads this
+#   # section yet; entity names are extracted freeform per item instead.
 #   entity_resolution:
 #     enabled: true
 #     entities:

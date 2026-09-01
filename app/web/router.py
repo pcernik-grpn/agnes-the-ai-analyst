@@ -6262,10 +6262,20 @@ async def corporate_memory_admin(
         Path(os.environ.get("DATA_DIR", "./data")) / "corporate-memory" / "knowledge.json"
     ).exists()
 
+    # "How detection works" panel (#1957 interim hotfix): read live so the
+    # panel names the two kill-switches' CURRENT state, the same
+    # corporate_memory.sources.session_transcripts config
+    # VerificationProcessor.process_session reads fresh on every run.
+    from app.instance_config import get_corporate_memory_config
+
+    _cm_config = get_corporate_memory_config() or {}
+    session_transcripts_config = (_cm_config.get("sources") or {}).get("session_transcripts") or {}
+
     ctx = _build_context(
         request,
         user=user,
         pending_items=pending,
+        session_transcripts_config=session_transcripts_config,
         stats={
             "total": len(all_items),
             "by_status": status_counts,
