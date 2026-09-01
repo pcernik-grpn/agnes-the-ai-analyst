@@ -22,9 +22,14 @@ from scripts.release_cut import (
     bump_server_json_version,
     cut_changelog,
     has_unreleased_content,
+    main,
     plan_release_cut,
     read_pyproject_version,
+    read_released_checksum,
+    released_region,
+    released_region_sha256,
     unreleased_bullets,
+    write_released_checksum,
 )
 
 # ---------------------------------------------------------------------------
@@ -392,3 +397,156 @@ def test_plan_release_cut_rejects_unknown_bump_kind():
             bump="banana",
             date="2026-08-26",
         )
+
+
+# ---------------------------------------------------------------------------
+# released-region checksum (#1918) — shared primitives
+# ---------------------------------------------------------------------------
+
+
+def test_released_region_starts_at_the_first_released_heading():
+    region = released_region(_CL_WITH_BULLETS)
+    assert region.startswith("## [0.88.0] - 2026-08-25")
+    assert "A new user-visible thing." not in region  # that bullet is [Unreleased], not released
+    assert "Something already released." in region
+
+
+def test_released_region_is_empty_with_no_released_heading_yet():
+    only_unreleased = _CL_HEADER + "## [Unreleased]\n\n### Added\n\n- pending\n"
+    assert released_region(only_unreleased) == ""
+
+
+def test_released_region_sha256_changes_when_released_text_changes():
+    digest = released_region_sha256(_CL_WITH_BULLETS)
+    mutated = _CL_WITH_BULLETS.replace("Something already released.", "Something EDITED after shipping.")
+    assert released_region_sha256(mutated) != digest
+
+
+def test_released_region_sha256_is_stable_for_unchanged_text():
+    assert released_region_sha256(_CL_WITH_BULLETS) == released_region_sha256(_CL_WITH_BULLETS)
+
+
+def test_released_region_sha256_ignores_unreleased_edits():
+    """Only the released region is hashed — a pending ``[Unreleased]`` bullet
+    changing does not move the digest, which is what lets a feature PR keep
+    adding bullets forever without ever touching this checksum."""
+    digest = released_region_sha256(_CL_WITH_BULLETS)
+    edited_unreleased = _CL_WITH_BULLETS.replace("A new user-visible thing.", "A DIFFERENT pending thing.")
+    assert released_region_sha256(edited_unreleased) == digest
+
+
+def test_read_released_checksum_missing_is_none():
+    assert read_released_checksum(_PYPROJECT) is None
+
+
+def test_write_then_read_released_checksum_round_trips():
+    digest = "a" * 64
+    updated = write_released_checksum(_PYPROJECT, digest)
+    assert read_released_checksum(updated) == digest
+    # every other byte preserved, like bump_pyproject_version
+    assert 'name = "agnes-the-ai-analyst"' in updated
+    assert 'version = "0.88.0"' in updated
+
+
+def test_write_released_checksum_replaces_an_existing_value_in_place():
+    once = write_released_checksum(_PYPROJECT, "a" * 64)
+    twice = write_released_checksum(once, "b" * 64)
+    assert read_released_checksum(twice) == "b" * 64
+    assert twice.count("[tool.agnes]") == 1  # not duplicated on a second write
+
+
+# ---------------------------------------------------------------------------
+# wiring the checksum into the cut itself (#1918)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_release_cut_writes_the_new_released_region_checksum():
+    plan = plan_release_cut(
+        changelog_text=_CL_WITH_BULLETS,
+        pyproject_text=_PYPROJECT,
+        bump="minor",
+        date="2026-08-26",
+    )
+    assert plan.released_changelog_sha256 == released_region_sha256(plan.changelog_text)
+    assert read_released_checksum(plan.pyproject_text) == plan.released_changelog_sha256
+    # the block that was just cut is now covered by the digest
+    assert "A new user-visible thing." in released_region(plan.changelog_text)
+
+
+def test_plan_release_cut_noop_leaves_the_checksum_untouched():
+    plan = plan_release_cut(
+        changelog_text=_CL_EMPTY_UNRELEASED,
+        pyproject_text=_PYPROJECT,
+        bump="minor",
+        date="2026-08-26",
+    )
+    assert plan.noop is True
+    assert plan.released_changelog_sha256 is None
+    assert plan.pyproject_text is None
+
+
+def test_main_cut_writes_the_released_checksum_alongside_the_version_bump(tmp_path):
+    """The zero-workflow-edit design: ``main()`` already writes pyproject.toml
+    (which ``daily-cut.yml`` already ``git add``s) on every cut, so once that
+    write includes the checksum, the workflow needs no edits to pick it up."""
+    changelog = tmp_path / "CHANGELOG.md"
+    pyproject = tmp_path / "pyproject.toml"
+    changelog.write_text(_CL_WITH_BULLETS, encoding="utf-8")
+    pyproject.write_text(_PYPROJECT, encoding="utf-8")
+
+    rc = main(
+        [
+            "--changelog",
+            str(changelog),
+            "--pyproject",
+            str(pyproject),
+            "--no-server-json",
+            "--bump",
+            "minor",
+            "--date",
+            "2026-08-26",
+        ]
+    )
+    assert rc == 0
+
+    new_changelog = changelog.read_text(encoding="utf-8")
+    new_pyproject = pyproject.read_text(encoding="utf-8")
+    assert read_released_checksum(new_pyproject) == released_region_sha256(new_changelog)
+    assert 'version = "0.89.0"' in new_pyproject
+
+
+def test_main_rebaseline_rewrites_the_checksum_without_cutting(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    pyproject = tmp_path / "pyproject.toml"
+    changelog.write_text(_CL_WITH_BULLETS, encoding="utf-8")
+    pyproject.write_text(write_released_checksum(_PYPROJECT, "0" * 64), encoding="utf-8")
+
+    rc = main(["--changelog", str(changelog), "--pyproject", str(pyproject), "--rebaseline"])
+    assert rc == 0
+
+    # CHANGELOG.md is untouched — --rebaseline cuts nothing
+    assert changelog.read_text(encoding="utf-8") == _CL_WITH_BULLETS
+    assert read_released_checksum(pyproject.read_text(encoding="utf-8")) == released_region_sha256(_CL_WITH_BULLETS)
+
+
+def test_main_rebaseline_dry_run_writes_nothing(tmp_path):
+    changelog = tmp_path / "CHANGELOG.md"
+    pyproject = tmp_path / "pyproject.toml"
+    changelog.write_text(_CL_WITH_BULLETS, encoding="utf-8")
+    pyproject.write_text(_PYPROJECT, encoding="utf-8")
+
+    rc = main(["--changelog", str(changelog), "--pyproject", str(pyproject), "--rebaseline", "--dry-run"])
+    assert rc == 0
+    assert pyproject.read_text(encoding="utf-8") == _PYPROJECT
+
+
+def test_main_rebaseline_refuses_a_malformed_changelog(tmp_path):
+    dup = _CL_HEADER + "## [0.88.0] - 2026-08-25\n\n- a\n\n## [0.88.0] - 2026-08-25\n\n- b\n"
+    changelog = tmp_path / "CHANGELOG.md"
+    pyproject = tmp_path / "pyproject.toml"
+    changelog.write_text(dup, encoding="utf-8")
+    pyproject.write_text(_PYPROJECT, encoding="utf-8")
+
+    rc = main(["--changelog", str(changelog), "--pyproject", str(pyproject), "--rebaseline"])
+    assert rc == 1
+    assert pyproject.read_text(encoding="utf-8") == _PYPROJECT  # untouched on failure

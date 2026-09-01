@@ -447,3 +447,6 @@ dev-dependencies = [
 # CVE-2024-37891 / CVE-2025-{xxx}. See `urllib3>=2.7.0` in [project]
 # dependencies above for the security rationale.
 override-dependencies = ["urllib3>=2.7.0"]
+
+[tool.agnes]
+released_changelog_sha256 = "423cac31fb533b238a702971052054ef60219b148c80bcb13cfd94c167d1ff22"
