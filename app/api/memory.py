@@ -254,6 +254,19 @@ class BulkUpdateRequest(BaseModel):
     updates: dict
 
 
+class BulkRejectRequest(BaseModel):
+    """Reject every ``pending`` id in ``item_ids``. Issue #1957.
+
+    Deliberately narrower than ``BulkUpdateRequest``: no ``updates`` dict and
+    no action choice — this is a bulk REJECT only, never a generic bulk
+    status setter. See ``admin_bulk_reject`` for why there is no bulk-approve
+    counterpart.
+    """
+
+    item_ids: List[str]
+    reason: Optional[str] = None
+
+
 class ResolveDuplicateRequest(BaseModel):
     """Resolve a duplicate-candidate relation row.
 
@@ -1462,6 +1475,67 @@ async def admin_bulk_update(
         else:
             errors[item_id] = status
     return {"updated": updated, "not_found": not_found, "errors": errors}
+
+
+@router.post("/admin/bulk-reject")
+async def admin_bulk_reject(
+    request: BulkRejectRequest,
+    user: dict = Depends(require_admin),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Reject every ``pending`` id in ``item_ids`` — the bulk counterpart to
+    ``POST /admin/reject`` (issue #1957: the review queue otherwise forces an
+    admin to reject harvested candidates one at a time).
+
+    ``bulk-update`` above excludes ``status`` from its allowlist because a
+    bulk status flip would bypass the dedicated governance endpoints and
+    their per-item audit rows (PR #126 review) — that objection was about
+    AUDIT, not about bulkness. This endpoint resolves it by looping the exact
+    single-item governance path instead of a generic field setter: the same
+    status transition (``repo.update_status(item_id, "rejected")``) and the
+    same ``corporate_memory.reject`` audit action per item that a one-by-one
+    click would write (``batch: True`` in the params distinguishes it from a
+    single click, the same convention ``/admin/batch``'s reject action uses).
+
+    Only ``pending`` items are rejected. Anything else — already approved or
+    revoked, or an unknown id — is reported per-id and never raises, so one
+    stale id in a large selection can't abort the rest. 200 even on partial
+    failure, mirroring ``admin_bulk_update``.
+
+    Deliberately NO bulk-approve sibling. Approving in bulk injects items
+    into every analyst's ``.claude/rules/`` without a human reading each one
+    first (issue #1957's own warning), so that capability stays single-item
+    (``POST /admin/approve``) or on the audited-but-broader ``/admin/batch``
+    surface — this narrower, safety-focused endpoint adds no path to it.
+    """
+    repo = knowledge_repo()
+    if not request.item_ids:
+        return {"rejected": [], "not_found": [], "skipped_not_pending": [], "errors": {}}
+
+    rejected: List[str] = []
+    not_found: List[str] = []
+    skipped_not_pending: List[str] = []
+    errors: dict = {}
+    for item_id in request.item_ids:
+        try:
+            item = repo.get_by_id(item_id)
+            if not item:
+                not_found.append(item_id)
+                continue
+            if item.get("status") != "pending":
+                skipped_not_pending.append(item_id)
+                continue
+            repo.update_status(item_id, "rejected")
+            _audit_action(conn, user, "reject", item_id, {"reason": request.reason, "batch": True})
+            rejected.append(item_id)
+        except Exception as exc:  # pragma: no cover - defensive, mirrors KnowledgeRepository.bulk_update
+            errors[item_id] = f"error: {exc}"
+    return {
+        "rejected": rejected,
+        "not_found": not_found,
+        "skipped_not_pending": skipped_not_pending,
+        "errors": errors,
+    }
 
 
 # Axes the tree endpoint groups by. Anything else → 400. Order matters for

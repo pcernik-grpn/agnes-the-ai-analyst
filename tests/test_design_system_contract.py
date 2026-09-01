@@ -1460,7 +1460,6 @@ _NATIVE_DIALOG_ALLOWLIST: set[str] = {
     "agents_legacy.html",
     "catalog_legacy.html",
     "data_app_detail_legacy.html",
-    "library_detail.html",
     "library_detail_legacy.html",
     "me_connections.html",
     "me_connections_legacy.html",

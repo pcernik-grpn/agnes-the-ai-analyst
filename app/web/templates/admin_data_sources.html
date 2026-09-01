@@ -2828,6 +2828,11 @@ function renderConnList() {
   list.innerHTML = _connections.map(_connectionCardHtml).join("");
   _fillGrantPickers();
   loadTokenMismatchWarnings();
+  // The cards are painted by fetch, so the extraction poll's self-start ran
+  // against a page with no cards on it and armed nothing. `typeof` because
+  // this function belongs to a LATER script block, and the parser is free to
+  // run this fetch's continuation between the two.
+  if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();
 }
 
 /* ── Keeping the strip true after a mutation ───────────────────────────────
@@ -2912,6 +2917,10 @@ function _repaintSourceCards() {
       else head.insertAdjacentHTML("beforeend", chipHtml);
     }
   }
+  // The strip we just replaced carried the live-crawl cell. Repaint it from
+  // what the poll already knows, or a mutation blanks a running crawl until
+  // the next tick.
+  if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();
 }
 
 // A connection whose storage token and master token resolve to DIFFERENT
@@ -7594,6 +7603,32 @@ function _extSchedule() {
     await _extTick();
     _extSchedule();
   }, _extNextDelay());
+}
+
+/* Cards arrive over fetch; this script self-starts at parse time. So the
+   first tick saw an empty page, found no connection to ask about, and the
+   scheduler — reading a state map that was still empty — armed the IDLE
+   interval. The extraction block appeared a full 30s after the card it
+   belongs to, and 60s when a mutation's `loadConnections()` repainted over
+   it while that tick was in flight. Every paint of the cards now says so.
+
+   Two halves, deliberately: repaint from cache is free and always runs, so
+   a rebuilt card gets its run row back in the same frame instead of
+   blanking; the request only goes out for a connection this page cannot
+   already draw, so a mutation-driven repaint costs nothing. */
+function _extAfterCardsPainted() {
+  const ids = _extConnectionIds();
+  if (!ids.length) return;
+  let unknown = false;
+  for (const id of ids) {
+    const st = _extState[id];
+    if (st && (st.data || st.stopped)) _extRender(id);
+    else unknown = true;
+  }
+  if (!unknown) return;
+  // Returned, not swallowed: the product callers are fire-and-forget, but a
+  // caller that wants to know when the ask landed should not have to guess.
+  return _extTick().then(_extSchedule);
 }
 
 function extRetry(connId) {

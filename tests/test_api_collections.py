@@ -325,6 +325,197 @@ class TestGetCollection:
         assert resp.status_code == 404
 
 
+class TestUpdateCollection:
+    """PATCH /api/collections/{id} — the editable metadata (name, slug,
+    description). Owner-or-admin, deliberately NOT every grant-holder: a
+    grant conveys reading, and renaming somebody's collection out from under
+    them is not a read."""
+
+    def _own(self, seeded_app, name="Analyst Upload", description=None):
+        """A collection OWNED by the analyst (created with their own token)."""
+        c = seeded_app["client"]
+        body = {"name": name}
+        if description is not None:
+            body["description"] = description
+        cr = c.post("/api/collections", json=body, headers=_auth(seeded_app["analyst_token"]))
+        assert cr.status_code == 201, cr.text
+        return cr.json()["id"]
+
+    def test_owner_renames_own_collection(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Old Name")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Q3 Supplier Contracts"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["name"] == "Q3 Supplier Contracts"
+        # …and it stuck.
+        reread = c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).json()
+        assert reread["name"] == "Q3 Supplier Contracts"
+
+    def test_rename_does_not_move_the_slug(self, seeded_app):
+        """The slug is this collection's URL. Re-deriving it from a new name
+        would break every /library/{slug} link already handed out, so a rename
+        alone leaves it alone."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Keeps Its Url")
+        before = c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).json()["slug"]
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Totally Different"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["slug"] == before
+
+    def test_admin_may_edit_someone_elses_collection(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Analyst Owned")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": "Curated by an admin."},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "Curated by an admin."
+
+    def test_a_mere_grant_holder_gets_403(self, seeded_app):
+        """The regression this gate exists for: read access is not write
+        access. The caller here can open the collection and search it."""
+        c = seeded_app["client"]
+        cr = c.post(
+            "/api/collections",
+            json={"name": "Shared Not Owned"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        cid = cr.json()["id"]
+        _seed_collection_grant(cid, "analyst1")
+        # Precondition: the grant really does convey reading.
+        assert c.get(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).status_code == 200
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Renamed By A Grantee"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "collection_not_owned"
+
+    def test_description_null_clears_it(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Has Desc", description="something")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": None},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] is None
+
+    def test_empty_string_description_clears_it_too(self, seeded_app):
+        """What an HTML textarea sends when the reader empties it."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Textarea Clear", description="something")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"description": "   "},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] is None
+
+    def test_omitted_description_survives_a_rename(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Keep Desc", description="keep me")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Renamed Only"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["description"] == "keep me"
+
+    def test_slug_is_normalised(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Slug Patch")
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"slug": "My New Slug!"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["slug"] == "my-new-slug"
+
+    def test_slug_collision_is_409(self, seeded_app):
+        c = seeded_app["client"]
+        first = self._own(seeded_app, name="Slug Taken")
+        taken = c.get(f"/api/collections/{first}", headers=_auth(seeded_app["analyst_token"])).json()["slug"]
+        second = self._own(seeded_app, name="Wants That Slug")
+        resp = c.patch(
+            f"/api/collections/{second}",
+            json={"slug": taken},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"].startswith("collection_slug_conflict:")
+
+    def test_no_known_field_is_400(self, seeded_app):
+        """A client that meant to change something and named nothing has a
+        bug; answering 200 would hide it."""
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Nothing To Do")
+        for body in ({}, {"origin": "generated"}):
+            resp = c.patch(
+                f"/api/collections/{cid}",
+                json=body,
+                headers=_auth(seeded_app["analyst_token"]),
+            )
+            assert resp.status_code == 400, resp.text
+            assert "collection_nothing_to_update" in resp.json()["detail"]
+
+    def test_a_collection_cannot_be_left_nameless(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Named")
+        blank = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "   "},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert blank.status_code == 400
+        assert "collection_name_empty" in blank.json()["detail"]
+        # An explicit null is the same mistake in JSON clothing.
+        nulled = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": None},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert nulled.status_code == 400
+
+    def test_missing_collection_is_404(self, seeded_app):
+        resp = seeded_app["client"].patch(
+            "/api/collections/col_does_not_exist",
+            json={"name": "Ghost"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 404
+
+    def test_deleted_collection_is_404(self, seeded_app):
+        c = seeded_app["client"]
+        cid = self._own(seeded_app, name="Deleted Then Edited")
+        assert c.delete(f"/api/collections/{cid}", headers=_auth(seeded_app["analyst_token"])).status_code == 204
+        resp = c.patch(
+            f"/api/collections/{cid}",
+            json={"name": "Resurrected"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 404
+
+    def test_unauthenticated_is_401(self, seeded_app):
+        resp = seeded_app["client"].patch("/api/collections/col_x", json={"name": "N"})
+        assert resp.status_code == 401
+
+
 class TestDeleteCollection:
     def test_admin_soft_deletes(self, seeded_app):
         c = seeded_app["client"]
@@ -2244,6 +2435,23 @@ class TestSourceManagedCollections:
         resp = self._upload(seeded_app, corpus_id, seeded_app["analyst_token"])
         assert resp.status_code == 409, resp.text
         assert resp.json()["detail"]["error"] == "collection_source_managed"
+
+    def test_admin_edit_of_a_source_managed_collection_is_409(self, seeded_app):
+        """Same integrity rule as the upload above, one step further: the name
+        and description are derived from the source scope, so an edit here
+        would be reverted by the next sync rather than kept."""
+        corpus_id = self._seed_managed(seeded_app, corpus_name="Managed Rename", connection_id="conn-sm-edit")
+        resp = seeded_app["client"].patch(
+            f"/api/collections/{corpus_id}",
+            json={"name": "Renamed By Hand"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["error"] == "collection_source_managed"
+        assert detail["connection"] == "Corp SharePoint"
+        # The message explains the EDIT, not an upload nobody attempted.
+        assert "sync" in detail["message"]
 
     def test_orphaned_collection_is_editable_again(self, seeded_app):
         """Unticking the scope orphans the collection — from then on it is an

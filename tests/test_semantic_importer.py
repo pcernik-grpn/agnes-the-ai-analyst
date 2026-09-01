@@ -53,6 +53,45 @@ def test_unchanged_document_is_a_no_op_write(system_db):
     assert semantic_model_repo().get_by_slug("retail")["updated_at"] == first
 
 
+def _doc_with_description(slug, description, metric="revenue"):
+    return (
+        "version: '0.2.0.dev0'\n"
+        "semantic_model:\n"
+        f"  - name: {slug}\n"
+        f'    description: "{description}"\n'
+        "    datasets:\n"
+        "      - name: orders\n"
+        "        source: db.public.orders\n"
+        "    metrics:\n"
+        f"      - name: {metric}\n"
+        "        expression:\n"
+        "          dialects:\n"
+        "            - dialect: ANSI_SQL\n"
+        "              expression: SUM(amount)\n"
+    )
+
+
+def test_a_freshly_synced_model_projects_the_documents_description_onto_the_row(system_db):
+    """#1955: the row's own `description` column used to stay NULL for every
+    model a sync wrote, so an imported model with no manual edit rendered
+    with no subtitle in the Library even though its document has one. A
+    fresh import now projects the document's (first) model-level
+    description onto the row."""
+    import_documents(SOURCE, [_doc_with_description("retail", "Retail domain: orders and customers.")])
+
+    row = semantic_model_repo().get_by_slug("retail")
+    assert row["description"] == "Retail domain: orders and customers."
+
+
+def test_a_document_with_no_description_still_stores_none(system_db):
+    """No regression for the common case: a document that declares no
+    description keeps storing NULL, not an empty string or the slug."""
+    import_documents(SOURCE, [_doc("retail")])
+
+    row = semantic_model_repo().get_by_slug("retail")
+    assert row["description"] is None
+
+
 def test_invalid_document_is_stored_with_its_errors_and_does_not_abort_the_run(system_db):
     """One bad file must not cost the sync its good files."""
     report = import_documents(SOURCE, [_doc("retail"), "semantic_model: [oops"])

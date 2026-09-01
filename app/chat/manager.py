@@ -210,9 +210,7 @@ async def claim_user_message(chat_id: str, client_msg_id: Optional[str]) -> bool
         return True
     key = _msg_claim_key(chat_id, client_msg_id)
     try:
-        return await asyncio.to_thread(
-            coordination().lease_acquire, key, _MSG_CLAIM_HOLDER, ttl_s=_MSG_CLAIM_TTL_SEC
-        )
+        return await asyncio.to_thread(coordination().lease_acquire, key, _MSG_CLAIM_HOLDER, ttl_s=_MSG_CLAIM_TTL_SEC)
     except Exception:
         logger.warning(
             "message-claim backend unavailable for %s (client_msg_id=%s) — accepting the send",
@@ -233,11 +231,10 @@ async def release_user_message_claim(chat_id: str, client_msg_id: Optional[str])
     if not client_msg_id:
         return
     try:
-        await asyncio.to_thread(
-            coordination().lease_release, _msg_claim_key(chat_id, client_msg_id), _MSG_CLAIM_HOLDER
-        )
+        await asyncio.to_thread(coordination().lease_release, _msg_claim_key(chat_id, client_msg_id), _MSG_CLAIM_HOLDER)
     except Exception:
         logger.warning("could not release message claim for %s (client_msg_id=%s)", chat_id, client_msg_id)
+
 
 # Poll-fallback cadence for ChatManager._inbound_consumer_loop (wave-2F
 # task 4). The coordination-backend pub/sub notify (app.chat.inbound.
@@ -2297,6 +2294,12 @@ class ChatManager:
             "AGNES_LLM_PROVIDER": getattr(self._config, "llm_provider", "anthropic"),
             "AGNES_VERTEX_PROJECT_ID": getattr(self._config, "vertex_project_id", ""),
             "AGNES_VERTEX_REGION": getattr(self._config, "vertex_region", ""),
+            # Docker-provider egress policy (chat.docker_egress_mode), forwarded
+            # so the runner's boot-time skill-dependency warm-up (#1977) can
+            # tell there is no route to PyPI under `none` without importing
+            # app.chat.config — this file runs standalone inside the sandbox.
+            # Inert on kai-agent: that provider never runs runner.py at all.
+            "AGNES_DOCKER_EGRESS_MODE": getattr(self._config, "docker_egress_mode", "none"),
             # No ANTHROPIC_API_KEY / AGNES_TOKEN here (chat sandbox secret
             # broker hardening, 2026-07-14): the real Anthropic key never
             # enters the sandbox env. The runner's own ``_start_relay``

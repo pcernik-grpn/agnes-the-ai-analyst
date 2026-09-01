@@ -1489,6 +1489,34 @@
         "title": "BuilderTurnRequest",
         "type": "object"
       },
+      "BulkRejectRequest": {
+        "description": "Reject every ``pending`` id in ``item_ids``. Issue #1957.\n\nDeliberately narrower than ``BulkUpdateRequest``: no ``updates`` dict and\nno action choice \u2014 this is a bulk REJECT only, never a generic bulk\nstatus setter. See ``admin_bulk_reject`` for why there is no bulk-approve\ncounterpart.",
+        "properties": {
+          "item_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "item_ids"
+        ],
+        "title": "BulkRejectRequest",
+        "type": "object"
+      },
       "BulkUpdateRequest": {
         "description": "Apply ``updates`` to every id in ``item_ids``. Issue #62.",
         "properties": {
@@ -11618,6 +11646,49 @@
           }
         },
         "title": "UpdateAgentRequest",
+        "type": "object"
+      },
+      "UpdateCollectionRequest": {
+        "description": "The editable metadata of a collection \u2014 every field optional.\n\nPRESENCE is the signal, not the value: ``{\"description\": null}`` clears\nthe description while a request that omits ``description`` leaves it\nalone. The handler reads ``model_fields_set`` for exactly that reason, so\ndo NOT give these fields non-None defaults \u2014 that would erase the\ndistinction the repository layer was built to keep.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "title": "UpdateCollectionRequest",
         "type": "object"
       },
       "UpdateConnectionBody": {
@@ -40230,6 +40301,77 @@
         "tags": [
           "collections"
         ]
+      },
+      "patch": {
+        "description": "Rename a collection or change its description/slug (owner or admin).\n\nThe gate is deliberately OWNER-OR-ADMIN rather than\n``require_collection_access``: a group grant conveys READ access, and a\ngrantee renaming somebody else's collection out from under them is not a\nread. Same predicate as ``delete_collection`` below, so the two\nowner-level actions on a collection agree about who may take them.\n\nPresence-based, per field: a field the request omits is untouched, and\n``description: null`` clears it. Editing NOTHING is a 400 rather than a\nsilent 200 \u2014 a client that meant to change something and named no known\nfield has a bug, and answering \"fine\" hides it.\n\n``slug`` is normalised the same way ``create_collection`` normalises it,\nso a patched slug always resolves via ``/library/{slug}``; a collision on\nthe unique index returns **409**. Renaming does NOT move the slug on its\nown: the slug is this collection's URL, and silently re-deriving it from\nthe new name would break every link and bookmark already pointing here.\nCallers that want the URL to follow the name pass both.\n\nA **source-managed** collection (fed by a connection's confirmed scope)\nis refused with the same typed **409** the upload path uses: its name is\nderived from the source scope, so a rename here would be silently\nreverted by the next sync \u2014 the \"a scheduled sync must not revert a\ndownstream edit\" rule the semantic layer states as ``409 source_owned``.",
+        "operationId": "update_collection_api_collections__collection_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "collection_id",
+            "required": true,
+            "schema": {
+              "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Collection",
+        "tags": [
+          "collections"
+        ]
       }
     },
     "/api/collections/{collection_id}/files": {
@@ -48036,6 +48178,70 @@
           }
         },
         "summary": "Admin Batch",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/api/memory/admin/bulk-reject": {
+      "post": {
+        "description": "Reject every ``pending`` id in ``item_ids`` \u2014 the bulk counterpart to\n``POST /admin/reject`` (issue #1957: the review queue otherwise forces an\nadmin to reject harvested candidates one at a time).\n\n``bulk-update`` above excludes ``status`` from its allowlist because a\nbulk status flip would bypass the dedicated governance endpoints and\ntheir per-item audit rows (PR #126 review) \u2014 that objection was about\nAUDIT, not about bulkness. This endpoint resolves it by looping the exact\nsingle-item governance path instead of a generic field setter: the same\nstatus transition (``repo.update_status(item_id, \"rejected\")``) and the\nsame ``corporate_memory.reject`` audit action per item that a one-by-one\nclick would write (``batch: True`` in the params distinguishes it from a\nsingle click, the same convention ``/admin/batch``'s reject action uses).\n\nOnly ``pending`` items are rejected. Anything else \u2014 already approved or\nrevoked, or an unknown id \u2014 is reported per-id and never raises, so one\nstale id in a large selection can't abort the rest. 200 even on partial\nfailure, mirroring ``admin_bulk_update``.\n\nDeliberately NO bulk-approve sibling. Approving in bulk injects items\ninto every analyst's ``.claude/rules/`` without a human reading each one\nfirst (issue #1957's own warning), so that capability stays single-item\n(``POST /admin/approve``) or on the audited-but-broader ``/admin/batch``\nsurface \u2014 this narrower, safety-focused endpoint adds no path to it.",
+        "operationId": "admin_bulk_reject_api_memory_admin_bulk_reject_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRejectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Bulk Reject",
         "tags": [
           "memory"
         ]
