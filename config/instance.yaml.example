@@ -1393,6 +1393,20 @@ extraction:
     # a run that draws a cluster of large files early. 0 disables the RSS
     # trigger; convert_recycle_after_docs above still applies.
     convert_recycle_rss_mb: 512
+    # Each conversion worker's OWN memory ceiling (RLIMIT_AS), in MiB,
+    # installed once right after it starts. A SEPARATE guard from the two
+    # above: recycling holds the STEADY STATE down, but a single
+    # pathological document (a spreadsheet loaded whole into memory, a
+    # crafted PDF) can still spike ONE worker past the container's own
+    # limit in isolation, and the kernel then SIGKILLs whichever child
+    # happens to be allocating at that moment -- not necessarily the file
+    # that caused it. Capping the worker itself turns that into a plain,
+    # ATTRIBUTABLE conversion failure for the file that hit the ceiling,
+    # instead of collateral damage to an innocent sibling. Raising the
+    # container's own memory limit is NOT a fix for this -- it only moves
+    # the ceiling a single heavy document can still reach. 0 disables the
+    # cap; not enforceable on every platform (notably macOS).
+    convert_child_memory_limit_mb: 1536
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.

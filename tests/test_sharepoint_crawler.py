@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -832,6 +833,115 @@ class TestConvertProcessPoolRecycling:
             # other crash.
             pool.repair()
             assert pool.convert(0, f_ok, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+
+class TestConvertChildMemoryLimit:
+    """The per-child RLIMIT_AS ceiling (`_install_memory_limit`) and the
+    operator-facing wording that distinguishes ITS failures from an
+    external-pressure SIGKILL — a second, live-deployment finding on top of
+    recycling: recycling holds the STEADY STATE down, but a single
+    pathological document (an .xlsx openpyxl loads whole into memory, in
+    one observed case) can still spike ONE worker past the container's own
+    ceiling in isolation, and the kernel's OOM killer then SIGKILLs
+    whichever child happens to be allocating at that moment — not
+    necessarily the file that caused it.
+    """
+
+    def test_memory_error_is_worded_as_the_files_own_limit(self, crawl_env, monkeypatch):
+        """A `MemoryError` from `convert_to_markdown` — whether raised by
+        the RLIMIT_AS ceiling for real or (as simulated here, portably) by
+        the converter itself — is counted convert_failed with a detail
+        that names the cause plainly and attributes it to THIS file, never
+        a bare `MemoryError` a reader has to already know the mechanism to
+        interpret."""
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(MemoryError())
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+
+    def test_a_sigkill_crash_is_worded_as_external_pressure_not_the_files_fault(self):
+        detail = crawler._convert_crash_detail("SIGKILL")
+        assert "SIGKILL" in detail
+        assert "may not be this file's fault" in detail
+
+    def test_a_non_sigkill_crash_is_worded_as_a_plain_crash(self):
+        detail = crawler._convert_crash_detail("SIGABRT")
+        assert detail == "conversion worker crashed: SIGABRT"
+        assert "may not be this file's fault" not in detail
+
+    def test_installing_a_tiny_limit_never_raises_out_of_the_child(self, tmp_path, monkeypatch):
+        """`_install_memory_limit` is best-effort by design (RLIMIT_AS is
+        not settable on every platform, notably macOS, where this repo's
+        own tests run) — a platform that refuses the syscall must still
+        convert normally, not lose the whole child to an unhandled
+        exception raised while merely trying to install its own safety
+        net."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        # 1 MiB: far below what even a bare Python interpreter maps, so on
+        # a platform that DOES enforce this it would fail every real
+        # conversion too -- the point here is only that installing it does
+        # not crash the worker outright.
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=1024 * 1024)
+        pool.start()
+        try:
+            assert pool._procs[0].is_alive()
+        finally:
+            pool.shutdown()
+
+    @staticmethod
+    def _current_vsz_bytes() -> int:
+        """This (the TEST) process's own current virtual memory size, from
+        /proc/self/status -- Linux only, which is fine since every caller
+        is itself gated to Linux. A freshly forked child's own baseline
+        starts at approximately this, so it calibrates the test below
+        against whatever THIS runner's actual baseline happens to be,
+        rather than a guessed constant that could be a false positive (too
+        tight, tripped by ordinary interpreter overhead on a heavier CI
+        image) or a false negative (too loose to ever exercise the
+        ceiling) on a machine this test has never seen."""
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+        raise RuntimeError("VmSize not found in /proc/self/status")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
+    def test_a_runaway_allocation_is_capped_on_linux(self, tmp_path, monkeypatch):
+        """The REAL enforcement, not a simulation — only meaningful (and
+        only run) on Linux, this module's deployment target and where the
+        memory pressure this guards against was observed. A conversion
+        that tries to allocate well past a tight, real RLIMIT_AS ceiling
+        gets a genuine MemoryError, attributed to the file that caused it,
+        not a SIGKILL that could be blamed on an innocent sibling."""
+        baseline = self._current_vsz_bytes()
+        limit = baseline + 100 * 1024 * 1024  # headroom over THIS runner's own baseline
+        over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
+
+        def _convert(path, mime):
+            data = bytearray(over_allocation)
+            data[0] = 1
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=limit)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert not outcome.ok
+            assert outcome.detail_type == "MemoryError"
         finally:
             pool.shutdown()
 
