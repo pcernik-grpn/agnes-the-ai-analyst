@@ -602,7 +602,7 @@ into the same runner frame protocol the native provider speaks, and the web
 client renders it over the existing WebSocket with no frontend changes —
 history, mid-turn reconnect replay, message-rate limits and the per-user
 concurrency cap all behave as with the native provider. (Token-derived caps
-do not — see the limitations below.)
+apply too, metered from broker-observed usage — see the limitations below.)
 
 ```yaml
 chat:
