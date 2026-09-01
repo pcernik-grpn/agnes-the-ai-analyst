@@ -2138,3 +2138,57 @@ def distribution_object_store_config() -> Optional[dict]:
         "access_key": access_key,
         "secret_key": secret_key,
     }
+
+
+#: The four per-feature SharePoint switches that `sharepoint.enabled` replaced.
+#: Each entry is ``(env_var, yaml_path)``. Kept as data rather than four
+#: hand-written checks so a fifth retirement is one tuple, not another branch.
+_RETIRED_SHAREPOINT_FLAGS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("AGNES_EXTRACTION_ENABLED", ("extraction", "enabled")),
+    ("AGNES_EXTRACTION_WEBHOOK_ENABLED", ("extraction_webhook", "enabled")),
+    ("AGNES_ACL_MIRRORING_ENABLED", ("acl_mirroring", "enabled")),
+    ("AGNES_ACL_ZONES_ENABLED", ("acl_sync", "zones_enabled")),
+)
+
+
+def warn_retired_sharepoint_flags() -> list[str]:
+    """Warn once per retired SharePoint switch that is still set.
+
+    The four flags below were replaced by the single ``sharepoint.enabled``
+    (``AGNES_SHAREPOINT_ENABLED``). Nothing reads them any more — which is
+    the hazard: an instance that runs extraction, the webhook receiver or
+    ACL mirroring today has one of them set and NOT the new one, so the
+    upgrade turns the whole connector off with nothing in the log saying
+    why. Extraction stops, the receiver 404s, ACL mirroring stops, and the
+    only clue is data quietly going stale.
+
+    Warning is all this does: it deliberately does NOT infer the new switch
+    from an old one. A flag that turns a data-ingesting, ACL-mirroring
+    connector back on is an operator's decision, and guessing it from a
+    retired key would be the same silent behaviour in the opposite
+    direction. Same shape as :func:`get_ui_layout`'s retired-value warning.
+
+    Returns the env-var names warned about, so a caller (and the test) can
+    assert on the result instead of scraping the log.
+    """
+    warned: list[str] = []
+    new_switch_set = bool(os.environ.get("AGNES_SHAREPOINT_ENABLED")) or get_value(
+        "sharepoint", "enabled", default=None
+    ) is not None
+    for env_var, path in _RETIRED_SHAREPOINT_FLAGS:
+        if os.environ.get(env_var) is None and get_value(*path, default=None) is None:
+            continue
+        warned.append(env_var)
+        tail = (
+            "`sharepoint.enabled` is set, so the connector's state comes from there."
+            if new_switch_set
+            else "SET `sharepoint.enabled: true` (or AGNES_SHAREPOINT_ENABLED=1) OR THE "
+            "WHOLE SHAREPOINT CONNECTOR IS OFF — extraction, the Graph change-notification "
+            "receiver and source-ACL mirroring all stop."
+        )
+        _warn_once(
+            f"retired_sharepoint_flag:{env_var}",
+            f"{'.'.join(path)} ({env_var}) is retired and no longer read; "
+            f"it was replaced by the single sharepoint.enabled switch. {tail}",
+        )
+    return warned
