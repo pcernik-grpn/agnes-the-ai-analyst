@@ -195,6 +195,26 @@ _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS = 40
 #: (``extraction.crawler.convert_recycle_rss_mb``); 0 disables it (the
 #: document-count trigger above still applies).
 _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
+#: Each conversion child's OWN virtual-address-space ceiling (``RLIMIT_AS``,
+#: installed once, right after fork — see ``_install_memory_limit``).
+#: Insurance against a SEPARATE live-deployment finding from the one above:
+#: recycling holds the STEADY STATE (per-child RSS observed at 530-760 MB
+#: across 11 children), but a single pathological document can still spike
+#: ONE child past the container's own ceiling in isolation — an .xlsx that
+#: openpyxl loads whole into memory, in one observed case — and the kernel's
+#: OOM killer then SIGKILLs whichever child happens to be allocating at that
+#: moment, which is NOT necessarily the file that caused the spike (see
+#: ``_ConvertCrashed``'s external-pressure framing). Capping the CHILD
+#: rather than the container makes the common case attributable: a runaway
+#: document now raises a plain ``MemoryError`` inside the process that read
+#: it, reported as an ordinary ``convert_failed`` for THAT file, before it
+#: can pressure any sibling. Raising the container's own memory limit is
+#: NOT a fix for this — it only moves the ceiling a single heavy document
+#: can still reach (observed at 4 GiB, then 12 GiB, then 20 GiB on the live
+#: instance). Configurable (``extraction.crawler.convert_child_memory_limit_mb``);
+#: 0 disables the cap. Not enforceable on every platform (notably macOS,
+#: where this repo's tests run) — see ``_install_memory_limit``.
+_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS
@@ -2009,21 +2029,60 @@ def _peak_rss_bytes() -> int:
     return peak * 1024 if sys.platform == "linux" else peak
 
 
-def _convert_worker_main(conn: Connection) -> None:
+def _install_memory_limit(limit_bytes: int) -> None:
+    """Cap THIS (child) process's own virtual address space at
+    ``limit_bytes`` — see :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for
+    why. Call ONCE, right after fork, before the first document — the
+    ceiling applies for the rest of this process's life.
+
+    ``RLIMIT_AS`` (not ``RLIMIT_DATA``, which modern glibc's ``mmap``-backed
+    large-allocation path bypasses entirely past its threshold, and not
+    ``RLIMIT_RSS``, a pure no-op on Linux since kernel 2.6.9) is the one
+    resource limit that reliably turns "this process is about to blow
+    through its budget" into a plain Python ``MemoryError`` at the
+    allocation that crosses it — caught by :func:`_convert_worker_main`'s
+    own ``except Exception``, exactly like any other conversion failure,
+    ATTRIBUTED to the file whose conversion was in progress.
+
+    Best-effort and silent: ``RLIMIT_AS`` is not settable on every
+    platform — notably macOS, where this repo's own tests run, refuses to
+    lower it at all — so a platform that cannot install this safety net
+    still converts, rather than refusing to start. Linux (this module's
+    deployment target, and where the memory pressure this guards against
+    was observed) enforces it reliably. 0 disables the cap outright.
+    """
+    if limit_bytes <= 0:
+        return
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0) -> None:
     """Entry point for a dedicated conversion child process — runs ONLY
     inside a forked child, never called directly.
 
-    Loops reading ``(tmp_path_str, mime)`` off ``conn`` and replying with a
+    Installs this worker's own memory ceiling (see
+    :func:`_install_memory_limit`) once, then loops reading
+    ``(tmp_path_str, mime)`` off ``conn`` and replying with a
     :class:`_ConvertReply`. An ordinary Python exception from
-    :func:`convert_to_markdown` is caught HERE, exactly like the
-    pre-isolation code did, and turned into the same kind of failure — both
-    ``type(exc).__name__`` and ``str(exc)`` cross back (see
-    :class:`_ConvertOutcome` for why sending both is safe: what to DO with
-    the message is the parent's scope-aware decision, not this function's).
-    A native crash bypasses this function's `try/except` entirely by
-    definition; the parent notices this worker is gone via the pipe closing
-    (``EOFError`` on its next ``recv``), not via anything sent from here.
+    :func:`convert_to_markdown` — including a ``MemoryError`` from hitting
+    that ceiling — is caught HERE, exactly like the pre-isolation code did,
+    and turned into the same kind of failure — both ``type(exc).__name__``
+    and ``str(exc)`` cross back (see :class:`_ConvertOutcome` for why
+    sending both is safe: what to DO with the message is the parent's
+    scope-aware decision, not this function's). A native crash — or a
+    SIGKILL from memory pressure OUTSIDE this process's own control, the
+    one case the memory ceiling above cannot turn into an ordinary
+    exception, because the kernel does not ask first — bypasses this
+    function's `try/except` entirely by definition; the parent notices this
+    worker is gone via the pipe closing (``EOFError`` on its next
+    ``recv``), not via anything sent from here.
     """
+    _install_memory_limit(memory_limit_bytes)
     while True:
         try:
             task = conn.recv()
@@ -2145,6 +2204,14 @@ class _ConvertProcessPool:
     unaffected either way — still counted ``convert_failed``, still logged
     with its signal — only whether a DIFFERENT, later file on the same slot
     in the same page has to wait for the next page boundary changes.
+
+    Every worker this pool ever forks — active or spare — also gets its own
+    ``RLIMIT_AS`` ceiling (``memory_limit_bytes``, installed inside the
+    child by :func:`_install_memory_limit`; see
+    :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for the full reasoning),
+    so a single pathological document raises an ATTRIBUTABLE
+    ``MemoryError`` for the file that caused it instead of pressuring the
+    whole container and getting an arbitrary sibling SIGKILLed.
     """
 
     def __init__(
@@ -2154,11 +2221,13 @@ class _ConvertProcessPool:
         ctx: Optional[Any] = None,
         recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
         recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
+        memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
     ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
         self._size = max(1, int(size))
         self._recycle_after_docs = max(0, int(recycle_after_docs))
         self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
+        self._memory_limit_bytes = max(0, int(memory_limit_bytes))
         self._procs: List[Optional[Any]] = [None] * self._size
         self._conns: List[Optional[Connection]] = [None] * self._size
         self._doc_counts: List[int] = [0] * self._size
@@ -2181,7 +2250,7 @@ class _ConvertProcessPool:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
         proc = self._ctx.Process(
             target=_convert_worker_main,
-            args=(child_conn,),
+            args=(child_conn, self._memory_limit_bytes),
             daemon=True,
             name=f"sp-convert-{slot}",
         )
@@ -2195,7 +2264,7 @@ class _ConvertProcessPool:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
         proc = self._ctx.Process(
             target=_convert_worker_main,
-            args=(child_conn,),
+            args=(child_conn, self._memory_limit_bytes),
             daemon=True,
             name=f"sp-convert-{slot}-spare",
         )
@@ -2419,6 +2488,29 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
     return anonymized_path, filename
 
 
+#: Signals whose only realistic cause on this pool is memory pressure
+#: applied from OUTSIDE the crashed worker's own accounting — the kernel's
+#: OOM killer picking whichever child happens to be allocating at the
+#: moment a memory cgroup hits its ceiling, per `_ConvertProcessPool`'s
+#: RLIMIT_AS section. A worker's OWN ceiling turns that same failure mode
+#: into a `MemoryError`, handled separately (see `_prepare_document`), so a
+#: SIGKILL that still reaches here was never given the chance to attribute
+#: itself. Every OTHER signal (SIGABRT, SIGSEGV, SIGBUS, ...) is a native
+#: abort raised BY the conversion backend on THIS file's own content —
+#: attributable, and worded as a plain crash.
+_EXTERNAL_PRESSURE_SIGNALS = frozenset({"SIGKILL"})
+
+
+def _convert_crash_detail(signal_name: str) -> str:
+    """The operator-facing wording for a :class:`_ConvertCrashed` failure —
+    deliberately different for a SIGKILL (see :data:`_EXTERNAL_PRESSURE_SIGNALS`)
+    than for any other signal, so a reader is never left guessing whether
+    the FILE is at fault or was collateral damage from a sibling's spike."""
+    if signal_name in _EXTERNAL_PRESSURE_SIGNALS:
+        return f"conversion worker killed by memory pressure outside its control ({signal_name}) — may not be this file's fault"
+    return f"conversion worker crashed: {signal_name}"
+
+
 def _prepare_document(
     tmp_path: Path,
     *,
@@ -2462,14 +2554,28 @@ def _prepare_document(
     conversion exception can quote a fragment of the very file it read. A
     native crash's ``detail`` (the signal name) is never document content,
     so it is kept for both.
+
+    A ``MemoryError`` (own-limit) failure and a signal crash's ``detail``
+    are DELIBERATELY worded differently (owner decision 2026-09-01, live
+    deployment #2): the former is a document this pool's own
+    ``RLIMIT_AS`` ceiling attributes to THIS file with certainty; the
+    latter, when the signal is ``SIGKILL`` specifically, is the kernel's
+    OOM killer reaching in from OUTSIDE this process's own accounting and
+    may have picked this file's worker only because it happened to be
+    allocating at the wrong moment — an operator reading a bare
+    ``SIGKILL`` cannot tell those apart, so :func:`_convert_crash_detail`
+    says so explicitly.
     """
     source_sha256 = _sha256_file(tmp_path)
     try:
         if convert_pool is not None:
             outcome = convert_pool.convert(convert_slot, tmp_path, mime)
             if not outcome.ok:
-                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, outcome.detail_type)
-                detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
+                if outcome.detail_type == "MemoryError":
+                    detail = "exceeded its own memory limit"
+                else:
+                    detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
+                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
                 return _PreparedDocument("convert_failed", detail=detail)
             markdown = outcome.markdown
         else:
@@ -2483,8 +2589,9 @@ def _prepare_document(
         # skipped exactly like an ordinary conversion failure; the crawl
         # continues with the next file, and this process — the one running
         # the crawl loop — was never at risk.
-        logger.warning("sharepoint crawl: conversion worker crashed for %s: %s", path, exc.signal_name)
-        return _PreparedDocument("convert_failed", detail=f"conversion worker crashed: {exc.signal_name}")
+        detail = _convert_crash_detail(exc.signal_name)
+        logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
+        return _PreparedDocument("convert_failed", detail=detail)
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
         detail = _convert_failure_detail(type(exc).__name__, str(exc), anonymize=anonymize)
@@ -3376,6 +3483,22 @@ def _convert_recycle_rss_bytes() -> int:
     return mb * 1024 * 1024
 
 
+def _convert_child_memory_limit_bytes() -> int:
+    """``extraction.crawler.convert_child_memory_limit_mb``, resolved to
+    bytes — see :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB`. 0 disables
+    the per-child memory cap."""
+    from app.instance_config import get_value
+
+    raw = get_value(
+        "extraction", "crawler", "convert_child_memory_limit_mb", default=_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+    )
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+    return mb * 1024 * 1024
+
+
 def _crawl_concurrency() -> int:
     """``extraction.crawler.concurrency`` — how many items of ONE delta page
     the crawl pipelines at a time.
@@ -3637,6 +3760,7 @@ async def _run_crawl_async(
         cap,
         recycle_after_docs=_convert_recycle_after_docs(),
         recycle_rss_bytes=_convert_recycle_rss_bytes(),
+        memory_limit_bytes=_convert_child_memory_limit_bytes(),
     )
     convert_pool.start()
     auth = GraphAuth(
