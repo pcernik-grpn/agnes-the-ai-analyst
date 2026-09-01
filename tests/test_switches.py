@@ -149,10 +149,13 @@ class TestPortedFlagsAreUnchanged:
             "AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             True,
         ),
+        # `default` is False since the #1656 audit follow-up (was
+        # grandfathered on); the config key and env var are what this class
+        # pins as unchanged.
         "mcp_query_param_token": (
             ("mcp", "allow_query_param_token"),
             "AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN",
-            True,
+            False,
         ),
     }
 
