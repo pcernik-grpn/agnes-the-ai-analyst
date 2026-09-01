@@ -863,6 +863,47 @@ def test_worker_loop_reaps_stuck_jobs(worker_db):
     assert row["error"] == "lease expired after max attempts"
 
 
+def test_heartbeat_keeps_a_short_lease_alive_across_a_longer_running_handler(worker_db):
+    """A short ``lease_seconds`` must not become a de facto duration cap.
+
+    Regression guard for ``app/worker/kinds.py``'s lease-sizing fix
+    (several kinds — ``data-refresh``, ``corpus-extraction``,
+    ``sharepoint-subtree-sweep`` — moved from a lease sized to their own
+    expected DURATION to one sized to the heartbeat CADENCE instead): the
+    heartbeat renews the lease every ``lease_seconds/3`` for as long as the
+    handler thread is alive, so a handler that legitimately runs LONGER
+    than its own ``lease_seconds`` must still complete normally — never
+    get reclaimed by a second slot mid-run — as long as it keeps
+    heartbeating. Proves the small default those kinds now share doesn't
+    quietly reintroduce a duration cap by the back door."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    lease_seconds = 1  # heartbeat every max(1/3, 0.5) = 0.5s
+    handler_duration_s = 1.5  # 1.5x the lease's own nominal length
+
+    def slow_handler(payload: dict) -> None:
+        time.sleep(handler_duration_s)
+
+    register_kind(
+        JobKind(name="slow_short_lease_test", handler=slow_handler, lane=LIGHT_LANE, lease_seconds=lease_seconds)
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("slow_short_lease_test", {})
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 2.2))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "done", (
+        f"expected the handler to complete normally despite outliving its own lease_seconds "
+        f"({lease_seconds}s < {handler_duration_s}s handler duration) — got status={row['status']!r}; "
+        f"a short lease must be kept alive by the heartbeat, not treated as a run-time ceiling"
+    )
+    assert row["attempts"] == 1, "job was claimed more than once — the heartbeat failed to keep the lease alive"
+
+
 # ---------------------------------------------------------------------------
 # observability (three-plane wave 2D, task 2): job-queue + worker metrics
 # ---------------------------------------------------------------------------
