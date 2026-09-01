@@ -346,6 +346,133 @@ class TestUserMessageIdempotency:
 
         asyncio.run(_run())
 
+    def test_the_claim_itself_admits_exactly_one_of_two_racing_callers(self):
+        """The primitive the guard rests on: ``lease_acquire`` is set-if-absent,
+        so of N concurrent claims on one key exactly one returns True."""
+        from app.chat.manager import claim_user_message
+
+        async def _run():
+            results = await asyncio.gather(
+                *[claim_user_message("chat_x", "submit-1") for _ in range(5)]
+            )
+            assert results.count(True) == 1
+
+        asyncio.run(_run())
+
+    def test_two_interleaved_sends_of_one_submit_persist_one_row(self, tmp_path, monkeypatch):
+        """Review finding on the first push: the process-local set was a
+        check-then-act — two coroutines could both pass it before either
+        recorded the id, and there IS a suspension point between the two (the
+        sender-limit gate). Forced here, because whether that gate actually
+        yields is an implementation detail this guard must not depend on.
+
+        Verified to FAIL (two rows) with the atomic claim stubbed out, so it
+        pins the fix rather than the fast path in front of it."""
+        mgr = _make_manager(tmp_path)
+        real_limits = mgr._enforce_sender_limits
+
+        async def _yielding_limits(*args, **kwargs):
+            await asyncio.sleep(0)          # hand control to the other send
+            return await real_limits(*args, **kwargs)
+
+        monkeypatch.setattr(mgr, "_enforce_sender_limits", _yielding_limits)
+
+        async def _run():
+            s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
+            ws = MagicMock()
+            ws.send_json = AsyncMock()
+            _seat_live(mgr, s.id, sinks=[SinkEntry(participant_email="u@x", sink=ws)])
+            await asyncio.gather(
+                mgr.send_user_message(s.id, "same question", client_msg_id="submit-1"),
+                mgr.send_user_message(s.id, "same question", client_msg_id="submit-1"),
+            )
+            msgs = [m for m in mgr._repo.list_messages(s.id) if m.role == "user"]
+            assert len(msgs) == 1
+
+        asyncio.run(_run())
+
+    def test_a_claim_is_released_when_the_persist_itself_fails(self, tmp_path):
+        """A burned claim over a row that was never written would turn the
+        client's retry into a silently dropped question."""
+        mgr = _make_manager(tmp_path)
+
+        async def _run():
+            s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
+            ws = MagicMock()
+            ws.send_json = AsyncMock()
+            _seat_live(mgr, s.id, sinks=[SinkEntry(participant_email="u@x", sink=ws)])
+            real_append = mgr._repo.append_message
+            calls = {"n": 0}
+
+            def _flaky(**kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1 and kwargs.get("role") == "user":
+                    raise RuntimeError("db blip")
+                return real_append(**kwargs)
+
+            mgr._repo.append_message = _flaky  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="db blip"):
+                await mgr.send_user_message(s.id, "q", client_msg_id="submit-1")
+            assert [m for m in mgr._repo.list_messages(s.id) if m.role == "user"] == []
+            # The retry of the SAME submit must land.
+            await mgr.send_user_message(s.id, "q", client_msg_id="submit-1")
+            assert len([m for m in mgr._repo.list_messages(s.id) if m.role == "user"]) == 1
+
+        asyncio.run(_run())
+
+    def test_the_claim_fails_open_when_coordination_is_unavailable(self, tmp_path, monkeypatch):
+        """A guard against duplicates must never become a reason a real
+        question is dropped."""
+        import app.chat.manager as mgr_mod
+
+        def _boom(*a, **k):
+            raise RuntimeError("coordination down")
+
+        monkeypatch.setattr(mgr_mod, "coordination", _boom)
+
+        async def _run():
+            assert await mgr_mod.claim_user_message("chat_x", "submit-1") is True
+
+        asyncio.run(_run())
+
+    def test_no_id_never_claims_anything(self, tmp_path, monkeypatch):
+        """Slack, headless and the agent runtime pass no id — they must not
+        start writing claims into the coordination backend."""
+        import app.chat.manager as mgr_mod
+
+        calls: list[str] = []
+
+        def _tracked():
+            calls.append("coordination")
+            raise AssertionError("claim_user_message touched the backend for a send with no id")
+
+        monkeypatch.setattr(mgr_mod, "coordination", _tracked)
+
+        async def _run():
+            assert await mgr_mod.claim_user_message("chat_x", None) is True
+            await mgr_mod.release_user_message_claim("chat_x", None)
+
+        asyncio.run(_run())
+        assert calls == []
+
+    def test_the_thin_producer_claims_through_the_same_helper(self, tmp_path):
+        """The forwarded path is where a role-split deployment persists, so a
+        guard that lived only in the manager's process would not cover it."""
+        from app.chat.manager import produce_inbound_user_message
+
+        mgr = _make_manager(tmp_path)
+
+        async def _run():
+            s = await mgr.create_session(user_email="u@x", surface=Surface.WEB)
+            for _ in range(2):
+                await produce_inbound_user_message(
+                    mgr._repo, mgr._config, s.id, "forwarded", client_msg_id="submit-1"
+                )
+            msgs = [m for m in mgr._repo.list_messages(s.id) if m.role == "user"]
+            assert len(msgs) == 1
+
+        asyncio.run(_run())
+
     def test_the_accepted_id_map_is_bounded(self, tmp_path):
         from app.chat.manager import _ACCEPTED_MSG_IDS_MAX_ENTRIES
 
@@ -506,9 +633,38 @@ class TestDeepLinkRestoreIsNotSilent:
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
             "function chatErrorCopy(raw, kind) {",
         )
-        # Both fetches the restore depends on route to the failure renderer.
         assert "if (restoring && !hydrated.ok) {" in body
-        assert body.count("_renderRestoreFailure(") == 2
+        # A history failure means the conversation could not be READ — that,
+        # and only that, gets the destructive invalid-session state.
+        assert body.count("_renderRestoreFailure(") == 1
+
+    def test_a_ticket_failure_keeps_the_transcript_it_just_proved_good(self):
+        """Review finding on the first push: history had already loaded, so a
+        failed WS ticket is usually a blip — erasing the transcript, the id and
+        the URL, and saying the chat may belong to someone else, was wrong on
+        every count."""
+        body = _slice(
+            _chat_js(),
+            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "function chatErrorCopy(raw, kind) {",
+        )
+        ticket_catch = body[body.index("const t = await api(`/api/chat/sessions/${chatId}/ticket`") :]
+        assert "_renderResumeFailure(err.message);" in ticket_catch
+        # The destructive renderer is not CALLED here (the prose above the
+        # branch names it to explain why it must not be).
+        assert "_renderRestoreFailure(" not in ticket_catch
+
+    def test_the_resume_failure_renderer_destroys_nothing(self):
+        body = _slice(
+            _chat_js(),
+            "function _renderResumeFailure(detail) {",
+            "/** Open (or resume) a chat session.",
+        )
+        assert "currentChatId = null" not in body
+        assert "_syncSessionUrl(null)" not in body
+        assert 'innerHTML = ""' not in body
+        assert "showCapabilities()" not in body
+        assert "renderSystemNote(" in body       # and it says how to retry
 
     def test_the_failure_renderer_leaves_a_clean_pre_conversation_state(self):
         body = _slice(
@@ -530,6 +686,50 @@ class TestDeepLinkRestoreIsNotSilent:
         )
         assert "return { ok: false, error: err.message, count: 0 };" in body
         assert "return { ok: true, error: null, count: history.length };" in body
+
+
+class TestConcurrentOpensCannotClobberEachOther:
+    """Review finding on the first push: `openSession` sets `currentChatId`
+    before its awaits and never re-checked afterwards, so a slow open could
+    paint into a conversation the user had since switched away from and
+    overwrite the global `ws` (leaving two sockets on one frame handler).
+    Pre-existing, but the early deep-link restore makes a click landing
+    mid-open an ordinary race rather than a rare one."""
+
+    def test_every_await_in_open_session_is_followed_by_a_generation_check(self):
+        body = _slice(
+            _chat_js(),
+            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "function chatErrorCopy(raw, kind) {",
+        )
+        assert "const openGen = ++_openGeneration;" in body
+        # One after the history hydrate, one after a successful ticket mint,
+        # one in the ticket's catch, and one immediately before `ws` is claimed.
+        assert body.count("openGen !== _openGeneration") == 4
+
+    def test_the_socket_is_claimed_only_by_the_newest_open(self):
+        body = _slice(
+            _chat_js(),
+            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "function chatErrorCopy(raw, kind) {",
+        )
+        ws_claim = body.index("ws = new WebSocket(")
+        guard = body.rindex("openGen !== _openGeneration", 0, ws_claim)
+        # Nothing awaits between the last guard and the assignment.
+        assert "await" not in body[guard:ws_claim]
+
+    def test_history_render_bails_when_it_has_been_superseded(self):
+        body = _slice(
+            _chat_js(),
+            "async function loadAndRenderHistory(chatId) {",
+            "/** Put the newest message in view.",
+        )
+        assert "const gen = _openGeneration;" in body
+        assert body.count("gen !== _openGeneration") == 2, "both the success and the error path"
+        # The check sits between the fetch and any rendering.
+        fetch = body.index("history = await api(")
+        first_render = body.index("renderMessage(m)")
+        assert fetch < body.index("gen !== _openGeneration") < first_render
 
 
 class TestRestoredSessionOpensAtTheLatestMessage:
