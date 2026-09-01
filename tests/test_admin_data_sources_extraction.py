@@ -60,11 +60,14 @@ _SIGNATURES = (
     "const EXT_STOP_REASON_TEXT = {",
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
+    "function _extErrorsSummaryHtml(connId, runId, errorCount) {",
+    "async function _extLoadErrorDetail(details) {",
+    "function _extErrorItemsHtml(runDetail) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
     "function _extRender(connId) {",
-    "function _extRunsHtml(body) {",
+    "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
     "function _extConfigHtml(body) {",
 )
@@ -256,6 +259,98 @@ class TestRunRow:
         assert "<input" not in html
         assert "<select" not in html
 
+    def test_a_last_run_that_erred_on_everything_reads_as_a_failure_not_green(self):
+        """The production incident this guards: a card that shows a green
+        dot and 'done' next to 1,263 silent failures is worse than showing
+        nothing — it actively reassures. `outcome`/`status` come from the
+        SERVER's recorded status (item 4's own guard); this only checks the
+        card renders whatever the server says, honestly."""
+        failed_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 900.0,
+                "files_done": 1551,
+                "new": 0,
+                "changed": 0,
+                "unchanged": 0,
+                "errors": 1263,
+                "skips_total": 7,
+                "skips_listed": 7,
+                "usage": {},
+            },
+            "runs_total": 3,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last),
+        )
+        html = out["html"]
+        assert "ext-dot--ok" not in html
+        assert "ext-dot--danger" in html
+        assert "failed" in html
+        assert "1,263 error" in html or "1263 error" in html
+        assert "ext-danger" in html
+
+    def test_a_clean_last_run_shows_no_error_line_and_a_green_dot(self):
+        clean_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_8",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 5,
+                "new": 5,
+                "changed": 0,
+                "unchanged": 0,
+                "errors": 0,
+                "skips_total": 0,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=clean_last),
+        )
+        html = out["html"]
+        assert "ext-dot--ok" in html
+        assert "error" not in html.lower()
+
+    def test_the_error_summary_carries_the_run_id_for_the_lazy_fetch(self):
+        """`ontoggle` fetches `.../extraction/runs/{run_id}` on first open —
+        the connection id and run id must be recoverable from the markup
+        alone, since nothing else threads them to the handler."""
+        failed_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_42",
+                "outcome": "failed",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 10.0,
+                "files_done": 10,
+                "new": 0,
+                "changed": 0,
+                "errors": 10,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last),
+        )
+        html = out["html"]
+        assert 'data-conn="sp1"' in html
+        assert 'data-run="er_42"' in html
+        assert "_extLoadErrorDetail(this)" in html
+
 
 class TestDegradation:
     def test_a_501_renders_once_and_explains_itself(self):
@@ -325,7 +420,7 @@ class TestRunsDrawer:
     }
 
     def test_rows_render_outcome_duration_and_files(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         html = out["html"]
         assert "interrupted" in html
         assert "failed" in html
@@ -333,20 +428,20 @@ class TestRunsDrawer:
         assert "4m 12s" in html
 
     def test_a_failed_row_shows_its_refusal_verbatim(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         assert "sharepoint.enabled is false" in out["html"]
 
     def test_only_the_interrupted_row_gets_the_resume_reassurance(self):
         """A crash must never carry copy telling an operator its work was
         kept and will resume."""
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         html = out["html"]
         assert html.count("the next run resumes") == 1
         # …and it sits in the interrupted row, above the failed one.
         assert html.index("the next run resumes") < html.index("sharepoint.enabled is false")
 
     def test_untruncated_history_is_named_not_silently_dropped(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         assert "5 older runs not shown" in out["html"]
 
     def test_a_skip_list_shorter_than_the_skip_count_says_so(self):
@@ -364,7 +459,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")
         assert "9 not indexed" in out["html"]
         assert "7 listed by name" in out["html"]
 
@@ -386,7 +481,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early — the run hit its time ceiling" in html
         # The reason line and the resume line are INDEPENDENT: this fixture
         # pins a server that did not vouch for resumability, and the drawer
@@ -412,7 +507,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early — the run hit its time ceiling" in html
         assert "the next run resumes from where it stopped" in html
 
@@ -432,7 +527,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "the next run resumes" not in html
         assert "graph exploded" in html
 
@@ -456,7 +551,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "throttling budget was exhausted" in html
         assert "the next run resumes from where it stopped" in html
 
@@ -476,7 +571,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "quota_exhausted" in html
         assert "the next run resumes" not in html
 
@@ -493,12 +588,110 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early" not in html
 
     def test_no_runs_is_an_empty_state_not_a_blank_drawer(self):
-        out = _run_js("console.log(JSON.stringify({html: _extRunsHtml({runs: [], total: 0})}));")
+        out = _run_js("console.log(JSON.stringify({html: _extRunsHtml('sp1', {runs: [], total: 0})}));")
         assert "No extraction runs recorded yet" in out["html"]
+
+    def test_a_row_with_errors_gets_the_same_treatment_the_last_run_block_does(self):
+        """`skips_total` already gets a warn line here — `errors` must too,
+        with the run's own id threaded through for the lazy fetch."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_bad",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 900.0,
+                    "files_done": 1551,
+                    "new": 0,
+                    "changed": 0,
+                    "errors": 1263,
+                    "skips_total": 7,
+                    "skips_listed": 7,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "1,263 error" in html or "1263 error" in html
+        assert 'data-conn="sp1"' in html
+        assert 'data-run="er_bad"' in html
+        assert "7 not indexed" in html  # the pre-existing skips line, unaffected
+
+    def test_a_row_with_no_errors_gets_no_error_line(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_ok",
+                    "outcome": "done",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 12.0,
+                    "files_done": 5,
+                    "errors": 0,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "ext-errors" not in html
+
+
+class TestErrorDetail:
+    """`_extErrorItemsHtml` — the itemized rows rendered once the per-run
+    fetch (`GET …/extraction/runs/{run_id}`, A3) resolves. Its shape mirrors
+    `report.errors_detail`, the same `{items, total, listed, truncated}`
+    envelope `skips` already uses server-side."""
+
+    def _html(self, report_errors_detail):
+        detail = {"report": {"errors_detail": report_errors_detail}}
+        out = _run_js(f"console.log(JSON.stringify({{html: _extErrorItemsHtml({json.dumps(detail)})}}));")
+        return out["html"]
+
+    def test_each_item_shows_path_reason_status_and_message(self):
+        html = self._html(
+            {
+                "items": [
+                    {"path": "Reports/Q3.docx", "reason": "download_failed", "detail": "HTTP 500", "status_code": 500}
+                ],
+                "total": 1,
+                "listed": 1,
+                "truncated": False,
+            }
+        )
+        assert "Reports/Q3.docx" in html
+        assert "download_failed" in html
+        assert "HTTP 500" in html
+        assert "500" in html
+
+    def test_a_status_less_error_shows_no_invented_status(self):
+        html = self._html(
+            {
+                "items": [
+                    {"path": "Reports/Q4.docx", "reason": "ingest_failed", "detail": "boom", "status_code": None}
+                ],
+                "total": 1,
+                "listed": 1,
+                "truncated": False,
+            }
+        )
+        assert "HTTP" not in html
+        assert "boom" in html
+
+    def test_truncation_is_named_not_silently_dropped(self):
+        items = [
+            {"path": f"Reports/f{i}.docx", "reason": "download_failed", "detail": "HTTP 500", "status_code": 500}
+            for i in range(2)
+        ]
+        html = self._html({"items": items, "total": 1263, "listed": 2, "truncated": True})
+        assert "1,263" in html or "1263" in html
+        assert "2" in html
+
+    def test_no_recorded_items_is_an_honest_empty_state(self):
+        html = self._html({"items": [], "total": 0, "listed": 0, "truncated": False})
+        assert "No per-file detail" in html
 
 
 class TestStopReasonVocabularyAgrees:

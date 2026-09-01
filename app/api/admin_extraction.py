@@ -353,6 +353,14 @@ async def extraction_run_detail(
     The skip list carries ``listed`` alongside ``total``: only oversize
     skips keep a path, so a run that refused 27 documents and can name 20 of
     them says exactly that instead of implying the list is the whole story.
+
+    The per-file error detail (download/convert/ingest failures — a path, a
+    reason, an upstream status code when known, and a message) lives at
+    ``report.errors_detail``, same ``{items, total, listed, truncated}``
+    envelope. It rides inside ``report`` rather than getting its own
+    top-level key or column because it is exactly as itemizable as the rest
+    of a run's numbers, never a separate concern — the source card's
+    error-count line fetches this endpoint on first expand to render it.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
