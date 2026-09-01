@@ -560,6 +560,21 @@ def test_the_clamp_does_not_fight_the_menus_own_scrolling():
     assert "menuEl.contains(e.target)" in replacer, "a scroll from inside the menu must not trigger a re-clamp"
 
 
+def test_an_open_submenu_is_re_placed_when_the_menu_itself_scrolls():
+    """The popover is `position: fixed`, so it does not follow the row it points
+    at — it has to be re-placed. A `scroll` event on an element does not bubble,
+    and leaning on it reaching a window capture listener left the popover
+    stranded beside a row that had scrolled away. A listener bound directly to
+    the menu cannot be missed."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "on(menuEl, 'scroll'" in js, "the menu needs its own scroll listener"
+    handler = js.split("on(menuEl, 'scroll'")[1][:300]
+    assert "placeSubmenu(open)" in handler
+    assert "clampMenuHeight" not in handler, (
+        "the menu's own scrolling must not re-clamp its height — that is what reset scrollTop"
+    )
+
+
 def test_the_count_and_the_applied_chips_are_separate_rows():
     """The count is a fact about the list; the chips are the conditions that
     produced it. On one line the chips read as part of the number. They stay in

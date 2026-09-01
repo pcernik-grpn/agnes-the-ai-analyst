@@ -518,6 +518,19 @@
     // cached value before re-clamping.
     on(global, 'resize', function (e) { cssMenuMaxHeight = null; replaceOpenSubmenu(e); });
     on(global, 'scroll', replaceOpenSubmenu, true);
+    //: The menu's OWN scrolling, on a listener bound directly to it. The window
+    //: capture listener above is meant to cover this — but a `scroll` event does
+    //: not bubble, and relying on it reaching an ancestor is what left a
+    //: `position: fixed` popover stranded beside the row it no longer points at
+    //: once the menu grew tall enough to scroll. A direct listener cannot be
+    //: missed. Re-places only: the menu's height is unaffected by its own
+    //: scrolling (see `replaceOpenSubmenu`).
+    if (menuEl) {
+      on(menuEl, 'scroll', function () {
+        var open = qs('.fbar-cat.is-open', menuEl);
+        if (open) placeSubmenu(open);
+      });
+    }
 
     // Open the Filter menu with ONE category's options showing — what a chip
     // click does, so a filter is edited where it was applied. A TOGGLE facet has

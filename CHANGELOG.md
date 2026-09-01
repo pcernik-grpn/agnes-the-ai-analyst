@@ -13,6 +13,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Fixed
 
 - **The Library's item count and its applied-filter chips are two rows, not one.** The count is a fact about the list; the chips are the conditions that produced it, and on one line the chips read as part of the number. They stay in one block, one row under the other, so the split cannot recreate the older layout it replaced (count under the page title, chips two bands below).
+- **A category's values no longer drift away from the category when the filter menu scrolls.** The popover is positioned `fixed`, so it has to be re-placed as its row moves; that re-placement hung on a `scroll` event reaching a window capture listener, and a `scroll` event on an element does not bubble. Once the menu was tall enough to scroll, the values could be left stranded well below the row they belonged to. The menu now carries its own scroll listener.
 - **A long filter menu no longer runs off the bottom of the window.** The category menu opted out of the base menu's height cap — an exemption written when its popovers were positioned `absolute` and got clipped, which stopped being true once collision detection moved into the JS and made them `position: fixed`. With the Library's four new entity categories (nine on a default instance, eleven on a fully-granted one), Clear and Done sat below the fold of a 720px-tall window. The menu now scrolls, and is clamped to the room actually below its trigger rather than to a share of the viewport that ignores where it starts.
 
 ### Added
