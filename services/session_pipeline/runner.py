@@ -259,7 +259,14 @@ def run_processor(
     }
 
     repo = session_processor_state_repo()
-    candidates = repo.scan_unprocessed_for(processor.name, effective_dir)
+    # A processor may declare a ``version`` (e.g. USAGE_PROCESSOR_VERSION):
+    # bumping it makes every state row written at an older version dirty, so
+    # existing sessions re-process once and backfill whatever the new version
+    # added. The backlog drains under the same attempt/time budgets as any
+    # other work. Processors without the attribute keep pure content-hash
+    # invalidation.
+    processor_version = getattr(processor, "version", None)
+    candidates = repo.scan_unprocessed_for(processor.name, effective_dir, version=processor_version)
     stats["scanned"] = len(candidates)
 
     if not candidates:
@@ -328,7 +335,7 @@ def run_processor(
         # only for files that survived directory scan. Free with respect to
         # the attempt budget above — it never calls the (expensive, LLM-
         # driving) processor, so it can't be starved out by the cap.
-        if repo.is_processed(processor.name, session_key, file_hash):
+        if repo.is_processed(processor.name, session_key, file_hash, version=processor_version):
             stats["skipped"] += 1
             continue
 
@@ -382,6 +389,7 @@ def run_processor(
             items_count=result.items_count,
             file_hash=file_hash,
             read_at=read_at,
+            version=processor_version,
         )
         stats["processed"] += 1
         stats["items_extracted"] += result.items_count
@@ -462,8 +470,13 @@ def process_single_session(dir_name: str, filename: str) -> bool:
         read_at = datetime.now(UTC)
         file_hash = compute_file_hash(path)
 
+        # Same version-aware bookkeeping as the sweep — a bumped
+        # USAGE_PROCESSOR_VERSION invalidates the ledger row here too, so the
+        # one-shot never short-circuits on a version-stale row the sweep
+        # would re-process.
+        processor_version = getattr(UsageProcessor, "version", None)
         state = session_processor_state_repo()
-        if state.is_processed(UsageProcessor.name, session_key, file_hash):
+        if state.is_processed(UsageProcessor.name, session_key, file_hash, version=processor_version):
             return True
 
         resolved_uid, resolved_email = resolve_user_identity(dir_name)
@@ -491,6 +504,7 @@ def process_single_session(dir_name: str, filename: str) -> bool:
             items_count=result.items_count,
             file_hash=file_hash,
             read_at=read_at,
+            version=processor_version,
         )
         logger.info("One-shot usage processing: %s (%d items)", session_key, result.items_count)
         return True

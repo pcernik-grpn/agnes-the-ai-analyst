@@ -10,6 +10,7 @@ the new content rather than treating the first hash as final.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,13 @@ import duckdb
 # as ambiguous and verify with the stored file hash before discarding.
 _MTIME_SKEW_WINDOW = timedelta(milliseconds=50)
 
+# A processor that declares a ``version`` gets it recorded inside the stored
+# file_hash as ``v<version>:<md5>`` (no schema change — the DuckDB app-state
+# ladder is frozen under the A3 ratchet). Unambiguous against a bare md5:
+# hex digests carry no ``:``. The format is private to this repo and its PG
+# sibling; callers pass ``version`` and a bare content hash.
+_VERSIONED_HASH_RE = re.compile(r"^v(\d+):(.*)$")
+
 
 def _md5_file(path: Path) -> str:
     h = hashlib.md5()
@@ -28,6 +36,21 @@ def _md5_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _compose_versioned_hash(file_hash: str, version: int | None) -> str:
+    return file_hash if version is None else f"v{version}:{file_hash}"
+
+
+def _split_versioned_hash(stored: str | None) -> tuple[int | None, str | None]:
+    """``(version, content_hash)`` parsed from a stored file_hash value.
+    Legacy rows (bare md5) and NULLs come back as ``(None, stored)``."""
+    if not stored:
+        return None, stored
+    m = _VERSIONED_HASH_RE.match(stored)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, stored
 
 
 class SessionProcessorStateRepository:
@@ -39,11 +62,16 @@ class SessionProcessorStateRepository:
         processor_name: str,
         session_file: str,
         file_hash: str,
+        *,
+        version: int | None = None,
     ) -> bool:
         """True iff a state row exists for (processor_name, session_file) AND
-        the stored file_hash matches the supplied current hash. Hash mismatch
-        (e.g. session jsonl grew since last run) is treated as unprocessed
-        so the processor reprocesses on the next tick."""
+        the stored file_hash matches the supplied current hash — at the same
+        processor *version*, when one is declared. Hash mismatch (session
+        jsonl grew since last run) or version mismatch (processor bumped its
+        version to force a backfill; also covers legacy rows written before
+        the processor declared one) is treated as unprocessed so the
+        processor reprocesses on the next tick."""
         result = self.conn.execute(
             """SELECT file_hash FROM session_processor_state
                 WHERE processor_name = ? AND session_file = ?""",
@@ -51,7 +79,7 @@ class SessionProcessorStateRepository:
         ).fetchone()
         if result is None:
             return False
-        return result[0] == file_hash
+        return result[0] == _compose_versioned_hash(file_hash, version)
 
     def mark_processed(
         self,
@@ -61,14 +89,21 @@ class SessionProcessorStateRepository:
         items_count: int,
         file_hash: str,
         read_at: datetime | None = None,
+        *,
+        version: int | None = None,
     ) -> None:
         """UPSERT — overwrites previous state row for (processor, session).
 
         *read_at* should be the moment the file hash was observed; when the
         processor runs for a long time or appends to the jsonl mid-run, this
         preserves the correct mtime/ordering relationship for the next scan.
+
+        *version*, when the processor declares one, is recorded inside the
+        stored hash so a later bump invalidates the row (see ``is_processed``
+        / ``scan_unprocessed_for``).
         """
         processed_at = read_at if read_at is not None else datetime.now(UTC)
+        stored_hash = _compose_versioned_hash(file_hash, version)
         self.conn.execute(
             """INSERT INTO session_processor_state
                 (processor_name, session_file, username, processed_at, items_extracted, file_hash)
@@ -78,7 +113,7 @@ class SessionProcessorStateRepository:
                     items_extracted = excluded.items_extracted,
                     file_hash = excluded.file_hash,
                     username = excluded.username""",
-            [processor_name, session_file, username, processed_at, items_count, file_hash],
+            [processor_name, session_file, username, processed_at, items_count, stored_hash],
         )
 
     def delete_for_processors(self, processor_names: list[str]) -> int:
@@ -162,11 +197,18 @@ class SessionProcessorStateRepository:
         self,
         processor_name: str,
         session_dir: Path,
+        *,
+        version: int | None = None,
     ) -> list[tuple[str, Path]]:
         """Return (username, jsonl_path) pairs in *session_dir* that this
         processor needs to (re)process: no state row, OR state row whose
         stored hash does not match the current file content, OR state row
-        with an mtime newer than the stored ``processed_at``.
+        with an mtime newer than the stored ``processed_at``, OR — when the
+        caller declares a processor *version* — a state row written at a
+        different (or no) version. The version check must live HERE, not only
+        in ``is_processed``: the mtime precheck below skips an untouched file
+        before any hash is consulted, so without it a version bump would
+        never re-process the existing backlog (observed live 2026-09-01).
 
         ``st_mtime`` is used as a cheap precheck, but it can lag
         ``datetime.now()`` by a few milliseconds on some filesystems/VM clocks.
@@ -200,6 +242,12 @@ class SessionProcessorStateRepository:
                     results.append((username, jsonl_file))
                     continue
                 processed_at, stored_hash = known[key]
+                stored_version, stored_content_hash = _split_versioned_hash(stored_hash)
+                if version is not None and stored_version != version:
+                    # Row written at an older processor version (or before the
+                    # processor declared one) → dirty regardless of mtime.
+                    results.append((username, jsonl_file))
+                    continue
                 if processed_at is None:
                     # Defensive: row without processed_at shouldn't happen
                     # (mark_processed always sets it), but if it does,
@@ -233,9 +281,10 @@ class SessionProcessorStateRepository:
                 if (processed_at - mtime) <= _MTIME_SKEW_WINDOW:
                     # mtime is too close to processed_at to trust alone:
                     # clock skew can make a post-process write look earlier
-                    # than processed_at.  Verify the stored hash.
+                    # than processed_at.  Verify the stored hash — the content
+                    # part of it, so versioned rows don't churn here.
                     try:
-                        if _md5_file(jsonl_file) != stored_hash:
+                        if _md5_file(jsonl_file) != stored_content_hash:
                             results.append((username, jsonl_file))
                     except OSError:
                         results.append((username, jsonl_file))

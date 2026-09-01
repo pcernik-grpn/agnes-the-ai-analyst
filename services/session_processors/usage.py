@@ -43,6 +43,12 @@ _CHAT_SESSION_PREFIX = "chat-"
 class UsageProcessor:
     name: str = "usage"
     cadence_minutes: int = 10
+    #: Bumping USAGE_PROCESSOR_VERSION invalidates every session's
+    #: ``session_processor_state`` row (the runner records the version inside
+    #: the stored hash), so existing files re-process once and backfill
+    #: whatever the new version added — the behavior the version-bump comments
+    #: in src/db.py have always assumed.
+    version: int = USAGE_PROCESSOR_VERSION
 
     def process_session(
         self,

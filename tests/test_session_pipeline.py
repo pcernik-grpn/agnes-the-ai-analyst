@@ -360,11 +360,14 @@ class _FakeProcessor:
         cadence_minutes: int = 10,
         return_value: ProcessorResult | None = None,
         raise_on_session: str | None = None,
+        version: int | None = None,
     ):
         self.name = name
         self.cadence_minutes = cadence_minutes
         self.return_value = return_value if return_value is not None else ProcessorResult(items_count=0)
         self.raise_on_session = raise_on_session
+        if version is not None:
+            self.version = version
         self.calls: list[str] = []
         self.call_kwargs: list[dict] = []
         self.call_usernames: list[str] = []
@@ -449,6 +452,62 @@ class TestRunProcessor:
         # Filtered at scan via mtime precheck — see test_processed_then_skipped_on_second_call.
         assert stats2["processed"] == 0
         assert stats2["scanned"] == 0
+        conn.close()
+
+    def test_version_bump_reprocesses_unchanged_file(self, tmp_path, monkeypatch):
+        """Bumping a processor's declared ``version`` must re-process files
+        whose content — and mtime — did not change. This is what makes a
+        ``USAGE_PROCESSOR_VERSION`` bump actually backfill existing sessions;
+        without it, only files whose content changed ever advanced (live gap
+        2026-09-01: 111 files stuck at v9 across 7+ hours of sweeps)."""
+        conn = _fresh_db(tmp_path, monkeypatch)
+        sessions = tmp_path / "sessions"
+        path = _seed_session(sessions, "alice", "s.jsonl")
+        # Push the mtime well into the past so the scan's stable-file skip
+        # would win if version invalidation were missing.
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+
+        proc_v1 = _FakeProcessor(version=1, return_value=ProcessorResult(items_count=1))
+        stats1 = run_processor(conn, proc_v1, session_data_dir=sessions)
+        assert stats1["processed"] == 1
+
+        # Same version, untouched file → filtered at scan, no churn.
+        stats2 = run_processor(conn, proc_v1, session_data_dir=sessions)
+        assert stats2["scanned"] == 0
+
+        # Version bump, untouched file → re-processed exactly once.
+        proc_v2 = _FakeProcessor(version=2, return_value=ProcessorResult(items_count=1))
+        stats3 = run_processor(conn, proc_v2, session_data_dir=sessions)
+        assert stats3["processed"] == 1
+        assert proc_v2.calls == ["alice/s.jsonl"]
+
+        stats4 = run_processor(conn, proc_v2, session_data_dir=sessions)
+        assert stats4["scanned"] == 0
+        conn.close()
+
+    def test_version_backfill_respects_attempt_budget(self, tmp_path, monkeypatch):
+        """A version bump makes the whole backlog dirty at once; it must drain
+        under the existing per-tick budgets (attempt cap here, the 150s time
+        budget shares the same code path) rather than in one giant tick."""
+        conn = _fresh_db(tmp_path, monkeypatch)
+        sessions = tmp_path / "sessions"
+        old = time.time() - 3600
+        for name in ("a.jsonl", "b.jsonl", "c.jsonl"):
+            p = _seed_session(sessions, "alice", name)
+            os.utime(p, (old, old))
+
+        proc_v1 = _FakeProcessor(version=1, return_value=ProcessorResult(items_count=1))
+        assert run_processor(conn, proc_v1, session_data_dir=sessions)["processed"] == 3
+
+        proc_v2 = _FakeProcessor(version=2, return_value=ProcessorResult(items_count=1))
+        stats = run_processor(conn, proc_v2, session_data_dir=sessions, max_sessions_per_run=2)
+        assert stats["processed"] == 2
+        assert stats["capped"] == 1
+
+        # Next tick finishes the drain.
+        stats2 = run_processor(conn, proc_v2, session_data_dir=sessions, max_sessions_per_run=2)
+        assert stats2["processed"] == 1
         conn.close()
 
     def test_file_hash_invalidates_state(self, tmp_path, monkeypatch):

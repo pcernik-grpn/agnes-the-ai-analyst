@@ -264,12 +264,15 @@ class TestProcessSingleSession:
         otherwise every one-shot would be redone on the next tick."""
         from services.session_pipeline.lib import compute_file_hash
         from services.session_pipeline.runner import process_single_session
+        from services.session_processors.usage import UsageProcessor
         from src.repositories import session_processor_state_repo
 
         path = write_session(tmp_path / "user_sessions" / "u1", "s1.jsonl", _two_turn_session())
         assert process_single_session("u1", "s1.jsonl") is True
 
-        assert session_processor_state_repo().is_processed("usage", "u1/s1.jsonl", compute_file_hash(path))
+        assert session_processor_state_repo().is_processed(
+            "usage", "u1/s1.jsonl", compute_file_hash(path), version=UsageProcessor.version
+        )
 
     def test_resolves_the_uploading_user_identity(self, duckdb_instance, tmp_path):
         """The directory name is ``users.id``; the summary must carry the
@@ -298,6 +301,27 @@ class TestProcessSingleSession:
 
         row = _summary(duckdb_instance, "u1/s1.jsonl")
         assert row["input_tokens"] == 16
+
+    def test_version_bump_reprocesses_unchanged_file(self, duckdb_instance, tmp_path, monkeypatch):
+        """The one-shot must honor version invalidation exactly like the sweep:
+        after a ``USAGE_PROCESSOR_VERSION`` bump, an unchanged file is
+        re-processed (and its ledger row rewritten at the new version) instead
+        of short-circuiting on the still-matching content hash."""
+        from services.session_pipeline.lib import compute_file_hash
+        from services.session_pipeline.runner import process_single_session
+        from services.session_processors.usage import UsageProcessor
+        from src.repositories import session_processor_state_repo
+
+        path = write_session(tmp_path / "user_sessions" / "u1", "s1.jsonl", _two_turn_session())
+        assert process_single_session("u1", "s1.jsonl") is True
+
+        bumped = UsageProcessor.version + 1
+        monkeypatch.setattr(UsageProcessor, "version", bumped)
+        state = session_processor_state_repo()
+        assert not state.is_processed("usage", "u1/s1.jsonl", compute_file_hash(path), version=bumped)
+
+        assert process_single_session("u1", "s1.jsonl") is True
+        assert state.is_processed("usage", "u1/s1.jsonl", compute_file_hash(path), version=bumped)
 
     def test_a_missing_file_returns_false_instead_of_raising(self, duckdb_instance):
         """It runs as a fire-and-forget background task: a raise would surface

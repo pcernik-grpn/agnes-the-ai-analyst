@@ -236,13 +236,13 @@ writes that field, there is no drift to reconcile and no need to cross-check
 
 ### CHANGELOG merge hazards
 
-**This section describes the failure mode the dedicated cut PR (above) was
-built to eliminate.** It should now be rare — feature PRs never rename
-`[Unreleased]` or bump the version, so a long-lived feature branch merging
-`origin/main` only ever picks up a rename on main's side, not a competing
-one from its own branch. Kept for the residual manual-cut path (the
-"Emergency path when Actions dispatch isn't available" case above) and as a
-diagnostic if an old habit resurfaces.
+**The dedicated cut PR (above) eliminated failure mode 2 below, not failure
+mode 1.** Feature PRs never rename `[Unreleased]` or bump the version, so two
+branches can no longer claim the same version number — that is the collision
+class, and it is gone. Failure mode 1 is a different animal and is *not* rare:
+it needs only a merge, and on 2026-09-01 it happened four times in one day,
+once in a ~1160-line merge, each caught by hand. That is what the automated
+backstop under mode 1 exists for (#1918).
 
 Merging `origin/main` into a long-lived feature branch touches `CHANGELOG.md`
 on both sides almost every time — main keeps cutting releases while your
@@ -255,6 +255,21 @@ released instead — because your bullet and main's release-cut both touched
 the same region of the file and the merge resolved textually rather than
 semantically. The fix is mechanical: move the bullet back up into
 `[Unreleased]`. No headers are damaged; only bullet placement is wrong.
+
+**Automated backstop for failure mode 1.** `tests/test_changelog_integrity.py`
+checks a sha256 of the whole RELEASED region (everything from the first
+`## [X.Y.Z]` heading to EOF) against a digest `scripts/release_cut.py` stamps
+into `pyproject.toml`'s `[tool.agnes] released_changelog_sha256` at every cut.
+A bullet landing in an already-released block — exactly the damage above —
+changes that region's bytes and fails CI on the next push, even though it
+disturbs no heading and creates no duplicate (the file's other five guards,
+all scoped to `[Unreleased]`, stay green on it). Find the drift with `git diff
+origin/main -- CHANGELOG.md`, move the bullet back up into `[Unreleased]`, and
+push again — the stored checksum only ever needs recomputing by a real cut. If
+an edit to released history is instead deliberate and reviewed (a rare,
+explicit exception), rebaseline it with `python scripts/release_cut.py
+--rebaseline`, which recomputes and rewrites only the stored digest and cuts
+nothing.
 
 **2. Version-number collision (worse — malformed section, not just misplaced
 content).** Symptom: after the merge, `git status` reports no conflict, but

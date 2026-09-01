@@ -21,6 +21,7 @@ class ProcessorResult:
     of records the processor produced (knowledge items, events, etc.) and
     is stored in session_processor_state.items_extracted for observability —
     not load-bearing for the framework's correctness."""
+
     items_count: int = 0
 
 
@@ -36,7 +37,16 @@ class SessionProcessor(Protocol):
     cadence_minutes: int
     """How often the scheduler should invoke this processor. The actual
     schedule entry is built in services/scheduler/__main__.py from this value
-    (env-overridable per processor)."""
+    (env-overridable per processor).
+
+    A processor may additionally declare a ``version: int`` class attribute
+    (not part of the Protocol — the runner reads it via ``getattr``, so
+    existing processors need not change). When present, the runner records it
+    in ``session_processor_state`` alongside the content hash, and bumping it
+    invalidates every previously processed session — the mechanism behind
+    ``USAGE_PROCESSOR_VERSION`` backfills. Declare one only when re-processing
+    the whole backlog on a bump is affordable (the usage processor is cheap
+    and local; an LLM-driven processor may not want this)."""
 
     def process_session(
         self,

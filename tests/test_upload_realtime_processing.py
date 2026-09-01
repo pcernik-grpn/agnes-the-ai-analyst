@@ -115,6 +115,7 @@ class TestRealtimeIngestOnUpload:
         """The CLI re-pushes a session it already pushed; the hash ledger must
         absorb it — one summary row, unchanged totals, ledger still current."""
         from services.session_pipeline.lib import compute_file_hash
+        from services.session_processors.usage import UsageProcessor
         from src.repositories import session_processor_state_repo, usage_repo
 
         token = seeded_app["analyst_token"]
@@ -130,7 +131,7 @@ class TestRealtimeIngestOnUpload:
 
         path = seeded_app["env"]["data_dir"] / "user_sessions" / ANALYST_ID / "twice.jsonl"
         assert session_processor_state_repo().is_processed(
-            "usage", f"{ANALYST_ID}/twice.jsonl", compute_file_hash(path)
+            "usage", f"{ANALYST_ID}/twice.jsonl", compute_file_hash(path), version=UsageProcessor.version
         )
 
     def test_a_corrupt_upload_still_answers_ok_and_records_nothing(self, upload_client, seeded_app):
