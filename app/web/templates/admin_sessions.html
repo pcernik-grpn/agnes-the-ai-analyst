@@ -82,7 +82,7 @@
 
   <header class="obs-topbar">
     <div class="obs-topbar-left">
-      <p class="obs-subtitle">All Claude Code sessions across every user. Also available locally for analysis. Click any row to read the full transcript; tick <b>Errors only</b> to surface sessions where tools failed.</p>
+      <p class="obs-subtitle">All Claude Code and chat sessions across every user. Analysts can query their own via the <code>agnes_sessions</code> table (server-side, <code>agnes-usage</code> package). Click any row to read the full transcript; tick <b>Errors only</b> to surface sessions where tools failed.</p>
       <div class="obs-narrative" id="sx-narrative">Loading…</div>
     </div>
     <div class="obs-topbar-right">
@@ -411,11 +411,16 @@
       const whenTitle = r.uploaded_at
         ? ' title="uploaded ' + escapeHtml(fmtTime(r.uploaded_at)) + '"'
         : '';
+      // Total of ALL call kinds — errors count across all of them, so the
+      // native-only count would show more errors than calls on MCP-heavy rows.
+      const callsTotal = (r.tool_calls || 0) + (r.mcp_calls || 0) + (r.subagent_dispatches || 0);
+      const callsTitle = (r.tool_calls || 0) + ' native · ' + (r.mcp_calls || 0)
+                       + ' MCP · ' + (r.subagent_dispatches || 0) + ' subagent';
       tr.innerHTML =
         '<td' + whenTitle + '>' + escapeHtml(fmtTime(r.started_at)) + idHint + '</td>' +
         '<td>' + escapeHtml(r.username || '—') + '</td>' +
         '<td class="obs-num">' + escapeHtml(fmtDuration(r.active_seconds)) + '</td>' +
-        '<td class="obs-num">' + fmtN(r.tool_calls) + '</td>' +
+        '<td class="obs-num" title="' + callsTitle + '">' + fmtN(callsTotal) + '</td>' +
         '<td class="obs-num">' + errCell + '</td>' +
         '<td>' + escapeHtml(r.primary_model || '—') + '</td>' +
         '<td><a href="' + viewerHref + '">View transcript</a></td>';

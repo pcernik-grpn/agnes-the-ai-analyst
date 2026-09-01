@@ -1092,10 +1092,18 @@ async function loadSessions() {
     // page's one state pill rather than a badge of its own.
     const unprocessed = !row.processed
       ? ` <span class="ud-state is-warn">pending</span>` : "";
+    // Total of ALL call kinds (native + MCP + subagent) — matching the
+    // Errors column, which counts errored results across every kind.
+    const callsTotal = row.tool_calls != null
+      ? (row.tool_calls || 0) + (row.mcp_calls || 0) + (row.subagent_dispatches || 0)
+      : null;
+    const callsTitle = callsTotal != null
+      ? `${row.tool_calls || 0} native · ${row.mcp_calls || 0} MCP · ${row.subagent_dispatches || 0} subagent`
+      : "";
     tr.innerHTML = `
       <td>${esc(fmtDate(row.started_at))}${unprocessed}</td>
       <td>${fmtDuration(row.active_seconds)}</td>
-      <td>${row.tool_calls != null ? esc(String(row.tool_calls)) : `<span class="ud-nil">—</span>`}</td>
+      <td title="${callsTitle}">${callsTotal != null ? esc(String(callsTotal)) : `<span class="ud-nil">—</span>`}</td>
       <td>${row.tool_errors != null && row.tool_errors > 0 ? `<span class="ud-err">${esc(String(row.tool_errors))}</span>` : (row.tool_errors === 0 ? "0" : `<span class="ud-nil">—</span>`)}</td>
       <td>${modelText}</td>
       <td class="ud-end"><a class="btn btn-secondary btn-sm" href="${dlHref}">Download .jsonl</a></td>

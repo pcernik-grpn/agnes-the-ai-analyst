@@ -555,11 +555,18 @@ class UsageRepository:
             params.extend([like, like])
         return " AND ".join(where), params
 
+    # Any surface reporting "tool calls" to a user means ALL agent-initiated
+    # calls — native tool_use + MCP tools + subagent dispatches — matching
+    # `tool_errors`, which counts `is_error` across every kind. (Slash
+    # commands are user-typed, not tool calls.) COALESCE guards rows that
+    # predate the columns. Mirrored in the sibling backend.
+    _CALLS_SUM = "COALESCE(tool_calls, 0) + COALESCE(mcp_calls, 0) + COALESCE(subagent_dispatches, 0)"
+
     _SESSION_SORT_KEYS = {
         "started_at": "started_at",
         "uploaded_at": "uploaded_at",
         "ended_at": "ended_at",
-        "tool_calls": "tool_calls",
+        "tool_calls": f"({_CALLS_SUM})",
         "tool_errors": "tool_errors",
         "active_seconds": "active_seconds",
         "username": "username",
@@ -625,7 +632,7 @@ class UsageRepository:
             f"""SELECT COUNT(*),
                       COUNT(DISTINCT username),
                       SUM(CASE WHEN tool_errors > 0 THEN 1 ELSE 0 END),
-                      SUM(tool_calls),
+                      SUM({self._CALLS_SUM}),
                       SUM(tool_errors)
                FROM usage_session_summary WHERE {where_sql}""",
             params,
@@ -680,18 +687,27 @@ class UsageRepository:
             "assistant_messages",
             "tool_calls",
             "tool_errors",
+            # Call-kind breakdown: the detail header totals these with
+            # tool_calls so "Errors" is never bigger than "Tool calls".
+            "mcp_calls",
+            "subagent_dispatches",
             "primary_model",
             # TCRD-222 — stored since v44, projected at last.
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
             "cache_creation_tokens",
+            # Resolved users.id (v45) — lets the transcript viewer link into
+            # /admin/activity?user_id=… for the same person. NULL for
+            # orphaned/deleted users; the UI omits the link then.
+            "user_id",
         )
         row = self.conn.execute(
             "SELECT session_id, started_at, ended_at, active_seconds, wall_seconds, "
             "user_messages, assistant_messages, tool_calls, tool_errors, "
+            "mcp_calls, subagent_dispatches, "
             "primary_model, input_tokens, output_tokens, cache_read_tokens, "
-            "cache_creation_tokens FROM usage_session_summary WHERE session_file = ?",
+            "cache_creation_tokens, user_id FROM usage_session_summary WHERE session_file = ?",
             [session_file],
         ).fetchone()
         if row is None:
@@ -699,7 +715,7 @@ class UsageRepository:
         return dict(zip(_KEYS, row))
 
     def list_sessions_for_user_admin(self, *, user_id: str, username: str) -> List[dict]:
-        """Admin per-user session list (9 cols). Matches on user_id OR username
+        """Admin per-user session list (11 cols). Matches on user_id OR username
         so both ingestion paths + pre-v45 rows surface. Source:
         app/api/admin_user_sessions.py list_user_sessions."""
         cols = [
@@ -711,6 +727,8 @@ class UsageRepository:
             "wall_seconds",
             "tool_calls",
             "tool_errors",
+            "mcp_calls",
+            "subagent_dispatches",
             "primary_model",
         ]
         rows = self.conn.execute(
@@ -718,7 +736,8 @@ class UsageRepository:
             SELECT
                 session_file, session_id, started_at, ended_at,
                 active_seconds, wall_seconds,
-                tool_calls, tool_errors, primary_model
+                tool_calls, tool_errors, mcp_calls, subagent_dispatches,
+                primary_model
             FROM usage_session_summary
             WHERE user_id = ? OR username = ?
             ORDER BY started_at DESC NULLS LAST
@@ -728,7 +747,7 @@ class UsageRepository:
         return [dict(zip(cols, r)) for r in rows]
 
     def list_sessions_for_user_self(self, user_id: str) -> list[dict]:
-        """Self per-user session list (14 cols). Filters on ``user_id`` — the
+        """Self per-user session list (16 cols). Filters on ``user_id`` — the
         account id the pipeline writes alongside the row (runner.py), NOT the
         ``username`` column, which since v60 holds the display email. KEPT
         SEPARATE from the admin variant. Source: app/api/me_stats.py
@@ -747,6 +766,8 @@ class UsageRepository:
             "user_messages",
             "tool_calls",
             "tool_errors",
+            "mcp_calls",
+            "subagent_dispatches",
             "input_tokens",
             "output_tokens",
             "cache_read_tokens",
@@ -759,6 +780,7 @@ class UsageRepository:
                 session_file, session_id, started_at, ended_at,
                 active_seconds, wall_seconds,
                 user_messages, tool_calls, tool_errors,
+                mcp_calls, subagent_dispatches,
                 input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens,
                 primary_model
@@ -934,7 +956,7 @@ class UsageRepository:
                        COALESCE(SUM(user_messages), 0),
                        COALESCE(SUM(skill_invocations), 0),
                        COALESCE(SUM({self._TOKEN_SUM}), 0),
-                       COALESCE(SUM(tool_calls), 0),
+                       COALESCE(SUM({self._CALLS_SUM}), 0),
                        COALESCE(SUM(tool_errors), 0),
                        COUNT(DISTINCT COALESCE(user_id, username))
                   FROM usage_session_summary
@@ -967,7 +989,7 @@ class UsageRepository:
                        COUNT(*),
                        COALESCE(SUM(user_messages), 0),
                        COALESCE(SUM({self._TOKEN_SUM}), 0),
-                       COALESCE(SUM(tool_calls), 0)
+                       COALESCE(SUM({self._CALLS_SUM}), 0)
                   FROM usage_session_summary
                   WHERE CAST(started_at AS DATE) >= ?
                     AND {self.REAL_SESSION_PREDICATE}
@@ -1052,7 +1074,7 @@ class UsageRepository:
                        COUNT(*),
                        COALESCE(SUM(user_messages), 0),
                        COALESCE(SUM({self._TOKEN_SUM}), 0),
-                       COALESCE(SUM(tool_calls), 0),
+                       COALESCE(SUM({self._CALLS_SUM}), 0),
                        COALESCE(SUM(tool_errors), 0),
                        MAX(ended_at)
                   FROM usage_session_summary
@@ -1103,7 +1125,7 @@ class UsageRepository:
                        COUNT(*),
                        COALESCE(SUM(user_messages), 0),
                        COALESCE(SUM({self._TOKEN_SUM}), 0),
-                       COALESCE(SUM(tool_calls), 0)
+                       COALESCE(SUM({self._CALLS_SUM}), 0)
                   FROM usage_session_summary
                   WHERE CAST(started_at AS DATE) >= ?
                     AND (user_id = ? OR username = ?)

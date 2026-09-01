@@ -42,7 +42,12 @@ from typing import Any, Iterator
 
 from src.repositories import marketplace_plugins_repo, store_entities_repo
 
-# v10: per-assistant-turn token rows. The processor now emits one
+# v11: TWO changes landed together, each of which was cut as v10 on its
+# own branch. The version is the reprocess signal, so shipping both AS v10
+# would leave a session already processed at v10 by one of them never
+# reprocessed for the other. Bumped once, for both:
+#
+#  (a) per-assistant-turn token rows. The processor now emits one
 # `usage_turns` row per assistant turn that reports a `message.usage` block
 # (`iter_turn_usage` below), so tokens — including the two cache counters —
 # are attributable to a turn and a model instead of only to a whole session.
@@ -51,8 +56,19 @@ from src.repositories import marketplace_plugins_repo, store_entities_repo
 # clears the `usage` state rows and backfills turns for sessions already on
 # disk. The write is idempotent — unique on (session_file, turn_uuid) — so a
 # reprocess cannot double-count.
+#
+#  (b) summary `tool_calls` now counts EVERY tool invocation the model made
+# (tool_use + mcp_call + subagent), not only the plain-tool subset. The old
+# definition made the number a lie on any MCP-heavy session — a web-chat
+# session whose tools are all MCP-served showed "Tool calls: 0" next to a
+# transcript full of tool cards — and left `tool_errors` (which has always
+# counted errors across ALL tool events) with a mismatched denominator, so
+# the KPI error rate could exceed 100%. `mcp_calls` / `subagent_dispatches`
+# remain as breakdowns of the total. Historic summary rows keep the old
+# number until their file changes or an admin runs
+# `POST /api/admin/usage/reprocess` (`agnes admin usage reprocess`).
 # (v9: phase-6 plugin-level rollup parity for flea. `_aggregate_events`
-# now produces synthetic (source='flea', type='plugin', parent_plugin='',
+# produces synthetic (source='flea', type='plugin', parent_plugin='',
 # name=<plugin_synth>) rows aggregating nested skill/agent invocations,
 # mirroring the curated path. Without this, flea plugin entity cards +
 # detail telemetry chips read 0 from `_load_invocation_stats` (which
@@ -68,7 +84,12 @@ from src.repositories import marketplace_plugins_repo, store_entities_repo
 # attribution and usage_events.source / ref_id are populated per-event from
 # the live marketplace_plugins + store_entities tables.)
 # (v4: #293 user_id column; v3: #303 <command-name> slash extraction.)
-USAGE_PROCESSOR_VERSION = 10
+USAGE_PROCESSOR_VERSION = 11
+
+#: The event_types that are a tool invocation by the model — one Anthropic
+#: `tool_use` block each. `slash_command` is excluded: it is a user action,
+#: not a model call, and can never carry `is_error`.
+TOOL_EVENT_TYPES = frozenset({"tool_use", "mcp_call", "subagent"})
 
 # Claude Code wraps user-typed slash invocations as
 # <command-name>/<name></command-name> inside the user message content
@@ -494,8 +515,12 @@ def compute_summary(turns: list[dict], events: list[dict]) -> dict:
     wall_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
     active_seconds = compute_active_seconds(timestamps)
 
-    # Aggregate counts from events
-    tool_calls = sum(1 for e in events if e["event_type"] == "tool_use")
+    # Aggregate counts from events. `tool_calls` counts every tool
+    # invocation (tool_use + mcp_call + subagent) — the same population
+    # `tool_errors` has always drawn from, and the number an operator can
+    # verify against the transcript's tool cards. `mcp_calls` /
+    # `subagent_dispatches` below are breakdowns of it, not siblings.
+    tool_calls = sum(1 for e in events if e["event_type"] in TOOL_EVENT_TYPES)
     tool_errors = sum(1 for e in events if e.get("is_error"))
     skill_invocations = sum(1 for e in events if e.get("skill_name"))
     subagent_dispatches = sum(1 for e in events if e["event_type"] == "subagent")

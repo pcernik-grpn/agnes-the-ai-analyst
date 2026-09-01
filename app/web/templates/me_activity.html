@@ -456,7 +456,7 @@
                     <td>${fmtTimestamp(r.started_at)}</td>
                     <td>${r.primary_model || '<em style="color:var(--ds-text-muted);">unprocessed</em>'}</td>
                     <td class="num">${fmtNum(r.user_messages)}</td>
-                    <td class="num">${fmtNum(r.tool_calls)}</td>
+                    <td class="num" title="${(r.tool_calls || 0)} native · ${(r.mcp_calls || 0)} MCP · ${(r.subagent_dispatches || 0)} subagent">${fmtNum((r.tool_calls || 0) + (r.mcp_calls || 0) + (r.subagent_dispatches || 0))}</td>
                     <td class="num">${fmtNum(r.tokens_total)}</td>
                     <td>${pipelineBadge(r.pipeline_status)}</td>
                     <td class="num">${r.items_extracted != null ? r.items_extracted : 0}</td>
