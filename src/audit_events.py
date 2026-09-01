@@ -1301,6 +1301,21 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
     ),
+    # -- read-only view-as (app/auth/view_as.py) ---------------------------
+    # Both rows are attributed to the VIEWER and name the target in
+    # `resource`, so "who looked through whose eyes, and when" is one query.
+    # Category "auth": what changed is the effective principal of a browser
+    # session, not any domain object.
+    "view_as.start": AuditEvent(
+        "view_as.start",
+        "auth",
+        "An admin began viewing Agnes read-only as another user (resource names the target).",
+    ),
+    "view_as.end": AuditEvent(
+        "view_as.end",
+        "auth",
+        "An admin left a read-only view-as session (resource names the target).",
+    ),
     # -- 2026-09-01 owner decision: the anonymize-in-front pipeline's
     # per-instance HMAC key (design spec §9.2) is generated and stored by
     # Agnes itself when no operator-minted env key is configured, instead of

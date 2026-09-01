@@ -2441,6 +2441,7 @@ function _connectorLogo(t) {{ return ""; }}
 function _sourceHealth(row) {{ return null; }}
 function _sourceSubtitle(row) {{ return ""; }}
 function _pipelineStripHtml(row) {{ return ""; }}
+function _nextStepHtml(row) {{ return ""; }}
 function _sharepointFactsHtml(row) {{ return ""; }}
 function _secretBadgeHtml(row) {{ return ""; }}
 function _masterTokenFactHtml(row) {{ return ""; }}
@@ -3320,6 +3321,7 @@ class El {
                 "function _pipelineStripHtml(row) {",
                 "function _sharepointHealth(fs) {",
                 "function _sourceHealth(row) {",
+                "function _nextStepHtml(row) {",
                 "async function refreshSourcePipelines() {",
                 "function _repaintSourceCards() {",
             )
@@ -3349,7 +3351,11 @@ chip.textContent = "No tables yet";
 const acts = new El("ds-src__acts");
 const bodyEl = new El("ds-src__body");
 bodyEl.hidden = false;  // the admin has this card expanded
-card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip}};
+// The next-step row the card was drawn with — "these tables are in no data
+// package". The refresh has to be able to REMOVE it, because the mutation
+// that triggered the refresh is usually the very act that finished the chain.
+const nextRow = new El("ds-next");
+card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip, ":scope > .ds-next": nextRow}};
 head.kids = {{".ds-src__health": chip, ".ds-src__acts": acts}};
 const breakRepaint = {break_repaint_js};
 global.document = {{
@@ -3384,6 +3390,8 @@ global.fetch = async (url, opts) => {{
     stripWritten: strip.written,
     stripRemoved: strip.removed,
     stripsInserted: head.inserted,
+    nextWritten: nextRow.written,
+    nextRemoved: nextRow.removed,
     chipText: chip.textContent,
     chipClass: chip.className,
     chipRemoved: chip.removed,
@@ -3464,5 +3472,40 @@ global.fetch = async (url, opts) => {{
         out = self._run(fresh=self._FRESH, concurrent=3)
         assert out["fetchCount"] == 1
         assert out["results"] == [True, True, True]
+
+    def test_a_finished_chain_takes_the_next_step_row_with_it(self):
+        """The card was drawn with "these tables are in no data package". The
+        wizard that just bundled and shared them is what triggered this
+        refresh, so the row has to GO — a next step still demanding the move
+        the admin just made is worse than no next step at all."""
+        out = self._run(fresh=self._FRESH)
+        assert out["nextRemoved"] is True
+        assert out["nextWritten"] is None
+
+    def test_a_still_open_chain_gets_the_fresh_next_step(self):
+        fresh = {
+            "c1": {
+                "tables": {"count": 3, "unlinked": 0, "basis": "connection", "distributable": 3},
+                "sync": {"last_sync": None, "age_minutes": None, "errors": 0},
+                "semantic": {"token": True, "metrics": 0, "terms": 0},
+                "feeds": {
+                    "packages": 1,
+                    "groups": 0,
+                    "people": 0,
+                    "next": {
+                        "key": "share",
+                        "text": "Bundled into 1 data package, shared with no group.",
+                        "cta": "Share it with a group",
+                        "href": "/admin/data-packages",
+                        "verify_cta": "Preview someone's Library",
+                        "verify_href": "/admin/access?lens=simulate",
+                    },
+                },
+            }
+        }
+        out = self._run(fresh=fresh)
+        assert out["nextRemoved"] is False
+        assert "Share it with a group" in (out["nextWritten"] or "")
+        assert "/admin/access?lens=simulate" in (out["nextWritten"] or "")
         # And the marker is cleared, so the NEXT mutation still gets a fresh read.
         assert out["inFlightCleared"] is True

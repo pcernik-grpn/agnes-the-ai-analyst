@@ -2571,6 +2571,19 @@
       </div>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
+      {# Read-only view-as. A POST form, never a link: entering changes the
+         effective principal of this browser session, and a state change on a
+         GET is exactly the CSRF hole `slack_bind` was bitten by (security
+         playbook §10). The hidden `user_id` is filled in by the person
+         picker below; `next` sends the admin to the Library, the page whose
+         answer differs most between two people. #}
+      <form method="post" action="/admin/view-as" id="ax-sim-viewas" hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="user_id" id="ax-sim-viewas-uid" value="">
+        <input type="hidden" name="next" value="/library">
+        {{ ds.button('View a page as them →', variant='secondary', type='submit',
+                     attrs='title="Opens Agnes read-only as this person — you cannot change anything until you exit."') }}
+      </form>
     </div>
     <div id="ax-sim-out"><div class="ax-empty">Pick a person to see what they can use, and why.</div></div>
   </div>
@@ -5736,13 +5749,23 @@
     history.replaceState(null, "", url);
     const out = el("ax-sim-out");
     const detailBtn = el("ax-sim-detail");
+    // Read-only view-as form: shown only once a person is picked, and the id
+    // is set on the hidden field rather than in the action URL so the POST
+    // body carries it alongside the CSRF token.
+    const viewAsForm = el("ax-sim-viewas");
+    const viewAsUid = el("ax-sim-viewas-uid");
     if (!uid) {
       out.innerHTML = `<div class="ax-empty">Pick a person to see what they can use, and why.</div>`;
       detailBtn.hidden = true;
+      if (viewAsForm) viewAsForm.hidden = true;
       return;
     }
     detailBtn.hidden = false;
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
+    if (viewAsForm && viewAsUid) {
+      viewAsUid.value = uid;
+      viewAsForm.hidden = false;
+    }
     out.innerHTML = `<div class="ax-empty">Resolving…</div>`;
     try {
       const [effResp, memResp, prevResp] = await Promise.all([

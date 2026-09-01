@@ -642,6 +642,12 @@ POSTURE: dict[str, str] = {
     "POST /auth/logout": "logout",
     "POST /me/profile/refetch-groups": "exempt:debug_dry_run_no_write",
     "POST /slack/bind": "slack.bind",
+    # Read-only view-as (app/auth/view_as.py). Both handlers write their own
+    # row via log_safe — they know the target, which the fallback middleware
+    # cannot derive from a form field — so these entries are the cross-check,
+    # not the emitter.
+    "POST /admin/view-as": "view_as.start",
+    "POST /admin/view-as/exit": "view_as.end",
 }
 
 

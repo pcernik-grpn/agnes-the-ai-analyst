@@ -683,6 +683,47 @@
   .ds-pipe__v.is-warn { color: var(--ds-accent-warn-ink); }
   .ds-pipe__v.is-err  { color: var(--ds-accent-danger-ink); }
 
+  /* ── The next step ─────────────────────────────────────────────────────
+     The strip above says WHAT is true of this source; this one line says
+     what to do about it, and only while the chain is unfinished — a source
+     whose data somebody can already pull renders nothing here. Three states
+     (`_source_next_step()` in app/web/router.py): in no package → in no
+     group → in an empty group.
+
+     Tinted, because a tint on this page means "worth acting on" (the shared
+     `.apg-strip` rule). Card-scoped rather than the page-level `.apg-strip`:
+     the sentence is about ONE source, so it belongs inside that source's
+     border — the same reason `.ds-token-mismatch` above is a band on the
+     card and not a banner over the list. */
+  .ds-next {
+    display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+    padding: 10px 16px;
+    border-top: 1px solid var(--ds-accent-warn-line);
+    background: var(--ds-accent-warn-bg);
+    color: var(--ds-accent-warn-ink);
+    font-size: 12.5px; line-height: 1.45;
+  }
+  /* Zero basis, for the reason `.apg-strip`'s own sentence carries it: an
+     auto basis makes flexbox wrap the line before it considers shrinking it,
+     leaving the trailing links stranded on a row of their own. */
+  .ds-next__txt { flex: 1 1 0; min-width: 0; }
+  .ds-next__end {
+    margin-left: auto; flex: 0 0 auto;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  /* The verify link is deliberately NOT a second button: one primary move
+     per state, and "did that work?" is a lens you open after acting, not an
+     alternative to acting. */
+  .ds-next__verify {
+    font-size: 12.5px; font-weight: 600;
+    color: inherit; text-decoration: underline;
+  }
+  .ds-next__verify:hover { text-decoration: none; }
+  .ds-next__verify:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+  }
+
   /* ── Step 1: semantic-layer opt-in ── */
   .ds-wsl-opt {
     border: 1px solid var(--border, var(--ds-border));
@@ -2176,6 +2217,33 @@ function _pipelineStripHtml(row) {
   return `<div class="ds-pipe ds-pipe--${cells.length}">${cells.join("")}</div>`;
 }
 
+/* ── The next step ─────────────────────────────────────────────────────────
+   The strip above reports; this line acts. It renders ONLY while this
+   source's chain is unfinished — the server decides, in `_source_next_step()`
+   (app/web/router.py), from the very cells the strip just drew, so a card can
+   never show "2 packages → 5 people" over a row telling its admin to bundle
+   something. Nothing to say → nothing rendered, so a finished setup is not
+   nagged and three healthy cards stay three quiet cards.
+
+   Every state carries the same second link: the Access page's Simulate lens,
+   which previews a person's Library from the same projection /library itself
+   runs. That is the honest answer to "did that actually work?", and this page
+   — where an admin arrives after connecting a source and then finds their
+   Library empty — is exactly where it was missing. */
+function _nextStepHtml(row) {
+  const step = ((SOURCE_PIPELINES[row.id] || {}).feeds || {}).next;
+  if (!step) return "";
+  return `
+<div class="ds-next" data-next-step="${_esc(step.key)}">
+  <span class="ds-next__txt">${_esc(step.text)}</span>
+  <span class="ds-next__end">
+    <a class="btn btn-primary btn-sm" href="${_esc(step.href)}">${_esc(step.cta)} &rarr;</a>
+    <a class="ds-next__verify" href="${_esc(step.verify_href)}"
+       title="Preview a person's Library exactly as their groups leave it — the same projection /library runs">${_esc(step.verify_cta)} &rarr;</a>
+  </span>
+</div>`;
+}
+
 /* ── The card's one status word ────────────────────────────────────────────
    A fold over the strip below it, in severity order, so the reader gets a
    VERDICT before the evidence and can skip a healthy card without reading
@@ -2694,6 +2762,7 @@ function _connectionCardHtml(row) {
     </div>
   </div>
   ${_pipelineStripHtml(row)}
+  ${_nextStepHtml(row)}
   <div class="ds-src__body" id="ds-body-${id}" hidden>
     <span class="ds-conn-test-result" id="ds-test-${id}"></span>
     <div class="ds-src__facts">${facts}</div>
@@ -2893,6 +2962,19 @@ function _repaintSourceCards() {
     if (strip && stripHtml) strip.outerHTML = stripHtml;
     else if (strip) strip.remove();
     else if (stripHtml && head) head.insertAdjacentHTML("afterend", stripHtml);
+
+    // The next-step row, same three cases — and the REMOVE case is the one
+    // that matters: the mutation that triggered this refresh is usually the
+    // very act that finished the chain, so a row still saying "put them in a
+    // package" after the admin just did is worse than no row at all.
+    const nextHtml = _nextStepHtml(row);
+    const next = card.querySelector(":scope > .ds-next");
+    if (next && nextHtml) next.outerHTML = nextHtml;
+    else if (next) next.remove();
+    else if (nextHtml) {
+      const anchor = card.querySelector(":scope > .ds-pipe") || head;
+      if (anchor) anchor.insertAdjacentHTML("afterend", nextHtml);
+    }
 
     if (!head) continue;
     const health = _sourceHealth(row);

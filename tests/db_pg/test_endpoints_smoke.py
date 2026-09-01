@@ -2128,6 +2128,59 @@ class TestUpgradeFreezeSmoke:
 # Route-coverage guard
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Read-only view-as
+# ---------------------------------------------------------------------------
+
+
+class TestViewAsSmoke:
+    """The two view-as routes, on both backends.
+
+    Behavioural depth lives in tests/test_view_as_readonly.py (the read-only
+    guard, narrowing, ticket binding, audit attribution, the banner). What is
+    worth re-asserting HERE is the part that is backend-shaped: entering and
+    exiting both write an audit row through the frozen DuckDB/Postgres pair,
+    and these are the gates that must refuse before any of that is reached.
+    """
+
+    COVERED_ROUTES = {
+        "POST /admin/view-as",
+        "POST /admin/view-as/exit",
+    }
+
+    def test_a_non_admin_cannot_enter(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "admin1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_analyst_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_an_automation_credential_cannot_enter(self, seeded_app_both):
+        """A PAT has no browser to show the banner in and no cookie jar to exit
+        with, so the mode would be invisible state on an automation token — the
+        route refuses even for a real admin."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as",
+            data={"user_id": "analyst1", "csrf_token": "x", "next": "/me/profile"},
+            headers=_admin_headers(seeded_app_both),
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+    def test_exiting_without_a_csrf_token_is_refused(self, seeded_app_both):
+        """Exit mounts no auth dependency by design (get_current_user resolves
+        to the TARGET while the mode is on), so its CSRF check is the gate that
+        has to hold."""
+        r = seeded_app_both["client"].post(
+            "/admin/view-as/exit",
+            data={"csrf_token": "", "next": "/me/profile"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403, r.text
+
+
 KNOWN_UNTESTED = {
     # Semantic-layer coverage + auto-draft sweep (semantic-phase5) — both
     # admin-gated, behaviorally covered outside this parameter-free smoke
