@@ -36,11 +36,23 @@
 .obs-narrative a { color: var(--obs-link); text-decoration: none; border-bottom: 1px dashed transparent; cursor: pointer; }
 .obs-narrative a:hover { border-bottom-color: var(--obs-link); }
 
-.obs-topbar-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* The controls end on one line, not centre on one. Only the time range
+   carries a label above it, so centring the row centred each checkbox
+   against the label+select STACK — putting both of them ~7px above the
+   dropdown they sit beside (#1956 item 11). Aligned to the bottom, the
+   labelled control's height stops mattering and the three controls share a
+   baseline; `.obs-live` takes the select's own box height so its text
+   centres where the select's does. */
+.obs-topbar-right { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
 .obs-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--obs-muted); display: block; margin-bottom: 2px; }
 .obs-window select { padding: 6px 8px; border: 1px solid var(--obs-border); border-radius: 6px; background: var(--obs-bg); font: inherit; }
-.obs-live { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--obs-muted); cursor: pointer; }
+/* 38px is the height of the control it stands beside — `.ds-dropdown-btn`,
+   the design-system dropdown the paper skin renders in place of the native
+   `<select>`. Given as a number because no control-height token exists yet;
+   if one lands, this is the line that should take it. */
+.obs-live { display: flex; align-items: center; gap: 6px; min-height: 38px;
+  font-size: 13px; color: var(--obs-muted); cursor: pointer; }
 .obs-live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ds-text-disabled); transition: background 0.2s; }
 .obs-live input:checked ~ .obs-live-dot { background: var(--ds-primary); animation: obs-pulse 2s ease-in-out infinite; }
 @keyframes obs-pulse {
