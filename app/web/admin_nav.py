@@ -183,8 +183,11 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         # sidebar that lit nothing — "you are nowhere" on a page one click deep.
         # It lights Data and renders Data's strip with NO tab active, which is
         # the truth: you are in this section, on none of its four lenses, and
-        # every one of them is one click away.
-        "match": ["/admin/sync"],
+        # every one of them is one click away. `/admin/semantic-layer` is here
+        # for the same reason now that it has no tab of its own (see the
+        # "Semantic layer health" comment below) — it's still reachable from a
+        # source card's pipeline cell, just not part of the strip.
+        "match": ["/admin/sync", "/admin/semantic-layer"],
         # ── The one strip that is a PIPELINE, not a set of categories ──────
         # Sources, Tables and Packages are not three kinds of thing you choose
         # between; they are one flow seen from three places — where data comes
@@ -240,32 +243,21 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "match": ["/admin/data-packages"],
                 "chain": True,
             },
-            # Semantic layer EARNS a tab where Sync does not, and the reason is
-            # what each thing is. A sync run is per-source and per-table — the
-            # source card's own SYNC cell is where it belongs, and the only
-            # cross-source question ("what failed today") is Activity's. The
-            # metric/glossary registry is the opposite: `metric_definitions` is
-            # ONE instance-wide table that several Keboola projects write into
-            # under their own `source_ref` (connectors/keboola/semantic_layer.py
-            # ::sync_semantic_layer), so a per-source panel structurally cannot
-            # show the thing that matters most — the same metric defined in two
-            # projects. Its singularity is the product promise (`agnes catalog
-            # --metrics` must give ONE answer for "what is MRR"), so it gets a
-            # surface of its own. Syncing stays per project.
-            {
-                "label": "Semantic layer health",
-                "href": "/admin/semantic-layer",
-                "match": ["/admin/semantic-layer"],
-                # No `chain` — see the block comment above the tabs list.
-            },
-            # Semantic layer health (above) answers "is what exists complete and
-            # healthy" — coverage/health/mute/feedback over the DOCUMENTS
-            # already imported. This tab answers the question upstream of
-            # that: where a document comes from in the first place —
-            # every `semantic_source` row, any kind (git/upload/connection)
-            # and any adapter (Keboola, Snowflake, Databricks), with its own
-            # sync-now action. Same "no chain" reasoning: instance-wide, not
-            # a pipeline stage.
+            # Semantic layer health (coverage/health/mute/feedback over the
+            # DOCUMENTS already imported) is NOT a tab here for now — the
+            # page is real and stays reachable (source cards still link to
+            # it, `/admin/semantic-layer` still renders), but the feature
+            # behind it is unfinished (tag-based checks only, coverage is a
+            # manual admin read with no automated scoring yet, no
+            # notifications) and isn't part of the demoed surface. Restore
+            # the tab once that work lands; until then keep it out of the
+            # strip so it doesn't read as a finished destination.
+            #
+            # This tab answers where a document comes from in the first
+            # place — every `semantic_source` row, any kind (git/upload/
+            # connection) and any adapter (Keboola, Snowflake, Databricks),
+            # with its own sync-now action. Same "no chain" reasoning as
+            # Semantic layer health: instance-wide, not a pipeline stage.
             {
                 "label": "Semantic sources",
                 "href": "/admin/semantic-sources",
@@ -572,6 +564,18 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # you MANAGE, and this is a log you CHECK — and the cross-source version
         # of that question ("what failed today") is what /admin/activity is.
         "reached_from": "the SYNC cell on each source card (/admin/data-sources)",
+    },
+    {
+        "href": "/admin/semantic-layer",
+        # Pulled off the Data tab strip on purpose: the feature (coverage,
+        # health, mute, feedback) is unfinished — tag-based checks only, no
+        # automated coverage scoring yet, no notifications — so it isn't part
+        # of the surface admins are meant to discover right now. The page
+        # itself still works and admins who know it exists still reach it: a
+        # source card's semantic cell on /admin/data-sources links here, and
+        # so does the "Manage this model" door on a semantic model's own page.
+        "reached_from": "the semantic cell on a source card (/admin/data-sources) "
+        "and the model detail page's manage door",
     },
 ]
 
