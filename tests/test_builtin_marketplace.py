@@ -393,18 +393,16 @@ def test_boot_seed_clears_a_stale_sync_error(tmp_path, monkeypatch):
 
     seed_builtin_marketplace()
     # The pre-fix wound: a manual sync attempt stamped its failure.
-    marketplace_registry_repo().update_sync_status(
-        BUILTIN_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found"
+    marketplace_registry_repo().update_sync_status(BUILTIN_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found")
+    assert marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is not None, (
+        "precondition: the stale stamp is in place"
     )
-    assert (
-        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is not None
-    ), "precondition: the stale stamp is in place"
 
     seed_builtin_marketplace()
 
-    assert (
-        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is None
-    ), "boot re-seed must clear the stale sync error it makes moot"
+    assert marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is None, (
+        "boot re-seed must clear the stale sync error it makes moot"
+    )
     conn.close()
 
 
@@ -427,9 +425,9 @@ def test_contributed_registry_row_seed_clears_a_stale_sync_error(tmp_path, monke
 
     _ensure_registry_row(registered_by="test")
 
-    assert (
-        marketplace_registry_repo().get(CONTRIBUTED_MARKETPLACE_SLUG)["last_error"] is None
-    ), "re-asserting the contributed registry row must clear the stale sync error"
+    assert marketplace_registry_repo().get(CONTRIBUTED_MARKETPLACE_SLUG)["last_error"] is None, (
+        "re-asserting the contributed registry row must clear the stale sync error"
+    )
     conn.close()
 
 
@@ -445,6 +443,65 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
         "the sync-state cell must branch on m.is_builtin — a bundled row "
         "otherwise shows 'failed'/'never' for a sync that can never run"
     )
+
+
+def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
+    """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
+    checked meant admin_disabled=true, so switching it ON looked like it
+    should turn something *on* while it actually hid the plugin. #1913's
+    reporter mistook a checked (= hidden) toggle for "still active". The
+    control now presents as "Enabled": checked means the plugin is available
+    to users (admin_disabled=false); the underlying admin_disabled write is
+    unchanged, only the rendered semantics flip."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-enabled-toggle" in template, "toggle wrapper class must be renamed off the inverted 'disable' name"
+    assert ">Enabled<" in template
+    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain anywhere in the markup"
+    assert '${isDisabled ? "" : "checked"}' in template, (
+        "checkbox must be checked when isDisabled is false (Enabled == ON)"
+    )
+    assert '${isDisabled ? "checked" : ""}' not in template, "the old inverted checked-binding must be gone"
+
+
+def test_plugin_controls_share_one_wrapper_for_visual_consistency():
+    """#1956 item 14c: the Enabled toggle and the system-mark control used to
+    sit loose in the row as two unrelated widgets (toggle vs. bare button).
+    They now share a common flex wrapper so they read as a matched pair of
+    controls rather than a random mix, and the system button wears the same
+    --ds-radius-btn every other labelled button in the app uses (it
+    previously hardcoded a bespoke 6px)."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-controls" in template
+    assert "border-radius: var(--ds-radius-btn)" in template.split(".plugin-system-btn {")[1].split("}")[0]
+
+
+def test_plugin_system_control_carries_a_discoverable_explanation():
+    """#1956 item 14a (reporter kbcMichal): "Unmark system" had no
+    explanation of what system-marking actually does. A hover-only `title`
+    on the button was already there and evidently was not enough — this adds
+    a persistent, always-visible help affordance next to the control whose
+    tooltip explains the *concept* (mandatory-for-everyone fanout) rather
+    than only the next click's side effect, and it reads the same regardless
+    of the plugin's current is_system value."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-help-icon" in template
+    help_text = template.split("sysHelpText =")[1].split(";")[0]
+    assert "mandatory" in help_text
+    assert "every" in help_text
+
+
+def test_disabled_pill_tooltip_calls_out_deprecation_auto_hide():
+    """#1956 item 14d: keep the DISABLED pill (it renders a real curator-level
+    state) but its tooltip must mention that a plugin marked `deprecated`
+    upstream (src/marketplace.py's sync-time auto-disable) is re-hidden on
+    every sync — otherwise an admin who never touched the toggle has no way
+    to learn why it flipped back."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    disabled_pill_line = next(
+        line for line in template.splitlines() if 'class="plugin-disabled-pill"' in line and "DISABLED<" in line
+    )
+    assert "deprecated" in disabled_pill_line.lower()
+    assert "sync" in disabled_pill_line.lower()
 
 
 def test_hub_sync_signal_ignores_bundled_rows(tmp_path, monkeypatch):

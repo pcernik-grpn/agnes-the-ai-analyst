@@ -36,6 +36,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - The "Semantic sources" toolbar button reads **"+ Add semantic source"** instead of the bare "+ Add source" — the Data section's tab strip sits right next to "Sources" (data sources), where the shorter label read as the same action.
 
 ### Fixed
+- **Marketplace plugin controls on `/admin/marketplaces` no longer read backwards.** The per-plugin toggle was labelled "Disabled" with checked meaning admin-disabled — an inverted control a reader could mistake for the plugin still being active while it flipped visibility off; it is now an "Enabled" toggle (checked = available to users), the same `admin_disabled` field underneath (#1956 item 14b). The "Mark as system" / "Unmark system" button gained a persistent help affordance explaining that "system" means mandatory for every user, since a bare hover tooltip on the button text was not discoverable enough (#1956 item 14a), and the DISABLED pill's tooltip now notes that a plugin marked `deprecated` upstream is auto-hidden again on every sync (#1956 item 14d).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
