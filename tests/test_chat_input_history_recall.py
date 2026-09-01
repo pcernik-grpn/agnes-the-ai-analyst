@@ -86,11 +86,15 @@ def test_submit_user_message_appends_sent_prompt_to_history():
     end = js.index("/** Resize the composer textarea")
     body = js[start:end]
     assert "lastUserText = text;" in body
-    assert "_promptHistory.push(text);" in body
+    # `rawText` is the message as TYPED. Since a turn can carry pasted
+    # attachments, `text` by this point may also hold the appended
+    # "[Attached image: uploads/…]" line — recalling a prompt must give back
+    # the sentence, not a pointer to a file that turn already consumed.
+    assert "_promptHistory.push(rawText);" in body
     assert "_historyPos = _promptHistory.length;" in body
     assert "_historyBrowsing = false;" in body
     # Back-to-back identical sends shouldn't create duplicate history entries.
-    assert "_promptHistory[_promptHistory.length - 1] !== text" in body
+    assert "_promptHistory[_promptHistory.length - 1] !== rawText" in body
 
 
 def test_composer_keydown_recall_sits_between_slash_menu_and_enter_submit():

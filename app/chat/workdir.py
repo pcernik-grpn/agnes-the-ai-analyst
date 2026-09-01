@@ -20,6 +20,13 @@ from app.chat.persistence import ChatRepository
 
 logger = logging.getLogger(__name__)
 
+#: Where ``POST /api/chat/uploads`` writes, relative to the user's workspace.
+#: Named here rather than in the endpoint because this module is what makes
+#: the directory REACHABLE: it is linked into every session dir below, and
+#: ``app/api/chat_uploads.py`` imports the name so the writer and the linker
+#: can never drift onto two different directories.
+UPLOADS_DIRNAME = "uploads"
+
 #: Workspace entries ``prepare_session_dir`` symlinks into a session dir
 #: (``CLAUDE.local.md`` only when ``include_personal_override``). "scaffolds"
 #: carries the data-apps starter templates the agnes-data-apps-extras skill
@@ -28,10 +35,27 @@ logger = logging.getLogger(__name__)
 #: deliberately get no workspace symlinks (see prepare_ephemeral_session_dir),
 #: so app scaffolding is a solo-session capability.
 #:
+#: ``uploads`` is what the user hands IN — a pasted screenshot, a CSV from the
+#: "+" menu. Without the link the endpoint's own hint ("available in your next
+#: chat sandbox session") was not true of any path the agent could name: the
+#: workspace is mounted at its absolute host path, which nothing in the
+#: conversation knows. Linked, the file is at ``uploads/<name>`` relative to
+#: the working directory, and because the link points at the live workspace
+#: directory a file pasted MID-session is there too, not only one that
+#: predates the spawn.
+#:
 #: The docker provider's profile-session mounts are derived from this SAME
 #: list (``app/chat/docker_provider.py``) — the allowlist of what a profiled
 #: sandbox may see must never be inferred from the agent-writable session dir.
-WORKSPACE_LINK_ENTRIES = (".claude", "CLAUDE.md", "snapshots", "scripts", "scaffolds", "CLAUDE.local.md")
+WORKSPACE_LINK_ENTRIES = (
+    ".claude",
+    "CLAUDE.md",
+    "snapshots",
+    "scripts",
+    "scaffolds",
+    UPLOADS_DIRNAME,
+    "CLAUDE.local.md",
+)
 
 
 #: Bundled skills that only make sense when a feature is switched on, keyed by
@@ -493,6 +517,11 @@ class WorkdirManager:
         # claude-agent-sdk resolves .claude/{skills,plugins,agents,commands,hooks}
         # against the per-user workspace.
         ws = self.user_workspace(user_email)
+        # Created eagerly, not on first upload: the loop below skips an entry
+        # whose target does not exist, so a workspace that had never received
+        # an upload got no link — and then a file pasted mid-conversation
+        # landed in a directory this session could not see.
+        (ws / UPLOADS_DIRNAME).mkdir(parents=True, exist_ok=True)
         entries = [e for e in WORKSPACE_LINK_ENTRIES if e != "CLAUDE.local.md"]
         if include_personal_override:
             entries.append("CLAUDE.local.md")
