@@ -2060,6 +2060,51 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
                     z-index 0s linear 0s;
     }
 
+    /* ── On an admin page the peek wants more intent ──────────────────────
+       The 120ms above is an anti-pass-through delay sized for a rail with a
+       PAGE beside it. An admin page puts a second navigation column there
+       instead, and `.admin-split` starts at x=56 — flush against the strip,
+       by design (see admin-nav.css) — so there is no buffer between the two
+       and the 184px of overlay lands squarely on the column the admin is
+       reading. A few pixels of pointer drift while scanning that list made
+       it disappear, which is what "the two nav layers fight for the same
+       space" describes (#1956 item 6).
+
+       So: ask for more of the same intent. Nothing changes about what a
+       deliberate hover does or how the peek looks once it is open, and
+       closing stays immediate — only a pointer that means to stay gets it.
+       A page tolerates being covered in a way a navigation column does not.
+
+       The full `transition` is restated rather than a bare `transition-delay`
+       because that shorthand would delay the z-index raise too, and that one
+       must stay at 0s for the reason the rule above gives.
+
+       Nested in `not (prefers-reduced-motion: reduce)` rather than added to
+       the `transition: none` list further down this file. Both would work
+       today, but these selectors are one class MORE specific than that list's
+       (`[data-rail-context]` on top of the same chain), so a rule that merely
+       joined the list would be outranked by them and the reduced-motion
+       caller would get a 400ms animated peek where they used to get an
+       instant one — worse than before the delay existed. Declaring them only
+       where motion is allowed cannot lose that contest, because for a
+       reduced-motion caller they are not in the cascade at all. */
+    @media not (prefers-reduced-motion: reduce) {
+        html[data-ui-layout="rail"] .rail[data-rail-context="admin"].rail-icon-mode:not(.rail-no-peek):hover {
+            transition: width var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
+                        box-shadow var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
+                        z-index 0s linear 0s;
+        }
+
+        /* Keyboard focus is unambiguous — there is no such thing as tabbing
+           into the rail by accident — so it keeps the ordinary opening beat.
+           Placed after the hover rule so it wins for a caller who is both. */
+        html[data-ui-layout="rail"] .rail[data-rail-context="admin"].rail-icon-mode:not(.rail-no-peek):focus-within {
+            transition: width var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .12s,
+                        box-shadow var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .12s,
+                        z-index 0s linear 0s;
+        }
+    }
+
     /* The peeked layout — the rows' expanded padding and gaps, which the
        collapsed rules above override with the centring values and which they
        animate back to over the same window the width uses. Nothing here is

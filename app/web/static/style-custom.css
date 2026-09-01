@@ -5657,10 +5657,99 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
    consumer of this class today. */
 .data-table-wrap {
     overflow-x: auto;
+    /* A visible scrollbar, not an overlay one. `auto` still means "only when
+       it overflows", so a table that fits draws nothing — but the ones that
+       DO overflow had no affordance at all on macOS, where the overlay bar is
+       painted only while the pointer is already scrolling. On Marketplaces
+       that hid the row's own verbs (Sync now / Details / Edit) past the right
+       edge with nothing on screen to say they were there (#1956 item 8).
+
+       Deliberately NOT paired with the standard `scrollbar-width` /
+       `scrollbar-color`: Chrome honours one model or the other, and setting
+       `scrollbar-width` makes it drop these `::-webkit-*` rules and go back
+       to an overlay bar, which is the bug. Firefox and the rest fall through
+       to their own always-visible default. */
 }
+.data-table-wrap::-webkit-scrollbar { height: 8px; }
+.data-table-wrap::-webkit-scrollbar-track { background: transparent; }
+.data-table-wrap::-webkit-scrollbar-thumb {
+    background: var(--ds-border);
+    border-radius: 4px;
+}
+.data-table-wrap::-webkit-scrollbar-thumb:hover { background: var(--ds-text-disabled); }
 .data-table-wrap thead th {
     position: static;
 }
+
+/* ── A pinned actions column — `.data-table--pinned-actions` ──────────────
+   Opt-in, on the TABLE, for the admin tables whose last column is the row's
+   own verbs (Sync now · Details · Edit, the `⋯` menu). Those are the one
+   thing a reader cannot recover by scrolling to a different column: a
+   destination has a header to scan back to, an action that is off-screen is
+   simply unavailable, and on Marketplaces they were the first thing the
+   overflow took (#1956 item 8).
+
+   Sticky HORIZONTALLY only. The sibling rule above disables the sticky
+   `thead` for everything in a `.data-table-wrap`, for the reason its own
+   note gives — the wrap is an unbounded scroll container, so a vertically
+   stuck header would silently re-target it and stop working. Nothing here
+   revisits that: `right` binds to the wrap's horizontal axis, which is the
+   one that actually scrolls, and `top` is never set.
+
+   Opt-in rather than `td:last-child` everywhere, because "the last column"
+   is a count, not a meaning — several of these tables end on a timestamp or
+   a status, and pinning those would just narrow the table for nothing.
+
+   The background is what makes it a pin instead of a transparent overlap, so
+   it has to track the row's own: surface at rest, the shared hover tint on
+   hover, and the header band in `thead`. The left hairline is deliberate and
+   permanent — it marks the column as pinned, and a divider that appeared
+   only once you had already scrolled would arrive after the moment it was
+   needed. */
+/* `clip`, not the `hidden` the base rule sets for the rounded corners.
+   `overflow: hidden` gives the TABLE a scrolling box, and a sticky cell is
+   constrained by the nearest ancestor that has one — so the cells below were
+   `position: sticky` against a box that never scrolls, which is a no-op, and
+   they rode off the right edge exactly as before. `clip` clips identically
+   (the corners still work) but establishes no scrolling box, so the pin
+   resolves against `.data-table-wrap`, the element that actually scrolls.
+   A browser without `clip` drops this line, keeps `hidden`, and gets today's
+   unpinned behaviour rather than a broken one. */
+.data-table--pinned-actions { overflow: clip; }
+
+/* `:not([colspan])` excludes the full-width cells these tables use for their
+   own empty and loading states — "No matches for …", "Loading tables…". A
+   `<td colspan="8">` is also a `td:last-child`, and while it cannot actually
+   travel (its sticky rect is the row it already fills) it would still draw
+   the pinned column's divider as a stray hairline down the left edge of every
+   such row.
+
+   `top: auto` because the reset above only ever overrode `position`: the
+   canonical `.data-table th { top: 0 }` is still in the cascade, and
+   re-establishing `position: sticky` here at a higher specificity would
+   quietly re-arm the vertical stickiness that reset exists to prevent. It is
+   inert only while no `.data-table-wrap` has a height cap — which is a fact
+   about today, not a guarantee. */
+.data-table--pinned-actions tbody td:last-child:not([colspan]),
+.data-table--pinned-actions thead th:last-child {
+    position: sticky;
+    right: 0;
+    top: auto;
+    border-left: 1px solid var(--ds-border);
+}
+.data-table--pinned-actions tbody td:last-child:not([colspan]) { background: var(--ds-surface); }
+/* `--ds-surface-dim`, the token the header band itself uses — NOT
+   `--ds-border-light`. The two are the same only in the base `:root`; in
+   paper (the default) and in dark they differ, and this rule outranks the
+   band's own, so the wrong one shows as an off-tint block at the end of the
+   header row. Most visible on /admin/users, where that cell's label is
+   screen-reader-only and the tint is all there is to see. */
+.data-table--pinned-actions thead th:last-child { background: var(--ds-surface-dim); }
+/* The hovered row paints `--ds-surface-dim`, not the `--border-light` the
+   rule further up this file declares — measured in the browser, because a
+   pinned cell that guesses its neighbour's tint shows the guess as a seam
+   down the edge of the column the moment anyone hovers a row. */
+.data-table--pinned-actions tbody tr:hover td:last-child:not([colspan]) { background: var(--ds-surface-dim); }
 
 /* ─── Badges — accent vocabulary ──────────────────────────────────────
    The canonical .badge above gets neutral chrome (chip on
