@@ -2297,3 +2297,79 @@ class TestTokenRefreshUnderConcurrency:
         asyncio.run(auth.refresh())
         asyncio.run(auth.refresh())
         assert acquisitions["n"] == 2
+# --------------------------------------------------------------------------
+# The LLM fact-extraction stage's chaining seam (owner decision 2026-09-01)
+# --------------------------------------------------------------------------
+
+
+class TestFactsExtractionSeam:
+    """The crawl owns only the SEAM: it calls the stage after a successful
+    pass, folds its numbers into the same report and the same
+    `extraction_runs` row, and lets a hard stop fail the run."""
+
+    def _one_file_crawl(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+    def test_the_stage_is_not_called_when_it_is_switched_off(self, crawl_env, monkeypatch):
+        self._one_file_crawl(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.facts_extraction_enabled",
+            lambda: False,
+        )
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert "facts" not in report
+        assert "facts_usage" not in report
+
+    def test_a_successful_crawl_chains_the_stage_and_merges_its_numbers(self, crawl_env, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        self._one_file_crawl(monkeypatch)
+
+        facts_report = {"docs_extracted": 2, "claims_written": 5, "facts_usage": {"calls": 2, "input_tokens": 900}}
+        seen: List[Any] = []
+
+        def fake_stage(connection, *, deadline=None):
+            seen.append((connection["id"], deadline))
+            return facts_report
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", fake_stage)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert seen and seen[0][0] == "conn1"
+        assert seen[0][1] is not None, "the stage shares the crawl's remaining deadline"
+        # One run, one set of counters: the stage's block rides in the same
+        # report and its spend is promoted next to the crawl's own totals.
+        assert report["facts"] == facts_report
+        assert report["facts_usage"] == {"calls": 2, "input_tokens": 900}
+        assert runs.finished[0]["usage"] == {"facts": {"calls": 2, "input_tokens": 900}}
+
+    def test_the_crawls_own_counters_are_untouched_by_the_stage(self, crawl_env, monkeypatch):
+        self._one_file_crawl(monkeypatch)
+        monkeypatch.setattr(
+            crawler, "maybe_run_facts_extraction", lambda connection, *, deadline=None: {"docs_extracted": 1}
+        )
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 1
+        assert report["interrupted"] is False
+
+    def test_a_hard_stop_in_the_stage_fails_the_run_loudly(self, crawl_env, monkeypatch):
+        """The crawl's own work is already durable; a stage that cannot run
+        must fail the run rather than report a clean pass with no facts."""
+        runs = _install_runs_repo(monkeypatch)
+        self._one_file_crawl(monkeypatch)
+
+        from connectors.sharepoint.facts_extraction import FactsExtractionUnavailable
+
+        def boom(connection, *, deadline=None):
+            raise FactsExtractionUnavailable("no credential")
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", boom)
+        with pytest.raises(FactsExtractionUnavailable):
+            _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert runs.finished[0]["status"] == "failed"
+        assert "FactsExtractionUnavailable" in runs.finished[0]["error"]

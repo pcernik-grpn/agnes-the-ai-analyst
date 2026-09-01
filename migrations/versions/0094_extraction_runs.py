@@ -37,7 +37,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 revision: str = "0094_extraction_runs"
-down_revision: Union[str, None] = "0093_merge_train23_semantic"
+down_revision: Union[str, None] = "0094_usage_turns"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

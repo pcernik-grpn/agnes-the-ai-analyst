@@ -1,11 +1,31 @@
 """Unified admin REST surface for managed prompts (#622 Slice 1).
 
-Two managed prompts, addressed by a public ``kind`` vocabulary:
+Three managed prompts, addressed by a public ``kind`` vocabulary:
 
-  - ``workspace`` → the analyst workspace ``CLAUDE.md`` (DB key ``claude_md``)
-  - ``install``   → the install / setup prompt        (DB key ``welcome``)
+  - ``workspace``       → the analyst workspace ``CLAUDE.md`` (DB key ``claude_md``)
+  - ``install``         → the install / setup prompt        (DB key ``welcome``)
+  - ``facts-extraction`` → the fact-extraction prompt        (DB key ``facts_extraction``)
 
-Each prompt has an explicit ``source_mode`` toggle (``editor`` ⇄ ``git``) that
+``facts-extraction`` (owner requirement 2026-09-01, "promptable") is the
+rules half of what
+``connectors.sharepoint.facts_extraction`` sends the model for every
+document; its other half, the ontology, is not admin text at all and comes
+from the semantic-model store. It joins this endpoint rather than growing a
+surface of its own precisely because nothing new was needed: the same
+``instance_templates`` table, the same routes, one more value in the
+``kind`` vocabulary — no new route path, no new editor, no migration. It
+differs from its two siblings in exactly two ways, both enforced below:
+
+  - It is **not a Jinja template** and is never rendered through one (it
+    has no context to interpolate — the document arrives in the user
+    message), so ``_validate_template`` does not run a render over it.
+    Nothing about it is an SSTI surface *because* nothing renders it.
+  - It is **not git-bindable**: it is not a file in an Initial Workspace
+    Template repo and has no seed path, so ``source``/``bind-git`` refuse
+    it (409) rather than binding it to something no renderer would read.
+
+Each of the other two prompts has an explicit ``source_mode`` toggle
+(``editor`` ⇄ ``git``) that
 supersedes the old implicit ``seed_owns()`` read-only lock:
 
   - ``editor``: the admin's DB override wins at render time (the editor is
@@ -35,28 +55,71 @@ from pydantic import BaseModel, Field
 from app.auth.access import require_admin
 from app.auth.dependencies import _get_db
 
+# Module-level and cheap: `facts_prompt` imports only stdlib and holds the
+# built-in default text plus this endpoint's `kind` token for it.
+from connectors.sharepoint.facts_prompt import PROMPT_KIND as FACTS_PROMPT_KIND
+from connectors.sharepoint.facts_prompt import default_prompt as facts_default_prompt
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["prompts"])
 
-# Public `kind` → (repo factory name, canonical seed path, human label).
-# The DB keys (claude_md / welcome) stay an internal detail of the repos;
-# this is the single translation point per the build spec.
+# Public `kind` → canonical seed path in the Initial Workspace Template
+# repo. The DB keys (claude_md / welcome / facts_extraction) stay an
+# internal detail of the repos; this is the single translation point per
+# the build spec.
 _KINDS = {
     "workspace": "workspace/CLAUDE.md",
     "install": "install-prompt/template.md.tmpl",
+    # No seed path: this prompt ships as a Python constant in the connector
+    # that uses it, not as a workspace file, so there is nothing to bind to.
+    FACTS_PROMPT_KIND: "",
 }
+
+#: Kinds that can be bound to a file in the IWT clone. Declared as the
+#: allowlist rather than derived from an empty seed path, so adding a kind
+#: is an explicit decision about git-bindability rather than a side effect.
+_GIT_BINDABLE_KINDS = frozenset({"workspace", "install"})
 
 
 def _repo(kind: str):
     """Backend-aware repo for a managed prompt kind."""
-    from src.repositories import claude_md_template_repo, welcome_template_repo
+    from src.repositories import claude_md_template_repo, facts_prompt_repo, welcome_template_repo
 
     if kind == "workspace":
         return claude_md_template_repo()
     if kind == "install":
         return welcome_template_repo()
+    if kind == FACTS_PROMPT_KIND:
+        # PG-only (A3 ratchet): on a DuckDB-backed instance this raises
+        # `RequiresPostgresBackend`, which the app-wide handler translates
+        # to a typed 501 — the documented fail-clean posture, never a raw
+        # 500, and never a silently-empty override.
+        return facts_prompt_repo()
     raise HTTPException(status_code=404, detail={"kind": "unknown_prompt_kind"})
+
+
+def _require_git_bindable(kind: str) -> None:
+    """409 for a kind that has no Initial Workspace Template file to bind.
+
+    Refused BEFORE the repo is touched: the facts-extraction repo has no
+    ``set_source_mode``/``bind_git`` at all (see
+    ``src/repositories/facts_prompt_pg.py``'s docstring for why a
+    silently-accepting stub would be worse), so this is the check that
+    turns an impossible action into an explained one.
+    """
+    if kind in _GIT_BINDABLE_KINDS:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "kind": "prompt_not_git_bindable",
+            "hint": (
+                "This prompt is not a file in the Initial Workspace Template repo — "
+                "it ships as a built-in default and is overridden here in the editor."
+            ),
+        },
+    )
 
 
 def _validate_kind(kind: str) -> None:
@@ -75,6 +138,10 @@ def _live_default(kind: str, conn, *, user: dict, server_url: str) -> str:
         from src.claude_md import compute_default_claude_md
 
         return compute_default_claude_md(conn, user=user, server_url=server_url)
+    if kind == FACTS_PROMPT_KIND:
+        # A static constant, not a render: this prompt has no per-instance
+        # context, which is exactly why it is not a template.
+        return facts_default_prompt()
     from src.welcome_template import compute_default_agent_prompt
 
     return compute_default_agent_prompt(conn, user=user, server_url=server_url)
@@ -110,7 +177,16 @@ def _validate_template(kind: str, content: str) -> None:
 
     Reuses the per-kind stub contexts so a save through /api/admin/prompts is
     held to the same bar as the grandfathered /api/admin/*-template editors.
+
+    ``facts-extraction`` is exempt because it is not a template: nothing
+    renders it (it is handed to the model as literal system text), so there
+    is no context to validate against and no render-time execution to
+    sandbox. Validating it as Jinja would REJECT legitimate prompts — a
+    rule about `{"id": ...}` JSON output contains braces a Jinja parser
+    reads as syntax.
     """
+    if kind == FACTS_PROMPT_KIND:
+        return
     if kind == "workspace":
         from app.api.claude_md import (
             _VALIDATION_STUB_CONTEXT,
@@ -151,6 +227,10 @@ def _validate_template(kind: str, content: str) -> None:
 class PromptGetResponse(BaseModel):
     kind: str
     source_mode: str
+    #: Where the EFFECTIVE prompt comes from — ``builtin`` (no override
+    #: stored; ``default`` below is what runs), ``admin`` (the editor
+    #: override in ``content``), or ``git`` (bound to an IWT file).
+    origin: str = "builtin"
     content: Optional[str]
     git_path: Optional[str] = None
     base_sha: Optional[str] = None
@@ -274,8 +354,21 @@ async def get_prompt(
             # operator re-reconciles rather than trust a stale bind.
             diverged = True
 
+    # Where the EFFECTIVE prompt comes from, stated rather than inferred by
+    # each caller from the content/source_mode pair. The fact-extraction
+    # config drawer reads this to say which rules a run used, and the same
+    # value travels into the extraction run report as `prompt_origin` (see
+    # connectors/sharepoint/facts_prompt.py::resolve_extraction_prompt).
+    if meta["source_mode"] == "git":
+        origin = "git"
+    elif content:
+        origin = "admin"
+    else:
+        origin = "builtin"
+
     return PromptGetResponse(
         kind=kind,
+        origin=origin,
         source_mode=meta["source_mode"],
         content=content,
         git_path=meta["git_path"],
@@ -342,6 +435,7 @@ async def set_source(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     _validate_kind(kind)
+    _require_git_bindable(kind)
     from src.initial_workspace import is_configured
 
     if payload.mode == "git" and not is_configured():
@@ -367,6 +461,7 @@ async def bind_git(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     _validate_kind(kind)
+    _require_git_bindable(kind)
     from src.initial_workspace import is_configured
 
     if not is_configured():
@@ -426,6 +521,12 @@ async def preview_prompt(
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     _validate_kind(kind)
+    if kind == FACTS_PROMPT_KIND:
+        # Nothing renders this prompt, so a preview IS the content. Echoed
+        # rather than 404'd so one editor UI can call one endpoint for
+        # every kind, and rendered through nothing so the preview can never
+        # differ from what the model is actually sent.
+        return {"content": payload.content}
     server_url = str(request.base_url).rstrip("/")
     env = make_prompt_env()  # F4: sandboxed — admin-authored content
     try:

@@ -1390,6 +1390,34 @@ extraction:
     # multiply: two concurrent crawls at 6 = twelve files in flight against
     # the same tenant.
     concurrency: 6
+  # The LLM stage — turn ingested documents into knowledge-graph facts
+  # (connectors/sharepoint/facts_extraction.py). Runs after a successful
+  # crawl, over the documents that crawl just ingested and indexed.
+  facts:
+    # OFF by default, and this is a COST decision, not a capability one:
+    # this is the only stage that spends model tokens per document.
+    # Measured against the shipped prompt + a 22-type ontology: $0.011 for a
+    # typical ~5k-token document on the default Haiku-class model, $0.020
+    # when the corrective verbatim retry fires, ~$0.045 for a 30k-token
+    # one — so a 10,000-document corpus is a $110-200 first pass. Sonnet is
+    # roughly 3x those figures. Re-runs are far cheaper: a document
+    # is re-extracted only when its content, the model, or the effective
+    # prompt changed, and the prompt + ontology prefix is cached.
+    # Spreadsheets and CSVs are never sent to the model at all.
+    # Needs `facts.enabled` (the fact-graph surface) as well — with that
+    # off, the pass is skipped rather than writing claims nothing can read.
+    # AGNES_EXTRACTION_FACTS_ENABLED overrides this at the environment level.
+    enabled: false
+    # How many documents are extracted in parallel; clamped to [1, 16].
+    # 1 is exactly sequential. Raise it to spend the wall-clock budget of a
+    # large corpus on more concurrent calls rather than a longer run, and
+    # lower it if the model account's rate limit is the binding constraint.
+    concurrency: 3
+    # OPTIONAL model override for this stage only (a full-corpus pass is
+    # the one place an operator may want a different tier from the
+    # anonymizer's). Accepts a tier name (haiku/sonnet/opus) or a concrete
+    # model id. Empty falls back to `extraction.model`, then Haiku.
+    model: ""
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails

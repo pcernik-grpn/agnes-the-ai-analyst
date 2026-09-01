@@ -7054,10 +7054,19 @@ function _extRunLine(run) {
   // NER token accounting (usage or the report's ner_usage): a token COUNT is a
   // fact; the drawer says "not priced" rather than inventing a dollar figure
   // until operator-configured pricing exists. Absence means "no tokens spent".
-  const u = run.usage && Object.keys(run.usage).length ? run.usage : (run.ner_usage || null);
-  if (u && (u.input_tokens || u.output_tokens)) {
-    const tok = (u.input_tokens || 0) + (u.output_tokens || 0);
-    bits.push(`${_extNum(tok)} NER tokens · not priced`);
+  // `usage` is keyed by stage ({ner: {...}, facts: {...}}); a flat token
+  // dict (the pre-stage-keyed shape) and `run.ner_usage` stay readable so
+  // rows recorded before the contract change keep rendering their spend.
+  const usage = run.usage && Object.keys(run.usage).length ? run.usage : (run.ner_usage ? { ner: run.ner_usage } : null);
+  if (usage) {
+    const stages = (usage.input_tokens || usage.output_tokens) ? { ner: usage } : usage;
+    const stageLabels = { ner: "NER", facts: "facts" };
+    for (const [stage, u] of Object.entries(stages)) {
+      if (u && (u.input_tokens || u.output_tokens)) {
+        const tok = (u.input_tokens || 0) + (u.output_tokens || 0);
+        bits.push(`${_extNum(tok)} ${stageLabels[stage] || stage} tokens · not priced`);
+      }
+    }
   }
   return bits.join(" · ");
 }

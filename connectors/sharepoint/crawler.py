@@ -369,8 +369,8 @@ class _RunRecorder:
         *,
         status: str,
         report: Optional[Dict[str, Any]] = None,
-        error: Optional[str] = None,
         usage: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
     ) -> None:
         if not self.run_id:
             return
@@ -382,10 +382,12 @@ class _RunRecorder:
                 status=status,
                 report=report or {},
                 skips=cap_skips(_skip_rows(stats), total=_skip_total(stats)),
-                # The LLM detector's own running token accounting
-                # (`_detector_usage`). `{}` still means "none spent" — the
-                # regex tier, or no anonymize scope — a different claim
-                # from "$0.00", and the UI keeps saying so.
+                # Per-stage token accounting, keyed by stage: `ner` (the
+                # anonymize seam's LLM detector, read via `_detector_usage`)
+                # and `facts` (the LLM extraction stage, when switched on).
+                # `{}` means "no tokens spent" — a different claim from
+                # "$0.00", and the UI must keep saying so. An absent stage
+                # spent nothing (regex tier, stage off), never $0.
                 usage=usage or {},
                 files_seen=stats.items_seen,
                 files_done=stats.items_done,
@@ -2171,6 +2173,28 @@ def _detector_usage(detector: Any) -> Dict[str, Any]:
     return out
 
 
+def maybe_run_facts_extraction(
+    connection: Dict[str, Any], *, deadline: Optional[_Deadline] = None
+) -> Optional[Dict[str, Any]]:
+    """Run the LLM fact-extraction stage over what this crawl just ingested,
+    or return ``None`` when it is switched off.
+
+    Delegates to ``connectors.sharepoint.facts_extraction`` — the walk, the
+    prompt, the verbatim retry, the batching and the ingest all live there;
+    this module owns only the seam. Imported lazily so an instance with
+    ``extraction.facts.enabled`` off never imports the LLM stack, the same
+    posture :func:`_entity_detector` takes for the anonymizer's own.
+
+    Synchronous inside the async crawl, exactly like the per-file
+    ``ingestor.ingest`` call: this whole coroutine owns its worker's
+    EXTRACTION lane slot, and there is no concurrent work for an event loop
+    to interleave.
+    """
+    from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
+
+    return maybe_run_after_crawl(connection, deadline=deadline)
+
+
 def _resolve_anonymization_key(scopes: Sequence[Dict[str, Any]]) -> Optional[bytes]:
     """The per-instance anonymization HMAC key, or ``None`` when no scope in
     this run needs one.
@@ -2244,6 +2268,8 @@ async def _run_crawl_async(
     # is still a rendered row rather than a silence (design §4.3).
     recorder = _RunRecorder(connection_id, job_id=job_id)
     recorder.start()
+    #: The LLM stage's own sub-report, or None when it is switched off.
+    facts_report: Optional[Dict[str, Any]] = None
 
     try:
         for scope in scopes:
@@ -2291,6 +2317,19 @@ async def _run_crawl_async(
                     deadline=deadline,
                     governor=governor,
                 )
+
+        # ---- the LLM stage (owner decision 2026-09-01) -------------------
+        # Chained HERE, not in the worker handler, for three reasons: it
+        # needs this run's remaining `deadline`, its numbers belong in this
+        # run's report and `extraction_runs` row, and it can only run over
+        # documents this crawl has already ingested and indexed. Off unless
+        # `extraction.facts.enabled` — `maybe_run_after_crawl` returns None
+        # and this is a no-op. A hard stop inside it (no credential, model
+        # unreachable, no ontology) propagates into the handler below and
+        # records the run as FAILED, exactly like any other crash: the
+        # crawl's own work is already durable, and the facts pass resumes
+        # from its per-document state next run.
+        facts_report = maybe_run_facts_extraction(connection, deadline=deadline)
     except BaseException as exc:
         # A crashed — or deliberately stopped — run still owes the operator
         # its numbers and its state: the rows are already ingested, so record
@@ -2323,19 +2362,37 @@ async def _run_crawl_async(
             status="interrupted" if reason in {r for _, r in _STOP_REASONS} else _record_status_for(exc),
             report=interrupted_report,
             error=f"{type(exc).__name__}: {exc}",
-            usage=ner_usage,
+            usage={"ner": ner_usage} if ner_usage else {},
         )
         raise
 
     report = stats.report(max_file_mb=max_file_mb)
     report["connection_id"] = connection_id
     report["scope_errors"] = scope_errors
+    # Both LLM stages' numbers ride in the SAME report and the SAME
+    # `extraction_runs` row: one run, one set of counters. `ner_usage` and
+    # `facts_usage` are promoted to the top level (next to the crawl's own
+    # totals) because they are what the cost surfaces read; the facts
+    # sub-report stays nested so the crawl report's existing contract is
+    # unchanged. The run row's `usage` is keyed by stage; `{}` still means
+    # "no tokens spent" — a different claim from "$0.00" — whenever a
+    # stage is off or the regex tier answered.
     ner_usage = _detector_usage(detector)
     if ner_usage:
         report["ner_usage"] = ner_usage
+    facts_usage: Dict[str, Any] = {}
+    if facts_report is not None:
+        report["facts"] = facts_report
+        facts_usage = facts_report.get("facts_usage") or {}
+        report["facts_usage"] = facts_usage
     state["last_run"] = report
     save_state(connection_id, state)
-    recorder.finish(stats, status="done", report=report, usage=ner_usage)
+    run_usage: Dict[str, Any] = {}
+    if ner_usage:
+        run_usage["ner"] = ner_usage
+    if facts_usage:
+        run_usage["facts"] = facts_usage
+    recorder.finish(stats, status="done", report=report, usage=run_usage)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",

@@ -720,3 +720,67 @@ def test_install_prompt_save_rejects_token_placeholder():
 
     # The token-free shape stays saveable.
     _validate_template("install", "Set up.\nagnes init --token-file ~/.agnes/token\n")
+
+
+# ---------------------------------------------------------------------------
+# facts-extraction: the third managed prompt (owner requirement 2026-09-01)
+# ---------------------------------------------------------------------------
+
+
+def test_facts_extraction_is_not_validated_as_a_jinja_template():
+    """It is never rendered through Jinja — it is handed to the model as
+    literal system text. Validating it AS a template would reject a
+    legitimate prompt: the output-format rules contain `{"id": ...}` braces
+    a Jinja parser reads as syntax."""
+    from app.api.prompts import _validate_template
+
+    # No exception: a prompt full of JSON braces is legal content here.
+    _validate_template("facts-extraction", 'Emit {"id": "x", "type": "y"} per line.')
+
+
+def test_facts_extraction_prompt_is_not_git_bindable():
+    """It is not a file in the Initial Workspace Template repo and has no
+    seed path, so binding it would point at something no renderer reads.
+    Refused with an explanation rather than silently accepted."""
+    from fastapi import HTTPException
+
+    from app.api.prompts import _require_git_bindable
+
+    _require_git_bindable("workspace")  # unchanged for the two that are
+    _require_git_bindable("install")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _require_git_bindable("facts-extraction")
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["kind"] == "prompt_not_git_bindable"
+
+
+def test_facts_extraction_default_is_the_builtin_prompt():
+    from app.api.prompts import _live_default
+    from connectors.sharepoint.facts_prompt import DEFAULT_EXTRACTION_PROMPT
+
+    assert _live_default("facts-extraction", None, user={}, server_url="") == DEFAULT_EXTRACTION_PROMPT
+
+
+def test_facts_extraction_preview_is_the_content_itself():
+    """Rendered through nothing, so the preview can never differ from what
+    the model is actually sent."""
+    import asyncio
+
+    from app.api.prompts import preview_prompt, PreviewRequest
+
+    body = PreviewRequest(content='Rule 1: emit {"id": "x"}.')
+    result = asyncio.run(preview_prompt("facts-extraction", body, request=None, user={}, conn=None))
+    assert result == {"content": 'Rule 1: emit {"id": "x"}.'}
+
+
+def test_an_unknown_prompt_kind_still_404s():
+    from fastapi import HTTPException
+
+    from app.api.prompts import _validate_kind
+
+    with pytest.raises(HTTPException) as exc_info:
+        _validate_kind("nope")
+    assert exc_info.value.status_code == 404
+    # The hint enumerates every kind, including the new one.
+    assert "facts-extraction" in str(exc_info.value.detail["hint"])
