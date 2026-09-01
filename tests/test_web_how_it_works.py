@@ -13,7 +13,7 @@ The connector content is not *summarized* here, it LIVES here. That is the
 point: two pages both explaining "how do I connect" had already drifted
 ("Four places" vs. six tool tabs), and a summary drifts by construction.
 
-The eight section anchors are a PUBLIC CONTRACT. Four surfaces point into
+The nine section anchors are a PUBLIC CONTRACT. Four surfaces point into
 #connect under ONE label — "Take {brand} to your tools": the chat landing's
 door, the rail's foot row, the onboarding checklist's step and the tour's
 closing button (first person there, "to my tools"). The Library connect banner
@@ -35,6 +35,7 @@ SECTION_IDS = [
     "cli",
     "first-run",
     "privacy",
+    "usage",
     "reference",
 ]
 
@@ -246,7 +247,7 @@ def test_terminal_first_session_is_demoted_not_deleted(page):
 
 # ── First-read consumability ─────────────────────────────────────────
 # Consolidating everything onto one page made it complete and also made it
-# ~4,300px of uniform density: eight sections all shaped alike, so nothing
+# ~4,300px of uniform density: nine sections all shaped alike, so nothing
 # distinguished essential from reference and "what do I do now?" was two
 # screens down. The assertions below pin the three fixes — they are the kind
 # of decision a well-meaning later edit reverses without noticing.
@@ -317,7 +318,7 @@ def test_fold_summary_keeps_the_heading_and_lede_in_the_flow(page, section_id):
 
 
 def test_the_id_stays_on_the_section_not_the_details(page):
-    """The eight anchors are an inbound-link contract, so they may not move onto
+    """The nine anchors are an inbound-link contract, so they may not move onto
     the `<details>`: `#connect` has to keep resolving whether the fold is open
     or closed, and the script opens the fold that owns the target."""
     for section_id in COLLAPSED_SECTIONS:
