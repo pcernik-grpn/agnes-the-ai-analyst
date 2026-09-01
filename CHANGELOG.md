@@ -44,6 +44,24 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   now follows that redirect by hand, with a separate, unauthenticated
   request — never the Graph bearer token — to the redirect target, keeping
   the per-file size cap and partial-file cleanup intact.
+- **A file the built-in SharePoint crawler failed to download, convert,
+  redact or ingest is retried on the next run instead of being skipped
+  forever.** A drive's delta cursor advanced past a page even when some of
+  its rows failed — correct for the page as a whole, but Microsoft Graph
+  only re-offers an item through delta when it CHANGES, so a file that
+  failed once and was never touched again would never come back around;
+  observed on a live deployment, a run where every download failed was
+  followed by one where delta reported nothing left to do, leaving a
+  fraction of the library actually indexed with no error anywhere in sight.
+  Every such failure is now recorded in the crawl's state file and retried
+  on every future run independent of what delta reports, until it either
+  succeeds or hits a bounded number of attempts — an item that keeps
+  failing (a permanently corrupt document, say) eventually stops being
+  retried, but that outcome is recorded in the run report rather than
+  silently dropped. Recovering an already-affected connection no longer
+  needs hand-editing the state file on the data disk: "Run extraction now"
+  and the `corpus-extraction` job payload both take a `resync` option that
+  forces a full re-enumeration (kept cTags still skip unchanged files).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
