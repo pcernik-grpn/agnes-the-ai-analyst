@@ -629,6 +629,22 @@
   .ax-preview__name a { color: inherit; text-decoration: none; }
   .ax-preview__name a:hover { color: var(--ds-primary); text-decoration: underline; text-underline-offset: 2px; }
 
+  /* A labelled section per question, so the three kinds of line stop looking
+     like one list of equally-weighted bullets. */
+  .ax-simsec { margin-top: 16px; }
+  .ax-simsec:first-of-type { margin-top: 10px; }
+  .ax-simsec__hd {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--ds-text-muted); margin-bottom: 2px;
+  }
+  /* The standing note about delivery — true of everyone, so it closes the
+     pane quietly instead of arriving as another finding. */
+  .ax-simnote {
+    margin: 16px 0 0; padding-top: 12px;
+    border-top: 1px solid var(--ds-border-light);
+    font-size: 12.5px; line-height: 1.5; color: var(--ds-text-secondary);
+  }
+  .ax-simnote b { color: var(--ds-text-primary); }
   .ax-chain { margin: 6px 0 0; padding: 0; list-style: none; }
   .ax-chain li {
     position: relative; margin-left: 8px; padding: 9px 0 9px 18px;
@@ -2580,6 +2596,11 @@
      meet again. And it promised the negative half for everyone, while only
      an admin ever saw one. #}
   <p class="apg-sec-desc">Follow one person's access: which groups they are in, what those groups grant, and whether it downloads automatically.</p>
+  {# The way back to the roster, on the page's own first line — `.apg-back` is
+     the shared component for exactly this (admin_page.css), so it looks like
+     every other way-back in the admin area rather than a link class bolted
+     onto a button. #}
+  <button type="button" class="apg-back" id="ax-sim-back" data-people-back hidden>← All people</button>
   <div class="ds-card">
     {# No second person picker. The toolbar's search sits above the tabs and
        already selects the person on this tab, so a "Person" dropdown here was
@@ -2597,7 +2618,6 @@
                      options=[{'value': '', 'label': 'Loading people…'}]) }}
     </span>
     <div class="ax-simrow">
-      <button type="button" class="ax-inherit" id="ax-sim-back" data-people-back hidden>← All people</button>
       <span class="ax-simwho" id="ax-sim-who"></span>
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
@@ -6079,12 +6099,21 @@
       chips.unshift(`<span class="ax-chip info">Admin — reaches everything regardless of grants</span>`);
     }
 
-    const chain = [];
+    /* Three questions, three sections — not one list of eight bullets.
+       The chain used to mix a membership statement, the things they can
+       reach, the things they cannot, and a standing note about `agnes pull`
+       into a single <ul> with one dot per line. Every line looked equally
+       important and the reader had to sort them by reading each one. Split,
+       the shape answers the questions in the order they are asked: who are
+       they, what can they reach, what can they not. */
+    const chain = [];       // "can use" — the bulk
+    const chainStop = [];   // "cannot use" — negatives and dangling grants
+    let memberLine = "";
     /* Every bolded name below is a GROUP, set in the same type as the package
        names beside it. The inline mark is what tells the two apart in prose,
        where there is no column to say which is which. */
     const gname = (n) => `<b>${AgnesKindGlyph.groupGlyph()} ${esc(n)}</b>`;
-    chain.push(`<li><b>${esc(person.name || person.email || "This person")}</b> is in ${
+    memberLine = (`<li><b>${esc(person.name || person.email || "This person")}</b> is in ${
       groupNames.length ? groupNames.map(gname).join(", ") : "<span class=\"muted\">no groups</span>"
     }</li>`);
 
@@ -6098,7 +6127,7 @@
       const href = firstGroup && firstGroup.id
         ? `/admin/access?group=${encodeURIComponent(firstGroup.id)}`
         : "/admin/access";
-      chain.push(`<li class="stop">Nothing is granted to those groups, so they see no shared data.
+      chainStop.push(`<li class="stop">Nothing is granted to those groups, so they see no shared data.
         <a href="${href}">Grant something →</a></li>`);
     }
 
@@ -6116,7 +6145,7 @@
       const fixHref = g0 && g0.group_id
         ? `/admin/access?group=${encodeURIComponent(g0.group_id)}`
         : "/admin/access";
-      chain.push(`<li class="stop"><b>${esc(p.resource_id)}</b> — a grant via
+      chainStop.push(`<li class="stop"><b>${esc(p.resource_id)}</b> — a grant via
         ${gname(g0 ? (g0.group_name || g0.group_id) : "a group")} points at a package that
         no longer exists. <a href="${fixHref}">Fix the grant →</a></li>`);
     }
@@ -6163,7 +6192,7 @@
       // Same correction as the chips: for an admin this is a fact about the
       // package, not a limit on the person. The Share link stays — it is
       // still the thing you would do next — but it stops being a `stop`.
-      chain.push(eff.is_admin
+      chainStop.push(eff.is_admin
         ? `<li><b>${esc(p.name)}</b> is not shared with any group — they reach it as an admin, nobody else does.
            <a href="/admin/data-packages/${encodeURIComponent(p.resource_id)}?from=simulate&user=${encodeURIComponent(uid)}">Share it →</a></li>`
         : `<li class="stop"><b>${esc(p.name)}</b> is not shared with any group they are in.
@@ -6171,14 +6200,31 @@
     }
 
     // "Delivery" here means SHIPPING, and it sat in a list where every other
-    // bold word is the group named Delivery. Two testers misread it.
-    chain.push(`<li><b>Getting it there:</b> a granted package reaches their machine on the next
-      <code>agnes pull</code> — sharing it is not the same as it having arrived.</li>`);
+    // bold word is the group named Delivery. Two testers misread it. It is a
+    // standing fact about how granting works, true of every person on this
+    // tab — so it closes the pane as a note rather than competing with the
+    // findings as a ninth bullet with its own dot.
+    const deliveryNote = `<p class="ax-simnote"><b>Getting it there:</b> a granted package reaches
+      their machine on the next <code>agnes pull</code> — sharing it is not the same as it
+      having arrived.</p>`;
+
+    const section = (label, rows) => rows.length
+      ? `<div class="ax-simsec"><div class="ax-simsec__hd">${label}</div>
+         <ul class="ax-chain">${rows.join("")}</ul></div>`
+      : "";
 
     el("ax-sim-out").innerHTML =
+      /* Result first, then why. The chips and the Library panel are the
+         ANSWER — what this person actually sees — and the three sections
+         under them are the reasoning that produced it. The panel used to sit
+         between "in these groups" and "what they can reach", splitting the
+         explanation in half with its own conclusion. */
       `<div class="ax-chips">${chips.join("") || '<span class="ax-chip no">Nothing shared with them yet</span>'}</div>
        ${renderLibraryPreview(preview, uid, !!eff.is_admin)}
-       <ul class="ax-chain">${chain.join("")}</ul>`;
+       ${section("In these groups", [memberLine])}
+       ${section("What they can reach", chain)}
+       ${section("What they cannot reach", chainStop)}
+       ${deliveryNote}`;
   }
 
   // The "Grant something →" interceptor lived here. It reached for the
