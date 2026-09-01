@@ -80,15 +80,18 @@ import functools
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import random
 import re
+import signal
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -1679,6 +1682,228 @@ async def _run_blocking(pool: Optional[ThreadPoolExecutor], fn: Callable[..., An
     return await loop.run_in_executor(pool, functools.partial(fn, *args, **kwargs))
 
 
+# --------------------------------------------------------------------------
+# Conversion process isolation
+#
+# A native crash inside a conversion backend (observed on a live deployment:
+# a `trap int3` abort inside libpdfium.so, reached via pypdfium2) takes down
+# the WHOLE interpreter — no Python exception is raised, so the per-file
+# `except Exception` around `convert_to_markdown` below is unreachable by
+# construction. `ThreadPoolExecutor` cannot help: a fatal signal kills the
+# process the thread runs in, worker thread and all. Only an OS PROCESS
+# boundary survives that, which is what this section builds: one dedicated,
+# reused child process per concurrency slot, talking to the parent over a
+# duplex `Pipe`.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _ConvertOutcome:
+    """One conversion attempt's result, as reported by a (still-alive) child
+    over its pipe. Never carries an exception object — only plain strings —
+    so this never depends on what happens to pickle across the boundary."""
+
+    ok: bool
+    markdown: str = ""
+    detail: str = ""
+
+
+class _ConvertCrashed(Exception):
+    """The child process handling this call died from a signal (or exited
+    non-zero without ever answering) instead of returning a result.
+
+    Raised only inside :meth:`_ConvertProcessPool.convert`, on the PARENT
+    side — never crosses a process boundary itself. The caller
+    (:func:`_prepare_document`) treats it exactly like an ordinary
+    conversion exception: the file is counted as ``convert_failed`` and the
+    crawl moves on. ``signal_name`` is the best identification available
+    (a POSIX signal name, ``"exit code N"``, or ``"unknown"`` when the
+    worker was already gone before this call).
+    """
+
+    def __init__(self, signal_name: str) -> None:
+        self.signal_name = signal_name
+        super().__init__(f"conversion worker terminated ({signal_name})")
+
+
+def _convert_worker_main(conn: Connection) -> None:
+    """Entry point for a dedicated conversion child process — runs ONLY
+    inside a forked child, never called directly.
+
+    Loops reading ``(tmp_path_str, mime)`` off ``conn`` and replying
+    ``(True, markdown)`` or ``(False, detail)``. An ordinary Python
+    exception from :func:`convert_to_markdown` is caught HERE, exactly like
+    the pre-isolation code did, and turned into the same kind of failure —
+    only ``type(exc).__name__`` crosses back, matching this module's
+    existing discipline of never letting a conversion failure's message
+    (which may quote unconvertible bytes) leave the process that read the
+    file. A native crash bypasses this function's `try/except` entirely by
+    definition; the parent notices this worker is gone via the pipe closing
+    (``EOFError`` on its next ``recv``), not via anything sent from here.
+    """
+    while True:
+        try:
+            task = conn.recv()
+        except (EOFError, OSError):
+            return
+        if task is None:  # shutdown sentinel
+            return
+        tmp_path_str, mime = task
+        try:
+            converted = convert_to_markdown(Path(tmp_path_str), mime)
+            markdown = str(getattr(converted, "markdown", "") or "")
+        except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
+            try:
+                conn.send((False, type(exc).__name__))
+            except OSError:
+                return
+            continue
+        try:
+            conn.send((True, markdown))
+        except OSError:
+            return
+
+
+class _ConvertProcessPool:
+    """A small, reused pool of persistent worker PROCESSES dedicated to the
+    convert step of one crawl run.
+
+    One process per concurrency slot (``0..size-1``), forked once (see
+    :meth:`start`) and reused for every file that slot handles for the rest
+    of the run — spawning a fresh interpreter per file would pay a full
+    cold start (plus re-importing markitdown/pypdfium2) on every single
+    document, which for a thousand-file crawl dwarfs the conversion itself.
+    Passing the temp file's PATH rather than its bytes keeps each round trip
+    to two short strings.
+
+    Deliberately ``fork``, never ``spawn``:
+
+    * ``fork`` is what makes a test's ``monkeypatch.setattr(crawler,
+      "convert_to_markdown", ...)`` reach the child at all. ``spawn`` starts
+      a brand new interpreter that re-imports this module fresh and never
+      sees a patch applied to the ALREADY-RUNNING parent's copy; ``fork``
+      copies the parent's memory as it stood at fork time, patch included,
+      which is also just a few ms instead of a few hundred.
+    * Every worker's ``Process`` and its duplex ``Connection`` are 1:1 — no
+      shared queue, no ambiguity about which process died: a slot's own
+      crash is detected by ``EOFError`` on ITS OWN connection (the OS always
+      closes the write end when a process exits, whatever the cause), and
+      its exact ``exitcode`` (negative == killed by that signal number) is
+      read directly off THAT ``Process`` object. That is deliberately NOT
+      ``concurrent.futures.ProcessPoolExecutor``: its only public failure is
+      a generic ``BrokenProcessPool`` with no per-worker detail, and a crash
+      there poisons the ENTIRE pool rather than the one slot that died.
+
+    Every fork this pool ever does — the initial :meth:`start` and every
+    :meth:`repair` — must happen from a point the CALLER has proven is
+    single-threaded (the top of a run, or a delta-page boundary once that
+    page's item-concurrency ``ThreadPoolExecutor`` has been joined).
+    ``fork()`` while another thread holds a C-level lock (malloc, DuckDB,
+    OpenSSL, ...) can hand the child a lock that will never be released —
+    this pool trusts its caller for that timing rather than re-deriving it.
+    """
+
+    def __init__(self, size: int, *, ctx: Optional[Any] = None) -> None:
+        self._ctx = ctx or multiprocessing.get_context("fork")
+        self._size = max(1, int(size))
+        self._procs: List[Optional[Any]] = [None] * self._size
+        self._conns: List[Optional[Connection]] = [None] * self._size
+
+    def start(self) -> None:
+        """Fork every slot that is not already alive. Call only from a
+        single-threaded context — see the class docstring."""
+        for slot in range(self._size):
+            if self._procs[slot] is None:
+                self._spawn(slot)
+
+    def _spawn(self, slot: int) -> None:
+        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        proc = self._ctx.Process(
+            target=_convert_worker_main,
+            args=(child_conn,),
+            daemon=True,
+            name=f"sp-convert-{slot}",
+        )
+        proc.start()
+        child_conn.close()  # the parent only ever uses its own end
+        self._procs[slot] = proc
+        self._conns[slot] = parent_conn
+
+    def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
+        """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
+        worker and returns its outcome, or raises :class:`_ConvertCrashed`
+        when that worker died instead of answering — the caller turns that
+        into the same ``convert_failed`` outcome an ordinary exception
+        would, with the signal named in the log line."""
+        proc = self._procs[slot]
+        conn = self._conns[slot]
+        if proc is None or conn is None or not proc.is_alive():
+            raise _ConvertCrashed(self._exit_detail(proc))
+        try:
+            conn.send((str(tmp_path), mime))
+            ok, payload = conn.recv()
+        except (EOFError, OSError):
+            raise _ConvertCrashed(self._exit_detail(proc)) from None
+        if ok:
+            return _ConvertOutcome(ok=True, markdown=payload)
+        return _ConvertOutcome(ok=False, detail=payload)
+
+    def _exit_detail(self, proc: Optional[Any]) -> str:
+        if proc is None:
+            return "unknown"
+        proc.join(timeout=5)
+        code = proc.exitcode
+        if code is None:
+            return "unknown"
+        if code < 0:
+            try:
+                return signal.Signals(-code).name
+            except ValueError:
+                return f"signal {-code}"
+        if code > 0:
+            return f"exit code {code}"
+        return "unknown"
+
+    def repair(self) -> List[int]:
+        """Replace every dead slot with a fresh worker. Call only from a
+        point the caller has proven single-threaded (a delta-page boundary,
+        after that page's item-concurrency thread pool has been joined).
+        Returns the repaired slot indices — used by tests."""
+        repaired = []
+        for slot, proc in enumerate(self._procs):
+            if proc is None or not proc.is_alive():
+                self._close_slot(slot)
+                self._spawn(slot)
+                repaired.append(slot)
+        return repaired
+
+    def _close_slot(self, slot: int) -> None:
+        proc = self._procs[slot]
+        conn = self._conns[slot]
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        self._procs[slot] = None
+        self._conns[slot] = None
+
+    def shutdown(self) -> None:
+        """Signal every live worker to exit, then reap them all. Safe to
+        call more than once and safe to call on a pool that never started."""
+        for conn in self._conns:
+            if conn is not None:
+                try:
+                    conn.send(None)
+                except OSError:
+                    pass
+        for slot in range(self._size):
+            self._close_slot(slot)
+
+
 @dataclass
 class _PreparedDocument:
     """Outcome of the blocking half of one item: hash -> convert -> anonymize.
@@ -1702,6 +1927,8 @@ def _prepare_document(
     anonymize: bool,
     anonymization_key: Optional[bytes],
     detector: Any,
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    convert_slot: int = 0,
 ) -> _PreparedDocument:
     """Hash, convert and (for an anonymize-marked scope) anonymize one file.
 
@@ -1709,11 +1936,40 @@ def _prepare_document(
     no state file — which is what makes it safe to run on a worker thread.
     An unexpected failure of the HASH itself still propagates (as it did
     before): a file we cannot read is not a convert failure.
+
+    Convert alone is isolated in a child process (``convert_pool``, see its
+    class docstring for why); anonymize stays HERE, on the calling thread, in
+    THIS process — it needs the HMAC key, and that key must never cross a
+    process boundary (on argv, in an environment variable of a child we do
+    not control, or otherwise) when there is no need for it to. Anonymize
+    input is already-converted markdown, not attacker-shaped file bytes, and
+    has no native-library dependency of the kind that motivated isolating
+    convert in the first place, so it carries none of the crash risk.
+    ``convert_pool=None`` (only ever a testing/unit-call default — the real
+    crawl always passes one) falls back to calling the converter inline, the
+    exact pre-isolation behaviour.
     """
     source_sha256 = _sha256_file(tmp_path)
     try:
-        converted = convert_to_markdown(tmp_path, mime)
-        markdown = str(getattr(converted, "markdown", "") or "")
+        if convert_pool is not None:
+            outcome = convert_pool.convert(convert_slot, tmp_path, mime)
+            if not outcome.ok:
+                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, outcome.detail)
+                return _PreparedDocument("convert_failed")
+            markdown = outcome.markdown
+        else:
+            converted = convert_to_markdown(tmp_path, mime)
+            markdown = str(getattr(converted, "markdown", "") or "")
+    except _ConvertCrashed as exc:
+        # The child that was converting this file died from a signal (a
+        # native abort/segfault, not a Python exception) — the one failure
+        # mode a `try/except Exception` can never catch, because nothing
+        # raises here: the process running it is simply gone. Counted and
+        # skipped exactly like an ordinary conversion failure; the crawl
+        # continues with the next file, and this process — the one running
+        # the crawl loop — was never at risk.
+        logger.warning("sharepoint crawl: conversion worker crashed for %s: %s", path, exc.signal_name)
+        return _PreparedDocument("convert_failed")
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
         return _PreparedDocument("convert_failed")
@@ -1750,6 +2006,8 @@ async def _process_item(
     anonymization_key: Optional[bytes],
     detector: Any = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    convert_slot: int = 0,
 ) -> None:
     """One delta row -> at most one ingested document. Never raises for a
     per-file fault: a locked, vanished, unconvertible, or un-anonymizable
@@ -1842,6 +2100,8 @@ async def _process_item(
                 anonymize=ctx.anonymize,
                 anonymization_key=anonymization_key,
                 detector=detector,
+                convert_pool=convert_pool,
+                convert_slot=convert_slot,
             )
         finally:
             # The local copy never persists — success, skip, or failure.
@@ -2012,6 +2272,7 @@ async def _process_page(
     deadline: Optional[_Deadline] = None,
     concurrency: int = 1,
     stop_watcher: Optional["_StopWatcher"] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
 ) -> None:
     """Run ONE delta page's rows, up to ``concurrency`` items at a time.
 
@@ -2034,6 +2295,21 @@ async def _process_page(
     ``concurrency <= 1`` takes the sequential branch: the same loop, the same
     inline calls and the same ordering the crawl had before this existed, so
     "1 == today's behaviour" is a property of the code, not a hope.
+
+    ``convert_pool`` (see its class docstring) supplies one dedicated
+    converter PROCESS per item-concurrency slot, ``0..workers-1``. The
+    sequential branch has exactly one slot (0) and no sibling to fall back
+    on, so it repairs that slot before every item — always safe here, since
+    this branch never creates a thread pool at all. The parallel branch
+    instead repairs once, at the PAGE boundary in :func:`_crawl_drive` (after
+    this function's own thread pool below has been joined): repairing a
+    slot mid-page would fork while its siblings' worker threads are still
+    live, which is exactly the hazard the pool's docstring warns about. A
+    slot that crashes mid-page therefore stays down for the REST of that
+    page — every item it draws counts as ``convert_failed`` until the next
+    page's repair — while the other slots keep converting normally; those
+    files are not lost, only deferred (no cTag is written for a
+    ``convert_failed`` item, so the next crawl retries them).
     """
     workers = max(1, int(concurrency))
     if workers == 1:
@@ -2045,6 +2321,10 @@ async def _process_page(
             # already-ingested item in it upserts to a no-op.
             if deadline is not None:
                 deadline.check()
+            # Always safe: this branch never creates a thread pool, so there
+            # is never another thread alive to hand a held lock to.
+            if convert_pool is not None:
+                convert_pool.repair()
             # Pure bookkeeping, so the report says `max_in_flight: 1` here
             # rather than a 0 that reads as "nothing ever ran".
             stats.enter_item()
@@ -2061,6 +2341,8 @@ async def _process_page(
                     max_file_mb=max_file_mb,
                     anonymization_key=anonymization_key,
                     detector=detector,
+                    convert_pool=convert_pool,
+                    convert_slot=0,
                 )
             finally:
                 stats.exit_item(time.monotonic() - started)
@@ -2096,7 +2378,7 @@ async def _process_page(
         cursor += 1
         return item
 
-    async def _worker() -> None:
+    async def _worker(slot: int) -> None:
         while True:
             if deadline is not None:
                 try:
@@ -2123,6 +2405,8 @@ async def _process_page(
                     anonymization_key=anonymization_key,
                     detector=detector,
                     pool=pool,
+                    convert_pool=convert_pool,
+                    convert_slot=slot,
                 )
             except BaseException as exc:  # noqa: BLE001 — re-raised after the drain
                 # Anything escaping `_process_item` is by definition NOT a
@@ -2150,8 +2434,11 @@ async def _process_page(
         # `gather` without `return_exceptions` would cancel the peers on the
         # first failure — exactly the "one bad future loses the others'
         # completed work" this must not do. Every worker returns normally and
-        # parks its exception in `aborts` instead.
-        await asyncio.gather(*[_worker() for _ in range(min(workers, len(items)))])
+        # parks its exception in `aborts` instead. Each worker keeps the SAME
+        # convert-pool slot (its position in this list) for the whole page —
+        # see `convert_pool`'s docstring for why that 1:1 pairing is what
+        # makes crash detection and repair unambiguous.
+        await asyncio.gather(*[_worker(i) for i in range(min(workers, len(items)))])
     finally:
         pool.shutdown(wait=True)
 
@@ -2186,6 +2473,7 @@ async def _crawl_drive(
     deadline: Optional[_Deadline] = None,
     governor: Optional[_ConcurrencyGovernor] = None,
     stop_watcher: Optional["_StopWatcher"] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
@@ -2202,7 +2490,13 @@ async def _crawl_drive(
     follow. Pages themselves remain strictly sequential: the next page's URL
     is only known once this page's response has been read, and its deltaLink
     must not be persisted before the current page's rows are on disk. Drives,
-    likewise, remain sequential — see the note in :func:`_run_crawl_async`."""
+    likewise, remain sequential — see the note in :func:`_run_crawl_async`.
+
+    ``convert_pool`` is repaired HERE, right after each page, not inside
+    :func:`_process_page`: by the time a page returns its own
+    item-concurrency thread pool (if any) has already been joined, which is
+    exactly the single-threaded window a fork-based repair needs — see
+    ``_ConvertProcessPool``'s docstring."""
     governor = governor or _ConcurrencyGovernor(1)
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
@@ -2277,7 +2571,14 @@ async def _crawl_drive(
             deadline=deadline,
             concurrency=governor.current(),
             stop_watcher=stop_watcher,
+            convert_pool=convert_pool,
         )
+        if convert_pool is not None:
+            # Safe HERE: `_process_page` has already joined this page's own
+            # thread pool (if it made one) before returning, so no other
+            # thread is alive to hand a held lock to. See the class
+            # docstring on `_ConvertProcessPool` and the note above.
+            convert_pool.repair()
         # The page's OWN throttling, not the run's running total: the
         # governor folds a DELTA, so one bad page cannot keep halving the
         # target for the rest of the crawl.
@@ -2561,6 +2862,14 @@ async def _run_crawl_async(
     # registration, not a drive, so what one drive learns about backing off
     # must carry to the next.
     governor = _ConcurrencyGovernor(cap, stats=stats)
+    # One dedicated converter process per concurrency slot, forked NOW —
+    # before anything below creates a `ThreadPoolExecutor` — so `.start()`
+    # runs in the single-threaded window its docstring requires. Sized to
+    # the run's hard ceiling, not the governor's current (adaptive) target,
+    # so a slot is always available for whatever concurrency a later page
+    # actually uses.
+    convert_pool = _ConvertProcessPool(cap)
+    convert_pool.start()
     auth = GraphAuth(
         acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
         stats=stats,
@@ -2588,52 +2897,60 @@ async def _run_crawl_async(
     facts_report: Optional[Dict[str, Any]] = None
 
     try:
-        for scope in scopes:
-            source_scope_id = str(scope.get("source_scope_id"))
-            try:
-                targets = await _drive_targets(transport, scope)
-                exclusions = await _excluded_path_prefixes(transport, scope)
-            except (CrawlError, SharePointGraphError) as exc:
-                # One scope's misconfiguration (or one site's outage) must not
-                # cost the connection's other scopes their pass — the same
-                # per-unit failure isolation `acl_sync` applies per connection.
-                scope_errors.append({"scope": source_scope_id, "error": str(exc)})
-                stats.add(errors=1)
-                continue
+        try:
+            for scope in scopes:
+                source_scope_id = str(scope.get("source_scope_id"))
+                try:
+                    targets = await _drive_targets(transport, scope)
+                    exclusions = await _excluded_path_prefixes(transport, scope)
+                except (CrawlError, SharePointGraphError) as exc:
+                    # One scope's misconfiguration (or one site's outage) must not
+                    # cost the connection's other scopes their pass — the same
+                    # per-unit failure isolation `acl_sync` applies per connection.
+                    scope_errors.append({"scope": source_scope_id, "error": str(exc)})
+                    stats.add(errors=1)
+                    continue
 
-            ctx = _ScopeContext(
-                source_scope_id=source_scope_id,
-                collection_id=str(scope["collection_id"]),
-                anonymize=bool(scope.get("anonymize")),
-                exclusions=exclusions,
-                zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
-            )
-            stats.add(scopes=1)
-            # Drives stay SEQUENTIAL, deliberately. Parallelising them is the
-            # second axis and it is not worth its risk here: every drive
-            # shares one state file whose per-drive deltaLink is the resume
-            # contract, and the 410-resync path mutates that file mid-drive;
-            # the 429 budget and the deadline are likewise run-wide, so a
-            # second axis mostly converts into 429s against the same tenant
-            # rather than into throughput. In-page concurrency already
-            # saturates a 200-row page. Correctness beats the second axis.
-            for target in targets:
-                await _crawl_drive(
-                    target,
-                    ctx=ctx,
-                    transport=transport,
-                    ingestor=ingestor,
-                    connection_id=connection_id,
-                    state=state,
-                    stats=stats,
-                    max_file_mb=max_file_mb,
-                    anonymization_key=anonymization_key,
-                    recorder=recorder,
-                    detector=detector,
-                    deadline=deadline,
-                    governor=governor,
-                    stop_watcher=stop_watcher,
+                ctx = _ScopeContext(
+                    source_scope_id=source_scope_id,
+                    collection_id=str(scope["collection_id"]),
+                    anonymize=bool(scope.get("anonymize")),
+                    exclusions=exclusions,
+                    zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
                 )
+                stats.add(scopes=1)
+                # Drives stay SEQUENTIAL, deliberately. Parallelising them is the
+                # second axis and it is not worth its risk here: every drive
+                # shares one state file whose per-drive deltaLink is the resume
+                # contract, and the 410-resync path mutates that file mid-drive;
+                # the 429 budget and the deadline are likewise run-wide, so a
+                # second axis mostly converts into 429s against the same tenant
+                # rather than into throughput. In-page concurrency already
+                # saturates a 200-row page. Correctness beats the second axis.
+                for target in targets:
+                    await _crawl_drive(
+                        target,
+                        ctx=ctx,
+                        transport=transport,
+                        ingestor=ingestor,
+                        connection_id=connection_id,
+                        state=state,
+                        stats=stats,
+                        max_file_mb=max_file_mb,
+                        anonymization_key=anonymization_key,
+                        recorder=recorder,
+                        detector=detector,
+                        deadline=deadline,
+                        governor=governor,
+                        stop_watcher=stop_watcher,
+                        convert_pool=convert_pool,
+                    )
+        finally:
+            # Done converting for this run either way (success, a scope
+            # error that propagated, a timeout, ...) — release the worker
+            # processes before the (potentially long) facts stage below runs,
+            # rather than leaving them idle for its whole duration.
+            convert_pool.shutdown()
 
         # ---- the LLM stage (owner decision 2026-09-01) -------------------
         # Chained HERE, not in the worker handler, for three reasons: it
