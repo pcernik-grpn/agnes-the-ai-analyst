@@ -16,7 +16,10 @@ import pytest
 
 
 @pytest.fixture
-def facts_client(seeded_app, monkeypatch):
+def facts_client(seeded_app, duckdb_backend_pinned, monkeypatch):
+    # `duckdb_backend_pinned`: the `*_fails_clean_on_duckdb` tests below must
+    # resolve DuckDB regardless of a `tests/db_pg/` test having run earlier
+    # in this worker process (issue #1658) — see `tests/_backend_pin.py`.
     monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
     return seeded_app
 

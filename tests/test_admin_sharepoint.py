@@ -2033,6 +2033,11 @@ class TestChangesFeedFailsCleanOnDuckDB:
     default here) only proves the typed 501 — never a raw 500 — regardless
     of whether the connection has any confirmed scopes yet."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
     def test_changes_501_on_duckdb_backend_no_scopes(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
