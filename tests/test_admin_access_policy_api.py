@@ -22,6 +22,8 @@ HTTP-level admin-token style, and
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 
@@ -284,6 +286,92 @@ class TestPolicyAuditRedaction:
         raw_params = rows[0]["params"]
         params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
         assert params["access_policy_note"] == "restrict rows to the caller's unit"
+
+
+# ── #1979: the source_query body must never land in audit_log.params ───
+#
+# `source_query` (extraction SQL, or for Keboola materialized a JSON
+# filter spec) is already persisted verbatim on `table_registry`. Same
+# "content never enters params" rationale as TestPolicyAuditRedaction
+# above -- register_table and update_table share the masking allowlist.
+
+
+@pytest.mark.journey
+class TestSourceQueryAuditRedaction:
+    @staticmethod
+    def _sentinel_filter(marker: str) -> str:
+        # Keboola materialized source_query must be a JSON filter spec
+        # (columns/whereFilters/changedSince), not SQL -- see
+        # RegisterTableRequest._check_mode_query_coherence.
+        return json.dumps({"columns": [marker]})
+
+    def test_register_table_audit_redacts_source_query(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        marker = "SENTINEL_SOURCE_QUERY_1979_REGISTER"
+        sentinel_query = self._sentinel_filter(marker)
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "redact_source_query_tbl",
+                "source_type": "keboola",
+                "query_mode": "materialized",
+                "source_query": sentinel_query,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
+        table_id = resp.json()["id"]
+
+        rows = _audit_rows(action="register_table", resource=table_id)
+        assert rows, "register_table audit entry not found"
+
+        raw_params = rows[0]["params"]
+        params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+
+        # The query body must not be recoverable from the row at all --
+        # neither under its own key nor smuggled anywhere else in params.
+        assert marker not in (raw_params if isinstance(raw_params, str) else json.dumps(params))
+        assert params["source_query"] != sentinel_query
+        assert params["source_query"] == "***"
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get(table_id)
+        assert row["source_query"] == sentinel_query
+
+    def test_update_table_audit_redacts_source_query(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="redact_source_query_update_tbl")
+        marker = "SENTINEL_SOURCE_QUERY_1979_UPDATE"
+        sentinel_query = self._sentinel_filter(marker)
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"query_mode": "materialized", "source_query": sentinel_query},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="update_table", resource=table_id)
+        assert rows, "update_table audit entry not found"
+
+        raw_params = rows[0]["params"]
+        params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+
+        assert marker not in (raw_params if isinstance(raw_params, str) else json.dumps(params))
+        assert params["source_query"] != sentinel_query
+        assert params["source_query"] == "***"
+
+        # But the audit trail must still show THAT source_query changed.
+        assert "source_query" in params["updated_fields"]
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get(table_id)
+        assert row["source_query"] == sentinel_query
 
 
 # ── Deliverable 2: POST /registry/{table_id}/policy/preview (§13.1) ────

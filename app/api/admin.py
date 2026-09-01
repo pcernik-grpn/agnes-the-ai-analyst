@@ -3454,10 +3454,11 @@ _VALID_SOURCE_TYPES: tuple[str, ...] = ("keboola", "bigquery", "jira", "local", 
 # models (RegisterTableRequest / UpdateTableRequest / ConfigureRequest /
 # ServerConfigUpdateRequest / PolicyPreviewRequest) when extending —
 # ConfigureRequest carries Keboola creds (`keboola_token`), and
-# `access_policy_sql` / `candidate_sql` carry SQL bodies that are already
-# durably persisted on `table_registry` (or, for a preview candidate,
-# never persisted at all) — the audit row only needs to say THAT it
-# changed/was previewed, never the body itself.
+# `access_policy_sql` / `candidate_sql` / `source_query` carry SQL (or
+# extraction-filter) bodies that are already durably persisted on
+# `table_registry` (or, for a preview candidate, never persisted at all)
+# — the audit row only needs to say THAT it changed/was previewed, never
+# the body itself.
 _SECRET_FIELDS: frozenset = frozenset(
     {
         # ConfigureRequest — POST /api/admin/configure carries Keboola creds.
@@ -3489,6 +3490,14 @@ _SECRET_FIELDS: frozenset = frozenset(
         # never even reaches persistent storage, so redacting it here is
         # the ONLY place it would otherwise be recoverable from.
         "candidate_sql",
+        # #1979 — RegisterTableRequest.source_query / UpdateTableRequest.
+        # source_query is the extraction SQL (or, for Keboola materialized,
+        # a JSON filter spec) that defines the table body itself. It is
+        # already durably persisted on `table_registry.source_query`;
+        # `updated_fields` (update_table) already tells the audit row THAT
+        # it changed, and register_table's `resource` names the table. Same
+        # "content never enters params" rationale as access_policy_sql.
+        "source_query",
     }
 )
 
