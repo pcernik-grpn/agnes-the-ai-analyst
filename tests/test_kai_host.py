@@ -2109,3 +2109,33 @@ def test_merged_config_bytes_do_not_depend_on_plugin_order(seeded_app, kai_env):
     assert list(settings) == sorted(settings)
     assert raw_mcp == _workspace_member(seeded_app, ".mcp.json")
     assert raw_settings == _workspace_member(seeded_app, ".claude/settings.json")
+
+
+def test_workspace_omits_python_bytecode_artifacts(seeded_app, kai_env):
+    """A ``__pycache__`` next to the bundled hook is build junk, not workspace
+    content: it ships bytecode compiled for the SERVER's interpreter into a
+    sandbox that never imports it, and every member costs the engine
+    (upload + ``tar`` listing + extraction) on every SDK spawn. It also breaks
+    the byte-stability contract — the file appears the first time the server
+    happens to run the hook."""
+    import tarfile as _tarfile
+
+    from app.api.kai import _workspace_template_root
+
+    root = _workspace_template_root()
+    cache_dir = root / ".claude" / "hooks" / "__pycache__"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stray = cache_dir / "pre_tool_use.cpython-312.pyc"
+    stray.write_bytes(b"\x00\x00\x00\x00not-real-bytecode")
+    try:
+        credential = _claims(_mint_session(seeded_app)["token"])["downstream_credential"]
+        resp = seeded_app["client"].get("/api/kai/workspace", headers={"Authorization": f"Bearer {credential}"})
+        assert resp.status_code == 200
+        with _tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+            names = [m.name for m in tar.getmembers()]
+        assert not any("__pycache__" in n.split("/") for n in names), names
+        assert not any(n.endswith(".pyc") for n in names), names
+        # The hook itself still ships — the exclusion is the cache, not the tree.
+        assert ".claude/hooks/pre_tool_use.py" in names
+    finally:
+        stray.unlink(missing_ok=True)

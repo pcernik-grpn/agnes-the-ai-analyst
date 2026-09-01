@@ -1001,6 +1001,29 @@ async def kai_mcp(
 #: the template is workspace content and goes as-is.
 _WORKSPACE_EXCLUDED_TOPLEVEL = frozenset({"docker-sandbox"})
 
+#: Directory names dropped at ANY depth, and the suffix that goes with them.
+#: ``__pycache__`` is not workspace content: it is bytecode the SERVER's
+#: interpreter compiled when it ran the bundled hook, for a sandbox that never
+#: imports the hook as a module. Shipping it costs the engine on every SDK
+#: spawn — one more member to upload, list (``tar -tzvf``) and extract — and it
+#: breaks this route's byte-stability promise, since the file appears the first
+#: time the server happens to execute the hook. ``.git`` is dropped for the
+#: same "not workspace content" reason and is checked here rather than
+#: separately.
+_WORKSPACE_EXCLUDED_DIR_NAMES = frozenset({".git", "__pycache__"})
+_WORKSPACE_EXCLUDED_SUFFIX = ".pyc"
+
+
+def _is_workspace_junk(arcname: str) -> bool:
+    """Whether this member is build/cache noise rather than workspace content.
+
+    Applied to the template walk AND to the assembled member set, so a
+    marketplace plugin or a previewed skill that carries a ``__pycache__``
+    cannot smuggle one in past the walk's own filter.
+    """
+    parts = arcname.split("/")
+    return bool(_WORKSPACE_EXCLUDED_DIR_NAMES.intersection(parts)) or arcname.endswith(_WORKSPACE_EXCLUDED_SUFFIX)
+
 #: Hard ceiling mirroring the engine's own (100 MiB, wire and extracted). The
 #: bundled template is ~160 KiB, so this only fires if an operator's override
 #: template is enormous — better a clear error here than a failed turn there.
@@ -1503,6 +1526,7 @@ def _build_workspace_archive(
     non-file member (symlink, device), so those are filtered here rather than
     failing someone's turn. Directories are implicit.
     """
+    started = time.monotonic()
     root, override_active = _workspace_source()
     if not root.is_dir():
         return None
@@ -1521,7 +1545,7 @@ def _build_workspace_archive(
         if not path.is_file() or path.is_symlink():
             continue
         rel = path.relative_to(root)
-        if rel.parts[0] in _WORKSPACE_EXCLUDED_TOPLEVEL or ".git" in rel.parts:
+        if rel.parts[0] in _WORKSPACE_EXCLUDED_TOPLEVEL or _is_workspace_junk(rel.as_posix()):
             continue
         paths[rel.as_posix()] = path
 
@@ -1594,7 +1618,7 @@ def _build_workspace_archive(
         if approved is not None:
             synthesized[_SETTINGS_ARCNAME] = approved
 
-    names = sorted({*paths, *synthesized})
+    names = sorted(n for n in {*paths, *synthesized} if not _is_workspace_junk(n))
 
     buffer = io.BytesIO()
     members = 0
@@ -1638,6 +1662,19 @@ def _build_workspace_archive(
     archive = buffer.getvalue()
     if len(archive) > _MAX_WORKSPACE_ARCHIVE_BYTES:
         raise HTTPException(status_code=500, detail="kai_workspace_too_large")
+    # The engine re-fetches this on every SDK process spawn, and everything
+    # downstream of the fetch scales with what is in here: the upload into the
+    # sandbox, the `tar` listing it is validated against, the extraction and
+    # the publish copy (`materializeWorkspacePayload` in the engine). So the
+    # three numbers that explain a slow first token — how long the build took,
+    # how many members the engine must list, how many bytes it must move — are
+    # logged per fetch rather than left to be guessed at from a stopwatch.
+    logger.info(
+        "kai workspace archive built: members=%d bytes=%d in %d ms",
+        members,
+        len(archive),
+        int((time.monotonic() - started) * 1000),
+    )
     return archive
 
 
