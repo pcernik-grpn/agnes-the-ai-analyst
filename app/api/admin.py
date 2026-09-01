@@ -5803,7 +5803,10 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     same underlying data (table access policies design doc §3.2, "the
     physical-source twin"). A row may carry more than one signal at once
     (e.g. a BigQuery row with both ``bq_fqn`` and ``bucket``/``source_table``
-    set); two rows collide when their signal sets intersect at all.
+    set); two rows collide when their signal sets intersect at all — through
+    ``_physical_signals_conflict`` below, never a bare ``&``, because the
+    ``bucket_table`` signal's ``connection_id`` component needs wildcard
+    matching that a plain set intersection can't express (see there).
     """
     signals: set = set()
     bq_fqn = (row.get("bq_fqn") or "").strip().lower()
@@ -5838,6 +5841,52 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     return signals
 
 
+def _bucket_table_signals_conflict(a: tuple, b: tuple) -> bool:
+    """Whether two ``("bucket_table", source_type, connection_id, bucket,
+    source_table)`` signals point at the same physical source, for the
+    physical-source-twin check ONLY.
+
+    An unpinned ``connection_id`` (``""`` — the default a registration that
+    never mentions ``connection_id`` gets) means "any connection of that
+    source type" here: a real repro showed a second registry row over the
+    same Keboola bucket/table with ``connection_id`` omitted sailing past
+    the twin check, because ``(keboola, "", b, t)`` does not literally equal
+    ``(keboola, <uuid>, b, t)``. Matching wildcards both ways (either side
+    blank) closes that gap regardless of which row -- the policied one or
+    the twin -- happens to carry the pin. Two rows that both pin DIFFERENT
+    non-empty connection_ids are still genuinely different projects and do
+    NOT conflict; this does not change how ``connection_id`` is stored or
+    resolved anywhere else, only how this one check reads it.
+    """
+    _, a_type, a_conn, a_bucket, a_table = a
+    _, b_type, b_conn, b_bucket, b_table = b
+    if a_type != b_type or a_bucket != b_bucket or a_table != b_table:
+        return False
+    return a_conn == b_conn or not a_conn or not b_conn
+
+
+def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
+    """Whether two physical-source signal sets (``_policy_physical_source_
+    signals``) resolve to the same underlying data. Exact-match for
+    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go
+    through ``_bucket_table_signals_conflict``'s wildcard ``connection_id``
+    rule. Every twin-check call site MUST go through this — a bare ``&``
+    only catches the exact-pin and both-unpinned cases, missing the
+    pinned/unpinned mix a live instance actually hit.
+    """
+    for sig_a in signals_a:
+        for sig_b in signals_b:
+            if sig_a == sig_b:
+                return True
+            if (
+                sig_a[0] == "bucket_table"
+                and sig_b[0] == "bucket_table"
+                and _bucket_table_signals_conflict(sig_a, sig_b)
+            ):
+                return True
+    return False
+
+
 def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
     """Whether ``row`` is the shape ``agnes pull`` downloads —
     ``query_mode in ('local', 'materialized')`` and not ``server_only``.
@@ -5865,7 +5914,7 @@ def _find_policied_physical_source_twin(
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or not other.get("access_policy_sql"):
             continue
-        if my_signals & _policy_physical_source_signals(other):
+        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
             return other
     return None
 
@@ -5897,7 +5946,7 @@ def _find_unpolicied_physical_source_twin(
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or other.get("access_policy_sql"):
             continue
-        if my_signals & _policy_physical_source_signals(other):
+        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
             return other
     return None
 
@@ -6004,7 +6053,11 @@ def _check_access_policy_physical_source_conflict(
                 "source returns the unfiltered rows to anyone granted it, "
                 "so attach a policy to this row too, point it at a "
                 "different physical source, unregister one of the two rows, "
-                "or read the policied table by its own name"
+                "or read the policied table by its own name. If this is "
+                "genuinely a different source connection reusing the same "
+                "bucket/table label, pin connection_id on both rows to "
+                "disambiguate -- an unpinned connection_id matches any "
+                "connection of that source type for this check"
             ),
         )
 
@@ -6064,7 +6117,11 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
                 f"(query_mode={str(other.get('query_mode') or 'local')!r}, "
                 f"server_only={bool(other.get('server_only'))}), so {reach} "
                 "-- attach a policy to that row, unregister it, or point it "
-                "at a different physical source, then attach this policy"
+                "at a different physical source, then attach this policy. "
+                "If this is genuinely a different source connection reusing "
+                "the same bucket/table label, pin connection_id on both rows "
+                "to disambiguate -- an unpinned connection_id matches any "
+                "connection of that source type for this check"
             ),
         )
 
@@ -8289,13 +8346,24 @@ def _build_keboola_discovery_plan(
     # check below is an O(1) dict hit per discovered entry rather than a
     # fresh `list_all()` scan each time (discovery routinely walks
     # hundreds of tables). Same signal vocabulary as the register/update
-    # interlocks, via `_policy_physical_source_signals`.
+    # interlocks, via `_policy_physical_source_signals`. A discovered
+    # entry never carries a `connection_id` (Keboola discovery is
+    # single-connection by construction here), so its `bucket_table`
+    # signal is always the wildcard case (`_bucket_table_signals_conflict`)
+    # -- `policied_by_bucket_table` drops the connection component so that
+    # lookup still catches a policied row that pins one, matching the
+    # register/update interlocks' wildcard semantics rather than requiring
+    # an exact, unreachable `connection_id` match.
     policied_by_signal: dict = {}
+    policied_by_bucket_table: dict = {}
     for row in registry_rows:
         if not row.get("access_policy_sql"):
             continue
         for signal in _policy_physical_source_signals(row):
             policied_by_signal.setdefault(signal, row)
+            if signal[0] == "bucket_table":
+                _, sig_type, _sig_conn, sig_bucket, sig_table = signal
+                policied_by_bucket_table.setdefault((sig_type, sig_bucket, sig_table), row)
 
     plan = {"new": [], "existing_match": [], "existing_drift": [], "invalid": []}
     for table in discovered:
@@ -8387,6 +8455,19 @@ def _build_keboola_discovery_plan(
             (policied_by_signal[s] for s in my_signals if s in policied_by_signal),
             None,
         )
+        if policied_twin is None:
+            # Wildcard direction: this discovered entry carries no
+            # `connection_id`, so fall back to the connection-agnostic
+            # index for a policied row over the same bucket/table pinned
+            # to a specific connection.
+            policied_twin = next(
+                (
+                    policied_by_bucket_table[(s[1], s[3], s[4])]
+                    for s in my_signals
+                    if s[0] == "bucket_table" and (s[1], s[3], s[4]) in policied_by_bucket_table
+                ),
+                None,
+            )
         if policied_twin is not None:
             plan["invalid"].append(
                 {
