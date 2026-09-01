@@ -1190,8 +1190,16 @@ Admin-only surface behind the "connect → scope → share" file-source wizard o
 client id, certificate via vault secret or `config.cert_private_key_env`);
 these three routes are the wizard's own steps 2/3.
 
+`POST/DELETE …/manual-sites` is the other half of the `?site_url=` escape
+hatch on `…/tree`: that browse resolves a named site but stores nothing, so
+under `Sites.Selected` — where Graph 403-forbids enumeration — the wizard
+forgot it on every reopen. The POST resolves and persists it on the
+connection (`config.manual_sites`, idempotent on the resolved site id), the
+DELETE (`?site_id=`) forgets it again.
+
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
+- /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
