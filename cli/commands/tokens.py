@@ -6,7 +6,7 @@ from typing import Optional
 
 import typer
 
-from cli.client import api_post, api_get, api_delete
+from cli.client import api_post, api_get, api_delete, error_detail
 
 token_app = typer.Typer(help="Personal access tokens (long-lived CLI/CI auth)")
 
@@ -43,7 +43,7 @@ def create(
     body = {"name": name, "expires_in_days": _parse_ttl(ttl), "surface": surface}
     resp = api_post("/auth/tokens", json=body)
     if resp.status_code != 201:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
     data = resp.json()
     if raw:
@@ -66,7 +66,7 @@ def list_tokens(as_json: bool = typer.Option(False, "--json")):
     """List your personal access tokens."""
     resp = api_get("/auth/tokens")
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
     rows = resp.json()
     if as_json:

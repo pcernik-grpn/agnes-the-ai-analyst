@@ -501,6 +501,48 @@ def api_put(path: str, *, timeout: float = 30.0, **kwargs) -> httpx.Response:
         raise _translate_transport_error(exc, context=f"PUT {path}", timeout_s=timeout) from exc
 
 
+# Cap for the raw-body fallback in `error_detail` — an HTML error page
+# from a proxy can be tens of KB; the terminal only needs enough to
+# identify it.
+_ERROR_DETAIL_TEXT_CAP = 300
+
+
+def error_detail(resp: httpx.Response) -> str:
+    """Human-readable error out of an HTTP error response. Never raises.
+
+    The app returns FastAPI-style ``{"detail": ...}`` JSON, but the body
+    that actually reaches the CLI can be anything — an HTML 403/404 from a
+    reverse proxy, an empty 502, plain text. Calling ``resp.json()`` bare
+    in an error path turns those into a JSONDecodeError traceback, which
+    is how `agnes admin config-surface` used to die on a proxy error page.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict) and body.get("detail") is not None:
+        detail = body["detail"]
+        return detail if isinstance(detail, str) else _json.dumps(detail)
+    text = " ".join((resp.text or "").split())
+    if len(text) > _ERROR_DETAIL_TEXT_CAP:
+        text = text[:_ERROR_DETAIL_TEXT_CAP] + "…"
+    return f"HTTP {resp.status_code}" + (f": {text}" if text else "")
+
+
+def error_detail_object(resp: httpx.Response) -> Any:
+    """The parsed ``detail`` payload in whatever shape the server sent it
+    (dict, str, list), or ``None`` when the body is not JSON or carries no
+    ``detail`` key. For callers that branch on structured detail — e.g.
+    version-conflict 409s. Never raises."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict):
+        return body.get("detail")
+    return None
+
+
 # ── SSE streaming POST ──────────────────────────────────────────────────
 # `agnes chat` (cli/commands/chat.py) is the sole consumer today: it posts
 # one user turn to `/api/v1/sessions/{id}/messages` and reads the AG-UI

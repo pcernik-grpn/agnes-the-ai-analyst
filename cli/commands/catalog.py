@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from cli.client import api_get
+from cli.client import api_get, error_detail
 from cli.v2_client import api_get_json, V2ClientError
 
 catalog_app = typer.Typer(help="List tables (and metrics, with --metrics) visible to you")
@@ -75,7 +75,7 @@ def _list_metrics(as_json: bool, category: Optional[str] = None) -> None:
 
     resp = api_get("/api/metrics", params=params)
     if resp.status_code != 200:
-        typer.echo(f"Failed: {resp.json().get('detail', resp.text)}", err=True)
+        typer.echo(f"Failed: {error_detail(resp)}", err=True)
         raise typer.Exit(1)
 
     data = resp.json()
