@@ -545,7 +545,10 @@ body.chat-page-body main { margin: 0; padding: 0; }
 
 .msg-body :first-child { margin-top: 0; }
 .msg-body :last-child  { margin-bottom: 0; }
-.msg-body p { margin: 6px 0; }
+/* 6px against a 23px line box read as one continuous slab — paragraph breaks
+   were nearly invisible, so a multi-paragraph answer had no place for the eye
+   to rest. */
+.msg-body p { margin: 8px 0; }
 
 /* Markdown lists. The global reset zeroes list padding; with the default
    list-style-position: outside that renders the markers in the negative
@@ -553,8 +556,65 @@ body.chat-page-body main { margin: 0; padding: 0; }
    markers ("10.", "11.") visibly overflow the left edge. Restore an indent
    wide enough for two-digit markers so they sit inside the bubble. */
 .msg-body ol,
-.msg-body ul { margin: 6px 0; padding-left: 1.8em; }
-.msg-body li { margin: 2px 0; }
+.msg-body ul { margin: 8px 0; padding-left: 1.8em; }
+.msg-body li { margin: 3px 0; }
+.msg-body li > ul,
+.msg-body li > ol { margin: 3px 0; }
+
+/* ---- Markdown typography inside an answer ------------------------------
+   An answer that arrives as a DOCUMENT — headings, steps, code, a table —
+   had no rules of its own here, so it fell through to the browser's
+   defaults: `h1` at 2em (30px against a 15px body) and `h2` at 1.5em, both
+   with the app reset's margin zeroed. Big enough to shout, with no space to
+   group anything, which is the specific way it was hard to scan — size
+   signal and no structure signal.
+
+   Two corrections. The SCALE comes down to reading sizes: this is a reply in
+   a conversation, not a page, and it is never competing with a page title
+   for the top of the screen. And every heading now carries far more space
+   ABOVE it than below — that asymmetry is what makes a heading read as
+   belonging to the block it introduces rather than floating between two. */
+.msg-body h1,
+.msg-body h2,
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  font-weight: var(--font-semibold);
+  line-height: 1.35;
+  color: var(--ds-text-primary);
+}
+.msg-body h1 { margin: 20px 0 8px; font-size: var(--text-lg); }
+.msg-body h2 { margin: 20px 0 6px; font-size: var(--text-md); }
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 { margin: 16px 0 4px; font-size: inherit; }
+/* Back-to-back headings are one unit — a section title over its subtitle —
+   so the lower one drops the gap it would otherwise open. */
+.msg-body h1 + h2,
+.msg-body h2 + h3,
+.msg-body h3 + h4 { margin-top: 8px; }
+
+/* Blocks that are not prose get more room than a paragraph: they are objects
+   in the flow, and reading resumes after them. The code block's own margin
+   lives with the shared `pre.code-block-wrap` rule further down (same
+   specificity as anything written here, and later in the file, so it wins —
+   changed there rather than out-specified here). */
+.msg-body .cloud-chat-table-wrap,
+.msg-body table { margin: var(--space-3) 0; }
+
+.msg-body hr {
+  margin: 20px 0;
+  border: 0;
+  border-top: 1px solid var(--ds-border);
+}
+.msg-body blockquote {
+  margin: 10px 0;
+  padding: 2px 0 2px var(--space-3);
+  border-left: 2px solid var(--ds-border);
+  color: var(--ds-text-secondary);
+}
 
 /* Streaming caret — anchored at the cursor position of the body so it
    actually sits where new tokens land. */
