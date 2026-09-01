@@ -284,6 +284,15 @@ EXEMPT: frozenset[str] = frozenset(
         # identity/groups directly and reads through `probe_policy` +
         # `get_analytics_db_readonly()` instead.
         "app/api/admin.py::preview_table_policy",
+        # review plan P1.4 -- POST .../policy/preview-groups. Same exemption
+        # reasoning as `preview_table_policy` immediately above: it exists
+        # BECAUSE it deliberately bypasses the resolver's admin-bypass path,
+        # sweeping every real `user_groups` row through the SAME policy via
+        # `get_analytics_db_readonly()` directly, so a `CASE`-on-`$user_groups`
+        # policy with a missing `ELSE` branch can be checked before anyone
+        # trusts it. require_admin-gated, audited (`access_policy.
+        # preview_groups`).
+        "app/api/admin.py::preview_table_policy_all_groups",
         # access-policy-builder-ux plan, Tasks 2/3 -- GET .../policy/columns
         # and its shared `_policy_builder_describe` DESCRIBE helper. Same
         # admin-authoring posture as `preview_table_policy` right above:

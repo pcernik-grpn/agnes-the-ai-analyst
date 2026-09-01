@@ -764,6 +764,361 @@ class TestPolicyPreview:
 
 
 @pytest.fixture
+def policied_invoices_with_real_groups(seeded_app, mock_extract_factory, monkeypatch):
+    """Same shape as ``policied_invoices_for_preview``, except ``Finance``
+    and ``Ops`` are REAL ``user_groups`` rows (not just ad-hoc ``as_groups``
+    strings) -- the set ``.../policy/preview-groups`` sweeps. No policy is
+    attached here; each test in ``TestPolicyPreviewGroups`` attaches its own
+    so a well-behaved policy and a buggy one can share the same data.
+    """
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories import user_groups_repo
+    from src.repositories.table_registry import TableRegistryRepository
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+    env = seeded_app["env"]
+    mock_extract_factory(
+        "keboola",
+        [
+            {
+                "name": "preview_groups_invoices",
+                "data": [
+                    {"id": "1", "unit": "Finance", "amount": "100"},
+                    {"id": "2", "unit": "Finance", "amount": "150"},
+                    {"id": "3", "unit": "Ops", "amount": "300"},
+                ],
+            }
+        ],
+    )
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).register(
+            id="preview_groups_invoices",
+            name="preview_groups_invoices",
+            source_type="keboola",
+            query_mode="local",
+            server_only=True,
+        )
+    finally:
+        conn.close()
+
+    user_groups_repo().create("Finance", created_by="admin")
+    user_groups_repo().create("Ops", created_by="admin")
+    return seeded_app
+
+
+@pytest.mark.journey
+class TestPolicyPreviewGroups:
+    """``POST .../policy/preview-groups`` (review plan P1.4) -- sweeps every
+    real ``user_groups`` row through the single-persona preview primitive in
+    one call, so a policy that branches on ``$user_groups`` can be checked
+    against every group that actually exists, not just the one the admin
+    remembered to type in by hand.
+    """
+
+    def test_preview_groups_sweeps_every_real_group(self, policied_invoices_with_real_groups):
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().set_access_policy(
+            "preview_groups_invoices",
+            sql="SELECT * FROM preview_groups_invoices WHERE list_contains($user_groups, unit)",
+            note="restrict to the caller's unit",
+            updated_by="admin",
+        )
+
+        c = policied_invoices_with_real_groups["client"]
+        token = policied_invoices_with_real_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_groups_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["rows_total"] == 3
+
+        by_group = {g["group"]: g for g in body["groups"]}
+        assert by_group["Finance"]["rows_visible"] == 2
+        assert by_group["Ops"]["rows_visible"] == 1
+        # System-seeded groups with no matching `unit` correctly see nothing
+        # -- this is the well-behaved case, contrasted by the next test.
+        assert by_group["Admin"]["rows_visible"] == 0
+        assert by_group["Everyone"]["rows_visible"] == 0
+
+    def test_preview_groups_catches_a_missing_else_branch(self, policied_invoices_with_real_groups):
+        """The exact bug class this endpoint exists to catch (documented in
+        ``docs/table-access-policies.md``'s "Row filtering" section): a
+        ``CASE`` with ``ELSE TRUE`` instead of ``ELSE FALSE`` silently
+        admits every group not explicitly enumerated. A single-persona
+        preview of the intended ``Finance`` group alone looks correct in
+        isolation -- sweeping every real group in one call is what surfaces
+        that ``Ops``/``Admin``/``Everyone`` also see the whole table.
+        """
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().set_access_policy(
+            "preview_groups_invoices",
+            sql=(
+                "SELECT * FROM preview_groups_invoices WHERE CASE "
+                "WHEN list_contains($user_groups, 'Finance') THEN unit = 'Finance' "
+                "ELSE TRUE END"
+            ),
+            note="buggy: should be ELSE FALSE",
+            updated_by="admin",
+        )
+
+        c = policied_invoices_with_real_groups["client"]
+        token = policied_invoices_with_real_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_groups_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        by_group = {g["group"]: g for g in resp.json()["groups"]}
+        assert by_group["Finance"]["rows_visible"] == 2
+        # The bug: every group NOT explicitly named falls into ELSE TRUE and
+        # sees the whole table, not just its own unit.
+        assert by_group["Ops"]["rows_visible"] == 3
+        assert by_group["Admin"]["rows_visible"] == 3
+        assert by_group["Everyone"]["rows_visible"] == 3
+
+    def test_preview_groups_422_when_no_stored_policy_and_no_candidate_sql(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="no_policy_tbl_groups")
+
+        resp = c.post(
+            f"/api/admin/registry/{table_id}/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_preview_no_policy" in resp.text
+
+    def test_preview_groups_404_for_unknown_table(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/does-not-exist/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 404, resp.text
+
+    def test_preview_groups_is_admin_only(self, policied_invoices_with_real_groups):
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().set_access_policy(
+            "preview_groups_invoices",
+            sql="SELECT * FROM preview_groups_invoices WHERE list_contains($user_groups, unit)",
+            note="restrict to the caller's unit",
+            updated_by="admin",
+        )
+
+        c = policied_invoices_with_real_groups["client"]
+        token = policied_invoices_with_real_groups["analyst_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_groups_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.journey
+class TestPolicyAuditActions:
+    """review plan P2.5 -- attaching/editing/clearing a policy through
+    ``PUT /registry/{id}`` already writes a generic ``update_table`` audit
+    row; it must ALSO write a dedicated ``access_policy.set`` /
+    ``access_policy.clear`` action, the same way ``.../policy/preview``
+    already gets its own ``access_policy.preview`` action, so "every policy
+    change in the last N days" is a direct query instead of grepping
+    ``update_table`` rows for ``access_policy_sql`` in ``updated_fields``.
+    """
+
+    def test_attaching_a_policy_writes_a_dedicated_set_action(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="audit_policy_tbl", server_only=True)
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": f"SELECT * FROM {table_id} WHERE list_contains($user_groups, 'Finance')",
+                "access_policy_note": "restrict to Finance",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="access_policy.set", resource=table_id)
+        assert rows, "attaching a policy left no dedicated access_policy.set audit row"
+        assert json.loads(rows[0]["params"])["access_policy_note"] == "restrict to Finance"
+        # The generic update_table row must still be written too -- this is
+        # additive, not a replacement.
+        assert _audit_rows(action="update_table", resource=table_id)
+
+    def test_clearing_a_policy_writes_a_dedicated_clear_action(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="audit_clear_tbl", server_only=True)
+
+        c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": f"SELECT * FROM {table_id} WHERE list_contains($user_groups, 'Finance')",
+                "access_policy_note": "restrict to Finance",
+            },
+            headers=_auth(token),
+        )
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": None},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="access_policy.clear", resource=table_id)
+        assert rows, "clearing a policy left no dedicated access_policy.clear audit row"
+
+    def test_an_unrelated_field_edit_writes_no_policy_audit_action(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="audit_unrelated_tbl")
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"description": "just a description edit"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert not _audit_rows(action="access_policy.set", resource=table_id)
+        assert not _audit_rows(action="access_policy.clear", resource=table_id)
+
+
+@pytest.fixture
+def policied_invoices_with_empty_mapping(seeded_app, mock_extract_factory, monkeypatch):
+    """A policied table whose policy joins a ``policy_mapping`` table that
+    is registered but never extracted/synced -- mirrors
+    ``tests/test_access_policy_effective_access.py::policied_workspace``'s
+    ``tbl_invoices``/``user_access`` shape, at the admin preview surface
+    (review plan P2.6)."""
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+    env = seeded_app["env"]
+    mock_extract_factory(
+        "keboola",
+        [
+            {
+                "name": "mapped_invoices",
+                "data": [
+                    {"id": "1", "unit": "Finance", "amount": "100"},
+                    {"id": "2", "unit": "Ops", "amount": "200"},
+                ],
+            },
+        ],
+    )
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id="mapped_invoices",
+            name="mapped_invoices",
+            source_type="keboola",
+            query_mode="local",
+            server_only=True,
+        )
+        registry.set_access_policy(
+            "mapped_invoices",
+            sql=(
+                "SELECT * FROM mapped_invoices WHERE unit IN (SELECT unit FROM mapping_tbl WHERE email = $user_email)"
+            ),
+            note="mapping filter",
+            updated_by="admin",
+        )
+        # Registered as a mapping table, but never extracted/synced -- no
+        # sync_state row for it at all.
+        registry.register(id="mapping_tbl", name="mapping_tbl", source_type="keboola", query_mode="local")
+        registry.set_policy_mapping("mapping_tbl", True)
+    finally:
+        conn.close()
+
+    return seeded_app
+
+
+@pytest.mark.journey
+class TestPolicyPreviewMappingWarning:
+    """review plan P2.6 -- ``.../policy/preview`` and ``.../policy/
+    preview-groups`` must flag a referenced ``policy_mapping`` table that is
+    empty/never synced, mirroring the ``mapping_empty`` reason
+    ``GET /api/me/effective-access`` already reports, so a suspiciously-low
+    ``rows_visible`` in the preview itself carries its own explanation.
+    """
+
+    def test_single_persona_preview_flags_the_empty_mapping_table(self, policied_invoices_with_empty_mapping):
+        c = policied_invoices_with_empty_mapping["client"]
+        token = policied_invoices_with_empty_mapping["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/mapped_invoices/policy/preview",
+            json={"as_user": "admin@test.com"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Fails soft BEFORE the live query -- the mapping table never
+        # synced, so there is no view to even count against; the whole
+        # point is to explain that instead of crashing on it.
+        assert body["rows_visible"] is None
+        assert body["mapping_warning"]
+        assert "mapping_tbl" in body["mapping_warning"]
+
+    def test_preview_groups_flags_the_empty_mapping_table(self, policied_invoices_with_empty_mapping):
+        c = policied_invoices_with_empty_mapping["client"]
+        token = policied_invoices_with_empty_mapping["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/mapped_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["mapping_warning"]
+        assert "mapping_tbl" in body["mapping_warning"]
+
+    def test_preview_omits_the_warning_when_nothing_is_wrong(self, policied_invoices_for_preview):
+        c = policied_invoices_for_preview["client"]
+        token = policied_invoices_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["mapping_warning"] is None
+
+
+@pytest.fixture
 def policied_wide_table_for_preview(seeded_app, mock_extract_factory, monkeypatch):
     """A table with MORE rows than ``_POLICY_PREVIEW_SAMPLE_LIMIT`` where
     the only rows a persona can see sit *outside* the raw sample window.

@@ -182,7 +182,12 @@ def test_access_policy_history_reads_the_existing_activity_endpoint(seeded_app):
     assert "async function _apLoadHistory" in body
     assert 'id="apHistorySection"' in body
     assert "/api/admin/activity?resource=" in body
-    assert "action_prefix=update_table" in body
+    # #1430 gave a policy write its own audit actions, so the fallback asks
+    # for those first and only then re-scans the generic `update_table`
+    # rows an instance wrote before they existed.
+    assert "'access_policy.'" in body
+    assert "row.action === 'access_policy.set'" in body
+    assert "'update_table'" in body
 
 
 def test_access_policy_history_cleared_detection_survives_audit_redaction(seeded_app):
@@ -226,6 +231,25 @@ def test_inline_eligibility_and_mapping_controls_render(seeded_app):
     body = r.text
     assert 'id="apMakeServerOnly"' in body
     assert 'id="apMappingToggle"' in body
+
+
+def test_mapping_toggle_is_visually_separated_from_the_row_scope_section(seeded_app):
+    """The mapping toggle answers a different question ("can other tables'
+    policies read through this one") than the row-rule/mask builder right
+    below it ("who sees which rows of THIS table") — stacked with identical
+    styling and no separator, it reads as one setting. It must carry its
+    own heading, a divider before the Builder tabs, and copy that says it
+    does not change this table's own row visibility."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "Use as input for other tables' policies" in body
+    assert "does not change who sees which" in body
+    mapping_idx = body.index("ap-mapping-section")
+    divider_idx = body.index('<hr style="border:0; border-top:1px solid var(--ds-border)')
+    tabs_idx = body.index('data-ap-tab="builder"')
+    assert mapping_idx < divider_idx < tabs_idx
 
 
 def test_registered_table_row_wires_the_access_chip_to_the_modal(seeded_app):
@@ -359,6 +383,89 @@ def test_builder_surfaces_compile_warnings(seeded_app):
     fn = body[body.index("function _apRenderCompileWarnings") : body.index("function _apShowSaveError")]
     assert "textContent" in fn
     assert "innerHTML" not in fn
+
+
+def test_save_confirms_before_storing_a_policy_that_filters_or_masks_nothing(seeded_app):
+    """A policy with no row rule and no column mask compiles to a bare
+    `SELECT * FROM t` — it saves successfully (masking-only or
+    filtering-only policies are legitimate, so this must never be a hard
+    block) but must not go through silently: `apSavePolicy()` asks for
+    explicit confirmation first, mirroring the same no-op condition
+    `compile_policy()` itself warns about (no WHERE, no EXCLUDE, no CASE)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "function _apSqlFiltersOrMasksNothing" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "_apSqlFiltersOrMasksNothing(sql)" in fn
+    assert "confirmModal(" in fn
+    assert "Save anyway" in fn
+
+
+def test_the_feature_flag_notice_has_exactly_one_implementation(seeded_app, monkeypatch):
+    """#1430 and #1979 both grew a "say the flag is off up front" notice and
+    they were reconciled onto ONE: the server-rendered ``{% if not
+    access_policies_enabled %}`` banner plus the ``disabled`` Save button
+    (pinned by ``test_flag_off_shows_a_notice_and_disables_save`` below).
+    The JS twin -- an ``ACCESS_POLICIES_ENABLED`` constant read from a
+    ``data-access-policies-enabled`` body attribute, feeding a second
+    ``#apFeatureDisabledWarning`` div and a client-side branch in
+    ``apSavePolicy()`` -- must not come back: two notices on one modal read
+    as two different rules, and the disabled button is the stronger gate
+    (the JS twin left Save clickable and only explained the refusal after
+    the click).
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    body = c.get("/admin/tables", headers=_auth(token)).text
+
+    assert 'id="apFeatureDisabledWarning"' not in body
+    assert "_apRenderFeatureDisabledWarning" not in body
+    # (the notice's own prose names the env var, so pin the JS symbol)
+    assert "var ACCESS_POLICIES_ENABLED" not in body
+    assert "!ACCESS_POLICIES_ENABLED" not in body
+    assert "data-access-policies-enabled" not in body
+    # ... and the surviving one is still there, with the flag off.
+    assert 'id="apFlagDisabledNotice"' in body
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+    assert 'id="apFlagDisabledNotice"' not in c.get("/admin/tables", headers=_auth(token)).text
+
+
+def test_preview_all_groups_button_is_wired_to_the_new_endpoint(seeded_app):
+    """review-plan P1.4: a "Preview all groups" action next to the
+    single-persona preview sweeps every real group through the same policy
+    in one call, so a CASE with a missing ELSE branch shows up as an
+    unexpected group seeing everything instead of requiring the admin to
+    run the single-persona preview once per group by hand."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "async function apRunPreviewAllGroups" in body
+    assert "/policy/preview-groups" in body
+    assert 'id="apPreviewGroupsResult"' in body
+    assert "Preview all groups" in body
+    assert "function _apRenderPreviewGroupsResult" in body
+
+
+def test_preview_renderers_surface_the_mapping_warning(seeded_app):
+    """review plan P2.6: both preview renderers must check
+    ``body.mapping_warning`` and show it as text (server-supplied string,
+    so ``textContent``-safe rendering via ``escapeHtml``, never raw
+    ``innerHTML``) instead of rendering a misleading rows/columns result
+    when a referenced ``policy_mapping`` table is empty or never synced."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    single = body[body.index("function _apRenderPreviewResult") : body.index("async function _apLoadHistory")]
+    assert "body.mapping_warning" in single
+    assert "escapeHtml(body.mapping_warning)" in single
+    groups = body[body.index("function _apRenderPreviewGroupsResult") : body.index("function _apMatchPreviewRows")]
+    assert "body.mapping_warning" in groups
+    assert "escapeHtml(body.mapping_warning)" in groups
 
 
 def test_preview_only_diffs_samples_the_server_says_are_comparable(seeded_app):
