@@ -1225,20 +1225,98 @@ pre.code-block-wrap code .hljs-deletion {
    panels directly (only oversize payloads keep a nested toggle).
    A failed call stays collapsed too and carries its diagnosis on the
    header line instead (see .cloud-chat-tool-summary.is-error). */
+/* Shared by the THREE things that wear this class — a tool-call step, an
+   approval gate, a question card. Only the reading column and the type scale
+   are shared. The chrome is deliberately NOT: a step is a trace line the
+   reader skims past, the other two are surfaces the reader has to act on, and
+   giving a trace line the same box as a decision made a turn's machinery
+   shout as loudly as its answer (#1974 item 1, second pass). */
 .cloud-chat-tool {
-  margin: var(--space-2) auto;
-  padding: var(--space-3) var(--space-4);
+  /* NEGATIVE on purpose. `.cloud-chat-messages` is a flex column with a
+     uniform `gap: var(--space-5)` (20px), which cannot be targeted per pair —
+     so an 8px margin here made a step sit 28px from the sentence above it,
+     WIDER than the 20px between two separate messages. That is backwards: a
+     step belongs to the turn it sits inside, and should read tighter to its
+     own prose than two messages read to each other. This claws back 8px of the
+     container gap, landing at 12px. */
+  margin: calc(var(--space-2) * -1) auto;
   max-width: var(--chat-reading-width);
+  color: var(--ds-text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* The card chrome, now owned by the two cards that need it. Both recolor it
+   further down (.cloud-chat-approval / .cloud-chat-question), which is why
+   this block declares the box and not its palette. */
+.cloud-chat-approval,
+.cloud-chat-question {
+  /* Undo the step's negative margin: these keep the container's own spacing,
+     because an approval gate or a question is a thing to stop at, not a step
+     to skim past. */
+  margin-top: 0;
+  margin-bottom: 0;
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--ds-border);
   border-left-width: 3px;
   border-radius: var(--radius-md);
   background: var(--ds-surface-dim);
-  color: var(--ds-text-secondary);
-  font-size: var(--text-sm);
 }
-.cloud-chat-tool.is-running { border-left-color: var(--ds-accent-info-line); }
-.cloud-chat-tool.is-done    { border-left-color: var(--ds-accent-success-line); }
-.cloud-chat-tool.is-error   { border-left-color: var(--ds-accent-danger-line); }
+
+/* ---- A tool-call step: a line, not a card ------------------------------
+   No fill, no border, no radius — the status lives in the icon, the smallest
+   thing that can carry it, and the row's whole job is to be skippable.
+   Expanding one still opens the args/result panels below it; those keep their
+   own hairline box, which is then the only box in the picture and so reads as
+   "here is the payload" rather than as more furniture. */
+.cloud-chat-tool--step {
+  padding: 0;
+}
+/* Left-packed, same as the group head above: icon · name · args · timing ·
+   caret, then empty space. Nothing is pinned to the right edge. */
+.cloud-chat-tool--step > .cloud-chat-tool-head > .cloud-chat-tool-summary {
+  flex: 0 1 auto;
+}
+.cloud-chat-tool--step > .cloud-chat-tool-head {
+  align-items: center;
+  /* A step is one line: the args summary already ellipsizes (see
+     .cloud-chat-tool-summary), so wrapping could only ever be worse. The
+     approval and question heads keep the base `wrap` — their reason lines are
+     prose and have to be allowed to flow. */
+  flex-wrap: nowrap;
+  padding: var(--space-1) 0;
+}
+/* The label is a human phrase ("Reading the data catalog"), not an identifier
+   — the same reason the definition-lookup variant below drops the mono
+   treatment. Scoped to the step, so the approval/question heads are
+   untouched. */
+.cloud-chat-tool--step .cloud-chat-tool-name {
+  font-family: inherit;
+  /* A step is machinery, not prose. It was set in the ANSWER's own ink and a
+     HEAVIER weight than the answer itself (500 against 400) — so the line
+     whose whole job is to be skippable was the most emphatic text in the
+     transcript. Secondary ink at normal weight measures 7.87:1 against the
+     surface here and 9.57:1 in dark: plainly readable, plainly subordinate to
+     the sentence above it. */
+  color: var(--ds-text-secondary);
+  font-weight: var(--font-normal);
+}
+/* Status lives in the icon — see the single `.cloud-chat-tool.is-*` block
+   further down. There is deliberately no `--step` copy of it here: the two
+   selectors carry the same specificity (0,3,0), so a copy above the original
+   would silently never apply, which is exactly what happened when this file
+   had both. */
+/* The detail hanging off an open step. ONE continuous hairline down the left
+   of every panel, rather than a rectangle each: a step that opened onto three
+   stacked white boxes (command, output, "show full output") was back to being
+   the heaviest thing on the screen the moment you looked inside it. The panels
+   abut deliberately — zero margin between them — so their rule segments join
+   into a single line tying the whole detail to the row above. */
+.cloud-chat-tool--step[open] > .cloud-chat-tool-args,
+.cloud-chat-tool--step[open] > .cloud-chat-tool-result {
+  margin: 0 0 0 var(--space-3);
+  padding: var(--space-2) 0 var(--space-2) var(--space-4);
+  border-left: 1px solid var(--ds-border);
+}
 /* A continuation bubble: the second and later text parts of a replayed turn,
    each sitting under the tool card it followed. It is the same assistant
    bubble, minus the avatar gutter's second copy of the avatar — the message
@@ -1257,9 +1335,10 @@ pre.code-block-wrap code .hljs-deletion {
    `.msg-bubble` (`flex: 0 1 auto; max-width: 80%`) and needed margin/width
    overrides to cope, which still left every card as wide as its own message's
    longest line instead of the reading column. */
-.cloud-chat-tool.is-replayed {
-  border-left-color: var(--ds-border);
-}
+/* Nothing left to neutralise: a step has no status edge, and _buildToolCard /
+   _updateToolGroupSummary give an outcome-less replayed row NO icon rather
+   than a tick it cannot evidence. The class still means what it meant — it
+   just needs no paint of its own. */
 
 /* ---- Tool-call group --------------------------------------------------
    A RUN of consecutive tool calls, folded into one <details> (chat.js →
@@ -1268,12 +1347,15 @@ pre.code-block-wrap code .hljs-deletion {
    inside it unchanged. A run of one is never wrapped, so this markup only
    exists where it saves the reader something.
 
-   The header borrows the card's own vocabulary deliberately: same dim
-   surface, same 3px status edge, same chevron. A group is a card-shaped
-   thing standing for cards, and giving it a second visual language would
-   read as a different kind of object. */
+   The header speaks the STEP's vocabulary, not a card's: same status icon,
+   same type scale, no box. It is one line of text that opens a list of lines
+   — a group that were a card standing over borderless rows would be the
+   heaviest thing on the screen while meaning the least. */
 .cloud-chat-tool-group {
-  margin: var(--space-2) auto;
+  /* Same reasoning as a lone step (see .cloud-chat-tool): a run of steps is
+     part of the turn, so it sits tighter to the prose than the container's
+     uniform gap allows on its own. */
+  margin: calc(var(--space-2) * -1) auto;
   max-width: var(--chat-reading-width);
 }
 summary.cloud-chat-tool-group-head {
@@ -1282,18 +1364,11 @@ summary.cloud-chat-tool-group-head {
   gap: var(--space-2);
   cursor: pointer;
   list-style: none;
-  padding: var(--space-2) var(--space-4);
-  border: 1px solid var(--ds-border);
-  border-left: 3px solid var(--ds-border);
-  border-radius: var(--radius-md);
-  background: var(--ds-surface-dim);
+  padding: var(--space-1) 0;
   color: var(--ds-text-secondary);
   font-size: var(--text-sm);
 }
 summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
-.cloud-chat-tool-group.is-running > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-info-line); }
-.cloud-chat-tool-group.is-done    > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-success-line); }
-.cloud-chat-tool-group.is-error   > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-danger-line); }
 .cloud-chat-tool-group-icon {
   flex: 0 0 auto;
   font-size: var(--text-md);
@@ -1303,7 +1378,7 @@ summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool-group.is-done    .cloud-chat-tool-group-icon { color: var(--ds-accent-success-line); }
 .cloud-chat-tool-group.is-error   .cloud-chat-tool-group-icon { color: var(--ds-accent-danger-line); }
 .cloud-chat-tool-group-label {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1311,11 +1386,30 @@ summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
   font-weight: var(--font-medium);
   color: var(--ds-text-primary);
 }
+/* Once the run has settled the label IS the control — "Show 6 steps" / "Hide
+   6 steps" (chat.js → _updateToolGroupSummary) — so it reads as the link it
+   behaves like. While the run is still going the label is the name of the step
+   in progress: a status, not something to click, and it keeps ordinary ink. */
+.cloud-chat-tool-group:not(.is-running) > .cloud-chat-tool-group-head .cloud-chat-tool-group-label {
+  color: var(--ds-primary);
+}
+summary.cloud-chat-tool-group-head:hover .cloud-chat-tool-group-label,
+summary.cloud-chat-tool-group-head:focus-visible .cloud-chat-tool-group-label {
+  text-decoration: underline;
+}
+/* Everything on the line packs LEFT, and the row's leftover width is simply
+   empty. Nothing stretches: with the box gone there is no edge for a count or
+   a caret to sit against, and pinning them right left a rail of marks
+   floating in whitespace with nothing to belong to. */
 .cloud-chat-tool-group-meta {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   font-size: var(--text-xs);
   color: var(--ds-text-muted);
   font-variant-numeric: tabular-nums;
+}
+.cloud-chat-tool-group-head > .cloud-chat-tool-chevron {
+  order: -1;
+  margin-right: calc(var(--space-1) * -1);
 }
 .cloud-chat-tool-group[open] > .cloud-chat-tool-group-head .cloud-chat-tool-chevron {
   transform: rotate(90deg);
@@ -1357,8 +1451,16 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   font-size: var(--text-md);
   line-height: 1;
 }
+/* The icon is the ONLY thing carrying a step's status now that a step draws no
+   status edge, so each of these is a meaningful graphic owing 3:1 (WCAG
+   1.4.11). Measured against the chat surface: info-line 3.82:1 and danger-line
+   4.83:1 are comfortable, but success-line came to 3.30:1 — clearing the floor
+   by too little for the state a reader sees most — so success takes -ink
+   (7.13:1 light, 10.91:1 dark). Only steps ever wear `is-done`; the approval
+   and question cards resolve out of `is-running` without it, so this is scoped
+   to the step by the state, not by a second selector. */
 .cloud-chat-tool.is-running .cloud-chat-tool-icon { color: var(--ds-accent-info-line); }
-.cloud-chat-tool.is-done    .cloud-chat-tool-icon { color: var(--ds-accent-success-line); }
+.cloud-chat-tool.is-done    .cloud-chat-tool-icon { color: var(--ds-accent-success-ink); }
 .cloud-chat-tool.is-error   .cloud-chat-tool-icon { color: var(--ds-accent-danger-line); }
 /* The header names a reader-facing ACTION ("Querying data"), not a tool id —
    it reads as prose, so it gets the prose face. The raw id lives in the

@@ -4165,7 +4165,11 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   else if (state === "output-error" || isError) statusClass = "is-error";
   else if (state === "output-available") statusClass = "is-done";
   const wrapIsError = statusClass === "is-error";
-  wrap.className = `cloud-chat-tool ${statusClass}`;
+  // `--step` marks this as a trace LINE rather than a card. The class is
+  // shared with the approval gate and the question card, which are surfaces
+  // the reader has to act on and keep the box; a step has no box at all
+  // (chat.css → "A tool-call step: a line, not a card").
+  wrap.className = `cloud-chat-tool cloud-chat-tool--step ${statusClass}`;
   wrap.dataset.tool = tool || "";
 
   // Header line — status + tool name + args summary. Always visible, even
@@ -4337,6 +4341,10 @@ function _buildToolGroup() {
   const body = document.createElement("div");
   body.className = "cloud-chat-tool-group-body";
   group.appendChild(body);
+  // The settled label reads "Show N steps" / "Hide N steps", so it is a
+  // function of `open` and has to be re-derived when the reader toggles it —
+  // otherwise an opened group still invites you to open it.
+  group.addEventListener("toggle", () => _updateToolGroupSummary(group));
   return group;
 }
 
@@ -4389,7 +4397,12 @@ function _updateToolGroupSummary(group) {
       }
     }
     const activeName = active ? active.querySelector(".cloud-chat-tool-name") : null;
-    label.textContent = activeName ? activeName.textContent : steps;
+    // Settled, the label is the CONTROL and says what clicking it does —
+    // "Show 6 steps" / "Hide 6 steps" — because with the box gone there is
+    // nothing else on the line that looks clickable. Live, it stays the name
+    // of the step in progress: a run still going has something better to say
+    // than how to fold it.
+    label.textContent = activeName ? activeName.textContent : `${group.open ? "Hide" : "Show"} ${steps}`;
   }
   const meta = group.querySelector(".cloud-chat-tool-group-meta");
   if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";

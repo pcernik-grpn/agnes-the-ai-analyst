@@ -1109,20 +1109,16 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     assert "if (icon.firstChild) head.appendChild(icon)" in fn, (
         "a stateless (pre-v123) part must not get an empty icon slot"
     )
+    # A step has no status edge to neutralise any more (a step is a line, not a
+    # card), so `.is-replayed` now carries NO rule at all — which is strictly
+    # stronger than the neutral-edge rule it replaced: there is nothing left to
+    # accidentally claim an outcome with, and nothing to override the live
+    # card's geometry with either. The class is still set and still means the
+    # same thing; the honesty is enforced in JS, by withholding the icon.
     css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
-    replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
-    replayed = replayed[: replayed.index("}")]
-    assert "accent-success" not in replayed and "accent-info" not in replayed, (
-        "the stateless fallback's edge must stay neutral"
+    assert ".cloud-chat-tool.is-replayed" not in css, (
+        "a step draws no status edge, so a replayed one needs no rule to neutralise"
     )
-    # Status only. Layout overrides here mean the card is being nested
-    # somewhere with different geometry than the live stream's — which is how
-    # replayed cards ended up as wide as each message's longest line.
-    for prop in ("margin", "max-width", "width"):
-        assert prop not in replayed, (
-            f"`{prop}` on .is-replayed — a replayed card must inherit the live card's "
-            "geometry by being appended in the same place, not by overriding it"
-        )
 
 
 def test_replayed_cards_are_siblings_in_the_messages_column():
@@ -1437,6 +1433,12 @@ function mkEl(tag) {
       toggle: (c, on) => { if (on) node._cls.add(c); else node._cls.delete(c); },
     },
     setAttribute(k, v) { node.attrs[k] = String(v); },
+    // The group registers a `toggle` handler to re-derive its Show/Hide label
+    // (chat.js -> _buildToolGroup). Recorded rather than ignored so a test can
+    // fire it and assert the flip, which is the whole point of the label.
+    _listeners: {},
+    addEventListener(type, fn) { (node._listeners[type] ||= []).push(fn); },
+    dispatch(type) { (node._listeners[type] || []).forEach((fn) => fn()); },
     appendChild(c) {
       if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((k) => k !== c);
       c.parentNode = node; node.children.push(c); return c;
@@ -1514,7 +1516,10 @@ process.stdout.write(JSON.stringify({
     assert res["alone"] == ["details:cloud-chat-tool is-done"], "a lone call is not worth a group header"
     assert res["run_len"] == 1 and res["run_cards"] == 3, "the whole run becomes one node"
     assert "cloud-chat-tool-group" in res["run_cls"]
-    assert res["run_label"] == "3 steps"
+    assert res["run_label"] == "Show 3 steps", (
+        "collapsed, the label says what clicking it does — with the box gone there is "
+        "nothing else on the line that looks like a control"
+    )
     assert res["run_meta"] == "2 failed" or res["run_meta"] == "1 failed"
     assert not res["run_open"], "a replayed group opens collapsed — it is the compact form"
     assert res["split"] == ["cloud-chat-tool is-done", "article", "cloud-chat-tool is-done"], (
@@ -1561,7 +1566,7 @@ process.stdout.write(JSON.stringify({
     )
     res = json.loads(_node_run(script))
     assert "is-error" in res["settled"][0], "a run with a failure in it says so on its edge"
-    assert res["settled"][1] == "3 steps"
+    assert res["settled"][1] == "Show 3 steps"
     assert res["settled"][2] == "2 failed"
     assert res["settled"][3] == ["icon-triangle-alert"]
     assert "is-running" in res["live"][0]
@@ -1632,9 +1637,197 @@ def test_a_run_is_ended_by_everything_that_is_not_another_tool_card():
         assert "_endToolGroup()" in tail, "clearing the transcript must clear the open run"
 
 
+def test_a_step_is_a_line_and_the_two_cards_keep_their_box():
+    """`.cloud-chat-tool` is worn by THREE things — a tool-call step, an
+    approval gate, a question card. The step is a trace line the reader skims
+    past; the other two are surfaces they have to act on. Sharing one box made
+    a turn's machinery shout as loudly as its answer, so the chrome moved off
+    the shared class onto the two that need it, and the step keeps nothing.
+
+    Both halves are asserted, because dropping either is the regression: a step
+    that regains a box is the original complaint, and an approval gate that
+    LOSES one is a decision prompt rendered as a log line."""
+    js = _read(CHAT_JS)
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert "cloud-chat-tool cloud-chat-tool--step" in card, "the step marks itself as one"
+
+    css = _read(CHAT_CSS)
+    shared = css[css.index(".cloud-chat-tool {") :]
+    shared = shared[: shared.index("}")]
+    for prop in ("border", "border-radius", "background", "padding"):
+        assert prop not in shared, f"`{prop}` on the shared class puts a box back on the step"
+
+    chrome = css[css.index(".cloud-chat-approval,\n.cloud-chat-question {") :]
+    chrome = chrome[: chrome.index("}")]
+    for prop in ("padding", "border", "border-radius", "background"):
+        assert prop in chrome, f"the approval/question card lost `{prop}` — it is a surface, not a line"
+    # And they opt OUT of the step's negative margin: an approval gate or a
+    # question is a thing to stop at, so it keeps the container's own spacing.
+    assert "margin-top: 0;" in chrome and "margin-bottom: 0;" in chrome
+
+
+def test_a_step_sits_tighter_to_its_prose_than_two_messages_do():
+    """`.cloud-chat-messages` is a flex column with a uniform `gap:
+    var(--space-5)` (20px) that cannot be targeted per pair. With a positive
+    8px margin a step sat 28px from the sentence above it — WIDER than the 20px
+    between two separate messages — which is backwards: a step belongs to the
+    turn it sits inside.
+
+    Hence the NEGATIVE margin, which claws 8px back off the container gap and
+    lands at 12px. It looks like a mistake and is not; this pins it so a tidy-up
+    cannot quietly restore the inversion."""
+    css = _read(CHAT_CSS)
+    for sel in (".cloud-chat-tool {", ".cloud-chat-tool-group {"):
+        rule = css[css.index(sel) :]
+        rule = rule[: rule.index("}")]
+        assert "margin: calc(var(--space-2) * -1) auto;" in rule, (
+            f"{sel} lost the negative margin — a step would space wider than a message again"
+        )
+    # The premise: the gap it is compensating for.
+    assert "gap: var(--space-5);" in css
+
+    step = css[css.index(".cloud-chat-tool--step {") :]
+    step = step[: step.index("}")]
+    assert "padding: 0" in step
+    # Status has to live somewhere: with no edge to tint, it is the icon, which
+    # makes each of these a meaningful graphic owing 3:1 (WCAG 1.4.11). Success
+    # takes -ink because -line measured only 3.30:1 against the chat surface;
+    # the other two measure 3.82 and 4.83 and stay on -line, which also keeps
+    # them distinguishable from the label's secondary ink beside them.
+    #
+    # Asserted on `.cloud-chat-tool.is-*`, NOT a `--step` variant. The two carry
+    # identical specificity (0,3,0), so a `--step` copy placed above this block
+    # is dead CSS that still reads as though it worked — which is exactly what
+    # shipped here once, and what the count assertion below now prevents.
+    # Whitespace-normalised: the rules are column-aligned in the sheet.
+    flat = re.sub(r"\s+", " ", css)
+    for state, token in (
+        ("is-running", "--ds-accent-info-line"),
+        ("is-done", "--ds-accent-success-ink"),
+        ("is-error", "--ds-accent-danger-line"),
+    ):
+        assert f".cloud-chat-tool.{state} .cloud-chat-tool-icon {{ color: var({token}); }}" in flat, (
+            f"{state} has no way to show itself once the status edge is gone"
+        )
+        assert flat.count(f".{state} .cloud-chat-tool-icon {{ color:") == 1, (
+            f"two rules colour the {state} icon at the same specificity — one of them is dead, "
+            "and which one depends only on file order"
+        )
+
+
+def test_a_step_label_is_quieter_than_the_answer_it_sits_under():
+    """It was set in the ANSWER's own --ds-text-primary and at a HEAVIER weight
+    than the answer itself (500 against 400), so the line whose whole job is to
+    be skippable was the most emphatic text in the transcript. Secondary ink at
+    normal weight measures 7.87:1 here and 9.57:1 in dark — subordinate, still
+    well clear of AA."""
+    css = _read(CHAT_CSS)
+    rule = css[css.index(".cloud-chat-tool--step .cloud-chat-tool-name {") :]
+    rule = rule[: rule.index("}")]
+    assert "color: var(--ds-text-secondary);" in rule
+    assert "font-weight: var(--font-normal);" in rule, "not heavier than the prose above it"
+    assert "--ds-text-primary" not in rule, "the answer's ink belongs to the answer"
+
+
+def test_the_settled_group_label_is_the_control_and_flips_on_toggle():
+    """Collapsed, the label reads "Show 6 steps"; open, "Hide 6 steps". It is a
+    function of `open`, so it has to be re-derived when the reader toggles —
+    otherwise an opened group still invites you to open it. While the run is
+    still going the label stays the name of the step in progress, which is a
+    status and not something to click."""
+    js = _read(CHAT_JS)
+    build = js[js.index("function _buildToolGroup") : js.index("function _updateToolGroupSummary")]
+    assert 'group.addEventListener("toggle"' in build, "the label depends on `open`; it must follow it"
+
+    fn = js[js.index("function _updateToolGroupSummary") : js.index("function _appendToolCard")]
+    assert 'group.open ? "Hide" : "Show"' in fn
+    assert "activeName ? activeName.textContent" in fn, "a running group still names the live step"
+
+    css = _read(CHAT_CSS)
+    assert (
+        ".cloud-chat-tool-group:not(.is-running) > .cloud-chat-tool-group-head .cloud-chat-tool-group-label {" in css
+    ), "only the settled label is inked as a control — the live one is a status"
+
+
+def test_nothing_on_a_step_line_is_pinned_to_the_right_edge():
+    """With the box gone there is no edge for a count, a duration or a caret to
+    sit against, and pinning them right left a rail of marks floating in
+    whitespace. Everything packs left; the leftover width is simply empty."""
+    css = _read(CHAT_CSS)
+    summary = css[css.index(".cloud-chat-tool--step > .cloud-chat-tool-head > .cloud-chat-tool-summary {") :]
+    summary = summary[: summary.index("}")]
+    assert "flex: 0 1 auto" in summary, "a growing summary pushes the caret to the far edge"
+    meta = css[css.index(".cloud-chat-tool-group-meta {") :]
+    meta = meta[: meta.index("}")]
+    assert "flex: 0 1 auto" in meta
+
+
+def test_an_open_step_shows_one_rule_not_a_stack_of_boxes():
+    """Opening a step used to reveal three stacked white rectangles — the
+    command panel, the output panel and the "show full output" panel — each
+    bordered and full width, which put back at the payload level exactly the
+    weight the row had just shed. The panels are plain now, tied together by
+    one continuous hairline down their left; they abut at zero margin so those
+    rule segments join into a single line instead of a dashed ladder."""
+    css = _read(CHAT_CSS)
+    detail = css[css.index(".cloud-chat-tool--step[open] > .cloud-chat-tool-args,") :]
+    detail = detail[: detail.index("}")]
+    assert "border-left: 1px solid var(--ds-border);" in detail
+    assert "margin: 0 0 0 var(--space-3);" in detail, "any vertical margin between panels breaks the rule into segments"
+
+    panel = css[css.index(".cloud-chat-tool-args,\n.cloud-chat-tool-json,") :]
+    panel = panel[: panel.index("}")]
+    for prop in ("border", "background", "border-radius"):
+        assert prop not in panel, f"`{prop}` on a panel is a rectangle inside the rule"
+
+    # "Show full output" is a control, so it reads like one rather than like a
+    # caption in a box of its own.
+    full = css[css.index(".cloud-chat-tool-result-full > summary,") :]
+    full = full[: full.index("}")]
+    assert "color: var(--ds-primary);" in full
+    assert "text-transform: uppercase" not in full, "a link, not a label"
+
+
+def test_an_answer_that_is_a_document_reads_like_one():
+    """An answer arriving as a document — headings, steps, code, a table — had
+    NO rules of its own, so it fell through to the browser's defaults: `h1` at
+    2em (30px against a 15px body) and `h2` at 1.5em, both with the app reset's
+    margin zeroed. Big enough to shout, with no space to group anything, which
+    is the specific way it was hard to scan.
+
+    Two properties are pinned. The scale stays at reading sizes — a reply is
+    not a page and never competes with a page title. And every heading carries
+    more space ABOVE than below, which is the asymmetry that makes it read as
+    belonging to the block it introduces rather than floating between two."""
+    css = _read(CHAT_CSS)
+
+    def rule(sel):
+        block = css[css.index(sel + " {") :]
+        return block[: block.index("}")]
+
+    assert "font-size: var(--text-lg);" in rule(".msg-body h1"), "h1 is 18px, not the UA's 2em"
+    assert "font-size: var(--text-md);" in rule(".msg-body h2")
+
+    # The asymmetry, read off the shorthand: `margin: <top> 0 <bottom>`.
+    for sel, top, bottom in ((".msg-body h1", 20, 8), (".msg-body h2", 20, 6)):
+        margin = re.search(r"margin: (\d+)px 0 (\d+)px", rule(sel))
+        assert margin, f"{sel} must set an explicit top/bottom margin"
+        assert int(margin.group(1)) == top and int(margin.group(2)) == bottom
+        assert int(margin.group(1)) > int(margin.group(2)), (
+            f"{sel} has no more room above than below — it groups with nothing"
+        )
+
+    # The elements that had no rule at all and inherited page chrome.
+    for sel in (".msg-body hr", ".msg-body blockquote"):
+        assert sel + " {" in css, f"{sel} still falls through to the browser default"
+
+
 def test_tool_group_css_uses_ds_tokens_only():
     css = _read(CHAT_CSS)
-    block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-head {")]
+    # Anchored on the group's own last rule rather than on ".cloud-chat-tool-head
+    # {", which now also matches inside ".cloud-chat-tool--step > .cloud-chat-tool-head {"
+    # further up the file and sliced the block to nothing.
+    block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-group-body > .cloud-chat-tool")]
     assert re.search(r"#[0-9a-fA-F]{3,8}\b", block) is None, "raw hex — the group is --ds-* like everything else"
     assert "var(--primary)" not in block, "the design system's token is --ds-primary"
     assert "--ds-accent-danger-line" in block and "--ds-accent-success-line" in block

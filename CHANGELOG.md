@@ -54,6 +54,64 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **A tool step sits closer to the sentence it belongs to.** The messages
+  column is a flex column with a uniform 20px `gap`, and a step added 8px of
+  its own margin on top — so it stood 28px from the prose above it, WIDER than
+  the 20px between two separate messages. Backwards, for something that is part
+  of the turn rather than a turn of its own. The step and the group now carry a
+  negative vertical margin that claws that back to 12px; the approval gate and
+  the question card opt out and keep the container's own spacing, because those
+  are things to stop at rather than steps to skim past.
+- **A tool step reads as machinery, not as prose.** Its label was set in the
+  ANSWER's own `--ds-text-primary` and at a heavier weight than the answer
+  itself (500 against 400) — so the line whose whole job is to be skippable was
+  the most emphatic text in the transcript. Secondary ink at normal weight:
+  7.87:1 against the surface and 9.57:1 in dark, plainly readable and plainly
+  subordinate to the sentence above it.
+- **The step's status icon was coloured by dead CSS.** Two rules coloured it at
+  identical specificity (`.cloud-chat-tool--step.is-done` and
+  `.cloud-chat-tool.is-done`, both `(0,3,0)`), so the earlier one never applied
+  and only file order decided. The duplicate is deleted, and with the status
+  edge gone in the same release the icon is the ONLY carrier of a step's state —
+  which makes it a meaningful graphic owing 3:1 (WCAG 1.4.11). Measured against
+  the chat surface, info 3.82:1 and danger 4.83:1 are comfortable but success
+  came to 3.30:1, so success moves to `--ds-accent-success-ink` (7.13:1 light,
+  10.91:1 dark). The guard now asserts one rule per state, so a duplicate
+  cannot silently go dead again.
+- **A tool call in web chat is a line, not a card.** Folding a run into one
+  group (#1974) cut how MANY boxes a turn showed; each one was still a filled,
+  bordered, radiused slab with a 3px status edge at full reading width, so six
+  steps were still six slabs once you opened the group. A step now draws no box
+  at all: status moves to the icon (the smallest thing that can carry it), the
+  label drops the monospace treatment it never earned (it is a phrase —
+  "Reading the data catalog" — not an identifier), and the row packs left
+  instead of pinning a duration and a caret to an edge that no longer exists.
+  A settled group header says what clicking it does ("Show 6 steps" /
+  "Hide 6 steps") because with the box gone nothing else on the line looks like
+  a control. Opening a step is lighter too: it used to reveal three stacked
+  bordered rectangles (command, output, "show full output"), putting back at
+  the payload level the weight the row had just shed. The panels are plain now,
+  tied together by one continuous hairline down their left, the code and
+  console blocks carry a quiet tint sized to their CONTENT rather than to the
+  reading column (`agnes catalog` is thirteen characters and was painting a
+  full-width band), and "Show full output" reads as the link it is. The double
+  padding went with it — the shared code-block rule's spacing had been nesting
+  inside each panel's own. Console output is **not capped at all** — it is one
+  `<pre>` holding the whole thing, bounded on screen by its own `max-height`
+  and scrolled. A line cap there bought nothing and cost a click: the content
+  was going to be behind a scrollbar either way, and a long dump is a single
+  text node rather than the hundreds of elements a long table is. The table
+  still caps for that reason, but **expanding it now grows the same table in
+  place** instead of rendering a second copy underneath — a 5-row preview used
+  to sit above a full 400-row table that started over at row one, and the
+  console did the same with lines 1-12 above lines 1-22. One payload, one
+  element. Also strictly cheaper: the table's full copy used to be built
+  eagerly whether or not anyone opened it. The over-cap raw-JSON route stays a
+  real disclosure, because past 500 rows it is genuinely additional content
+  rather than a repeat. The chrome did not disappear, it moved:
+  `.cloud-chat-tool` is shared with the approval gate and the question card,
+  which are surfaces the reader has to act on, and those two now own the box
+  outright and are unchanged.
 - **A tool card in web chat shows what the tool actually returned.** Three
   content bugs in the tool-call renderer, all of them hitting the results
   analysts see most. (1) A tabular result that arrived as a JSON **string** —
