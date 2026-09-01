@@ -2343,20 +2343,6 @@
 
      By group and By bundle are two readings of the SAME panel, so both point
      at it; that is what `aria-controls` is for. #}
-  <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
-    <button type="button" role="tab" id="ax-tab-group" class="tab-strip__item is-active"
-            data-by="group" aria-selected="true" aria-controls="ax-pane-edit">
-      By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span>
-    </button>
-    <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
-            data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
-      By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
-    </button>
-    <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
-            data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
-      By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
-    </button>
-  </nav>
   {# The shared toolbar component, the same one the Library's browsing block
      uses: `.fbar` owns the row (flex, 10px gap), `.fbar__search` the field,
      `.fbar-filter` the button and its menu. Page-local rules here set only
@@ -2404,6 +2390,20 @@
          below, so it IS a row of that list — see `newGroupRow` in
          renderGroups. #}
     </div>
+  <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
+    <button type="button" role="tab" id="ax-tab-group" class="tab-strip__item is-active"
+            data-by="group" aria-selected="true" aria-controls="ax-pane-edit">
+      By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span>
+    </button>
+    <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
+            data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
+      By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
+    </button>
+    <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
+            data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
+      By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
+    </button>
+  </nav>
 </div>
 
 {# ── The list: groups, or bundles ── #}
@@ -2959,13 +2959,31 @@
        tier pair goes too — Optional/Automatic on a mandatory plugin is the
        same false choice. (#1956 item 13.) */
     if (o.managedBy) {
+      // No Optional/Automatic pair: that choice does not exist on a mandatory
+      // plugin, and offering it was the same falsehood the Revoke was. The
+      // tier it actually has, stated — the Manage column beside it says where
+      // that was decided, so this does not repeat the destination.
       return `<span class="ax-ctl ax-ctl--managed">
-        <span class="ax-managed" data-tip="${esc(o.managedBy.reason || "")}">${esc(o.managedBy.label)}</span>
-        <a class="ax-inherit" href="${esc(o.managedBy.href)}">${esc(o.managedBy.surface)} →</a></span>`;
+        <span class="ax-managed" data-tip="${esc(o.managedBy.reason || "")}">Required</span></span>`;
     }
-    return `<span class="ax-ctl">${tierPart}
-      <button type="button" class="ax-revoke" data-revoke>Revoke</button>
-      ${o.href ? `<a class="ax-own__edit" href="${o.href}">where it lives ↗</a>` : ""}</span>`;
+    return `<span class="ax-ctl">${tierPart}</span>`;
+  };
+
+  /* The row's ACT, in the column "What they will see" used to occupy. Revoke
+     for a grant this page owns; the way to the owning surface for one it does
+     not (an inherited Everyone grant, a Required plugin). Exactly one of the
+     two, because a row either is yours to change or it is not. */
+  const manageCell = (o) => {
+    const m = o || {};
+    if (m.inherited) {
+      return `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
+        title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`;
+    }
+    if (m.managedBy) {
+      return `<a class="ax-inherit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} →</a>`;
+    }
+    return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
+      m.href ? `<a class="ax-own__edit" href="${m.href}">where it lives ↗</a>` : ""}`;
   };
 
   /* The reads cell, as drawn: a small label saying WHERE the person meets
@@ -3445,13 +3463,22 @@
       // Revoke both act on the Everyone grant, so offering them here would
       // let an admin quietly alter a company-wide grant while looking at one
       // group. Say where it comes from and send them there instead.
+      const ownHref = owned && hrefFn ? hrefFn(i.resource_id) : "";
+      // An inherited row is NOT this group's to change: the tier control and
+      // Revoke both act on the Everyone grant, so offering them here would
+      // let an admin quietly alter a company-wide grant while looking at one
+      // group. Say where it comes from and send them there instead.
+      // Inherited: the tier is real but it is Everyone's to set, so it is
+      // stated rather than offered. The Manage column carries the way there,
+      // which is why this does not repeat the word "Everyone".
       const control = grant.inherited
-        ? `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
-              title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`
-        : controlCell(t.type_key, tier, {
-            href: owned && hrefFn ? hrefFn(i.resource_id) : "",
-            managedBy: grant.managed_by,
-          });
+        ? `<span class="ax-ctl ax-ctl--managed"><span class="ax-managed"
+             data-tip="Granted to Everyone, so it reaches this group's members too. Its tier is set there.">${
+               tier === "required" ? "Automatic" : "Optional"}</span></span>`
+        : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by });
+      const manage = manageCell({
+        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref,
+      });
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
         ${kindTag(t)}
@@ -3461,7 +3488,7 @@
             who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}</span>
         </span>
         <span class="ax-r__ctl">${control}</span>
-        <span class="ax-r__rd">${readsLabelled(t.type_key, tier)}</span>
+        <span class="ax-r__rd ax-r__manage">${manage}</span>
       </div>`;
     };
 
@@ -3487,24 +3514,20 @@
     const families = (overview.families || []).length
       ? overview.families
       : [{ key: "knowledge", display_name: "Knowledge", blurb: "" }];
-    const sections = families.map((f) => {
-      const parts = byFamily.get(f.key) || [];
-      if (!parts.length) return "";
-      /* The Library's group header, part for part: a band carrying a caret,
-         the label, a live count and one line of hint. Same component, so a
-         band here and a band there cannot drift apart. */
-      return `
-      <div class="ax-fam">
-        <div class="fbar-groupband ax-fam__hd">
-          <div class="fbar-grouptoggle" role="presentation">
-            <span class="fbar-group__title">${esc(f.display_name)}</span>
-            <span class="fbar-group__n">${parts.length}</span>
-            ${f.blurb ? `<span class="fbar-group__hint">${esc(f.blurb)}</span>` : ""}
-          </div>
-        </div>
-        ${parts.join("")}
-      </div>`;
-    }).join("");
+    /* ONE list, in family order — no band per family.
+       A group holding three things was three headed sections of one row each,
+       and each header spent a line restating what its family means ("Read,
+       query or open — and what their agents may cite"). That is a definition
+       of the taxonomy, printed inside the answer to "what does Finance have",
+       which is not the question it answers. Worse, the same split is already
+       available as a CHOICE: the toolbar's Kind filter narrows to exactly one
+       family, on demand, for the reader who wants that cut.
+       Family order is kept — the rows still arrive Knowledge, then
+       Capabilities, then Surfaces — so nothing about the reading order
+       changes; only the furniture between them is gone. */
+    const sections = families
+      .map((f) => (byFamily.get(f.key) || []).join(""))
+      .join("");
 
     /* Above the list, not after it. At the foot it cost a scroll through
        everything the group already has to reach the thing that adds one
@@ -3522,10 +3545,21 @@
     // The column header belongs to the GROUP, not to each family. Repeated
     // per family it was three copies of four words, and it made each family
     // read as its own table rather than a band of one list.
+    /* "What they will see" is gone. It printed the CONSEQUENCE of the tier
+       ("In their Library / Keep a local copy"), which is a function of the
+       Optional/Automatic choice and not of the row — so the same two strings
+       repeated down the column, a legend rendered once per row. The meaning
+       moves onto the tier control itself, where the choice is actually made
+       and where a reader is already looking when they wonder what it does.
+
+       The column it vacated goes to the ACT: revoke, or the way to the
+       surface that owns this grant when it is not this page (a Required
+       plugin, or an inherited Everyone grant). Those were previously crowded
+       into the same cell as the tier pair. */
     const colhd = sections ? `
       <div class="ax-colhd">
         <span>Kind</span><span>What the group gets</span>
-        <span>Admin control</span><span class="ax-colhd__u">What they will see</span>
+        <span>Access tier</span><span class="ax-colhd__u">Manage</span>
       </div>` : "";
 
     /* Advanced is gone too. It was the same browsing tree one disclosure
