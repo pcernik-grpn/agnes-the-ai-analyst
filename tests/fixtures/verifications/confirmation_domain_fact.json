@@ -6,8 +6,12 @@
       "content": "The orders table uses order_id as primary key and net_revenue_usd as the revenue column.",
       "user_quote": "Yes, that's correct. order_id is the primary key and the revenue column is net_revenue_usd.",
       "domain": "data",
-      "entities": ["orders", "net_revenue_usd"],
-      "base_confidence": 0.60
+      "entities": [
+        "orders",
+        "net_revenue_usd"
+      ],
+      "base_confidence": 0.6,
+      "scope": "general"
     }
   ]
 }

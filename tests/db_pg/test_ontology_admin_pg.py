@@ -196,6 +196,27 @@ def test_http_save_empty_draft_is_422(tmp_path, monkeypatch, pg_engine):
     assert r.json()["detail"]["error"] == "empty_draft"
 
 
+def test_http_save_relationship_description_survives_into_the_model(tmp_path, monkeypatch, pg_engine):
+    """The end-to-end path for section 3's description field: draft edit ->
+    Save -> the saved semantic-model document carries the relationship's own
+    description, not just the entity endpoints' descriptions."""
+    client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    headers = _auth(admin_token)
+    draft_id = client.post("/api/admin/ontology/drafts", json={"name": "desc_test"}, headers=headers).json()["id"]
+    client.put(
+        f"/api/admin/ontology/drafts/{draft_id}",
+        json={
+            "node_types": {"a": {"attrs": {}}, "b": {"attrs": {}}},
+            "edge_types": {"linked_to": {"src": "a", "dst": "b", "description": "what this relationship represents"}},
+        },
+        headers=headers,
+    )
+    saved = client.post(f"/api/admin/ontology/drafts/{draft_id}/save", headers=headers)
+    assert saved.status_code == 200, saved.text
+    model = client.get(f"/api/admin/semantic-models/{saved.json()['model']['slug']}", headers=headers).json()
+    assert "what this relationship represents" in model["document"]
+
+
 def test_http_save_evidence_required_false_survives_into_the_model(tmp_path, monkeypatch, pg_engine):
     client, admin_token = _pg_client(tmp_path, monkeypatch, pg_engine)
     headers = _auth(admin_token)
