@@ -278,8 +278,22 @@ class TestFixtureIdsPresent:
 
 
 class TestSmallFixtureInSync:
-    def test_committed_fixture_matches_a_fresh_regeneration(self, tmp_path):
+    def test_committed_fixture_matches_a_fresh_regeneration(self, tmp_path, monkeypatch):
         assert SMALL_FIXTURE_DIR.exists(), "run scripts/eval/corpus_gen.py --small first"
+
+        # The committed fixture is deliberately the FALLBACK output (all
+        # Markdown + the scan PDF): reviewable in a diff, and identical no
+        # matter which optional Office-writer libraries the regenerating
+        # environment happens to carry. Pin the writers to that mode here —
+        # without this, an env with python-pptx/openpyxl installed (the
+        # `extraction` extra pulls both) regenerates real binaries and this
+        # test measures the machine's package set instead of the generator.
+        # Patched on the module object corpus_gen ACTUALLY imported —
+        # its own sys.path fallback can bind `corpus_helpers.writers` as a
+        # distinct module from this test's `scripts.eval.…` import, and
+        # patching the wrong twin silently changes nothing.
+        monkeypatch.setattr(corpus_gen.writers, "_has", lambda module_name: False)
+        monkeypatch.setattr(writers, "_has", lambda module_name: False)
 
         fresh = tmp_path / "fresh_small"
         fresh_manifest = corpus_gen.generate(fresh, seed=corpus_gen.DEFAULT_SEED, small=True)
