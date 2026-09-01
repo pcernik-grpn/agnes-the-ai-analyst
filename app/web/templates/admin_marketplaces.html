@@ -144,6 +144,15 @@
     border: 1px solid var(--border, #e5e7eb); border-radius: 8px;
     background: var(--surface, #fff);
   }
+  .mp-sync-note {
+    margin: 0 0 12px; padding: 9px 11px;
+    background: var(--ds-surface-dim); border-radius: var(--ds-radius-btn);
+    font-size: 12px; line-height: 1.5; color: var(--ds-text-secondary);
+  }
+  .mp-sync-note b { color: var(--ds-text-primary); font-weight: 600; }
+  /* Populated by openDetails(); collapses rather than showing an empty band
+     if that ever fails. */
+  .mp-sync-note:empty { display: none; }
   .plugin-list .empty { padding: 24px; text-align: center; color: var(--text-secondary, #6b7280); font-size: 13px; }
   .plugin-item {
     padding: 12px 14px;
@@ -492,6 +501,12 @@
   <div class="modal-card" style="max-width:720px;">
     <h3 id="details-title">Marketplace details</h3>
     <p class="sub" id="details-sub"></p>
+    {# The sync cadence and the next run. Both existed only as prose on the
+       empty state and the register form ("every night at 03:00 UTC") and as a
+       row in the scheduler's source, so an admin looking at a stale
+       marketplace could not tell when it would next be picked up (#1956
+       item 15). #}
+    <p class="mp-sync-note" id="details-sync"></p>
     <div id="details-body" class="plugin-list"></div>
     <div class="modal-actions">
       {{ ds.button('Close', variant='primary',
@@ -569,6 +584,21 @@ function esc(s) {
 }
 function fmtDate(s) { return s ? (window.AgnesTime.formatDateTime(s) || "—") : "—"; }
 function shortSha(s) { return s ? s.slice(0, 7) : "—"; }
+
+// The next 03:00 UTC, rendered in the reader's own zone. The schedule is
+// stated in UTC because that is what the scheduler runs on, but "when is that
+// for me?" is the question an admin actually has. Computed rather than read:
+// every marketplace is cloned by ONE fixed `daily 03:00` row in
+// services/scheduler/__main__.py with no per-marketplace override, so there is
+// nothing on the marketplace row to read. If the cadence ever becomes
+// configurable, this is the line that should read the real value instead.
+function nextNightlySync() {
+  const now = new Date();
+  const next = new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 3, 0, 0));
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return window.AgnesTime.formatDateTime(next.toISOString()) || next.toISOString();
+}
 // v87: full 40-char SHA pins render short like a commit hash; tag names
 // render in full since they're already short and human-readable.
 function shortRef(r) { return /^[0-9a-f]{40}$/i.test(r || "") ? r.slice(0, 7) : r; }
@@ -771,6 +801,13 @@ async function openDetails(id, name) {
   document.getElementById("details-title").textContent = `${name || id}`;
   const sub = document.getElementById("details-sub");
   sub.innerHTML = `<code>${esc(id)}</code>${m && m.url ? ` · <span class="mp-url" title="${esc(m.url)}">${esc(m.url)}</span>` : ""}`;
+  // One instance-wide schedule, stated as such — there is no per-marketplace
+  // cadence to imply by putting a different number on each row.
+  const syncEl = document.getElementById("details-sync");
+  syncEl.innerHTML = `<b>Sync</b> — every night at 03:00 UTC (next: ${esc(nextNightlySync())})`
+    + (m && m.last_synced_at ? `. Last synced ${esc(fmtDate(m.last_synced_at))}.` : ". Never synced yet.")
+    + ` Use <b>Sync now</b> on the marketplace row to pull immediately.`;
+
   const body = document.getElementById("details-body");
   body.innerHTML = `<div class="empty">Loading plugins…</div>`;
   openModal("details-modal");
