@@ -1606,6 +1606,15 @@ class ExtractionRunOptions(BaseModel):
         le=86400,
         description="Hard ceiling for this one run, seconds (0 = unbounded).",
     )
+    resync: Optional[bool] = Field(
+        None,
+        description=(
+            "Drop this connection's persisted deltaLinks and item-failure queue before "
+            "running, so every drive re-enumerates from scratch (already-ingested files "
+            "are not re-downloaded — cTags are kept). The supported recovery path for a "
+            "connection whose delta cursor ran past documents it never actually ingested."
+        ),
+    )
 
 
 # --- Graph subscription lifecycle -------------------------------------------
@@ -1798,7 +1807,10 @@ async def trigger_extraction(
     ``{"connection_id": connection_id}``, the exact payload shape that
     handler documents. An optional :class:`ExtractionRunOptions` body adds
     the handler's per-run overrides (``concurrency``, ``timeout_s``) for
-    THIS run only — configured values stay untouched.
+    THIS run only — configured values stay untouched — plus ``resync``, the
+    supported alternative to hand-editing the crawl state file on the data
+    disk when a connection's delta cursor ran past documents it never
+    ingested: see ``connectors.sharepoint.crawler._apply_resync``.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
@@ -1832,6 +1844,8 @@ async def trigger_extraction(
             payload["concurrency"] = options.concurrency
         if options.timeout_s is not None:
             payload["timeout_s"] = options.timeout_s
+        if options.resync:
+            payload["resync"] = True
 
     job = jobs_repo().enqueue(
         "corpus-extraction",
