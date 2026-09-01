@@ -473,6 +473,69 @@ class TestAdminLibraryPreviewSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Admin — force-end a user's sessions without deactivating (issue #1676
+# remainder)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminRevokeSessionsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/users/{user_id}/revoke-sessions",
+    }
+
+    def test_revoke_sessions_honest_per_backend(self, seeded_app_both):
+        """200 on both backends. PG actually bumps `session_revoked_before`;
+        DuckDB has no such column (A3 ratchet) and stays a documented no-op —
+        the response body says which happened rather than always claiming
+        success."""
+        from src.repositories import users_repo
+
+        backend = seeded_app_both["backend"]
+        before = users_repo().get_by_id("analyst1")
+        assert before.get("session_revoked_before") is None
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["revoked"] is (backend == "pg"), body
+        assert body["backend_supports_revocation"] is (backend == "pg"), body
+
+        after = users_repo().get_by_id("analyst1")
+        if backend == "pg":
+            assert after["session_revoked_before"] is not None
+        else:
+            assert after.get("session_revoked_before") is None
+
+    def test_revoke_sessions_denied_for_non_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert r.status_code == 403, r.text
+
+    def test_revoke_sessions_unknown_user_404(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/nope-does-not-exist/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_revoke_sessions_writes_an_audit_row(self, seeded_app_both):
+        from src.repositories import audit_repo
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        rows, _ = audit_repo().query(action_in=["user.revoke_sessions"])
+        assert any(row.get("resource", "").endswith("analyst1") for row in rows), rows
+
+
+# ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
 

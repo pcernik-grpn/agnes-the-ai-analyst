@@ -350,6 +350,19 @@ auth:
 #   # clients regardless. See docs/DEPLOYMENT.md. Env override:
 #   # AGNES_MCP_CONNECTOR_UI_ENABLED.
 #   connector_ui_enabled: true
+#
+#   # Accept the MCP bearer token as a `?token=` query parameter on the SSE
+#   # transport (/api/mcp/sse), for a legacy client that cannot set the
+#   # Authorization header on a GET. OFF by default (#1656 audit follow-up):
+#   # a token in the query string is captured by every request-logging
+#   # intermediary — reverse proxy, uvicorn access log, SIEM — and by browser
+#   # history (CWE-598). Prefer the Authorization header; every connection
+#   # snippet Agnes hands out (/mcp-connect) is header-based already. Turn
+#   # this on only for a documented client that genuinely cannot send a
+#   # header — Agnes still logs a one-time warning naming the exposure the
+#   # first time the fallback is actually used. Env override:
+#   # AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN.
+#   allow_query_param_token: false
 
 # --- Access control (optional) ---
 # access:

@@ -5,6 +5,13 @@ no admin-nav entry of its own. When the `facts` flag is off, or the active
 backend is DuckDB (drafts are PG-only), the page renders an explanatory
 empty state rather than 404ing or crashing -- same posture as /apps when
 data_apps is disabled.
+
+The builder's client-side behavior lives in one inline ``<script>`` (no
+separate ``.js`` file). Following ``tests/test_chat_tool_rendering_ui.py``'s
+pattern: pure helper functions are extracted by name and run node-executed
+against the SHIPPED source (no copies); DOM-touching wiring is pinned
+structurally via substring assertions on the same source, since this repo
+carries no jsdom dependency.
 """
 
 from __future__ import annotations
@@ -16,7 +23,31 @@ from pathlib import Path
 
 import pytest
 
-_TEMPLATE_SRC = Path("app/web/templates/ontology_builder.html").read_text(encoding="utf-8")
+_TEMPLATE_PATH = Path("app/web/templates/ontology_builder.html")
+_TEMPLATE_SRC = _TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def _script_source() -> str:
+    """The inline ``<script>`` body under ``{% block scripts %}`` -- no
+    Jinja inside it, so it is plain, node-executable JS as-is."""
+    start = _TEMPLATE_SRC.index("<script>", _TEMPLATE_SRC.index("{% block scripts %}")) + len("<script>")
+    end = _TEMPLATE_SRC.index("</script>", start)
+    return _TEMPLATE_SRC[start:end]
+
+
+def _slice(src: str, start_marker: str, end_marker: str) -> str:
+    start = src.index(start_marker)
+    end = src.index(end_marker, start)
+    return src[start:end]
+
+
+def _node_run(script: str) -> str:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout
 
 
 def _auth(token: str) -> dict:
@@ -67,6 +98,153 @@ def test_template_save_is_the_only_write_comment_present():
     """Documentation smoke check: the Save-only-write invariant is stated in
     the template itself, not just in code review memory."""
     assert "Save is the only write" in _TEMPLATE_SRC
+
+
+# ---------------------------------------------------------------------------
+# Section 3 (relationship types) — a description field, mirroring entity types
+# ---------------------------------------------------------------------------
+
+
+def test_relationship_row_renders_a_description_field():
+    """Entity types (section 2) have a description input; relationship types
+    (section 3) must too -- otherwise the only way to explain what an edge
+    MEANS is to mislabel it on an entity's description, which is the wrong
+    place and does not reach the extraction prompt for the edge itself."""
+    js = _script_source()
+    esc_fn = _slice(js, "function esc(s) {", "function setStatus(")
+    row_fn = _slice(js, "function _edgeRowHtml(", "function renderEdgeRows(")
+    script = (
+        esc_fn
+        + row_fn
+        + """
+    var withDescription = _edgeRowHtml('owned_by', {src: 'a', dst: 'b', description: 'who financially controls whom'});
+    var withoutDescription = _edgeRowHtml('related_to', {src: 'a', dst: 'b'});
+    process.stdout.write(JSON.stringify({withDescription: withDescription, withoutDescription: withoutDescription}));
+    """
+    )
+    res = json.loads(_node_run(script))
+    assert 'data-field="description"' in res["withDescription"]
+    assert "who financially controls whom" in res["withDescription"]
+    # No description set -> an empty field, never the literal string "undefined".
+    assert 'data-field="description" value=""' in res["withoutDescription"]
+
+
+def test_relationship_description_edit_is_wired_to_the_draft():
+    """Structural pin (DOM-touching wiring, no jsdom in this repo): editing
+    the description input must write ``draft.edge_types[name].description``,
+    the same shape ``_draft_to_ontology_dict``/``translate_ontology`` already
+    read on the backend."""
+    js = _script_source()
+    render_fn = _slice(
+        js,
+        "function renderEdgeRows(",
+        "document.addEventListener('DOMContentLoaded', function () {\n    document.getElementById('ont-add-edge')",
+    )
+    assert 'data-field="description"' in render_fn
+    assert "draft.edge_types[name].description = e.target.value" in render_fn
+
+
+# ---------------------------------------------------------------------------
+# Section 4 (document sample) — adding a document never fails silently
+# ---------------------------------------------------------------------------
+
+
+def test_sample_duplicate_matches_by_collection_and_file_id_not_by_name():
+    """Two distinct files can share a filename (different paths in the same
+    collection) -- the duplicate check must key on the real identifier
+    (collection_id + file_id), never on the display name, or two genuinely
+    different documents would look like the same one."""
+    js = _script_source()
+    fn = _slice(js, "function sampleDuplicate(", "function wireDocumentSample(")
+    script = (
+        fn
+        + """
+    var sample = [
+      {collection_id: 'c1', file_id: 'f1', name: 'col / report.md'},
+      {collection_id: 'c1', file_id: 'f2', name: 'col / report.md'},
+    ];
+    process.stdout.write(JSON.stringify({
+      sameNameDifferentFile: sampleDuplicate(sample, 'c1', 'f3'),
+      trueDuplicate: sampleDuplicate(sample, 'c1', 'f1'),
+      otherCollection: sampleDuplicate(sample, 'c2', 'f1'),
+      emptySample: sampleDuplicate(null, 'c1', 'f1'),
+    }));
+    """
+    )
+    res = json.loads(_node_run(script))
+    assert res["sameNameDifferentFile"] is None, "a third file with the same name as an existing one is not a duplicate"
+    assert res["trueDuplicate"]["file_id"] == "f1"
+    assert res["otherCollection"] is None
+    assert res["emptySample"] is None
+
+
+def test_add_doc_handler_toasts_instead_of_silently_doing_nothing():
+    """A rejected add (nothing picked, or a real duplicate) must tell the
+    operator -- the reported bug was that the sample count simply did not
+    change, with no error and no toast."""
+    js = _script_source()
+    handler = _slice(
+        js, "document.getElementById('ont-add-doc').addEventListener('click'", "function renderSampleList("
+    )
+    assert handler.count("toast(") >= 2, "both the missing-selection and the duplicate branch must toast"
+    assert "sampleDuplicate(" in handler
+
+
+# ---------------------------------------------------------------------------
+# Create tab — Import is never a silent no-op, and the file-read race is closed
+# ---------------------------------------------------------------------------
+
+
+def test_import_validation_message_for_empty_paste():
+    js = _script_source()
+    fn = _slice(js, "function _importValidationError(", "function wireCreateTab(")
+    script = (
+        fn
+        + """
+    process.stdout.write(JSON.stringify({
+      empty: _importValidationError(''),
+      whitespace: _importValidationError('   \\n  '),
+      missing: _importValidationError(undefined),
+      real: _importValidationError('node_types: {}'),
+    }));
+    """
+    )
+    res = json.loads(_node_run(script))
+    assert res["empty"], "pressing Import on an empty textarea must say something"
+    assert res["whitespace"]
+    assert res["missing"]
+    assert res["real"] is None
+
+
+def test_import_click_handler_toasts_instead_of_silently_returning():
+    js = _script_source()
+    handler = _slice(
+        js,
+        "document.getElementById('ont-import-btn').addEventListener('click'",
+        "Array.prototype.forEach.call(document.querySelectorAll('.ont-tab')",
+    )
+    assert "_importValidationError(" in handler
+    assert "toast(" in handler
+    # The old bug: `if (!text.trim()) return;` with nothing else -- guard
+    # against a silent early return sneaking back in.
+    assert "if (!text.trim()) return;" not in handler
+
+
+def test_file_read_disables_import_until_the_read_completes():
+    """A user who picks a file and immediately clicks Import can otherwise
+    race the asynchronous FileReader and hit the empty-textarea path for a
+    file that has not finished loading yet."""
+    js = _script_source()
+    handler = _slice(
+        js,
+        "document.getElementById('ont-file').addEventListener('change'",
+        "document.getElementById('ont-import-btn').addEventListener('click'",
+    )
+    disable_at = handler.index("importBtn.disabled = true")
+    read_at = handler.index("reader.readAsText")
+    onload_at = handler.index("reader.onload")
+    assert disable_at < read_at, "Import must be disabled BEFORE the async read starts, not after"
+    assert "importBtn.disabled = false" in handler[onload_at:]
 
 
 # ---------------------------------------------------------------------------
@@ -126,15 +304,6 @@ function fetch(url) {
 """
 
 
-def _node_run(script: str) -> dict:
-    node = shutil.which("node")
-    if not node:
-        pytest.skip("node not available")
-    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
-    assert out.returncode == 0, out.stdout + out.stderr
-    return json.loads(out.stdout)
-
-
 def _run_load_collections(collections_result: dict) -> dict:
     esc_fn = _extract_function(_TEMPLATE_SRC, "function esc(s) {")
     load_fn = _extract_function(_TEMPLATE_SRC, "function loadCollections() {")
@@ -153,7 +322,7 @@ def _run_load_collections(collections_result: dict) -> dict:
         + "  }));\n"
         + "});\n"
     )
-    return _node_run(script)
+    return json.loads(_node_run(script))
 
 
 def test_load_collections_populates_picker_from_items_shape():
@@ -226,5 +395,5 @@ def test_files_for_collection_handles_files_wrapped_shape():
         + "  console.log(JSON.stringify({ files, errors: consoleErrors }));\n"
         + "});\n"
     )
-    result = _node_run(script)
+    result = json.loads(_node_run(script))
     assert result["files"] == [{"file_id": "f1", "filename": "policy.pdf"}]

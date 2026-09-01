@@ -783,6 +783,7 @@ fabricated one is dropped rather than corrected.
 - /api/admin/users/{user_id}/library-preview
 - /api/admin/users/{user_id}/memberships
 - /api/admin/users/{user_id}/memberships/{group_id}
+- /api/admin/users/{user_id}/revoke-sessions
 - /api/admin/users/{user_id}/sessions
 - /api/admin/users/{user_id}/sessions/download-all
 - /api/admin/users/{user_id}/sessions/{session_file}/download
