@@ -484,6 +484,121 @@ class TestCollectionResourceType:
             assert "col_del" not in ids
 
 
+class TestCollectionInventoryProjection:
+    """The admin /access page is where "what files exist on this instance, and
+    whose are they" is answered. An admin sees every collection by god-mode,
+    including the private one-file artefacts a chat file-drop creates, so the
+    projection has to name the owner and the file count — and must not omit
+    files."""
+
+    def _seed_user(self, conn, user_id: str, email: str) -> None:
+        conn.execute(
+            "INSERT INTO users (id, email, name) VALUES (?, ?, ?)",
+            [user_id, email, email.split("@")[0]],
+        )
+
+    def test_collection_item_names_its_owner(self, system_conn):
+        from app.resource_types import _collection_blocks
+
+        self._seed_user(system_conn, "u_owner", "jan@example.com")
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_owned', 'owned', 'Owned Files', 'u_owner')"
+        )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert items["col_owned"]["owner_email"] == "jan@example.com"
+
+    def test_owner_is_none_when_the_account_is_gone(self, system_conn):
+        """An orphaned collection still lists — an inventory that drops rows it
+        cannot fully describe is worse than one with a blank column."""
+        from app.resource_types import _collection_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_orphan', 'orphan', 'Orphan', 'u_deleted')"
+        )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert "col_orphan" in items
+        assert items["col_orphan"]["owner_email"] is None
+
+    def test_collection_item_counts_its_files(self, system_conn):
+        from app.resource_types import _collection_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_two', 'two', 'Two', 'u1')"
+        )
+        repo = corpus_files_repo()
+        for n in ("a.pdf", "b.pdf"):
+            repo.add(
+                corpus_id="col_two",
+                filename=n,
+                sha256="0" * 64,
+                file_type="pdf",
+                size_bytes=1024,
+                storage_path=f"/tmp/{n}",
+            )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert items["col_two"]["file_count"] == 2
+
+    def test_a_single_file_collection_is_listed_in_the_file_inventory(self, system_conn):
+        """The regression this projection change exists for: a chat file-drop
+        creates a ONE-file collection, and skipping those hid most of a real
+        instance's files from the page that inventories them."""
+        from app.resource_types import _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        self._seed_user(system_conn, "u_drop", "eva@example.com")
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_drop', 'test-download', 'test_download.md', 'u_drop')"
+        )
+        corpus_files_repo().add(
+            corpus_id="col_drop",
+            filename="test_download.md",
+            sha256="1" * 64,
+            file_type="md",
+            size_bytes=2048,
+            storage_path="/tmp/test_download.md",
+        )
+        blocks = {b["id"]: b for b in _corpus_file_blocks()}
+        assert "col_drop" in blocks, "a one-file collection's file must be visible to an admin"
+        item = blocks["col_drop"]["items"][0]
+        assert item["name"] == "test_download.md"
+        assert item["owner_email"] == "eva@example.com"
+        # The block header names the owner too, so the file list reads as
+        # "somebody's upload" rather than as a folder on the instance.
+        assert "eva@example.com" in blocks["col_drop"]["name"]
+
+    def test_file_inventory_states_shape_never_content(self, system_conn):
+        from app.resource_types import _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_meta', 'meta', 'Meta', 'u1')"
+        )
+        corpus_files_repo().add(
+            corpus_id="col_meta",
+            filename="report.pdf",
+            sha256="2" * 64,
+            file_type="pdf",
+            size_bytes=2_202_010,
+            storage_path="/tmp/report.pdf",
+        )
+        item = {b["id"]: b for b in _corpus_file_blocks()}["col_meta"]["items"][0]
+        assert item["description"] == "pdf · 2.1 MB"
+        # Nothing in the projection can carry document text.
+        assert "text" not in item and "content" not in item
+
+    def test_empty_collection_contributes_no_file_block(self, system_conn):
+        from app.resource_types import _corpus_file_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_empty', 'empty', 'Empty', 'u1')"
+        )
+        assert "col_empty" not in {b["id"] for b in _corpus_file_blocks()}
+
+
 class TestMcpSourceResourceType:
     """TCRD-236: ``mcp_source`` makes a registered MCP server a grantable
     resource, ANDed with the existing per-tool ``tool_grants`` gate."""

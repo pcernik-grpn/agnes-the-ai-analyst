@@ -243,3 +243,75 @@ def test_list_all_row_shape_matches_list(repo):
     all_row = repo.list_all()[0]
     assert set(all_row) == set(listed)
     assert all_row == listed
+
+
+# ---------------------------------------------------------------------------
+# update() — the editable-metadata patch (name / slug / description)
+# ---------------------------------------------------------------------------
+
+
+def test_update_writes_name_slug_and_description(repo):
+    corpus_id = repo.create(name="Old", slug="old-slug", description="old desc", created_by="u")
+    assert repo.update(corpus_id, name="New", slug="new-slug", description="new desc") is True
+    row = repo.get(corpus_id)
+    assert row["name"] == "New"
+    assert row["slug"] == "new-slug"
+    assert row["description"] == "new desc"
+    # A patch is a mutation — updated_at moves with it.
+    assert row["updated_at"] >= row["created_at"]
+
+
+def test_update_leaves_omitted_fields_alone(repo):
+    corpus_id = repo.create(name="Keep", slug="keep-me", description="keep this", created_by="u")
+    repo.update(corpus_id, name="Renamed")
+    row = repo.get(corpus_id)
+    assert row["name"] == "Renamed"
+    assert row["slug"] == "keep-me"
+    assert row["description"] == "keep this"
+
+
+def test_update_clears_description_when_passed_none(repo):
+    """PRESENCE, not truthiness: passing ``description=None`` clears it, which
+    is the only way a caller can express "remove the description" — omitting
+    the field means "leave it alone" (the test above)."""
+    corpus_id = repo.create(name="Desc", slug="desc-clear", description="something", created_by="u")
+    assert repo.update(corpus_id, description=None) is True
+    assert repo.get(corpus_id)["description"] is None
+
+
+def test_update_refuses_a_column_outside_the_allowlist(repo):
+    corpus_id = repo.create(name="Guard", slug="guard", description=None, created_by="u")
+    with pytest.raises(ValueError):
+        repo.update(corpus_id, created_by="someone-else")
+    # …and nothing was written on the way to the raise.
+    assert repo.get(corpus_id)["created_by"] == "u"
+
+
+def test_update_with_no_fields_is_false_and_writes_nothing(repo):
+    corpus_id = repo.create(name="Noop", slug="noop", description="d", created_by="u")
+    before = repo.get(corpus_id)
+    assert repo.update(corpus_id) is False
+    assert repo.get(corpus_id) == before
+
+
+def test_update_returns_false_for_a_missing_row(repo):
+    assert repo.update("col_nonexistent", name="Nope") is False
+
+
+def test_update_returns_false_for_a_soft_deleted_row(repo):
+    """A deleted collection is not editable — the API turns this False into a
+    404, the same answer every other entity-scoped read gives for it."""
+    corpus_id = repo.create(name="Gone", slug="gone-update", description=None, created_by="u")
+    repo.soft_delete(corpus_id)
+    assert repo.update(corpus_id, name="Resurrected") is False
+    assert repo.get(corpus_id, include_deleted=True)["name"] == "Gone"
+
+
+def test_update_raises_on_slug_collision(repo):
+    """Both engines raise (DuckDB ``ConstraintException`` / PG
+    ``IntegrityError``) so the API's create-path 409 handling covers the patch
+    path unchanged."""
+    repo.create(name="First", slug="taken", description=None, created_by="u")
+    second = repo.create(name="Second", slug="free", description=None, created_by="u")
+    with pytest.raises(Exception):
+        repo.update(second, slug="taken")

@@ -42,7 +42,12 @@ who receives it:
 
 - `/admin/access` — the groups workspace: members and grants side by side.
   The *Simulate a person* tab (`/admin/access?lens=simulate`) answers "what
-  exactly does this user see?".
+  exactly does this user see?". Switching to the by-resource lens lists every
+  grantable thing on the instance including *Collections* and *Files in
+  collections* — each naming its owner and, for a collection, its file count,
+  so "what files exist here and whose are they" is answerable without opening
+  any of them. Names, formats and sizes only; nothing on this page shows file
+  contents.
 
 ## Maintain
 
