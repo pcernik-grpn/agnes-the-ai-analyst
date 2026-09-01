@@ -750,6 +750,73 @@ class TestCorpusExtractionHandler:
         assert not hasattr(_kinds, "_agnes_producer_callback_env")
 
 
+class TestDispatchJobThreadsSharePointJobId:
+    """``extraction_runs.job_id`` was null in production because nothing
+    upstream of the crawl ever supplied it — the handler only ever sees
+    ``job["payload_json"]``, never the job row. ``dispatch_job`` (the ONE
+    place both are in scope) is where that gets fixed; the handler test
+    above (``test_enabled_delegates_the_whole_payload_to_the_builtin_crawl``)
+    deliberately calls the handler directly and stays unaffected."""
+
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}, "extraction": {"timeout_s": 60}}
+
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+    def _stub_crawl(self, monkeypatch):
+        calls: list = []
+
+        def _fake(payload):
+            calls.append(dict(payload))
+            return {"mode": "builtin", "new": 0}
+
+        monkeypatch.setattr("connectors.sharepoint.crawler.run_builtin_crawl", _fake)
+        return calls
+
+    def test_the_claimed_jobs_own_id_reaches_the_crawl_payload(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {"id": "job-77", "kind": "corpus-extraction", "payload_json": {"connection_id": "conn1"}}
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "job-77"}]
+
+    def test_an_explicit_payload_job_id_is_never_overwritten(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {
+            "id": "job-77",
+            "kind": "corpus-extraction",
+            "payload_json": {"connection_id": "conn1", "job_id": "explicit"},
+        }
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "explicit"}]
+
+    def test_a_different_kinds_payload_is_never_touched(self, jobs_db, monkeypatch):
+        """``_INJECT_JOB_ID_KINDS`` is a closed, named set — no other kind's
+        payload gains a key it never asked for."""
+        from app.worker.kinds import dispatch_job
+        from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+
+        calls: list = []
+        register_kind(JobKind(name="trivial-kind", handler=calls.append, lane=LIGHT_LANE))
+
+        job = {"id": "job-1", "kind": "trivial-kind", "payload_json": {"foo": "bar"}}
+        dispatch_job(job)
+
+        assert calls == [{"foo": "bar"}]
+
+
 class TestAnonymizationKeyResolution:
     """``_resolve_anonymization_key`` — the per-instance HMAC key behind the
     §9.2 pseudonym scheme. Kept (and kept tested) through the external-mode

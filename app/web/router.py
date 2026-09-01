@@ -8827,14 +8827,20 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
 
-    **"Scope collections" is an interim heuristic**
-    (`facts_ingest_runs_repo().distinct_corpus_ids()` — see that method's
-    own docstring): every collection this instance has EVER ingested facts
-    into, because there is no persisted connection → collection mapping yet
-    (the connect wizard's step 2 owns that; a sibling, independent effort).
-    Two sharepoint connections on one instance would not be told apart by
-    this alone — acceptable for a single-connection instance, named here so
-    it is not rediscovered as a surprise later.
+    **"Scope collections" is this connection's OWN scope mapping** — every
+    confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
+    same rows the crawl itself routes documents into (`connectors.
+    sharepoint.crawler._confirmed_scopes` reads the identical field). This
+    used to be `facts_ingest_runs_repo().distinct_corpus_ids()` — every
+    collection this INSTANCE had ever ingested FACTS into, a proxy that only
+    worked once a document reached the (opt-in, off-by-default) facts stage.
+    A crawl with `extraction.facts.enabled: false` — the common case — has
+    ALWAYS ingested documents, but the proxy returned `[]` for it, so
+    `cell["crawl"]["documents"]` and `cell["extract"]` read as zero/empty on
+    an instance that had already indexed real files (live symptom: "CRAWL —
+    0 documents", "EXTRACTION — Nothing yet" on a connection with 71
+    `indexed` files). The connection's own scopes are exact, not a proxy,
+    and read correctly whether or not the facts stage has ever run.
 
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
@@ -8860,10 +8866,9 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
 
     scope_ids: list[str] = []
     try:
-        from src.repositories import facts_ingest_runs_repo
-
-        scope_ids = facts_ingest_runs_repo().distinct_corpus_ids()
-    except Exception as e:
+        raw_scopes = (conn.get("config") or {}).get("scopes") or []
+        scope_ids = sorted({s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")})
+    except Exception as e:  # noqa: BLE001 — a malformed config degrades, never a 500
         logger.debug("sharepoint pipeline cell: could not resolve scope collections: %s", e)
 
     # ── crawl / extract: corpus_files across scope collections, bucketed by
@@ -9088,9 +9093,11 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # dropping the row or failing the whole cell; a repo-wide failure
     # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
     # all rather than a 500 for the whole card — same posture as every
-    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
-    # heuristic over ingest history), this list is direct — every scope this
-    # CONNECTION has confirmed, whether or not it has ingested anything yet.
+    # other sub-block here. Reads `config.scopes` a second time rather than
+    # projecting from `scope_ids` above: that one is a bare set of collection
+    # ids, this one needs the full row (`source_scope_id`, `display_path`,
+    # `anonymize`) `_scope_out` renders — two projections of the SAME field,
+    # not two different sources of truth for it.
     scopes: list[dict[str, Any]] = []
     try:
         from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
