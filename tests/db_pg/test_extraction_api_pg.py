@@ -194,4 +194,7 @@ def test_config_answers_on_postgres_too(tmp_path, monkeypatch, pg_engine):
 
     body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
     assert body["section_editable"] is True  # registry-driven since producer.command was removed
-    assert any(row["key"] == "extraction.enabled" for row in body["effective"])
+    # The on/off leaf moved to the single sharepoint switch (2026-09-01 flag
+    # consolidation); the drawer's Enabled row reads it from there.
+    assert any(row["key"] == "sharepoint.enabled" for row in body["effective"])
+    assert any(row["key"] == "extraction.timeout_s" for row in body["effective"])

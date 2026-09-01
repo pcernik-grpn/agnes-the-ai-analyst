@@ -237,9 +237,13 @@ class TestNotificationDelivery:
         """The webhook never queues a job doomed to fail: same readiness
         gate the manual admin trigger checks BEFORE enqueueing. sharepoint
         stays ON (the router-level gate needs it, same flag as the receiver
-        itself) but no producer is configured, so the SECOND readiness gate
-        is what makes this unusable."""
+        itself) but the `extraction` dependency extra is missing — the only
+        remaining readiness leg past the switch since the producer-config
+        one died with the external mode."""
+        import sys
+
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
+        monkeypatch.setitem(sys.modules, "pypdfium2", None)
         conn_id, secret = self._connection_with_secret(seeded_app)
 
         r = seeded_app["client"].post(

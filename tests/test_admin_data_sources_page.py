@@ -2005,7 +2005,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
         # Ready -> no unready badge, and the button carries no `disabled`.
-        assert "Extraction is disabled on this instance" not in html
+        assert "connector is disabled on this instance" not in html
         assert "No extraction producer is configured" not in html
         assert "disabled" not in html
         assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
@@ -2041,7 +2041,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "Extraction is disabled on this instance" in html
+        assert "connector is disabled on this instance" in html
         assert "no schedule configured" in html.lower()
         assert "disabled" in html
 
