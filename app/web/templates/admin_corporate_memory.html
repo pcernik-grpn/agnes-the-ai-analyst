@@ -124,21 +124,56 @@
             background: var(--border);
         }
 
-        /* Tab Navigation */
+        /* Tab Navigation ------------------------------------------------
+           Two lanes, not one. The tabs scroll; the actions do not.
+
+           They used to share a single `overflow-x: auto` row, which meant
+           the two things you cannot reach any other way — "+ New Item" and
+           "+ New Memory Domain" — were the first to slide off the right
+           edge, behind a scrollbar macOS only draws while it is moving
+           (#1956 item 16). A destination has a tab to fall back on; an
+           action clipped out of the viewport is simply gone. */
+        /* `flex-end` so the tabs' own height drives the row and each tab's
+           `margin-bottom: -2px` underline lands exactly on the row's rule. */
+        .tab-row {
+            display: flex;
+            align-items: flex-end;
+            gap: var(--space-3);
+            margin-bottom: var(--space-5);
+            border-bottom: 2px solid var(--border);
+        }
+        .tab-actions {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+            flex-shrink: 0;
+            padding-bottom: var(--space-2);
+        }
         .tab-nav {
             display: flex;
             gap: var(--space-1);
-            margin-bottom: var(--space-5);
-            border-bottom: 2px solid var(--border);
             /* v55 L50: MODERATION + CATALOG group labels + separator
                pushed total width past most viewports → buttons wrapped
                text 2× per line. Allow horizontal scroll instead of
                wrapping; tabs stay one line, whole strip slides on
-               overflow with a thin scrollbar at the bottom edge. */
+               overflow. */
             flex-wrap: nowrap;
+            flex: 1 1 auto;
+            min-width: 0;
             overflow-x: auto;
             overflow-y: hidden;
-            scrollbar-width: thin;
+            /* No scrollbar styling here, deliberately. A non-overlay bar
+               would occupy 6px INSIDE this box, which pushes the tabs' content
+               bottom 6px above `.tab-nav`'s own bottom edge — and that edge is
+               what `.tab-row`'s rule sits on and what each tab's
+               `margin-bottom: -2px` underline is aimed at. The affordance
+               would therefore break the alignment above precisely when the
+               strip overflows, which is the only state it exists for.
+
+               It is also no longer needed: the actions that were genuinely
+               unreachable have left this lane entirely, so what remains behind
+               an overflow is tabs, each of which is a destination the reader
+               can also reach by scrolling — not a verb that had disappeared. */
         }
 
         .tab-btn {
@@ -870,9 +905,13 @@
                 gap: var(--space-4);
             }
 
-            .tab-nav {
-                overflow-x: auto;
-            }
+            /* Narrow: the actions take their own line under the tabs rather
+               than competing with them for a ~360px row. The rule moves to the
+               tab lane with them — left on `.tab-row` it would be drawn under
+               the BUTTONS, which is not what the tabs' underline aims at. */
+            .tab-row { flex-wrap: wrap; border-bottom: none; }
+            .tab-nav { border-bottom: 2px solid var(--border); }
+            .tab-actions { width: 100%; padding: var(--space-3) 0 0; }
 
             .batch-bar {
                 flex-wrap: wrap;
@@ -1130,7 +1169,8 @@
              groupings are cosmetic. Domains + "+ New" actions stay on the
              right edge (E2E found admins had no UI to create a domain
              even though the API existed). -->
-        <div class="tab-nav" style="display:flex; align-items:center; gap:0;">
+        <div class="tab-row">
+        <div class="tab-nav" style="align-items:center; gap:0;">
             <span class="tab-group-label" style="padding:0 8px; font-size:11px; font-weight:600;
                   text-transform:uppercase; letter-spacing:.04em; color:var(--text-muted);">
                 Moderation
@@ -1166,13 +1206,13 @@
                 Domains
                 <span class="tab-badge" id="domainsBadge" style="display:none;"></span>
             </button>
-            <div style="flex:1;"></div>
+        </div>
+        <div class="tab-actions">
             <button class="btn btn-secondary"
-                    onclick="openCreateMemoryItemModal()"
-                    style="margin-left:auto;">+ New Item</button>
+                    onclick="openCreateMemoryItemModal()">+ New Item</button>
             <button class="btn btn-primary"
-                    onclick="openCreateMemoryDomainModal('', null)"
-                    style="margin-left:8px;">+ New Memory Domain</button>
+                    onclick="openCreateMemoryDomainModal('', null)">+ New Memory Domain</button>
+        </div>
         </div>
 
         <!-- Review Queue Tab -->
