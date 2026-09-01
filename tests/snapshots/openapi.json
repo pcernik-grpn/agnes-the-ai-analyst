@@ -38,6 +38,21 @@
         "title": "AddItemRequest",
         "type": "object"
       },
+      "AddManualSiteBody": {
+        "description": "The URL an admin pasted into \"Add a site by URL\" (step 2) \u2014 the SAME\ninput :func:`browse_tree`'s ``?site_url=`` already resolves, just carried\nin a POST body instead of a query param so this call can also persist the\nresult (see :func:`add_manual_site`).",
+        "properties": {
+          "site_url": {
+            "minLength": 1,
+            "title": "Site Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_url"
+        ],
+        "title": "AddManualSiteBody",
+        "type": "object"
+      },
       "AddMemberRequest": {
         "properties": {
           "email": {
@@ -1386,6 +1401,43 @@
         "title": "Body_upload_session_api_upload_sessions_post",
         "type": "object"
       },
+      "Body_view_as_enter_admin_view_as_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "next": {
+            "default": "",
+            "title": "Next",
+            "type": "string"
+          },
+          "user_id": {
+            "default": "",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "title": "Body_view_as_enter_admin_view_as_post",
+        "type": "object"
+      },
+      "Body_view_as_exit_admin_view_as_exit_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "next": {
+            "default": "",
+            "title": "Next",
+            "type": "string"
+          }
+        },
+        "title": "Body_view_as_exit_admin_view_as_exit_post",
+        "type": "object"
+      },
       "BootstrapRequest": {
         "properties": {
           "email": {
@@ -1472,6 +1524,34 @@
           "message"
         ],
         "title": "BuilderTurnRequest",
+        "type": "object"
+      },
+      "BulkRejectRequest": {
+        "description": "Reject every ``pending`` id in ``item_ids``. Issue #1957.\n\nDeliberately narrower than ``BulkUpdateRequest``: no ``updates`` dict and\nno action choice \u2014 this is a bulk REJECT only, never a generic bulk\nstatus setter. See ``admin_bulk_reject`` for why there is no bulk-approve\ncounterpart.",
+        "properties": {
+          "item_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "item_ids"
+        ],
+        "title": "BulkRejectRequest",
         "type": "object"
       },
       "BulkUpdateRequest": {
@@ -4414,6 +4494,18 @@
             ],
             "description": "Files of one delta page pipelined at once for this run (1 = sequential).",
             "title": "Concurrency"
+          },
+          "resync": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested.",
+            "title": "Resync"
           },
           "timeout_s": {
             "anyOf": [
@@ -9859,7 +9951,7 @@
         "type": "object"
       },
       "SessionFilePreview": {
-        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
+        "description": "What to show for one session file, and how \u2014 the modal's single fetch.\n\n``kind`` is the client's only switch, exactly as on the Library's sibling\nendpoint (``GET /api/collections/{id}/files/{fid}/preview``):\n\n* ``image`` / ``pdf`` \u2014 fetch ``raw_url``, let the browser draw it.\n* ``slides`` \u2014 ``slides`` holds the deck's text, slide by slide.\n* ``sheets`` \u2014 ``sheets`` holds the workbook's cells, sheet by sheet.\n* ``text`` \u2014 ``text`` holds it; ``truncated`` says a glance is all this is.\n* ``none`` \u2014 ``reason`` says why, in the words the modal shows.",
         "properties": {
           "file_type": {
             "anyOf": [
@@ -9905,6 +9997,20 @@
               }
             ],
             "title": "Reason"
+          },
+          "sheets": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/SheetPreview"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sheets"
           },
           "size_bytes": {
             "anyOf": [
@@ -10159,6 +10265,36 @@
           "is_everyone"
         ],
         "title": "ShareTargetResponse",
+        "type": "object"
+      },
+      "SheetPreview": {
+        "description": "One worksheet of an ``.xlsx`` preview \u2014 see ``src/office_preview.Sheet``.\n\n``rows`` is rectangular (every row padded to the widest), so the client\nrenders a grid without re-deriving the column count. ``truncated`` is per\nsheet: one small tab can sit beside a 50 000-row export in the same\nworkbook, and a modal-wide \"showing the first rows\" would be wrong about\nthe small one.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "rows": {
+            "default": [],
+            "items": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SheetPreview",
         "type": "object"
       },
       "SkillEntry": {
@@ -11535,6 +11671,49 @@
           }
         },
         "title": "UpdateAgentRequest",
+        "type": "object"
+      },
+      "UpdateCollectionRequest": {
+        "description": "The editable metadata of a collection \u2014 every field optional.\n\nPRESENCE is the signal, not the value: ``{\"description\": null}`` clears\nthe description while a request that omits ``description`` leaves it\nalone. The handler reads ``model_fields_set`` for exactly that reason, so\ndo NOT give these fields non-None defaults \u2014 that would erase the\ndistinction the repository layer was built to keep.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "title": "UpdateCollectionRequest",
         "type": "object"
       },
       "UpdateConnectionBody": {
@@ -13477,7 +13656,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.94.0"
+    "version": "0.95.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -16849,6 +17028,102 @@
           }
         },
         "summary": "Admin User Detail Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/view-as": {
+      "post": {
+        "description": "Begin a read-only view-as session for ``user_id``.\n\nPOST-only and CSRF-gated (``web_csrf`` double-submit, the\n:func:`slack_bind_confirm` shape): a mode change reachable from a menu\nitem must not fire on ambient cookie auth alone \u2014 security playbook \u00a710,\nwhich this repo learned from a GET that bound an attacker's Slack identity\nto a victim's account.\n\n``Depends(require_admin)`` is the gate. It also makes the mode\nnon-nestable for free: while a view-as is active the caller is not an\nadmin (``app.auth.access.is_user_admin`` answers False for the narrowed\nsubject), so re-entering requires exiting first \u2014 and the read-only guard\nrefuses this very POST anyway.",
+        "operationId": "view_as_enter_admin_view_as_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_view_as_enter_admin_view_as_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View As Enter",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/view-as/exit": {
+      "post": {
+        "description": "End a read-only view-as session \u2014 clear the ticket cookie, nothing else.\n\nThe one path ``ViewAsReadOnlyMiddleware`` lets through as a non-GET while\nthe mode is active, so it is deliberately the smallest handler in the\nfile: it reads no target, writes no state, and touches exactly one cookie.\n\nIt mounts **no auth dependency**, and that is the point rather than an\noversight. ``get_current_user`` resolves to the TARGET while the mode is\non, so ``require_admin`` would 403 the very person trying to leave and\n``get_optional_user`` would hand back an identity that is not the actor's.\nThe caller is instead identified by the HttpOnly, server-signed ticket\nitself, and the action is gated by the same ``web_csrf`` double-submit\ntoken as every other state-changing web POST \u2014 a cross-site page can read\nneither.",
+        "operationId": "view_as_exit_admin_view_as_exit_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_view_as_exit_admin_view_as_exit_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View As Exit",
         "tags": [
           "web"
         ]
@@ -31627,72 +31902,9 @@
         ]
       }
     },
-    "/api/admin/sharepoint/connections/{connection_id}/corpus-map": {
-      "get": {
-        "description": "Scope\u2192collection routing map (spec \u00a713.2 / item 3). Keys are in the\ncrawl resolver's OWN shape \u2014 ``\"<site display name>\"`` or\n``\"<site display name>/<drive-relative folder path>\"`` \u2014 built by the\nshared translation in ``connectors/sharepoint/corpus_map.py``, so this\nendpoint and anything else reasoning about scope routing cannot drift.\nThe earlier flat ``{source_scope_id: collection_id}`` shape was\nunusable for routing: the resolver matches keys against crawler rows'\nsite/path components, which a Graph scope id never equals.\n\nEvery ACTIVE permission zone (2026-08-31 plan, Task 3/7 \u2014\n``connectors/sharepoint/acl_sync.py``'s ``config[\"acl_zones\"]``) folds in\nas an ADDITIONAL, NESTED key under its parent scope's own key (a zone's\n``display_path`` always extends its parent's) \u2014 see\n``connectors/sharepoint/corpus_map.py``'s module docstring for why the\nproducer's resolver MUST match these longest-prefix-first, and why a\nresolver that gets that wrong still fails closed rather than leaking\nzone content (the ingest gate, 2026-08-31 plan, Task 5). A DISSOLVED\nzone is never mapped \u2014 its content re-homes to the parent scope.\n\n``409 corpus_map_ambiguous`` when the confirmed scopes/zones cannot form\nan unambiguous map (e.g. a site scope plus a drive scope of the same\nsite) \u2014 never a best-guess map.\n\nDeliberately does NOT carry ``anonymize`` \u2014 a caller that needs to know\nWHICH scopes to anonymize reads ``GET .../scopes`` instead (each row\nalready carries ``anonymize``); the built-in crawl reads the same flag\noff the scope rows directly.",
-        "operationId": "corpus_map_api_admin_sharepoint_connections__connection_id__corpus_map_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "connection_id",
-            "required": true,
-            "schema": {
-              "title": "Connection Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Corpus Map",
-        "tags": [
-          "admin"
-        ]
-      }
-    },
     "/api/admin/sharepoint/connections/{connection_id}/extract": {
       "post": {
-        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested: see ``connectors.sharepoint.crawler._apply_resync``.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
         "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
         "parameters": [
           {
@@ -31910,7 +32122,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": {
       "get": {
-        "description": "A3 \u2014 one run's stored report, usage and capped skip list.\n\nThe skip list carries ``listed`` alongside ``total``: only oversize\nskips keep a path, so a run that refused 27 documents and can name 20 of\nthem says exactly that instead of implying the list is the whole story.",
+        "description": "A3 \u2014 one run's stored report, usage and capped skip list.\n\nThe skip list carries ``listed`` alongside ``total``: only oversize\nskips keep a path, so a run that refused 27 documents and can name 20 of\nthem says exactly that instead of implying the list is the whole story.\n\nThe per-file error detail (download/convert/ingest failures \u2014 a path, a\nreason, an upstream status code when known, and a message) lives at\n``report.errors_detail``, same ``{items, total, listed, truncated}``\nenvelope. It rides inside ``report`` rather than getting its own\ntop-level key or column because it is exactly as itemizable as the rest\nof a run's numbers, never a separate concern \u2014 the source card's\nerror-count line fetches this endpoint on first expand to render it.",
         "operationId": "extraction_run_detail_api_admin_sharepoint_connections__connection_id__extraction_runs__run_id__get",
         "parameters": [
           {
@@ -32043,6 +32255,207 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/stop": {
+      "post": {
+        "description": "Cooperative stop (owner-frustration fix, 2026-09-01: \"je to stra\u0161n\u00fd\nblackbox, nevid\u00edm co se d\u011bje v extrakci a nem\u016f\u017eu j\u00ed stopnout\" \u2014 \"it's a\ntotal black box, I can't see what's happening in the extraction and I\ncan't stop it\").\n\nSets ``config.extraction.stop_requested_at`` on the connection row\n(:func:`connectors.sharepoint.crawler.request_stop`) \u2014 the SAME JSON\ncolumn the extraction dispatch bookkeeping already lives in, carried\nforward on every generic connection edit\n(``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``). The crawl polls it at the\nsame quiescent points its own timeout already checks (between delta\npages always, between files every 10 completed items) and raises\n``CrawlStopped`` there, which records the run exactly like a timeout \u2014\n``interrupted_reason: \"stopped\"``, resumable, state saved.\n\nWorks on BOTH app-state backends: unlike every other route in this\nmodule, this one touches no ``extraction_runs`` row, so it is never\ngated behind the A3 Postgres-only ratchet \u2014 a DuckDB-backed instance can\nrequest a stop exactly as a Postgres-backed one can.\n\nAlways ``202`` once the connection exists, whether or not a run is\nvisibly active: a stop requested with nothing running simply waits on\nthe connection row until the next run starts, at which point it is\nconsumed (or, if unconsumed, cleared) \u2014 see ``note`` in the response\nwhen this instance can tell no run is currently active. ``404`` for an\nunknown or non-SharePoint connection. Deliberately NOT gated on\n``sharepoint.enabled`` \u2014 this module's whole surface reads/writes\nobservability state rather than running a crawl, the same posture its\nGET siblings already take (an admin can still see run history after\ndisabling the connector; they can equally still stop a run already in\nflight from before it was disabled).",
+        "operationId": "request_extraction_stop_api_admin_sharepoint_connections__connection_id__extraction_stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Extraction Stop",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/manual-sites": {
+      "delete": {
+        "description": "Forget one site previously added by URL (see :func:`add_manual_site`).\nPurely local bookkeeping \u2014 unlike a confirmed scope, a manual site owns\nno collection and no grants, so there is nothing else to reconcile.",
+        "operationId": "remove_manual_site_api_admin_sharepoint_connections__connection_id__manual_sites_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "title": "Site Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Manual Site",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Resolve a site by URL AND persist it on the connection (2026-09-01 bug\nreport): ``GET .../tree?site_url=`` (the ``Sites.Selected`` escape hatch\ndocumented on :func:`browse_tree`) only ever RESOLVED a site \u2014 the result\nlived in the wizard's own client-side ``spManualSites`` and was reset\nevery time the wizard opened, forcing the admin to re-paste the same URL\non every visit. This route reuses the exact same validation\n(:func:`_parse_site_url`) and resolution (``get_site_by_path``) as that\nquery param, then stores the result on ``config.manual_sites`` \u2014 a plain\nlist of ``{id, name, web_url}`` rows, the same normalized shape\n``get_site_by_path`` already returns \u2014 so a reopen (or a page reload) can\nread it straight back from the connection listing instead of losing it.\n\nIdempotent on the resolved site id: adding the same site twice (the same\nURL, or two URLs that resolve to the same site) replaces its row in\nplace rather than appending a duplicate \u2014 the same \"storage anchor is\nthe id, not what the admin typed\" principle the confirmed-scope\ncollections use (module docstring).",
+        "operationId": "add_manual_site_api_admin_sharepoint_connections__connection_id__manual_sites_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddManualSiteBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Manual Site",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/scopes": {
       "delete": {
         "description": "Unselect a scope \u2014 an explicit exclusion (spec \u00a713.2: \"unselected rows\nare explicit exclusions\"). Removes the wizard's own bookkeeping row; what\nhappens to the scope's collection depends on whether it holds data:\n\n* **Empty (0 files)** \u2014 soft-deleted. Deleting a collection stays a\n  separate, deliberate operation where DATA is at stake, but an empty\n  scope collection has none, and keeping it is exactly what bred\n  orphaned 0-file collections (observed live 2026-08-31). The response\n  says ``collection_kept: false``.\n* **Has files** \u2014 kept, and the response says so (``collection_kept:\n  true`` + the collection ref) so the wizard can tell the admin where to\n  delete it deliberately (the Library).\n\nEither way a tombstone (``config.retired_scope_collections``, keyed by\n``source_scope_id``) records which collection this scope owned, so a\nlater re-tick of the same folder re-adopts it \u2014 restoring the\nauto-deleted empty one, re-attaching to the kept one \u2014 instead of\nminting a slug-suffixed duplicate (see\n:func:`_readopted_scope_collection_id`).\n\nIts ``sharepoint-acl-sync``-owned (sentinel-assigned) grants on that\ncollection do NOT survive, though (2026-08-31 plan, Task 8): with the\nscope row gone, the sync never reconciles that collection again, so a\nsentinel-owned grant left behind would dangle forever \u2014 indistinguishable\nfrom a deliberate, still-maintained grant to anyone reading ``/admin/\naccess``. Same removal loop :func:`confirm_scope` uses for its own\n``mirrored`` -> ``manual`` transition; an admin-assigned grant on the\nsame collection is untouched either way (on the kept collection it keeps\nworking; on the soft-deleted one it resurrects with it on re-tick, so\nthe share state round-trips the untick like everything else).",
@@ -32117,7 +32530,7 @@
         ]
       },
       "get": {
-        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants, plus this\nconnection's permission zones (2026-08-31 plan, Task 3/8 \u2014 ``\"zones\"``,\nACTIVE and DISSOLVED alike so the wizard can show a zone's history\nrather than have it vanish the moment it dissolves; see :func:`_zone_out`\nfor the exact projection).\n\nAlso the corpus-extraction producer's own callback read (TCRD-...):\na ``ProducerPrincipal`` scoped to THIS connection may call this too\n(see ``require_admin_or_producer_connection``) \u2014 self-audited here\n(``sharepoint_connection.scopes_read``, ``client_kind=\"producer\"``)\nsince a restricted principal's identity is never stashed onto\n``request.state.user``, so the generic audit-fallback middleware would\notherwise see no attributable caller and write nothing at all.",
+        "description": "The wizard's step-2/3 source of truth: every confirmed scope row,\nenriched with its collection and current group grants, plus this\nconnection's permission zones (2026-08-31 plan, Task 3/8 \u2014 ``\"zones\"``,\nACTIVE and DISSOLVED alike so the wizard can show a zone's history\nrather than have it vanish the moment it dissolves; see :func:`_zone_out`\nfor the exact projection).",
         "operationId": "list_scopes_api_admin_sharepoint_connections__connection_id__scopes_get",
         "parameters": [
           {
@@ -36357,7 +36770,7 @@
     },
     "/api/admin/users/{user_id}/library-preview": {
       "get": {
-        "description": "What the person's Library actually shows \u2014 the RESULT, where\n/effective-access is the why.\n\nComputed by ``StackResolver.browse``, the same grants-based projection\nthe /library page renders the target's shared bands from \u2014 deliberately\nNOT ``browse_admin`` and NOT a re-derivation from the grant rows, so\nthis preview cannot drift from the page it claims to predict (the\nLibrary's contract is no admin god-mode, and that applies to a preview\nOF a person just as it does to the person themselves). Covers the two\ngoverned kinds the resolver serves to the Library (data packages,\nmemory domains); the other granted kinds keep their per-type fold in\nthe Simulate chain.",
+        "description": "What the person's Library actually shows \u2014 the RESULT, where\n/effective-access is the why.\n\nEvery section is computed by the SAME projection the /library page\nrenders that person's shared bands from \u2014 ``StackResolver.browse`` for\nthe two governed kinds, ``app.services.library_grants`` for the two the\nresolver does not serve. Deliberately NOT ``browse_admin``, and never a\nprivate re-derivation from the grant rows, so this preview cannot drift\nfrom the page it claims to predict (the Library's contract is no admin\ngod-mode, and that applies to a preview OF a person just as it does to\nthe person themselves).\n\nCovers every GRANTED kind the Library lists: data packages, curated\nmarketplace plugins, recipes, memory domains \u2014 in the Library's own\nreading order, so the panel looks like the page. It used to iterate the\ntwo governed kinds alone, which meant \"I can see it in admin but they\ncannot see it in their Library\" got a real answer about a data package\nand silence about a plugin.\n\nDeliberately NOT here: what the person INSTALLED for themselves from the\ncommunity store, and anything they authored. Those are theirs, not an\nadmin's grant, and this lens answers what the grants do.",
         "operationId": "user_library_preview_api_admin_users__user_id__library_preview_get",
         "parameters": [
           {
@@ -38674,7 +39087,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/preview": {
       "get": {
-        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``) is previewed as its own words, read straight out of the OOXML\narchive by ``src/office_preview`` \u2014 no optional extra, no conversion\nservice. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
+        "description": "What to show for one session file, and how.\n\nThe point of this endpoint is the deliverable a browser cannot draw. A\n``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a\n``.docx``, and an ``.xlsx``) is previewed as its own content, read\nstraight out of the OOXML archive by ``src/office_preview`` \u2014 no optional\nextra, no conversion service. Images and PDFs point at the sibling ``\u2026/raw`` viewer; textual\nfiles carry their own first ``_PREVIEW_MAX_CHARS``; everything else\nreports ``kind=\"none\"`` with the sentence the modal shows.\n\nDeliberately one endpoint for every format, mirroring the Library's\n``\u2026/files/{id}/preview``: the client must not have to know which\nextensions are safe to stream inline \u2014 that list is a security boundary\nand it lives on this side.",
         "operationId": "preview_session_file_api_chat_sessions__chat_id__files_preview_get",
         "parameters": [
           {
@@ -40009,6 +40422,77 @@
         "tags": [
           "collections"
         ]
+      },
+      "patch": {
+        "description": "Rename a collection or change its description/slug (owner or admin).\n\nThe gate is deliberately OWNER-OR-ADMIN rather than\n``require_collection_access``: a group grant conveys READ access, and a\ngrantee renaming somebody else's collection out from under them is not a\nread. Same predicate as ``delete_collection`` below, so the two\nowner-level actions on a collection agree about who may take them.\n\nPresence-based, per field: a field the request omits is untouched, and\n``description: null`` clears it. Editing NOTHING is a 400 rather than a\nsilent 200 \u2014 a client that meant to change something and named no known\nfield has a bug, and answering \"fine\" hides it.\n\n``slug`` is normalised the same way ``create_collection`` normalises it,\nso a patched slug always resolves via ``/library/{slug}``; a collision on\nthe unique index returns **409**. Renaming does NOT move the slug on its\nown: the slug is this collection's URL, and silently re-deriving it from\nthe new name would break every link and bookmark already pointing here.\nCallers that want the URL to follow the name pass both.\n\nA **source-managed** collection (fed by a connection's confirmed scope)\nis refused with the same typed **409** the upload path uses: its name is\nderived from the source scope, so a rename here would be silently\nreverted by the next sync \u2014 the \"a scheduled sync must not revert a\ndownstream edit\" rule the semantic layer states as ``409 source_owned``.",
+        "operationId": "update_collection_api_collections__collection_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "collection_id",
+            "required": true,
+            "schema": {
+              "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Collection",
+        "tags": [
+          "collections"
+        ]
       }
     },
     "/api/collections/{collection_id}/files": {
@@ -40074,7 +40558,7 @@
         ]
       },
       "post": {
-        "description": "Upload one or more files into a collection.\n\nAlso the corpus-extraction producer's own upload callback (TCRD-...):\na ``ProducerPrincipal`` scoped to THIS collection may call this too\n(see ``require_collection_write_or_producer_access``) \u2014 every OTHER\ncollection route (read/delete/reingest/preview/raw) keeps\n``require_collection_access`` unchanged and still 403s that same\nprincipal.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, its row is\nupdated IN PLACE (id preserved) \u2014 chunks/derived tables purged and\n``processing_status`` reset only when the content actually changed;\nunchanged content against an ``indexed`` row just refreshes filename/path\n(a rename/move) and skips re-chunking entirely. Unchanged content against\na row whose ingest never completed (``rejected``, ``needs_review``, or\n``pending``) is treated as a **retry**: the row resets to ``pending`` and\ningestion is re-scheduled, so re-uploading the same bytes after fixing\nthe cause works without a separate ``\u2026/reingest`` call. Files without a\n``path`` keep the legacy plain-insert behavior. The update runs only\nafter the replacement blob is safely stored, so a failed re-upload never\ndestroys the existing file. When ``paths`` is supplied it MUST have\nexactly one entry per file (positional pairing), else the request is\nrejected with **400** \u2014 a short/misaligned list would silently assign\npaths to the wrong files; two files sharing a non-blank ``path`` in one\nbatch are likewise rejected (**400** ``duplicate_path_in_batch``). The\n``(corpus_id, path)`` invariant is also enforced by a unique index.\n\n**Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+\noptional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,\neach paired positionally with ``files`` exactly like ``paths``) lets a\ndoc-sync client supply the producer's own delta key (e.g.\n``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``\nis tried FIRST, before the ``path`` match \u2014 and, like a path match, ANY\nmatch preserves the row's id, including a manual (no-``source_stable_ids``)\npath re-upload of a file a crawler previously anchored, so a hand upload\ncan no longer cascade a document's derived data away. Two files sharing a\nnon-blank ``source_stable_id`` in one batch are rejected with **400**\n``duplicate_source_stable_id_in_batch`` \u2014 the second would otherwise\noverwrite the first's row in place and silently drop its bytes \u2014 and a\nread-only pre-flight resolves every file's target row before anything is\nstored to catch the two collisions that cross the two key spaces: two\nfiles landing on the SAME existing row through different anchors (**400**\n``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is\nalready held by another row, which would otherwise violate the\n``(corpus_id, path)`` unique index and 500 mid-batch (**409**\n``path_owned_by_another_file``). The mapping table\nis Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed\ninstance answers **501** before any file is touched; omitting the field\nkeeps this endpoint byte-identical to the plain ``paths`` behavior above.\n``document_dates`` is accepted and pairing-validated for forward\ncompatibility with the doc-sync wire format but is not yet persisted\nhere \u2014 it belongs to a claim, written by the (future) fact-ingest API.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026,\nclaims_purged}`` for every uploaded file (in upload order).\n``claims_purged`` (spec \u00a78 coupled bug) is the count of fact-graph claims\ndropped for THIS file because its content changed in place (\u00a76) \u2014 0 for\na brand-new file, an unchanged-content resync/rename, or when the\n``facts`` feature flag is off. A producer that ingested claims for this\nfile should treat a non-zero count as \"re-ingest is needed\", not\n\"already shipped\" \u2014 the purge and the producer's own idempotence\notherwise disagree silently (live-verified: a rename recomputing a\nprovenance header purged claims that were never re-sent).",
+        "description": "Upload one or more files into a collection.\n\nEach file passes through the extension allowlist:\n\n* **tier1** (txt, pdf, docx, \u2026) \u2192 content-addressed write +\n  ``processing_status='pending'``.\n* **tier2** (png, jpg, tiff, \u2026) \u2192 same write + ``'pending'``\n  (vision/OCR ingestion deferred to Slice 5).\n* **bundle** (zip) \u2192 same write + ``'pending'``; the background task\n  unpacks it and ingests every supported member as its own child row\n  (``parent_file_id`` \u2192 the archive row).\n* **unsupported** (.dwg, .exe, \u2026) \u2192 stored raw +\n  ``processing_status='rejected'`` with ``processing_detail`` describing\n  the reason. The *whole response* returns **422** when any file is\n  rejected (all results are still returned so the caller sees which\n  files succeeded and which were rejected).\n\n**Upsert:** an optional ``paths`` form field (repeated, paired positionally\nwith ``files``) gives each file a caller-supplied logical identity. When a\nfile with the same ``(collection_id, path)`` already exists, its row is\nupdated IN PLACE (id preserved) \u2014 chunks/derived tables purged and\n``processing_status`` reset only when the content actually changed;\nunchanged content against an ``indexed`` row just refreshes filename/path\n(a rename/move) and skips re-chunking entirely. Unchanged content against\na row whose ingest never completed (``rejected``, ``needs_review``, or\n``pending``) is treated as a **retry**: the row resets to ``pending`` and\ningestion is re-scheduled, so re-uploading the same bytes after fixing\nthe cause works without a separate ``\u2026/reingest`` call. Files without a\n``path`` keep the legacy plain-insert behavior. The update runs only\nafter the replacement blob is safely stored, so a failed re-upload never\ndestroys the existing file. When ``paths`` is supplied it MUST have\nexactly one entry per file (positional pairing), else the request is\nrejected with **400** \u2014 a short/misaligned list would silently assign\npaths to the wrong files; two files sharing a non-blank ``path`` in one\nbatch are likewise rejected (**400** ``duplicate_path_in_batch``). The\n``(corpus_id, path)`` invariant is also enforced by a unique index.\n\n**Source-anchored upsert (crawler sync):** ``source_stable_ids`` (+\noptional ``source_doc_ids``, ``source_sha256s``, ``document_dates``,\neach paired positionally with ``files`` exactly like ``paths``) lets a\ndoc-sync client supply the producer's own delta key (e.g.\n``graph:<driveItem-id>``). A match on ``(collection_id, source_stable_id)``\nis tried FIRST, before the ``path`` match \u2014 and, like a path match, ANY\nmatch preserves the row's id, including a manual (no-``source_stable_ids``)\npath re-upload of a file a crawler previously anchored, so a hand upload\ncan no longer cascade a document's derived data away. Two files sharing a\nnon-blank ``source_stable_id`` in one batch are rejected with **400**\n``duplicate_source_stable_id_in_batch`` \u2014 the second would otherwise\noverwrite the first's row in place and silently drop its bytes \u2014 and a\nread-only pre-flight resolves every file's target row before anything is\nstored to catch the two collisions that cross the two key spaces: two\nfiles landing on the SAME existing row through different anchors (**400**\n``duplicate_target_row_in_batch``) and a stable-id match whose ``path`` is\nalready held by another row, which would otherwise violate the\n``(corpus_id, path)`` unique index and 500 mid-batch (**409**\n``path_owned_by_another_file``). The mapping table\nis Postgres-only: supplying ``source_stable_ids`` on a DuckDB-backed\ninstance answers **501** before any file is touched; omitting the field\nkeeps this endpoint byte-identical to the plain ``paths`` behavior above.\n``document_dates`` is accepted and pairing-validated for forward\ncompatibility with the doc-sync wire format but is not yet persisted\nhere \u2014 it belongs to a claim, written by the (future) fact-ingest API.\n\nReturns a list of ``{file_id, filename, path, processing_status, \u2026,\nclaims_purged}`` for every uploaded file (in upload order).\n``claims_purged`` (spec \u00a78 coupled bug) is the count of fact-graph claims\ndropped for THIS file because its content changed in place (\u00a76) \u2014 0 for\na brand-new file, an unchanged-content resync/rename, or when the\n``facts`` feature flag is off. A producer that ingested claims for this\nfile should treat a non-zero count as \"re-ingest is needed\", not\n\"already shipped\" \u2014 the purge and the producer's own idempotence\notherwise disagree silently (live-verified: a rename recomputing a\nprovenance header purged claims that were never re-sent).",
         "operationId": "upload_files_api_collections__collection_id__files_post",
         "parameters": [
           {
@@ -42025,7 +42509,7 @@
     },
     "/api/facts/corrections": {
       "get": {
-        "description": "The producer export (spec \u00a77.4): every ``wrong`` subject with its\n``natural_keys`` snapshot, so a producer's re-extraction pass can prune\nthem before re-asserting claims. Server-side, corrections are ALSO\nenforced at read time regardless (\u00a74) \u2014 a producer that ignores this\nexport cannot resurrect a withheld fact, this just saves it the wasted\nwork. Scheduler token, admin PAT, or a corpus-extraction\n``ProducerPrincipal`` (``app.auth.producer_token``).\n\nNOT filtered to the caller's own ``collection_ids`` \u2014 a ``corrections``\nrow is keyed on ``(subject_kind, subject_id)`` with only a\n``natural_keys`` snapshot (spec \u00a73: it must survive the subject itself\nbeing deleted and re-created), so there is no cheap, always-correct way\nto join it back to a collection: the fact/edge it corrected may no\nlonger exist at all, and even when it does, \"which collection\" is a\nproperty of its CLAIMS' evidence, not of the correction row. A producer\nscoped to two of an instance's five collections therefore currently\nsees every withheld subject, instance-wide, exactly like an admin does\n\u2014 TODO(TCRD-...): revisit if/when corrections gain a cheap collection\njoin, rather than shipping a filter that would silently return the\nwrong subset today.",
+        "description": "The corrections export (spec \u00a77.4): every ``wrong`` subject with its\n``natural_keys`` snapshot, so a re-extraction pass can prune them\nbefore re-asserting claims. Server-side, corrections are ALSO enforced\nat read time regardless (\u00a74) \u2014 an extraction pass that ignores this\nexport cannot resurrect a withheld fact, this just saves it the wasted\nwork. Scheduler token or admin PAT.\n\nNOT filtered to the caller's own ``collection_ids`` \u2014 a ``corrections``\nrow is keyed on ``(subject_kind, subject_id)`` with only a\n``natural_keys`` snapshot (spec \u00a73: it must survive the subject itself\nbeing deleted and re-created), so there is no cheap, always-correct way\nto join it back to a collection: the fact/edge it corrected may no\nlonger exist at all, and even when it does, \"which collection\" is a\nproperty of its CLAIMS' evidence, not of the correction row. A producer\nscoped to two of an instance's five collections therefore currently\nsees every withheld subject, instance-wide, exactly like an admin does\n\u2014 TODO(TCRD-...): revisit if/when corrections gain a cheap collection\njoin, rather than shipping a filter that would silently return the\nwrong subset today.",
         "operationId": "list_corrections_api_facts_corrections_get",
         "parameters": [
           {
@@ -42323,7 +42807,7 @@
     },
     "/api/facts/ingest": {
       "post": {
-        "description": "Ingest one producer batch (spec \u00a77.2) \u2014 scheduler token, admin PAT,\nor a corpus-extraction producer credential (``ProducerPrincipal``, see\n``app.auth.producer_token``) scoped to a set of collections.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\n``llm_usage`` (optional, see :class:`FactsIngestLlmUsage`) rides along\nthe SAME way \u2014 into the persisted run report only, never the returned\nreport, and never part of the ingest fingerprint/idempotency logic. It\nis honest, ongoing cost VISIBILITY for what this run of the extraction\npipeline itself cost (tokens, prompt-cache, wall time) \u2014 never\nindependently verified, exactly like ``anonymization``'s self-reported\ntally. ``GET /api/facts/ingest-runs`` echoes it per-run and also\nreturns a ``llm_usage_totals`` cumulative rollup across every run this\ninstance has ever persisted.\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n\nProducer scope gate: a ``ProducerPrincipal`` caller additionally has\nevery ``documents[]`` row's ``corpus_id`` checked against its own\n``collection_ids`` claim \u2014 any row naming a corpus outside that set is\nREJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,\nitemizing the offending corpus ids), an authorization boundary\nindependent of the ``ambiguous_cross_collection_doc_id`` data-integrity\nrule above \u2014 AND, because the repository's doc_id ladder falls back to\nan unrestricted instance-wide scan exactly when ``documents[]`` declared\nno corpus at all, a producer batch that references any doc_id (node/edge\nevidence, or ``full_documents``' replace-mode delete list) without\ndeclaring one is refused whole (``403``\n``producer_batch_declares_no_corpus``). See\n:func:`_refuse_producer_out_of_scope_documents`. A human admin (or the\nscheduler token) has no such claim, keeps the documented\ndocuments-omitted replay flow, and is unaffected by either half.\n``evidence[].audience`` (Task 10, spec \u00a74.2) is format-validated FIRST,\nbefore either gate below \u2014 see :func:`_validate_evidence_audience`.\n\nA fourth gate (2026-08-31 plan, Task 5) refuses any ``documents[]`` row\nwhose ``path``/``stable_id`` falls under a SharePoint connection's\nexcluded subtree/file or another collection's active permission zone \u2014\nserver-side MUST NOT enforcement independent of whether the producer\nhonored the crawl-time exclusion list. See\n:func:`_refuse_source_acl_excluded_documents`.",
+        "description": "Ingest one facts batch (spec \u00a77.2) \u2014 scheduler token or admin PAT.\n\nBatch caps (\u2264500 documents, \u22645000 claims/request) 413; a single\ndocument's evidence alone exceeding the claim cap is a distinct 422\nprotocol error (never split across requests, per \u00a77.2). ``documents``\nmay be omitted only when every evidence ``doc_id`` already resolves\nthrough a prior upload's ``corpus_file_sources`` mapping \u2014 otherwise\n400 with the unresolved ids itemized. A byte-identical copy (TCRD-241)\ncan anchor more than one ``corpus_file_sources`` row for the same\n``doc_id``; resolution is corpus-scoped and deterministic (indexed\ncopies preferred, ``corpus_file_id`` as tiebreak) \u2014 never an arbitrary\ncross-collection pick, since that would mis-scope a claim's visibility.\nWhen this batch's ``documents[]`` declared at least one collection but a\ncited ``doc_id`` is anchored only in some OTHER, undeclared collection,\nthat claim is REJECTED (``ambiguous_cross_collection_doc_id``, itemized\nin ``claims_rejected`` like any other reason) rather than written under\na collection wider than the producer's batch ever declared (RBAC\nreview, PR #1736) \u2014 nothing is ever silently attached cross-collection.\nAn entirely `documents[]`-omitted batch (the \"already resolves\" replay\nabove) has no batch-declared scope to escape and is unaffected.\nEverything else \u2014 the verbatim gate, deferred-vs-rejected, union vs\n`full_documents` replace, alias/edge resolution, correction\nre-attachment, the post-ingest orphan sweep \u2014 happens in\n:meth:`FactsPgRepository.ingest_batch`; this\nhandler only translates its typed exceptions to HTTP status codes.\nResponse IS the run report: ``{claims_written,\nclaims_accepted_via_identity, claims_rejected: [{row, reason}],\nsource_urls_rejected: [{doc_id, reason}], deferred: [...],\nsubjects_created, subjects_deleted, corrections_active: [...],\nreview_items: [...]}``.\n\n``claims_accepted_via_identity`` (spec \u00a78) is the subset of\n``claims_written`` whose quote passed the verbatim gate ONLY via the\ndocument's own SERVER-STORED ``filename``/``path`` \u2014 never a chunk of\nits extracted text \u2014 so an operator can see how much evidence is\nfilename-grounded rather than content-grounded.\n\n``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``\nthe validator dropped as invalid (``too_long`` / ``unparseable`` /\n``not_https`` / ``no_host``) \u2014 the claim itself still wrote, only its\ncitation link is missing; a producer that never sends ``source_url`` is\nnot itemized here at all, only one that sends a value Agnes refuses.\n\nA copy of that same report is ALSO persisted to ``facts_ingest_runs``\n(``GET /api/facts/ingest-runs``, the source card's pipeline strip and\nerror badges \u2014 spec \u00a713.2) \u2014 deliberately AFTER\n:meth:`FactsPgRepository.ingest_batch` has already committed and OUTSIDE\nits transaction: a run-report write is a side record, never a condition\nof the ingest succeeding, so a failure there is logged and swallowed,\nnever surfaced as a 5xx for a batch that in fact wrote its claims fine.\n\n``anonymization`` (spec \u00a79.2, optional) rides along INTO that persisted\nrun report only \u2014 never into the returned report above, and never\njoined against real corpus ids (a corpus id the batch's own\n``documents`` never mention is kept, not rejected: this is the\nproducer's self-reported tally of what it anonymized, not something\nAgnes independently verifies \u2014 see ``docs/anonymization.md``).\n\n``llm_usage`` (optional, see :class:`FactsIngestLlmUsage`) rides along\nthe SAME way \u2014 into the persisted run report only, never the returned\nreport, and never part of the ingest fingerprint/idempotency logic. It\nis honest, ongoing cost VISIBILITY for what this run of the extraction\npipeline itself cost (tokens, prompt-cache, wall time) \u2014 never\nindependently verified, exactly like ``anonymization``'s self-reported\ntally. ``GET /api/facts/ingest-runs`` echoes it per-run and also\nreturns a ``llm_usage_totals`` cumulative rollup across every run this\ninstance has ever persisted.\n\nAnonymize-fail-closed hardening: BEFORE any of the above runs, a batch\nthat documents a corpus whose SharePoint connect-wizard scope is\nanonymize-marked (``config.scopes[].anonymize``) is REFUSED \u2014 whole\nbatch, nothing written \u2014 unless THIS batch's own ``anonymization``\nblock declares that corpus (``403`` ``anonymization_not_declared``,\nitemizing the offending corpus ids). This is the enforcement point for\nthe guarantee the connect wizard's checkbox only ever *requested*:\nAgnes still cannot verify a document's CONTENT was anonymized (see\n``docs/anonymization.md``), but it now refuses to accept a claim for an\nanonymize-marked corpus with no declaration at all, regardless of\nwhether the connection's ``config.scopes`` survived an unrelated edit,\nthe per-instance HMAC key is configured, or the producer remembered the\nblock. A lookup failure while answering \"is this corpus marked\" is\nitself refused (``503`` ``anonymization_check_unavailable``) rather\nthan treated as \"nothing is marked\" \u2014 see\n:func:`_refuse_undeclared_anonymize_marked_corpora`.\n``evidence[].audience`` (Task 10, spec \u00a74.2) is format-validated FIRST,\nbefore either gate \u2014 see :func:`_validate_evidence_audience`.\n\nA fourth gate (2026-08-31 plan, Task 5) refuses any ``documents[]`` row\nwhose ``path``/``stable_id`` falls under a SharePoint connection's\nexcluded subtree/file or another collection's active permission zone \u2014\nserver-side MUST NOT enforcement independent of whether the producer\nhonored the crawl-time exclusion list. See\n:func:`_refuse_source_acl_excluded_documents`.",
         "operationId": "facts_ingest_api_facts_ingest_post",
         "parameters": [
           {
@@ -42391,7 +42875,7 @@
     },
     "/api/facts/ingest-runs": {
       "get": {
-        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.\n\n``llm_usage_totals`` is a CUMULATIVE rollup of every persisted run's\noptional ``llm_usage`` block (see :class:`FactsIngestLlmUsage`) \u2014\nsummed tokens/documents/wall time, the union of models seen, and a\nrough ``estimated_cost_usd`` (``None`` until at least one run can be\npriced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for\nwhy it is never a fabricated precise number). It covers EVERY run this\ninstance has ever persisted, not just the ``limit``-bounded ``runs``\nlist above, and is instance-wide rather than per-connection (same\ninterim limitation as ``distinct_corpus_ids``'s \"scope collections\"\nheuristic) \u2014 a per-connection split is a documented follow-up once a\nreal connection-to-collection mapping exists.",
+        "description": "Persisted run reports (spec \u00a77.2/\u00a713.2), newest first \u2014 what the\n``/admin/data-sources`` source card reads its pipeline-strip counts and\nper-category error badges from (``app/web/router.py``'s\n``_sharepoint_pipeline_cell``). ``facts_ingest_runs_repo()`` is PG-only\n(A3 ratchet); on a DuckDB-backed instance this raises\n``RequiresPostgresBackend``, translated to a typed ``501`` by the\napp-wide handler.\n\n``llm_usage_totals`` is a CUMULATIVE rollup of every persisted run's\noptional ``llm_usage`` block (see :class:`FactsIngestLlmUsage`) \u2014\nsummed tokens/documents/wall time, the union of models seen, and a\nrough ``estimated_cost_usd`` (``None`` until at least one run can be\npriced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for\nwhy it is never a fabricated precise number). It covers EVERY run this\ninstance has ever persisted, not just the ``limit``-bounded ``runs``\nlist above, and is instance-wide rather than per-connection \u2014 see that\nmethod's own docstring for why (an ingest run report carries no\nconnection id to split on, unlike ``_sharepoint_pipeline_cell``'s\ncrawl/extract/facts counts).",
         "operationId": "list_ingest_runs_api_facts_ingest_runs_get",
         "parameters": [
           {
@@ -47815,6 +48299,70 @@
           }
         },
         "summary": "Admin Batch",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/api/memory/admin/bulk-reject": {
+      "post": {
+        "description": "Reject every ``pending`` id in ``item_ids`` \u2014 the bulk counterpart to\n``POST /admin/reject`` (issue #1957: the review queue otherwise forces an\nadmin to reject harvested candidates one at a time).\n\n``bulk-update`` above excludes ``status`` from its allowlist because a\nbulk status flip would bypass the dedicated governance endpoints and\ntheir per-item audit rows (PR #126 review) \u2014 that objection was about\nAUDIT, not about bulkness. This endpoint resolves it by looping the exact\nsingle-item governance path instead of a generic field setter: the same\nstatus transition (``repo.update_status(item_id, \"rejected\")``) and the\nsame ``corporate_memory.reject`` audit action per item that a one-by-one\nclick would write (``batch: True`` in the params distinguishes it from a\nsingle click, the same convention ``/admin/batch``'s reject action uses).\n\nOnly ``pending`` items are rejected. Anything else \u2014 already approved or\nrevoked, or an unknown id \u2014 is reported per-id and never raises, so one\nstale id in a large selection can't abort the rest. 200 even on partial\nfailure, mirroring ``admin_bulk_update``.\n\nDeliberately NO bulk-approve sibling. Approving in bulk injects items\ninto every analyst's ``.claude/rules/`` without a human reading each one\nfirst (issue #1957's own warning), so that capability stays single-item\n(``POST /admin/approve``) or on the audited-but-broader ``/admin/batch``\nsurface \u2014 this narrower, safety-focused endpoint adds no path to it.",
+        "operationId": "admin_bulk_reject_api_memory_admin_bulk_reject_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRejectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Bulk Reject",
         "tags": [
           "memory"
         ]

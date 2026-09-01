@@ -41,6 +41,17 @@ outlives its access token, meets 429/503, and gets killed mid-pass):
   — a crash costs re-work, never coverage. Re-ingesting an already-ingested
   item is a no-op: the ingest path matches on ``(collection, stable_id)``
   and an unchanged sha256 against an indexed row skips re-chunking.
+* **A per-item failure never advances past itself.** A page that finishes
+  cleanly still writes its deltaLink even when one of ITS rows failed to
+  download/convert/anonymize/ingest — that is correct, the alternative pins
+  the whole drive on one bad file. What is NOT correct is forgetting the
+  failure: Graph's delta feed only re-offers an item when it CHANGES, so an
+  item nobody touches again would otherwise never come back around. Every
+  such failure is recorded in the state file's ``failed_items`` and replayed
+  from there on every future run, independent of what delta reports, until
+  it either succeeds (the entry is cleared) or exhausts
+  :data:`_MAX_ITEM_RETRY_ATTEMPTS` (recorded as given-up — still visible in
+  the state file and the run report, never silently dropped).
 * **Oversize accounting.** A file over the size cap is skipped, counted, and
   its bytes reported — "we indexed the corpus" and "we indexed the small
   half of it" must never look the same in the report. Every other refusal
@@ -67,6 +78,10 @@ Security posture:
   drive-relative path and every file under that prefix is skipped.
   Fail-closed — a scope whose exclusion roots cannot be resolved is not
   crawled at all.
+* ``GraphTransport.download_to_temp`` follows a file download's 302 to its
+  pre-authenticated URL BY HAND, on a separate request that carries no
+  ``Authorization`` header — the bearer token must never reach the
+  non-Graph host that redirect points at. See its own docstring.
 """
 
 from __future__ import annotations
@@ -76,15 +91,19 @@ import functools
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import random
 import re
+import signal
+import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -145,8 +164,79 @@ _THROTTLE_BURST_429S = 2
 _THROTTLE_BURST_WAIT_S = 30.0
 #: Largest skipped files kept in the report.
 _OVERSIZE_SAMPLE = 20
-#: Delta page size asked of Graph — also the state-checkpoint granularity.
+#: Per-file errors kept ON THE STATS OBJECT while the crawl runs. Matches
+#: ``extraction_runs_pg._SKIPS_CAP`` (200) — the value the persisted row
+#: itself is capped to at ``finish()`` — so the in-memory sample and the
+#: stored one never disagree about how many are honestly kept.
+_ERROR_SAMPLE = 200
+#: Completed items kept in the live checkpoint's `activity.recent` list.
+_RECENT_ACTIVITY_SAMPLE = 5
+#: A conversion worker is recycled after converting this many documents,
+#: whichever slot it is. Insurance against a REAL, observed failure: crash
+#: isolation (`_ConvertProcessPool`) fixed "one bad file kills the worker",
+#: but a worker that never dies just keeps running — and markitdown/
+#: pypdfium2 hold onto memory per document, so its RSS climbs without
+#: bound over a large crawl. On a live deployment this reached ~8.4 GiB
+#: across 6 slots (~22 documents each) before the container's memory
+#: cgroup started SIGKILLing whichever child allocated next, INDISCRIMINATELY
+#: — including a `.url`, a `.json` and a one-page `.docx`, files nowhere
+#: near a gigabyte on their own. At that point isolation had only turned
+#: "one bad file kills the worker" into "the worker survives but converts
+#: nothing else", which is better but still fatal to a large crawl.
+#: Configurable (``extraction.crawler.convert_recycle_after_docs``) because
+#: the right number depends on the container's own memory ceiling, not on
+#: this code; 0 disables the document-count trigger (the RSS trigger below
+#: still applies).
+_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS = 40
+#: A worker is ALSO recycled the moment its own peak RSS crosses this many
+#: MiB, whichever trigger fires first — some documents are simply heavier
+#: than others, so a fixed document count alone under-reacts to a run that
+#: draws a cluster of large files early. Configurable
+#: (``extraction.crawler.convert_recycle_rss_mb``); 0 disables it (the
+#: document-count trigger above still applies).
+_DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
+#: Each conversion child's OWN virtual-address-space ceiling (``RLIMIT_AS``,
+#: installed once, right after fork — see ``_install_memory_limit``).
+#: Insurance against a SEPARATE live-deployment finding from the one above:
+#: recycling holds the STEADY STATE (per-child RSS observed at 530-760 MB
+#: across 11 children), but a single pathological document can still spike
+#: ONE child past the container's own ceiling in isolation — an .xlsx that
+#: openpyxl loads whole into memory, in one observed case — and the kernel's
+#: OOM killer then SIGKILLs whichever child happens to be allocating at that
+#: moment, which is NOT necessarily the file that caused the spike (see
+#: ``_ConvertCrashed``'s external-pressure framing). Capping the CHILD
+#: rather than the container makes the common case attributable: a runaway
+#: document now raises a plain ``MemoryError`` inside the process that read
+#: it, reported as an ordinary ``convert_failed`` for THAT file, before it
+#: can pressure any sibling. Raising the container's own memory limit is
+#: NOT a fix for this — it only moves the ceiling a single heavy document
+#: can still reach (observed at 4 GiB, then 12 GiB, then 20 GiB on the live
+#: instance). Configurable (``extraction.crawler.convert_child_memory_limit_mb``);
+#: 0 disables the cap. Not enforceable on every platform (notably macOS,
+#: where this repo's tests run) — see ``_install_memory_limit``.
+_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
+#: Delta page size asked of Graph — also the RESUME-STATE checkpoint
+#: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
+#: here, load-bearing for the resume contract. The run recorder's PROGRESS
+#: checkpoint (`files_done`/`checkpoint_at`, `_RunRecorder.maybe_checkpoint`)
+#: is a separate, more frequent cadence — see the constants below.
 _DELTA_PAGE_SIZE = 200
+#: How often `_RunRecorder.maybe_checkpoint` is allowed to write PROGRESS
+#: (never the resume state above) between delta-page boundaries: at most
+#: once per this many seconds, or once per `_PROGRESS_CHECKPOINT_EVERY_
+#: ITEMS` newly finished items, whichever comes first. A page can span many
+#: minutes of real download/convert/anonymize/ingest work once downloads
+#: actually succeed, and without this an operator watches "0 files
+#: processed" for that whole window despite the crawl demonstrably working.
+_PROGRESS_CHECKPOINT_INTERVAL_S = 5.0
+_PROGRESS_CHECKPOINT_EVERY_ITEMS = 10
+#: How many passes a single item is retried through the failure queue (see
+#: the module docstring's "a per-item failure never advances past itself")
+#: before it is given up on. Bounds the cost of a permanently-broken file
+#: (a corrupt document that will never convert) at a handful of retries per
+#: run rather than forever; crossing it is recorded, never silent — see
+#: :func:`_note_retry`.
+_MAX_ITEM_RETRY_ATTEMPTS = 5
 #: Streaming download chunk.
 _DOWNLOAD_CHUNK = 1 << 20
 
@@ -171,14 +261,23 @@ class GraphGone(Exception):
 class CrawlTimeout(CrawlError):
     """The run exceeded ``extraction.timeout_s``.
 
-    v1 has no other stop mechanism — no UI cancel, and (since the external
-    producer was removed) no subprocess to kill — so this bound is the only
-    thing standing between a pathological estate and a worker slot occupied
-    forever. Raised between files and between delta pages, i.e. always at a
-    point where the crawl state on disk is consistent: the run aborts through
-    the same path a :class:`GraphThrottled` abort takes, which persists the
+    Raised between files and between delta pages, i.e. always at a point
+    where the crawl state on disk is consistent: the run aborts through the
+    same path a :class:`GraphThrottled` abort takes, which persists the
     state and the (interrupted) report, and the next run resumes from the
-    deltaLink + cTags already written.
+    deltaLink + cTags already written. See also :class:`CrawlStopped` — the
+    admin-requested counterpart to this deadline.
+    """
+
+
+class CrawlStopped(CrawlError):
+    """An admin asked this run to stop (``POST …/extraction/stop`` —
+    owner-frustration fix, 2026-09-01: "can't see it, can't stop it").
+
+    Raised at the SAME quiescent points :class:`CrawlTimeout` is — see
+    :func:`request_stop`, :func:`_clear_stale_stop` and :class:`_StopWatcher`
+    below — so the crawl state on disk is exactly as consistent as a
+    timeout's: the next run resumes from the persisted deltaLink + cTags.
     """
 
 
@@ -193,19 +292,139 @@ class GraphThrottled(CrawlError):
 #: nothing is known about how far the state file got, and "your work is safe"
 #: must never be guessed.
 #:
-#: Order is irrelevant (the two classes are disjoint siblings), but the
-#: mapping is a tuple rather than a dict because ``isinstance`` — not an
-#: exact type lookup — is what has to decide, so a future subclass of either
+#: Order is irrelevant (the classes are disjoint siblings), but the mapping
+#: is a tuple rather than a dict because ``isinstance`` — not an exact type
+#: lookup — is what has to decide, so a future subclass of any of them
 #: inherits the right reason instead of silently falling through to "error".
 _STOP_REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (CrawlTimeout, "timeout"),
+    (CrawlStopped, "stopped"),
     (GraphThrottled, "throttled"),
 )
 
 
 def _stop_reason(exc: BaseException) -> str:
-    """``"timeout"`` / ``"throttled"`` / ``"error"`` for an aborted run."""
+    """``"timeout"`` / ``"stopped"`` / ``"throttled"`` / ``"error"`` for an
+    aborted run."""
     return next((reason for cls, reason in _STOP_REASONS if isinstance(exc, cls)), "error")
+
+
+# --------------------------------------------------------------------------
+# Cooperative stop — the owner's other complaint ("can't stop it"), fixed
+# WITHOUT a new store: the signal lives on the connection row's own
+# ``config.extraction`` sub-object — the same JSON column
+# ``_record_extraction_dispatch`` already writes ``last_run_at``/
+# ``last_job_id`` into, one key over. That is what makes this work on BOTH
+# app-state backends unlike ``extraction_runs`` (PG-only, A3): a DuckDB
+# instance has always had ``source_connections``/``config_patch``.
+#
+# ``extraction`` is already carried forward whole by the generic connection
+# editor (``app.api.admin_sharepoint.SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``),
+# so an admin editing the connection's name or certificate cannot erase a
+# pending stop request any more than it can erase the dispatch bookkeeping
+# next to it.
+# --------------------------------------------------------------------------
+
+#: The key itself, inside ``config["extraction"]`` — named once so the
+#: three functions below and the admin endpoint that writes it
+#: (``app/api/admin_extraction.py``) cannot spell it two different ways.
+STOP_REQUESTED_AT_KEY = "stop_requested_at"
+
+
+def request_stop(connection_id: str) -> str:
+    """Ask this connection's crawl to stop at its next quiescent point.
+
+    Returns the ISO timestamp recorded. Safe to call whether or not a run is
+    currently active: a stop requested while nothing is running simply
+    waits on the connection row until the NEXT run starts, at which point
+    :func:`_clear_stale_stop` clears it unconsumed — a stop meant for a run
+    that already finished (or never started) must never reach forward and
+    kill a future, unrelated one.
+    """
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id) or {}
+    extraction = dict((row.get("config") or {}).get("extraction") or {})
+    stamp = _now_iso()
+    extraction[STOP_REQUESTED_AT_KEY] = stamp
+    repo.config_patch(connection_id, {"extraction": extraction})
+    return stamp
+
+
+def _clear_stale_stop(connection_id: str) -> None:
+    """Clear any stop flag left over from a PREVIOUS run, at the START of
+    THIS one. A stop requested for a run that already finished, failed, or
+    never started must not be honored by the next, unrelated run — this is
+    what keeps the flag from reaching forward past the run it was meant to
+    stop.
+    """
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id) or {}
+    extraction = dict((row.get("config") or {}).get("extraction") or {})
+    if extraction.pop(STOP_REQUESTED_AT_KEY, None) is not None:
+        repo.config_patch(connection_id, {"extraction": extraction})
+
+
+def _stop_requested(connection_id: str) -> Optional[str]:
+    """This connection's live stop flag, or ``None``.
+
+    A fresh repo read every call — deliberately, not cached — because the
+    signal is written by a DIFFERENT process (the admin API handling
+    ``POST …/extraction/stop``) than the one running this crawl.
+    """
+    from src.repositories import source_connections_repo
+
+    row = source_connections_repo().get(connection_id)
+    if not row:
+        return None
+    extraction = (row.get("config") or {}).get("extraction") or {}
+    stamp = extraction.get(STOP_REQUESTED_AT_KEY)
+    return str(stamp) if stamp else None
+
+
+#: Cadence for the file-boundary stop check. Between delta pages the check
+#: is unconditional (a 200-row page is already several network round trips,
+#: so one more row read is noise there) — but a repo read on EVERY file
+#: would not be, on a fast, mostly-``unchanged`` re-crawl of a large estate.
+#: Charged only once every this many COMPLETED items instead.
+_STOP_CHECK_EVERY_ITEMS = 10
+
+
+class _StopWatcher:
+    """Polls :func:`_stop_requested` at the crawl's existing quiescent
+    points — the cooperative-stop counterpart to :class:`_Deadline`.
+
+    Unlike the deadline (an in-memory clock comparison), honoring a stop
+    costs a repo read every time it is checked, which is why — unlike the
+    deadline — the two call sites below use a DIFFERENT cadence: always
+    between delta pages (:meth:`check_page_boundary`), but only every
+    :data:`_STOP_CHECK_EVERY_ITEMS` completed items between files
+    (:meth:`maybe_check_item_boundary`). Both raise :class:`CrawlStopped` at
+    a boundary the resume guarantee already treats as consistent, exactly
+    like a timeout.
+    """
+
+    def __init__(self, connection_id: str, *, every: int = _STOP_CHECK_EVERY_ITEMS) -> None:
+        self.connection_id = connection_id
+        self.every = max(1, int(every))
+        self._last_checked = 0
+
+    def check_page_boundary(self) -> None:
+        self._raise_if_stopped()
+
+    def maybe_check_item_boundary(self, items_done: int) -> None:
+        if items_done - self._last_checked < self.every:
+            return
+        self._last_checked = items_done
+        self._raise_if_stopped()
+
+    def _raise_if_stopped(self) -> None:
+        stamp = _stop_requested(self.connection_id)
+        if stamp:
+            raise CrawlStopped(f"stop requested at {stamp} — stopping; the next run resumes")
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +493,10 @@ def load_state(connection_id: str) -> Dict[str, Any]:
             )
     state.setdefault("delta_links", {})
     state.setdefault("ctags", {})
+    #: ``stable_id -> {state_key, path, item, attempts, ..., given_up}`` —
+    #: see the module docstring's "a per-item failure never advances past
+    #: itself" and :func:`_note_retry` / :func:`_retry_failed_items`.
+    state.setdefault("failed_items", {})
     return state
 
 
@@ -323,6 +546,11 @@ class _RunRecorder:
         self.job_id = job_id
         self.run_id: Optional[str] = None
         self._repo: Any = None
+        # Bookkeeping for `maybe_checkpoint` — a SEPARATE, rate-limited
+        # sibling of `checkpoint`, never the crawl's own resume state.
+        self._progress_lock = threading.Lock()
+        self._last_progress_at = 0.0
+        self._last_progress_items_done = 0
 
     def _resolve(self) -> Any:
         if self._repo is None:
@@ -331,9 +559,44 @@ class _RunRecorder:
             self._repo = extraction_runs_repo()
         return self._repo
 
-    def start(self) -> None:
+    def start(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        # Measured from here, not from process epoch: a run whose first
+        # delta page takes a while must not have its very first item
+        # trigger `maybe_checkpoint` purely because "now - 0" is huge.
+        # ``clock`` is a test seam only — production never passes one.
+        self._last_progress_at = clock()
         try:
-            self.run_id = self._resolve().start(
+            repo = self._resolve()
+        except Exception as exc:  # noqa: BLE001 — recording is never load-bearing
+            self.run_id = None
+            logger.info(
+                "sharepoint crawl: run recording unavailable for connection %s (%s) — crawling anyway",
+                self.connection_id,
+                type(exc).__name__,
+            )
+            return
+        # BEFORE opening this run's own row: only one crawl per connection
+        # runs at a time (the trigger's own idempotency dedup on the owning
+        # job), so a row still `running` here cannot be us — it is a
+        # previous worker's crawl that died without ever calling `finish`.
+        # Closing it now is what stops the source card from reading a
+        # run that will never move again (see `abandon_stale_running`).
+        try:
+            abandoned = repo.abandon_stale_running(self.connection_id)
+            if abandoned:
+                logger.warning(
+                    "sharepoint crawl: closed %d abandoned run row(s) for connection %s before starting a new one",
+                    len(abandoned),
+                    self.connection_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — never blocks the new run
+            logger.debug(
+                "sharepoint crawl: could not sweep abandoned runs for connection %s (%s) — continuing",
+                self.connection_id,
+                type(exc).__name__,
+            )
+        try:
+            self.run_id = repo.start(
                 connection_id=self.connection_id,
                 job_id=self.job_id,
                 phase="crawl",
@@ -362,6 +625,42 @@ class _RunRecorder:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("sharepoint crawl: run checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def maybe_checkpoint(self, stats: "CrawlStats", *, clock: Callable[[], float] = time.monotonic) -> None:
+        """A RATE-LIMITED sibling of :meth:`checkpoint`, called after every
+        item — not just at the delta-page boundary.
+
+        A delta PAGE is up to :data:`_DELTA_PAGE_SIZE` (200) items, and once
+        downloads actually succeed (as opposed to failing instantly), one
+        page can be many minutes of real download/convert/anonymize/ingest
+        work. `checkpoint` alone left an operator watching `files_done: 0`
+        for that whole window even while the crawl was demonstrably
+        working — the same "unverified renders healthy" failure the status
+        guard elsewhere in this module exists to avoid, just for PROGRESS
+        instead of OUTCOME.
+
+        Fires at most once per :data:`_PROGRESS_CHECKPOINT_INTERVAL_S`
+        seconds or :data:`_PROGRESS_CHECKPOINT_EVERY_ITEMS` newly finished
+        items, whichever comes first, so a slow single file (elapsed time)
+        and a fast run of small ones (item count) both get seen. Writes to
+        the exact same destination `checkpoint` does
+        (`files_seen`/`files_done`/`progress`/`checkpoint_at`) — never the
+        crawl's own resume state (`deltaLink`/cTags in the state file),
+        which still persists only at the page boundary in `_crawl_drive`
+        and is unaffected by this.
+        """
+        if not self.run_id:
+            return
+        now = clock()
+        with self._progress_lock:
+            items_since = stats.items_done - self._last_progress_items_done
+            due = (now - self._last_progress_at) >= _PROGRESS_CHECKPOINT_INTERVAL_S
+            due = due or items_since >= _PROGRESS_CHECKPOINT_EVERY_ITEMS
+            if not due:
+                return
+            self._last_progress_at = now
+            self._last_progress_items_done = stats.items_done
+        self.checkpoint(stats)
 
     def finish(
         self,
@@ -416,6 +715,13 @@ def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
         "throttle_wait_s": round(stats.throttle_wait_s, 1),
         "oversize_files": stats.oversize_files,
         "elapsed_s": round(max(time.monotonic() - stats.started, 0.0), 1),
+        # What the crawl is touching RIGHT NOW (owner-frustration fix,
+        # 2026-09-01: "I can't see what's happening in the extraction") —
+        # see `CrawlStats.activity_snapshot`. Read by the status endpoint's
+        # `running` payload; absent from a finished run's stored `report`
+        # (a different dict — see `CrawlStats.report`), which is the honest
+        # answer for a run with nothing left in flight.
+        "activity": stats.activity_snapshot(phase="crawl"),
     }
 
 
@@ -446,6 +752,28 @@ def _skip_total(stats: "CrawlStats") -> int:
     )
 
 
+def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The STANDING view of the item-failure queue, read straight from the
+    state file rather than this run's own counters — so an operator sees
+    "3 documents are stuck" on every report from here on, not only on the
+    run where the third one crossed the retry bound.
+
+    ``pending`` still gets retried every run; ``given_up`` stopped being
+    retried after :data:`_MAX_ITEM_RETRY_ATTEMPTS` failures and needs a
+    human (fix the file, or force a ``resync`` — see :func:`_apply_resync`).
+    """
+    failed_items = state.get("failed_items") or {}
+    given_up = [entry for entry in failed_items.values() if isinstance(entry, dict) and entry.get("given_up")]
+    pending = len(failed_items) - len(given_up)
+    return {
+        "pending": pending,
+        "given_up": len(given_up),
+        "given_up_sample": [
+            {"path": entry.get("path"), "attempts": entry.get("attempts")} for entry in given_up[:_OVERSIZE_SAMPLE]
+        ],
+    }
+
+
 def _record_status_for(exc: BaseException) -> str:
     """Severity-first outcome for a crawl that raised.
 
@@ -457,6 +785,37 @@ def _record_status_for(exc: BaseException) -> str:
     if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
         return "interrupted"
     return "failed"
+
+
+#: A run that finished WITHOUT raising still owes the operator an honest
+#: outcome word: fewer than this many per-file errors is a stray blip — a
+#: run that otherwise found nothing new/changed to do (a healthy, idle
+#: steady-state pass) must not have its status flipped by one transient
+#: fault. At or above it, with zero documents actually landed, the run did
+#: not accomplish anything and calling it `"done"` — the production incident
+#: this guards against recorded 1263 per-file errors and 0 ingested
+#: documents, reported as `done` — is the exact unverified-renders-healthy
+#: failure this whole recorder exists to avoid.
+_UNPRODUCTIVE_RUN_MIN_ERRORS = 5
+
+
+def _ingested_nothing_despite_errors(stats: "CrawlStats") -> bool:
+    """True for a run that completed (no exception) but accomplished
+    nothing: at least :data:`_UNPRODUCTIVE_RUN_MIN_ERRORS` per-file errors
+    and zero new/changed documents.
+
+    Deliberately narrow. `errors` only counts a fault the crawl could not
+    recover from (download/convert/ingest failure, or a whole scope it could
+    not read) — the routine skip reasons (`permission_skips`,
+    `excluded_subtree_skips`, oversize, `anonymize_failed`) are deliberate
+    decisions, not failures, and never count here, so a normal run that
+    politely skipped a great many documents is not mistaken for a broken
+    one. `new`/`changed` are zero-checked rather than compared to `errors`
+    as a ratio: with both at zero, everything this run attempted to land
+    failed by construction — "erred on almost everything" needs no separate
+    ratio once nothing landed at all.
+    """
+    return stats.errors >= _UNPRODUCTIVE_RUN_MIN_ERRORS and stats.new == 0 and stats.changed == 0
 
 
 # --------------------------------------------------------------------------
@@ -504,6 +863,13 @@ class CrawlStats:
     retry_wait_s: float = 0.0
     token_refreshes: int = 0
     delta_resyncs: int = 0
+    #: Items replayed from a PRIOR run's failure queue that succeeded this
+    #: time (cleared from ``failed_items``) / that hit :data:`_MAX_ITEM_
+    #: RETRY_ATTEMPTS` and were given up on THIS run. Not the same axis as
+    #: ``errors`` above — a fresh failure this run is counted there; these
+    #: two are about the queue of PAST failures. See :func:`_note_retry`.
+    item_retry_recovered: int = 0
+    item_retry_given_up: int = 0
     scopes: int = 0
     drives: int = 0
     downloads: int = 0
@@ -520,6 +886,12 @@ class CrawlStats:
     oversize_files: int = 0
     oversize_bytes: int = 0
     oversize_largest: List[Dict[str, Any]] = field(default_factory=list)
+    #: Itemized per-file faults this run could not recover from — download,
+    #: convert, or ingest — bounded the same way ``oversize_largest`` is.
+    #: ``anonymize_failed`` and the routine skip reasons are deliberate
+    #: decisions, not failures, and never land here; only the reasons that
+    #: also bump :attr:`errors` do. See :meth:`note_error`.
+    errors_detail: List[Dict[str, Any]] = field(default_factory=list)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -558,6 +930,23 @@ class CrawlStats:
     #: perfectly serial run has item_seconds ≈ duration_s, a run at N-way
     #: overlap approaches N × duration_s.
     item_seconds: float = 0.0
+    #: Items currently being downloaded/converted/ingested, for the live
+    #: checkpoint's ``activity`` block (owner-frustration fix, 2026-09-01:
+    #: "I can't see what it's doing") — ``{token: (path, started_at_iso)}``.
+    #: Under concurrency several of these are non-empty at once; the
+    #: checkpoint picks whichever ONE is still there when it reads this dict
+    #: (:meth:`activity_snapshot`) — the block exists to prove the crawl is
+    #: alive, not to enumerate every worker. Paths only, NEVER file content —
+    #: they are drive-relative paths already handled as ordinary (if
+    #: untrusted-ish) data everywhere else in this module, and this surface
+    #: is admin-only (``extraction_runs`` sits behind ``require_admin``), so
+    #: no extra redaction is needed here beyond that existing gate.
+    _in_flight_paths: Dict[int, Tuple[str, str]] = field(default_factory=dict, repr=False, compare=False)
+    _in_flight_token: int = field(default=0, repr=False, compare=False)
+    #: Last up to 5 completed items, newest first — ``{path, outcome}``. Not
+    #: part of :meth:`report`'s contract (that stays unchanged); read only by
+    #: :meth:`activity_snapshot`.
+    recent: List[Dict[str, Any]] = field(default_factory=list, repr=False, compare=False)
     #: Guards every counter above. Not compared, not printed — it is machinery.
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -615,6 +1004,57 @@ class CrawlStats:
             self.oversize_largest.sort(key=lambda e: -int(e["size"]))
             del self.oversize_largest[_OVERSIZE_SAMPLE:]
 
+    def note_error(self, path: str, reason: str, *, detail: str = "", status_code: Optional[int] = None) -> None:
+        """One per-file fault, itemized — the difference between a bare
+        error COUNT and a diagnosable run. Callers still call :meth:`add`
+        for the ``errors``/``convert_failed`` counters themselves; this only
+        appends the row a caller who can name a path is able to give.
+        ``detail`` must already be a caller-composed, safe-to-log string
+        (a status code and an upstream error body/exception message, never a
+        token, a certificate, or file content) — this method does not scrub
+        it further.
+        """
+        with self._lock:
+            self.errors_detail.append({"path": path, "reason": reason, "detail": detail, "status_code": status_code})
+            del self.errors_detail[_ERROR_SAMPLE:]
+
+    def enter_item_activity(self, path: str) -> int:
+        """One file's download/convert/ingest pipeline STARTING, for the
+        live ``activity`` checkpoint block. Returns a token to pass back to
+        :meth:`exit_item_activity` — under concurrency several items are
+        in flight at once, and a token is what lets a fast neighbour's exit
+        remove exactly ITS OWN entry rather than a slower one's."""
+        with self._lock:
+            self._in_flight_token += 1
+            token = self._in_flight_token
+            self._in_flight_paths[token] = (path, _now_iso())
+        return token
+
+    def exit_item_activity(self, token: int, path: str, outcome: str) -> None:
+        """The pipeline for ``token`` finished (whatever the outcome) —
+        drop it from the in-flight set and push it onto ``recent``."""
+        with self._lock:
+            self._in_flight_paths.pop(token, None)
+            self.recent.insert(0, {"path": path, "outcome": outcome})
+            del self.recent[_RECENT_ACTIVITY_SAMPLE:]
+
+    def activity_snapshot(self, *, phase: str) -> Dict[str, Any]:
+        """``{phase, current_path, current_started_at, recent}`` for the live
+        checkpoint. ``current_path`` names ANY one in-flight item — under
+        concurrency several are true at once, and this block exists to prove
+        the crawl is alive, not to enumerate every worker."""
+        with self._lock:
+            current_path: Optional[str] = None
+            current_started_at: Optional[str] = None
+            if self._in_flight_paths:
+                current_path, current_started_at = next(iter(self._in_flight_paths.values()))
+            return {
+                "phase": phase,
+                "current_path": current_path,
+                "current_started_at": current_started_at,
+                "recent": list(self.recent[:_RECENT_ACTIVITY_SAMPLE]),
+            }
+
     def report(
         self,
         *,
@@ -622,6 +1062,8 @@ class CrawlStats:
         interrupted: bool = False,
         interrupted_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
+        from src.repositories.extraction_runs_pg import cap_skips
+
         elapsed = max(time.monotonic() - self.started, 1e-6)
         processed = self.new + self.changed
         return {
@@ -658,6 +1100,13 @@ class CrawlStats:
             "retry_wait_s": round(self.retry_wait_s, 1),
             "token_refreshes": self.token_refreshes,
             "delta_resyncs": self.delta_resyncs,
+            # The item-failure queue THIS run touched — how many prior
+            # failures finally landed, and how many just crossed the retry
+            # bound. `retry_backlog` (below, added by the caller once the
+            # state file is final) is the standing count an operator reads
+            # to know whether anything is still stuck.
+            "item_retry_recovered": self.item_retry_recovered,
+            "item_retry_given_up": self.item_retry_given_up,
             # What the pool was ALLOWED to do, what the tenant let it do, and
             # what it actually did. `max_in_flight` below `effective_max`
             # means something other than the knob bounded the run; a non-zero
@@ -684,6 +1133,15 @@ class CrawlStats:
                 "bytes_human": human_bytes(self.oversize_bytes),
                 "largest": list(self.oversize_largest),
             },
+            # The itemized counterpart to the bare `errors` count above —
+            # same envelope `extraction_runs.skips` uses (`items`/`listed`/
+            # `total`/`truncated`), reused rather than reinvented so the two
+            # "how much did we not index, and can we name it" surfaces never
+            # drift on shape. `total` can exceed `listed`: a scope-level
+            # fault (the caller's own `scope_errors` list) bumps `errors`
+            # but has no single file to name, so it is counted here without
+            # a row of its own.
+            "errors_detail": cap_skips(list(self.errors_detail), total=self.errors),
         }
 
 
@@ -715,6 +1173,21 @@ def _require_graph_url(url: str) -> str:
     if parts.scheme != "https" or parts.hostname != _GRAPH_HOST:
         raise CrawlError(f"refusing to send a Graph token to a non-Graph URL: {parts.scheme}://{parts.hostname}")
     return url
+
+
+async def _stream_body_to_temp(resp: httpx.Response, tmp_path: Path, max_bytes: int, item_id: str) -> int:
+    """Stream ``resp``'s body into ``tmp_path``, enforcing ``max_bytes`` as it
+    goes. Shared by :meth:`GraphTransport.download_to_temp`'s direct-200 and
+    followed-redirect-200 paths, so the size cap applies identically to
+    either — a redirect must never become a way around it."""
+    written = 0
+    with open(tmp_path, "wb") as fh:
+        async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
+            written += len(chunk)
+            if max_bytes and written > max_bytes:
+                raise CrawlError(f"download exceeded the {max_bytes}-byte cap for item {item_id}")
+            fh.write(chunk)
+    return written
 
 
 class GraphAuth:
@@ -945,6 +1418,20 @@ class GraphTransport:
         ``max_bytes`` is a second, independent guard on top of the caller's
         ``size``-based skip: Graph's reported ``size`` is metadata, and a
         response that disagrees with it must not be able to fill the disk.
+
+        **The 302.** Graph answers ``GET .../content`` with a redirect to a
+        pre-authenticated URL on a DIFFERENT host (blob storage, never
+        ``graph.microsoft.com``) rather than the bytes themselves. httpx does
+        not follow redirects by default, and turning that on
+        (``follow_redirects=True``) would not be safe here even so: httpx
+        replays the ``Authorization`` header across a redirect, which would
+        hand the Graph bearer token to that other host. So a 3xx with a
+        ``Location`` is followed by hand, with a SEPARATE, unauthenticated
+        request — never through :func:`_require_graph_url`, deliberately,
+        since that guard exists to keep the bearer token off a non-Graph
+        host, and this second request carries no token to protect. The size
+        cap and the temp-file cleanup guarantee apply identically to
+        whichever response actually carried the bytes.
         """
         url = _require_graph_url(f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content")
         fd, tmp_name = tempfile.mkstemp(suffix=Path(name or "").suffix)
@@ -958,24 +1445,32 @@ class GraphTransport:
             while True:
                 attempt += 1
                 self.stats.add(requests=1)
-                written = 0
                 try:
                     headers, used_token = await self._authorized()
                     async with graph_client._http_client() as client:
+                        redirect_location: Optional[str] = None
                         async with client.stream("GET", url, headers=headers, timeout=_REQUEST_TIMEOUT_S) as resp:
-                            action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
-                            if action == "ok":
-                                with open(tmp_path, "wb") as fh:
-                                    async for chunk in resp.aiter_bytes(_DOWNLOAD_CHUNK):
-                                        written += len(chunk)
-                                        if max_bytes and written > max_bytes:
-                                            raise CrawlError(
-                                                f"download exceeded the {max_bytes}-byte cap for item {item_id}"
-                                            )
-                                        fh.write(chunk)
-                                self.stats.add(downloads=1, bytes_downloaded=written)
-                                return tmp_path
-                            await resp.aread()  # drain before deciding, so the connection is reusable
+                            if 300 <= resp.status_code < 400:
+                                redirect_location = resp.headers.get("Location")
+                            if redirect_location is None:
+                                action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
+                                if action == "ok":
+                                    written = await _stream_body_to_temp(resp, tmp_path, max_bytes, item_id)
+                                    self.stats.add(downloads=1, bytes_downloaded=written)
+                                    return tmp_path
+                                await resp.aread()  # drain before deciding, so the connection is reusable
+                            else:
+                                await resp.aread()  # drain the redirect body before following it
+
+                        if redirect_location is not None:
+                            # No Authorization header on this one — see the docstring.
+                            async with client.stream("GET", redirect_location, timeout=_REQUEST_TIMEOUT_S) as resp:
+                                action, wait = self._classify(resp, attempt, throttle_wait, refreshed)
+                                if action == "ok":
+                                    written = await _stream_body_to_temp(resp, tmp_path, max_bytes, item_id)
+                                    self.stats.add(downloads=1, bytes_downloaded=written)
+                                    return tmp_path
+                                await resp.aread()
                 except (httpx.TransportError, httpx.TimeoutException) as exc:
                     if attempt >= self.max_attempts:
                         raise CrawlError(f"download failed after {attempt} attempts: {type(exc).__name__}") from exc
@@ -1100,9 +1595,8 @@ class DriveTarget:
 
 def _scope_kind(source_scope_id: str) -> str:
     """Site / drive / folder, decided STRUCTURALLY from the Graph id shape —
-    the same rule ``connectors/sharepoint/corpus_map.py`` uses, and for the
-    same reason: it must work for scope rows confirmed before this module
-    existed, with no Graph round trip."""
+    it must work for scope rows confirmed before this module existed, with
+    no Graph round trip."""
     if "," in source_scope_id:
         return "site"
     if source_scope_id.startswith("b!"):
@@ -1240,7 +1734,7 @@ def _should_skip_name(name: str) -> bool:
 def _drive_relative_path(parent_reference: Dict[str, Any], name: str) -> str:
     """``parentReference.path`` + item name, with Graph's
     ``/drives/<id>/root:`` prefix stripped — the DRIVE-relative path the
-    corpus-map resolver and the collections ``path`` key both speak."""
+    zone router and the collections ``path`` key both speak."""
     parent = str(parent_reference.get("path") or "")
     rel = _DRIVE_ROOT_PREFIX_RE.sub("", parent).strip("/")
     return f"{rel}/{name}".strip("/") if rel else name.strip("/")
@@ -1447,6 +1941,471 @@ async def _run_blocking(pool: Optional[ThreadPoolExecutor], fn: Callable[..., An
     return await loop.run_in_executor(pool, functools.partial(fn, *args, **kwargs))
 
 
+# --------------------------------------------------------------------------
+# Conversion process isolation
+#
+# A native crash inside a conversion backend (observed on a live deployment:
+# a `trap int3` abort inside libpdfium.so, reached via pypdfium2) takes down
+# the WHOLE interpreter — no Python exception is raised, so the per-file
+# `except Exception` around `convert_to_markdown` below is unreachable by
+# construction. `ThreadPoolExecutor` cannot help: a fatal signal kills the
+# process the thread runs in, worker thread and all. Only an OS PROCESS
+# boundary survives that, which is what this section builds: one dedicated,
+# reused child process per concurrency slot, talking to the parent over a
+# duplex `Pipe`.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _ConvertOutcome:
+    """One conversion attempt's result, as returned by
+    :meth:`_ConvertProcessPool.convert`.
+
+    ``detail_type`` (``type(exc).__name__``) is always safe to log and
+    persist. ``detail_message`` (``str(exc)``) may quote a fragment of the
+    document the child just read, so whether it is safe to KEEP is a
+    per-scope decision — an anonymize-marked scope's whole premise is that
+    document content never reaches storage in readable form — made by
+    :func:`_prepare_document`, which already owns the anonymize decision,
+    not by anything upstream of it.
+    """
+
+    ok: bool
+    markdown: str = ""
+    detail_type: str = ""
+    detail_message: str = ""
+
+
+@dataclass
+class _ConvertReply:
+    """The actual wire message :func:`_convert_worker_main` sends back — a
+    superset of :class:`_ConvertOutcome` carrying ``rss_bytes`` (this
+    worker's own peak RSS right after the attempt, success or failure).
+    :meth:`_ConvertProcessPool.convert` reads ``rss_bytes`` to decide
+    whether to recycle the slot (see the class docstring's "RECYCLING"
+    section) and then discards it — callers outside this module's
+    recycling logic see only the plain :class:`_ConvertOutcome`, which has
+    no business carrying a process-internal metric.
+    """
+
+    outcome: _ConvertOutcome
+    rss_bytes: int = 0
+
+
+class _ConvertCrashed(Exception):
+    """The child process handling this call died from a signal (or exited
+    non-zero without ever answering) instead of returning a result.
+
+    Raised only inside :meth:`_ConvertProcessPool.convert`, on the PARENT
+    side — never crosses a process boundary itself. The caller
+    (:func:`_prepare_document`) treats it exactly like an ordinary
+    conversion exception: the file is counted as ``convert_failed`` and the
+    crawl moves on. ``signal_name`` is the best identification available
+    (a POSIX signal name, ``"exit code N"``, or ``"unknown"`` when the
+    worker was already gone before this call) — never document content, so
+    it is always safe to keep and log regardless of scope.
+    """
+
+    def __init__(self, signal_name: str) -> None:
+        self.signal_name = signal_name
+        super().__init__(f"conversion worker terminated ({signal_name})")
+
+
+def _peak_rss_bytes() -> int:
+    """This (calling) process's peak resident-set size, in bytes.
+
+    ``resource.ru_maxrss`` is kilobytes on Linux — this module's deployment
+    target, and where the memory growth this guards against was observed —
+    but bytes on macOS/BSD, where this repo's tests run; normalized here
+    once so every caller gets bytes regardless of platform. A HIGH-WATER
+    MARK, not current usage, on purpose: it never drops back down even if
+    the child frees memory afterward, which is the right signal for "has
+    this worker EVER shown itself to be a memory hog" — a transient dip
+    must not reset the recycle clock.
+    """
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak * 1024 if sys.platform == "linux" else peak
+
+
+def _install_memory_limit(limit_bytes: int) -> None:
+    """Cap THIS (child) process's own virtual address space at
+    ``limit_bytes`` — see :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for
+    why. Call ONCE, right after fork, before the first document — the
+    ceiling applies for the rest of this process's life.
+
+    ``RLIMIT_AS`` (not ``RLIMIT_DATA``, which modern glibc's ``mmap``-backed
+    large-allocation path bypasses entirely past its threshold, and not
+    ``RLIMIT_RSS``, a pure no-op on Linux since kernel 2.6.9) is the one
+    resource limit that reliably turns "this process is about to blow
+    through its budget" into a plain Python ``MemoryError`` at the
+    allocation that crosses it — caught by :func:`_convert_worker_main`'s
+    own ``except Exception``, exactly like any other conversion failure,
+    ATTRIBUTED to the file whose conversion was in progress.
+
+    Best-effort and silent: ``RLIMIT_AS`` is not settable on every
+    platform — notably macOS, where this repo's own tests run, refuses to
+    lower it at all — so a platform that cannot install this safety net
+    still converts, rather than refusing to start. Linux (this module's
+    deployment target, and where the memory pressure this guards against
+    was observed) enforces it reliably. 0 disables the cap outright.
+    """
+    if limit_bytes <= 0:
+        return
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
+def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0) -> None:
+    """Entry point for a dedicated conversion child process — runs ONLY
+    inside a forked child, never called directly.
+
+    Installs this worker's own memory ceiling (see
+    :func:`_install_memory_limit`) once, then loops reading
+    ``(tmp_path_str, mime)`` off ``conn`` and replying with a
+    :class:`_ConvertReply`. An ordinary Python exception from
+    :func:`convert_to_markdown` — including a ``MemoryError`` from hitting
+    that ceiling — is caught HERE, exactly like the pre-isolation code did,
+    and turned into the same kind of failure — both ``type(exc).__name__``
+    and ``str(exc)`` cross back (see :class:`_ConvertOutcome` for why
+    sending both is safe: what to DO with the message is the parent's
+    scope-aware decision, not this function's). A native crash — or a
+    SIGKILL from memory pressure OUTSIDE this process's own control, the
+    one case the memory ceiling above cannot turn into an ordinary
+    exception, because the kernel does not ask first — bypasses this
+    function's `try/except` entirely by definition; the parent notices this
+    worker is gone via the pipe closing (``EOFError`` on its next
+    ``recv``), not via anything sent from here.
+    """
+    _install_memory_limit(memory_limit_bytes)
+    while True:
+        try:
+            task = conn.recv()
+        except (EOFError, OSError):
+            return
+        if task is None:  # shutdown sentinel
+            return
+        tmp_path_str, mime = task
+        try:
+            converted = convert_to_markdown(Path(tmp_path_str), mime)
+            markdown = str(getattr(converted, "markdown", "") or "")
+        except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
+            outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
+            try:
+                conn.send(_ConvertReply(outcome=outcome, rss_bytes=_peak_rss_bytes()))
+            except OSError:
+                return
+            continue
+        try:
+            conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_peak_rss_bytes()))
+        except OSError:
+            return
+
+
+class _ConvertProcessPool:
+    """A small, reused pool of persistent worker PROCESSES dedicated to the
+    convert step of one crawl run.
+
+    One process per concurrency slot (``0..size-1``), forked once (see
+    :meth:`start`) and reused — spawning a fresh interpreter per file would
+    pay a full cold start (plus re-importing markitdown/pypdfium2) on every
+    single document, which for a thousand-file crawl dwarfs the conversion
+    itself. Passing the temp file's PATH rather than its bytes keeps each
+    round trip to two short strings.
+
+    Deliberately ``fork``, never ``spawn``:
+
+    * ``fork`` is what makes a test's ``monkeypatch.setattr(crawler,
+      "convert_to_markdown", ...)`` reach the child at all. ``spawn`` starts
+      a brand new interpreter that re-imports this module fresh and never
+      sees a patch applied to the ALREADY-RUNNING parent's copy; ``fork``
+      copies the parent's memory as it stood at fork time, patch included,
+      which is also just a few ms instead of a few hundred.
+    * Every worker's ``Process`` and its duplex ``Connection`` are 1:1 — no
+      shared queue, no ambiguity about which process died: a slot's own
+      crash is detected by ``EOFError`` on ITS OWN connection (the OS always
+      closes the write end when a process exits, whatever the cause), and
+      its exact ``exitcode`` (negative == killed by that signal number) is
+      read directly off THAT ``Process`` object. That is deliberately NOT
+      ``concurrent.futures.ProcessPoolExecutor``: its only public failure is
+      a generic ``BrokenProcessPool`` with no per-worker detail, and a crash
+      there poisons the ENTIRE pool rather than the one slot that died.
+
+    Every FORK this pool ever does — the initial :meth:`start` and every
+    :meth:`repair` — must happen from a point the CALLER has proven is
+    single-threaded (the top of a run, or a delta-page boundary once that
+    page's item-concurrency ``ThreadPoolExecutor`` has been joined).
+    ``fork()`` while another thread holds a C-level lock (malloc, DuckDB,
+    OpenSSL, ...) can hand the child a lock that will never be released —
+    this pool trusts its caller for that timing rather than re-deriving it.
+
+    RECYCLING (owner-reported, live-deployment finding, 2026-09-01): crash
+    isolation alone turns "one bad file kills the worker" into "the worker
+    SURVIVES but converts nothing else" — markitdown/pypdfium2 hold onto
+    memory per document, so a slot that never dies just keeps running, and
+    its RSS climbs without bound over a large crawl until the container's
+    memory cgroup starts SIGKILLing whichever child allocates next,
+    INDISCRIMINATELY (see :data:`_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS`). A
+    slot's process is therefore replaced after ``recycle_after_docs``
+    documents or once its peak RSS crosses ``recycle_rss_bytes``, whichever
+    comes first.
+
+    The same single-threaded-fork constraint applies to a RECYCLE as to any
+    other fork, but a recycle is decided inside :meth:`convert` itself —
+    the one method that runs on a worker THREAD, mid-page, with siblings
+    still active, i.e. never at a safe point. Three ways to reconcile that
+    were weighed:
+
+    1. Recycle only at the next :meth:`repair` (a genuine safe point).
+       Rejected: a default page is up to 200 items, so a slot could convert
+       4-5x its budget before a page boundary ever arrives — exactly the
+       "the budget is meaningless past 200" gap this exists to close.
+    2. Use ``spawn`` for a recycle's replacement only — ``spawn`` needs no
+       single-threaded window at all, since it starts a brand new
+       interpreter rather than forking this one, so it sidesteps the
+       constraint entirely. Rejected: a ``spawn``-started replacement
+       re-imports this module fresh in the new interpreter, so it would
+       stop seeing a test's ``monkeypatch.setattr(crawler,
+       "convert_to_markdown", ...)`` the moment a slot recycles mid-test —
+       the exact problem that made this class choose ``fork`` in the first
+       place — silently diverging from every OTHER worker in the pool and
+       from itself before its own first recycle.
+    3. **Chosen: pre-fork a SPARE per slot from a safe point, swap it in
+       when the budget is hit.** :meth:`start` forks both the ACTIVE worker
+       and an idle SPARE for every slot; :meth:`repair` (a safe point,
+       called after every page) tops up any slot whose spare was consumed.
+       The swap itself — retire the active, promote the spare — does no
+       ``fork()`` at all, only a termination signal to the retiree and a
+       pointer reassignment, so it is safe from ANY thread, including a
+       worker thread mid-page. The spare is forked through the same
+       ``fork`` context as everything else, so it inherits the SAME
+       monkeypatched state a test applied before the run started, keeping
+       option 2's failure mode off the table. Cost: double the idle process
+       count versus options 1/2 — acceptable, since an idle (never-yet-used)
+       spare's own memory footprint is just import overhead, not yet the
+       per-document accumulation this whole mechanism exists to bound.
+
+    A slot with no spare ready when its budget is hit (it already recycled
+    once this page, before the last :meth:`repair` had a chance to refill
+    it) simply keeps running past its budget until the next safe point —
+    bounded staleness, never unbounded growth, and never a correctness
+    issue: :meth:`convert` still returns every file's real outcome either
+    way.
+
+    The SAME swap primitive also repairs a mid-page CRASH instantly when a
+    spare happens to be ready, rather than leaving the slot down for the
+    rest of the page (the pre-recycling behavior, still exactly what
+    happens when no spare is available). The crashed file's own outcome is
+    unaffected either way — still counted ``convert_failed``, still logged
+    with its signal — only whether a DIFFERENT, later file on the same slot
+    in the same page has to wait for the next page boundary changes.
+
+    Every worker this pool ever forks — active or spare — also gets its own
+    ``RLIMIT_AS`` ceiling (``memory_limit_bytes``, installed inside the
+    child by :func:`_install_memory_limit`; see
+    :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for the full reasoning),
+    so a single pathological document raises an ATTRIBUTABLE
+    ``MemoryError`` for the file that caused it instead of pressuring the
+    whole container and getting an arbitrary sibling SIGKILLed.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        *,
+        ctx: Optional[Any] = None,
+        recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
+        recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
+        memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
+    ) -> None:
+        self._ctx = ctx or multiprocessing.get_context("fork")
+        self._size = max(1, int(size))
+        self._recycle_after_docs = max(0, int(recycle_after_docs))
+        self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
+        self._memory_limit_bytes = max(0, int(memory_limit_bytes))
+        self._procs: List[Optional[Any]] = [None] * self._size
+        self._conns: List[Optional[Connection]] = [None] * self._size
+        self._doc_counts: List[int] = [0] * self._size
+        #: Pre-forked, idle standby per slot — see the class docstring's
+        #: "RECYCLING" section for why this exists.
+        self._spare_procs: List[Optional[Any]] = [None] * self._size
+        self._spare_conns: List[Optional[Connection]] = [None] * self._size
+
+    def start(self) -> None:
+        """Fork every slot's ACTIVE worker, and a SPARE standing by for the
+        same slot, that are not already alive. Call only from a
+        single-threaded context — see the class docstring."""
+        for slot in range(self._size):
+            if self._procs[slot] is None:
+                self._spawn(slot)
+            if self._spare_procs[slot] is None:
+                self._spawn_spare(slot)
+
+    def _spawn(self, slot: int) -> None:
+        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        proc = self._ctx.Process(
+            target=_convert_worker_main,
+            args=(child_conn, self._memory_limit_bytes),
+            daemon=True,
+            name=f"sp-convert-{slot}",
+        )
+        proc.start()
+        child_conn.close()  # the parent only ever uses its own end
+        self._procs[slot] = proc
+        self._conns[slot] = parent_conn
+        self._doc_counts[slot] = 0
+
+    def _spawn_spare(self, slot: int) -> None:
+        parent_conn, child_conn = self._ctx.Pipe(duplex=True)
+        proc = self._ctx.Process(
+            target=_convert_worker_main,
+            args=(child_conn, self._memory_limit_bytes),
+            daemon=True,
+            name=f"sp-convert-{slot}-spare",
+        )
+        proc.start()
+        child_conn.close()
+        self._spare_procs[slot] = proc
+        self._spare_conns[slot] = parent_conn
+
+    def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
+        """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
+        worker and returns its outcome, or raises :class:`_ConvertCrashed`
+        when that worker died instead of answering — the caller turns that
+        into the same ``convert_failed`` outcome an ordinary exception
+        would, with the signal named in the log line. Also where recycling
+        (see the class docstring) is decided and, when a spare is ready,
+        carried out — after this call's own result is already determined,
+        so a recycle never changes what THIS file's outcome was."""
+        proc = self._procs[slot]
+        conn = self._conns[slot]
+        if proc is None or conn is None or not proc.is_alive():
+            detail = self._exit_detail(proc)
+            self._swap_in_spare(slot)  # best-effort recovery for the NEXT file
+            raise _ConvertCrashed(detail)
+        try:
+            conn.send((str(tmp_path), mime))
+            reply: _ConvertReply = conn.recv()
+        except (EOFError, OSError):
+            detail = self._exit_detail(proc)
+            self._swap_in_spare(slot)
+            raise _ConvertCrashed(detail) from None
+        self._doc_counts[slot] += 1
+        over_doc_budget = bool(self._recycle_after_docs) and self._doc_counts[slot] >= self._recycle_after_docs
+        over_rss_ceiling = bool(self._recycle_rss_bytes) and reply.rss_bytes >= self._recycle_rss_bytes
+        if over_doc_budget or over_rss_ceiling:
+            self._swap_in_spare(slot)
+        return reply.outcome
+
+    def _exit_detail(self, proc: Optional[Any]) -> str:
+        if proc is None:
+            return "unknown"
+        proc.join(timeout=5)
+        code = proc.exitcode
+        if code is None:
+            return "unknown"
+        if code < 0:
+            try:
+                return signal.Signals(-code).name
+            except ValueError:
+                return f"signal {-code}"
+        if code > 0:
+            return f"exit code {code}"
+        return "unknown"
+
+    def _swap_in_spare(self, slot: int) -> bool:
+        """Retire slot's ACTIVE process (dead from a crash, or simply past
+        its recycle budget) and promote its pre-forked SPARE in its place.
+
+        No ``fork()`` — only a termination signal to the retiree and a
+        pointer reassignment — so this is safe to call from ANY thread, at
+        ANY point in a page, unlike :meth:`_spawn`/:meth:`repair`; that is
+        what lets a slot recycle (or recover from a crash) mid-page rather
+        than only at the next page boundary. Returns ``False``, leaving the
+        slot exactly as it was, when no spare is ready yet — the caller
+        (:meth:`convert`) already handles both outcomes: a dead slot stays
+        dead until :meth:`repair`, same as before recycling existed; a
+        merely over-budget slot just keeps running past its budget.
+        """
+        spare_proc = self._spare_procs[slot]
+        spare_conn = self._spare_conns[slot]
+        if spare_proc is None or spare_conn is None or not spare_proc.is_alive():
+            return False
+        self._close_slot(slot)
+        self._procs[slot] = spare_proc
+        self._conns[slot] = spare_conn
+        self._spare_procs[slot] = None
+        self._spare_conns[slot] = None
+        self._doc_counts[slot] = 0
+        return True
+
+    def repair(self) -> List[int]:
+        """Replace every dead ACTIVE slot with a fresh worker, and top up
+        any slot whose SPARE was consumed by a mid-page recycle or crash
+        recovery. Call only from a point the caller has proven
+        single-threaded (a delta-page boundary, after that page's
+        item-concurrency thread pool has been joined). Returns the
+        repaired ACTIVE slot indices — used by tests."""
+        repaired = []
+        for slot, proc in enumerate(self._procs):
+            if proc is None or not proc.is_alive():
+                self._close_slot(slot)
+                self._spawn(slot)
+                repaired.append(slot)
+        for slot, spare in enumerate(self._spare_procs):
+            if spare is None or not spare.is_alive():
+                self._close_spare(slot)
+                self._spawn_spare(slot)
+        return repaired
+
+    def _close_slot(self, slot: int) -> None:
+        proc = self._procs[slot]
+        conn = self._conns[slot]
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        self._procs[slot] = None
+        self._conns[slot] = None
+
+    def _close_spare(self, slot: int) -> None:
+        proc = self._spare_procs[slot]
+        conn = self._spare_conns[slot]
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        self._spare_procs[slot] = None
+        self._spare_conns[slot] = None
+
+    def shutdown(self) -> None:
+        """Signal every live worker (active AND spare) to exit, then reap
+        them all. Safe to call more than once and safe to call on a pool
+        that never started."""
+        for conn in (*self._conns, *self._spare_conns):
+            if conn is not None:
+                try:
+                    conn.send(None)
+                except OSError:
+                    pass
+        for slot in range(self._size):
+            self._close_slot(slot)
+            self._close_spare(slot)
+
+
 @dataclass
 class _PreparedDocument:
     """Outcome of the blocking half of one item: hash -> convert -> anonymize.
@@ -1455,11 +2414,100 @@ class _PreparedDocument:
     thread: the caller (on the event loop) turns the outcome into the exact
     same counters the sequential pipeline recorded, so a fail-closed refusal
     is still counted once, per item, whatever thread noticed it.
+
+    ``path``/``filename`` are the RESOLVED values the caller ingests — the
+    real drive-relative path and ``<stem>.md`` for a plain scope, or their
+    anonymized equivalents for an anonymize-marked one (see
+    :func:`_anonymize_identity`). Never the raw ones when the scope
+    anonymizes: a caller that ingested ``path``/``filename`` on ``"ok"``
+    needs no branch of its own on ``anonymize`` to know which to use.
     """
 
     outcome: str  # "ok" | "convert_failed" | "convert_empty" | "anonymize_failed"
     markdown: str = ""
     source_sha256: str = ""
+    path: str = ""
+    filename: str = ""
+    #: Why a ``"convert_failed"`` outcome failed — empty for every other
+    #: outcome, and gated by scope: see :func:`_prepare_document`'s
+    #: ``_convert_failure_detail`` for what this may and may not contain.
+    detail: str = ""
+
+
+def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
+    """The ``(path, filename)`` an anonymize-marked scope stores instead of
+    the real ones — same key, same detector as the document body.
+
+    The source name and folder path are routinely the single most
+    re-identifying string in a document (a deal name, a client name); an
+    anonymize-marked scope's promise that "Agnes never holds the original at
+    all" (``docs/anonymization.md``) is broken if they survive verbatim
+    while the body is redacted.
+
+    Each path SEGMENT is anonymized independently — not the path as one
+    string — and the ``"/"`` separator structure is kept: two files under
+    the same real folder still share the same anonymized folder prefix
+    (the substitution is deterministic under one key), so prefix matching,
+    the exclusion index and the corpus-map resolver keep working the same
+    SHAPE against the anonymized tree they worked against the real one, even
+    though no segment is readable any more.
+
+    The returned ``path``'s leaf segment keeps the SOURCE file's extension
+    (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
+    mirroring the exact relationship the un-anonymized values already have
+    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
+    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
+    converted markdown's own name). Only the identity-bearing STEM changes,
+    never the suffix a downstream reader keys extension logic on.
+
+    Routing decisions (which collection, which exclusion rule) are made
+    EARLIER in the pipeline against the RAW path — those decisions come from
+    admin-configured real folder names and must see the real thing. This
+    function only prepares what gets PERSISTED.
+    """
+    stem = Path(name).stem or name
+    suffix = Path(name).suffix
+    anonymized_stem = str(anonymize_markdown(stem, key=key, detector=detector).text)
+    filename = f"{anonymized_stem}.md"
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    segments = [
+        str(anonymize_markdown(segment, key=key, detector=detector).text) for segment in folder.split("/") if segment
+    ]
+    anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
+    return anonymized_path, filename
+
+def _convert_failure_detail(detail_type: str, detail_message: str, *, anonymize: bool) -> str:
+    """The ``detail`` a ``"convert_failed"`` outcome is allowed to carry,
+    decided by THIS scope's anonymize flag — see :func:`_prepare_document`'s
+    docstring for the full reasoning. ``detail_message`` may quote a
+    fragment of the document a converter just failed on; ``detail_type``
+    (``type(exc).__name__``) never does and is always kept."""
+    if not anonymize and detail_message:
+        return detail_message
+    return detail_type
+
+
+#: Signals whose only realistic cause on this pool is memory pressure
+#: applied from OUTSIDE the crashed worker's own accounting — the kernel's
+#: OOM killer picking whichever child happens to be allocating at the
+#: moment a memory cgroup hits its ceiling, per `_ConvertProcessPool`'s
+#: RLIMIT_AS section. A worker's OWN ceiling turns that same failure mode
+#: into a `MemoryError`, handled separately (see `_prepare_document`), so a
+#: SIGKILL that still reaches here was never given the chance to attribute
+#: itself. Every OTHER signal (SIGABRT, SIGSEGV, SIGBUS, ...) is a native
+#: abort raised BY the conversion backend on THIS file's own content —
+#: attributable, and worded as a plain crash.
+_EXTERNAL_PRESSURE_SIGNALS = frozenset({"SIGKILL"})
+
+
+def _convert_crash_detail(signal_name: str) -> str:
+    """The operator-facing wording for a :class:`_ConvertCrashed` failure —
+    deliberately different for a SIGKILL (see :data:`_EXTERNAL_PRESSURE_SIGNALS`)
+    than for any other signal, so a reader is never left guessing whether
+    the FILE is at fault or was collateral damage from a sibling's spike."""
+    if signal_name in _EXTERNAL_PRESSURE_SIGNALS:
+        return f"conversion worker killed by memory pressure outside its control ({signal_name}) — may not be this file's fault"
+    return f"conversion worker crashed: {signal_name}"
 
 
 def _prepare_document(
@@ -1467,42 +2515,169 @@ def _prepare_document(
     *,
     mime: str,
     path: str,
+    name: str,
     anonymize: bool,
     anonymization_key: Optional[bytes],
     detector: Any,
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    convert_slot: int = 0,
 ) -> _PreparedDocument:
-    """Hash, convert and (for an anonymize-marked scope) anonymize one file.
+    """Hash, convert and (for an anonymize-marked scope) anonymize one file —
+    its BODY, and (see :func:`_anonymize_identity`) its filename and path.
 
     Pure with respect to crawl state — it touches no counters, no cTags and
     no state file — which is what makes it safe to run on a worker thread.
     An unexpected failure of the HASH itself still propagates (as it did
     before): a file we cannot read is not a convert failure.
+
+    Convert alone is isolated in a child process (``convert_pool``, see its
+    class docstring for why); anonymize stays HERE, on the calling thread, in
+    THIS process — it needs the HMAC key, and that key must never cross a
+    process boundary (on argv, in an environment variable of a child we do
+    not control, or otherwise) when there is no need for it to. Anonymize
+    input is already-converted markdown, not attacker-shaped file bytes, and
+    has no native-library dependency of the kind that motivated isolating
+    convert in the first place, so it carries none of the crash risk.
+    ``convert_pool=None`` (only ever a testing/unit-call default — the real
+    crawl always passes one) falls back to calling the converter inline, the
+    exact pre-isolation behaviour.
+
+    A ``"convert_failed"`` outcome's ``detail`` is gated by THIS scope's
+    ``anonymize`` flag (owner decision 2026-09-01, reconciling #1993's
+    per-file error detail with this module's own no-content-leaves-the-file
+    -reader rule): a plain scope keeps the exception's full message — an
+    admin on that connection can already open the document itself, so a
+    diagnosable failure beats a silent one — while an anonymize-marked
+    scope keeps only the exception's TYPE, since that scope's whole premise
+    is that document content never reaches storage in readable form, and a
+    conversion exception can quote a fragment of the very file it read. A
+    native crash's ``detail`` (the signal name) is never document content,
+    so it is kept for both.
+
+    A ``MemoryError`` (own-limit) failure and a signal crash's ``detail``
+    are DELIBERATELY worded differently (owner decision 2026-09-01, live
+    deployment #2): the former is a document this pool's own
+    ``RLIMIT_AS`` ceiling attributes to THIS file with certainty; the
+    latter, when the signal is ``SIGKILL`` specifically, is the kernel's
+    OOM killer reaching in from OUTSIDE this process's own accounting and
+    may have picked this file's worker only because it happened to be
+    allocating at the wrong moment — an operator reading a bare
+    ``SIGKILL`` cannot tell those apart, so :func:`_convert_crash_detail`
+    says so explicitly.
     """
     source_sha256 = _sha256_file(tmp_path)
     try:
-        converted = convert_to_markdown(tmp_path, mime)
-        markdown = str(getattr(converted, "markdown", "") or "")
+        if convert_pool is not None:
+            outcome = convert_pool.convert(convert_slot, tmp_path, mime)
+            if not outcome.ok:
+                if outcome.detail_type == "MemoryError":
+                    detail = "exceeded its own memory limit"
+                else:
+                    detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
+                logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
+                return _PreparedDocument("convert_failed", detail=detail)
+            markdown = outcome.markdown
+        else:
+            converted = convert_to_markdown(tmp_path, mime)
+            markdown = str(getattr(converted, "markdown", "") or "")
+    except _ConvertCrashed as exc:
+        # The child that was converting this file died from a signal (a
+        # native abort/segfault, not a Python exception) — the one failure
+        # mode a `try/except Exception` can never catch, because nothing
+        # raises here: the process running it is simply gone. Counted and
+        # skipped exactly like an ordinary conversion failure; the crawl
+        # continues with the next file, and this process — the one running
+        # the crawl loop — was never at risk.
+        detail = _convert_crash_detail(exc.signal_name)
+        logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
+        return _PreparedDocument("convert_failed", detail=detail)
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
-        return _PreparedDocument("convert_failed")
+        detail = _convert_failure_detail(type(exc).__name__, str(exc), anonymize=anonymize)
+        return _PreparedDocument("convert_failed", detail=detail)
     if not markdown.strip():
         logger.info("sharepoint crawl: conversion produced no text for %s", path)
         return _PreparedDocument("convert_empty")
 
     if anonymize:
         # FAIL CLOSED. An anonymize-marked scope promised its audience that
-        # no raw identifier reaches the collection; a document that cannot be
-        # anonymized is therefore counted and dropped, never ingested in its
-        # original form. Unchanged by concurrency: the refusal is decided per
-        # document, inside this function, before any caller can ingest it.
+        # no raw identifier reaches the collection — not in the body, and not
+        # in the filename or folder path either; a document any part of which
+        # cannot be anonymized is therefore counted and dropped, never
+        # ingested in its original form. Unchanged by concurrency: the
+        # refusal is decided per document, inside this function, before any
+        # caller can ingest it.
         if anonymization_key is None:
             return _PreparedDocument("anonymize_failed")
         try:
             markdown = str(anonymize_markdown(markdown, key=anonymization_key, detector=detector).text)
+            out_path, out_filename = _anonymize_identity(path, name, key=anonymization_key, detector=detector)
         except Exception as exc:  # noqa: BLE001 — incl. ImportError / DetectionUnavailable
             logger.warning("sharepoint crawl: anonymization failed for %s: %s", path, type(exc).__name__)
             return _PreparedDocument("anonymize_failed")
-    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256)
+    else:
+        out_path, out_filename = path, f"{Path(name).stem or name}.md"
+    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256, path=out_path, filename=out_filename)
+
+
+def _note_retry(
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    stable_id: str,
+    *,
+    target: DriveTarget,
+    item: Dict[str, Any],
+    path: str,
+) -> None:
+    """Record one failed pass over ``stable_id`` so it is retried on a
+    future run regardless of what the delta feed offers next — see the
+    module docstring's "a per-item failure never advances past itself".
+
+    Stores the item dict AS SEEN at failure time (not a fresh Graph
+    fetch): it already carries everything :func:`_process_item` needs to
+    retry — id, name, parentReference, size, mimeType, cTag — so a retry
+    costs one extra download attempt, not a second round-trip through the
+    delta/metadata API. Idempotent to call again on a repeat failure: the
+    attempt counter accumulates across runs (and across a same-run retry
+    replay landing on the same item twice), it is never reset except by a
+    success (:func:`_clear_retry`) or an operator-requested resync.
+    """
+    with _state_lock:
+        failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
+        entry = failed_items.get(stable_id)
+        if not isinstance(entry, dict):
+            entry = {"first_failed_at": _now_iso()}
+        entry["state_key"] = target.state_key
+        entry["item"] = item
+        entry["path"] = path
+        entry["last_failed_at"] = _now_iso()
+        attempts = int(entry.get("attempts", 0)) + 1
+        entry["attempts"] = attempts
+        just_exhausted = attempts >= _MAX_ITEM_RETRY_ATTEMPTS and not entry.get("given_up")
+        if just_exhausted:
+            entry["given_up"] = True
+        failed_items[stable_id] = entry
+    if just_exhausted:
+        stats.add(item_retry_given_up=1)
+        logger.warning(
+            "sharepoint crawl: giving up on %s after %d failed attempts — it stays out of the "
+            "collection until an operator intervenes (fix the file, or run a resync); the state "
+            "file and the run report keep the record",
+            path,
+            attempts,
+        )
+
+
+def _clear_retry(state: Dict[str, Any], stable_id: str) -> bool:
+    """Drop ``stable_id`` from the failure queue — it just ingested cleanly,
+    however it got here (a normal delta row or a queued retry). Returns
+    whether it was actually IN the queue, so a caller can tell "this was a
+    prior failure that just recovered" from "this item never failed"."""
+    with _state_lock:
+        failed_items = state.get("failed_items")
+        if not failed_items:
+            return False
+        return failed_items.pop(stable_id, None) is not None
 
 
 async def _process_item(
@@ -1518,6 +2693,8 @@ async def _process_item(
     anonymization_key: Optional[bytes],
     detector: Any = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    convert_slot: int = 0,
 ) -> None:
     """One delta row -> at most one ingested document. Never raises for a
     per-file fault: a locked, vanished, unconvertible, or un-anonymizable
@@ -1570,77 +2747,138 @@ async def _process_item(
         return
 
     mime = str((item.get("file") or {}).get("mimeType") or "")
+    # In flight from here to the end of the function — the download/convert/
+    # ingest span, i.e. the part slow enough to be worth SHOWING an admin
+    # watching live (owner-frustration fix, 2026-09-01). `outcome_label`
+    # names how it ended for the `activity.recent` list; the `finally`
+    # guarantees exactly one `exit_item_activity` per `enter_item_activity`,
+    # whatever branch below returns or raises.
+    activity_token = stats.enter_item_activity(path)
+    outcome_label = "error"
     try:
-        tmp_path = await transport.download_to_temp(
-            target.drive_id, str(item["id"]), name, max_bytes=_max_file_bytes(max_file_mb)
-        )
-    except GraphThrottled:
-        # NOT a per-file fault, despite being a CrawlError: the tenant is
-        # throttling this app registration as a whole, so absorbing it here
-        # would turn "back off" into "keep hammering, one 429 budget per
-        # file". Aborts the run; the next one resumes from the persisted
-        # deltaLink + cTags. Under concurrency the page driver also stops
-        # feeding the pool the moment this escapes, so a 429 storm costs one
-        # budget per IN-FLIGHT item, never one per remaining file.
-        raise
-    except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
-        stats.add(errors=1)
-        logger.warning("sharepoint crawl: download failed for %s: %s", path, type(exc).__name__)
-        return
+        try:
+            tmp_path = await transport.download_to_temp(
+                target.drive_id, str(item["id"]), name, max_bytes=_max_file_bytes(max_file_mb)
+            )
+        except GraphThrottled:
+            # NOT a per-file fault, despite being a CrawlError: the tenant is
+            # throttling this app registration as a whole, so absorbing it
+            # here would turn "back off" into "keep hammering, one 429
+            # budget per file". Aborts the run; the next one resumes from
+            # the persisted deltaLink + cTags. Under concurrency the page
+            # driver also stops feeding the pool the moment this escapes,
+            # so a 429 storm costs one budget per IN-FLIGHT item, never one
+            # per remaining file.
+            outcome_label = "throttled"
+            raise
+        except (CrawlError, SharePointGraphError, httpx.HTTPError) as exc:
+            # `SharePointGraphError.status_code` is the upstream HTTP status,
+            # documented safe to log (Entra/Graph error bodies never carry a
+            # credential); the other two exception types carry no status.
+            status_code = getattr(exc, "status_code", None)
+            detail = str(exc)
+            stats.add(errors=1)
+            stats.note_error(path, "download_failed", detail=detail, status_code=status_code)
+            outcome_label = "download_failed"
+            logger.warning(
+                "sharepoint crawl: download failed for %s: %s status=%s detail=%s",
+                path,
+                type(exc).__name__,
+                status_code,
+                detail,
+            )
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
 
-    try:
-        prepared: _PreparedDocument = await _run_blocking(
-            pool,
-            _prepare_document,
-            tmp_path,
-            mime=mime,
-            path=path,
-            anonymize=ctx.anonymize,
-            anonymization_key=anonymization_key,
-            detector=detector,
-        )
+        try:
+            prepared: _PreparedDocument = await _run_blocking(
+                pool,
+                _prepare_document,
+                tmp_path,
+                mime=mime,
+                path=path,
+                name=name,
+                anonymize=ctx.anonymize,
+                anonymization_key=anonymization_key,
+                detector=detector,
+                convert_pool=convert_pool,
+                convert_slot=convert_slot,
+            )
+        finally:
+            # The local copy never persists — success, skip, or failure.
+            tmp_path.unlink(missing_ok=True)
+
+        if prepared.outcome == "convert_failed":
+            stats.add(convert_failed=1, errors=1)
+            stats.note_error(path, "convert_failed", detail=prepared.detail)
+            outcome_label = "convert_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+        if prepared.outcome == "convert_empty":
+            # Not a failure to retry: the document converted fine and
+            # genuinely has no text. Unlike the other three outcomes here,
+            # running it through the pipeline again cannot change the answer.
+            stats.add(convert_failed=1)
+            outcome_label = "convert_empty"
+            return
+        if prepared.outcome == "anonymize_failed":
+            stats.add(anonymize_failed=1)
+            outcome_label = "anonymize_failed"
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+
+        try:
+            _file_id, was_new = await _run_blocking(
+                pool,
+                ingestor.ingest,
+                collection_id=collection_id,
+                stable_id=stable_id,
+                # RESOLVED values from `_prepare_document` — the real
+                # path/name for a plain scope, the anonymized ones for a
+                # marked scope. NOT the raw `path`/`name` locals above: those
+                # are for routing and logging only, and must never reach
+                # storage for a marked scope.
+                path=prepared.path,
+                filename=prepared.filename,
+                markdown=prepared.markdown,
+                source_sha256=prepared.source_sha256,
+            )
+        except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
+            status_code = getattr(exc, "status_code", None)
+            detail = str(exc)
+            stats.add(errors=1)
+            stats.note_error(path, "ingest_failed", detail=detail, status_code=status_code)
+            outcome_label = "ingest_failed"
+            logger.warning(
+                "sharepoint crawl: ingest failed for %s: %s status=%s detail=%s",
+                path,
+                type(exc).__name__,
+                status_code,
+                detail,
+            )
+            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            return
+
+        outcome_label = "new" if was_new else "changed"
+        if was_new:
+            stats.add(new=1)
+        else:
+            stats.add(changed=1)
+        # Written only AFTER the document is durably ingested: a cTag
+        # recorded before the ingest would make a resumed run skip a file it
+        # never landed. Per ITEM, not per page — a slow neighbour in the
+        # same page must not hold this one's cTag hostage — but always
+        # under the state lock, so it can never land inside a `save_state`
+        # serialization.
+        if ctag:
+            with _state_lock:
+                ctags[stable_id] = ctag
+        # However it got here — a normal delta row or a queued retry — it
+        # just ingested cleanly, so it owes the failure queue nothing more.
+        if _clear_retry(state, stable_id):
+            stats.add(item_retry_recovered=1)
     finally:
-        # The local copy never persists — success, skip, or failure.
-        tmp_path.unlink(missing_ok=True)
-
-    if prepared.outcome == "convert_failed":
-        stats.add(convert_failed=1, errors=1)
-        return
-    if prepared.outcome == "convert_empty":
-        stats.add(convert_failed=1)
-        return
-    if prepared.outcome == "anonymize_failed":
-        stats.add(anonymize_failed=1)
-        return
-
-    try:
-        _file_id, was_new = await _run_blocking(
-            pool,
-            ingestor.ingest,
-            collection_id=collection_id,
-            stable_id=stable_id,
-            path=path,
-            filename=f"{Path(name).stem or name}.md",
-            markdown=prepared.markdown,
-            source_sha256=prepared.source_sha256,
-        )
-    except Exception as exc:  # noqa: BLE001 — one file's ingest, not the run
-        stats.add(errors=1)
-        logger.warning("sharepoint crawl: ingest failed for %s: %s", path, type(exc).__name__)
-        return
-
-    if was_new:
-        stats.add(new=1)
-    else:
-        stats.add(changed=1)
-    # Written only AFTER the document is durably ingested: a cTag recorded
-    # before the ingest would make a resumed run skip a file it never landed.
-    # Per ITEM, not per page — a slow neighbour in the same page must not
-    # hold this one's cTag hostage — but always under the state lock, so it
-    # can never land inside a `save_state` serialization.
-    if ctag:
-        with _state_lock:
-            ctags[stable_id] = ctag
+        stats.exit_item_activity(activity_token, path, outcome_label)
 
 
 class _ConcurrencyGovernor:
@@ -1731,8 +2969,11 @@ class _ConcurrencyGovernor:
 #: Higher wins when several workers fail in the same page — the run reports
 #: the WORST thing that happened to it, never the first one to be noticed.
 #: A tenant-wide throttle outranks the clock: "we ran out of time" invites a
-#: retry, "the tenant is refusing us" is what an operator has to act on.
-_ABORT_SEVERITY: Tuple[type, ...] = (GraphThrottled, CrawlTimeout, GraphGone)
+#: retry, "the tenant is refusing us" is what an operator has to act on. An
+#: admin-requested stop outranks GraphGone (a routine 410-resync trigger,
+#: never a run-ending fault on its own) for the same reason a timeout does:
+#: it is a deliberate, named exit, not an incidental one.
+_ABORT_SEVERITY: Tuple[type, ...] = (GraphThrottled, CrawlTimeout, CrawlStopped, GraphGone)
 
 
 def _abort_rank(exc: BaseException) -> int:
@@ -1756,18 +2997,22 @@ async def _process_page(
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
     concurrency: int = 1,
+    stop_watcher: Optional["_StopWatcher"] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    recorder: Optional["_RunRecorder"] = None,
 ) -> None:
     """Run ONE delta page's rows, up to ``concurrency`` items at a time.
 
-    The page is the unit of the resume contract, and this function is what
+    The page is the unit of the RESUME contract, and this function is what
     keeps that true under parallelism:
 
     * every item's cTag is still written by the item itself, right after its
       own durable ingest — a slow neighbour cannot delay it, and a fast
       neighbour cannot claim it;
     * this function does not return until every worker has finished, so the
-      caller's ``deltaLink`` persist + recorder checkpoint still happen after
-      *all* of the page's rows, never in the middle of it;
+      caller's ``deltaLink`` persist + the unconditional recorder checkpoint
+      it makes afterward still happen after *all* of the page's rows, never
+      in the middle of it;
     * the deadline is re-checked before each item is picked up, so an expired
       budget stops FEEDING the pool and then drains it, rather than starting
       work it has no time to finish;
@@ -1778,6 +3023,21 @@ async def _process_page(
     ``concurrency <= 1`` takes the sequential branch: the same loop, the same
     inline calls and the same ordering the crawl had before this existed, so
     "1 == today's behaviour" is a property of the code, not a hope.
+
+    ``convert_pool`` (see its class docstring) supplies one dedicated
+    converter PROCESS per item-concurrency slot, ``0..workers-1``. The
+    sequential branch has exactly one slot (0) and no sibling to fall back
+    on, so it repairs that slot before every item — always safe here, since
+    this branch never creates a thread pool at all. The parallel branch
+    instead repairs once, at the PAGE boundary in :func:`_crawl_drive` (after
+    this function's own thread pool below has been joined): repairing a
+    slot mid-page would fork while its siblings' worker threads are still
+    live, which is exactly the hazard the pool's docstring warns about. A
+    slot that crashes mid-page therefore stays down for the REST of that
+    page — every item it draws counts as ``convert_failed`` until the next
+    page's repair — while the other slots keep converting normally; those
+    files are not lost, only deferred (no cTag is written for a
+    ``convert_failed`` item, so the next crawl retries them).
     """
     workers = max(1, int(concurrency))
     if workers == 1:
@@ -1789,6 +3049,10 @@ async def _process_page(
             # already-ingested item in it upserts to a no-op.
             if deadline is not None:
                 deadline.check()
+            # Always safe: this branch never creates a thread pool, so there
+            # is never another thread alive to hand a held lock to.
+            if convert_pool is not None:
+                convert_pool.repair()
             # Pure bookkeeping, so the report says `max_in_flight: 1` here
             # rather than a 0 that reads as "nothing ever ran".
             stats.enter_item()
@@ -1805,10 +3069,19 @@ async def _process_page(
                     max_file_mb=max_file_mb,
                     anonymization_key=anonymization_key,
                     detector=detector,
+                    convert_pool=convert_pool,
+                    convert_slot=0,
                 )
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            # Between files, cadence-limited (see `_StopWatcher`): a
+            # completed item's cTag is already in `state`, so a stop here
+            # is exactly as safe to resume from as the deadline check above.
+            if stop_watcher is not None:
+                stop_watcher.maybe_check_item_boundary(stats.items_done)
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
         return
 
     if not items:
@@ -1835,7 +3108,7 @@ async def _process_page(
         cursor += 1
         return item
 
-    async def _worker() -> None:
+    async def _worker(slot: int) -> None:
         while True:
             if deadline is not None:
                 try:
@@ -1862,6 +3135,8 @@ async def _process_page(
                     anonymization_key=anonymization_key,
                     detector=detector,
                     pool=pool,
+                    convert_pool=convert_pool,
+                    convert_slot=slot,
                 )
             except BaseException as exc:  # noqa: BLE001 — re-raised after the drain
                 # Anything escaping `_process_item` is by definition NOT a
@@ -1873,13 +3148,29 @@ async def _process_page(
             finally:
                 stats.exit_item(time.monotonic() - started)
             stats.add(items_done=1)
+            # Same drain mechanism as the deadline check above and the
+            # abort-on-exception path in the `try` block: appended to
+            # `aborts` and returned, never raised past this loop, so
+            # `_next_item()` stops handing out work to the OTHER workers too
+            # and the in-flight ones still get to finish this iteration.
+            if stop_watcher is not None:
+                try:
+                    stop_watcher.maybe_check_item_boundary(stats.items_done)
+                except CrawlStopped as exc:
+                    aborts.append(exc)
+                    return
+            if recorder is not None:
+                recorder.maybe_checkpoint(stats)
 
     try:
         # `gather` without `return_exceptions` would cancel the peers on the
         # first failure — exactly the "one bad future loses the others'
         # completed work" this must not do. Every worker returns normally and
-        # parks its exception in `aborts` instead.
-        await asyncio.gather(*[_worker() for _ in range(min(workers, len(items)))])
+        # parks its exception in `aborts` instead. Each worker keeps the SAME
+        # convert-pool slot (its position in this list) for the whole page —
+        # see `convert_pool`'s docstring for why that 1:1 pairing is what
+        # makes crash detection and repair unambiguous.
+        await asyncio.gather(*[_worker(i) for i in range(min(workers, len(items)))])
     finally:
         pool.shutdown(wait=True)
 
@@ -1898,6 +3189,78 @@ def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+async def _retry_failed_items(
+    target: DriveTarget,
+    *,
+    ctx: _ScopeContext,
+    transport: GraphTransport,
+    ingestor: _Ingestor,
+    connection_id: str,
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    max_file_mb: int,
+    anonymization_key: Optional[bytes],
+    detector: Any,
+    deadline: Optional[_Deadline],
+    recorder: Optional["_RunRecorder"],
+) -> None:
+    """Replay every item THIS drive previously failed on, before asking
+    Graph for what changed.
+
+    This is the other half of the fix: Graph's delta feed only re-offers an
+    item when it CHANGES, so a file that failed to download/convert/
+    anonymize/ingest — and nobody has touched since — would otherwise never
+    be handed to us again once its page's deltaLink moves past it. Each
+    entry in ``failed_items`` carries the item dict as last seen, which is
+    everything :func:`_process_item` needs to try it again; success clears
+    the entry (:func:`_clear_retry`), a repeat failure bumps ``attempts``
+    (:func:`_note_retry`) and re-queues it, and an item already at
+    :data:`_MAX_ITEM_RETRY_ATTEMPTS` is skipped here — it stays recorded,
+    just not retried every run.
+
+    Sequential and outside the page/concurrency machinery on purpose: the
+    backlog is normally tiny (persistently-failing files, not a fresh
+    page), and giving it its own governor/pool would buy nothing but risk
+    for a path this rarely used.
+    """
+    failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
+    pending = [
+        (stable_id, entry)
+        for stable_id, entry in failed_items.items()
+        if entry.get("state_key") == target.state_key
+        and isinstance(entry.get("item"), dict)
+        and not entry.get("given_up")
+    ]
+    if not pending:
+        return
+    for _stable_id, entry in pending:
+        if deadline is not None:
+            deadline.check()
+        stats.add(items_seen=1)
+        stats.enter_item()
+        started = time.monotonic()
+        try:
+            await _process_item(
+                entry["item"],
+                target=target,
+                ctx=ctx,
+                transport=transport,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=max_file_mb,
+                anonymization_key=anonymization_key,
+                detector=detector,
+            )
+        finally:
+            stats.exit_item(time.monotonic() - started)
+        stats.add(items_done=1)
+    with _state_lock:
+        save_state(connection_id, state)
+    if recorder is not None:
+        recorder.checkpoint(stats)
+
+
 async def _crawl_drive(
     target: DriveTarget,
     *,
@@ -1913,6 +3276,8 @@ async def _crawl_drive(
     detector: Any = None,
     deadline: Optional[_Deadline] = None,
     governor: Optional[_ConcurrencyGovernor] = None,
+    stop_watcher: Optional["_StopWatcher"] = None,
+    convert_pool: Optional[_ConvertProcessPool] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
@@ -1920,19 +3285,45 @@ async def _crawl_drive(
     ``recorder`` (optional, defaults to no recording) rides the checkpoint
     this function already writes — see :class:`_RunRecorder`.
 
+    ``stop_watcher`` (optional) is checked unconditionally at every page
+    boundary, same as ``deadline`` — see :class:`_StopWatcher`.
+
     ``governor`` supplies the WITHIN-PAGE item concurrency (see
     :func:`_process_page`) and is fed this drive's throttling at every page
     boundary, so a tenant pushing back shrinks the target for the pages that
     follow. Pages themselves remain strictly sequential: the next page's URL
     is only known once this page's response has been read, and its deltaLink
     must not be persisted before the current page's rows are on disk. Drives,
-    likewise, remain sequential — see the note in :func:`_run_crawl_async`."""
+    likewise, remain sequential — see the note in :func:`_run_crawl_async`.
+
+    ``convert_pool`` is repaired HERE, right after each page, not inside
+    :func:`_process_page`: by the time a page returns its own
+    item-concurrency thread pool (if any) has already been joined, which is
+    exactly the single-threaded window a fork-based repair needs — see
+    ``_ConvertProcessPool``'s docstring."""
     governor = governor or _ConcurrencyGovernor(1)
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
     url: Optional[str] = delta_links.get(target.state_key) or base
     resynced = False
     stats.add(drives=1)
+    # Retry this drive's OWN backlog first — see `_retry_failed_items`. It
+    # runs before the first delta fetch so a resume that starts with a
+    # 410 still gets the queued items a chance regardless.
+    await _retry_failed_items(
+        target,
+        ctx=ctx,
+        transport=transport,
+        ingestor=ingestor,
+        connection_id=connection_id,
+        state=state,
+        stats=stats,
+        max_file_mb=max_file_mb,
+        anonymization_key=anonymization_key,
+        detector=detector,
+        deadline=deadline,
+        recorder=recorder,
+    )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
     # pushing back too — and deliberately not reset by a 410 resync, so that
@@ -1945,6 +3336,8 @@ async def _crawl_drive(
         # deltaLink/cTags are on disk, so stopping here costs nothing.
         if deadline is not None:
             deadline.check()
+        if stop_watcher is not None:
+            stop_watcher.check_page_boundary()
         if page_throttle_mark is None:
             page_throttle_mark = stats.throttle_snapshot()
         try:
@@ -1998,7 +3391,16 @@ async def _crawl_drive(
             detector=detector,
             deadline=deadline,
             concurrency=governor.current(),
+            stop_watcher=stop_watcher,
+            convert_pool=convert_pool,
+            recorder=recorder,
         )
+        if convert_pool is not None:
+            # Safe HERE: `_process_page` has already joined this page's own
+            # thread pool (if it made one) before returning, so no other
+            # thread is alive to hand a held lock to. See the class
+            # docstring on `_ConvertProcessPool` and the note above.
+            convert_pool.repair()
         # The page's OWN throttling, not the run's running total: the
         # governor folds a DELTA, so one bad page cannot keep halving the
         # target for the rest of the crawl.
@@ -2022,10 +3424,12 @@ async def _crawl_drive(
             next_link = page.get("@odata.nextLink")
             save_state(connection_id, state)
             url = _require_graph_url(str(next_link)) if next_link else None
-        # The SAME checkpoint boundary, a second destination — no new write
-        # loop and no new frequency (design §7.1). It runs after the state
-        # file, so a recorder failure can never cost the crawl its resume
-        # point.
+        # The SAME state-checkpoint boundary, a second destination (design
+        # §7.1) — and, unlike `_process_page`'s per-item `maybe_checkpoint`
+        # calls above, UNCONDITIONAL: every page's final numbers are
+        # durably recorded even if the rate limiter would otherwise have
+        # withheld a write. Runs after the state file, so a recorder
+        # failure can never cost the crawl its resume point.
         if recorder is not None:
             recorder.checkpoint(stats)
 
@@ -2048,6 +3452,50 @@ def _max_file_mb() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return _DEFAULT_MAX_FILE_MB
+
+
+def _convert_recycle_after_docs() -> int:
+    """``extraction.crawler.convert_recycle_after_docs`` — see
+    :data:`_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS` for why this exists. 0 (or
+    negative, or unparseable) disables the document-count trigger; the RSS
+    trigger, if configured, still applies."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_recycle_after_docs", default=_DEFAULT_CONVERT_RECYCLE_AFTER_DOCS)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS
+
+
+def _convert_recycle_rss_bytes() -> int:
+    """``extraction.crawler.convert_recycle_rss_mb``, resolved to bytes —
+    see :data:`_DEFAULT_CONVERT_RECYCLE_RSS_MB`. 0 disables the RSS
+    trigger; the document-count trigger, if configured, still applies."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_recycle_rss_mb", default=_DEFAULT_CONVERT_RECYCLE_RSS_MB)
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_CONVERT_RECYCLE_RSS_MB
+    return mb * 1024 * 1024
+
+
+def _convert_child_memory_limit_bytes() -> int:
+    """``extraction.crawler.convert_child_memory_limit_mb``, resolved to
+    bytes — see :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB`. 0 disables
+    the per-child memory cap."""
+    from app.instance_config import get_value
+
+    raw = get_value(
+        "extraction", "crawler", "convert_child_memory_limit_mb", default=_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+    )
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+    return mb * 1024 * 1024
 
 
 def _crawl_concurrency() -> int:
@@ -2161,15 +3609,33 @@ def _detector_usage(detector: Any) -> Dict[str, Any]:
 
     ``{}`` means "no tokens were spent" — the regex tier, or no anonymize
     scope in the run — which the UI keeps distinct from a computed $0.00.
-    Never raises: usage is observability, not a gate."""
+    When tokens WERE spent, ``estimated_cost_usd`` is priced through
+    ``src.llm_pricing.cost_usd`` — the one place a token count becomes USD
+    (mirroring ``connectors.sharepoint.facts_extraction._Report.render``'s
+    own pricing of its stage, the same field name and rounding). Never
+    raises: usage is observability, not a gate."""
     llm = getattr(detector, "llm", None)
     usage = getattr(llm, "total_usage", None)
     if not isinstance(usage, dict):
         return {}
-    model = getattr(llm, "model", None)
     out: Dict[str, Any] = {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
-    if out and model:
+    if not out:
+        return {}
+    model = getattr(llm, "model", None)
+    if model:
         out["model"] = str(model)
+        from src.llm_pricing import cost_usd
+
+        out["estimated_cost_usd"] = round(
+            cost_usd(
+                model=str(model),
+                input_tokens=int(usage.get("input_tokens") or 0),
+                output_tokens=int(usage.get("output_tokens") or 0),
+                cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+                cache_creation_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+            ),
+            4,
+        )
     return out
 
 
@@ -2238,6 +3704,16 @@ async def _run_crawl_async(
     concurrency: Optional[int] = None,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
+    # A stop requested for a PREVIOUS run (already finished, failed, or one
+    # that never actually started) must never reach forward and kill this
+    # one — clear it unconsumed, at the very start, before anything else.
+    # Best-effort: a repo hiccup here must not block the run it is trying to
+    # let start cleanly.
+    try:
+        _clear_stale_stop(connection_id)
+    except Exception as exc:  # noqa: BLE001 — never load-bearing
+        logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+    stop_watcher = _StopWatcher(connection_id)
     scopes = _confirmed_scopes(connection)
     if only_scope_ids:
         wanted = set(only_scope_ids)
@@ -2272,6 +3748,20 @@ async def _run_crawl_async(
     # registration, not a drive, so what one drive learns about backing off
     # must carry to the next.
     governor = _ConcurrencyGovernor(cap, stats=stats)
+    # One dedicated converter process per concurrency slot, forked NOW —
+    # before anything below creates a `ThreadPoolExecutor` — so `.start()`
+    # runs in the single-threaded window its docstring requires. Sized to
+    # the run's hard ceiling, not the governor's current (adaptive) target,
+    # so a slot is always available for whatever concurrency a later page
+    # actually uses. Recycled per `_ConvertProcessPool`'s own "RECYCLING"
+    # section — resolved once, here, same as every other crawler.* knob.
+    convert_pool = _ConvertProcessPool(
+        cap,
+        recycle_after_docs=_convert_recycle_after_docs(),
+        recycle_rss_bytes=_convert_recycle_rss_bytes(),
+        memory_limit_bytes=_convert_child_memory_limit_bytes(),
+    )
+    convert_pool.start()
     auth = GraphAuth(
         acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
         stats=stats,
@@ -2299,51 +3789,60 @@ async def _run_crawl_async(
     facts_report: Optional[Dict[str, Any]] = None
 
     try:
-        for scope in scopes:
-            source_scope_id = str(scope.get("source_scope_id"))
-            try:
-                targets = await _drive_targets(transport, scope)
-                exclusions = await _excluded_path_prefixes(transport, scope)
-            except (CrawlError, SharePointGraphError) as exc:
-                # One scope's misconfiguration (or one site's outage) must not
-                # cost the connection's other scopes their pass — the same
-                # per-unit failure isolation `acl_sync` applies per connection.
-                scope_errors.append({"scope": source_scope_id, "error": str(exc)})
-                stats.add(errors=1)
-                continue
+        try:
+            for scope in scopes:
+                source_scope_id = str(scope.get("source_scope_id"))
+                try:
+                    targets = await _drive_targets(transport, scope)
+                    exclusions = await _excluded_path_prefixes(transport, scope)
+                except (CrawlError, SharePointGraphError) as exc:
+                    # One scope's misconfiguration (or one site's outage) must not
+                    # cost the connection's other scopes their pass — the same
+                    # per-unit failure isolation `acl_sync` applies per connection.
+                    scope_errors.append({"scope": source_scope_id, "error": str(exc)})
+                    stats.add(errors=1)
+                    continue
 
-            ctx = _ScopeContext(
-                source_scope_id=source_scope_id,
-                collection_id=str(scope["collection_id"]),
-                anonymize=bool(scope.get("anonymize")),
-                exclusions=exclusions,
-                zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
-            )
-            stats.add(scopes=1)
-            # Drives stay SEQUENTIAL, deliberately. Parallelising them is the
-            # second axis and it is not worth its risk here: every drive
-            # shares one state file whose per-drive deltaLink is the resume
-            # contract, and the 410-resync path mutates that file mid-drive;
-            # the 429 budget and the deadline are likewise run-wide, so a
-            # second axis mostly converts into 429s against the same tenant
-            # rather than into throughput. In-page concurrency already
-            # saturates a 200-row page. Correctness beats the second axis.
-            for target in targets:
-                await _crawl_drive(
-                    target,
-                    ctx=ctx,
-                    transport=transport,
-                    ingestor=ingestor,
-                    connection_id=connection_id,
-                    state=state,
-                    stats=stats,
-                    max_file_mb=max_file_mb,
-                    anonymization_key=anonymization_key,
-                    recorder=recorder,
-                    detector=detector,
-                    deadline=deadline,
-                    governor=governor,
+                ctx = _ScopeContext(
+                    source_scope_id=source_scope_id,
+                    collection_id=str(scope["collection_id"]),
+                    anonymize=bool(scope.get("anonymize")),
+                    exclusions=exclusions,
+                    zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
                 )
+                stats.add(scopes=1)
+                # Drives stay SEQUENTIAL, deliberately. Parallelising them is the
+                # second axis and it is not worth its risk here: every drive
+                # shares one state file whose per-drive deltaLink is the resume
+                # contract, and the 410-resync path mutates that file mid-drive;
+                # the 429 budget and the deadline are likewise run-wide, so a
+                # second axis mostly converts into 429s against the same tenant
+                # rather than into throughput. In-page concurrency already
+                # saturates a 200-row page. Correctness beats the second axis.
+                for target in targets:
+                    await _crawl_drive(
+                        target,
+                        ctx=ctx,
+                        transport=transport,
+                        ingestor=ingestor,
+                        connection_id=connection_id,
+                        state=state,
+                        stats=stats,
+                        max_file_mb=max_file_mb,
+                        anonymization_key=anonymization_key,
+                        recorder=recorder,
+                        detector=detector,
+                        deadline=deadline,
+                        governor=governor,
+                        stop_watcher=stop_watcher,
+                        convert_pool=convert_pool,
+                    )
+        finally:
+            # Done converting for this run either way (success, a scope
+            # error that propagated, a timeout, ...) — release the worker
+            # processes before the (potentially long) facts stage below runs,
+            # rather than leaving them idle for its whole duration.
+            convert_pool.shutdown()
 
         # ---- the LLM stage (owner decision 2026-09-01) -------------------
         # Chained HERE, not in the worker handler, for three reasons: it
@@ -2367,6 +3866,7 @@ async def _run_crawl_async(
         interrupted_report = stats.report(max_file_mb=max_file_mb, interrupted=True, interrupted_reason=reason)
         interrupted_report["connection_id"] = connection_id
         interrupted_report["scope_errors"] = scope_errors
+        interrupted_report["retry_backlog"] = _retry_backlog_snapshot(state)
         state["last_run"] = interrupted_report
         save_state(connection_id, state)
         if reason != "error":
@@ -2404,6 +3904,7 @@ async def _run_crawl_async(
     report = stats.report(max_file_mb=max_file_mb)
     report["connection_id"] = connection_id
     report["scope_errors"] = scope_errors
+    report["retry_backlog"] = _retry_backlog_snapshot(state)
     # Both LLM stages' numbers ride in the SAME report and the SAME
     # `extraction_runs` row: one run, one set of counters. `ner_usage` and
     # `facts_usage` are promoted to the top level (next to the crawl's own
@@ -2432,7 +3933,30 @@ async def _run_crawl_async(
         run_usage["ocr"] = ocr_usage
     if facts_usage:
         run_usage["facts"] = facts_usage
-    recorder.finish(stats, status="done", report=report, usage=run_usage)
+    if _ingested_nothing_despite_errors(stats):
+        # Same status vocabulary a crash already uses (`failed` /
+        # `interrupted` / `done`) — no new word is minted here. A run that
+        # errored on (almost) everything and landed nothing is at least as
+        # bad as a crash, and the JOB itself still completed (no exception
+        # propagates from here): `extraction_runs.status` and the job's own
+        # lifecycle are allowed to disagree by design (see
+        # `ExtractionRunsPgRepository`'s module docstring) — this is exactly
+        # the case that split them.
+        status = "failed"
+        finish_error = (
+            f"{stats.errors} file(s) errored and 0 documents were ingested this run — "
+            "see report.errors_detail for the per-file causes"
+        )
+        logger.warning(
+            "sharepoint crawl: connection %s — %d errors and 0 new/changed documents; "
+            "recording this run as failed rather than done",
+            connection_id,
+            stats.errors,
+        )
+    else:
+        status = "done"
+        finish_error = None
+    recorder.finish(stats, status=status, report=report, usage=run_usage, error=finish_error)
     logger.info(
         "sharepoint crawl: connection %s — %d new, %d changed, %d unchanged, %d deleted, "
         "%d errors, %d oversize skipped",
@@ -2447,31 +3971,57 @@ async def _run_crawl_async(
     return report
 
 
+def _apply_resync(connection_id: str) -> None:
+    """Force every drive of this connection to re-enumerate from scratch on
+    its next crawl — the supported alternative to hand-editing the crawl
+    state file on the data disk to recover a connection whose delta cursor
+    ran past documents it never actually ingested.
+
+    Drops ``delta_links`` (so the next pass starts every drive from a bare
+    ``/delta``, which Graph answers with the drive's full current listing)
+    and ``failed_items`` (a full re-walk offers every previously-failed item
+    to the normal delta pipeline again, so the queue's own bookkeeping —
+    including anything already given up on — would otherwise be stale).
+    ``ctags`` are kept: a resync should make Graph tell us about everything
+    again, not force re-downloading files whose content has not changed.
+    """
+    with _state_lock:
+        state = load_state(connection_id)
+        state["delta_links"] = {}
+        state["failed_items"] = {}
+        save_state(connection_id, state)
+
+
 def run_builtin_crawl(payload: dict) -> dict:
     """Entry point for the ``corpus-extraction`` job kind
     (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
     this).
 
-    Bounded by ``extraction.timeout_s`` — v1's ONLY deliberate stop mechanism
-    (no UI cancel, and since the external producer was removed, no subprocess
-    to kill). On expiry the run saves its state, reports
-    ``interrupted_reason="timeout"``, and fails the job; the next run resumes
-    from the persisted deltaLinks and cTags. ``payload["timeout_s"]``
-    overrides the configured value for one run (0 = unbounded).
+    Bounded by ``extraction.timeout_s``. On expiry the run saves its state,
+    reports ``interrupted_reason="timeout"``, and fails the job; the next
+    run resumes from the persisted deltaLinks and cTags.
+    ``payload["timeout_s"]`` overrides the configured value for one run
+    (0 = unbounded).
 
     An exhausted 429 budget stops a run the same way, reporting
-    ``interrupted_reason="throttled"`` — see :data:`_STOP_REASONS` for why
-    those two, and only those two, license a caller to tell the operator the
-    next run picks up where this one stopped.
+    ``interrupted_reason="throttled"``. So does an admin-requested
+    cooperative stop (``POST …/extraction/stop`` — see :func:`request_stop`),
+    reporting ``interrupted_reason="stopped"`` — see :data:`_STOP_REASONS`
+    for why those three, and only those three, license a caller to tell the
+    operator the next run picks up where this one stopped.
 
     ``payload``: ``connection_id`` (required — a ``source_connections`` row
     with ``source_type='sharepoint'``) and optionally ``scopes`` (a list of
     ``source_scope_id``s to narrow the run to; every confirmed scope
-    otherwise) and ``concurrency`` (this run's in-page item concurrency,
+    otherwise), ``concurrency`` (this run's in-page item concurrency,
     overriding ``extraction.crawler.concurrency``, clamped to
     ``[1, 16]`` — the same one-run override shape ``timeout_s`` has; the
-    report's ``concurrency`` block names the effective value and its source).
-    Credentials are resolved from the row, never from the payload.
+    report's ``concurrency`` block names the effective value and its source),
+    and ``resync`` (truthy — drops this connection's persisted deltaLinks
+    and item-failure queue before crawling, so every drive re-enumerates
+    from scratch; see :func:`_apply_resync`. The supported way to recover a
+    connection stuck believing it has nothing left to do). Credentials are
+    resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
@@ -2479,9 +4029,13 @@ def run_builtin_crawl(payload: dict) -> dict:
 
     An optional ``job_id`` in the payload is recorded on the run row
     (``extraction_runs.job_id``) so the card can join a run to its job's
-    lifecycle. Nothing supplies it today — the worker hands this handler the
-    job's PAYLOAD, not its id — so the column is honestly null rather than
-    guessed, and the liveness check falls back to checkpoint age.
+    lifecycle. ``app/worker/kinds.py::dispatch_job`` merges the claimed job's
+    own id in before calling this handler's caller (``_run_corpus_
+    extraction``), since ``JobKind.handler`` only ever sees the payload, not
+    the job row — see ``_payload_for_handler`` there. A payload built outside
+    the worker (a test, a manual trigger) may simply omit it; the column is
+    then honestly null rather than guessed, and the liveness check falls
+    back to checkpoint age.
     """
     connection_id = payload.get("connection_id")
     if not connection_id:
@@ -2492,6 +4046,9 @@ def run_builtin_crawl(payload: dict) -> dict:
     connection = source_connections_repo().get(connection_id)
     if connection is None or connection.get("source_type") != "sharepoint":
         raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
+
+    if payload.get("resync"):
+        _apply_resync(str(connection_id))
 
     try:
         return asyncio.run(

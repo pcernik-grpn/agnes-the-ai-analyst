@@ -192,7 +192,11 @@
   .plugin-system-btn {
     display: inline-flex; align-items: center; gap: 5px;
     background: var(--ds-surface); border: 1px solid var(--ds-accent-warn-line);
-    border-radius: 6px; padding: 5px 11px; font-size: 11px;
+    /* #1956 item 14c: every other labelled button in the app wears
+       --ds-radius-btn — this one hardcoded a bespoke 6px, which is part of
+       why it read as a different species of control than the toggle beside
+       it. */
+    border-radius: var(--ds-radius-btn); padding: 5px 11px; font-size: 11px;
     font-weight: 600; cursor: pointer;
     color: var(--ds-accent-warn-ink); white-space: nowrap;
     transition: background 0.15s, border-color 0.15s, color 0.15s;
@@ -230,10 +234,33 @@
     text-transform: uppercase; letter-spacing: 0.4px;
   }
 
-  /* v78: "Disable plugin" toggle switch — copied from admin_users.html so
-     the on/off control reads identically across the admin surface. */
-  .plugin-disable-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-  .plugin-disable-toggle .toggle-label { font-size: 11px; font-weight: 600; color: var(--text-secondary, #6b7280); }
+  /* v78: on/off toggle switch — copied from admin_users.html so the widget
+     itself reads identically across the admin surface. #1956 item 14b: the
+     original label/checked semantics ("Disabled", checked = hidden) were
+     inverted from the switch's own visual language (checked/coloured read as
+     "on"). The class name and caption were renamed to the "Enabled" framing
+     this control has always rendered as everywhere else; the wire field it
+     writes (admin_disabled) is unchanged, only the presentation flipped. */
+  .plugin-enabled-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .plugin-enabled-toggle .toggle-label { font-size: 11px; font-weight: 600; color: var(--text-secondary, #6b7280); }
+  /* #1956 item 14c: shared wrapper so the Enabled toggle and the system-mark
+     button (still a button — see the JS comment above sysBtnIcon for why)
+     read as one matched row of controls instead of two unrelated widgets. */
+  .plugin-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .plugin-system-control { display: inline-flex; align-items: center; gap: 6px; }
+  /* Small, always-visible help affordance — a bare `title` on the button
+     text alone was not discoverable enough (#1913 traces back to exactly
+     this control being misread). */
+  .plugin-help-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%; flex-shrink: 0;
+    background: var(--ds-surface-dim); color: var(--ds-text-secondary);
+    cursor: help;
+  }
+  .plugin-help-icon:hover, .plugin-help-icon:focus-visible {
+    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+    outline: none;
+  }
   .toggle { position: relative; display: inline-block; width: 36px; height: 20px; }
   .toggle input { opacity: 0; width: 0; height: 0; }
   .toggle-slider {
@@ -245,7 +272,10 @@
     width: 16px; height: 16px; background: var(--surface, #fff); border-radius: 50%;
     transition: 0.2s;
   }
-  .toggle input:checked + .toggle-slider { background: var(--ds-accent-danger-ink, #ef4444); }
+  /* Checked == Enabled == ON, so it wears the same positive/success tone as
+     the sync "ok" dot elsewhere on this page (.mp-ok-dot) rather than the
+     alarm-red the old inverted "Disabled" reading used. */
+  .toggle input:checked + .toggle-slider { background: var(--ds-accent-success-ink); }
   .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
   .toggle input:focus-visible + .toggle-slider { outline: 2px solid var(--ds-primary, #6366f1); outline-offset: 2px; }
   .toggle input:disabled + .toggle-slider { opacity: 0.5; cursor: wait; }
@@ -277,6 +307,48 @@
    action sets render via `ds.button` (auto-imported by base_ds). JS-generated
    per-row `.icon-btn` actions stay page-local. #}
 <div class="marketplaces-page">
+
+  {# ── Synced, listed here, and in nobody's Library ────────────────────────
+     The page's own table proves a marketplace produced plugins; the served
+     feed (`/marketplace.zip`, `/marketplace.git/*`) is grant-filtered per
+     caller, so until a group is granted them those plugins reach no user.
+     That gap is invisible from every column above, and the reported symptom
+     was an admin registering a marketplace, seeing its plugins right here,
+     opening /library and concluding the product was broken.
+
+     The shared context strip in its warn state (`.apg-strip`,
+     css/admin_page.css), built exactly like the Packages lens's "N tables in
+     no package" band: leading mark, one sentence, plain trailing links. A
+     tinted strip renders every `a` inside it as inherited-ink + underline, so
+     a `.btn` in here would come out a colourless underlined rectangle — the
+     links are the house form for this object, not a downgrade.
+
+     Server-rendered and CONDITIONAL: once every plugin is granted it is gone,
+     because a finished setup should not be nagged. Data:
+     `_marketplace_plugin_delivery()` in app/web/router.py. #}
+  {% if plugin_delivery and plugin_delivery.ungranted %}
+  {% set _n = plugin_delivery.ungranted %}
+  <div class="apg-strip apg-strip--warn" id="mp-ungranted-note">
+    <span class="apg-strip__mark" aria-hidden="true">!</span>
+    <span>
+      <strong>{{ _n }} plugin{{ '' if _n == 1 else 's' }} granted to no group</strong>
+      — synced and listed below, but the served marketplace is filtered by group,
+      so {{ 'it reaches' if _n == 1 else 'they reach' }} nobody. Grant
+      {{ 'it' if _n == 1 else 'them' }} to a group and
+      {{ 'it appears' if _n == 1 else 'they appear' }} in those people's Library.
+    </span>
+    <span class="apg-strip__end">
+      {# `?kind=` is the Access page's own resource-type filter (`listKind`),
+         so the reader lands on the grant editor already narrowed to plugins
+         rather than on every resource this instance governs. #}
+      <a href="/admin/access?kind=marketplace_plugin">Grant {{ 'it' if _n == 1 else 'them' }} to a group &rarr;</a>
+      {# The preview lens, not "open the Library as yourself" — a different
+         question. It is the honest check that the grant landed. #}
+      <a href="{{ simulate_lens_href }}"
+         title="Preview a person's Library exactly as their groups leave it">Preview someone's Library &rarr;</a>
+    </span>
+  </div>
+  {% endif %}
 
   <div class="marketplaces-toolbar">
     <input id="mp-search" type="search" class="search-input" placeholder="Filter by slug, name, or URL…" aria-label="Filter by slug, name, or URL" autocomplete="off">
@@ -724,8 +796,12 @@ async function openDetails(id, name) {
       const isDisabled = p.admin_disabled === true;
       // v78: a disabled plugin is hidden everywhere, so the amber SYSTEM pill
       // is replaced by a neutral DISABLED pill and the system button is locked.
+      // #1956 item 14d: the title also calls out the auto-disable path — an
+      // admin who never touched the toggle otherwise has no way to learn a
+      // deprecated-upstream plugin got re-hidden on the last sync (see
+      // src/marketplace.py's deprecated-plugin sync step).
       const sysPill = isDisabled
-        ? `<span class="plugin-disabled-pill" title="Admin-disabled — hidden from every user across all served surfaces">DISABLED</span>`
+        ? `<span class="plugin-disabled-pill" title="Admin-disabled — hidden from every user across all served surfaces. If the marketplace's metadata marks this plugin deprecated, sync re-disables it automatically on every run.">DISABLED</span>`
         : (p.is_system
           ? `<span class="plugin-system-pill" title="Mandatory for every user — managed below">SYSTEM</span>`
           : "");
@@ -741,11 +817,15 @@ async function openDetails(id, name) {
         ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
         : "";
       const sysBtnLabel = p.is_system ? "Unmark system" : "Mark as system";
+      // #1956 item 14a: every branch now restates what "system" fundamentally
+      // means (mandatory for every user), not just the next click's specific
+      // side effect — "Unmark system" previously explained only the unmark
+      // consequence, never the concept itself.
       const sysBtnTitle = isDisabled
-        ? "Plugin is disabled. Re-enable it before marking as system."
+        ? "System means mandatory for every user. Plugin is disabled, so it can't be marked as system — re-enable it first."
         : (p.is_system
-          ? "Remove the system mark. Existing per-group grants and per-user subscriptions remain — admin can clean them up on each group's Access tab."
-          : "Make this plugin mandatory for every user. Adds RBAC grants for every group and subscriptions for every user.");
+          ? "System means mandatory for every user. Unmark removes that going forward, but existing per-group grants and per-user subscriptions remain — admin can clean them up on each group's Access tab."
+          : "Mark as system to make this plugin mandatory for every user: adds an RBAC grant for every group and a subscription for every user.");
       // Shield icon on both states — it's the semantic anchor for
       // "org policy / system" and dropping it on unmark broke visual
       // parity between the two toggle states.
@@ -754,31 +834,55 @@ async function openDetails(id, name) {
               stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
            <path d="M12 2 4 6v6c0 5 3.4 9.5 8 10 4.6-.5 8-5 8-10V6l-8-4z"/>
          </svg>`;
+      // #1956 item 14a: a small always-visible help affordance beside the
+      // system control — a bare `title` on the button text was already there
+      // and was evidently not discoverable enough (this is exactly what
+      // #1913's reporter misread). This one carries a constant explanation of
+      // the *concept*, independent of is_system/admin_disabled, so it reads
+      // the same in every state.
+      const sysHelpIcon =
+        `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+           <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="11.5"/><line x1="12" y1="8" x2="12" y2="8"/>
+         </svg>`;
+      // No literal double quotes here — esc() round-trips through
+      // textContent/innerHTML, which (correctly, per the HTML text-node
+      // serialization algorithm) escapes &/</> but not ", so a literal "
+      // would break out of the surrounding title="…" attribute.
+      const sysHelpText =
+        "System marks a plugin mandatory for every user: it grants every existing group, subscribes every existing user, and new users/groups inherit it automatically from then on. Users can't remove it themselves. Unmarking stops that going forward but does not undo grants or subscriptions already made — clean those up on each group's Access tab.";
       return `<div class="plugin-item">
         <div class="plugin-item-head">
           <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
           <span class="spacer"></span>
-          <label class="plugin-disable-toggle" title="${esc(isDisabled
-              ? "Plugin is admin-disabled and hidden everywhere. Toggle off to re-enable."
-              : "Admin-disable this plugin instance-wide — hides it from every served surface for all users.")}">
-            <span class="toggle-label">Disabled</span>
-            <span class="toggle">
-              <input type="checkbox"
-                     data-action="toggle-disabled"
-                     data-marketplace="${esc(id)}"
-                     data-plugin="${esc(p.name)}"
-                     data-admin-disabled="${isDisabled ? "1" : "0"}"
-                     ${isDisabled ? "checked" : ""}>
-              <span class="toggle-slider"></span>
+          <span class="plugin-controls">
+            <label class="plugin-enabled-toggle" title="${esc(isDisabled
+                ? "Hidden from every served surface for all users. Toggle on to make it available again."
+                : "Available to users with a grant. Toggle off to admin-disable it instance-wide — hides it from every served surface for all users.")}">
+              <span class="toggle-label">Enabled</span>
+              <span class="toggle">
+                <input type="checkbox"
+                       data-action="toggle-disabled"
+                       data-marketplace="${esc(id)}"
+                       data-plugin="${esc(p.name)}"
+                       data-admin-disabled="${isDisabled ? "1" : "0"}"
+                       ${isDisabled ? "" : "checked"}>
+                <span class="toggle-slider"></span>
+              </span>
+            </label>
+            <span class="plugin-system-control">
+              <button class="plugin-system-btn ${p.is_system ? "is-system" : ""} ${isDisabled ? "is-locked" : ""}"
+                      data-action="toggle-system"
+                      data-marketplace="${esc(id)}"
+                      data-plugin="${esc(p.name)}"
+                      data-is-system="${p.is_system ? "1" : "0"}"
+                      ${isDisabled ? "disabled" : ""}
+                      title="${esc(sysBtnTitle)}">${sysBtnIcon}${esc(sysBtnLabel)}</button>
+              <span class="plugin-help-icon" tabindex="0" role="img"
+                    aria-label="What does marking a plugin as system do?"
+                    title="${esc(sysHelpText)}">${sysHelpIcon}</span>
             </span>
-          </label>
-          <button class="plugin-system-btn ${p.is_system ? "is-system" : ""} ${isDisabled ? "is-locked" : ""}"
-                  data-action="toggle-system"
-                  data-marketplace="${esc(id)}"
-                  data-plugin="${esc(p.name)}"
-                  data-is-system="${p.is_system ? "1" : "0"}"
-                  ${isDisabled ? "disabled" : ""}
-                  title="${esc(sysBtnTitle)}">${sysBtnIcon}${esc(sysBtnLabel)}</button>
+          </span>
         </div>${desc}${metaHtml}
       </div>`;
     }).join("");
@@ -897,9 +1001,10 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
   const bodyEl = document.getElementById("disable-confirm-body");
   const okBtn = document.getElementById("disable-confirm-ok-btn");
 
-  // Revert the optimistic flip — the switch only reflects server state after
-  // the re-fetch in openDetails. If the admin cancels, it must stay as-is.
-  el.checked = isDisabled;
+  // Revert the optimistic flip — the switch (labelled "Enabled": checked ==
+  // available) only reflects server state after the re-fetch in openDetails.
+  // If the admin cancels, it must snap back to what the server still has.
+  el.checked = !isDisabled;
 
   if (isDisabled) {
     titleEl.textContent = "Enable plugin?";

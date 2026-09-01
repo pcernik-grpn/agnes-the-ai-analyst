@@ -2178,13 +2178,16 @@ def _mark_anonymize(client, headers, *, corpus_id: str, name: str) -> str:
     return str(r.json()["id"])
 
 
-def _producer_auth(conn_id: str, corpus_id: str) -> dict:
-    """Uploads into the scope-marked corpus ride the producer's scoped
-    credential - an interactive upload is 409 `collection_source_managed`
-    by design, and the anonymize-in-front producer is the real caller."""
-    from app.auth.producer_token import mint_producer_token
+def _pipeline_upload(client, corpus_id: str, headers: dict, **kwargs):
+    """Uploads into the scope-marked corpus arrive only through the
+    in-process pipeline — an interactive upload is 409
+    `collection_source_managed` by design and the external producer's HTTP
+    credential no longer exists. Suspend the integrity rule for the request
+    (the refusal is covered in tests/test_api_collections.py)."""
+    from unittest import mock
 
-    return _auth(mint_producer_token(connection_id=conn_id, collection_ids=[corpus_id], ttl_seconds=3600))
+    with mock.patch("app.api.collections.source_managing_connection", return_value=None):
+        return client.post(f"/api/collections/{corpus_id}/files", headers=headers, **kwargs)
 
 
 def test_http_anonymize_marked_corpus_without_declaration_writes_nothing(tmp_path, monkeypatch, pg_engine):
@@ -2194,14 +2197,15 @@ def test_http_anonymize_marked_corpus_without_declaration_writes_nothing(tmp_pat
     created = client.post("/api/collections", json={"name": "Anon Gate E2E"}, headers=headers)
     assert created.status_code == 201, created.text
     corpus_id = created.json()["id"]
-    conn_id = _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg")
+    _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg")
 
     content = b"Acme Rollout is sponsored by Alice Adams."
-    up = client.post(
-        f"/api/collections/{corpus_id}/files",
+    up = _pipeline_upload(
+        client,
+        corpus_id,
+        _auth(admin_token),
         files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
         data={"paths": ["acme.md"]},
-        headers=_producer_auth(conn_id, corpus_id),
     )
     assert up.status_code == 201, up.text
 
@@ -2240,14 +2244,15 @@ def test_http_anonymize_marked_corpus_with_declaration_is_accepted(tmp_path, mon
     created = client.post("/api/collections", json={"name": "Anon Gate Declared E2E"}, headers=headers)
     assert created.status_code == 201, created.text
     corpus_id = created.json()["id"]
-    conn_id = _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg-declared")
+    _mark_anonymize(client, headers, corpus_id=corpus_id, name="sp-gate-pg-declared")
 
     content = b"Acme Rollout is sponsored by Alice Adams."
-    up = client.post(
-        f"/api/collections/{corpus_id}/files",
+    up = _pipeline_upload(
+        client,
+        corpus_id,
+        _auth(admin_token),
         files={"files": ("acme.md", io.BytesIO(content), "text/markdown")},
         data={"paths": ["acme.md"]},
-        headers=_producer_auth(conn_id, corpus_id),
     )
     assert up.status_code == 201, up.text
 

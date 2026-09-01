@@ -78,7 +78,8 @@ from app.instance_config import feature_enabled, get_data_apps_config, get_publi
 from app.resource_types import ResourceType
 from app.secrets_vault import VaultKeyNotConfiguredError, decrypt_secret, encrypt_secret
 from src.audit_helpers import log_safe
-from src.data_apps.git_repos import fast_forward_live, init_app_repo
+from src.data_apps.deploy_check import CheckReport, check_git_ref, skipped_report
+from src.data_apps.git_repos import fast_forward_live, init_app_repo, resolve_ref
 from src.data_apps.runner_client import RunnerClient, RunnerError, RunnerUnavailable, up_timeout
 from src.data_apps.spec import AGNES_INTERNAL_URL, RESERVED_SLUGS, SLUG_RE, build_config_json, build_container_spec
 from src.repositories import access_token_repo, audit_repo, data_apps_repo, users_repo
@@ -173,6 +174,12 @@ _CONFIG_DEFAULTS = {
     # `src/data_apps/spec.py::build_container_spec`.
     "container_read_only": False,
     "container_pids_limit": 512,
+    # Deploy-time exposure scan (#1946, `src/data_apps/deploy_check.py`) —
+    # warn-first: `warn` surfaces findings alongside a deploy that still
+    # runs, `block` refuses the deploy on any finding, `off` skips the scan
+    # entirely. A plain config key, not a switches.py entry — it's a
+    # three-way mode, not a feature flag (see `_deploy_check_mode`).
+    "deploy_checks": "warn",
 }
 
 # `POST /api/data-apps` quota-check-then-create serialization. Short TTL —
@@ -342,6 +349,14 @@ def require_op_lease(slug: str) -> str:
 
 def _effective_config() -> dict:
     return {**_CONFIG_DEFAULTS, **get_data_apps_config()}
+
+
+def _deploy_check_mode() -> str:
+    """`data_apps.deploy_checks` — `warn` (default) / `block` / `off`. Any
+    other configured value falls back to `warn` rather than silently
+    disabling the scan on a typo."""
+    mode = _effective_config().get("deploy_checks", "warn")
+    return mode if mode in ("warn", "block", "off") else "warn"
 
 
 def same_origin_serving_allowed() -> bool:
@@ -1417,6 +1432,7 @@ async def deploy_data_app(
     holder = require_op_lease(slug)
     try:
         repo = data_apps_repo()
+        deploy_check_result: Optional[CheckReport] = None
         if payload.mode == "dev":
             # Dev-mode deploys serve the draft's pinned `draft_branch` straight
             # from the parent's repo — `build_config_json` already selects it
@@ -1439,7 +1455,47 @@ async def deploy_data_app(
             if payload.sha:
                 raise HTTPException(status_code=400, detail="external_repo_sha_unsupported")
             sha = ""
+            # An external repo's source never reaches Agnes, so it can never
+            # be scanned (#1946). `warn`/`off` say so in the response; `block`
+            # refuses the deploy rather than silently exempting it from a
+            # policy the operator deliberately opted into.
+            check_mode = _deploy_check_mode()
+            if check_mode == "block":
+                raise HTTPException(status_code=422, detail={"error": "deploy_check_unavailable_external_repo"})
+            if check_mode != "off":
+                deploy_check_result = skipped_report("external_repo")
         else:
+            # Deploy-time exposure scan (#1946) — resolve the SAME target the
+            # fast-forward below will land on (explicit sha, else the default
+            # branch) and lint it BEFORE `fast_forward_live` ever runs, so a
+            # `block`-mode finding never advances `agnes-live` or reaches the
+            # runner. `target_sha` is None only when there's nothing valid to
+            # check (no commits yet, or a bogus sha) — `fast_forward_live`
+            # below raises its own, already-handled error for that.
+            check_mode = _deploy_check_mode()
+            target_sha = (
+                resolve_ref(slug, payload.sha)
+                if payload.sha
+                else (resolve_ref(slug, "main") or resolve_ref(slug, "HEAD"))
+            )
+            if check_mode != "off" and target_sha:
+                deploy_check_result = check_git_ref(slug, target_sha, secret_names=())
+                _audit(
+                    conn,
+                    user["id"],
+                    "data_app.deploy_check",
+                    f"data_app:{slug}",
+                    {
+                        "status": deploy_check_result["status"],
+                        "finding_count": len(deploy_check_result["findings"]),
+                        "rule_ids": sorted({f["rule_id"] for f in deploy_check_result["findings"]}),
+                    },
+                )
+                if check_mode == "block" and deploy_check_result["findings"]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error": "deploy_check_failed", "deploy_check": deploy_check_result},
+                    )
             try:
                 sha = fast_forward_live(slug, payload.sha)
             except ValueError as exc:
@@ -1473,7 +1529,10 @@ async def deploy_data_app(
         repo.set_state(row["id"], "running")
         _audit(conn, user["id"], "data_app.deploy", f"data_app:{slug}", {"sha": sha})
 
-        return {"state": "running", "deployed_sha": sha}
+        result: dict = {"state": "running", "deployed_sha": sha}
+        if deploy_check_result is not None:
+            result["deploy_check"] = deploy_check_result
+        return result
     finally:
         release_op_lease(slug, holder)
 

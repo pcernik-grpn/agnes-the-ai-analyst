@@ -98,6 +98,22 @@ def _model_name(parsed: Optional[Dict[str, Any]]) -> Optional[str]:
     return models[0].get("name") or None
 
 
+def _model_description(parsed: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The document's own first ``semantic_model`` entry's ``description``,
+    projected onto the stored row's ``description`` column (#1955) so a
+    freshly-synced model is never blank at the source — mirrors
+    :func:`_model_name`. The Library row (``app/web/router.py``) also falls
+    back to the document's description at render time for rows synced
+    before this projection existed, or by a sync path that doesn't call it;
+    this is the write-time half, for rows created from here on."""
+    if not parsed:
+        return None
+    models = parsed.get("semantic_model") or []
+    if not models:
+        return None
+    return models[0].get("description") or None
+
+
 def _stable_suffix(parsed: Optional[Dict[str, Any]], content_hash: str) -> str:
     """The suffix that tells two same-named models apart, stably across runs.
 
@@ -115,9 +131,7 @@ def _stable_suffix(parsed: Optional[Dict[str, Any]], content_hash: str) -> str:
     return key if key and key != (model.get("name") or "") else content_hash[:12]
 
 
-def _disambiguated_slug(
-    slug: str, parsed: Optional[Dict[str, Any]], content_hash: str, seen_slugs: set[str]
-) -> str:
+def _disambiguated_slug(slug: str, parsed: Optional[Dict[str, Any]], content_hash: str, seen_slugs: set[str]) -> str:
     """``slug`` itself the first time it appears in a batch, ``slug-<stable
     id>`` after that.
 
@@ -138,8 +152,7 @@ def _disambiguated_slug(
         candidate = f"{slug}-{_stable_suffix(parsed, content_hash)}-{suffix}"
         suffix += 1
     logger.warning(
-        "Semantic import: two documents declare the model name %r; storing the later one as %r so "
-        "neither is lost.",
+        "Semantic import: two documents declare the model name %r; storing the later one as %r so neither is lost.",
         slug,
         candidate,
     )
@@ -235,7 +248,7 @@ def import_documents(source: dict, documents: List[str]) -> ImportReport:
             id="/".join([src_name, src_ref or "_", slug_key]),
             slug=slug_key,
             name=name,
-            description=None,
+            description=_model_description(document_json),
             document=text,
             document_json=document_json,
             spec_version=result.spec_version,

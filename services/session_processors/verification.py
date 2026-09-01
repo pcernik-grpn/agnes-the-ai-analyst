@@ -78,6 +78,24 @@ class VerificationProcessor:
         conn: duckdb.DuckDBPyConnection,
         **kwargs: object,
     ) -> ProcessorResult:
+        # Read corporate_memory.sources.session_transcripts.* fresh on every
+        # call (not cached at import/construction time) — same live-read
+        # contract as resolve_distribution_mode() / the collector's own
+        # governance_config lookup, so a save in /admin/server-config takes
+        # effect on the next scheduler tick, no restart required (#1957).
+        from app.instance_config import get_corporate_memory_config
+
+        cm_config = get_corporate_memory_config() or {}
+        session_transcripts_config = (cm_config.get("sources") or {}).get("session_transcripts") or {}
+
+        if session_transcripts_config.get("enabled", True) is False:
+            logger.info(
+                "Session-transcript extraction disabled via "
+                "corporate_memory.sources.session_transcripts.enabled — skipping %s",
+                session_key,
+            )
+            return ProcessorResult(items_count=0)
+
         repo = knowledge_repo()
         session_id = f"session-{session_path.stem}-{username}"
 
@@ -87,6 +105,28 @@ class VerificationProcessor:
             return ProcessorResult(items_count=0)
 
         verifications = extract_verifications(self.extractor, username, session_id, turns)
+
+        # Deterministic post-filter on corporate_memory.sources.
+        # session_transcripts.detection_types, BEFORE dedup/insert below.
+        # Absent key (legacy/no corporate_memory config, or the section
+        # exists but doesn't set this key) keeps every detection_type the
+        # LLM can return — behavior is unchanged from before this knob was
+        # wired. An explicit empty list is a valid, if unusual, way to
+        # block every detection type without disabling the source outright.
+        allowed_detection_types = session_transcripts_config.get("detection_types")
+        if allowed_detection_types is not None:
+            allowed_set = set(allowed_detection_types)
+            before_count = len(verifications)
+            verifications = [v for v in verifications if v.get("detection_type") in allowed_set]
+            dropped_count = before_count - len(verifications)
+            if dropped_count:
+                logger.info(
+                    "detection_types filter dropped %d/%d extracted verification(s) for %s (allowed=%s)",
+                    dropped_count,
+                    before_count,
+                    session_key,
+                    sorted(allowed_set),
+                )
 
         items_created = 0
         loop_start = time.monotonic()

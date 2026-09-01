@@ -71,6 +71,78 @@ def _make_package(seeded_app, slug: str, *, granted: bool) -> str:
     return pkg_id
 
 
+def _group_with(name: str, *user_ids: str) -> str:
+    """A non-system group holding exactly the named seeded users.
+
+    Grants in these tests go to a group somebody is EXPLICITLY enrolled in.
+    The seeded users are not in ``Everyone`` on their own — that membership is
+    a real ``user_group_members`` row ``ensure_everyone_membership()`` writes
+    at sign-in, which the fixture never runs — so a grant to ``Everyone`` and
+    a member who was never enrolled would assert nothing.
+    """
+    from src.repositories import user_group_members_repo, user_groups_repo
+
+    groups = user_groups_repo()
+    group = groups.get_by_name(name) or groups.create(name)
+    members = user_group_members_repo()
+    for uid in user_ids:
+        if not members.has_membership(uid, group["id"]):
+            members.add_member(uid, group["id"], source="test")
+    return group["id"]
+
+
+def _grant(seeded_app, *, group_id: str, resource_type: str, resource_id: str, requirement: str = "available") -> None:
+    r = seeded_app["client"].post(
+        "/api/admin/grants",
+        headers=_auth(seeded_app["admin_token"]),
+        json={
+            "group_id": group_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "requirement": requirement,
+        },
+    )
+    assert r.status_code in (200, 201, 409), r.text
+
+
+def _make_plugin(
+    *,
+    marketplace_id: str = "mp-example",
+    name: str = "seam-plugin",
+    admin_disabled: bool = False,
+) -> str:
+    """A curated plugin on a registered marketplace. Returns its grant path
+    (``<marketplace_id>/<plugin_name>``) — the id `resource_grants` stores."""
+    from src.repositories import marketplace_plugins_repo, marketplace_registry_repo
+
+    marketplace_registry_repo().register(
+        id=marketplace_id,
+        name="Example marketplace",
+        url="https://example.com/marketplace.git",
+    )
+    marketplace_plugins_repo().replace_for_marketplace(
+        marketplace_id,
+        [{"name": name, "version": "1.0", "description": "A plugin shared by the organization."}],
+    )
+    if admin_disabled:
+        marketplace_plugins_repo().set_admin_disabled(marketplace_id, name, True)
+    return f"{marketplace_id}/{name}"
+
+
+def _make_recipe(slug: str = "seam-recipe", title: str = "Seam recipe") -> str:
+    from src.repositories import recipes_repo
+
+    return recipes_repo().create(
+        slug=slug,
+        title=title,
+        description="A prepared analysis an admin curated.",
+        icon=None,
+        color=None,
+        sql_template="SELECT 1",
+        related_table_ids=[],
+    )
+
+
 class TestTheContextContract:
     """Any link that crosses the admin↔analyst seam carries its origin in the
     URL (`?from=`), and the destination's back link honors it. The pattern is
@@ -394,3 +466,152 @@ class TestTheLibraryShapedPreview:
         assert "Required by your admin" in src
         assert "In their Library" in src
         assert "Optional — no local copy yet" in src
+
+    def test_the_pane_renders_whatever_kinds_the_api_sends(self) -> None:
+        """The band renderer is generic over ``sections`` and a kind with no
+        admin page falls back to the row's own analyst href — which is what
+        lets a widened preview reach the panel with no per-kind JS, and what
+        keeps the next kind from needing a template change either."""
+        src = ACCESS.read_text()
+        assert "preview.sections.map(" in src
+        assert "adminPage ? adminPage(it.id) : it.href" in src
+
+
+class TestThePreviewCoversEveryGrantedKind:
+    """Simulate answers for the kinds the Library actually shows.
+
+    It used to iterate two — data packages and memory domains — so "I can see
+    it in admin but they cannot see it in their Library" got a real answer for
+    governed data and silence for a curated plugin, which is the same question
+    about a different row. Every kind here is resolved the way ``/library``
+    resolves it, so the preview cannot claim something the page won't render.
+    """
+
+    API = "/api/admin/users/{uid}/library-preview"
+
+    def _preview(self, seeded_app, uid: str) -> dict:
+        r = seeded_app["client"].get(self.API.format(uid=uid), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _section(self, body: dict, kind: str) -> dict | None:
+        return next((s for s in body["sections"] if s["kind"] == kind), None)
+
+    def test_a_granted_plugin_is_in_the_preview(self, seeded_app) -> None:
+        """The half the lens used to stay silent on."""
+        path = _make_plugin()
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+
+        section = self._section(self._preview(seeded_app, "analyst1"), "marketplace_plugin")
+        assert section is not None, "a granted plugin must reach the preview"
+        assert section["label"] == "Plugins"
+        row = next(i for i in section["items"] if i["id"] == path)
+        assert row["name"] == "seam-plugin"
+        assert row["href"] == "/marketplace/curated/mp-example/seam-plugin"
+
+    def test_an_uninstalled_available_plugin_is_eligible_not_delivered(self, seeded_app) -> None:
+        """A plugin is the one granted kind whose membership is NOT automatic:
+        an available-tier grant nobody installed is eligibility, and their
+        Claude Code does not load it. Saying "in stack" there is exactly the
+        false reassurance this pane exists to avoid."""
+        path = _make_plugin(name="seam-uninstalled")
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+
+        section = self._section(self._preview(seeded_app, "analyst1"), "marketplace_plugin")
+        row = next(i for i in section["items"] if i["id"] == path)
+        assert row["requirement"] == "available"
+        assert row["in_stack"] is False
+        assert row["materialized"] is False
+
+    def test_a_required_plugin_grant_is_already_served_to_them(self, seeded_app) -> None:
+        path = _make_plugin(name="seam-required")
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(
+            seeded_app,
+            group_id=gid,
+            resource_type="marketplace_plugin",
+            resource_id=path,
+            requirement="required",
+        )
+
+        section = self._section(self._preview(seeded_app, "analyst1"), "marketplace_plugin")
+        row = next(i for i in section["items"] if i["id"] == path)
+        assert row["requirement"] == "required"
+        assert row["in_stack"] is True
+        assert row["materialized"] is True
+
+    def test_a_plugin_granted_to_a_group_they_are_not_in_stays_out(self, seeded_app) -> None:
+        """The non-member proof. ``viewer1`` is in no group holding the grant,
+        so their preview must not list the plugin — an admin simulating them
+        is asking what THEY see, and no answer may be god-mode."""
+        path = _make_plugin()
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+
+        body = self._preview(seeded_app, "viewer1")
+        assert body["sections"] == []
+
+    def test_an_admin_disabled_plugin_is_in_nobodys_library(self, seeded_app) -> None:
+        """Admin-disabled is instance-wide "does not exist" for every
+        user-facing surface, grants notwithstanding — the same post-filter
+        /library applies."""
+        path = _make_plugin(name="seam-disabled", admin_disabled=True)
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+
+        assert self._section(self._preview(seeded_app, "analyst1"), "marketplace_plugin") is None
+
+    def test_a_granted_recipe_is_in_the_preview(self, seeded_app) -> None:
+        recipe_id = _make_recipe()
+        gid = _group_with("seam-recipe-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="recipe", resource_id=recipe_id)
+
+        section = self._section(self._preview(seeded_app, "analyst1"), "recipe")
+        assert section is not None
+        assert section["label"] == "Recipes"
+        row = next(i for i in section["items"] if i["id"] == recipe_id)
+        assert row["name"] == "Seam recipe"
+        assert row["href"] == "/catalog/r/seam-recipe"
+        # Nothing to opt into and nothing to download: the grant IS the
+        # reading right, and `agnes pull` does not distribute recipes.
+        assert row["in_stack"] is True
+        assert row["materialized"] is False
+
+    def test_a_recipe_granted_elsewhere_stays_out(self, seeded_app) -> None:
+        recipe_id = _make_recipe(slug="seam-recipe-private", title="Private seam recipe")
+        gid = _group_with("seam-recipe-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="recipe", resource_id=recipe_id)
+
+        assert self._preview(seeded_app, "viewer1")["sections"] == []
+
+    def test_the_governed_kinds_keep_their_own_sections(self, seeded_app) -> None:
+        """Widening adds bands; it does not reshape the two that were here.
+        The order mirrors the Library's own reading order, so the preview
+        looks like the page it predicts."""
+        pkg_id = _make_package(seeded_app, "seam-preview-mixed", granted=True)
+        path = _make_plugin(name="seam-mixed")
+        recipe_id = _make_recipe(slug="seam-recipe-mixed", title="Mixed seam recipe")
+        gid = _group_with("seam-mixed-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+        _grant(seeded_app, group_id=gid, resource_type="recipe", resource_id=recipe_id)
+
+        body = self._preview(seeded_app, "analyst1")
+        assert [s["kind"] for s in body["sections"]] == ["data_package", "marketplace_plugin", "recipe"]
+        packages = self._section(body, "data_package")
+        row = next(i for i in packages["items"] if i["id"] == pkg_id)
+        assert row["requirement"] == "available"
+        assert row["href"] == "/catalog/p/seam-preview-mixed"
+
+    def test_the_widened_preview_is_still_admin_only(self, seeded_app) -> None:
+        """More kinds must not come with a wider door."""
+        path = _make_plugin()
+        gid = _group_with("seam-plugin-readers", "analyst1")
+        _grant(seeded_app, group_id=gid, resource_type="marketplace_plugin", resource_id=path)
+
+        r = seeded_app["client"].get(
+            self.API.format(uid="analyst1"),
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403, r.text

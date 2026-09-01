@@ -328,6 +328,34 @@ def test_no_duplicate_unreleased_subsections(changelog_text: str) -> None:
     assert_no_duplicate_unreleased_subsections(changelog_text)
 
 
+def assert_no_conflict_markers(changelog_text: str) -> None:
+    """No line may BE a git conflict marker.
+
+    The other guards cannot see this. The released-region checksum covers
+    released blocks only, so a marker left in ``[Unreleased]`` passes it; the
+    duplicate-bullet guard compares bullets, and a marker line is not a
+    bullet. One reached ``main`` exactly that way during the 2026-09-01 merge
+    trains — an orphan ``<<<<<<< HEAD`` with no matching ``=======``, which a
+    union-style resolution passes through as ordinary text.
+
+    Matched at line start, never as a substring: the ``[0.55.1]`` section
+    legitimately DOCUMENTS these markers inside backticks, and a substring
+    test would report that prose as corruption.
+    """
+    bad = [
+        (i, line)
+        for i, line in enumerate(changelog_text.splitlines(), 1)
+        if line.startswith(("<<<<<<<", ">>>>>>>")) or line == "======="
+    ]
+    assert not bad, (
+        "CHANGELOG.md carries unresolved git conflict marker(s): "
+        + "; ".join(f"line {i}: {line!r}" for i, line in bad)
+        + ". A merge was committed without finishing the resolution — remove the "
+        "marker line(s) and keep the content that belongs there "
+        "(docs/RELEASING.md § CHANGELOG merge hazards)."
+    )
+
+
 def test_no_duplicate_unreleased_bullets(changelog_text: str) -> None:
     assert_no_duplicate_unreleased_bullets(changelog_text)
 
@@ -665,3 +693,51 @@ def test_a_release_cut_output_still_passes_the_guard() -> None:
     cut_pyproject = write_released_checksum(_PYPROJECT_STUB, released_region_sha256(cut))
 
     assert_released_region_unchanged(cut, cut_pyproject)
+
+
+# --- seventh guard: no unresolved conflict markers ------------------------
+
+
+def test_no_conflict_markers_in_the_committed_changelog(changelog_text: str) -> None:
+    assert_no_conflict_markers(changelog_text)
+
+
+def test_an_orphan_conflict_marker_is_caught() -> None:
+    """The real shape: a lone ``<<<<<<< HEAD`` with no matching ``=======``.
+
+    A union-style merge resolution keeps both sides of a BALANCED conflict and
+    passes an unbalanced marker through untouched, so it reads as ordinary
+    text and reaches the commit. Every other guard stays green on it — which
+    is why this one exists.
+    """
+    corrupt = _GOOD.replace("### Fixed", "<<<<<<< HEAD\n\n### Fixed", 1)
+
+    assert_single_unreleased(corrupt)
+    assert_no_duplicate_headings(corrupt)
+    assert_versions_strictly_descending(corrupt)
+    assert_no_duplicate_unreleased_bullets(corrupt)
+
+    with pytest.raises(AssertionError, match="conflict marker"):
+        assert_no_conflict_markers(corrupt)
+
+
+def test_a_full_conflict_block_is_caught() -> None:
+    corrupt = _GOOD.replace(
+        "- a shipped change\n",
+        "<<<<<<< HEAD\n- a shipped change\n=======\n- their version\n>>>>>>> branch\n",
+        1,
+    )
+    with pytest.raises(AssertionError, match="conflict marker"):
+        assert_no_conflict_markers(corrupt)
+
+
+def test_a_bullet_that_merely_mentions_markers_is_not_flagged() -> None:
+    """The [0.55.1] section documents these markers inside backticks. Matching
+    them as a substring rather than at line start would fail the build on
+    correct prose — so this is pinned, not left to care."""
+    prose = _GOOD.replace(
+        "- a shipped change",
+        "- removed the stray markers (`<<<<<<<` / `=======` / `>>>>>>>`) from the section",
+        1,
+    )
+    assert_no_conflict_markers(prose)

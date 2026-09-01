@@ -23,6 +23,21 @@ markdown is stored — so every downstream surface (`/raw`, `/preview`, the
 chunk index, search) necessarily serves the anonymized form, because that
 is all that was ever ingested.
 
+The document's **filename and folder path** get the same treatment, not
+just its body: for a lot of documents (a deal room, a client-named folder
+tree) the source name is the single most re-identifying string in it, so
+storing it verbatim would have broken the "never holds the original"
+guarantee even with a fully redacted body. The crawler
+(`connectors.sharepoint.crawler._anonymize_identity`) anonymizes each path
+SEGMENT independently — not the path as one opaque string — under the same
+per-instance key and the same detector as the body, and keeps the `/`
+separator structure: two files that really are under one folder still share
+one anonymized folder prefix, so folder-scoped browsing and prefix matching
+over the anonymized tree work the same shape they did over the real one.
+Routing decisions (which collection a file lands in, which exclusion rule
+applies) are still made against the REAL path, earlier in the pipeline —
+only what gets *persisted* is anonymized.
+
 Three moving parts:
 
 1. **Mark which scopes need it.** The connect wizard's step-2 "anonymize"
@@ -410,3 +425,14 @@ at all. An anonymized scope is materially safer than an un-anonymized one;
 it is not a guarantee that nothing identifying survived — which is what the
 preview panel is for: check a real sample of *your* documents before
 trusting a crawl over thousands of them.
+
+**Retroactive folder-exclusion/zone cleanup doesn't reach an anonymized
+scope's already-ingested files.** The ACL sweep that retroactively purges
+content under a newly excluded folder or a dissolved permission zone
+(`connectors.sharepoint.acl_sync._cleanup_connection_content`) matches on
+the STORED `corpus_files.path` — which is the anonymized path for a marked
+scope, and can never prefix-match the admin's real, un-anonymized exclusion
+folder or zone path. A file-kind exclusion (matched by the Graph item's
+stable id, not its path) is unaffected; only folder-kind exclusions and
+zone dissolutions lose their retroactive reach. Known, tracked (#2011), not
+yet fixed — see the comments at the match site in that module.
