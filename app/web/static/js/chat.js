@@ -106,6 +106,12 @@ let inFlightToolCalls = new Map();
 // a permanently-expanded dump of every stdout/stderr. Cleared by that same
 // pass — a card belongs to exactly one turn's collapse.
 let _currentTurnToolCards = [];
+// The open tool-call GROUP — the <details> that consecutive cards share (see
+// "Tool-call groups" below) — and, before there are two of them, the lone card
+// still standing on its own in the stream. Both are cleared by anything that
+// ends a run: a text token, an approval/question card, or the turn itself.
+let _currentToolGroup = null;
+let _looseToolCard = null;
 // tool_use_ids of in-flight preview tools. tool_result frames carry the call id
 // in `frame.tool` (NOT the tool name — see runner._emit_tool_result), so a
 // non-directive preview result (error / data_apps_disabled) is identified by
@@ -295,6 +301,7 @@ function renderSystemNote(text, tone) {
   note.className = `cloud-chat-system-note is-${tone === "error" ? "error" : "warn"}`;
   note.setAttribute("role", "status");
   note.textContent = text;
+  _endToolGroup();
   $("chat-messages").appendChild(note);
   maybeScrollToBottom();
 }
@@ -579,6 +586,31 @@ function stripSourcesFence(markdown) {
 
 const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
 
+/** Where a claim's chip goes when you click it.
+ *
+ *  Checking a number means opening the thing it came from, so the chip that
+ *  names that thing IS the link — it rendered as a dead label, which put the
+ *  most obvious next click of the whole answer nowhere (#1974).
+ *
+ *  The workspace prompt asks for the REGISTRY ID on a `table:` line and the
+ *  canonical `family/name` on a `metric:` one (see the "Say where every number
+ *  came from" section of app/initial_workspace_default/CLAUDE.md), which is
+ *  exactly what `/catalog/t/{id}` and the metrics tab's search take. A ref that
+ *  resolves to nothing lands on the catalog's own not-found page, which is a
+ *  true answer to "show me this table" — better than a chip that cannot be
+ *  asked. `assumption` is free text about the analyst's own choices, with
+ *  nothing to open, so it stays a plain label.
+ *
+ *  Built with encodeURIComponent, never string-pasted: the ref is model output
+ *  and lands in a URL. */
+function _claimHref(claim) {
+  const ref = (claim && claim.ref) || "";
+  if (!ref) return "";
+  if (claim.kind === "table") return `/catalog/t/${encodeURIComponent(ref)}`;
+  if (claim.kind === "metric") return `/semantic-layer?tab=all_metrics&q=${encodeURIComponent(ref)}`;
+  return "";
+}
+
 /** Chips under an assistant turn. `verdict` is the server's, never recomputed
  *  here — the client has no record of what actually ran, and a second opinion
  *  derived from less information would be worse than none. */
@@ -634,13 +666,17 @@ function renderSourcesChips(bubble, verdict) {
   }
 
   for (const c of claims) {
-    const chip = document.createElement("span");
+    // A table or metric claim is a link to the thing it names; an assumption
+    // has nothing to open and stays a <span> (see _claimHref).
+    const href = _claimHref(c);
+    const chip = document.createElement(href ? "a" : "span");
+    if (href) chip.href = href;
     // Three states, and the middle one is the point of the whole feature:
     // verified (a tool call supports it), unverified (the answer named
     // something nothing ran touched), and neutral (an assumption, which there
     // is nothing to check against).
     const state = c.verified === true ? "is-ok" : c.verified === false ? "is-unverified" : "is-neutral";
-    chip.className = `msg-source-chip ${state}`;
+    chip.className = `msg-source-chip ${state}${href ? " is-link" : ""}`;
     const kind = document.createElement("span");
     kind.className = "msg-source-kind";
     kind.textContent = _CLAIM_LABEL[c.kind] || c.kind;
@@ -1377,6 +1413,7 @@ async function deleteSession(chatId) {
     markActiveSidebar(null);
     if (ws) { ws.close(); ws = null; }
     $("chat-messages").innerHTML = "";
+    _endToolGroup();
     setStatus("");
     setThreadTitle(null);
     showCapabilities();
@@ -1836,6 +1873,7 @@ async function loadAndRenderHistory(chatId) {
   // draw — see `_openGeneration`.
   const gen = _openGeneration;
   $("chat-messages").innerHTML = "";
+  _endToolGroup();
   clearThinkingPlaceholder();
   // Reset recall state for the chat being loaded up front, not after a
   // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
@@ -2823,7 +2861,12 @@ function renderMessage(m) {
       : "This answer was interrupted before Agnes wrote anything — ask again to retry.";
     nodes.push(note);
   }
-  for (const node of nodes) $("chat-messages").appendChild(node);
+  // Runs of consecutive cards fold into groups here exactly as they do live,
+  // so a reload renders the same compact trail the turn settled into rather
+  // than the wall it was built from. Applied AFTER the interrupted-turn note
+  // is pushed, so the note lands where it belongs — outside the run, under it,
+  // which is also what its position in `nodes` already says.
+  for (const node of _groupConsecutiveToolCards(nodes)) $("chat-messages").appendChild(node);
   if (m.role === "assistant") _markLatestAssistant(tailArticle);
   // Measured after insertion, and against the tail article only: the cards
   // and earlier segments are siblings, not part of the answer's height —
@@ -3313,6 +3356,9 @@ function _sealStreamingSegment() {
 function appendToken(text) {
   clearThinkingPlaceholder();
   if (!currentAssistantArticle) {
+    // Prose after a run of tool calls closes that run: the next card belongs
+    // to whatever the agent does AFTER this sentence, not before it.
+    _endToolGroup();
     currentAssistantArticle = createMessageShell({ role: "assistant" });
     currentAssistantArticle.classList.add("is-streaming");
     currentAssistantBody = currentAssistantArticle.querySelector(".msg-body");
@@ -3443,8 +3489,11 @@ function finalizeAssistantMessage(frame) {
 // the body, no nested toggles (only oversize payloads keep a "show all"
 // route). Tabular results (`agnes catalog`, `agnes query`,
 // `agnes describe`) get a real <table>; markdown-ish strings render as
-// markdown; everything else is pretty-printed JSON. A FAILED call opens
-// itself — its output is the diagnosis.
+// markdown; everything else is pretty-printed JSON. A FAILED call stays
+// collapsed like any other and puts its diagnosis on the header line, where
+// folding keeps it — auto-opening put the ARGS dump on screen instead (#1974).
+//
+// Consecutive cards fold into one group; see "Tool-call groups" below.
 //
 // Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
 // check = done, triangle-alert = error. The status class on the wrapper
@@ -3706,6 +3755,8 @@ function renderApprovalRequest(frame) {
   actions.appendChild(mkBtn("Deny", "deny", "is-deny"));
   wrap.appendChild(actions);
 
+  // An approval card is not a tool card — it ends the run above it.
+  _endToolGroup();
   $("chat-messages").appendChild(wrap);
   maybeScrollToBottom();
 }
@@ -3932,6 +3983,8 @@ function renderQuestionRequest(frame) {
   actions.appendChild(dismissBtn);
   wrap.appendChild(actions);
 
+  // A question card is not a tool card — it ends the run above it.
+  _endToolGroup();
   $("chat-messages").appendChild(wrap);
   maybeScrollToBottom();
 }
@@ -3996,9 +4049,16 @@ function resolveQuestionCard(frame) {
  *  — `state` is absent there and the card stays deliberately neutral rather
  *  than claim a success the row cannot evidence.
  *
- *  <details>/<summary> — COLLAPSED by default: the header line (status,
- *  name, args summary, timing) is the transcript trail; one click opens the
- *  formatted args + result. A FAILED call opens itself. */
+ *  <details>/<summary> — COLLAPSED by default, a failed call included: the
+ *  header line (status, name, args-or-error, timing) is the transcript trail,
+ *  and one click opens the formatted args + result.
+ *
+ *  A failed call used to open itself, on the reasoning that its output is the
+ *  diagnosis nobody knows to click for. True — but what it opened onto was the
+ *  ARGS panel, so a turn with two failures led with two screens of request JSON
+ *  above the answer (#1974). The diagnosis is now on the HEADER instead, in
+ *  place of the args summary: the reader gets the error without a click, and
+ *  the raw payload stays behind the same one expander as every other card. */
 function _buildToolCard({ tool, args, status, state, result, isError }) {
   const wrap = document.createElement("details");
   // One status vocabulary for both paths: a replayed part's `state` maps onto
@@ -4011,9 +4071,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   const wrapIsError = statusClass === "is-error";
   wrap.className = `cloud-chat-tool ${statusClass}`;
   wrap.dataset.tool = tool || "";
-  // A failed call opens itself — the error text is the one body a reader
-  // must not have to know to click for. Same rule live and replayed.
-  if (wrapIsError) wrap.open = true;
 
   // Header line — status + tool name + args summary. Always visible, even
   // collapsed: it's a <summary>, not a body element.
@@ -4071,6 +4128,12 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   head.appendChild(chevron);
 
   wrap.appendChild(head);
+  // A replayed failure carries its diagnosis on the header, exactly as a live
+  // one does once its result lands (see renderToolCallEnd). AFTER the header is
+  // in the card: _setToolCardError finds the summary by querying `wrap`, so
+  // called any earlier it silently does nothing and a reloaded failure shows
+  // its args sketch where its error should be.
+  if (wrapIsError) _setToolCardError(wrap, result);
 
   // Args — formatted JSON, visible the moment the card is expanded. The
   // card header is the one click now; the old nested args toggle inside a
@@ -4087,10 +4150,214 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // bespoke quote/document preview a live one does (see
   // _renderFactClaimsPreview) instead of a generic JSON dump.
   if (status !== "running" && result !== undefined) {
-    const body = _renderToolResultPreview(result, tool);
+    const body = _renderToolResultPreview(result, tool, wrapIsError);
     if (body) wrap.appendChild(body);
   }
   return wrap;
+}
+
+//: The header only has room for a line. The whole payload is one click away
+//: inside the card, so this is a lead, not a truncation of the record.
+const _TOOL_ERROR_LINE_CHARS = 160;
+
+/** The one-line diagnosis a failed card shows on its header, in place of the
+ *  args sketch: the args are behind the expander, the error is the thing the
+ *  reader needs at a glance.
+ *
+ *  Returns plain text and is ALWAYS written with `textContent`. An internal
+ *  failure routinely names an internal endpoint ("400 Bad Request for
+ *  http://localhost:8000/api/query"), and rendering that through markdown made
+ *  the chat offer a localhost URL as a link to click (#1974). Nothing in an
+ *  error string is improved by markdown, and one thing in it is made worse. */
+function _toolErrorLine(result) {
+  let text = _unwrapMcpEnvelope(result);
+  if (text && typeof text === "object") {
+    text = text.error || text.message || text.detail || text.errorText || JSON.stringify(text);
+  }
+  if (typeof text !== "string") text = text == null ? "" : String(text);
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > _TOOL_ERROR_LINE_CHARS ? text.slice(0, _TOOL_ERROR_LINE_CHARS - 1) + "…" : text;
+}
+
+/** Put the diagnosis on a failed card's header line. No-op when the payload
+ *  yields no text — the status icon and edge already say it failed. */
+function _setToolCardError(wrap, result) {
+  const line = _toolErrorLine(result);
+  if (!line) return;
+  const summary = wrap.querySelector(".cloud-chat-tool-summary");
+  if (!summary) return;
+  summary.classList.add("is-error");
+  summary.textContent = line;
+  summary.title = line;
+}
+
+// ---------- Tool-call groups ----------------------------------------------
+// A research question can open with a dozen tool calls before the answer's
+// first sentence. One card per call is a readable trail; twelve stacked cards
+// is two screens of machinery above the thing the reader asked for (#1974).
+// So a RUN of consecutive calls — nothing but tool cards between them — folds
+// into ONE collapsed <details> whose summary is the whole run ("6 steps ·
+// 2 failed"). The cards themselves are unchanged, one click inside.
+//
+// A run of ONE is never wrapped: a lone call is already a single line, and a
+// group header over it would add a click and say nothing. The group appears
+// the moment a second consecutive card arrives, and adopts the first.
+//
+// What ENDS a run is anything that isn't another tool card — a text token
+// opening a fresh bubble, an approval or question card, a system note, the end
+// of the turn. That is what keeps a group meaning "these ran together, between
+// these two things the agent said" rather than "every tool call of the turn".
+
+function _buildToolGroup() {
+  const group = document.createElement("details");
+  group.className = "cloud-chat-tool-group";
+  const head = document.createElement("summary");
+  head.className = "cloud-chat-tool-group-head";
+  const icon = document.createElement("span");
+  icon.className = "cloud-chat-tool-group-icon";
+  icon.setAttribute("aria-hidden", "true");
+  head.appendChild(icon);
+  const label = document.createElement("span");
+  label.className = "cloud-chat-tool-group-label";
+  head.appendChild(label);
+  const meta = document.createElement("span");
+  meta.className = "cloud-chat-tool-group-meta";
+  head.appendChild(meta);
+  const chevron = document.createElement("span");
+  chevron.className = "cloud-chat-tool-chevron";
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.appendChild(iconEl("chevron-right"));
+  head.appendChild(chevron);
+  group.appendChild(head);
+  const body = document.createElement("div");
+  body.className = "cloud-chat-tool-group-body";
+  group.appendChild(body);
+  return group;
+}
+
+/** Re-derive the group header from the cards inside it. Called on every add
+ *  and every result, so a live run reads as the step it is on and a settled
+ *  one as what it did. The counts are READ OFF THE CARDS rather than tracked
+ *  in a counter: the cards are the record, and a counter that drifts would
+ *  report a run that failed as one that did not. */
+function _updateToolGroupSummary(group) {
+  if (!group) return;
+  const body = group.querySelector(".cloud-chat-tool-group-body");
+  const cards = body ? Array.from(body.children).filter((c) => c.classList.contains("cloud-chat-tool")) : [];
+  const n = cards.length;
+  let running = 0;
+  let failed = 0;
+  let unknown = 0;
+  for (const c of cards) {
+    if (c.classList.contains("is-running")) running++;
+    else if (c.classList.contains("is-error")) failed++;
+    else if (!c.classList.contains("is-done")) unknown++;
+  }
+  group.classList.toggle("is-running", running > 0);
+  group.classList.toggle("is-error", running === 0 && failed > 0);
+  group.classList.toggle("is-done", running === 0 && failed === 0 && unknown === 0);
+  const icon = group.querySelector(".cloud-chat-tool-group-icon");
+  if (icon) {
+    // A pre-v123 replayed card records no outcome, so a group holding one
+    // shows NO status icon rather than a tick it cannot evidence — the same
+    // rule the individual card follows.
+    if (running > 0) icon.replaceChildren(iconEl("hourglass"));
+    else if (failed > 0) icon.replaceChildren(iconEl("triangle-alert"));
+    else if (unknown === 0) icon.replaceChildren(iconEl("check"));
+    else icon.replaceChildren();
+  }
+  const steps = `${n} step${n === 1 ? "" : "s"}`;
+  const label = group.querySelector(".cloud-chat-tool-group-label");
+  if (label) {
+    // Live: the name of the call in progress, so a collapsed group still says
+    // what is happening right now. Settled: the size of the run.
+    //
+    // The last RUNNING card, not simply the last card. Calls can settle out of
+    // order, so once the newest one finished while an earlier one was still
+    // going, "last card" named a step that was already done while the group
+    // still read as running. (Copilot review on #1985.)
+    let active = null;
+    for (let i = n - 1; i >= 0; i--) {
+      if (cards[i].classList.contains("is-running")) {
+        active = cards[i];
+        break;
+      }
+    }
+    const activeName = active ? active.querySelector(".cloud-chat-tool-name") : null;
+    label.textContent = activeName ? activeName.textContent : steps;
+  }
+  const meta = group.querySelector(".cloud-chat-tool-group-meta");
+  if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
+}
+
+/** Put a tool card in the stream, folding it together with the card before it
+ *  when that card is still the last thing in the stream. */
+function _appendToolCard(wrap) {
+  const stream = $("chat-messages");
+  // The open group only counts while it is still the LAST thing in the stream.
+  // `_endToolGroup` is called from every appender that knows about runs, but
+  // the preview paths append an assistant article without going through any of
+  // them — and a card then dropped into the older group would jump visually
+  // back above that article. Tail-checked rather than fixed at those two call
+  // sites, so a future appender cannot reintroduce it. (Copilot review
+  // on #1985.)
+  if (_currentToolGroup && stream.lastElementChild !== _currentToolGroup) _endToolGroup();
+  if (_currentToolGroup) {
+    _currentToolGroup.querySelector(".cloud-chat-tool-group-body").appendChild(wrap);
+    _updateToolGroupSummary(_currentToolGroup);
+    return;
+  }
+  // Second consecutive card: build the group in the first card's place and
+  // move it inside, so the run reads as one block from the outside.
+  if (_looseToolCard && _looseToolCard.parentNode === stream && stream.lastElementChild === _looseToolCard) {
+    const group = _buildToolGroup();
+    stream.insertBefore(group, _looseToolCard);
+    const body = group.querySelector(".cloud-chat-tool-group-body");
+    body.appendChild(_looseToolCard);
+    body.appendChild(wrap);
+    _currentToolGroup = group;
+    _looseToolCard = null;
+    _updateToolGroupSummary(group);
+    return;
+  }
+  stream.appendChild(wrap);
+  _looseToolCard = wrap;
+}
+
+/** Close the open run. Anything appended after this starts a new one. */
+function _endToolGroup() {
+  _currentToolGroup = null;
+  _looseToolCard = null;
+}
+
+/** Fold every run of two or more consecutive tool cards in `nodes` into a
+ *  group, preserving order. The reload twin of the live path above — a
+ *  refresh must not turn one compact group back into a wall of cards. */
+function _groupConsecutiveToolCards(nodes) {
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (run.length < 2) {
+      out.push(...run);
+    } else {
+      const group = _buildToolGroup();
+      const body = group.querySelector(".cloud-chat-tool-group-body");
+      for (const card of run) body.appendChild(card);
+      _updateToolGroupSummary(group);
+      out.push(group);
+    }
+    run = [];
+  };
+  for (const node of nodes) {
+    if (node && node.classList && node.classList.contains("cloud-chat-tool")) run.push(node);
+    else {
+      flush();
+      out.push(node);
+    }
+  }
+  flush();
+  return out;
 }
 
 function renderToolCallStart(frame) {
@@ -4101,7 +4368,7 @@ function renderToolCallStart(frame) {
   _sealStreamingSegment();
   const wrap = _buildToolCard({ tool: frame.tool, args: frame.args, status: "running" });
   wrap.dataset.startedAt = String(performance.now());
-  $("chat-messages").appendChild(wrap);
+  _appendToolCard(wrap);
   inFlightToolCalls.set(_toolCallId(frame), wrap);
   _currentTurnToolCards.push(wrap);
   maybeScrollToBottom();
@@ -4124,9 +4391,10 @@ function renderToolCallEnd(frame) {
   const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
-  // A FAILED call opens itself: cards start collapsed, and the error text
-  // is the one body a reader must not have to know to click for.
-  if (isError) wrap.open = true;
+  // A failed card stays COLLAPSED and puts its diagnosis on the header line
+  // instead (see _buildToolCard's note): the reader gets the error without a
+  // click, and the raw args stay behind the same expander as everywhere else.
+  if (isError) _setToolCardError(wrap, result);
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
   if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
 
@@ -4160,8 +4428,12 @@ function renderToolCallEnd(frame) {
   if (_bareToolName(toolName) === "fact_claims") {
     _recordFactClaimsEvidence(_asToolResultObject(result));
   }
-  const body = _renderToolResultPreview(result, toolName);
+  const body = _renderToolResultPreview(result, toolName, isError);
   if (body) wrap.appendChild(body);
+
+  // The group header counts running / failed off its cards, so it has to be
+  // recomputed the moment one of them settles.
+  _updateToolGroupSummary(wrap.closest(".cloud-chat-tool-group"));
 
   maybeScrollToBottom();
 }
@@ -4176,17 +4448,27 @@ function renderToolCallEnd(frame) {
  *  the finished answer. Each card's own <details> toggle still opens it
  *  back up on click.
  *
- *  A FAILED card is left open. `renderToolCallEnd` marks it `is-error` (red
- *  border, warning icon) precisely because its output is the thing the reader
- *  needs, and the `error` terminal case is the one where that matters most: a
- *  turn that died mid-tool would otherwise fold shut the very card explaining
- *  why, behind a click nobody knows to make. Folding is for the noise, not
- *  for the diagnosis. */
+ *  A FAILED card folds with the rest now. It used to be exempt, because its
+ *  output was the thing the reader needed and folding it put the diagnosis
+ *  behind a click nobody knows to make — but the diagnosis is on the HEADER
+ *  line since #1974, which is exactly the part folding keeps. Nothing is
+ *  hidden by folding it that was visible before; what folds away is the args
+ *  dump that came with it.
+ *
+ *  Runs fold too: the group is the compact form of the whole trail, so a
+ *  settled turn is one line per run rather than one per call. */
 function _collapseFinishedToolCalls() {
+  const groups = new Set();
   for (const wrap of _currentTurnToolCards) {
-    if (wrap.classList.contains("is-error")) continue;
     wrap.open = false;
+    const group = wrap.closest(".cloud-chat-tool-group");
+    if (group) groups.add(group);
   }
+  for (const group of groups) {
+    group.open = false;
+    _updateToolGroupSummary(group);
+  }
+  _endToolGroup();
   _currentTurnToolCards = [];
   // Defensive: the normal path resets facts-turn evidence inside
   // `renderFactsScopeLine` once it has been read. A turn that ends WITHOUT
@@ -4391,7 +4673,7 @@ function _renderFactClaimsPreview(result) {
  *  `fact_neighbors` are left on the generic path — their JSON already reads
  *  fine here, and they get their human head from `_TOOL_LABELS` alone.
  */
-function _renderToolResultPreview(result, toolName) {
+function _renderToolResultPreview(result, toolName, isError) {
   if (result == null || result === "") return null;
 
   if (_bareToolName(toolName) === "fact_claims") {
@@ -4403,6 +4685,21 @@ function _renderToolResultPreview(result, toolName) {
 
   result = _unwrapMcpEnvelope(result);
   if (result == null || result === "") return null;
+
+  // A failure's output is a diagnostic message, not a document: plain text,
+  // never markdown. marked's GFM autolinker turns a bare URL into an <a>, so
+  // an internal error was offering `http://localhost:8000/api/query` to the
+  // reader as a link to follow (#1974). Nothing in an error string is made
+  // better by markdown, and that one thing is made worse.
+  if (isError === true && typeof result === "string") {
+    const wrap = document.createElement("div");
+    wrap.className = "cloud-chat-tool-result is-text is-error";
+    const pre = document.createElement("pre");
+    pre.className = "cloud-chat-tool-error-body";
+    pre.textContent = result;
+    wrap.appendChild(pre);
+    return wrap;
+  }
 
   // Already-tabular JSON shapes — render a real <table> preview.
   const table = _coerceToTablePreview(result);
@@ -5127,6 +5424,37 @@ async function submitUserMessage(text) {
   ws.send(JSON.stringify({ type: "user_msg", text, client_msg_id: submitId }));
 }
 
+/** Publish the composer's REAL height as `--chat-composer-h` on the shell.
+ *
+ *  Inside an active thread the composer floats over the transcript
+ *  (`position: absolute`, see chat.css `.has-thread`), and the padding that
+ *  kept the last turn clear of it was a constant sized for one line. Past
+ *  roughly four lines the composer grew up over the conversation — which is
+ *  worst in exactly the case that makes it grow: writing a long answer to a
+ *  question you need to keep reading (#1974). Measuring instead means growth
+ *  shrinks the scroll region rather than covering it.
+ *
+ *  Cheap by construction: one offsetHeight read on a change we already
+ *  handle, and a no-op on the empty-state layout, where the composer is in
+ *  normal flow and the variable goes unused. */
+function _syncComposerHeightVar() {
+  const form = $("chat-form");
+  const shell = document.querySelector(".cloud-chat-shell");
+  if (!form || !shell) return;
+  const next = `${Math.ceil(form.offsetHeight)}px`;
+  if (shell.style.getPropertyValue("--chat-composer-h") === next) return;
+  // Hold the reader's place across the change. What grows is the padding
+  // BELOW the last turn, so reserving the space without this only moves the
+  // scroll floor: the composer still rises over the text that was above it,
+  // which is the overlap being fixed. Measuring from the bottom — the edge
+  // the composer moves — and restoring that distance is what turns growth
+  // into "the transcript scrolls up" instead of "the transcript is covered".
+  const msgs = $("chat-messages");
+  const fromBottom = msgs ? msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight : 0;
+  shell.style.setProperty("--chat-composer-h", next);
+  if (msgs) msgs.scrollTop = msgs.scrollHeight - msgs.clientHeight - fromBottom;
+}
+
 /** Resize the composer textarea to fit its content, capped at 220px
  *  (matches max-height in chat.css). Reset to ``auto`` first so the
  *  scrollHeight calculation isn't dragged down by the last value. */
@@ -5139,8 +5467,22 @@ function autosizeComposer() {
   // the column height rather than its single-line content height, which
   // would pin the composer at its 220px max on load. Only measure to
   // grow once there is actual content.
-  if (ta.value.trim() === "") return;
+  if (ta.value.trim() === "") {
+    _syncComposerHeightVar();
+    return;
+  }
   ta.style.height = Math.min(ta.scrollHeight, 220) + "px";
+  _syncComposerHeightVar();
+}
+
+// The composer also changes height for reasons no keystroke reports — the
+// window resizing under a wrapped line, the agent picker or an attachment row
+// appearing. Observing the form covers all of them with one rule instead of a
+// call site per cause; the polyfill-free fallback is the autosize path above,
+// which already covers typing.
+if (typeof ResizeObserver === "function") {
+  const _composerForm = $("chat-form");
+  if (_composerForm) new ResizeObserver(_syncComposerHeightVar).observe(_composerForm);
 }
 
 // #new-chat is the sidebar's +New chat button (topnav) OR the rail's
@@ -5164,6 +5506,7 @@ $("new-chat")?.addEventListener("click", async (e) => {
     _syncSessionUrl(null);
     markActiveSidebar(null);
     $("chat-messages").innerHTML = "";
+    _endToolGroup();
     showCapabilities();
     setThreadTitle(null);
     setStatus(`Could not start chat: ${err.message}`, "error");

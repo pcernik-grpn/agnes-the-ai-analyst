@@ -286,6 +286,21 @@ class SlidePreview(BaseModel):
     lines: list[str] = []
 
 
+class SheetPreview(BaseModel):
+    """One worksheet of an ``.xlsx`` preview — see ``src/office_preview.Sheet``.
+
+    ``rows`` is rectangular (every row padded to the widest), so the client
+    renders a grid without re-deriving the column count. ``truncated`` is per
+    sheet: one small tab can sit beside a 50 000-row export in the same
+    workbook, and a modal-wide "showing the first rows" would be wrong about
+    the small one.
+    """
+
+    name: str
+    rows: list[list[str]] = []
+    truncated: bool = False
+
+
 class SessionFilePreview(BaseModel):
     """What to show for one session file, and how — the modal's single fetch.
 
@@ -294,6 +309,7 @@ class SessionFilePreview(BaseModel):
 
     * ``image`` / ``pdf`` — fetch ``raw_url``, let the browser draw it.
     * ``slides`` — ``slides`` holds the deck's text, slide by slide.
+    * ``sheets`` — ``sheets`` holds the workbook's cells, sheet by sheet.
     * ``text`` — ``text`` holds it; ``truncated`` says a glance is all this is.
     * ``none`` — ``reason`` says why, in the words the modal shows.
     """
@@ -306,6 +322,7 @@ class SessionFilePreview(BaseModel):
     raw_url: str | None = None
     text: str | None = None
     slides: list[SlidePreview] | None = None
+    sheets: list[SheetPreview] | None = None
     truncated: bool = False
     #: ``file`` when the bytes ARE the text, ``extracted`` when this module
     #: pulled the words out of a container format (a deck, a document).
@@ -661,9 +678,9 @@ async def preview_session_file(
 
     The point of this endpoint is the deliverable a browser cannot draw. A
     ``.pptx`` handed to an ``<iframe>`` is a download prompt, so a deck (and a
-    ``.docx``) is previewed as its own words, read straight out of the OOXML
-    archive by ``src/office_preview`` — no optional extra, no conversion
-    service. Images and PDFs point at the sibling ``…/raw`` viewer; textual
+    ``.docx``, and an ``.xlsx``) is previewed as its own content, read
+    straight out of the OOXML archive by ``src/office_preview`` — no optional
+    extra, no conversion service. Images and PDFs point at the sibling ``…/raw`` viewer; textual
     files carry their own first ``_PREVIEW_MAX_CHARS``; everything else
     reports ``kind="none"`` with the sentence the modal shows.
 
@@ -724,6 +741,24 @@ async def preview_session_file(
             kind="slides",
             size_bytes=len(data),
             slides=[SlidePreview(index=s.index, title=s.title, lines=s.lines) for s in slides],
+            truncated=truncated,
+            source="extracted",
+        )
+
+    if office_kind == "sheets":
+        from src.office_preview import xlsx_sheets
+
+        sheets, truncated = await asyncio.to_thread(xlsx_sheets, data)
+        if not sheets:
+            return out(
+                kind="none",
+                size_bytes=len(data),
+                reason="This workbook's sheets could not be read — download it to open it.",
+            )
+        return out(
+            kind="sheets",
+            size_bytes=len(data),
+            sheets=[SheetPreview(name=s.name, rows=s.rows, truncated=s.truncated) for s in sheets],
             truncated=truncated,
             source="extracted",
         )

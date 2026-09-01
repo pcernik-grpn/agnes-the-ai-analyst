@@ -1328,18 +1328,27 @@ class TestDataLensFlowStrip:
         chained = [t for t in tabs if t["chain"]]
         assert [t["label"] for t in chained] == ["Sources", "Tables", "Data packages"]
 
-    def test_semantic_layer_is_named_in_full_and_not_in_the_chain(self) -> None:
+    def test_semantic_sources_is_named_in_full_and_not_in_the_chain(self) -> None:
         """ "Semantic" is an adjective with no noun, and "Packages" collides
         with the marketplace's plugin packages — both shipped with a caption
         under them explaining what they meant, which is the tell that the name
         was doing too little. The names carry it now; there are no captions.
 
-        The tab is "Semantic layer health" rather than plain "Semantic layer"
-        because three pages wore the latter at once — see
+        "Semantic sources" is named in full rather than plain "Semantic"
+        because three pages wore that shorter name at once — see
         tests/test_semantic_page_names_contract.py."""
         tabs = self._data_tabs()
-        semantic = next(t for t in tabs if t["label"] == "Semantic layer health")
+        semantic = next(t for t in tabs if t["label"] == "Semantic sources")
         assert semantic["chain"] is False
+
+    def test_semantic_layer_health_is_pulled_from_the_strip(self) -> None:
+        """Unfinished feature (coverage/health/mute/feedback), pulled off the
+        strip so it doesn't read as a finished destination — see the "Semantic
+        layer health" comment on the Data section's tabs and its entry in
+        ADMIN_NAV_OFFNAV. The page itself still renders; it's just not one of
+        the tabs here."""
+        tabs = self._data_tabs()
+        assert all(t["label"] != "Semantic layer health" for t in tabs)
 
     def test_no_tab_carries_a_purpose_caption(self) -> None:
         """A label that needs a gloss should be relabelled, not annotated."""

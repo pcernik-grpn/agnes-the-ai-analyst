@@ -131,6 +131,27 @@
 .ch-listhead #ch-chips { margin: 0; justify-content: flex-start; }
 .ch-listhead .fbar-chip { height: 22px; }
 .ch-count { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-text-muted); }
+/* The way into the rows the count says are missing (#1974). Sits directly
+   after the count, in the count's own uppercase voice, but as a LINK rather
+   than a chip: it does not describe a filter that is applied, it offers one —
+   and the chips beside it, which do describe applied filters, must not read as
+   the same kind of thing. */
+.ch-hidden-note {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ds-primary);
+  cursor: pointer;
+}
+.ch-hidden-note:hover,
+.ch-hidden-note:focus-visible { text-decoration: underline; }
+.ch-hidden-note[hidden] { display: none; }
+
 /* Same fixed 16px slot as every row's `.ch-row__sel`, so the header box sits
    exactly above the column it selects — that alignment is the label. */
 .ch-selectall { flex: 0 0 16px; display: inline-flex; align-items: center; justify-content: center; }

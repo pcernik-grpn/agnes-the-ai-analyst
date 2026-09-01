@@ -9,6 +9,7 @@
  *   image / pdf → the real bytes, drawn by the browser from `raw_url`
  *   slides      → a deck's text, slide by slide (chat deliverables — a
  *                 browser cannot draw a .pptx, so the server sends its words)
+ *   sheets      → a workbook's cells, sheet by sheet (same reason for .xlsx)
  *   text        → source (textual uploads) or the extracted text, in a <pre>
  *   none        → the server's own sentence about why not, verbatim
  *
@@ -196,6 +197,45 @@
       var deckNotes = ['Slide text only — not the rendered layout.'];
       if (data.truncated) deckNotes.push('Showing the first slides.');
       ui.note.textContent = deckNotes.join(' ');
+      return;
+    }
+
+    if (data.kind === 'sheets') {
+      // A .xlsx has no browser renderer either, so the server sends the
+      // stored cells and this draws them as grids — one per sheet, in tab
+      // order. Each table scrolls in its own wrapper so a wide export never
+      // makes the modal scroll sideways.
+      var book = el('div', 'fp-sheets');
+      var anyClipped = false;
+      (data.sheets || []).forEach(function (s) {
+        var section = el('section', 'fp-sheet');
+        section.appendChild(el('span', 'fp-sheet__name', s.name || 'Sheet'));
+        var rows = s.rows || [];
+        if (!rows.length) {
+          section.appendChild(el('p', 'fp-sheet__empty', 'This sheet is empty.'));
+        } else {
+          var wrap = el('div', 'fp-sheet__wrap');
+          var table = el('table', 'fp-sheet__grid');
+          var body = document.createElement('tbody');
+          rows.forEach(function (cells) {
+            var tr = document.createElement('tr');
+            (cells || []).forEach(function (cell) {
+              tr.appendChild(el('td', null, cell));
+            });
+            body.appendChild(tr);
+          });
+          table.appendChild(body);
+          wrap.appendChild(table);
+          section.appendChild(wrap);
+        }
+        if (s.truncated) anyClipped = true;
+        book.appendChild(section);
+      });
+      ui.body.appendChild(book);
+      var bookNotes = ['Stored cell values — not the rendered formatting.'];
+      if (anyClipped) bookNotes.push('Showing the first rows and columns.');
+      if (data.truncated) bookNotes.push('Showing the first sheets.');
+      ui.note.textContent = bookNotes.join(' ');
       return;
     }
 
