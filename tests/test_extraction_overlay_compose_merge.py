@@ -120,7 +120,12 @@ def project(tmp_path: Path, compose_available) -> Path:
     """A VM-like compose project dir: the repo's real compose chain + the
     overlay exactly as the startup script writes it (default, unpinned case)
     + a VM-like .env."""
-    for name in ("docker-compose.yml", "docker-compose.prod.yml", "docker-compose.host-mount.yml"):
+    for name in (
+        "docker-compose.yml",
+        "docker-compose.prod.yml",
+        "docker-compose.host-mount.yml",
+        "docker-compose.gcp-logging.yml",
+    ):
         shutil.copy(REPO / name, tmp_path / name)
     (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm(image_set=False))
     (tmp_path / ".env").write_text(VM_ENV)
@@ -139,6 +144,45 @@ def project_with_worker_image(tmp_path: Path, compose_available) -> Path:
 
 
 BASE_CHAIN = ["docker-compose.yml", "docker-compose.prod.yml", "docker-compose.host-mount.yml"]
+
+
+def test_gcp_logging_overlay_reaches_the_activated_worker(project: Path):
+    """The log-driver overlay must actually land on the worker in the chain a
+    VM assembles — not merely name it.
+
+    Two things could make the entry inert and neither shows up in a static
+    read of the file: the worker is profile-gated in the base compose (so an
+    overlay entry for a service compose has filtered out does nothing), and
+    docker-compose.extraction.yml loads AFTER docker-compose.gcp-logging.yml
+    in the resolver's COMPOSE_FILE order, so it is the file with the last
+    word on this service's keys. Order below mirrors the VM's.
+    """
+    chain = BASE_CHAIN + ["docker-compose.gcp-logging.yml", "docker-compose.extraction.yml"]
+    services = _compose_config(project, chain)["services"]
+
+    assert services["extraction-worker"].get("logging") == {"driver": "gcplogs"}, (
+        "the extraction worker must ship to Cloud Logging on a VM with the "
+        "overlay armed — this is the service that runs the connector crawls"
+    )
+    assert services["app"]["logging"] == {"driver": "gcplogs"}
+
+    # redis comes from the extraction overlay alone, so the log-driver overlay
+    # must NOT name it (doing so breaks every instance without that overlay);
+    # it keeps the default driver until its own overlay sets one.
+    assert "logging" not in services["redis"]
+
+
+def test_gcp_logging_overlay_loads_without_the_conditional_overlays(project: Path):
+    """The safety half: the log-driver overlay is engaged from file presence
+    alone, independently of which other overlays a VM loads. Layered on the
+    bare base chain it must still produce a parseable project — a service
+    named here but defined only in a conditional overlay would make compose
+    reject the whole stack on every instance that lacks it."""
+    services = _compose_config(project, BASE_CHAIN + ["docker-compose.gcp-logging.yml"])["services"]
+    assert services["app"]["logging"] == {"driver": "gcplogs"}
+    # Still profile-gated without the extraction overlay — the logging entry
+    # does not accidentally activate anything.
+    assert "extraction-worker" not in services
 
 
 def test_without_overlay_worker_stays_profile_gated(project: Path):

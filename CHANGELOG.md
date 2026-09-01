@@ -26,6 +26,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A stopped run says whether its state can be trusted.** The run report carries `interrupted_reason`: `"timeout"` (the ceiling above), `"throttled"` (the tenant's 429 budget ran out), `"error"` for anything else, or `null` on a clean pass. The first two are exactly the stops that abort at a point where the persisted deltaLinks and cTags describe what was actually ingested, so a reader may tell an operator the next run picks up where this one left off; after an unexpected exception nothing is known about how far the state file got, and "your work is safe" is never guessed. Matched with `isinstance`, so a later subclass of either stop inherits its reason instead of silently degrading to `"error"`.
 - **The built-in SharePoint crawler routes crawled files into permission zones.** Per file, it picks the target collection by the longest matching ACTIVE permission zone `rel_path` prefix, scoped to the same drive (nested zones: the deepest one wins), falling back to the scope's own collection — a dissolved zone is ignored, so its content re-homes to the parent scope, and a correctly-routed crawl never trips the source-ACL ingest gate. Excluded-subtree entries now split by `kind`: a `kind="file"` entry skips exactly that one item (matched by drive-relative path and stable id), never a sibling whose name merely shares its prefix, while `kind="folder"` entries keep the existing subtree-prefix match. An entry already carrying `rel_path` is used directly with zero Graph calls; a legacy entry without one still falls back to resolving it via Graph, fail-closed.
 - **A running SharePoint extraction can be watched and stopped.** The source card's Run row now shows live `activity` — the drive-relative path of a file currently being downloaded/converted/ingested plus the last 5 completed items with their outcomes — read straight off the crawl's own checkpoint (`GET …/extraction/status`), so a multi-hour crawl is no longer a black box between checkpoints. A new `POST /api/admin/sharepoint/connections/{id}/extraction/stop` (`202`, audited as `extraction.stop_requested`) asks a running (or about-to-start) run to stop cooperatively: it sets `config.extraction.stop_requested_at` on the connection row, which the crawl polls at the same quiescent points its `extraction.timeout_s` ceiling already checks (unconditionally between delta pages, every 10 completed items between files) and honors exactly like a timeout — `interrupted_reason: "stopped"`, a resumable run, state saved, in-flight items drained before the run ends. A stale flag left by a previous run is cleared at the start of the next one, so a stop can never reach forward and kill an unrelated run. Unlike the run-history endpoints next to it, the stop signal lives on `source_connections` (not the PG-only `extraction_runs` table), so it works on both app-state backends.
+- **A deploy-time exposure check for hosted data apps, warn-first.** `POST /api/data-apps/{slug}/deploy` now runs a pure, best-effort static scan (`src/data_apps/deploy_check.py`) over the target commit before it is promoted to `agnes-live` — an exposed static-file server root (Node `express.static`/`serveStatic`/fastify-static, Python `StaticFiles`/`send_from_directory`/`app.static_folder`, nginx `root`/`alias`), the whole process environment or the injected `AGNES_TOKEN` echoed into a response, and debug mode left on. `data_apps.deploy_checks` (default `warn`) surfaces findings alongside a deploy that still runs; `block` refuses the deploy outright on any finding, including for an externally-hosted repo Agnes cannot scan at all; `off` disables the scan. `agnes app deploy` prints any findings under the `State:` line.
 
 ### Changed
 
@@ -71,6 +72,41 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   separate, retired mechanism). **Consumers of this module need to repin to
   the release that carries this fix to drop the now-unnecessary
   `extraction_worker_image` requirement.**
+- **Container logs that never reached Cloud Logging.** The `gcplogs` overlay
+  (`docker-compose.gcp-logging.yml`, engaged by `enable_gcp_logging`) listed the
+  services the compose file had when it was written and was never revisited, so
+  every service added since — `extraction-worker`, `apps-runner`, `egress-proxy`,
+  `kai-agent-stub` — silently kept the default `json-file` driver. The gap was
+  invisible from the outside: `app`, `scheduler` and `caddy` shipped normally, so
+  an instance looked correctly configured while the connector-crawl logs an
+  operator actually goes looking for stayed on the box and died with each
+  auto-upgrade container recreate. The near-miss that hid it is that `extract`
+  (the one-shot extractor, present in the list and not running) and
+  `extraction-worker` (the long-running extraction lane, running and absent) are
+  two different services. The overlay now covers exactly the services
+  `docker-compose.yml` defines, both directions pinned by a guard — services that
+  exist only in a conditional overlay (`redis`, `postgres`, `kai-agent`) must
+  keep taking their log driver there, since naming one here would make compose
+  refuse to parse the whole stack on every instance that does not load it. Takes
+  effect on a VM at the next container recreate.
+- **A file the built-in SharePoint crawler failed to download, convert,
+  redact or ingest is retried on the next run instead of being skipped
+  forever.** A drive's delta cursor advanced past a page even when some of
+  its rows failed — correct for the page as a whole, but Microsoft Graph
+  only re-offers an item through delta when it CHANGES, so a file that
+  failed once and was never touched again would never come back around;
+  observed on a live deployment, a run where every download failed was
+  followed by one where delta reported nothing left to do, leaving a
+  fraction of the library actually indexed with no error anywhere in sight.
+  Every such failure is now recorded in the crawl's state file and retried
+  on every future run independent of what delta reports, until it either
+  succeeds or hits a bounded number of attempts — an item that keeps
+  failing (a permanently corrupt document, say) eventually stops being
+  retried, but that outcome is recorded in the run report rather than
+  silently dropped. Recovering an already-affected connection no longer
+  needs hand-editing the state file on the data disk: "Run extraction now"
+  and the `corpus-extraction` job payload both take a `resync` option that
+  forces a full re-enumeration (kept cTags still skip unchanged files).
 - **Chat session restore, part 2: a refresh mid-answer no longer loses the
   reply, and a session deep link no longer looks like a silent new chat.**
   `?session=` reached the address bar in the last round; the rest of the
@@ -148,7 +184,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The producer corpus-map handoff endpoint.** `GET /api/admin/sharepoint/connections/{id}/corpus-map` (with its `connectors/sharepoint/corpus_map.py` builder, the wizard's "Download corpus map" link, and the producer-token grant for the route) served exactly one consumer — the retired external corpus-extraction producer. The built-in pipeline routes scopes and permission zones structurally inside the crawler and never read this map. Producer tokens keep the rest of their callback surface (`GET …/scopes`, collection file upload, facts ingest/corrections) unchanged.
 
 ### Internal
-
+- **The two health-probe event-loop guards asserted nothing, and then
+  asserted it unreliably.** Both patched `_check_db_schema` — the inner
+  read *behind* the memoized `_cached_db_schema` the endpoints await — so
+  with the loop blocked the first probe slept, filled the cache, and the
+  second returned from it for free: healthy and regressed both measured one
+  sleep (1.53s either way). They now patch the cached layer, and assert
+  **peak concurrency** instead of elapsed time. A wall-clock threshold had
+  to fit between one sleep and two while a loaded shard runner's own
+  overhead measured ~1.05s and varied — the liveness guard failed at 1.54s
+  against 0.9s and again at 2.55s against a widened 2.5s, both times with
+  `app/api/health.py` byte-identical to a passing `main`. Peak concurrency
+  is 2 off-loop and 1 when blocked, independent of machine load; verified
+  by forcing `asyncio.to_thread` inline, where both guards now fail.
 - **A git conflict marker left in `CHANGELOG.md` now fails CI.** A seventh guard in `tests/test_changelog_integrity.py` refuses any line that *is* a marker. Nothing could see this before: the released-region checksum covers released blocks only, so a marker in `[Unreleased]` passes it, and the duplicate-bullet guard compares bullets — a marker line is not one. An orphan `<<<<<<< HEAD` with no matching `=======` reached `main` exactly that way, because a union-style merge resolution keeps both sides of a *balanced* conflict and passes an unbalanced marker through as ordinary text. Matched at line start rather than as a substring, since the `[0.55.1]` section legitimately documents these markers inside backticks — pinned by its own test so a future tightening cannot fail the build on correct prose.
 
 - **Corporate Memory detection is now documented where admins can find it, ahead of the scheduled-agent rework in #1971.** `/admin/corporate-memory` gained a "How detection works" panel (the two extraction paths and their inputs, the fixed confidence-by-detection-type lookup, the currently-constant category, and where to find the two kill-switches above); `docs/corporate-memory-governance.md` gained a "How Candidates Are Detected" section, dropped its stale claim that the AI self-reports a confidence score, and fixed a wrong config key name (`auto_confidence_threshold` → `auto_publish_min_confidence`); and the remaining inert `corporate_memory.*` knobs (`sources.claude_local_md.*`, `sources.session_transcripts.confidence_base`/`max_turns_per_session`, `extraction.*`, `review_period_months`, `entity_resolution.*`) are now labeled "not yet wired" in the server-config schema and `instance.yaml.example` instead of silently implying they already do something.
