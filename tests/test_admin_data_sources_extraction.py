@@ -626,3 +626,150 @@ class TestConfigDrawer:
 
     def test_the_section_lock_reason_is_stated_once(self):
         assert "not admin-writable" in self._html()
+
+
+_SCHEDULE_SIGNATURES = (
+    "function _extS(id) {",
+    "async function _extFetchOne(connId) {",
+    "function _extConnectionIds() {",
+    "function _extNextDelay() {",
+    "async function _extTick() {",
+    "function _extSchedule() {",
+    "function _extAfterCardsPainted() {",
+)
+
+
+def _run_schedule_js(body: str) -> dict:
+    """The poll's timing, on a fake clock.
+
+    Cards on this page arrive over fetch, so the harness starts with none —
+    which is exactly the state the script self-starts against in a browser.
+    """
+    tpl = TEMPLATE.read_text(encoding="utf-8")
+    fns = "\n".join(_extract_block(tpl, sig) for sig in _SCHEDULE_SIGNATURES)
+    script = f"""
+const EXT_POLL_ACTIVE_MS = 3000;
+const EXT_POLL_IDLE_MS = 30000;
+const EXT_POLL_MAX_BACKOFF_MS = 60000;
+const EXT_MAX_FAILURES = 3;
+
+let NOW = 0;
+let CARDS = [];                 // no [data-ext-conn] until the cards paint
+const requests = [];
+const renders = [];
+const timers = [];
+
+const document = {{
+  visibilityState: "visible",
+  querySelectorAll: () => CARDS.map((id) => ({{ dataset: {{ extConn: id }} }})),
+  getElementById: () => null,
+}};
+function setTimeout(fn, ms) {{ timers.push({{ id: timers.length + 1, at: NOW + ms, fn }}); return timers.length; }}
+function clearTimeout(id) {{ const t = timers.find((x) => x.id === id); if (t) t.cancelled = true; }}
+async function fetch(url) {{
+  requests.push(NOW);
+  return {{ ok: true, status: 200, json: async () => ({{ connection_id: "sp1", runs_total: 0, as_of: null }}) }};
+}}
+function _extRender(connId) {{ renders.push({{ t: NOW, connId }}); }}
+
+const _extState = {{}};
+let _extTimer = null;
+let _extInFlight = false;
+
+{fns}
+
+async function runClock(untilMs) {{
+  for (let guard = 0; guard < 200; guard++) {{
+    const next = timers.filter((t) => !t.cancelled && !t.fired && t.at > NOW).sort((a, b) => a.at - b.at)[0];
+    if (next) next.fired = true;
+    if (!next || next.at > untilMs) break;
+    NOW = next.at;
+    await next.fn();
+  }}
+  NOW = untilMs;
+}}
+
+(async () => {{
+{body}
+}})();
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    if proc.returncode == 127:
+        pytest.skip("node unavailable")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
+
+
+class TestPollFollowsTheCards:
+    """The poll must be armed by the paint, not by the idle interval.
+
+    The script self-starts at parse time, when the connections fetch has not
+    resolved and the page carries no card. That first tick finds nothing to
+    ask about, and the scheduler — reading a still-empty state map — arms the
+    IDLE interval, so the run row used to appear 30 s (and, when a mutation
+    repainted over it mid-tick, 60 s) after the card it belongs to.
+    """
+
+    def test_the_first_request_follows_the_paint_not_the_idle_interval(self):
+        out = _run_schedule_js("""
+  await _extTick();                       // parse time: no cards on the page
+  _extSchedule();
+  await runClock(1500);                   // the connections fetch resolves
+  CARDS = ["sp1"];
+  await _extAfterCardsPainted();
+  await runClock(2000);
+  console.log(JSON.stringify({ first: requests.length ? requests[0] : null, count: requests.length }));
+""")
+        assert out["first"] == 1500, out
+        assert out["count"] == 1, out
+
+    def test_a_paint_with_nothing_known_yet_re_arms_the_cadence(self):
+        """The pending idle timer is not the schedule any more — a live run
+        must poll at the ACTIVE cadence from the paint, not inherit the 30 s
+        wheel the empty page armed."""
+        out = _run_schedule_js("""
+  await _extTick();
+  _extSchedule();
+  await runClock(1500);
+  CARDS = ["sp1"];
+  await _extAfterCardsPainted();
+  await runClock(40000);
+  console.log(JSON.stringify({ requests }));
+""")
+        # 1500 (the paint), then the re-armed idle wheel — never a first ask
+        # at 30 000 with the paint 28.5 s earlier.
+        assert out["requests"][0] == 1500, out
+        assert out["requests"][1] == 31500, out
+
+    def test_a_repaint_over_known_state_redraws_without_asking_again(self):
+        """A mutation's `loadConnections()` rebuilds the card and wipes the
+        block. Redrawing it from cache costs nothing; asking again would put
+        a request on every mutation."""
+        out = _run_schedule_js("""
+  CARDS = ["sp1"];
+  await _extTick();                       // one real read
+  const after = requests.length;
+  NOW = 5000;
+  _extAfterCardsPainted();                // the card was rebuilt underneath
+  console.log(JSON.stringify({
+    requests_before: after,
+    requests_after: requests.length,
+    repainted: renders.filter((r) => r.t === 5000).map((r) => r.connId),
+  }));
+""")
+        assert out["requests_before"] == 1, out
+        assert out["requests_after"] == 1, out
+        assert out["repainted"] == ["sp1"], out
+
+    def test_the_paint_hook_is_called_from_every_card_paint(self):
+        tpl = TEMPLATE.read_text(encoding="utf-8")
+        # Guarded by `typeof`: the hook lives in a later script block than the
+        # renderers that call it, and the parser may run a fetch continuation
+        # between the two.
+        assert tpl.count('if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();') == 2
