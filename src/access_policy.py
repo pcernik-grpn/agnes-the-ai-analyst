@@ -199,7 +199,7 @@ def policied_relation(table_id: str, principal, *, dialect: str = "duckdb") -> P
 
     Never executes ``relation_sql`` — that is each enforcement surface's job.
     """
-    if dialect not in ("duckdb", "bigquery", "databricks"):
+    if dialect not in ("duckdb", "bigquery", "databricks", "snowflake"):
         raise ValueError(f"unknown dialect: {dialect!r}")
 
     row = _resolve_table_row(table_id)
@@ -232,6 +232,8 @@ def policied_relation(table_id: str, principal, *, dialect: str = "duckdb") -> P
         relation_sql = _transpile_policy_to_bigquery(policy_sql, table_id=resolved_id)
     elif dialect == "databricks":
         relation_sql = _transpile_policy_to_databricks(policy_sql, table_id=resolved_id)
+    elif dialect == "snowflake":
+        relation_sql = _transpile_policy_to_snowflake(policy_sql, table_id=resolved_id)
     else:
         relation_sql = policy_sql
 
@@ -300,6 +302,63 @@ def _transpile_policy_to_databricks(policy_sql: str, *, table_id: str) -> str:
     """
     try:
         statements = sqlglot.transpile(policy_sql, read="duckdb", write="databricks")
+    except Exception as exc:
+        raise PolicyError(table_id) from exc
+    if not statements:
+        raise PolicyError(table_id)
+    return statements[0]
+
+
+def _transpile_policy_to_snowflake(policy_sql: str, *, table_id: str) -> str:
+    """Transpile an admin-authored, DuckDB-dialect policy body to Snowflake
+    SQL -- the fourth dialect (S2, RLS review issue #1979).
+
+    Verified end to end on sqlglot 30.17.0: ``EXCLUDE`` stays ``EXCLUDE``
+    (Snowflake natively supports ``SELECT * EXCLUDE (col)``, the same
+    construct DuckDB uses -- unlike BigQuery, which needs the rewrite to
+    ``EXCEPT``), ``md5(x)`` stays ``MD5(x)`` (Snowflake's
+    own ``MD5`` already returns a hex string, the same shape DuckDB's does,
+    so -- unlike BigQuery's ``TO_HEX(MD5(x))`` -- nothing needs rewriting for
+    the doc's pseudonymization idiom to keep its meaning), and
+    ``list_contains($g, col)`` -> ``ARRAY_CONTAINS(CAST(col AS VARIANT),
+    :g)`` -- note the argument order: Snowflake's ``ARRAY_CONTAINS`` takes
+    ``(value, array)``, the OPPOSITE of Databricks' ``ARRAY_CONTAINS(array,
+    value)``, so a caller composing SQL against this arm's output cannot
+    assume parity with the sibling engine's shape. Every ``$name``
+    placeholder renders as ``:name`` -- the same generic named-parameter
+    token sqlglot also uses for Databricks (§6.2's binding guarantee holds
+    here too: the value never enters the SQL text).
+
+    Unlike the BigQuery and Databricks arms, no execution site in this
+    codebase currently consumes ``dialect="snowflake"`` output directly. A
+    registered ``query_mode='remote'`` Snowflake row is a plain DuckDB VIEW
+    over the ATTACHed ``sf`` catalog
+    (``connectors/snowflake/extract_init.py::_remote_view_sql``), so an
+    ordinary caller SQL statement referencing it by its registered name
+    already runs -- correctly policy-filtered -- through the pre-existing
+    ``dialect="duckdb"`` arm and DuckDB's own native parameter binding; see
+    ``app/api/query.py``'s ``rewrite_sql(..., dialect=_policy_parse_dialect
+    (...))`` call, which resolves to ``"duckdb"`` for a Snowflake-registered
+    table today. This arm exists for a genuinely Snowflake-*native* SQL text
+    surface -- e.g. the ``snowflake_query()`` DuckDB pass-through a
+    Snowflake semantic-view ``MEASURE()`` query would need (the same reason
+    the Databricks arm exists independent of ``MEASURE()``'s own local
+    ``/api/v2/sample`` wiring, S1, which is tracked separately) -- and
+    because Snowflake bind variables are POSITIONAL/NUMBERED
+    (``:1``, ``:2``, ...), never named, in every execution path this
+    codebase could plausibly use (the Python connector's ``qmark``/
+    ``numeric`` paramstyles; see ``connectors/snowflake/policy_params.py``),
+    a future caller must still run this arm's ``:name`` output through that
+    module before binding -- exactly the same shape the Databricks arm's own
+    docstring documents for its array-valued variable.
+
+    A transpile failure is a ``PolicyError`` for the same reason as the
+    other two remote arms: the admin never authors Snowflake SQL directly,
+    so a failure here means the body uses a construct sqlglot cannot carry
+    across dialects, and §16 forbids leaking the engine's own message.
+    """
+    try:
+        statements = sqlglot.transpile(policy_sql, read="duckdb", write="snowflake")
     except Exception as exc:
         raise PolicyError(table_id) from exc
     if not statements:

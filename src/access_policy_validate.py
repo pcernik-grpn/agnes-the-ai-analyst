@@ -433,14 +433,15 @@ def _reject_untranspilable(sql: str) -> None:
     engine's SQL without error (§7.2) -- the admin authors DuckDB SQL once,
     and sqlglot produces the form actually run against the source.
 
-    Checked for BOTH remote engines at save time, not just the one this
+    Checked for EVERY remote engine at save time, not just the one this
     particular table happens to sit on. A policy that transpiles to BigQuery
-    but not to Databricks would save clean and then fail at read time on a
-    Databricks table -- and a policy read that fails, correctly, denies (§17),
-    so the admin would have shipped an outage instead of an access rule. The
-    save-time check is the only moment where the feedback is cheap.
+    but not to Databricks (or Snowflake, S2 -- RLS review issue #1979) would
+    save clean and then fail at read time on that engine's table -- and a
+    policy read that fails, correctly, denies (§17), so the admin would have
+    shipped an outage instead of an access rule. The save-time check is the
+    only moment where the feedback is cheap.
     """
-    for engine in ("bigquery", "databricks"):
+    for engine in ("bigquery", "databricks", "snowflake"):
         try:
             sqlglot.transpile(sql, read="duckdb", write=engine)
         except Exception as exc:

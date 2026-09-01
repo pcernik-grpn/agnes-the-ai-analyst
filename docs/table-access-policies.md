@@ -111,7 +111,7 @@ unit IN (SELECT unnest($g))    →  a GENERATE_ARRAY/CROSS JOIN construct, ~10×
 
 The `unnest` form isn't rejected — the save-time validator logs a server-side warning rather than blocking the save — but there's no reason to reach for it over `list_contains`.
 
-### One authored body, three engines
+### One authored body, several engines
 
 You write the policy once, in DuckDB SQL. Each engine gets it in its own dialect, and — the part that matters — each engine's own **named-parameter** syntax, so the caller's identity is never text inside the statement:
 
@@ -120,10 +120,13 @@ You write the policy once, in DuckDB SQL. Each engine gets it in its own dialect
 | DuckDB | `$user_email` | native named parameters |
 | BigQuery | `@user_email` | `QueryParameter` on the job config |
 | Databricks | `:user_email` | the Statement Execution API's `parameters` field |
+| Snowflake | `:user_email` | numbered (`:1`, `:2`, …) positional binds — see below |
 
 Databricks needs one extra step for `$user_groups` alone: its API binds **scalars only**, so the array marker is rewritten into `ARRAY(:p0, :p1, …)` over generated scalar markers. The group names still travel as request fields — only how many of them there are becomes visible in the statement. A caller in no groups binds a typed empty array and matches nothing.
 
-A policy that fails to transpile to *either* remote engine is rejected at save time (`policy_untranspilable`), not at read time — a policy that denies because it cannot be compiled is an outage wearing an access rule's clothes.
+Snowflake's resolver transpile arm (`policied_relation(..., dialect="snowflake")`) exists for a genuinely Snowflake-native SQL text surface — a `snowflake_query()` pass-through, or a Snowflake semantic-view `MEASURE()` query that cannot parse as DuckDB SQL at all. A `query_mode='remote'` Snowflake row registered by name, the ordinary case, already reads correctly *today* through the plain `dialect="duckdb"` arm: the row is a DuckDB VIEW over the ATTACHed `sf` catalog (the `snowflake` DuckDB community extension), so the query text is DuckDB SQL bound with DuckDB's own native parameters, never Snowflake-dialect text. Snowflake has no named-bind-variable syntax an external driver resolves against request parameters (`:name` in Snowflake SQL is a *Snowflake Scripting* local-variable reference, valid only inside a stored procedure) — every real Snowflake execution path binds **positionally** (`qmark`/`numeric` paramstyle), so a caller of the transpile arm renumbers every marker via `connectors/snowflake/policy_params.py::bind_policy_parameters`, which also expands `$user_groups` into a bracket array literal (`[:3, :4, …]`) the same way the Databricks module expands its own `ARRAY(...)`.
+
+A policy that fails to transpile to *any* remote engine (BigQuery, Databricks, Snowflake) is rejected at save time (`policy_untranspilable`), not at read time — a policy that denies because it cannot be compiled is an outage wearing an access rule's clothes.
 
 ## Mapping tables
 

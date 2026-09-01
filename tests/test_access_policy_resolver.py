@@ -283,10 +283,12 @@ class TestAgentPrincipalBindsCaller:
 
 
 class TestUnknownDialect:
-    """Only the two known dialects are accepted -- an unrecognized one fails
-    loudly rather than silently falling back to an unfiltered relation. The
-    BigQuery arm itself (§7.2) is covered end to end in
-    ``tests/test_access_policy_bigquery.py`` (Task 10)."""
+    """Only the known dialects (``duckdb`` / ``bigquery`` / ``databricks`` /
+    ``snowflake``) are accepted -- an unrecognized one fails loudly rather
+    than silently falling back to an unfiltered relation. The BigQuery arm
+    itself (§7.2) is covered end to end in
+    ``tests/test_access_policy_bigquery.py`` (Task 10); the Snowflake arm
+    (S2, RLS review issue #1979) in ``tests/test_access_policy_snowflake.py``."""
 
     def test_unknown_dialect_raises_value_error(self, policy_env):
         with pytest.raises(ValueError):
