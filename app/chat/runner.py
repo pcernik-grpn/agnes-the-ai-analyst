@@ -87,27 +87,30 @@ _WORKSPACE_WAIT_SECONDS = 180
 _CONTEXT_RESTORE_PATH = "/tmp/agnes-context.md"
 
 
-#: The ``next_actions`` trailer contract, stated where the model cannot skim
-#: past it.
+#: The ``next_actions`` trailer contract, on the one prompt surface an admin
+#: cannot replace.
 #:
-#: The rule already exists, in prose, in the workspace prompt
-#: (``config/claude_md_template.txt`` -> "Offer the next step"). That is the
-#: wrong surface for it: CLAUDE.md is a ~400-line project memory the model
-#: reads as *context*, the section sits two thirds of the way down, and it
-#: ends in a soft opt-out ("skip the block when the conversation is clearly
-#: over"). The observable result is that the chips stopped appearing —
-#: nothing in the client broke, the model simply stopped writing the block.
+#: The rule also exists, in prose, in the workspace prompt
+#: (``config/claude_md_template.txt`` -> "Offer the next step"). That surface
+#: alone is not enough for a reason that has nothing to do with model
+#: attention: an admin Workspace Prompt override
+#: (``src/initial_workspace.py::resolve_prompt``) REPLACES the shipped
+#: template wholesale, section included. On such an instance the chips can
+#: never come back, whatever the template says. Here they can.
 #:
-#: The embedded kai-agent turn engine, whose buttons are reliable, puts the
-#: same requirement in its SYSTEM prompt with hard rules and a fixed count.
-#: This is that placement, borrowed. It is not a second, competing copy of
-#: the rule: the CLAUDE.md section stays as the human-readable statement an
-#: admin can read and edit, and both say the same thing about the same fence.
+#: What this is NOT: a compliance fix. A 3-arm A/B against a real model
+#: (n=10 per arm — old CLAUDE.md alone / new CLAUDE.md + this / new CLAUDE.md
+#: alone) could not distinguish the three: 8-10 of 10 replies carried the
+#: block in every arm, and the run-to-run spread swamped the difference. Do
+#: not restate "the system prompt is what makes the buttons reliable" without
+#: a measurement that shows it; the earlier version of this comment did, and
+#: it was wrong.
 #:
-#: The word cap is not cosmetic. The trailer streams AFTER the visible prose
+#: The word cap IS load-bearing. The trailer streams after the visible prose
 #: and the client withholds a half-open fence (``_streamingSafeText`` in
-#: chat.js), so every token spent here is a token the reader waits through
-#: with nothing changing on screen. Two short lines keep that tail small.
+#: chat.js), so every token here is a token the reader waits through with
+#: nothing changing on screen. Measured hidden tail in that A/B: ~200 chars
+#: before, ~160 after.
 _NEXT_ACTIONS_CONTRACT = """\
 ## Next actions — required trailer
 

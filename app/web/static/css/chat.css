@@ -1687,9 +1687,16 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   cursor: pointer;
   text-align: left;
 }
-.cloud-chat-next-action:hover {
+.cloud-chat-next-action:hover:not([disabled]) {
   border-color: var(--ds-primary);
   color: var(--ds-primary);
+}
+/* Drawn mid-stream: the follow-ups are on screen the moment the trailer
+   closes, but the turn is still running and a click would submit into it.
+   Muted and inert until finalize re-renders the row enabled. */
+.cloud-chat-next-action[disabled] {
+  color: var(--ds-text-muted);
+  cursor: default;
 }
 .cloud-chat-next-action:focus-visible {
   outline: var(--ds-focus-outline);

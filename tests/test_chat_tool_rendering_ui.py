@@ -138,7 +138,7 @@ def test_the_prompt_mandates_the_next_actions_trailer():
     flat = re.sub(r"\s+", " ", md)
     assert "```next_actions" in md
     assert "one-click buttons" in flat
-    assert "Skip the block" in flat, "the prompt must say when NOT to emit it"
+    assert "Omit it in exactly two cases" in flat, "the prompt must say when NOT to emit it"
 
 
 def test_the_template_carries_the_trailer_for_the_sandbox_only():
@@ -925,13 +925,12 @@ def test_reset_clears_the_seal_bookkeeping():
 
 def test_the_sandbox_system_prompt_carries_the_next_actions_contract():
     """Why this exists at all, given the CLAUDE.md sections above already say
-    it: CLAUDE.md is a ~400-line project memory the model reads as context,
-    the section sits two thirds down, and it ends in an opt-out. The chips
-    stopped appearing with nothing in the client broken — the model had
-    simply stopped writing the block. The embedded kai-agent turn engine
-    puts the same requirement in its SYSTEM prompt with a fixed count and
-    hard rules; this pins that placement so a later refactor of the
-    restore-context branch cannot quietly drop it."""
+    it: an admin Workspace Prompt override (src/initial_workspace.py::
+    resolve_prompt) REPLACES the shipped template wholesale, so on such an
+    instance the section is simply gone and no template edit can bring the
+    chips back. The system prompt is the surface an override cannot reach.
+    NOT justified as a compliance fix — a 3-arm A/B against a real model
+    could not distinguish it from the CLAUDE.md wording alone."""
     src = Path("app/chat/runner.py").read_text(encoding="utf-8")
     assert "_NEXT_ACTIONS_CONTRACT" in src
     start = src.index('_NEXT_ACTIONS_CONTRACT = """')
@@ -965,6 +964,43 @@ def test_the_trailer_is_written_before_the_sources_block():
     for path in (Path("config/claude_md_template.txt"), WORKSPACE_CLAUDE_MD):
         flat = re.sub(r"\s+", " ", _read(path))
         assert "before any `sources` block" in flat, path
+
+
+def test_no_prompt_surface_keeps_the_conversation_is_over_opt_out():
+    """The root cause was a judgement call the model kept making. Naming two
+    hard cases in the system prompt is worthless while a workspace prompt
+    loaded alongside it still says "skip the block when the conversation is
+    clearly over" — the model would simply follow the permissive one, and the
+    admin-readable contract would not be the same contract. (Copilot review
+    on this PR.)"""
+    for path in (
+        Path("app/chat/runner.py"),
+        Path("config/claude_md_template.txt"),
+        WORKSPACE_CLAUDE_MD,
+    ):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "conversation is clearly over" not in flat, path
+    for path in (Path("config/claude_md_template.txt"), WORKSPACE_CLAUDE_MD):
+        flat = re.sub(r"\s+", " ", _read(path))
+        assert "Omit it in exactly two cases" in flat, path
+
+
+def test_pending_chips_are_inert_until_the_turn_ends():
+    """The mid-stream row exists to SHOW the follow-ups early, not to let one
+    be fired into a running turn: submitUserMessage has no in-flight guard
+    and calls _resetStreamingState(), so the old turn's remaining frames
+    would render below the new user message."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
+    assert "function renderNextActions(bubble, actions, pending = false)" in js
+    assert "btn.disabled = pending;" in body
+    assert "if (btn.disabled) return;" in body, "the handler must refuse too, not only the attribute"
+    stream = js[js.index("function _renderStreamingMarkdown") : js.index("function _flushStreamingTail")]
+    assert "streamedActions, true)" in stream, "the streaming draw is the only pending one"
+    # Every finish path renders the row enabled — a chip that stayed dead
+    # after the turn ended would be worse than no chip at all.
+    for call in re.findall(r"renderNextActions\([^;]*?\);", js[js.index("function finalizeAssistantMessage") :]):
+        assert "true)" not in call, f"finalize must render enabled chips: {call}"
 
 
 def test_chips_are_drawn_mid_stream_not_only_at_finalize():

@@ -61,8 +61,9 @@ app's own definition.
 ## Say where every number came from
 
 The user is promised, in the product's own onboarding, that you always show
-where an answer came from. Honour it: **an answer that reports a figure ends
-with a `sources` block** — a fenced block, one claim per line:
+where an answer came from. Honour it: **an answer that reports a figure
+carries a `sources` block** — a fenced block, one claim per line. It is the
+LAST thing in the reply, after the `next_actions` block:
 
     ```sources
     table: hr_headcount
@@ -109,9 +110,13 @@ it is time the reader waits with nothing on screen:
     ```
 
 The web chat lifts this block out of your reply and renders the lines as
-one-click buttons — it never appears as text. Skip the block when the
-conversation is clearly over, or when you are asking the user a question
-and the only sensible next step is their answer.
+one-click buttons — it never appears as text. Omit it in exactly two cases:
+you are asking the user a direct question and their answer is the only
+sensible next step, or the reply was requested as a single machine-readable
+value (JSON only, a named schema), where one extra character is the
+difference between a parseable answer and a broken one. "The conversation
+feels finished" is NOT one of them — that judgement is what made the buttons
+disappear, and a reader who is done simply does not click.
 
 ## Charts
 

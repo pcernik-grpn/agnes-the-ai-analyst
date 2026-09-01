@@ -698,7 +698,7 @@ function renderFactsScopeLine(bubble) {
   _resetFactsTurnEvidence();
 }
 
-function renderNextActions(bubble, actions) {
+function renderNextActions(bubble, actions, pending = false) {
   _clearNextActions();
   if (!bubble || !actions || actions.length === 0) return;
   const row = document.createElement("div");
@@ -708,7 +708,20 @@ function renderNextActions(bubble, actions) {
     btn.type = "button";
     btn.className = "cloud-chat-next-action";
     btn.textContent = action;
+    // `pending` is the mid-stream draw: the trailer has closed but the turn
+    // has not. Showing the row there is the point — the reader learns the
+    // follow-ups exist while the tail is still arriving — but CLICKING it
+    // must not be possible yet. The click submits, submitUserMessage has no
+    // in-flight guard (typing into the composer mid-turn is already allowed
+    // and the runner buffers the second user_msg), and it calls
+    // _resetStreamingState(), which drops the stream pointers: the old
+    // turn's remaining frames — the sources verdict, the final
+    // assistant_message — would then land in a fresh bubble BELOW the new
+    // user message. Finalize re-renders this same row enabled a moment
+    // later. (Copilot review on this PR.)
+    btn.disabled = pending;
     btn.addEventListener("click", () => {
+      if (btn.disabled) return;
       const ta = $("chat-input");
       if (!ta) return;
       ta.value = action;
@@ -2947,7 +2960,7 @@ function _renderStreamingMarkdown() {
   // (nothing parseable yet) never clears a row that is already up.
   const streamedActions = extractNextActions(currentAssistantText).actions;
   if (streamedActions.length) {
-    renderNextActions(currentAssistantBody.closest(".msg-bubble"), streamedActions);
+    renderNextActions(currentAssistantBody.closest(".msg-bubble"), streamedActions, true);
   }
   maybeScrollToBottom();
 }
