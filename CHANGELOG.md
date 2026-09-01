@@ -161,7 +161,19 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The producer corpus-map handoff endpoint.** `GET /api/admin/sharepoint/connections/{id}/corpus-map` (with its `connectors/sharepoint/corpus_map.py` builder, the wizard's "Download corpus map" link, and the producer-token grant for the route) served exactly one consumer — the retired external corpus-extraction producer. The built-in pipeline routes scopes and permission zones structurally inside the crawler and never read this map. Producer tokens keep the rest of their callback surface (`GET …/scopes`, collection file upload, facts ingest/corrections) unchanged.
 
 ### Internal
-
+- **The two health-probe event-loop guards asserted nothing, and then
+  asserted it unreliably.** Both patched `_check_db_schema` — the inner
+  read *behind* the memoized `_cached_db_schema` the endpoints await — so
+  with the loop blocked the first probe slept, filled the cache, and the
+  second returned from it for free: healthy and regressed both measured one
+  sleep (1.53s either way). They now patch the cached layer, and assert
+  **peak concurrency** instead of elapsed time. A wall-clock threshold had
+  to fit between one sleep and two while a loaded shard runner's own
+  overhead measured ~1.05s and varied — the liveness guard failed at 1.54s
+  against 0.9s and again at 2.55s against a widened 2.5s, both times with
+  `app/api/health.py` byte-identical to a passing `main`. Peak concurrency
+  is 2 off-loop and 1 when blocked, independent of machine load; verified
+  by forcing `asyncio.to_thread` inline, where both guards now fail.
 - **A git conflict marker left in `CHANGELOG.md` now fails CI.** A seventh guard in `tests/test_changelog_integrity.py` refuses any line that *is* a marker. Nothing could see this before: the released-region checksum covers released blocks only, so a marker in `[Unreleased]` passes it, and the duplicate-bullet guard compares bullets — a marker line is not one. An orphan `<<<<<<< HEAD` with no matching `=======` reached `main` exactly that way, because a union-style merge resolution keeps both sides of a *balanced* conflict and passes an unbalanced marker through as ordinary text. Matched at line start rather than as a substring, since the `[0.55.1]` section legitimately documents these markers inside backticks — pinned by its own test so a future tightening cannot fail the build on correct prose.
 
 - **Corporate Memory detection is now documented where admins can find it, ahead of the scheduled-agent rework in #1971.** `/admin/corporate-memory` gained a "How detection works" panel (the two extraction paths and their inputs, the fixed confidence-by-detection-type lookup, the currently-constant category, and where to find the two kill-switches above); `docs/corporate-memory-governance.md` gained a "How Candidates Are Detected" section, dropped its stale claim that the AI self-reports a confidence score, and fixed a wrong config key name (`auto_confidence_threshold` → `auto_publish_min_confidence`); and the remaining inert `corporate_memory.*` knobs (`sources.claude_local_md.*`, `sources.session_transcripts.confidence_base`/`max_turns_per_session`, `extraction.*`, `review_period_months`, `entity_resolution.*`) are now labeled "not yet wired" in the server-config schema and `instance.yaml.example` instead of silently implying they already do something.
