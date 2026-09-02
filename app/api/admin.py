@@ -21,7 +21,7 @@ import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin, require_admin_all_surface
 from app.auth.dependencies import _get_db
 from app.switches import SWITCHES
 from connectors.bigquery.access import BqAccess, get_bq_access
@@ -7222,6 +7222,51 @@ def _policy_preview_dialect(row: dict) -> Optional[str]:
     return source_type if source_type in ("bigquery", "databricks") else None
 
 
+# §16 -- a failing policy's raw engine message can quote literal values and
+# identifiers straight out of the policy body, which is why ``PolicyError``
+# deliberately carries no engine detail. The two admin previews were the one
+# place that detail still reached a response (``f"policy_preview_failed:
+# {exc}"``, and ``str(exc)`` per failing group). It goes to the server log
+# instead; the caller gets a table-scoped message and a coarse reason class
+# (#1979, security review).
+_POLICY_PREVIEW_REASONS = {
+    "CatalogException": "catalog_error",
+    "BinderException": "binder_error",
+    "ConversionException": "conversion_error",
+    "InvalidInputException": "invalid_input",
+    "ParserException": "parse_error",
+    "ParseError": "parse_error",
+    "OutOfMemoryException": "resource_error",
+    "PermissionException": "permission_error",
+}
+
+
+def _policy_preview_failure_reason(exc: Exception) -> str:
+    """A coarse class for WHY the preview failed, drawn from a closed
+    vocabulary keyed on the exception TYPE -- never on its message, so no
+    policy-body text can ride along."""
+    return _POLICY_PREVIEW_REASONS.get(type(exc).__name__, "execution_error")
+
+
+def _policy_preview_failed_detail(exc: Exception, *, table_id: str, group: Optional[str] = None) -> str:
+    """The one message both previews return when executing a policy body
+    fails -- table-scoped, engine-text-free, and logged in full server-side
+    so an operator loses nothing."""
+    reason = _policy_preview_failure_reason(exc)
+    logger.warning(
+        "access-policy preview failed for table %s (%s)%s: %s",
+        table_id,
+        reason,
+        f" as group {group!r}" if group else "",
+        exc,
+    )
+    return (
+        f"policy_preview_failed: the access policy for table {table_id!r} could not be "
+        f"evaluated ({reason}); the engine's own message is in the server log, not in "
+        "this response, because it can quote values out of the policy body"
+    )
+
+
 def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
     """Why an admin preview cannot run against this table at all, or ``None``.
 
@@ -7307,7 +7352,7 @@ def _policy_preview_mapping_warning(
 def preview_table_policy(
     table_id: str,
     request: PolicyPreviewRequest,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
     bq: BqAccess = Depends(get_bq_access),
 ):
@@ -7325,6 +7370,15 @@ def preview_table_policy(
     it — so identity/groups are resolved directly from the request (or, for
     ``as_user``, from that user's own live membership), never from the
     calling admin's principal.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): this route hands back policy CONTENT with no
+    per-table grant check and no policy rewrite standing behind it, so its
+    admin gate is the ONLY thing between the caller and unpolicied data --
+    the same shape K2 fixed on ``POST /api/query/hybrid``. A
+    ``surface='stack'`` admin PAT (the ``agnes init`` default, deliberately
+    filtered like an analyst everywhere else) is refused here; a browser
+    session or a full-surface PAT is not.
 
     Every preview is audited (§13.1: "it shows one person another person's
     slice, and 'who looked at whose data, when' is the first question asked
@@ -7511,7 +7565,7 @@ def preview_table_policy(
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail=f"policy_preview_failed: could not parse policy SQL: {exc}",
+                detail=_policy_preview_failed_detail(exc, table_id=table_id),
             ) from exc
 
         # §6.3, mirrored from the LIVE resolver (`src/access_policy.py::
@@ -7561,7 +7615,7 @@ def preview_table_policy(
                 analytics_conn, row["name"], policy_sql, params
             )
         except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"policy_preview_failed: {exc}") from exc
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
     finally:
         analytics_conn.close()
 
@@ -7620,7 +7674,7 @@ class PolicyPreviewGroupsRequest(BaseModel):
 def preview_table_policy_all_groups(
     table_id: str,
     request: PolicyPreviewGroupsRequest,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
 ):
     """Batch single-group preview across every real group in the instance.
 
@@ -7640,6 +7694,14 @@ def preview_table_policy_all_groups(
     primitive that does not exist yet): this previews one group at a time,
     never a combination, and only counts rows -- no sample-row
     materialization -- so it stays a single cheap ``COUNT(*)`` per group.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): it reports per-group visibility over the table's real rows with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
     """
     from src.access_policy_validate import PolicyValidationError, validate_policy_sql
     from src.db import get_analytics_db_readonly
@@ -7697,7 +7759,7 @@ def preview_table_policy_all_groups(
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"policy_preview_failed: could not parse policy SQL: {exc}",
+            detail=_policy_preview_failed_detail(exc, table_id=table_id),
         ) from exc
 
     # §6.3, the same screen `preview_table_policy` applies to a stored body:
@@ -7729,7 +7791,7 @@ def preview_table_policy_all_groups(
         try:
             rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
         except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"policy_preview_failed: {exc}") from exc
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
 
         results = []
         for group_name in group_names:
@@ -7750,7 +7812,13 @@ def preview_table_policy_all_groups(
                     params,
                 ).fetchone()[0]
             except Exception as exc:
-                results.append({"group": group_name, "rows_visible": None, "error": str(exc)})
+                results.append(
+                    {
+                        "group": group_name,
+                        "rows_visible": None,
+                        "error": _policy_preview_failed_detail(exc, table_id=table_id, group=group_name),
+                    }
+                )
                 continue
             results.append({"group": group_name, "rows_visible": int(rows_visible), "error": None})
     finally:
@@ -7895,7 +7963,7 @@ def _policy_builder_looks_like_pii(col_name: str, profile_col: dict) -> bool:
 async def list_access_policy_revisions(
     table_id: str,
     limit: int = Query(10, ge=1, le=50),
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
 ):
     """The saved states of this table's access policy, newest first (#1979).
 
@@ -7918,6 +7986,14 @@ async def list_access_policy_revisions(
     raises, and the modal falls back to its audit-derived, read-only
     history. The registry lookup runs FIRST, so a typo'd table id is a 404
     on every backend rather than advice to migrate a database.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): every listed revision carries a full historical policy body with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
     """
     if not table_registry_repo().get(table_id):
         raise HTTPException(status_code=404, detail="Table not found")
@@ -7965,7 +8041,7 @@ async def list_access_policy_revisions(
 @router.get("/registry/{table_id}/policy/columns")
 async def policy_builder_columns(
     table_id: str,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
     bq: BqAccess = Depends(get_bq_access),
 ):
@@ -7980,6 +8056,14 @@ async def policy_builder_columns(
     (``PUT /registry/{id}`` writing a non-null ``access_policy_sql``, per
     that flag's own hint text in ``_flag_default("access_policies", ...)``
     above).
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): it returns the table's real schema plus profiler SAMPLE VALUES with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
     """
     row = table_registry_repo().get(table_id)
     if not row:

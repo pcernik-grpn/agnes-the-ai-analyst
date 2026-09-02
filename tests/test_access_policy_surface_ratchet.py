@@ -282,7 +282,11 @@ EXEMPT: frozenset[str] = frozenset(
         # here -- the whole point is to run the policy as the CHOSEN
         # persona regardless of who is asking, so it binds that persona's
         # identity/groups directly and reads through `probe_policy` +
-        # `get_analytics_db_readonly()` instead.
+        # `get_analytics_db_readonly()` instead. What the credential surface
+        # DOES still decide is who may ask at all: since the #1979 security
+        # review (F2) this route is gated by `require_admin_all_surface`, so
+        # a `surface='stack'` admin PAT never reaches its raw
+        # `base_sample_rows`.
         "app/api/admin.py::preview_table_policy",
         # review plan P1.4 -- POST .../policy/preview-groups. Same exemption
         # reasoning as `preview_table_policy` immediately above: it exists
@@ -290,15 +294,21 @@ EXEMPT: frozenset[str] = frozenset(
         # sweeping every real `user_groups` row through the SAME policy via
         # `get_analytics_db_readonly()` directly, so a `CASE`-on-`$user_groups`
         # policy with a missing `ELSE` branch can be checked before anyone
-        # trusts it. require_admin-gated, audited (`access_policy.
-        # preview_groups`).
+        # trusts it. Audited (`access_policy.preview_groups`) and, since the
+        # #1979 security review (F2), gated by `require_admin_all_surface`
+        # rather than plain `require_admin`: like every other policy-CONTENT
+        # route in this section, its admin gate is the only check between the
+        # caller and unpolicied data, so a `surface='stack'` admin PAT is
+        # refused (same reasoning as `query_hybrid.py::hybrid_query` below).
         "app/api/admin.py::preview_table_policy_all_groups",
         # access-policy-builder-ux plan, Tasks 2/3 -- GET .../policy/columns
         # and its shared `_policy_builder_describe` DESCRIBE helper. Same
         # admin-authoring posture as `preview_table_policy` right above:
-        # require_admin-gated, reads the table's OWN schema/profile so an
-        # admin can pick columns to mask BEFORE any policy exists, never a
-        # caller-facing content read. `policy_builder_compile` (the
+        # reads the table's OWN schema/profile so an admin can pick columns
+        # to mask BEFORE any policy exists, never a caller-facing content
+        # read -- and, like that route, gated by `require_admin_all_surface`
+        # since the #1979 security review (F2), because the profiler SAMPLE
+        # VALUES it returns are real cell content. `policy_builder_compile` (the
         # POST .../policy/compile handler) calls this same helper but is not
         # itself a scanned node -- it never calls a target primitive
         # directly, only through this already-classified helper.

@@ -151,6 +151,20 @@ class PolicyUnknownTable(PolicyError):
     """
 
 
+class PolicyAmbiguousTable(PolicyError):
+    """Two or more registry rows carry names that differ ONLY by case, and
+    this reference folds onto all of them (§5.3).
+
+    DuckDB's catalog is case-insensitive AND case-preserving, so it can hold
+    only ONE of ``invoices`` / ``INVOICES`` as a view -- which of the two
+    registry rows (and therefore which policy, or none) governs the view the
+    caller would actually read is unknowable from the registry alone. A
+    refusal, NOT a ``PolicyUnknownTable``: this is exactly the shape whose
+    swallowing served raw rows in the first place, so it must never land in
+    ``rewrite_sql``'s swallowed arm.
+    """
+
+
 def assert_unique_output_columns(column_names, table_id: str) -> None:
     """Fail closed when a POLICIED read produced duplicate output column names.
 
@@ -440,21 +454,74 @@ def transpile_policy_sql(policy_sql: str, *, table_id: str, dialect: str) -> str
     raise ValueError(f"unknown dialect: {dialect!r}")
 
 
-def _resolve_table_row(table_id: str) -> dict:
-    """id-or-name lookup (§5.3) — ``id`` checked first (registry PK, exact
-    match), then ``name`` (what master views and SQL ``FROM`` clauses name).
-    Neither resolving is still a refusal, never a silent passthrough — but a
-    DISTINGUISHABLE one: ``PolicyUnknownTable`` (a ``PolicyError`` subclass,
-    so every caller that only knows the base type is unaffected) says "this
-    name is not in the registry", which is the sole outcome ``rewrite_sql``
-    is allowed to treat as none of its business.
+def find_registry_row(name_or_id: str) -> dict | None:
+    """The registry lookup every policy surface resolves a referenced
+    identifier through — ``None`` when nothing answers to it.
+
+    ``id`` is matched exactly (registry PK; an id is opaque and never
+    appears in a ``FROM`` clause) and NAMES are matched case-insensitively;
+    if the two arms disagree about WHICH ROW is meant, that is an ambiguity
+    and refuses like any other. The NAME arm folds case because the thing it
+    is protecting does: DuckDB's catalog is case-insensitive and even
+    resolves a QUOTED ``FROM "Invoices"`` onto the view created as
+    ``invoices``. Both
+    ``get_by_name`` implementations (DuckDB and Postgres) compare with
+    ``=``, so an upper-cased reference used to resolve to NOTHING —
+    ``PolicyUnknownTable``, the one outcome ``rewrite_sql`` swallows as "not
+    a registered table" — and the caller then read the raw, unfiltered view
+    with a 200 and no ``row_scope`` (#1979, security review). The rule this
+    function exists to hold: **whatever DuckDB would fold onto a policied
+    view must be resolvable here**.
+
+    Two rows whose names differ only by case are ambiguous and raise
+    ``PolicyAmbiguousTable`` (a ``PolicyError`` → a structured refusal
+    everywhere, never the swallowed subclass): the catalog can hold only one
+    of the two views, so which row governs the read is unknowable.
+
+    Scans ``list_all()`` rather than adding a case-insensitive lookup to the
+    frozen DuckDB↔PG ``table_registry`` pair — the same "the registry is
+    bounded by an instance's table count" trade-off
+    ``app/api/query.py::_policied_row_over_physical_source`` already makes,
+    and it is the only shape that can SEE the ambiguity at all.
     """
     from src.repositories import table_registry_repo
 
     repo = table_registry_repo()
-    row = repo.get(table_id)
-    if row is None:
-        row = repo.get_by_name(table_id)
+    wanted = (name_or_id or "").lower()
+
+    candidates: list[dict] = []
+    seen_ids: set = set()
+    for row in [repo.get(name_or_id)] + [r for r in repo.list_all() if str(r.get("name") or "").lower() == wanted]:
+        if row is None:
+            continue
+        row_id = row.get("id")
+        if row_id in seen_ids:
+            continue
+        seen_ids.add(row_id)
+        candidates.append(row)
+
+    if len(candidates) > 1:
+        # Includes the shape where one row's ID equals ANOTHER row's name:
+        # taking the id hit would hand back an unpolicied row while DuckDB
+        # folded the very same identifier onto the policied row's view.
+        raise PolicyAmbiguousTable(name_or_id)
+    if candidates:
+        return candidates[0]
+    # Defensive: a backend whose `list_all` is ever narrower than
+    # `get_by_name` must not lose an exact match.
+    return repo.get_by_name(name_or_id)
+
+
+def _resolve_table_row(table_id: str) -> dict:
+    """id-or-name lookup (§5.3) — see :func:`find_registry_row` for the
+    exact/case-folded/ambiguous rules. Not resolving is still a refusal,
+    never a silent passthrough — but a DISTINGUISHABLE one:
+    ``PolicyUnknownTable`` (a ``PolicyError`` subclass, so every caller that
+    only knows the base type is unaffected) says "this name is not in the
+    registry", which is the sole outcome ``rewrite_sql`` is allowed to treat
+    as none of its business.
+    """
+    row = find_registry_row(table_id)
     if row is None:
         raise PolicyUnknownTable(table_id)
     return row
@@ -1078,23 +1145,43 @@ def _protected_table_self_names(*, table_name: str | None, table_id: str | None)
     from src.repositories import table_registry_repo
 
     repo = table_registry_repo()
+    try:
+        mapping_names = {
+            str(r.get("name") or "").lower() for r in repo.list_all() if r.get("policy_mapping") and r.get("name")
+        }
+    except Exception:
+        mapping_names = set()
+
     for key in (table_id, table_name):
         if not key:
             continue
         try:
-            row = repo.get(key) or repo.get_by_name(key)
+            row = find_registry_row(key)
         except Exception:
             row = None
         if not row:
             continue
         for field in ("name", "source_table"):
             value = row.get(field)
-            if value:
+            if not value:
+                continue
+            lowered = str(value).lower()
+            if field == "source_table" and lowered in mapping_names:
                 # A `bucket.source_table` reference parses with the bucket as
                 # the schema and only the final identifier as `Table.name`,
                 # which is what `referenced_names` above collects -- so the
-                # bare `source_table` is the form that has to be excluded.
-                names.add(str(value).lower())
+                # bare `source_table` is normally the form that has to be
+                # excluded. NOT when some `policy_mapping=true` row is
+                # actually NAMED that, though: then the reference is far more
+                # likely that real mapping dependency than this table's own
+                # physical source, and excluding it suppressed the empty-
+                # mapping refusal for a genuine dependency, restoring the
+                # silent 0-row answer this whole check exists to prevent
+                # (#1979, security review). The row's own `name` (and `id`)
+                # stay excluded unconditionally -- a body's mandatory
+                # `FROM <itself>` is never a mapping dependency.
+                continue
+            names.add(lowered)
     return names
 
 

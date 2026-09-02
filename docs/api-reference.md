@@ -255,6 +255,15 @@ attached/replaced/cleared via `PUT /api/admin/registry/{table_id}` (`access_poli
 Every call is recorded to the audit log (`access_policy.preview`) — it shows one admin
 another person's data slice.
 
+These four policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
+`.../policy/columns`, `.../policy/revisions`) need an admin credential whose data-read
+**surface** is `all` — a browser session, a regular PAT, or `agnes init --as-admin`.
+A `surface='stack'` PAT (the `agnes init` default, filtered like an analyst everywhere
+else) gets `403` with a detail naming the fix: they return real table content with no
+per-table grant check and no policy rewrite behind them, so the admin gate is the only
+thing standing between the caller and unpolicied data. `.../policy/compile` is
+deliberately not narrowed — it persists nothing and returns only generated SQL.
+
 | Field | Type | Notes |
 |---|---|---|
 | `sql` | string, optional | A candidate policy body to preview before saving. Omit to preview the table's **currently stored** `access_policy_sql`. Validated the same way a `PUT` would validate it. |
@@ -377,7 +386,9 @@ as `access_policy_sql` (plus the mandatory `access_policy_note`).
 Both builder routes are admin-only and, like `.../policy/preview`, available regardless
 of `access_policies.enabled`: they neither read nor write a stored policy. That flag
 gates attaching one (`PUT` with a non-null `access_policy_sql`) and applying one on a
-read.
+read. `.../policy/columns` returns real profiler sample values, so it additionally
+requires the full (`all`) credential surface described in §3.7; `.../policy/compile`
+does not.
 
 ### 3.9 Access-policy history — `GET /api/admin/registry/{table_id}/policy/revisions`
 
@@ -389,6 +400,9 @@ SQL body — which is what the policy editor's history panel renders and what it
 The audit trail cannot answer this question: `audit_log.params` redacts
 `access_policy_sql` (content never enters the trail), so an audit row records *that* a
 policy changed and by whom, never what it was.
+
+Because every listed revision carries a full historical policy body, this route requires
+the full (`all`) credential surface described in §3.7.
 
 ```bash
 curl -s "https://{your-instance}/api/admin/registry/orders_daily/policy/revisions?limit=10" \

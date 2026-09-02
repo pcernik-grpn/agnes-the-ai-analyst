@@ -373,3 +373,105 @@ class TestUnknownTable:
 
         with pytest.raises(PolicyUnknownTable):
             policied_relation("does-not-exist", policy_env["solo_user"])
+
+
+class TestCaseInsensitiveNameResolution:
+    """DuckDB's catalog folds identifiers -- ``FROM INVOICES`` and ``FROM
+    "Invoices"`` both resolve to the view created as ``invoices`` (verified:
+    DuckDB even folds a QUOTED identifier onto an existing view, and refuses
+    to create a second view differing only by case). The registry lookup
+    behind the policy resolver was exact-equality on both backends, so a
+    caller who merely changed the case of the table name got
+    ``PolicyUnknownTable`` -- the ONE outcome ``rewrite_sql`` swallows as
+    "not a registered table" -- and read the raw, unfiltered view with a
+    200 (#1979, security review). Resolution must fold exactly like the
+    catalog it protects.
+    """
+
+    def test_upper_cased_name_resolves_to_the_registered_row(self, policy_env):
+        result = policied_relation("INVOICES", policy_env["solo_user"])
+        assert result.policied is True
+        assert result.table_id == "tbl_invoices"
+        assert result.relation_sql == GROUPS_ONLY_POLICY
+
+    def test_mixed_case_name_resolves_to_the_registered_row(self, policy_env):
+        result = policied_relation("Invoices", policy_env["solo_user"])
+        assert result.policied is True
+        assert result.table_id == "tbl_invoices"
+
+    def test_exact_name_still_resolves(self, policy_env):
+        result = policied_relation("invoices", policy_env["solo_user"])
+        assert result.policied is True
+        assert result.table_id == "tbl_invoices"
+
+    def test_exact_id_still_wins(self, policy_env):
+        result = policied_relation("tbl_invoices", policy_env["solo_user"])
+        assert result.policied is True
+        assert result.table_id == "tbl_invoices"
+
+    def test_a_genuinely_unknown_name_is_still_the_unknown_subclass(self, policy_env):
+        """Folding case must not turn "no such table" into a refusal --
+        every query naming a CTE or an information_schema view depends on
+        that outcome staying swallowable."""
+        from src.access_policy import PolicyUnknownTable
+
+        with pytest.raises(PolicyUnknownTable):
+            policied_relation("NoSuchTable", policy_env["solo_user"])
+
+    def test_case_variant_registry_rows_fail_closed(self, policy_env):
+        """Two registry rows differing only by case are ambiguous: the
+        analytics catalog can hold only ONE of the two views, so which row's
+        policy applies is unknowable. Refuse (a ``PolicyError``, which
+        ``rewrite_sql`` propagates as a structured ``policy_error``) rather
+        than pick one -- never the swallowed ``PolicyUnknownTable``."""
+        from src.access_policy import PolicyUnknownTable
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="tbl_invoices_upper",
+                name="INVOICES",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+        finally:
+            conn.close()
+
+        for spelling in ("invoices", "INVOICES", "Invoices"):
+            with pytest.raises(PolicyError) as exc_info:
+                policied_relation(spelling, policy_env["solo_user"])
+            assert not isinstance(exc_info.value, PolicyUnknownTable)
+
+
+class TestRewriteThroughTheRealResolver:
+    """``rewrite_sql`` with its DEFAULT ``resolve=policied_relation`` -- the
+    exact wiring ``POST /api/query`` uses. ``tests/test_access_policy_
+    rewrite.py`` drives the rewrite through a fake resolver that always
+    matched case-insensitively; the REAL one did not, which is how the
+    case-folding leak survived a green suite (#1979, security review).
+    """
+
+    def test_every_casing_of_a_policied_name_is_rewritten_identically(self, policy_env):
+        from src.access_policy import rewrite_sql
+
+        principal = policy_env["solo_user"]
+        ids_seen = []
+        for spelling in ("invoices", "INVOICES", "Invoices", '"Invoices"'):
+            sql, params, policied_ids = rewrite_sql(f"SELECT * FROM {spelling}", principal)
+            assert policied_ids == ["tbl_invoices"], spelling
+            assert "list_contains" in sql, spelling
+            assert params["user_groups"] == ["Finance", "Marketing"] or "user_groups" in params
+            ids_seen.append(tuple(policied_ids))
+        assert len(set(ids_seen)) == 1
+
+    def test_an_unregistered_name_is_still_left_alone(self, policy_env):
+        from src.access_policy import rewrite_sql
+
+        sql, params, policied_ids = rewrite_sql(
+            "WITH totals AS (SELECT 1 AS n) SELECT * FROM totals", policy_env["solo_user"]
+        )
+        assert policied_ids == []
+        assert params == {}

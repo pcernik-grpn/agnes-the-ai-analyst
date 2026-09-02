@@ -671,3 +671,94 @@ class TestQueryEndpointWithNameKeyedMappingSyncState:
         assert body["row_count"] == 1, body
         id_idx = body["columns"].index("id")
         assert {row[id_idx] for row in body["rows"]} == {"1"}
+
+
+class TestSourceTableExclusionIsNarrow:
+    """F4 (security review, #1979): the protected row's ``source_table`` is
+    subtracted from the referenced names so a body naming the physical
+    ``bucket.source_table`` form still counts as a self-reference. But the
+    subtraction was unconditional -- a protected table whose ``source_table``
+    happens to equal a REAL ``policy_mapping=true`` row's name suppressed the
+    empty-mapping refusal for that genuine dependency, and the read fell back
+    to the silent 0-row answer this whole check exists to prevent.
+
+    So ``source_table`` is excluded only when NO registry row with
+    ``policy_mapping=true`` carries that name (lower-cased). ``name`` and
+    ``id`` are always excluded -- a body's mandatory ``FROM <itself>`` is
+    never a mapping dependency.
+    """
+
+    @pytest.fixture
+    def collision(self, e2e_env):
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            # The empty mapping table a policy legitimately joins.
+            registry.register(id="cost_centres", name="cost_centres", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("cost_centres", True)
+            # The protected table -- its PHYSICAL source_table collides with
+            # the mapping table's registered name.
+            registry.register(
+                id="tbl_ledger",
+                name="ledger",
+                source_type="keboola",
+                query_mode="local",
+                bucket="in.c-fin",
+                source_table="cost_centres",
+                server_only=True,
+            )
+        finally:
+            conn.close()
+
+    def test_a_real_mapping_dependency_is_not_masked_by_source_table(self, collision):
+        from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+
+        with pytest.raises(PolicyMappingEmpty) as exc_info:
+            raise_if_policy_mapping_empty(
+                "SELECT * FROM ledger WHERE unit IN (SELECT unit FROM cost_centres WHERE email = $user_email)",
+                table_name="ledger",
+                table_id="tbl_ledger",
+            )
+        assert exc_info.value.mapping_table == "cost_centres"
+
+    def test_the_self_reference_by_name_is_still_excluded(self, collision):
+        from src.access_policy import raise_if_policy_mapping_empty
+
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM ledger WHERE owner = $user_email",
+            table_name="ledger",
+            table_id="tbl_ledger",
+        )
+
+    def test_source_table_is_still_excluded_when_no_mapping_row_claims_it(self, e2e_env):
+        """The case the exclusion was added for is untouched: a body naming
+        the physical ``bucket.source_table`` form of its OWN table, where
+        nothing marks that name as a mapping table."""
+        from src.access_policy import raise_if_policy_mapping_empty
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="tbl_ledger2",
+                name="ledger2",
+                source_type="keboola",
+                query_mode="local",
+                bucket="in.c-fin",
+                source_table="raw_ledger",
+                server_only=True,
+            )
+            registry.register(id="raw_ledger", name="raw_ledger", source_type="keboola", query_mode="local")
+        finally:
+            conn.close()
+
+        raise_if_policy_mapping_empty(
+            'SELECT * FROM "in.c-fin".raw_ledger WHERE owner = $user_email',
+            table_name="ledger2",
+            table_id="tbl_ledger2",
+        )

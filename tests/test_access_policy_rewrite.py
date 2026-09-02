@@ -35,10 +35,21 @@ POLICY_SQL = "SELECT id, amount FROM invoices WHERE list_contains($user_groups, 
 def fake_resolver_policying(target_name: str, *, relation_sql: str = POLICY_SQL, table_id: str | None = None):
     """A ``resolve=`` double good enough to exercise ``rewrite_sql`` without
     a registry: ``policied=True`` for exactly ``target_name`` (matched
-    case-insensitively, mirroring DuckDB folding unquoted identifiers),
+    case-insensitively, mirroring DuckDB folding identifiers),
     ``policied=False`` passthrough for every other name -- the same two
     outcomes ``policied_relation`` itself returns for "policy attached" vs.
     "registered but no policy".
+
+    A DOUBLE, and it once flattered the real thing: this fake always folded
+    case while ``policied_relation``'s registry lookup compared names with
+    ``=`` on both backends, so ``FROM INVOICES`` resolved to nothing, landed
+    in ``rewrite_sql``'s swallowed ``PolicyUnknownTable`` arm, and served the
+    raw view -- with this file green throughout (#1979, security review).
+    The case contract is therefore pinned against the REAL resolver in
+    ``tests/test_access_policy_resolver.py`` (``TestCaseInsensitiveName
+    Resolution`` / ``TestRewriteThroughTheRealResolver``); keep this fake in
+    step with it, and never treat a green run here as evidence about
+    resolution.
     """
     resolved_id = table_id or target_name
 

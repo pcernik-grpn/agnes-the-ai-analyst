@@ -829,3 +829,144 @@ class TestIssueLiteralGroupNamesUnderscore:
         body = r.json()
         assert {row["country"] for row in body["rows"]} == {"CZ"}
         assert body["row_scope"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 10. The case of the table name is not a way out of the policy.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestTableNameCaseDoesNotBypassThePolicy:
+    """DuckDB's catalog folds identifiers -- ``FROM ORDERS`` and even
+    ``FROM "Orders"`` resolve to the view created as ``orders`` -- while the
+    registry lookup behind ``policied_relation`` was exact-equality on both
+    backends. So a caller who merely SHOUTED the table name got
+    ``PolicyUnknownTable``, the one outcome ``rewrite_sql`` swallows as "not
+    a registered table", and read every raw row with a 200 and
+    ``row_scope: null`` (#1979, security review).
+    """
+
+    @pytest.mark.parametrize("spelling", ["ORDERS", "Orders", '"Orders"', '"ORDERS"'])
+    def test_alice_is_filtered_whatever_the_casing(self, pilot, spelling):
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": f"SELECT * FROM {spelling}"}, headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 3, body
+        assert {row[body["columns"].index("id")] for row in body["rows"]} == CZ_IDS
+        assert "Mueller" not in r.text and "Dupont" not in r.text
+        assert body["row_scope"] is not None
+        assert "orders" in body["row_scope"]["policied_tables"]
+
+    def test_an_uppercase_aggregate_is_still_the_callers_own_slice(self, pilot):
+        c = pilot["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT sum(CAST(amount AS DOUBLE)) AS s FROM ORDERS"},
+            headers=_auth(pilot["bob_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["rows"][0][0] == 900.0
+
+    def test_ambiguous_case_variant_registry_rows_are_refused(self, pilot):
+        """Two registry rows differing only by case: the analytics catalog
+        can hold only ONE of the two views, so which policy applies is
+        unknowable. Fail closed with the structured ``policy_error`` --
+        never serve the raw view."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="orders_upper",
+                name="ORDERS",
+                source_type="keboola",
+                query_mode="materialized",
+                server_only=True,
+            )
+        finally:
+            conn.close()
+
+        c = pilot["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(pilot["alice_token"]))
+        assert r.status_code == 500, r.text
+        assert r.json()["detail"]["reason"] == "policy_error"
+        assert "Novak" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# 11. Policy-CONTENT admin surfaces are surface-checked (F2, security review).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.journey
+class TestPolicyContentSurfacesRequireFullSurface:
+    """The four admin routes that hand back policy CONTENT -- raw unfiltered
+    sample rows (`.../policy/preview`), per-group visibility counts
+    (`.../policy/preview-groups`), profiler sample values
+    (`.../policy/columns`) and historical policy bodies
+    (`.../policy/revisions`) -- have no per-table grant check and no policy
+    rewrite standing behind them: their admin gate is the ONLY thing between
+    the caller and unpolicied data. That is exactly the shape K2 fixed on
+    ``POST /api/query/hybrid``, so they take the same
+    ``require_admin_all_surface`` gate: a ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, filtered like an analyst everywhere else) is
+    refused with the distinct 403 that names the fix.
+    """
+
+    ROUTES = [
+        ("POST", "/api/admin/registry/orders/policy/preview", {"as_groups": [GROUP_CZ]}),
+        ("POST", "/api/admin/registry/orders/policy/preview-groups", {}),
+        ("GET", "/api/admin/registry/orders/policy/columns", None),
+        ("GET", "/api/admin/registry/orders/policy/revisions", None),
+    ]
+
+    def _call(self, c, method, url, body, token):
+        if method == "POST":
+            return c.post(url, json=body, headers=_auth(token))
+        return c.get(url, headers=_auth(token))
+
+    @pytest.mark.parametrize("method,url,body", ROUTES)
+    def test_stack_surface_admin_pat_is_refused(self, pilot, method, url, body):
+        r = self._call(pilot["client"], method, url, body, pilot["admin_stack_token"])
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert detail != "Admin access required"
+        assert "surface" in detail
+        # None of the content these routes exist to return may leak out.
+        assert "Novak" not in r.text and "Mueller" not in r.text
+
+    @staticmethod
+    def _assert_passed_the_gate(r):
+        """200, or the typed 501 the PG-only ``access_policy_revisions`` repo
+        answers with on this DuckDB app-state fixture (A3) -- either way the
+        surface gate let the caller through, which is what is under test."""
+        if r.status_code == 501:
+            assert r.json()["error"] == "requires_postgres_backend", r.text
+            return
+        assert r.status_code == 200, r.text
+
+    @pytest.mark.parametrize("method,url,body", ROUTES)
+    def test_full_surface_admin_pat_is_allowed(self, pilot, method, url, body):
+        r = self._call(pilot["client"], method, url, body, pilot["admin_all_token"])
+        self._assert_passed_the_gate(r)
+
+    @pytest.mark.parametrize("method,url,body", ROUTES)
+    def test_the_browser_session_credential_still_works(self, pilot, method, url, body):
+        """The admin web UI's own credential carries no ``credential_surface``
+        key, which reads as ``'all'`` -- the ``/admin/tables`` policy modal
+        must keep working."""
+        r = self._call(pilot["client"], method, url, body, pilot["admin_token"])
+        self._assert_passed_the_gate(r)
+
+    def test_compile_stays_on_the_plain_admin_gate(self, pilot):
+        """``.../policy/compile`` persists nothing and returns only generated
+        SQL -- no table content -- so it is deliberately NOT narrowed."""
+        r = pilot["client"].post(
+            "/api/admin/registry/orders/policy/compile",
+            json={"row_rules": [], "masks": [], "default_action": "deny"},
+            headers=_auth(pilot["admin_stack_token"]),
+        )
+        assert r.status_code != 403, r.text

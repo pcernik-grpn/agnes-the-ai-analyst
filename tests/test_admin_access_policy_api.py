@@ -1792,3 +1792,135 @@ class TestPolicyPreviewRemoteDatabricks:
             headers=_auth(token),
         )
         assert resp.status_code == 200, resp.text
+
+
+# ── F3 (security review, #1979): no raw engine text on the preview surfaces ──
+
+
+class TestPreviewFailuresCarryNoEngineDetail:
+    """§16 -- "a raw DuckDB/BigQuery error for a failing policy can quote
+    literal values out of the policy body", which is why ``PolicyError``
+    deliberately carries none. The two admin previews were the exception:
+    both 422'd with ``f"policy_preview_failed: {exc}"`` and
+    ``preview-groups`` put ``str(exc)`` in each failing group's ``error``.
+    The engine detail belongs in the server log; the response gets a
+    table-scoped message plus a coarse reason class.
+    """
+
+    def test_the_detail_helper_names_the_table_and_hides_the_engine_text(self, caplog):
+        import logging
+
+        from app.api.admin import _policy_preview_failed_detail
+
+        exc = Exception('Binder Error: Referenced column "secret_salary_2026" not found')
+        with caplog.at_level(logging.WARNING, logger="app.api.admin"):
+            detail = _policy_preview_failed_detail(exc, table_id="orders_daily")
+
+        assert detail.startswith("policy_preview_failed:")
+        assert "orders_daily" in detail
+        assert "secret_salary_2026" not in detail
+        assert "Binder Error" not in detail
+        # The operator still gets the whole engine message, server-side.
+        assert "secret_salary_2026" in caplog.text
+
+    def test_the_reason_class_is_a_fixed_vocabulary(self):
+        from app.api.admin import _policy_preview_failure_reason
+
+        class CatalogException(Exception):
+            pass
+
+        assert _policy_preview_failure_reason(CatalogException("Table with name x does not exist")) == "catalog_error"
+        assert _policy_preview_failure_reason(RuntimeError("boom")) == "execution_error"
+
+    def test_preview_groups_422_carries_no_engine_text(self, seeded_app, monkeypatch):
+        """A policied table whose local view was never built: the
+        ``SELECT COUNT(*)`` fails inside DuckDB, and the 422 must not repeat
+        what DuckDB said."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="never_synced_tbl",
+                name="never_synced_tbl",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+            registry.set_access_policy(
+                "never_synced_tbl",
+                sql="SELECT * FROM never_synced_tbl WHERE list_contains($user_groups, unit)",
+                note="unit filter",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        resp = seeded_app["client"].post(
+            "/api/admin/registry/never_synced_tbl/policy/preview-groups",
+            json={},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_preview_failed:")
+        assert "never_synced_tbl" in detail
+        assert "Catalog Error" not in detail and "does not exist" not in detail
+
+    def test_a_failing_group_reports_a_typed_error_not_the_engine_message(
+        self, seeded_app, mock_extract_factory, monkeypatch
+    ):
+        """The per-group sweep keeps going past a failure, so its ``error``
+        field is a CONTENT field like any other -- ``str(exc)`` there put the
+        engine's message (which quotes policy-body identifiers and literals)
+        straight into the response body and the admin UI."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+
+        env = seeded_app["env"]
+        mock_extract_factory("keboola", [{"name": "brittle_tbl", "data": [{"id": "1", "unit": "Finance"}]}])
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="brittle_tbl",
+                name="brittle_tbl",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+            # Saved past the validated write path on purpose: a body that
+            # parses and validates statically but cannot BIND (the column was
+            # dropped upstream after the policy was written).
+            registry.set_access_policy(
+                "brittle_tbl",
+                sql="SELECT * FROM brittle_tbl WHERE list_contains($user_groups, secret_dropped_column)",
+                note="unit filter",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        resp = seeded_app["client"].post(
+            "/api/admin/registry/brittle_tbl/policy/preview-groups",
+            json={},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        groups = resp.json()["groups"]
+        assert groups and all(g["error"] for g in groups), resp.text
+        for group in groups:
+            assert group["rows_visible"] is None
+            assert group["error"].startswith("policy_preview_failed")
+            assert "brittle_tbl" in group["error"]
+        assert "secret_dropped_column" not in resp.text
+        assert "Binder Error" not in resp.text

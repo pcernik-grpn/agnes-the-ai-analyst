@@ -47,6 +47,7 @@ from src.access_policy import (
     PolicyNameCollision,
     assert_policied_reads_unique,
     assert_unique_output_columns,
+    find_registry_row,
     policied_relation,
     raise_if_policy_mapping_empty,
     rewrite_sql,
@@ -3162,12 +3163,18 @@ def _table_is_registered(name_or_id: str) -> bool:
     ``policied_relation`` now answers that itself (``PolicyUnknownTable`` vs.
     ``PolicyError``, #1979); this stays as the resolvers' own second opinion,
     because they wrap that call in engine-specific work whose failures are not
-    typed that way."""
-    repo = table_registry_repo()
-    if repo.get(name_or_id):
+    typed that way.
+
+    Resolves through the SAME ``find_registry_row`` the policy resolver uses,
+    so the two can never disagree about whether a name is registered — an
+    exact-equality lookup here would have called an upper-cased reference to
+    a policied table "unknown" and let its resolution failure stay swallowed
+    (#1979, security review). Ambiguous case-variant rows ARE registered, and
+    fail closed downstream."""
+    try:
+        return find_registry_row(name_or_id) is not None
+    except PolicyError:
         return True
-    getter = getattr(repo, "get_by_name", None)
-    return bool(getter(name_or_id)) if getter else False
 
 
 def _assert_policy_substitution_complete(expected_ids, actual_ids) -> None:
