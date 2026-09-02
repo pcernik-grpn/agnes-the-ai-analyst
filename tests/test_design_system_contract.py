@@ -1622,6 +1622,70 @@ def test_data_table_wrap_disables_sticky_thead() -> None:
     )
 
 
+# ── The edge cue: a cut table has to SAY it is cut ───────────────────────
+# The scrollbar the rules above paint sits under the LAST ROW, so on a
+# twelve-row table it is hundreds of pixels below the reader's eye and on a
+# long list off-screen entirely — a table cut mid-column looked complete
+# (/admin/data-packages at a 900px window simply had no "Shared with").
+# `js/table_scroll_cue.js` marks the wrap `is-cue-left` / `is-cue-right` for
+# whichever side still has content behind it; these three guards pin that the
+# JS is loaded globally, that each class draws something, and that a pinned
+# actions column is never the thing that fades.
+_CUE_MASK_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-left,\s*"
+    r"\.data-table-wrap\.is-cue-right:not\(:has\(\.data-table--pinned-actions\)\)\s*\{"
+    r"[^}]*mask-image[^}]*\}",
+    re.DOTALL,
+)
+_CUE_SHADOW_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-right\s+\.data-table--pinned-actions[^{]*\{"
+    r"[^}]*box-shadow[^}]*\}",
+    re.DOTALL,
+)
+
+
+def test_the_scroll_cue_script_is_loaded_for_every_page() -> None:
+    """The wrap is shared by ten admin pages and none should have to opt in —
+    so the cue rides `_app_scripts.html`, not a per-page `head_extra`."""
+    scripts = (TEMPLATES / "_app_scripts.html").read_text(encoding="utf-8")
+    assert "js/table_scroll_cue.js" in scripts, (
+        "table_scroll_cue.js is not in _app_scripts.html — the is-cue-* classes "
+        "would be set on no page, and a cut table would again say nothing"
+    )
+
+
+def test_a_cut_edge_fades_and_an_uncut_one_does_not() -> None:
+    """Both fade sides ride ONE mask declaration keyed on two custom
+    properties: an uncut side resolves to `0px`, which collapses its two
+    colour stops onto the same offset and draws nothing."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _CUE_MASK_RE.search(css), (
+        "no `is-cue-*` mask rule in style-custom.css — the wrap's cut edge draws "
+        "no fade, so the only affordance is again the scrollbar under the last row"
+    )
+    assert "--dtw-fade-left: 0px" in css and "--dtw-fade-right: 0px" in css, (
+        "the fade custom properties have no 0px resting value — an uncut edge "
+        "would fade as though content were hidden behind it"
+    )
+
+
+def test_a_pinned_actions_column_is_shadowed_and_never_faded() -> None:
+    """The mask applies to sticky children too, so fading the right edge of a
+    table with pinned actions would fade out precisely the button the pin
+    exists to keep on screen. That side states the same fact with a shadow."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _CUE_SHADOW_RE.search(css), (
+        "no `is-cue-right` box-shadow on `.data-table--pinned-actions` — a pinned "
+        "column would sit flush over hidden table with nothing to say so"
+    )
+    mask_rule = _CUE_MASK_RE.search(css)
+    assert mask_rule and ":not(:has(.data-table--pinned-actions))" in mask_rule.group(0), (
+        "the fade is not excluded for a table with pinned actions — the mask "
+        "would fade the pinned button itself, which is the one thing that has "
+        "to stay legible while the rest scrolls"
+    )
+
+
 # Every admin page whose `<th>` inline-styled its own right alignment instead
 # of using `.num` — the class style-custom.css already defines for a
 # right-aligned/mono/tabular-nums column and that `admin_moderation_hub.html`

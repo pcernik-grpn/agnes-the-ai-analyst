@@ -27,6 +27,12 @@
        app-wide because the macro is, and it binds nothing when no card on the
        page carries a key. #}
     <script src="{{ static_url('js/connect_banner.js') }}" defer></script>
+    <!-- Edge cue for `.data-table-wrap`: sets is-cue-left / is-cue-right so a
+         table cut mid-column says so AT the cut, rather than only through a
+         scrollbar sitting under its last row. Global because the wrap is —
+         ten admin pages use it and none should have to opt in.
+         See app/web/static/js/table_scroll_cue.js. -->
+    <script src="{{ static_url('js/table_scroll_cue.js') }}" defer></script>
     <!-- window.confirmModal / alertModal / promptModal — design-system
          replacements for native confirm()/alert()/prompt() (#497 §1).
          Defined here alongside the other end-of-<body> app globals (e.g.

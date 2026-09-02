@@ -5730,6 +5730,68 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     position: static;
 }
 
+/* ── "There is more this way" — the cue AT the cut ────────────────────────
+   The scrollbar above is an affordance in the wrong PLACE: it sits under the
+   last row, so on a twelve-row table it is 400px below the reader's eye and
+   on a long one it is off-screen. A table cut mid-column then looks
+   complete — /admin/data-packages at a 900px window simply had no "Shared
+   with", with nothing near the cut to say one had been taken away.
+
+   `js/table_scroll_cue.js` sets `is-cue-left` / `is-cue-right` on the wrap
+   for whichever side still has content behind it (globally, no page opt-in);
+   these rules are what those classes draw. Two mechanisms, because the two
+   edges are not symmetrical:
+
+   * the LEFT edge, and the right edge of a table with no pinned column, get
+     a fade — the mask is in the wrap's own box coordinates, so it stays at
+     the edge while the content scrolls under it, and it needs no extra
+     element inside a scroll container (where an absolutely-positioned one
+     would scroll away and a sticky pseudo-element is not reliable);
+   * a table WITH `.data-table--pinned-actions` must not fade its right edge:
+     that is where the pin holds the row's verbs, and a mask applies to
+     sticky children too — it would fade out exactly the button the pin
+     exists to keep. That side gets a shadow under the pinned column instead,
+     which is the same statement ("something is hidden beneath this") in the
+     one form that leaves the button legible.
+
+   One mask declaration driven by two custom properties rather than four
+   selector combinations: a side that is not cut resolves to `0px`, which
+   puts both of that side's colour stops at the same offset and draws no
+   fade. The selector still excludes a pinned table's right-only state
+   outright, so a wrap with nothing to fade carries no mask — and no
+   compositing layer — rather than an inert one. */
+.data-table-wrap {
+    --dtw-fade-left: 0px;
+    --dtw-fade-right: 0px;
+}
+.data-table-wrap.is-cue-left { --dtw-fade-left: 56px; }
+.data-table-wrap.is-cue-right:not(:has(.data-table--pinned-actions)) {
+    --dtw-fade-right: 56px;
+}
+.data-table-wrap.is-cue-left,
+.data-table-wrap.is-cue-right:not(:has(.data-table--pinned-actions)) {
+    -webkit-mask-image: linear-gradient(to right,
+        transparent 0, black var(--dtw-fade-left),
+        black calc(100% - var(--dtw-fade-right)), transparent 100%);
+            mask-image: linear-gradient(to right,
+        transparent 0, black var(--dtw-fade-left),
+        black calc(100% - var(--dtw-fade-right)), transparent 100%);
+}
+
+/* The pinned column's own cue. The permanent left hairline says "this column
+   is pinned"; the shadow says "and there is table under it right now", so it
+   is here and not on the base rule — a pinned column with nothing hidden
+   beneath it should look flush, not raised.
+
+   Offset and blur are what make it legible at all: the first pass spent the
+   blur against a -8px spread and painted a ~4px feather nobody could see on
+   screen. This one reads to the left of the pin, which is where the hidden
+   table is. */
+.data-table-wrap.is-cue-right .data-table--pinned-actions tbody td:last-child:not([colspan]),
+.data-table-wrap.is-cue-right .data-table--pinned-actions thead th:last-child {
+    box-shadow: -14px 0 18px -2px color-mix(in srgb, var(--ds-text-primary) 26%, transparent);
+}
+
 /* ── A pinned actions column — `.data-table--pinned-actions` ──────────────
    Opt-in, on the TABLE, for the admin tables whose last column is the row's
    own verbs (Sync now · Details · Edit, the `⋯` menu). Those are the one
