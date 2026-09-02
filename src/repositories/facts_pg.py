@@ -1586,7 +1586,17 @@ class FactsPgRepository:
         all_evidence = _visibility_mode() == "all_evidence"
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
-        with self._engine.connect() as conn:
+        # No LIMIT here (unlike search()/neighbors()) — this method has no
+        # limit_applied-style truncation signal to pair one with, so a bare
+        # cap would recreate the S6 shortfall-oracle shape those two avoid;
+        # left for a follow-up with its own wire-contract review. The
+        # statement_timeout IS wired here, same as search()/neighbors() —
+        # a subject with a pathological claim count still had nothing
+        # bounding how long the connection sat executing this query.
+        # `.begin()` (not `.connect()`) so `SET LOCAL` applies to the
+        # queries that follow in the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             kind = self._subject_kind(conn, subject_id)
             if kind is None:
                 raise FactNotFound(subject_id)
@@ -1804,6 +1814,65 @@ class FactsPgRepository:
             f"WITH {cte} "
             "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
             "GROUP BY f.type ORDER BY f.type"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return {r["type"]: int(r["n"]) for r in rows}
+
+    def count_visible_edges_by_type(self, caller) -> Dict[str, int]:
+        """Caller-scoped ``{type: count}`` over every visible EDGE — the
+        edge-type discovery row `fact_type_map` grew alongside its existing
+        node-type counts (spec §12), so an agent can learn a valid
+        `fact_neighbors(edge_types=[...])` value without first pulling every
+        relationship off a well-connected node (a token-burn shape a live
+        run surfaced: "which industries is X in" cost an unfiltered, every-
+        edge-type traversal because there was no cheap way to learn the
+        `in_industry` edge type name up front).
+
+        Same non-disclosure the fact side makes: a type with no visible
+        edges is omitted rather than reported as 0, and the gate is shared
+        verbatim via :meth:`_visible_edges_for_corpus_cte`'s
+        ``all_collections=True`` — never a naive
+        ``SELECT type, COUNT(*) FROM edges GROUP BY type``, which would be
+        the S2 existence oracle for edges."""
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        cte = self._visible_edges_for_corpus_cte(is_admin, all_collections=True)
+        params: Dict[str, Any] = (
+            {}
+            if is_admin
+            else {"readable": list(readable), "tiered_hidden": tiered_hidden, "audience_pairs": audience_pairs}
+        )
+        # An edge's own evidence is not the whole of what makes it reachable:
+        # `neighbors` resolves the OTHER endpoint per hop and skips the edge
+        # when that fact is withheld, so an edge into a `wrong`/`restricted`
+        # fact was counted here while no traversal could ever produce it — and
+        # for a type that is empty once those are removed, a nonzero count is
+        # exactly the existence oracle the docstring above says this must not
+        # be (Devin Review on #2079).
+        #
+        # Deliberately narrowed to the endpoint CORRECTIONS rather than
+        # composed with `_visible_facts_for_corpus_cte`: that CTE requires a
+        # fact to carry evidence in its own right, which is STRICTER than the
+        # endpoint test `neighbors` applies — a fact evidenced only through
+        # the incident edge passes there and would vanish here, making the map
+        # under-count edges the caller really can traverse. Matching the
+        # over-count with an under-count is not a fix.
+        endpoint_gate = (
+            " WHERE NOT EXISTS ("
+            "SELECT 1 FROM corrections co WHERE co.subject_kind = 'fact' "
+            "AND co.subject_id IN (e.src, e.dst) "
+            "AND co.verdict IN ('wrong', 'restricted') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM corrections cr WHERE cr.subject_kind = 'fact' "
+            "AND cr.subject_id = co.subject_id AND cr.verdict = 'revealed'))"
+        )
+        sql = sa.text(
+            f"WITH {cte} "
+            "SELECT e.type, COUNT(*) AS n FROM edge_visible v JOIN edges e ON e.id = v.subject_id"
+            f"{endpoint_gate} "
+            "GROUP BY e.type ORDER BY e.type"
         )
         with self._engine.connect() as conn:
             rows = conn.execute(sql, params).mappings().all()
@@ -2028,28 +2097,42 @@ class FactsPgRepository:
                 out[corpus_id] = int(row[0]) if row else 0
         return out
 
-    def _visible_edges_for_corpus_cte(self, is_admin: bool) -> str:
+    def _visible_edges_for_corpus_cte(self, is_admin: bool, *, all_collections: bool = False) -> str:
         """SQL for an ``edge_visible(subject_id)`` CTE over EDGES evidenced
         by ``:corpus_id`` — the edge analogue of
-        :meth:`_visible_facts_for_corpus_cte`, used only by
+        :meth:`_visible_facts_for_corpus_cte`, used by
         :meth:`count_visible_edges_for_collections` (the source card's
-        pipeline-strip "edges" number, spec §13.2). Unlike a fact, an edge's
-        own claim IS its only evidence path — there is no endpoint-claim
-        fallback — so this candidacy/visibility rule is simpler: any_evidence
-        semantics only (matching :meth:`neighbors`'s own edge-visibility
-        rule — an edge needs its OWN readable claim, never inferred from its
-        endpoints), withheld (``wrong``/``restricted``) edges excluded,
-        ``revealed`` ones included unconditionally. Returned as a fragment
-        (no leading ``WITH``); every caller must bind ``:corpus_id`` and,
-        when ``is_admin`` is False, ``:readable``, ``:tiered_hidden`` and
-        ``:audience_pairs`` (:func:`_audience_context`, same as
-        :meth:`_visible_facts_for_corpus_cte`)."""
+        pipeline-strip "edges" number, spec §13.2) and, with
+        ``all_collections=True``, :meth:`count_visible_edges_by_type` (the
+        `fact_type_map` edge-type discovery row — spec §12 query-surface
+        note). Unlike a fact, an edge's own claim IS its only evidence path
+        — there is no endpoint-claim fallback — so this candidacy/visibility
+        rule is simpler: any_evidence semantics only (matching
+        :meth:`neighbors`'s own edge-visibility rule — an edge needs its OWN
+        readable claim, never inferred from its endpoints), withheld
+        (``wrong``/``restricted``) edges excluded, ``revealed`` ones
+        included unconditionally. Returned as a fragment (no leading
+        ``WITH``); every caller must bind, when ``is_admin`` is False,
+        ``:readable``, ``:tiered_hidden`` and ``:audience_pairs``
+        (:func:`_audience_context`, same as
+        :meth:`_visible_facts_for_corpus_cte`) — and, when
+        ``all_collections`` is False, ``:corpus_id``.
+
+        With ``all_collections=True`` the ONLY change is candidacy: every
+        non-withheld edge with at least one claim instead of the ones
+        evidenced by a bound ``:corpus_id`` — same relationship the fact
+        CTE's own ``all_collections`` flag has to its per-collection form,
+        shared verbatim rather than restated (a second copy is how the two
+        drift, and drift in this gate is the S2 existence oracle)."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
+        candidate_where = (
+            "c.edge_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.edge_id IS NOT NULL"
+        )
         return f"""
             edge_candidates AS (
                 SELECT DISTINCT c.edge_id AS subject_id
                 FROM claims c
-                WHERE c.corpus_id = :corpus_id AND c.edge_id IS NOT NULL
+                WHERE {candidate_where}
                   AND NOT EXISTS (
                     SELECT 1 FROM corrections co
                     WHERE co.subject_kind = 'edge' AND co.subject_id = c.edge_id
