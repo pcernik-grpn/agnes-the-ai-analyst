@@ -18,9 +18,9 @@
 //     caller reading it while peeking understands what the click commits to;
 //   - the Cmd/Ctrl+\ keyboard shortcut (VS Code / Slack convention), guarded
 //     against firing while focus is in a text input;
-//   - `.rail-no-hover-peek`, reconciled against the DOM on load — the hover
-//     half of the peek is off on a page that carries the admin secondary nav,
-//     and only the DOM knows for certain that it does (see the note below).
+//   - `.rail-strip-only`, reconciled against the DOM on load — the peek is off
+//     entirely on a page that carries the admin secondary nav, and only the DOM
+//     knows for certain that it does (see the note below).
 //
 // Self-guards on the rail being present, so loading it on every rail page
 // (not just /admin, unlike its retired predecessor rail_icon_mode.js) is a
@@ -32,11 +32,13 @@
   if (!rail) return;
 
   // Does this page carry the ADMIN SECONDARY NAV? If it does, the collapsed
-  // rail must not peek open on hover: the peek is a 240px overlay and that
-  // column is 200px wide starting at the rail's own edge, so a stray pointer
-  // pass erased the navigation in use (#1956 item 6). `.rail-no-hover-peek`
-  // turns the hover half off in rail.css; `:focus-within` still peeks, and a
-  // hovered row names itself with a label chip instead.
+  // rail must not peek open at all: the peek is a 240px overlay and that column
+  // is 200px wide starting at the rail's own edge, so opening it erased the
+  // navigation in use (#1956 item 6). `.rail-strip-only` turns both triggers
+  // off in rail.css — hover AND focus, the latter because the search box is
+  // focused by CLICKING it, which put the mouse back on the peek. What replaces
+  // it: a hovered or focused row names itself with a label chip, and the
+  // onboarding panel and search field fly out beside the strip.
   //
   // _app_rail.html renders the class from the REQUEST PATH so it is right
   // before first paint — a hover must never wait on this file to know whether
@@ -46,7 +48,7 @@
   // time a deferred script runs it exists — so reconcile in BOTH directions
   // rather than only adding, or a stale server guess outlives the page it was
   // made for.
-  rail.classList.toggle("rail-no-hover-peek", !!document.querySelector(".admin-nav"));
+  rail.classList.toggle("rail-strip-only", !!document.querySelector(".admin-nav"));
 
   // Per-context memory, matching the pre-paint bootstrap in _app_rail.html:
   // `admin` pages remember their own width separately from the rest of the

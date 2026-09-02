@@ -93,14 +93,16 @@
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
 {# Does this page render the ADMIN SECONDARY NAV (`_admin_nav.html`, via
    base_admin.html / base_admin_page.html)? If it does, the collapsed rail must
-   not PEEK OPEN ON HOVER: the peek is a 240px overlay and that column is 200px
-   wide starting at the rail's own edge, so a stray pointer pass erased the
-   navigation the caller was actually using (#1956 item 6). `.rail-no-hover-peek`
-   turns the hover half of the peek off; the keyboard `:focus-within` half
-   stays, because that is deliberate and it is the only way a caller tabbing
-   through the strip reads the labels. Hovering a single row still names it —
-   the label unfurls beside the icon as a chip instead of the whole column
-   opening (rail.css).
+   not PEEK OPEN AT ALL: the peek is a 240px overlay and that column is 200px
+   wide starting at the rail's own edge, so opening it erased the navigation the
+   caller was actually using (#1956 item 6). `.rail-strip-only` turns both
+   triggers off — hover AND focus. Focus was kept at first, on the reasoning
+   that it is deliberate where a pointer pass is not; the search box is focused
+   by CLICKING it, so that put the mouse straight back on the peek and the bug
+   returned by a second route. This rail does not widen in place; what needs
+   width flies out beside it — a hovered or focused row's label as a chip, the
+   onboarding panel, the search field (rail.css). The toggle still pins the
+   whole column open for anyone who wants it.
 
    `_admin_page` is the same test, which is why it is reused rather than
    restated: every /admin/* page renders that column EXCEPT the three Library
@@ -115,7 +117,7 @@
    present adds it, absent removes it. Same division of labour as
    `.rail-icon-mode` directly above — the server supplies the value that has to
    be right before paint, and script owns the truth. #}
-<nav class="rail{% if _admin_page %} rail-icon-mode rail-no-hover-peek{% endif %}" aria-label="Primary"
+<nav class="rail{% if _admin_page %} rail-icon-mode rail-strip-only{% endif %}" aria-label="Primary"
      data-rail-context="{{ 'admin' if _admin_page else 'app' }}">
     <script>
       (function () {

@@ -203,21 +203,21 @@ class TestTheCollapsedRailKeepsItsSearch:
         """On the SHARED peek trigger, not a hand-rolled `:hover, :focus-within`
         pair — which is what this rule was, and what broke it. A 42px input only
         makes sense once the column is 240px wide, so the two have to be the same
-        event: on a rail whose hover peek is off (`.rail-no-hover-peek`, the pages
+        event: on a rail whose hover peek is off (`.rail-strip-only`, the pages
         carrying the admin secondary nav) the pair still fired and the box
         reappeared inside the 40px strip, an empty pill with the magnifier shoved
         against its left edge. The pair also predated `.rail-no-peek`, so a
         pointer-driven collapse popped it open on the way down."""
         reveals = re.findall(r"rail-icon-mode(.*?) \.rail-search-input \{\s*display: block;", rail_css)
         assert reveals, "nothing hands the search box back when the column opens"
-        trigger = ":not(.rail-no-peek):is(:hover:where(:not(.rail-no-hover-peek)), :focus-within)"
+        trigger = ":not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within)"
         assert trigger in reveals, reveals
         # The other `display: block` on this input is the invisible click target
         # that makes the collapsed box reachable at all on a rail that cannot
         # hover-peek — focus is what opens the column, so something has to take
         # the click. It is hover-scoped away from the peek, never a second reveal.
         for got in reveals:
-            assert got == trigger or got == ".rail-no-hover-peek:not(:focus-within)", got
+            assert got == trigger or got == ".rail-strip-only", got
 
 
 class TestTheWizardCanMakeAnAudience:
