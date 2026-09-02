@@ -1619,6 +1619,11 @@ class TestSharePointSourceCard:
                 "next_run_at": None,
                 "extraction_ready": False,
                 "extraction_unready_reason": "extraction_disabled",
+                # The "Extract facts now" gate: the connector switch is
+                # checked first (the whole admin surface 409s without it),
+                # then the pass's own two switches.
+                "facts_extraction_ready": False,
+                "facts_extraction_unready_switch": "sharepoint.enabled",
             }
         finally:
             source_connections_repo().delete(conn_id)
@@ -1704,6 +1709,60 @@ class TestSharePointSourceCard:
             in_agnes = inv["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
             assert in_agnes["extraction_ready"] is True
             assert in_agnes["extraction_unready_reason"] is None
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_facts_extraction_gate_names_the_first_switch_that_is_off(self, seeded_app, monkeypatch):
+        """`facts_extraction_ready` mirrors `_facts_extraction_readiness`
+        (the SAME two switches the `sharepoint-facts-extraction` job honors)
+        behind the connector switch, and `facts_extraction_unready_switch`
+        names the first one that is off — the card renders that key as the
+        button's disabled reason, so a click can never 409 on a switch the
+        page already knew about."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        configured: dict = {}
+
+        def _fake_get_value(*keys, default=None):
+            node = configured
+            for key in keys:
+                if isinstance(node, dict) and key in node:
+                    node = node[key]
+                else:
+                    return default
+            return node
+
+        monkeypatch.setattr("app.instance_config.get_value", _fake_get_value)
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+
+            def _gate():
+                return _source_inventory()["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
+
+            g = _gate()
+            assert g["facts_extraction_ready"] is False
+            assert g["facts_extraction_unready_switch"] == "extraction.facts.enabled"
+
+            configured["extraction"] = {"facts": {"enabled": True}}
+            g = _gate()
+            assert g["facts_extraction_ready"] is False
+            assert g["facts_extraction_unready_switch"] == "facts.enabled"
+
+            configured["facts"] = {"enabled": True}
+            g = _gate()
+            assert g["facts_extraction_ready"] is True
+            assert g["facts_extraction_unready_switch"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1922,6 +1981,8 @@ class TestSharePointSourceCardRendering:
                 "function _spRejectionReasonText(reason) {",
                 "const EXTRACTION_UNREADY_REASON_TEXT = {",
                 "function _extractionUnreadyReasonText(reason) {",
+                "const FACTS_EXTRACTION_UNREADY_TEXT = {",
+                "function _factsExtractionUnreadyText(switchKey) {",
                 "function _spGroupRejectionRows(rows) {",
                 "function _spRejectionRowHtml(r) {",
                 "function toggleFileSourceDrawer(connId, category) {",
@@ -2020,11 +2081,13 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "next_run_at": "2026-08-29T12:00:00+00:00",
                 "extraction_ready": True,
                 "extraction_unready_reason": None,
+                "facts_extraction_ready": True,
+                "facts_extraction_unready_switch": None,
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        # Ready -> no unready badge, and the button carries no `disabled`.
+        # Ready -> no unready badge, and neither button carries `disabled`.
         assert "connector is disabled on this instance" not in html
         assert "No extraction producer is configured" not in html
         assert "disabled" not in html
@@ -2346,6 +2409,71 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         html = result["html"]
         assert "anonymized 1" in html
         assert "anonymization requested 1" in html
+
+    # -- "Extract facts now" (the standalone sharepoint-facts-extraction pass) --
+
+    def _in_agnes(self, **over):
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {
+                "enabled": True,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
+                "facts_extraction_ready": True,
+                "facts_extraction_unready_switch": None,
+                **over,
+            },
+        }
+        return fs
+
+    def test_extract_facts_now_renders_next_to_run_extraction_now_with_its_help_text(self):
+        fs = self._in_agnes()
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "Extract facts now" in html
+        assert 'id="ext-facts-btn-sp-conn-1"' in html
+        assert "runSpFactsExtraction('sp-conn-1')" in html
+        assert "Runs over documents indexed so far; safe to repeat." in html
+        assert 'data-facts-ready="1"' in html
+        # Both verbs live on the same card block, in order: crawl first.
+        assert html.index("Run extraction now") < html.index("Extract facts now")
+
+    def test_extract_facts_now_defaults_disabled_when_the_gate_is_missing(self):
+        """Fail closed on an older/degraded cell shape (no `in_agnes` at
+        all) — same posture as the Run button."""
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")["html"]
+        assert 'id="ext-facts-btn-sp-conn-1"' in html
+        assert 'data-facts-ready="0"' in html
+
+    def test_extract_facts_now_is_disabled_with_the_cost_switch_named(self):
+        fs = self._in_agnes(facts_extraction_ready=False, facts_extraction_unready_switch="extraction.facts.enabled")
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "extraction.facts.enabled" in html
+        # The reason is a visible badge, not only a tooltip.
+        assert "Fact extraction is off" in html
+
+    def test_extract_facts_now_is_disabled_with_the_surface_switch_named(self):
+        fs = self._in_agnes(facts_extraction_ready=False, facts_extraction_unready_switch="facts.enabled")
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "fact graph is off" in html.lower()
+        assert "facts.enabled" in html
+
+    def test_extract_facts_now_is_disabled_when_the_connector_is_off(self):
+        fs = self._in_agnes(
+            enabled=False,
+            extraction_ready=False,
+            extraction_unready_reason="extraction_disabled",
+            facts_extraction_ready=False,
+            facts_extraction_unready_switch="sharepoint.enabled",
+        )
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "sharepoint.enabled" in html
 
 
 class TestSourceTypeAwareActionsMenu:

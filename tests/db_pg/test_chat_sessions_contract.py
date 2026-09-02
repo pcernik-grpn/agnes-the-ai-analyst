@@ -1,4 +1,4 @@
-"""Cross-engine contract for the chat-session title writes.
+"""Cross-engine contract for the chat-session title and archive writes.
 
 Parametrises over [DuckDB ``ChatRepository``, Postgres
 ``ChatSessionPgRepository``] — a frozen pre-A3 pair (see CLAUDE.md, "Dual-
@@ -7,6 +7,11 @@ back. Covers ``set_title`` (the rename endpoint) and ``set_title_if_unset``
 (the auto-title task's conditional write, TCRD-290): fill only while empty,
 report whether this call wrote, treat an empty string as unset, and never
 invent a row.
+
+Also ``archive_session`` / ``restore_session``, whose contract is not just the
+`archived` flag: archiving UNPINS, because a pin means "keep this at the top of
+my list" and archiving means "this is not in my list". Two UPDATE statements in
+two dialects, one invariant — exactly the drift this file exists to catch.
 
 Follows the pattern of ``test_jobs_contract.py``.
 """
@@ -82,3 +87,41 @@ def test_set_title_if_unset_treats_empty_string_as_unset(repo):
 def test_set_title_if_unset_never_invents_a_row(repo):
     assert repo.set_title_if_unset("chat_does_not_exist", "x") is False
     assert repo.get_session("chat_does_not_exist") is None
+
+
+# ── archive / restore ─────────────────────────────────────────────────────
+
+
+def test_archiving_clears_the_pin(repo):
+    """Pinned and archived are contradictory states, so the write that creates
+    one clears the other."""
+    s = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    repo.set_pinned(s.id, True)
+    assert repo.get_session(s.id).pinned_at is not None
+
+    repo.archive_session(s.id)
+    got = repo.get_session(s.id)
+    assert got.archived is True
+    assert got.pinned_at is None
+
+
+def test_restoring_does_not_put_the_pin_back(repo):
+    """The pin is gone, not parked. Re-pinning a restored conversation is one
+    click for whoever wants it; guessing on their behalf would resurrect a
+    position they may have long stopped wanting."""
+    s = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    repo.set_pinned(s.id, True)
+    repo.archive_session(s.id)
+    repo.restore_session(s.id)
+    got = repo.get_session(s.id)
+    assert got.archived is False
+    assert got.pinned_at is None
+
+
+def test_archiving_an_unpinned_session_is_unremarkable(repo):
+    """The clear is unconditional, so it must be a no-op on a row that never
+    had a pin rather than an error or a stray write."""
+    s = repo.create_session(user_email="u@x.com", surface=Surface.WEB)
+    repo.archive_session(s.id)
+    got = repo.get_session(s.id)
+    assert got.archived is True and got.pinned_at is None

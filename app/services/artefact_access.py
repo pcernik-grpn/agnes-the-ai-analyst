@@ -183,22 +183,25 @@ def list_candidate_collections(user_id: str) -> Tuple[List[dict], int]:
 
     accessible = [col for col in fc_repo.list() if is_owned_or_shared_with_me(ctx, col)]
 
+    # One grouped count for every corpus, rather than reading every row of
+    # every accessible collection to arrive at a per-collection number.
+    try:
+        file_counts = cf_repo.count_by_corpus()
+    except Exception:
+        file_counts = {}
+
     candidates: List[dict] = []
     for col in accessible:
         if col["id"] in in_stack:
             continue
-        candidates.append(_candidate_shape(col, ctx, cf_repo))
+        candidates.append(_candidate_shape(col, ctx, file_counts.get(col["id"], 0)))
 
     return candidates, len(accessible)
 
 
-def _candidate_shape(col: dict, ctx: ArtefactAccessContext, cf_repo) -> dict:
+def _candidate_shape(col: dict, ctx: ArtefactAccessContext, file_count: int) -> dict:
     visibility, visibility_label = collection_visibility(ctx, col["id"])
     owned = col.get("created_by") == ctx.uid
-    try:
-        file_count = len(cf_repo.list_for_corpus(col["id"]))
-    except Exception:
-        file_count = 0
     updated = col.get("updated_at") or col.get("created_at")
     return {
         "id": col["id"],

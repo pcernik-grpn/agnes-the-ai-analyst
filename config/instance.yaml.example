@@ -1478,6 +1478,28 @@ extraction:
     # while still keeping the worst case per file small against a corpus of
     # thousands. 0 disables the bound (the pre-fix behaviour).
     item_timeout_s: 300
+    # Ceiling on the CONVERTED MARKDOWN a conversion worker is allowed to
+    # send back to the crawl's main process, in MiB. A THIRD, separate
+    # guard from the two above: recycling and the RLIMIT_AS cap both hold
+    # the WORKER's own memory down, but neither bounds how big the
+    # converted TEXT itself gets before it crosses back into the crawl's
+    # main process -- where anonymize, storage and chunking each hold their
+    # own copy, on top of every OTHER document in flight at the same time.
+    # A spreadsheet's markdown table can stay comfortably under the
+    # worker's own memory ceiling the whole time while still being large
+    # enough, multiplied across `concurrency` documents at once, to exhaust
+    # the crawl's main process instead. Over the cap is counted
+    # `convert_failed` for that one file, exactly like any other
+    # unconvertible document -- never a crash, never collateral damage to a
+    # sibling. 0 disables the cap.
+    #
+    # 8, not something larger, because the converter already caps a
+    # conversion at 5,000,000 CHARACTERS: the biggest reply that can exist
+    # is ~4.8 MiB of ASCII and ~19 MiB at the four-bytes-per-character
+    # worst case. A threshold above that is unreachable and guards nothing.
+    # At 8 MiB an ordinary document passes untouched and the multi-byte
+    # ones that really do reach double-digit megabytes are refused.
+    max_converted_mb: 8
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.

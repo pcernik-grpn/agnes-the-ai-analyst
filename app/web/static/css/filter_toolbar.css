@@ -140,7 +140,42 @@
    fixed set of chips and toggles `hidden` per filter (the tokens toolbar on
    /me/profile) needs this; callers that build chips dynamically never hit it. */
 .fbar-chip[hidden] { display: none; }
-.fbar-chip:hover { border-color: var(--ds-primary); }
+/* A chip is TWO controls — its body reopens that facet's editor, its × drops
+   the filter — and a border that barely moved said neither. The pill deepens
+   under the cursor, and the body underlines its values, which is the half that
+   opens something; the × keeps its own stronger hover below, so the two
+   targets stay distinguishable while the chip is lit. */
+.fbar-chip { transition: background-color .12s ease, border-color .12s ease; }
+.fbar-chip:hover {
+  border-color: var(--ds-primary);
+  background: color-mix(in srgb, var(--ds-primary) 20%, transparent);
+}
+.fbar-chip__edit:hover .fbar-chip__vals,
+.fbar-chip__edit:hover .fbar-chip__label:only-child { text-decoration: underline; }
+@media (prefers-reduced-motion: reduce) {
+  .fbar-chip { transition: none; }
+}
+
+/* ── The menu opened from a CHIP ──────────────────────────────────────────
+   One category, in place. A chip means "change this one", so the sibling
+   categories, the standalone toggles above them and the Clear/Done footer are
+   all noise here — and the category itself stops being a row that reveals a
+   popover: it IS the menu, so its options sit directly under its label. */
+.fbar-menu--single { width: 232px; }
+.fbar-menu--single > .fbar-menu__opt,
+.fbar-menu--single > .fbar-menu__foot,
+.fbar-menu--single .fbar-cat:not(.is-single) { display: none; }
+.fbar-menu--single .fbar-cat.is-single .fbar-cat__btn { pointer-events: none; }
+.fbar-menu--single .fbar-cat.is-single .fbar-cat__caret { display: none; }
+.fbar-menu--single .fbar-cat.is-single .fbar-cat__pop {
+  position: static;
+  width: auto;
+  max-height: 54vh;
+  padding: 2px 0 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
 .fbar-chip__edit { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 0; border: none; background: none; font: inherit; color: inherit; cursor: pointer; }
 .fbar-chip__label { flex: none; color: var(--ds-text-secondary); font-weight: 500; }
 /* A toggle facet's chip has no values span, so its label IS the chip's content —
@@ -990,12 +1025,17 @@ button.fbar-card__access--fixed:hover svg { color: var(--ds-text-secondary); }
    Owner), the Filter menu lists the CATEGORIES; hovering (or focusing) one
    opens its options beside the menu. Keeps the menu short as facets grow,
    and keeps every option one hop away. Driven by filter_toolbar.js. */
-/* A menu hosting category popovers must NOT clip them: the base .fbar-menu
-   sets overflow-y:auto for long option lists, which establishes a clipping box
-   that swallows an absolutely-positioned child. A category menu is short by
-   construction (a handful of families), so it doesn't need to scroll — each
-   popover scrolls internally instead. */
-.fbar-menu--cats { overflow: visible; max-height: none; }
+/* A category menu SCROLLS like any other, inheriting the base .fbar-menu's
+   `max-height: 60vh; overflow-y: auto`. It used to opt out, because a popover
+   positioned `absolute` inside it was swallowed by that clipping box — but the
+   popover has been `position: fixed` since collision detection moved into
+   filter_toolbar.js ("it escapes every ancestor's clipping box, so a scrolling
+   menu can't swallow it"), and the JS re-places an open submenu on scroll in
+   the capture phase, so the menu's own scrolling keeps it aligned.
+   The opt-out's other premise — "short by construction, a handful of
+   families" — stopped being true when the Library grew entity facets: nine
+   categories ran the menu past the bottom of a 720px-tall viewport and put
+   Clear/Done out of reach. Nothing to restore here; the base rule is correct. */
 .fbar-cat { position: relative; }
 .fbar-cat__btn { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; border: none; background: none; border-radius: 8px; font: inherit; font-size: 13.5px; font-weight: 500; color: var(--ds-text-primary); text-align: left; cursor: pointer; }
 .fbar-cat__btn:hover, .fbar-cat.is-open > .fbar-cat__btn { background: color-mix(in srgb, var(--ds-text-primary) 6%, transparent); color: var(--ds-primary); }

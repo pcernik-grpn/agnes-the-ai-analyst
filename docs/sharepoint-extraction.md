@@ -79,7 +79,13 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options.
+  reports it. Per-run override in the Run-now options. Editable in
+  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
+  worker's **memory lever** (every file in flight is a converter child
+  process holding that document — six in flight has exceeded a 12 GiB
+  container on large decks, two held it under 4 GiB), and the worker reads
+  it at the start of each run, so a save applies to the next run with no
+  restart.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
@@ -106,10 +112,15 @@ indexed — after turning `extraction.facts.enabled` on for the first time
 over an existing connection, or after a prompt/ontology change — trigger it
 on its own, with its own wall-clock budget
 (`extraction.facts.run_timeout_s`, independent of the crawl's own
-`extraction.timeout_s`): `POST /api/admin/sharepoint/connections/{id}
-/facts-extract` or `agnes admin sharepoint facts-extract <connection_id>`
-(`--doc-id` narrows it to one document, e.g. to test a prompt change
-cheaply; `--timeout-s` overrides the budget for that one run).
+`extraction.timeout_s`): source card → **Extract facts now** (next to
+**Run extraction now**; disabled, with the reason, while either switch is
+off), `POST /api/admin/sharepoint/connections/{id}/facts-extract`, or
+`agnes admin sharepoint facts-extract <connection_id>` (`--doc-id` narrows
+it to one document, e.g. to test a prompt change cheaply; `--timeout-s`
+overrides the budget for that one run). The pass is incremental — indexed
+documents without up-to-date facts — so it is safe to repeat, and it runs
+alongside a crawl; while one is queued or running the card's Run row says
+so and the button is locked.
 
 ## Troubleshooting quick table
 

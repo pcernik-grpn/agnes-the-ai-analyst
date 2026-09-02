@@ -32227,7 +32227,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/status": {
       "get": {
-        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.",
+        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.\n\n``facts_job`` is the queued/running standalone facts pass for this\nconnection (:func:`_facts_job_in_flight`) or ``null`` \u2014 a job, never a\nrun: it is what lets the card say \"a facts pass is running\" and lock\nits own \"Extract facts now\" button while one is, since that pass never\nappears in ``running``/``last_completed``.",
         "operationId": "extraction_status_api_admin_sharepoint_connections__connection_id__extraction_status_get",
         "parameters": [
           {
@@ -39624,7 +39624,7 @@
     },
     "/api/chat/sessions/{chat_id}/pin": {
       "put": {
-        "description": "Pin or unpin a conversation in the caller's history panel.\n\nOwnership-gated the same way as archive/messages: 404 (never 403) when the\nsession doesn't exist or belongs to someone else, so the endpoint can't be\nused to probe for other users' session ids. Idempotent \u2014 pinning an already\npinned session just re-stamps ``pinned_at``, which re-orders it to the front\nof the Pinned group.",
+        "description": "Pin or unpin a conversation in the caller's history panel.\n\nOwnership-gated the same way as archive/messages: 404 (never 403) when the\nsession doesn't exist or belongs to someone else, so the endpoint can't be\nused to probe for other users' session ids. Idempotent \u2014 pinning an already\npinned session just re-stamps ``pinned_at``, which re-orders it to the front\nof the Pinned group.\n\nPinning an ARCHIVED conversation is refused (409): a pin means \"keep this at\nthe top of my list\" and archiving means \"this is not in my list\", so the two\nstates contradict each other \u2014 ``archive_session`` clears the pin for the\nsame reason. Restore it first if you want it back on the shelf. UNpinning is\nalways allowed, so a row pinned before this invariant existed can still be\ntidied up.",
         "operationId": "set_session_pinned_api_chat_sessions__chat_id__pin_put",
         "parameters": [
           {
@@ -40539,7 +40539,7 @@
         ]
       },
       "get": {
-        "description": "Return a collection's metadata + file list.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.",
+        "description": "Return a collection's metadata + a bounded preview of its files.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.\n\n``files`` is capped at ``DEFAULT_FILE_LIST_LIMIT`` (oldest-first, the\nordering this endpoint always used) \u2014 ``files_total`` is the collection's\nreal file count and ``files_truncated`` says whether ``files`` is the\nwhole thing or a preview of it. A caller that needs the rest, or wants to\nsearch/paginate/filter, uses ``GET /{collection_id}/files``.",
         "operationId": "get_collection_api_collections__collection_id__get",
         "parameters": [
           {
@@ -40673,7 +40673,7 @@
     },
     "/api/collections/{collection_id}/files": {
       "get": {
-        "description": "List all files in a collection (all processing statuses).",
+        "description": "List files in a collection (all processing statuses) \u2014 paginated,\noptionally filtered by filename/path substring (``q``) and/or exact\n``processing_status`` (``status``), in ``order`` (``newest`` here by\ndefault \u2014 the dashboard's most useful default; see\n``corpus_files_repo().list_for_corpus`` for the full set and its\n``, id ASC`` tie-break).\n\n``limit``/``offset`` are clamped, never rejected \u2014 see\n``_clamp_file_list_limit``/``_clamp_file_list_offset``. A blank ``q`` or\n``status`` (``?q=``, what every HTML form sends for an unset optional)\nmeans \"no filter\", exactly like the ``corpus_id`` handling in\n``search_collections`` above.\n\n``total`` is the row count AFTER the ``q``/``status`` filters and BEFORE\n``limit``/``offset`` \u2014 the number of matches a caller paging through\n``q`` can trust, not the collection's whole file count.",
         "operationId": "list_files_api_collections__collection_id__files_get",
         "parameters": [
           {
@@ -40682,6 +40682,68 @@
             "required": true,
             "schema": {
               "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "newest",
+              "title": "Order",
               "type": "string"
             }
           },
@@ -43257,7 +43319,7 @@
     },
     "/api/facts/type-map": {
       "get": {
-        "description": "Live counts per node type over everything the caller can see \u2014 the\nhead of the Library's Knowledge tab, where each type is a way in.\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach. A type nobody can see\nis absent rather than reported as ``0``, so the response never\ndistinguishes \"no such type here\" from \"none you may read\" \u2014 the same\nnon-disclosure ``search()`` makes. Response: ``{\"types\": [{\"type\",\n\"count\"}], \"total\"}``, ordered by type.",
+        "description": "Live counts per node type AND per edge (relationship) type over\neverything the caller can see \u2014 the head of the Library's Knowledge\ntab, where each node type is a way in, and the cheap primer to read\nBEFORE calling ``POST /api/facts/neighbors`` with an ``edge_types``\nfilter on a well-connected node (a live-run finding: omitting\n``edge_types`` because the caller had no cheap way to learn a valid\nname pulled every relationship off the node instead of the one wanted).\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a node type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach, and an edge type's\n``count`` is exactly how many edges of that type\n``neighbors(edge_types=[that type])`` would let this caller reach from\nsomewhere. A type nobody can see is absent rather than reported as\n``0``, so the response never distinguishes \"no such type here\" from\n\"none you may read\" \u2014 the same non-disclosure ``search()``/``neighbors()``\nmake. Response: ``{\"types\": [{\"type\", \"count\"}], \"total\",\n\"edge_types\": [{\"type\", \"count\"}]}``, both lists ordered by type.",
         "operationId": "facts_type_map_api_facts_type_map_get",
         "parameters": [
           {
@@ -61503,7 +61565,7 @@
     },
     "/chats": {
       "get": {
-        "description": "Chats \u2014 the caller's conversations, in one manageable list.\n\nThe rail carries New chat, the pinned shelf and a handful of recent\nconversations; past that a 240px column cannot answer \"where is the analysis\nI ran three weeks ago\" or \"clear out everything I started and abandoned\".\nThis page is that surface, and it deliberately reuses the Library's\nstructure \u2014 prominent search in the header, one filter/sort dock, scannable\nrows \u2014 so the two inventories read as the same product.\n\nSame gate as /chat: chat has to be enabled AND the caller must hold the chat\ngrant; both failures bounce home rather than 403, matching the chat page (the\nrail hides the link for them too, so this guards a direct URL hit).\n\nRendering is server-side; search, the four segments (All / Pinned / Shared /\nArchived), the Agent + Source facets, sort, the table \u21c4 grid switch, the\nrow actions and the bulk bar are all client-side over those rows\n(static/js/chats_page.js).",
+        "description": "Chats \u2014 the caller's conversations, in one manageable list.\n\nThe rail carries New chat, the pinned shelf and a handful of recent\nconversations; past that a 240px column cannot answer \"where is the analysis\nI ran three weeks ago\" or \"clear out everything I started and abandoned\".\nThis page is that surface, and it deliberately reuses the Library's\nstructure \u2014 prominent search in the header, one filter/sort dock, scannable\nrows \u2014 so the two inventories read as the same product.\n\nSame gate as /chat: chat has to be enabled AND the caller must hold the chat\ngrant; both failures bounce home rather than 403, matching the chat page (the\nrail hides the link for them too, so this guards a direct URL hit).\n\nRendering is server-side; search, the Show controls (a lifecycle state \u2014\nActive / Archived / All, resting on Active \u2014 plus independent \"Pinned only\"\nand \"Shared only\" toggles), the Agent + Source facets, sort, the row actions\nand the bulk bar are all client-side over those rows\n(static/js/chats_page.js).",
         "operationId": "chats_page_chats_get",
         "parameters": [
           {
@@ -62349,6 +62411,48 @@
               "default": 1,
               "title": "Facts Page",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "files_page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Files Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           },
           {

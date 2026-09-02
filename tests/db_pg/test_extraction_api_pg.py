@@ -214,3 +214,26 @@ def test_config_answers_on_postgres_too(tmp_path, monkeypatch, pg_engine):
     # consolidation); the drawer's Enabled row reads it from there.
     assert any(row["key"] == "sharepoint.enabled" for row in body["effective"])
     assert any(row["key"] == "extraction.timeout_s" for row in body["effective"])
+
+
+def test_status_reports_an_in_flight_facts_pass_off_the_job_queue(tmp_path, monkeypatch, pg_engine):
+    """The standalone facts pass never opens an `extraction_runs` row, so
+    the card's poll would otherwise be blind to it; `facts_job` is read off
+    the job queue and is `null` — never zeros — when nothing is queued."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["facts_job"] is None
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": conn_id},
+        idempotency_key=f"sharepoint-facts-extraction:{conn_id}",
+    )
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["facts_job"]["id"] == job["id"]
+    assert body["facts_job"]["status"] == "queued"
+    assert body["running"] is None, "a facts pass is a job, never claimed to be a crawl run"

@@ -1330,7 +1330,11 @@ never gets a job that fails 30+ minutes later in a worker; `409
 facts_extraction_already_running` when one is already queued/running for
 this connection (its own idempotency key, distinct from every other kind's
 — a facts-extraction trigger never dedups against a crawl, an ACL sync or a
-subtree sweep). CLI: `agnes admin sharepoint facts-extract <connection_id>`.
+subtree sweep). The `facts_extraction_disabled` body also names the config
+key that is off in `switch` (`extraction.facts.enabled` or `facts.enabled`).
+CLI: `agnes admin sharepoint facts-extract <connection_id>`; UI: the source
+card's **Extract facts now** button (next to **Run extraction now**), which
+renders disabled with that same reason while either switch is off.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
@@ -1530,7 +1534,14 @@ currently being downloaded/converted/ingested (any of several under
 concurrency) and `recent` is the last up to 5 completed items
 (`{path, outcome}`) — so the card can show what the crawl is touching right
 now instead of only aggregate counters. `activity` is `null`/absent on older
-rows and on a finished run (nothing left in flight).
+rows and on a finished run (nothing left in flight). `facts_job` is the
+queued/running standalone facts pass for this connection
+(`{id, status, created_at, started_at}`) or `null` — a job, never a run: the
+`sharepoint-facts-extraction` pass opens no `extraction_runs` row, so it is
+read off the job queue (matched on the same idempotency key the trigger
+dedups on) and never appears in `running`/`last_completed`. The card shows
+it as a "facts pass queued/running" line in the Run row and locks its own
+"Extract facts now" button while one is in flight.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -2243,6 +2254,30 @@ a real member's id and filename in this same listing) could re-upload an
 unrelated file under a member's own anchor and have it silently resolve to
 (and overwrite) that member's row.
 
+**Listing files is paginated.** `GET .../files` answers
+`{files, total, limit, offset}` — `limit` defaults to **25** and clamps to
+`1..200`, `offset` clamps to `>= 0`, and neither is ever a `422`: the web
+page builds these query strings itself and a validation error would break its
+own pagination links. `total` is the count AFTER the filters below and BEFORE
+`limit`/`offset`, so a caller paging a search can trust it as the number of
+matches rather than the collection's size. `GET /api/collections/{collection_id}`
+applies the same cap to its inline `files` and reports `files_total` +
+`files_truncated`, so a reader can tell "this collection has 25 files" from
+"this is the first page of 3000". **This is breaking** for a caller that
+assumed either list was complete.
+
+`q` filters by **case-insensitive substring** over `filename` and `path`, with
+LIKE metacharacters escaped so `report_v2` does not also match `reportXv2`.
+Note the deliberate difference from `GET /api/collections/search`, which
+searches document *contents* whole-word with no wildcard: `q=smlou` finds
+`smlouva.pdf` here and finds nothing there. `status` filters on an exact
+`processing_status`. A blank `?q=` or `?status=` — what an HTML form sends for
+an unset optional — means "no filter", never "match nothing". `order` is one
+of `newest` (the default here) / `oldest` / `name` / `size`; an unrecognised
+value falls back to `oldest` rather than erroring. Every ordering carries an
+`id ASC` tie-break, because files uploaded in one batch share a `created_at`
+and without it a page boundary would repeat or skip rows.
+
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The
 gate is **owner-or-admin**, not every grant-holder: a group grant conveys
@@ -2370,16 +2405,24 @@ open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
 tool.
 
 `GET /api/facts/type-map` answers "what is in the graph at all" —
-`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
-through the SAME visibility gate as `search()` with no `type` (shared via
-`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
-of the rule), so a type's number is exactly what that caller could reach
-through `search(type=...)`. A type with no subjects visible to the caller
-is OMITTED rather than reported as `0`: absence is deliberately
-indistinguishable from "no such type in this ontology", because a `0` would
-confirm the type exists and that something occupies it — the aggregate form
-of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
-the `fact_type_map` MCP tool.
+`{"types": [{"type", "count"}], "total", "edge_types": [{"type",
+"count"}]}`, both lists ordered by type. Counts run through the SAME
+visibility gate as `search()`/`neighbors()` with no `type` filter (shared
+via `_visible_facts_for_corpus_cte(all_collections=True)` and
+`_visible_edges_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a node type's number is exactly what that caller could
+reach through `search(type=...)`, and an edge type's number is exactly what
+`neighbors(edge_types=[that type])` could reach from somewhere. A type with
+nothing visible to the caller is OMITTED rather than reported as `0`:
+absence is deliberately indistinguishable from "no such type in this
+ontology", because a `0` would confirm the type exists and that something
+occupies it — the aggregate form of the §5 existence oracle. `edge_types`
+is the primer a caller should read BEFORE traversing a well-connected node
+with `neighbors(edge_types=[...])` — a live-run finding showed that without
+a cheap way to learn a valid edge type name (e.g. `in_industry`), an agent
+fell back to an unfiltered traversal that returned every relationship type
+the node had. Triple-surface with `agnes facts type-map` and the
+`fact_type_map` MCP tool.
 
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a

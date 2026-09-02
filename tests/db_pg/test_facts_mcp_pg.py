@@ -257,3 +257,32 @@ def test_fact_search_q_reaches_the_repository(pg_env, repo, mcp_call):
     result = mcp_call("fact_search", token, type="organization", q="Parts Authority")
     ids = [s["id"] for s in result["subjects"]]
     assert ids == [parts_authority]
+
+
+def test_fact_type_map_reports_both_node_and_edge_types(pg_env, repo, mcp_call):
+    """`fact_type_map` (build order step 6 discovery tool) surfaces edge
+    types alongside node types -- the cheap primer a session should read
+    BEFORE calling `fact_neighbors(edge_types=[...])` on a well-connected
+    node, instead of pulling every relationship type off it to find out
+    which one it wanted."""
+    from app.auth.jwt import create_access_token
+
+    owner_id, owner_email = _seed_two_collection_fixture()
+
+    client_id = repo.create_fact(type="client")
+    industry_id = repo.create_fact(type="industry")
+    repo.add_claim(fact_id=client_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Client.")
+    repo.add_claim(
+        fact_id=industry_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Industry."
+    )
+    edge_id = repo.create_edge(src=client_id, type="in_industry", dst=industry_id)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Client is in it."
+    )
+
+    token = create_access_token(user_id=owner_id, email=owner_email)
+    result = mcp_call("fact_type_map", token)
+    edge_types = {t["type"]: t["count"] for t in result["edge_types"]}
+    assert edge_types == {"in_industry": 1}
+    node_types = {t["type"] for t in result["types"]}
+    assert {"client", "industry"} <= node_types

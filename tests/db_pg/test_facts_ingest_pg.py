@@ -168,6 +168,15 @@ def _seed_ready_doc(
     return doc_id
 
 
+def _seed_second_doc(*, file_id: str, doc_id: str, text: str) -> str:
+    """A second indexed document in the SAME collection — `_seed_ready_doc`
+    seeds the collection itself, so calling it twice collides on the primary
+    key. Everything else is identical."""
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text=text)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+    return doc_id
+
 # ---------------------------------------------------------------------------
 # EQ1 — the verbatim gate rejects fabrication, non-zero rejection count.
 # ---------------------------------------------------------------------------
@@ -1278,6 +1287,136 @@ def test_possible_duplicate_of_edge_needs_no_evidence_and_is_a_review_item(pg_en
         edges=[{"src": "engagement:acme", "type": "possible_duplicate_of", "dst": "engagement:acme-corporation"}],
     )
     assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"])
+
+
+# ---------------------------------------------------------------------------
+# possible_duplicate_of — SYSTEM-proposed candidates. Extraction is
+# per-document and stateless (spec's own `entity_resolution` split: pass 1
+# never sees the rest of the graph), so a cross-document duplicate can only
+# ever be caught here, comparing a NEWLY minted alias against every OTHER
+# alias of the same type already on file -- never on the producer's own
+# initiative. `_duplicate_candidate_reason` is the pure matching rule; the
+# tests below drive it through `ingest_batch` to prove the write path.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_candidate_reason_matches_name_token_prefix():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood-farms", "norwood-farms-group") is not None
+    assert _duplicate_candidate_reason("norwood-farms-group", "norwood-farms") is not None  # symmetric
+
+
+def test_duplicate_candidate_reason_matches_near_identical_spelling():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood", "norwod") is not None  # one dropped letter
+
+
+def test_duplicate_candidate_reason_none_for_unrelated_names():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("globex-corp", "initech") is None
+
+
+def test_duplicate_candidate_reason_none_for_identical_slugs():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood-farms", "norwood-farms") is None
+
+
+def test_duplicate_candidate_reason_none_below_the_short_token_floor():
+    """A stub prefix like ``co`` trivially prefixes many unrelated names —
+    the length floor exists so the prefix rule stays a real signal, not a
+    coincidence generator."""
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("co", "co-op-farms") is None
+
+
+def test_duplicate_candidate_reason_none_when_qualifiers_diverge_after_a_shared_word():
+    """Two equally-qualified names sharing only a leading word are NOT a
+    prefix relationship (only a STRICT prefix counts) — distinguishes a
+    genuine short-form/long-form pair from two different, unrelated
+    entities whose fuller names happen to start the same way."""
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("riverton-north-labs", "riverton-south-metrics") is None
+
+
+def test_duplicate_candidate_proposed_across_two_separate_ingest_calls(pg_env, repo):
+    """Two SEPARATE `ingest_batch` calls — two different documents, exactly
+    how a real crawl sends them — each mint one new `client` fact with NO
+    producer-authored edge between them at all. The name-token-prefix rule
+    still proposes a `possible_duplicate_of` review item on the second
+    call: the exact gap a live-graph audit found — cross-document variants
+    of one name never meet inside a single (stateless) extraction call, so
+    nothing upstream of `ingest_batch` could ever have proposed this."""
+    doc1 = _seed_ready_doc(pg_env, file_id="cf_dup1", doc_id="doc_dup1", text="Norwood Farms placed an order.")
+    first = repo.ingest_batch(nodes=[_node("client:norwood-farms", doc1, "Norwood Farms placed an order.")])
+    assert not [ri for ri in first["review_items"] if ri.get("type") == "possible_duplicate_of"]
+
+    doc2 = "doc_dup2"
+    _seed_corpus_file(file_id="cf_dup2")
+    _seed_chunk(file_id="cf_dup2", text="Norwood Farms Group renewed its contract.")
+    _seed_source_mapping(file_id="cf_dup2", source_doc_id=doc2)
+    second = repo.ingest_batch(
+        nodes=[_node("client:norwood-farms-group", doc2, "Norwood Farms Group renewed its contract.")]
+    )
+
+    dup_items = [ri for ri in second["review_items"] if ri.get("type") == "possible_duplicate_of"]
+    assert len(dup_items) == 1
+    assert dup_items[0]["auto"] is True
+    assert dup_items[0]["reason"]
+    assert {dup_items[0]["src"], dup_items[0]["dst"]} == {"client:norwood-farms", "client:norwood-farms-group"}
+
+    # Never auto-merged: both facts still exist as distinct subjects, per
+    # the ontology's own `entity_resolution` convention ("merge on exact
+    # normalized slug only... never auto-merged").
+    assert second["subjects_created"] == 1
+
+
+def test_unrelated_same_type_facts_get_no_duplicate_candidate(pg_env, repo):
+    doc1 = _seed_ready_doc(pg_env, file_id="cf_unrel1", doc_id="doc_unrel1", text="Globex Corp placed an order.")
+    repo.ingest_batch(nodes=[_node("client:globex-corp", doc1, "Globex Corp placed an order.")])
+
+    doc2 = "doc_unrel2"
+    _seed_corpus_file(file_id="cf_unrel2")
+    _seed_chunk(file_id="cf_unrel2", text="Initech renewed its contract.")
+    _seed_source_mapping(file_id="cf_unrel2", source_doc_id=doc2)
+    report = repo.ingest_batch(nodes=[_node("client:initech", doc2, "Initech renewed its contract.")])
+
+    assert not [ri for ri in report["review_items"] if ri.get("type") == "possible_duplicate_of"]
+
+
+def test_duplicate_candidate_not_reproposed_when_fact_already_existed(pg_env, repo):
+    """The scan only ever looks at facts THIS batch newly minted (spec's
+    `_resolve_alias` fires ``created=True`` exactly once per fact's
+    lifetime) — a later batch that just adds a second claim to an
+    ALREADY-existing fact (a re-crawled or revisited document) has nothing
+    new to compare, so it proposes nothing a second time. This is what
+    keeps a scheduled re-crawl from spamming the same review item on every
+    run."""
+    doc1 = _seed_ready_doc(
+        pg_env,
+        file_id="cf_dup3",
+        doc_id="doc_dup3",
+        text="Norwood Farms placed an order. Norwood Farms Group renewed.",
+    )
+    repo.ingest_batch(
+        nodes=[
+            _node("client:norwood-farms", doc1, "Norwood Farms placed an order."),
+            _node("client:norwood-farms-group", doc1, "Norwood Farms Group renewed."),
+        ]
+    )
+
+    doc2 = "doc_dup3b"
+    _seed_corpus_file(file_id="cf_dup3b")
+    _seed_chunk(file_id="cf_dup3b", text="Norwood Farms renewed again.")
+    _seed_source_mapping(file_id="cf_dup3b", source_doc_id=doc2)
+    report = repo.ingest_batch(nodes=[_node("client:norwood-farms", doc2, "Norwood Farms renewed again.")])
+
+    assert not [ri for ri in report["review_items"] if ri.get("type") == "possible_duplicate_of"]
 
 
 # ---------------------------------------------------------------------------
@@ -2450,6 +2589,50 @@ def test_http_deleting_a_file_via_collections_api_sweeps_orphaned_subjects(tmp_p
     assert after.json()["subjects"] == []
 
 
+def test_moving_a_file_repoints_its_claims_at_the_new_collection(pg_env, repo):
+    """`claims.corpus_id` is denormalized from `corpus_files` and is the
+    column fact visibility is filtered on. Moving a file updated the file row
+    and left every claim behind, so the facts stayed grouped under — and
+    readable to — the collection the file had just left (Devin Review on
+    #2068)."""
+    file_id = "cf_moved"
+    doc_id = "doc_moved"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_collection(collection_id="col_b")
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text="The engagement began in March.", ordinal=0)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:moved",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement began in March"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 1
+
+    from src.repositories import corpus_files_repo
+
+    assert corpus_files_repo().move_to_corpus(file_id, "col_b") is True
+    moved = repo.reassign_file_corpus(file_id, "col_b")
+    assert moved == 1, "every claim anchored to the moved file must follow it"
+
+    import sqlalchemy as sa
+
+    with repo._engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("SELECT corpus_id FROM claims WHERE corpus_file_id = :f"),
+            {"f": file_id},
+        ).fetchall()
+    assert [r[0] for r in rows] == ["col_b"], (
+        "a claim left on the old collection stays visible to that collection's audience"
+    )
+
+
 def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env, repo, monkeypatch):
     """The boundary-crossing check joins the whole document, and it runs per
     QUOTE. A batch where many quotes miss their individual chunks — exactly
@@ -2503,3 +2686,73 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
         f"the document must be rebuilt once per file per batch, not once per quote; "
         f"joined {_CountingSeparator.calls} times for 5 boundary-crossing quotes"
     )
+
+
+def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo):
+    """`_propose_duplicate_candidates` writes claimless `possible_duplicate_of`
+    edges, and `ingest_batch` finishes by calling `sweep_orphans()`, which
+    deleted every claimless edge — so each candidate was created and destroyed
+    inside the same call and the review queue never received one (Devin Review
+    on #2075).
+
+    End-to-end rather than on the SQL: ingest two documents whose entities
+    differ only the way the matching rule is meant to catch, then read the
+    collection's review items back through the surface a human actually sees.
+    """
+    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupa", doc_id="doc_dupa")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
+
+    doc_b = _seed_second_doc(
+        text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb"
+    )
+    report = repo.ingest_batch(
+        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
+    )
+
+    assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"]), report["review_items"]
+
+    import sqlalchemy as sa
+
+    with repo._engine.connect() as conn:
+        surviving = conn.execute(
+            sa.text("SELECT count(*) FROM edges WHERE type = 'possible_duplicate_of'")
+        ).scalar_one()
+    assert surviving == 1, (
+        "the candidate must outlive the ingest that proposed it — a claimless "
+        "proposal is not an orphan"
+    )
+
+
+def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
+    """The other half of the same exception. A proposal carries no evidence,
+    so it must not count as the incident edge that anchors a fact through the
+    orphan sweep — otherwise a candidate between two facts whose claims are
+    all gone would keep both in the graph forever.
+
+    Note this one passes against the PRE-fix code too, and honestly so: there
+    the candidate was swept and could not anchor anything. It is a boundary
+    guard on the exception introduced beside it, not a regression test for the
+    reported bug — verified by removing the `e.type <> 'possible_duplicate_of'`
+    clause from the FACT sweep, which leaves two unevidenced facts standing."""
+    import sqlalchemy as sa
+
+    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupc", doc_id="doc_dupc")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
+    doc_b = _seed_second_doc(
+        text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd"
+    )
+    repo.ingest_batch(
+        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
+    )
+
+    # Every claim gone — both facts are now unevidenced, and the only thing
+    # touching them is the proposal.
+    with repo._engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM claims"))
+    repo.sweep_orphans()
+
+    with repo._engine.connect() as conn:
+        facts_left = conn.execute(sa.text("SELECT count(*) FROM facts")).scalar_one()
+        edges_left = conn.execute(sa.text("SELECT count(*) FROM edges")).scalar_one()
+    assert facts_left == 0, "a proposal must not anchor a fact no document evidences"
+    assert edges_left == 0, "the proposal dies with its endpoints (ON DELETE CASCADE)"
