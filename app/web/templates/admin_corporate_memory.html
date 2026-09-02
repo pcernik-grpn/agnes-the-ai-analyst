@@ -162,18 +162,35 @@
             min-width: 0;
             overflow-x: auto;
             overflow-y: hidden;
-            /* No scrollbar styling here, deliberately. A non-overlay bar
-               would occupy 6px INSIDE this box, which pushes the tabs' content
-               bottom 6px above `.tab-nav`'s own bottom edge — and that edge is
-               what `.tab-row`'s rule sits on and what each tab's
-               `margin-bottom: -2px` underline is aimed at. The affordance
-               would therefore break the alignment above precisely when the
-               strip overflows, which is the only state it exists for.
+            /* Scroll shadows — the affordance a hidden scrollbar owes the
+               reader, at ZERO layout cost.
 
-               It is also no longer needed: the actions that were genuinely
-               unreachable have left this lane entirely, so what remains behind
-               an overflow is tabs, each of which is a destination the reader
-               can also reach by scrolling — not a verb that had disappeared. */
+               A real scrollbar was tried first and had to go: it occupies 6px
+               INSIDE this box, pushing the tabs' content bottom 6px above
+               `.tab-nav`'s own bottom edge — and that edge is what `.tab-row`'s
+               rule sits on and what each tab's `margin-bottom: -2px` underline
+               is aimed at. The affordance broke the alignment above it,
+               precisely when the strip overflows, which is the only state it
+               exists for.
+
+               This paints instead of reserving. Two opaque "covers" ride the
+               CONTENT (`local`) and two shadows ride the BOX (`scroll`), so a
+               shadow is uncovered only on a side that still has tabs behind
+               it: nothing to scroll, nothing drawn, and no scroll listener to
+               keep in sync. The covers are `--ds-surface` because that is
+               measurably what sits behind this strip (`admin_page.css` paints
+               the admin shell `--ds-surface` via `.container--full`), and both
+               halves are tokens, so the dark theme follows. */
+            background:
+                linear-gradient(to right, var(--ds-surface) 30%, transparent) left center,
+                linear-gradient(to left, var(--ds-surface) 30%, transparent) right center,
+                radial-gradient(farthest-side at 0 50%,
+                    color-mix(in srgb, var(--ds-text-primary) 18%, transparent), transparent) left center,
+                radial-gradient(farthest-side at 100% 50%,
+                    color-mix(in srgb, var(--ds-text-primary) 18%, transparent), transparent) right center;
+            background-repeat: no-repeat;
+            background-size: 34px 100%, 34px 100%, 13px 100%, 13px 100%;
+            background-attachment: local, local, scroll, scroll;
         }
 
         .tab-btn {

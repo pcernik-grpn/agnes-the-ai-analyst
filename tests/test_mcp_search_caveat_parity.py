@@ -145,3 +145,38 @@ def test_neither_server_still_ships_the_stale_caveat(label, pattern):
     fix applied to one of them is the recurring shape of this bug."""
     for path in (HTTP_TOOLS, STDIO_TOOLS):
         assert not re.search(pattern, path.read_text(encoding="utf-8"), re.I), f"{path.name} still says: {label}"
+
+
+# ---------------------------------------------------------------------------
+# TCRD-287: an oversized result is shortened, never refused — and both servers
+# must tell the model how to read a shortened hit in full.
+# ---------------------------------------------------------------------------
+
+COMPACTION_CONTRACT = (
+    ("the truncated_fields marker", r"truncated_fields"),
+    ("the whole-document follow-up", r"collection_file_read"),
+    ("prefix, not the whole passage", r"prefix"),
+)
+
+
+@pytest.mark.parametrize("tool", SEARCH_TOOLS)
+@pytest.mark.parametrize(("label", "pattern"), COMPACTION_CONTRACT, ids=[c[0] for c in COMPACTION_CONTRACT])
+def test_both_servers_document_the_compaction_contract(tool, label, pattern):
+    for source, which in ((HTTP_TOOLS, "HTTP"), (STDIO_TOOLS, "stdio")):
+        doc = _docstring(source.read_text(encoding="utf-8"), tool)
+        assert re.search(pattern, doc, re.I), f"{tool} ({which}) does not mention: {label}"
+
+
+@pytest.mark.parametrize("tool", SEARCH_TOOLS)
+def test_both_servers_apply_the_compaction(tool):
+    """Docs without the call would be the docstring-only fix this file exists
+    to catch. Each server's tool body must hand its response to the shared
+    helper — the same one, so a borderline result cannot be cut on one
+    transport and refused on the other."""
+    for source, which in ((HTTP_TOOLS, "HTTP"), (STDIO_TOOLS, "stdio")):
+        src = source.read_text(encoding="utf-8")
+        m = re.search(rf"(?:async\s+)?def\s+{re.escape(tool)}\s*\(.*?(?=\n\s*@tool\(|\Z)", src, re.S)
+        assert m, f"{tool} ({which}) not found"
+        assert "compact_search_results(" in m.group(0) and f'"{tool}"' in m.group(0), (
+            f"{tool} ({which}) does not route its response through compact_search_results"
+        )
