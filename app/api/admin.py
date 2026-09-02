@@ -520,6 +520,12 @@ _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+# `extraction.crawler.concurrency` bounds — the SAME clamp the crawler applies
+# (`connectors.sharepoint.crawler._MAX_CONCURRENCY`), pinned by
+# `tests/test_admin_server_config_extraction_section.py` rather than imported:
+# this module must not carry an import-time dependency on the crawler stack.
+_CRAWLER_CONCURRENCY_MIN = 1
+_CRAWLER_CONCURRENCY_MAX = 32
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -599,6 +605,25 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     f"{_EXTRACTION_TIMEOUT_MAX} (got {timeout_s})"
                 ),
             )
+
+    crawler = patch.get("crawler")
+    if crawler is not None:
+        if not isinstance(crawler, dict):
+            raise HTTPException(status_code=422, detail="extraction.crawler must be a mapping")
+        concurrency = crawler.get("concurrency")
+        if concurrency is not None:
+            if not isinstance(concurrency, int) or isinstance(concurrency, bool):
+                raise HTTPException(status_code=422, detail="extraction.crawler.concurrency must be an integer")
+            if concurrency < _CRAWLER_CONCURRENCY_MIN or concurrency > _CRAWLER_CONCURRENCY_MAX:
+                # The crawler would clamp this silently; refuse it here,
+                # where the admin can see why the run is not what they set.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"extraction.crawler.concurrency must be between {_CRAWLER_CONCURRENCY_MIN} and "
+                        f"{_CRAWLER_CONCURRENCY_MAX} (got {concurrency})"
+                    ),
+                )
 
 
 def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
@@ -1045,6 +1070,31 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
             ),
+        },
+        "crawler": {
+            "kind": "object",
+            "hint": (
+                "Built-in crawler tuning — how one crawl run behaves inside the extraction "
+                "worker (connectors/sharepoint/crawler.py)."
+            ),
+            "fields": {
+                "concurrency": {
+                    "kind": "int",
+                    "default": 6,
+                    "hint": (
+                        "How many files of one delta page a crawl holds in flight at once "
+                        "(download → convert → anonymize → ingest); clamped to [1, 32]. This is "
+                        "the extraction worker's MEMORY lever: every file in flight is a converter "
+                        "child process holding that document, so the worker's peak memory scales "
+                        "with it — six in flight has exceeded a 12 GiB container on large decks "
+                        "and PDFs, two held it under 4 GiB. Lower it when the worker is killed by "
+                        "its memory limit; raise it only with container and tenant headroom. "
+                        "Multiplies with extraction.concurrency (crawls at once). A per-run "
+                        "override lives in the source card's Run-now options. Read by the worker "
+                        "at the start of each run — effective on the next run, no restart."
+                    ),
+                },
+            },
         },
         "facts": {
             "kind": "object",

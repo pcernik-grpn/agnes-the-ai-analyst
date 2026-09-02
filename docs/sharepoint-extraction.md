@@ -79,7 +79,13 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options.
+  reports it. Per-run override in the Run-now options. Editable in
+  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
+  worker's **memory lever** (every file in flight is a converter child
+  process holding that document — six in flight has exceeded a 12 GiB
+  container on large decks, two held it under 4 GiB), and the worker reads
+  it at the start of each run, so a save applies to the next run with no
+  restart.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
