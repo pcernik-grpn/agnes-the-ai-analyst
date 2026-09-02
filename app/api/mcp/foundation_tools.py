@@ -1188,15 +1188,12 @@ def register_foundation_tools(
         limit: Annotated[int, Field(ge=1, le=500)] = 500,
         include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
     ) -> dict:
-        """Traverse relationships from ONE starting fact — use for
-        connection/chain questions ("how are X and Y connected", "who does
-        X report to", "which team owns this client") once you have a
-        starting `subject_id` from `fact_search`; prefer this over inferring
-        structure from a SQL join or a document search. For a question
-        about ALL relationships of one type ("which clients does each
-        sponsor own", "which industries are our clients in") do NOT walk
-        every root — call `fact_edges` once instead. Depth <= 2, capped
-        fanout (design doc §12).
+        """Traverse relationships from ONE starting fact — connection/chain
+        questions ("how are X and Y connected", "who does X report to") once
+        you have a `subject_id` from `fact_search`; prefer it over inferring
+        structure from SQL or document search. For ALL relationships of one
+        type, call `fact_edges` once instead of walking every root. Depth
+        <= 2, capped fanout (design doc §12).
 
         PASS `edge_types` WHEN YOU KNOW IT — a well-connected node (a hub
         client, a busy person) can carry many relationship types at once;
@@ -1268,17 +1265,17 @@ def register_foundation_tools(
         limit: Annotated[int, Field(ge=1, le=100)] = 100,
     ) -> dict:
         """List EVERY relationship of one type you can see, with both ends
-        as full subjects — in ONE call. This is the tool for aggregation
-        and comparison questions over a relationship ("which clients does
-        each sponsor own, and how many", "which industries are our clients
-        in", "who advised whom"): call `fact_type_map` once to learn the
-        relationship type names (its `edge_types` list), then call this once
-        with that `edge_type`. Do not answer such a question by calling
-        `fact_neighbors` per root — that is one call per entity plus one
-        `fact_claims` per citation; this returns the same edges, both
-        endpoints projected, and (with `include_claims`) the quotes to cite,
-        in a single round trip. Use `fact_neighbors` only when the question
-        starts from ONE known entity.
+        as full subjects, in ONE call — the tool for aggregation and
+        comparison questions over a relationship ("which clients does each
+        sponsor own", "which industries are our clients in"). Read the type
+        names from `fact_type_map`'s `edge_types`, then call this once; do
+        not call `fact_neighbors` per root. Use `fact_neighbors` only when
+        the question starts from ONE known entity.
+
+        Per root, `fact_neighbors` + `fact_claims` is one call per entity
+        plus one per citation; this returns the same edges, both endpoints
+        projected, and (with `include_claims`) the quotes to cite, in a
+        single round trip.
 
         Two hops in one call: `extend_edge_type` follows a second
         relationship type from every listed edge's `extend_from` endpoint

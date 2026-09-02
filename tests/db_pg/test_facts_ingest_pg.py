@@ -1150,7 +1150,7 @@ def test_c5_orphan_sweep_spares_a_fact_with_only_a_claimed_incident_edge(pg_env,
 
     deleted = repo.sweep_orphans()
     assert deleted == 0
-    assert repo.claims(_admin(), dst) == {"claims": [], "revealed": False}
+    assert repo.claims(_admin(), dst) == {"claims": [], "revealed": False, "limit_applied": False}
 
 
 def test_c5_orphan_sweep_deletes_a_fact_when_its_incident_edges_are_also_claimless(pg_env, repo):
