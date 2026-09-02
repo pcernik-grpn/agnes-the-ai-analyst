@@ -4165,6 +4165,134 @@ class TestFactsExtractionSeam:
         assert calls == [{"stats": stats, "docs_done": 7, "docs_total": 9, "path": "c.docx"}]
 
 
+class TestFactsStreaming:
+    """``extraction.facts.stream_every`` — let fact extraction run WHILE a
+    crawl is still going, by enqueueing a standalone
+    ``sharepoint-facts-extraction`` job (the same job kind, enqueue call and
+    idempotency key ``POST …/connections/{id}/facts-extract`` uses) every N
+    successfully ingested files, plus once more when enumeration finishes.
+    The chained tail pass (:func:`crawler.maybe_run_facts_extraction`) skips
+    whenever a standalone pass for the connection is already queued or
+    running, so the two never interleave on the same per-document ledger.
+    """
+
+    def _enable_facts_switches(self, monkeypatch) -> None:
+        """Both gates ``_facts_extraction_readiness`` (and the chained
+        pass) check — enabled here so a streamed enqueue actually fires
+        rather than silently skipping at the readiness check."""
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+
+    def _two_page_two_file_crawl(self, monkeypatch) -> None:
+        """Two delta pages, one new file each — two page boundaries for
+        ``_maybe_stream_facts_extraction`` to fire at, plus the run's final
+        flush after enumeration."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("item2", name="b.pdf", ctag="ctag-2")],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?token=NEW",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+
+    def test_enqueues_a_job_with_the_right_key_and_payload_after_stream_every_files(self, crawl_env, monkeypatch):
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(crawler, "_facts_stream_every", lambda: 1)
+        self._two_page_two_file_crawl(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 2  # both pages' files were ingested
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        # Three trigger points fired (page 1, page 2, the final flush) but
+        # idempotency dedup collapses them onto ONE row.
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["payload_json"] == {"connection_id": "conn1"}
+        assert job["idempotency_key"] == "sharepoint-facts-extraction:conn1"
+        assert job["status"] == "queued"
+
+    def test_stream_every_zero_never_enqueues_a_job(self, crawl_env, monkeypatch):
+        """Default (0, off) — the crawl's behaviour is unchanged: no
+        streamed job is ever enqueued, whatever the crawl ingests."""
+        assert crawler._facts_stream_every() == 0
+        self._two_page_two_file_crawl(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 2
+
+        from src.repositories import jobs_repo
+
+        assert jobs_repo().list(kind="sharepoint-facts-extraction") == []
+
+    def test_dedupe_path_does_not_raise_and_does_not_pile_up(self, crawl_env, monkeypatch, caplog):
+        self._enable_facts_switches(monkeypatch)
+
+        from src.repositories import jobs_repo
+
+        existing = jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "conn1"},
+            idempotency_key="sharepoint-facts-extraction:conn1",
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="connectors.sharepoint.crawler"):
+            crawler._enqueue_streamed_facts_pass("conn1")  # must not raise
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        assert len(jobs) == 1
+        assert jobs[0]["id"] == existing["id"]
+        assert any("not piling up" in r.getMessage() for r in caplog.records)
+
+    def test_chained_tail_pass_skips_when_a_standalone_job_is_in_flight(self, crawl_env, monkeypatch, caplog):
+        """Independent of ``stream_every``: an ALREADY in-flight standalone
+        pass (a streamed enqueue or a manual trigger) makes the crawl's own
+        chained tail pass skip, so the two never race the same per-document
+        ledger."""
+        self._enable_facts_switches(monkeypatch)
+
+        def boom(connection, *, deadline=None, on_progress=None):
+            raise AssertionError("the chained pass must not run while a standalone pass is in flight")
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_run_after_crawl", boom)
+
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "conn1"},
+            idempotency_key="sharepoint-facts-extraction:conn1",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        with caplog.at_level(logging.INFO, logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert "facts" not in report
+        assert "facts_usage" not in report
+        assert any("standalone pass in flight — skipping chained pass" in r.getMessage() for r in caplog.records)
+
+
 # --------------------------------------------------------------------------
 # Cooperative stop (owner-frustration fix, 2026-09-01): "it's a black box,
 # I can't see what's happening and I can't stop it". The signal lives on
@@ -4560,8 +4688,7 @@ class TestRetryUsesTheConversionPool:
         )
         assert "convert_pool=convert_pool" in body, "the pool must reach _process_item"
         assert "convert_slot=0" in body, (
-            "the retry loop is sequential, so it owns slot 0 — the same slot "
-            "the sequential page path uses"
+            "the retry loop is sequential, so it owns slot 0 — the same slot the sequential page path uses"
         )
 
     def test_the_retry_loop_repairs_the_pool_before_each_item(self):
@@ -4572,8 +4699,7 @@ class TestRetryUsesTheConversionPool:
         can hold a lock a fork would copy."""
         body = self._retry_source()
         assert "convert_pool.repair()" in body, (
-            "a crashed conversion worker would otherwise carry into the next "
-            "retried item"
+            "a crashed conversion worker would otherwise carry into the next retried item"
         )
 
     def test_the_caller_threads_the_pool_in(self):
@@ -4583,9 +4709,9 @@ class TestRetryUsesTheConversionPool:
         src = Path("connectors/sharepoint/crawler.py").read_text(encoding="utf-8")
         i = src.index("await _retry_failed_items(")
         call = src[i : src.index("\n    )", i)]
-        assert "convert_pool=convert_pool" in call, (
-            "_crawl_drive must pass its run's pool into the backlog replay"
-        )
+        assert "convert_pool=convert_pool" in call, "_crawl_drive must pass its run's pool into the backlog replay"
+
+
 def test_the_converted_size_cap_is_reachable_by_the_converter():
     """A byte ceiling above what the converter can emit guards nothing.
 

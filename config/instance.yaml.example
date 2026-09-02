@@ -1543,6 +1543,19 @@ extraction:
     # crawl for time, so it gets a budget of its own. 0 disables the bound
     # (unbounded), same convention as `extraction.timeout_s`.
     run_timeout_s: 3600
+    # Let fact extraction run WHILE a crawl is still going, without an
+    # external script: after every N successfully ingested files (and once
+    # more when enumeration finishes), the built-in crawler enqueues a
+    # standalone `sharepoint-facts-extraction` job for the connection — the
+    # SAME job kind and idempotency key `POST …/connections/{id}/facts-
+    # extract` uses, so a fast crawl crossing several thresholds before a
+    # prior pass finishes collapses onto one queued job rather than piling
+    # up. 0 (the default) disables this — only the chained tail pass runs,
+    # after the crawl finishes, exactly as before this knob existed. Needs
+    # the worker's EXTRACTION lane (`extraction.concurrency` above) sized
+    # to at least 2 for a streamed pass to actually OVERLAP the crawl still
+    # running; at the default of 1 it simply queues behind it.
+    stream_every: 0
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails
