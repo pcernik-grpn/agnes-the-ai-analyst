@@ -603,6 +603,14 @@ function isSecretKey(key) {
   const k = (key || "").toLowerCase();
   return SECRET_PATTERNS.some(p => k.includes(p));
 }
+// Kinds that can never hold a credential, whatever the key is called —
+// mirrors the server's `_declared_boolean_fields` / `_declared_numeric_fields`
+// carve-out in `_is_secret_key` (chat.max_session_tokens matches "token" by
+// naming coincidence and must render as a plain number, not a masked secret).
+const NEVER_SECRET_KINDS = new Set(["bool", "int", "float"]);
+function isSecretField(key, kind) {
+  return kind === "secret" || (isSecretKey(key) && !NEVER_SECRET_KINDS.has(kind));
+}
 
 // Section copy — kept short; the issue's Scope section explains the rest.
 const SECTION_META = {
@@ -672,7 +680,7 @@ const SECTION_META = {
   },
   chat: {
     title: "Chat access",
-    help: "Expose the cloud chat surface and whether an agent's tool calls need explicit approval. Separate from the Cloud chat card below, which holds the provider keys chat needs to actually start.",
+    help: "Expose the cloud chat surface, whether an agent's tool calls need explicit approval, and the three per-sender limits: the daily USD spend cap (per person, resets at midnight UTC — the one an eval run or a heavy day hits first), the cumulative per-conversation token budget, and the message rate. The limits are read once at startup, so saving them takes effect after the app process restarts. Separate from the Cloud chat card below, which holds the provider keys chat needs to actually start.",
   },
 };
 // Danger-zone sections (extra confirmation dialog before saving) — driven
@@ -790,7 +798,7 @@ function renderLeafInput(fieldId, section, pathSegments, kind, value, opts, isUn
   const dottedKey = (pathSegments || []).join(".");
   const dataPath = encodePath(pathSegments);
   const leafKey = pathSegments && pathSegments.length ? pathSegments[pathSegments.length - 1] : "";
-  const isSecret = isSecretKey(String(leafKey)) || kind === "secret";
+  const isSecret = isSecretField(String(leafKey), kind);
   if (kind === "secret") {
     const ph = isUnset
       ? "unset — type to set"
@@ -1012,7 +1020,7 @@ function renderNestedField(section, pathSegments, label, value, spec, depth) {
     : (value && typeof value === "object") ? "object"
     : "string"
   );
-  const isSecret = isSecretKey(label) || kind === "secret";
+  const isSecret = isSecretField(label, kind);
   const isUnset = (value === undefined);
   const fieldId = `f_${section}_${dottedKey.replace(/\W/g, "_")}`;
   const wrapperClass = "cfg-field nested-field" + (isUnset ? " is-unset" : "");

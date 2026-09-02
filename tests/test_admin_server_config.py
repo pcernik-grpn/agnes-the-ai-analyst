@@ -186,6 +186,36 @@ class TestGetServerConfigAPI:
         assert data["sections"]["email"]["smtp_host"] == "smtp.example.com"
         assert data["sections"]["auth"]["allowed_domain"] == "example.com"
 
+    def test_get_does_not_mask_the_chat_token_budget(self, seeded_app, monkeypatch, tmp_path):
+        """`chat.max_session_tokens` matches the "token" redactor substring by
+        naming coincidence. Masked, GET hands the panel `***` for a
+        `type=number` input, the browser shows it empty, and the next "Save
+        section" posts `null` — silently resetting the operator's budget to
+        the default. The registry declares it numeric, and a number is never
+        a credential, so the value must pass through verbatim — alongside the
+        spend cap, which the same card must show as a float field."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump({"chat": {"max_session_tokens": 123456, "daily_anthropic_spend_usd": 100.0}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/api/admin/server-config", headers=_auth(token))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["chat"]["max_session_tokens"] == 123456
+        assert data["sections"]["chat"]["daily_anthropic_spend_usd"] == 100.0
+        known = data["known_fields"]["chat"]
+        assert known["max_session_tokens"]["kind"] == "int"
+        assert known["daily_anthropic_spend_usd"]["kind"] == "float"
+        assert known["rate_messages_per_hour"]["kind"] == "int"
+
     def test_get_redacts_the_snowflake_credential_env_NAMES(self, seeded_app, monkeypatch, tmp_path):
         """`token_env` / `private_key_env` hold env-var NAMES, not values, but
         `_is_secret_key` matches them on "token"/"private" and `_redact` masks
