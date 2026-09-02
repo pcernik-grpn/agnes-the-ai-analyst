@@ -956,9 +956,12 @@ class FakeBatchesAPI:
     """No-network double for ``client.messages.batches``.
 
     ``outcomes`` maps ``custom_id -> ("succeeded", reply_text) |
-    ("errored", error_type) | ("canceled", None) | ("expired", None)``. A
-    batch is ``ended`` immediately after ``create()`` unless ``hold()`` is
-    called for its id right after — the seam the resumability/deadline
+    ("errored", error_type) | ("canceled", None) | ("expired", None)`` — OR
+    a LIST of such tuples, consumed in order across repeated ``create()``
+    calls for the same custom_id (the seam a corrective-retry-batch test
+    uses: the FIRST batch gets entry 0, the follow-up retry batch entry 1).
+    A batch is ``ended`` immediately after ``create()`` unless ``hold()``
+    is called for its id right after — the seam the resumability/deadline
     tests use to keep a batch ``in_progress`` until ``release()``.
     """
 
@@ -969,6 +972,7 @@ class FakeBatchesAPI:
         self._next_id = 0
         self._held: set[str] = set()
         self._results: dict[str, list] = {}
+        self._attempt: dict[str, int] = {}
 
     def create(self, *, requests):
         self._next_id += 1
@@ -977,7 +981,13 @@ class FakeBatchesAPI:
         results = []
         for req in requests:
             custom_id = req["custom_id"]
-            kind, payload = self.outcomes.get(custom_id, ("succeeded", "NODES\nEDGES\n"))
+            spec = self.outcomes.get(custom_id, ("succeeded", "NODES\nEDGES\n"))
+            if isinstance(spec, list):
+                idx = min(self._attempt.get(custom_id, 0), len(spec) - 1)
+                self._attempt[custom_id] = self._attempt.get(custom_id, 0) + 1
+                kind, payload = spec[idx]
+            else:
+                kind, payload = spec
             if kind == "succeeded":
                 results.append(
                     _fake_batch_result(custom_id, kind="succeeded", message=_fake_message(payload, usage=self.usage))
@@ -1049,6 +1059,72 @@ def test_batch_pass_writes_claims_through_the_real_ingest_chokepoint(pg_env):
 
     found = facts_repo().search({"id": "admin1"}, type="engagement", filters={}, q=None, limit=10)
     assert found["subjects"], "the batch pass's facts must be readable back through the real search path"
+
+
+def test_batch_gate_failure_defers_to_a_follow_up_retry_batch_by_default(pg_env):
+    """``extraction.facts.retry_transport`` defaults to ``batch`` — a
+    verbatim-gate failure must submit ONE follow-up batch (never a live
+    sync call) and recover through the SAME merge rule `extract_one`'s own
+    retry branch applies."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March for Contoso.")
+
+    bad = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "This sentence was never in the document."}],
+    }
+    fixed = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "for Contoso"}],
+    }
+    api = FakeBatchesAPI({"cf_1": [("succeeded", _stream(bad)), ("succeeded", _stream(fixed))]})
+    report = _run_batch(FakeBatchClient(api))
+
+    assert len(api.created) == 2, "the gate failure must submit a follow-up retry batch"
+    assert report["docs_extracted"] == 1
+    assert report["claims_written"] == 1
+    assert report["facts_retries"] == 1
+    assert report["facts_quotes_dropped"] == 0
+    assert report["docs_via_batch"] == 1
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    assert state["docs"]["cf_1"]["status"] == "done"
+
+
+def test_batch_retry_batch_that_still_fails_is_dropped_and_counted(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    bad = {
+        "id": "client:x",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "never appeared"}],
+    }
+    still_bad = {
+        "id": "client:x",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "still never appeared"}],
+    }
+    api = FakeBatchesAPI({"cf_1": [("succeeded", _stream(bad)), ("succeeded", _stream(still_bad))]})
+    report = _run_batch(FakeBatchClient(api))
+
+    assert len(api.created) == 2
+    assert report["docs_extracted"] == 1, "the document is still processed — zero facts, not zero documents"
+    assert report["claims_written"] == 0
+    assert report["facts_quotes_dropped"] == 1
+    assert report["facts_retries"] == 1
 
 
 def test_batch_submission_records_batch_submitted_state_before_collection(pg_env):
