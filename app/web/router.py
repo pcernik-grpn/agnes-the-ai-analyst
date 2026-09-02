@@ -512,16 +512,14 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "agent": ("/library?section=agent", "All agent templates"),
     "files": ("/library?section=files", "Library"),
     # The flat metric/glossary registries are not a `type_key`: they are a
-    # destination the Semantic models band links OUT to, not one of the
-    # Library's bands, so they have no `?section=` to open. They get the
-    # band's own anchor instead — without one the bare /library the fallback
-    # returns lands the reader at the top of the page, with the whole
-    # inventory between them and the section they clicked.
-    # `#lib-defs` exists exactly when that block rendered (library.html emits
-    # it under `if definitions_footer`, set only when the caller can see at
-    # least one metric or glossary term); when it did not, the anchor is inert
-    # and the browser stays at the top, which is what a bare /library did
-    # anyway.
+    # destination the Library links OUT to, not one of its bands, so they have
+    # no `?section=` to open. They get the Definitions strip's anchor instead.
+    # `#lib-defs` exists exactly when that strip rendered (library.html emits
+    # it under `if library_definitions`, set only when the caller can see at
+    # least one metric or glossary term, or can read a model); when it did
+    # not, the anchor is inert and the browser stays at the top, which is what
+    # a bare /library did anyway. The strip sits ABOVE the inventory now, so
+    # the anchor lands at the head of the page either way.
     "semantics": ("/library#lib-defs", "Library"),
 }
 
@@ -2353,7 +2351,7 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: list[d
     ``semantic_models`` read failure must degrade to "no link" and leave the
     rest of the page intact rather than 500 it. ``surface`` only labels the log.
 
-    Shared by ``/library``'s Semantic models section and the model list's own
+    Shared by ``/library``'s Definitions strip and the model list's own
     empty states. One reader, because the two disagreeing is exactly how the
     flat page came to claim "no metrics registered yet" on an instance whose
     Library was already offering the document next door.
@@ -3625,31 +3623,38 @@ async def library_page(
         except Exception as e:
             _lost("apps", e)
 
-    # ── The semantic layer — a SECTION, and its two flat projections ──────
-    # This closed the page as a footer aside for one good reason and one bad
-    # one. The good one still holds: a METRIC or a glossary term is not a row
-    # here — it is the organization's agreed vocabulary, which nobody owns,
-    # shares, installs or drops, so as a row it had to neuter all four of the
-    # table's columns at once (Owner / Sharing / Stack / Actions), and four
-    # special-cased columns is the table saying the object is not one of its
-    # rows.
+    # ── The semantic layer — a STRIP above the inventory, not a section ───
+    # Three placements, and each move was the page learning what the object
+    # is. A footer aside below an unbounded list (unreachable — after every
+    # row is where a reader stops looking), then a named SECTION whose band
+    # carried the two flat projections as links, and now a strip standing
+    # between the type map and the toolbar.
     #
-    # The bad one was treating the MODEL like the metric. A semantic model
-    # answers every one of those columns honestly — it has a source, it
-    # reaches you through a grant exactly as a Data Package does, your agents
-    # do read it, and it has a detail page — so the thing that could not be a
-    # row was never the document, only its projection. #1707 N3: the models
-    # are rows in a NAMED section at a fixed slot in the order above, and the
-    # two flat projections ride that section's band as links into their tabs
-    # on /semantic-layer (they were `/catalog/semantics#metrics` and
-    # `#glossary`; that page is now a 308 onto the same two tabs).
+    # What the section got right survives here: a METRIC or a glossary term
+    # is not a row — it is the organization's agreed vocabulary, which nobody
+    # owns, shares, installs or drops, so as a row it had to neuter all four
+    # of the table's columns at once (Owner / Sharing / Stack / Actions).
+    #
+    # What it got wrong is that the MODEL is not a peer of the rows either.
+    # A Data Package is data you can reach; a semantic model is a statement
+    # ABOUT that data and is useless without it — a dependent layer, not a
+    # sibling entry in the same inventory. The table's own affordances say so:
+    # Filter, sort and "Agents use it" are inventory controls, and none of the
+    # three means anything applied to three documents. So the whole layer
+    # leaves the table and becomes one destination above it, with the models,
+    # the metrics and the glossary as the three tabs of `/semantic-layer` —
+    # which is where a reader can act on all three at their own altitude.
+    #
+    # Stated in place rather than hidden behind the click: the counts ride the
+    # strip's own sentence, so a caller who never opens it still leaves
+    # knowing the vocabulary exists and roughly how much of it is defined.
     #
     # The counts are computed here — RBAC-filtered on the metric side by the
     # same `_first_inaccessible_table` predicate those tabs apply, so the
-    # section never advertises definitions the caller cannot open; the
-    # glossary is deliberately ungated (business vocabulary, not data), so its
-    # count is instance-wide.
-    definitions_footer: dict = {}
+    # strip never advertises definitions the caller cannot open; the glossary
+    # is deliberately ungated (business vocabulary, not data), so its count is
+    # instance-wide.
+    library_definitions: dict = {}
     try:
         from app.api.metrics import _first_inaccessible_table
         from src.rbac import get_accessible_tables
@@ -3657,114 +3662,94 @@ async def library_page(
         # No `conn` argument: /library takes no raw ``Depends(_get_db)``
         # connection, and passing one would be the backend-split bug class on a
         # Postgres instance. The default path reads through the repo factory.
-        _accessible = get_accessible_tables(user)
-        _allowed = None if _accessible is None else set(_accessible)
-        _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
-        # 500 is GET /api/glossary's own max limit and the repo has no
-        # unbounded mode (it bounds a full-table scan) — above the scale this
-        # feature targets, so an exact count in practice.
-        _glossary_terms = glossary_repo().list(limit=500)
+        # One boundary per read, not one around all three. The comment below
+        # claimed the model read already had its own guard; it did not — a
+        # single `try` wrapped every read, so one failing table removed the
+        # whole Definitions row and the reader was told a populated semantic
+        # layer does not exist (Devin Review on #2069). A count that cannot be
+        # read now degrades to "none of those", and the row still states the
+        # two that could.
+        _visible_metrics: list = []
+        _glossary_count = 0
+        _has_readable_model = False
 
-        # What the page's search box matches the footer on. The reader types
-        # the TERM they want — "ARR", "active account" — not the word
-        # "definitions", so the block carries its contents' vocabulary: every
-        # metric name, display name and synonym (synonyms are what make "MRR"
-        # reach "Monthly Recurring Revenue"), and every glossary term.
-        #
-        # Names only, never the definition bodies. This ships in an attribute
-        # on every page load, and matching on prose would surface the block for
-        # words that merely appear inside some definition. The metric side
-        # inherits the RBAC filter above for free.
-        def _index_words(values) -> str:
-            seen: dict[str, None] = {}
-            for v in values:
-                for word in str(v or "").split():
-                    w = word.strip().lower()
-                    if w:
-                        seen.setdefault(w, None)
-            return " ".join(seen)
+        try:
+            _accessible = get_accessible_tables(user)
+            _allowed = None if _accessible is None else set(_accessible)
+            _visible_metrics = [
+                m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None
+            ]
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count visible metrics: %s", e)
+        # Through the shared helper, not a second inline
+        # `glossary_repo().list(limit=500)`: this strip and the
+        # `/semantic-layer` tab strip show the SAME number to the same caller
+        # one click apart, and two call sites are two chances for that pair to
+        # drift. Only the count is wanted here — the strip states how much
+        # vocabulary exists and links out; the terms themselves are read and
+        # searched on the page that owns them.
+        try:
+            _glossary_count = _glossary_terms_count()
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count glossary terms: %s", e)
 
         # Whether to offer the "Browse the semantic layer" link below — a
         # readable-model check scoped to what THIS caller can reach, the same
         # `_can_read_model` gate the /semantic-layer browse pages apply. It
         # answers "does this caller have a semantic model to browse at all", so
-        # a caller who can read nothing gets neither the link nor a
-        # "0 metrics · 0 terms" footer pointing at an empty page. A model with
-        # no metrics/glossary projected yet (or a purely native, browse-only
-        # model) still counts — gating on the flat projection's counts would
-        # hide the one thing this UI exists to browse. Read in its own guard so
-        # a semantic_models failure leaves the metric/glossary footer already
-        # computed above intact instead of suppressing it.
+        # a caller who can read nothing is not pointed at an empty page. A
+        # model with no metrics/glossary projected yet (or a purely native,
+        # browse-only model) still counts — gating on the flat projection's
+        # counts would hide the one thing this UI exists to browse. Read in
+        # its own guard (see above) so a semantic_models failure leaves the
+        # metric and glossary counts intact instead of suppressing the strip
+        # entirely.
         #
-        # ONE `_can_read_model` sweep (the #1850 memo): the same list answers
-        # the browse gate below AND supplies the section's rows. The check
-        # resolves a model's Data Packages per row, so a second sweep would
-        # double this page's semantic-layer cost for an answer it already had.
-        _readable_models = _readable_semantic_model_rows(user, conn, surface="/library")
-        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library", rows=_readable_models)
+        # The models are no longer ROWS on this page — the whole layer is one
+        # destination now (see the note above), and `/semantic-layer`'s Models
+        # tab is where a model is listed, with its object counts, dialects and
+        # validation status. What survives here is the single question this
+        # page still has to answer: does this caller have a readable document
+        # at all, which decides where the strip's one link should land.
+        try:
+            _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not resolve a readable semantic model: %s", e)
 
-        # One row per SLUG — the newest readable row, matching what
-        # `/semantic-layer/{slug}` resolves to. Two models can share a slug
-        # (unique only per source/source_ref), and a second row would link to
-        # the same page as the first (Devin #1398).
-        _newest_by_slug: dict = {}
-        for _m in _readable_models:
-            _cur = _newest_by_slug.get(_m.get("slug"))
-            if _cur is None or str(_m.get("updated_at") or "") > str(_cur.get("updated_at") or ""):
-                _newest_by_slug[_m.get("slug")] = _m
-        for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
-            from app.web.semantic_layer_view import model_of, object_counts, source_label
-
-            _model = model_of(_m)
-            try:
-                _counts = object_counts(_model)
-            except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
-                _counts = {}
-            _meta = " · ".join(
-                f"{_counts[k]} {lbl}{'' if _counts[k] == 1 else 's'}"
-                for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
-                if _counts.get(k)
-            )
-            # #1955: the row's own `description` column is empty for every
-            # model a sync wrote (the importer never projected the
-            # document's model-level description onto it) so this fell back
-            # to "" — an imported model rendered with no subtitle even
-            # though its document has one. Fall back to the document's own
-            # description. `_model` is the SAME `model_of(_m)` already
-            # computed above for `_counts` — a dict unwrap of `document_json`,
-            # itself already fetched whole by `list_all()` above — so this is
-            # a dict lookup, not an extra query or document parse.
-            _description = _m.get("description") or _model.get("description") or ""
-            _add_shared_row(
-                item_id=_m["id"],
-                title=_m.get("name") or _slug,
-                description=_description,
-                href=f"/semantic-layer/{quote(str(_slug))}",
-                glyph="data",
-                type_key="semantic_model",
-                type_label="Semantic model",
-                origin="granted",
-                origin_label="Shared with you",
-                added=None,
-                meta_text=_meta,
-                owner_label=source_label(_m.get("source")),
-                owner_key=str(_m.get("source") or "manual"),
-            )
-
-        if _visible_metrics or _glossary_terms or _has_readable_model:
-            definitions_footer = {
+        if _visible_metrics or _glossary_count or _has_readable_model:
+            library_definitions = {
                 "metric_count": len(_visible_metrics),
-                "glossary_count": len(_glossary_terms),
-                # Only THIS gates the "Browse the semantic layer" link: the
-                # metric/glossary links ride the flat projection above, but the
-                # browse page needs a readable document, so a caller with
-                # visible metrics yet no readable model must not be sent there.
-                "has_semantic_models": _has_readable_model,
-                "search": _index_words(
-                    [m.get("display_name") for m in _visible_metrics]
-                    + [m.get("name") for m in _visible_metrics]
-                    + [s for m in _visible_metrics for s in (m.get("synonyms") or [])]
-                    + [g.get("term") for g in _glossary_terms]
+                "glossary_count": _glossary_count,
+                # The sentence says "N glossary terms"; N saturates at the
+                # read limit, so say so rather than stating a cap as a total.
+                "glossary_count_label": _glossary_count_label(_glossary_count),
+                # Where the strip's ONE link lands. The strip offers a single
+                # call to action by design — two competing links beside a
+                # sentence is the band this replaced — so the target has to
+                # carry what the two links used to say between them.
+                #
+                # Always the Metrics tab, for every caller. The fork this
+                # replaced sent a reader who could read a document to the bare
+                # `/semantic-layer` (its Models tab) and everyone else to the
+                # metrics — written before this card's own copy became "21
+                # metrics, 12 glossary terms". Against that sentence the Models
+                # tab shows NEITHER of the two things just counted: the reader
+                # clicks a promise about words and numbers and arrives at a list
+                # of documents. The tab strip carries them on to the models in
+                # one click, which is the right way round.
+                # ...with one exception the paragraph above did not consider:
+                # an instance that HAS a semantic layer but no metrics in it.
+                # Sending that reader to the metrics tab lands them on the one
+                # empty list on the page, having just been told the layer holds
+                # 40 glossary terms (Devin Review on #2069). Pick the first tab
+                # that actually holds something, in the order the card counts
+                # them; metrics stay the default whenever they exist.
+                "browse_href": (
+                    "/semantic-layer?tab=all_metrics"
+                    if _visible_metrics
+                    else "/semantic-layer?tab=all_glossary"
+                    if _glossary_count
+                    else "/semantic-layer"
                 ),
             }
     except Exception as e:
@@ -3905,13 +3890,6 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
-        # Directly under the governed data, because it is what that data
-        # MEANS: the reader who has just seen "Data packages" is one line away
-        # from the definitions those tables are queried through. A FIXED slot,
-        # never the tail of the page — this was a footer aside below an
-        # unbounded list, i.e. after every row, which is where a reader stops
-        # looking (#1707 N3).
-        "semantic_model",
         "plugin",
         "skill",
         "agent",
@@ -3934,7 +3912,6 @@ async def library_page(
     _TAB_CAPABILITIES = "capabilities"
     _SECTION_TAB = {
         "data_package": _TAB_KNOWLEDGE,
-        "semantic_model": _TAB_KNOWLEDGE,
         "data_app": _TAB_KNOWLEDGE,
         "recipe": _TAB_KNOWLEDGE,
         "files": _TAB_KNOWLEDGE,
@@ -3982,7 +3959,6 @@ async def library_page(
         # footer aside's name and is retired with it: it named the CONTENTS
         # (metrics, terms) while the section holds the documents those are
         # projected from.
-        "semantic_model": "Semantic models",
         "data_app": "Apps",
         "memory_domain": "Memory",
     }
@@ -4003,7 +3979,6 @@ async def library_page(
         "agent": "Reusable role definitions. Install one and your agents gain a ready-made specialist — or start an agent of your own from it.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
-        "semantic_model": "What your data means — your agents answer with these.",
         "data_app": "Hosted apps running next to your data.",
         "memory_domain": "Curated organizational knowledge.",
     }
@@ -4031,11 +4006,6 @@ async def library_page(
         "agent": ("agent", "agent"),
         "recipe": ("recipe", "recipes"),
         "data_package": ("data", "data"),
-        # The `data` accent, deliberately shared with Data packages rather than
-        # given a `--ds-kind-semantic` of its own: a semantic model is a
-        # statement ABOUT the governed data, and the model cards on
-        # /semantic-layer already wear this kind (semantic_layer_list.html).
-        "semantic_model": ("data", "data"),
         "data_app": ("app", "app"),
         "memory_domain": ("memory", "memory"),
     }
@@ -4058,15 +4028,6 @@ async def library_page(
         loose = [r for r in rows if not r.get("is_folder")]
         return folders + loose
 
-    # The semantic layer is the one section that can exist with NO rows: a
-    # caller may have visible metrics and glossary terms yet no readable
-    # DOCUMENT, and the two flat projections are still theirs to open. Given
-    # its own empty band rather than dropped, because dropping it is how the
-    # footer aside's whole failure mode returns — the definitions become
-    # unreachable from the page that is supposed to inventory them.
-    if definitions_footer and "semantic_model" not in grouped:
-        grouped["semantic_model"] = []
-
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
         kind, glyph = _SECTION_KINDS.get(key, ("library", "doc"))
@@ -4081,12 +4042,6 @@ async def library_page(
                 "rows": _section_rows(key, rows),
                 "kind": kind,
                 "glyph": glyph,
-                # Links carried by the section's own BAND rather than by any
-                # row — the flat metric/glossary projections are a destination,
-                # not inventory (see the note where `definitions_footer` is
-                # built). Only this section supplies them; every other renders
-                # its band exactly as before.
-                "defs": definitions_footer if key == "semantic_model" else None,
                 # One link across to the OTHER half of the story: the band
                 # explains what a template IS, and this is the one thing you do
                 # with it that does not happen here. It opens the builder's
@@ -4189,7 +4144,7 @@ async def library_page(
         library_sections=library_sections,
         library_tabs=library_tabs,
         library_active_tab=library_active_tab,
-        definitions_footer=definitions_footer,
+        library_definitions=library_definitions,
         library_origins=library_origins,
         library_requirements=library_requirements,
         library_in_stack_count=library_in_stack_count,
@@ -4584,12 +4539,30 @@ _SEMANTIC_LAYER_LIST_TAB_LABELS = {
 }
 
 
+#: The bound both glossary counts read under — the ``/semantic-layer`` tab
+#: strip and ``/library``'s Definitions strip. Shared so the two numbers, shown
+#: to the same caller one click apart, cannot drift.
+_GLOSSARY_COUNT_LIMIT = 500
+
+
 def _glossary_terms_count() -> int:
     """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
     unbounded mode (it bounds a full-table scan) — comfortably above the
     tens-to-low-hundreds scale this feature targets, so an exact count in
-    practice rather than a true cap."""
-    return len(glossary_repo().list(limit=500))
+    practice rather than a true cap.
+
+    "In practice" is not "always", which is why :func:`_glossary_count_label`
+    exists: a registry at or past the limit renders ``500+`` rather than
+    stating 500 as an exact total (Devin Review on #2069)."""
+    return len(glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT))
+
+
+def _glossary_count_label(count: int) -> str:
+    """The count as the page should SAY it — ``500+`` once it saturates.
+
+    The number itself stays an int for every caller that does arithmetic or a
+    truthiness check on it; only the rendered label changes."""
+    return f"{_GLOSSARY_COUNT_LIMIT}+" if count >= _GLOSSARY_COUNT_LIMIT else str(count)
 
 
 @router.get("/semantic-layer", response_class=HTMLResponse)
@@ -4796,6 +4769,7 @@ async def semantic_layer_list(
         metric_categories=metric_categories,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
+        glossary_count_label=_glossary_count_label(glossary_count),
         glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)

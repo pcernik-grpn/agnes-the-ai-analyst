@@ -91,48 +91,91 @@ def _seed_definitions(metrics: int = 1, terms: int = 1) -> None:
         glossary_repo().create(id=f"g{i}", term=f"Term {i}", definition="What it means here.")
 
 
-def test_library_shows_definitions_on_the_semantic_models_band(seeded_app):
-    """The metric and glossary registries are a DESTINATION, not inventory.
+def test_library_shows_definitions_as_a_strip_above_the_inventory(seeded_app):
+    """The whole semantic layer is a DESTINATION, not inventory.
 
-    Two things were conflated here and the split is the whole point. A metric
-    or a glossary term is the one thing on this page nobody owns, shares,
-    installs, drops or edits, so as a row it would blank all four of the
-    table's columns at once (Owner / Sharing / Access / Actions) — and four
-    special-cased columns is the list saying the object is not one of its
-    rows. It therefore stays a pair of LINKS.
+    Two objects, and both fail the table for the same reason at different
+    depths. A metric or a glossary term is the one thing on this page nobody
+    owns, shares, installs, drops or edits, so as a row it would blank all
+    four of the table's columns at once. A stored MODEL answers those columns
+    honestly — which is why it was a row for a while — but it is still not a
+    PEER of the rows beside it: a Data Package is data you can reach, a model
+    is a statement about that data and is worthless without one. The toolbar
+    settles it. Filter, sort and "Agents use it" are inventory affordances,
+    and a row none of the three can act on is the table saying the object is
+    not one of its rows.
 
-    Where those links live did change (#1707 N3): they used to close the page
-    as a footer aside below an unbounded list, i.e. after every row. They now
-    ride the band of the Library's own "Semantic models" section, which holds
-    the stored documents those registries are projected from — documents that
-    answer all four columns honestly and ARE rows.
+    So the layer leaves the table entirely and becomes one strip above it,
+    with `/semantic-layer` holding models, metrics and glossary as three tabs
+    at their own top level. Third placement and, unlike the footer aside and
+    the section band before it, the first that does not have to special-case
+    the object to keep it.
     """
     _seed_definitions(metrics=2, terms=3)
     c = seeded_app["client"]
     r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
     assert 'id="lib-defs"' in r.text
+    # The counts are stated IN PLACE, as prose rather than as links: a reader
+    # who never clicks still learns the vocabulary exists and how much of it
+    # is defined, which is the only reason this is on the page at all.
     assert "2 metrics" in r.text
     assert "3 glossary terms" in r.text
-    # Into the folded tabs (#1707 N5), never the retired flat page.
-    assert 'href="/semantic-layer?tab=all_metrics"' in r.text
-    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    # ONE call to action. Two competing links beside a sentence is the band
+    # this replaced, and the strip stops being an entrance the moment it
+    # becomes a second inventory.
+    assert r.text.count('class="lib-defs__cta"') == 1
+    # Names what it opens — "the semantic layer" is the concept, the models
+    # are the thing on the other side of the link.
+    assert "Browse definitions" in r.text
     assert "/catalog/semantics" not in r.text
-    # Still not inventory: the definitions themselves are no row and no kind.
+    # The layer is off the table: no Semantic models section, no rows, no
+    # facet — the models are listed by /semantic-layer's own Models tab.
+    assert 'data-lib-sec="semantic_model"' not in r.text
     assert 'data-lib-sec="definitions"' not in r.text
     assert 'data-kind="definitions"' not in r.text
     # And not the retired header link either.
     assert "lib-browse-semantics" not in r.text
 
 
-def test_library_definitions_carry_their_contents_for_search(seeded_app):
-    """The block is searchable BY TERM, not just by the word "definitions".
+def test_library_definitions_link_lands_on_a_tab_the_caller_can_use(seeded_app):
+    """The one link's TARGET carries what the two links used to say.
 
-    Someone types "MRR" or "active account" — the term they half-remember —
-    the list comes back empty, and the footer is the one thing on the page
-    that knows the word. Without the index it stays silent and the reader
-    concludes Agnes has never heard of it. This is also the only one-step term
-    lookup the rail chrome has, since it renders no global search box.
+    `/semantic-layer` opens on Models, which is the right front door only for
+    a caller who can read a document. A caller with visible metrics and no
+    readable model would land on an empty tab and conclude the definitions
+    they were just told about are not there — so they are sent straight to
+    the projection that IS theirs. One link, one label, different landing.
+    """
+    _seed_definitions(metrics=2, terms=3)
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    # No semantic model seeded here, so the metrics tab is the honest landing.
+    assert 'href="/semantic-layer?tab=all_metrics"' in r.text
+
+
+def test_library_search_does_not_answer_from_the_definitions(seeded_app):
+    """The strip is a SIGN, not a search result — one job per surface.
+
+    It used to answer the page's search box: it shipped an index of every
+    metric name, synonym and glossary term in a `data-defs-search` attribute
+    and said "'mrr' is one of your organization's definitions" when a query
+    matched. That was built for the old band placement, where the definitions
+    sat halfway down the page and a reader who searched and found nothing had
+    no way to learn they existed.
+
+    Two things retired it. The strip now stands permanently above the empty
+    state with its counts and its link, so it answers that reader by being on
+    screen rather than by matching their query — the hint was paying twice for
+    one job. And it could not be positioned honestly: a block that responds to
+    the search box belongs in the results region, and a block in the results
+    region that ignores Filter and sort reads as broken.
+
+    So the Library's search searches the Library, and `/semantic-layer`
+    searches its own content (a filter box on the metrics tab, a search box on
+    the glossary tab). This guards the split, and the payload win that came
+    with it — the index shipped in an attribute on every single page load.
     """
     from src.repositories import glossary_repo, metric_repo
 
@@ -150,27 +193,50 @@ def test_library_definitions_carry_their_contents_for_search(seeded_app):
     c = seeded_app["client"]
     r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
-    index = r.text.split('data-defs-search="', 1)[1].split('"', 1)[0]
-    # Reachable by display name, short name, synonym and glossary term.
-    assert "monthly" in index and "recurring" in index
-    assert "mrr" in index
-    assert "arr" in index
-    assert "active" in index
-    # Definition BODIES stay out — the index ships on every page load, and
-    # matching on prose would surface the block on incidental words.
-    assert "normalized" not in index
-    assert "paid" not in index
+    assert 'id="lib-defs"' in r.text, "the strip itself stays — only its search coupling went"
+    assert "data-defs-search" not in r.text
+    assert 'id="lib-defs-hit"' not in r.text
+    # Nothing about a metric's vocabulary rides the page any more.
+    assert "Monthly Recurring Revenue" not in r.text
+
+    src = (Path("app/web/templates/library.html")).read_text(encoding="utf-8")
+    assert "syncDefinitionsHit" not in src, (
+        "the definitions hint is back in the onApply chain — the strip is a sign, "
+        "not a search result; /semantic-layer searches its own content"
+    )
+
+
+def test_the_semantic_layer_page_searches_its_own_content():
+    """The other half of the split above: dropping the Library's hint is only
+    safe because the destination is self-sufficient. If these boxes go, the
+    definitions become searchable nowhere and the hint has to come back."""
+    src = (Path("app/web/templates/semantic_layer_list.html")).read_text(encoding="utf-8")
+    # Stated as the CLAIM, not as one generation's ids: the Library drops its
+    # own search hint only because the destination searches its own content, so
+    # what has to hold is that a search box exists there at all. Pinning
+    # `id="sl-search"` would make this fail on a branch that has the Library
+    # half of the redesign without the Definitions half, which is exactly how
+    # these two ship — stacked, and reviewable one at a time.
+    assert 'type="search"' in src, "the destination must search its own content"
 
 
 def test_library_definitions_counts_are_singular_for_one(seeded_app):
-    """ "1 metric", not "1 metrics" — the count is read as a sentence."""
+    """ "1 metric", not "1 metrics" — the counts ARE the sentence now.
+
+    They stopped being two link labels and became prose inside the strip's
+    description, so they have to read as prose: asserted on the counts span
+    itself rather than by scanning the whole page for a substring.
+    """
     _seed_definitions(metrics=1, terms=1)
     c = seeded_app["client"]
     r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
-    assert "1 metric " in r.text or "1 metric&" in r.text or "1 metric<" in r.text
-    assert "1 metrics" not in r.text
-    assert "1 glossary terms" not in r.text
+    counts = r.text.split('class="lib-defs__counts"', 1)[1].split("</span>", 1)[0]
+    assert "1 metric," in counts
+    # No full stop: the counts are a line of page metadata now, not prose.
+    assert "1 glossary term" in counts
+    assert "1 metrics" not in counts
+    assert "1 glossary terms" not in counts
 
 
 def test_library_hides_definitions_when_semantic_layer_is_empty(seeded_app):
@@ -207,8 +273,11 @@ def test_library_definitions_are_labeled_in_plain_words(seeded_app):
     c = seeded_app["client"]
     r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
-    block = r.text.split('id="lib-defs"', 1)[1].split("</aside>", 1)[0]
+    block = r.text.split('id="lib-defs"', 1)[1].split("</div>", 1)[0]
     assert "Definitions" in block
+    # "Semantic layer" is allowed on the CTA (it names the destination page),
+    # but never as the block's own label — that name belongs to
+    # /admin/semantic-layer, where the reader operates the sync.
     assert "Semantic layer" not in block
 
 
@@ -221,12 +290,12 @@ def test_library_definitions_are_not_at_the_tail_of_an_unbounded_list(seeded_app
     visit, so the surface positioned as the curated single source of truth was
     the one thing nobody could find.
 
-    The fix is the Semantic models section's FIXED slot in `_SECTION_ORDER`
-    (directly under Data packages), not a strip pinned above the tabs — so what
-    is asserted is the property both approaches were after: the definitions
-    precede the unbounded artefact sections rather than trailing them. Position
-    is asserted rather than mere presence, because presence is exactly what the
-    old bug had.
+    Two fixes since, and this asserts the property both were after rather
+    than either mechanism: first a Semantic models section at a fixed slot in
+    `_SECTION_ORDER`, now a strip above the toolbar with the whole layer off
+    the table. Either way the definitions precede the unbounded artefact
+    sections rather than trailing them. Position is asserted rather than mere
+    presence, because presence is exactly what the old bug had.
     """
     _seed_definitions()
     for i in range(6):
@@ -246,9 +315,12 @@ def test_library_definitions_are_not_at_the_tail_of_an_unbounded_list(seeded_app
                 f"Definitions must precede the unbounded {later} section, "
                 "or it is a footer again under a different name"
             )
-    # Still not inventory, and still not a notice — its own shape on the band.
-    assert 'data-lib-sec="definitions"' not in body
-    assert 'data-kind="definitions"' not in body
+    # Above every BAND, including the first one — which is the property that
+    # matters and the one the footer version failed. It now follows the count
+    # and the controls rather than preceding them: it opens the list instead of
+    # standing over the page, because it is one of the things the reader came
+    # for, not a sign about them.
+    assert defs_at < body.index('<div class="lib-list">')
 
 
 def test_library_filter_is_disabled_when_there_is_nothing_to_filter(seeded_app):
@@ -963,33 +1035,78 @@ def test_data_app_detail_shows_no_error_row_when_healthy(seeded_app, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Type map at the head of the Knowledge tab (TCRD-250). The macro and its CSS
-# ship in the facts branch; this is the wiring — the page must render it when
-# the graph has something, stay exactly as it was when it doesn't, and never
-# 500 because a decoration is unavailable.
+# The type map is NOT on this page. It counts what extraction pulled OUT of
+# documents — a setup question, asked by whoever configured the crawl — and it
+# now lives on /admin/ontology, beside the controls that fix a bad number. Its
+# new contract needs a graph, so it needs Postgres: tests/db_pg/test_facts_ui.py.
 # ---------------------------------------------------------------------------
 
 
-def test_the_library_carries_no_type_map_at_all(seeded_app):
-    """It headed the Knowledge tab and now heads /admin/ontology.
-
-    A reader here wants their own documents; node-type counts describe what was
-    pulled *out* of documents, which is a question about the extraction pass —
-    so it belongs on the page of the person who configured that pass. What the
-    Library keeps is the part a reader can act on: the same vocabulary, as the
-    Client / Industry / Offering / Document type facets.
-
-    Asserted against a live page AND the template, because the two failure
-    modes differ: a stale context key renders nothing and looks fine, while
-    leftover markup renders an empty block above the list.
-    """
+def test_library_renders_without_a_type_map_when_the_graph_is_empty(seeded_app):
+    """The facts feature is off by default, so this is the ordinary case: the
+    Library must look exactly as it did before this wiring existed."""
     r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200, r.text
     assert 'id="lib-typemap"' not in r.text
-    src = Path("app/web/templates/library.html").read_text(encoding="utf-8")
-    assert "lib-typemap" not in src
-    assert "syncTypeMap" not in src
-    assert "type_map.css" not in src, "the stylesheet goes with the block it styled"
+
+
+def test_the_definitions_strip_is_not_tab_driven(seeded_app):
+    """It stands above the split, at the rank of the page's own lede, so it is
+    visible in BOTH buckets — a page-level sign, never a member of one half.
+
+    It used to be Knowledge-only, on the reasoning that definitions describe
+    data and the other half holds skills, plugins and agents. What retired
+    that is the toolbar moving above the tabs: with one search over the whole
+    Library and the tabs reading its results, there is no half left for a
+    page-level sign to live inside.
+    """
+    _seed_definitions()
+    src = (Path("app/web/templates/library.html")).read_text(encoding="utf-8")
+    assert "lib-defs-wrap" not in src, "the tab-gated wrapper is gone — the strip is page-level now"
+
+    c = seeded_app["client"]
+    for tab in ("knowledge", "capabilities"):
+        r = c.get(f"/library?tab={tab}", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'id="lib-defs"' in r.text, f"the strip must render on {tab} too"
+
+
+def test_the_tabs_sit_under_the_toolbar_as_result_buckets():
+    """The tabs are not a scope picked before searching — they are where one
+    search's results fell.
+
+    They headed the page for a long time, above the toolbar, on the ordinary
+    rule that the wider scope contains the narrower. The ENGINE never worked
+    that way: `refreshTabCounts` calls `libRowsMatching(null, true)` — the
+    `ignoreTab` path — so search and every facet have always been applied
+    across both halves, and each badge has always been that half's share of
+    one global result set. Above the search box the tabs described a set the
+    reader had not narrowed yet; under it they read correctly, and a match in
+    the half you are not looking at is a number instead of being invisible.
+
+    No engine change came with the move, which is exactly why this needs a
+    guard: putting the tabs back above the toolbar would silently restore a
+    layout the code contradicts.
+    """
+    src = (Path("app/web/templates/library.html")).read_text(encoding="utf-8")
+    # Order in the source is the order on the page: the Definitions card closes
+    # the page head, then toolbar, tabs, count, list. It sits ABOVE the controls
+    # because a semantic model is not optional — `src/claude_md.py` writes every
+    # readable model into the workspace document at session start, and there is
+    # no `semantic_model` type in the Stack, so no row-level "Add to my agents"
+    # exists for one. Every row in the list below has an opt-in state, which is
+    # the defining property of that region; an always-on block among them reads
+    # as a member of a set it is not in.
+    defs_at = src.index("{{ definitions_strip(library_definitions) }}")
+    bar_at = src.index('<div class="fbar fbar--ranked"')
+    tabs_at = src.index('<div class="tab-strip lib-tabs" id="lib-tabs"')
+    count_at = src.index('id="lib-item-count"')
+    assert defs_at < bar_at < tabs_at < count_at
+    # The tabs left the page head with the move; a rule still scoping them
+    # there is dead and would drop their spacing without failing anything.
+    assert ".lib-head .lib-tabs" not in src
+    # The cross-tab count path is what makes the order correct — keep it.
+    assert "libRowsMatching(null, true)" in src
 
 
 def test_the_type_map_helper_fails_soft_on_every_axis():
@@ -1115,247 +1232,108 @@ def test_reason_clause_never_takes_the_row_down(seeded_app, monkeypatch):
     assert "You have it because" not in row
 
 
-# ── The empty state has to say WHICH emptiness it means ──────────────────────
-#
-# /library is grant-scoped and deliberately not admin god-mode (see
-# `library_page`'s docstring), so a fully stocked workspace still renders an
-# empty Library for anyone no admin has granted anything to. The one copy the
-# page used to have — "Your library is empty … upload a file" — framed the
-# surface as purely self-authored, so that reader concluded the product was
-# broken rather than that they were ungranted. Same class of claim as the
-# `library_load_errors` band one branch away: "empty" is a statement about the
-# world, and the page can only honestly make it when it knows the world is.
+def test_the_definitions_glyph_is_in_both_sources():
+    """`kind_glyph` in macros/_catalog_card.html is the ORIGINAL and
+    static/js/kind_glyph.js is its transcription — the macro's own note says
+    adding a kind means adding it to both and nowhere else. The JS copy had
+    already fallen six kinds behind once, which is the failure that file
+    exists to prevent, so a new kind is pinned in both."""
+    from pathlib import Path
 
-#: Verbatim, so a copy edit that reintroduces the conflation fails here.
-SELF_AUTHORED_EMPTY_TITLE = "Your library is empty"
-UNGRANTED_EMPTY_TITLE = "Nothing has been shared with you yet"
-#: The primary upload CTA specifically — the words "Upload a file" also appear
-#: in the always-present "+ Add" menu, which is not what these assert about.
-PRIMARY_UPLOAD_CTA = '<button type="button" class="cc-btn cc-btn--primary" data-new-upload>Upload a file</button>'
+    path = "M12 7.2C10.4 5.7 7.9 5.1 4 5.6v12.6c3.9-.5 6.4.1 8 1.6 1.6-1.5 4.1-2.1 8-1.6V5.6c-3.9-.5-6.4.1-8 1.6Z"
+    macro = Path("app/web/templates/macros/_catalog_card.html").read_text(encoding="utf-8")
+    js = Path("app/web/static/js/kind_glyph.js").read_text(encoding="utf-8")
+    assert "kind == 'definitions'" in macro
+    assert "definitions:" in js
+    assert path in macro and path in js, "the same drawing, not two drawings of the same idea"
 
 
-def _seed_ungranted_package(conn, *, slug: str, name: str) -> str:
-    """A data package that exists instance-wide and is granted to nobody."""
-    from src.repositories.data_packages import DataPackagesRepository
+def test_the_agent_template_band_link_survives_the_definitions_move():
+    """#2015's "Start from a template" link is band-level, and this branch
+    rewrote the band it sits in.
 
-    return DataPackagesRepository(conn).create(
-        name=name, slug=slug, description="d", icon=None, color=None, created_by="test"
-    )
+    The regression it guards against is silent: the router keeps passing
+    `band_link`, so nothing errors — the macro that renders it was simply
+    dropped along with the Definitions band it used to share classes with, and
+    the link disappears. Main has no test for that link at all, which is why it
+    could go unnoticed; a parallel session caught it, not me.
 
-
-def _empty_state(body: str) -> str:
-    """The ONE `.lib-empty` block a rowless Library renders.
-
-    Its no-results twin (`id="lib-noresults"`) lives inside the has-rows
-    branch, so it is absent here — but the rail around the page is not, and an
-    admin's rail is full of `/admin/*` links. Scoping keeps "this state offers
-    no admin action" an assertion about the state rather than about the chrome.
+    Asserted as the CHAIN rather than through a rendered page: the rows come
+    from `user_store_installs_repo`, so a live render needs a store install
+    seeded, and each link below is a place the chain has actually broken —
+    populated, called, rendered, styled.
     """
-    start = body.index('<div class="lib-empty">')
-    return body[start : body.index("</section>", start)]
+    from pathlib import Path
+
+    router = Path("app/web/router.py").read_text(encoding="utf-8")
+    src = Path("app/web/templates/library.html").read_text(encoding="utf-8")
+
+    # 1. the router still populates it for the agent section
+    assert '"band_link": (' in router
+    assert '{"href": "/agents?from_template=1", "label": "Start from a template"}' in router
+
+    # 2. the macro exists, and renders the link as a real anchor
+    macro = src.split("{% macro band_link(link) %}", 1)[1].split("{% endmacro %}", 1)[0]
+    assert 'href="{{ link.href }}"' in macro
+    assert "{{ link.label }}" in macro
+
+    # 3. …and is CALLED. This is the link that was missing.
+    assert "{{ band_link(sec.band_link) }}" in src
+
+    # 4. …and is styled. Its own class names now: on main the macro borrowed
+    #    `.lib-defs__link(s)` from the Definitions band, which this branch turns
+    #    into a page-level row, so those names would describe a block nowhere
+    #    near a section band.
+    assert ".lib-band__link {" in src
+    assert "lib-defs__link" not in src, "the retired Definitions-band classes are gone"
 
 
-def test_genuinely_empty_instance_keeps_the_self_authored_copy(seeded_app):
-    """Nothing to be granted anywhere → the old copy is the true one. "Upload a
-    file" really is the next move on an instance with no content in it yet."""
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert SELF_AUTHORED_EMPTY_TITLE in body
-    assert PRIMARY_UPLOAD_CTA in body
-    assert UNGRANTED_EMPTY_TITLE not in body
+def test_definitions_link_avoids_a_tab_with_nothing_in_it(seeded_app):
+    """Metrics is the default landing, not the unconditional one.
 
-
-def test_the_empty_starter_memory_domains_are_not_grantable_content(seeded_app):
-    """The subtle half of "genuinely empty". Every instance ships six empty
-    starter memory domains, so a domain EXISTING says nothing — and an empty
-    domain is hidden from the Memory band even when granted, so counting them
-    would make the genuinely-empty state unreachable. Memory only counts once
-    a domain holds knowledge."""
-    from src.repositories import memory_domains_repo
-
-    assert memory_domains_repo().list(limit=100), "fixture assumption: starter domains are seeded"
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert SELF_AUTHORED_EMPTY_TITLE in body
-    assert UNGRANTED_EMPTY_TITLE not in body
-
-
-def test_ungranted_memory_with_content_is_grantable_content(seeded_app):
-    """Data packages are not the only kind the copy names — knowledge nobody
-    has been granted reaches the same state."""
-    from src.db import get_system_db
-    from src.repositories.knowledge import KnowledgeRepository
-    from src.repositories.memory_domains import MemoryDomainsRepository
-
-    conn = get_system_db()
-    domain_id = MemoryDomainsRepository(conn).create(
-        slug="unshared-memory", name="Unshared Memory", description="d", icon=None, color=None, created_by="test"
-    )
-    KnowledgeRepository(conn).create(
-        id="unshared_item",
-        title="Runbook",
-        content="# Runbook",
-        category="workflow",
-        status="approved",
-        source_user="contrib@example.com",
-    )
-    MemoryDomainsRepository(conn).add_item(domain_id, "unshared_item", added_by="test")
-    conn.close()
-
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert UNGRANTED_EMPTY_TITLE in body
-    assert SELF_AUTHORED_EMPTY_TITLE not in body
-
-
-def test_ungranted_content_is_not_reported_as_an_empty_library(seeded_app):
-    """The bug: a package exists instance-wide, is granted to nobody, and the
-    page told the reader their library was empty and to upload a file."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _seed_ungranted_package(conn, slug="unshared-pkg", name="Unshared Package")
-    conn.close()
-
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert UNGRANTED_EMPTY_TITLE in body
-    assert SELF_AUTHORED_EMPTY_TITLE not in body
-    # The wrong next move, so never the primary action here.
-    assert PRIMARY_UPLOAD_CTA not in body
-    # Aggregate only: the state discloses THAT the workspace holds grantable
-    # content, never which content — naming a resource to someone with no
-    # grant is the disclosure the empty/blocked vocabulary spec rules out.
-    assert "Unshared Package" not in body
-
-
-def test_ungranted_state_names_the_grant_mechanism(seeded_app):
-    """Why the list is empty, in the vocabulary the reader can act on."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _seed_ungranted_package(conn, slug="mech-pkg", name="Mechanism Package")
-    conn.close()
-
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert "data packages, memory and plugins" in body
-    assert "an admin shares one with a group you are in" in body
-
-
-def test_ungranted_state_sends_a_non_admin_to_an_admin(seeded_app):
-    """A reader who cannot grant is told who can — and is offered none of the
-    admin actions, which would 403 on arrival."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _seed_ungranted_package(conn, slug="ask-pkg", name="Ask Package")
-    conn.close()
-
-    state = _empty_state(seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text)
-    assert "Ask an admin to grant your group what you need." in state
-    assert "/admin/access" not in state
-
-
-def test_ungranted_state_gives_an_admin_the_grant_and_preview_actions(seeded_app):
-    """An admin reading "ask an admin" is the same lie in a different hat: they
-    ARE the admin, so the state carries the two things they need — the page
-    that writes the grant, and the lens that proves it landed."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _seed_ungranted_package(conn, slug="admin-pkg", name="Admin Package")
-    conn.close()
-
-    state = _empty_state(seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text)
-    assert UNGRANTED_EMPTY_TITLE in state
-    assert '<a class="cc-btn cc-btn--primary" href="/admin/access">Grant access</a>' in state
-    assert '<a class="cc-btn" href="/admin/access?lens=simulate">Simulate a person</a>' in state
-    assert "Ask an admin to grant your group what you need." not in state
-
-
-def test_a_granted_caller_sees_rows_and_no_empty_state_at_all(seeded_app):
-    """The third state, and the control for the other two: once the grant
-    exists neither empty copy may appear."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _grant_package_to_named_group(
-        conn, slug="shared-pkg", name="Shared Package", user_id="analyst1", group_name="Analysts"
-    )
-    conn.close()
-
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert "Shared Package" in body
-    assert SELF_AUTHORED_EMPTY_TITLE not in body
-    assert UNGRANTED_EMPTY_TITLE not in body
-
-
-def test_a_failed_read_still_wins_over_the_ungranted_copy(seeded_app, monkeypatch):
-    """Precedence: with a content read down we do not know whether anything is
-    granted, so the honest "couldn't be loaded" branch keeps the page — the
-    ungranted copy would be a second confident claim about an unread world."""
-    from src.db import get_system_db
-
-    conn = get_system_db()
-    _seed_ungranted_package(conn, slug="down-pkg", name="Down Package")
-    conn.close()
-
-    from app.services.stack_resolver import StackResolver
-
-    def _explode(self, user_id, resource_type):
-        raise RuntimeError("grants repo down")
-
-    monkeypatch.setattr(StackResolver, "browse", _explode)
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert "Your library couldn’t be loaded" in body
-    assert UNGRANTED_EMPTY_TITLE not in body
-
-
-def test_a_granted_plugin_row_says_which_group_grants_it(seeded_app):
-    """The "because you are in X" clause must reach plugin rows too.
-
-    `_because_of` fed the ROW's type key straight into `ResourceType()`. Rows
-    say `plugin` (it drives `data-kind` and the toolbar facet); grants are
-    stored as `marketplace_plugin`. So every plugin row raised
-    `'plugin' is not a valid ResourceType`, `_granted_via` swallowed it, and
-    the clause silently vanished — on every render, for every plugin, while
-    data-package rows next to it explained themselves fine.
-
-    Invisible from the inside: the page still rendered, the row still
-    appeared, and nothing failed. It was found by reading the log of a real
-    render, which is why the assertion here is on the clause a person reads
-    rather than on the absence of a warning.
+    An instance whose semantic layer holds glossary terms and no metrics was
+    told "0 metrics, 3 glossary terms" and then sent to the metrics tab — the
+    one empty list on the page (Devin Review on #2069). The link follows the
+    counts it just stated.
     """
-    from src.db import get_system_db
-    from src.repositories.resource_grants import ResourceGrantsRepository
-    from src.repositories.user_group_members import UserGroupMembersRepository
-    from src.repositories.user_groups import UserGroupsRepository
+    _seed_definitions(metrics=0, terms=3)
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    assert 'href="/semantic-layer?tab=all_metrics"' not in r.text
 
-    conn = get_system_db()
-    conn.execute(
-        "INSERT INTO marketplace_registry (id, name, url) VALUES (?, 'Why Co', 'https://example.com/w.git')",
-        ["why-mkt"],
-    )
-    conn.execute(
-        "INSERT INTO marketplace_plugins (marketplace_id, name, description, is_system) "
-        "VALUES (?, ?, 'Explains itself', FALSE)",
-        ["why-mkt", "why-plugin"],
-    )
-    groups = UserGroupsRepository(conn)
-    grp = groups.get_by_name("why-group") or groups.create(name="why-group", description="t", created_by="t")
-    UserGroupMembersRepository(conn).add_member("analyst1", grp["id"], source="admin", added_by="t")
-    ResourceGrantsRepository(conn).create(
-        group_id=grp["id"],
-        resource_type="marketplace_plugin",
-        resource_id="why-mkt/why-plugin",
-        assigned_by="admin",
-        # REQUIRED, not available: `_because_of` is only composed for a row
-        # that is IN the stack (the locked state whose tooltip answers "can I
-        # remove this"). An available-tier grant nobody subscribed to renders
-        # the Add affordance instead and carries no such clause for ANY kind,
-        # which is a separate design choice, not this bug.
-        requirement="required",
-    )
-    conn.close()
 
-    body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-    assert "why-plugin" in body, "the granted plugin should be listed at all"
-    assert "because you are in why-group" in body, (
-        "a plugin row must name the group that grants it, exactly as a data-package row does"
+def test_one_unreadable_count_does_not_erase_the_definitions_row(seeded_app, monkeypatch):
+    """The three counts had ONE exception boundary between them, so a single
+    failing read removed the whole row and told a reader with a populated
+    semantic layer that they had none (Devin Review on #2069). Each read now
+    stands alone: the failed one degrades, the others still state their
+    number."""
+    _seed_definitions(metrics=2, terms=3)
+
+    import app.web.router as router
+
+    def _boom(*a, **k):
+        raise RuntimeError("metric table unavailable")
+
+    monkeypatch.setattr(router, "metric_repo", _boom)
+
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert "glossary term" in r.text, (
+        "a failed metric read must not take the glossary count down with it"
     )
+    assert "3 glossary term" in r.text
+
+
+def test_a_saturated_glossary_count_is_not_stated_as_an_exact_total():
+    """`_glossary_terms_count` reads at most `_GLOSSARY_COUNT_LIMIT` rows, so
+    at or past that limit the number it returns IS the limit. Rendering it
+    bare states a cap as a total (Devin Review on #2069)."""
+    from app.web.router import _GLOSSARY_COUNT_LIMIT, _glossary_count_label
+
+    assert _glossary_count_label(0) == "0"
+    assert _glossary_count_label(_GLOSSARY_COUNT_LIMIT - 1) == str(_GLOSSARY_COUNT_LIMIT - 1)
+    assert _glossary_count_label(_GLOSSARY_COUNT_LIMIT) == f"{_GLOSSARY_COUNT_LIMIT}+"

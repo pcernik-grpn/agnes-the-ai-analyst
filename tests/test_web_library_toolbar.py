@@ -632,3 +632,105 @@ def test_the_library_does_not_restyle_the_shared_chip():
     in the document)."""
     html = _LIBRARY_HTML.read_text(encoding="utf-8")
     assert ".library-page .fbar-chip" not in html
+
+
+def test_the_applied_chips_sit_between_the_toolbar_and_the_tabs():
+    """The chips state what narrowed the WHOLE Library — both halves — and the
+    tabs then split what survived. Below the tabs they described the wrong
+    scope: a condition on the active bucket rather than on the set the buckets
+    divide. They belong under the control that set them."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    toolbar = html.index('class="fbar fbar--ranked"')
+    chips = html.index('id="lib-chips"')
+    tabs = html.index('id="lib-tabs"')
+    assert toolbar < chips < tabs, "toolbar → chips → tabs"
+    state = html[html.index('class="lib-browse__state"') :]
+    assert 'id="lib-chips"' not in state.split("</div>")[0], (
+        "the chips left the count row; leaving a second copy behind is how two would drift"
+    )
+
+
+def test_the_count_row_carries_the_cross_tab_number():
+    """One line of list metadata: how many matched here, and how many of the
+    same answer fell in the other bucket. Standing on its own below the tabs it
+    read as a notice; beside the count it reads as what it is."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    state = html[html.index('class="lib-browse__state"') :]
+    row = state[: state.index("</div>")]
+    assert 'id="lib-item-count"' in row and 'id="lib-crosstab"' in row
+
+
+def test_more_coming_soon_is_gone():
+    """A permanent 'more is coming' note is furniture: it says nothing about
+    the list a reader is looking at, and it had already been moved three times
+    looking for a home. Removed with its macro and CSS — a macro nobody calls
+    is the fourth home waiting to be found."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert "library_more_coming" not in html
+    assert "lib-count-note" not in html
+    assert "More coming soon" not in html
+
+
+def test_the_tabs_stay_below_the_toolbar():
+    """Not cosmetic: `refreshTabCounts` matches rows with `ignoreTab`, so search
+    and every facet apply across BOTH halves and a tab badge is that half's
+    share of one result set. The tabs are the buckets a search falls into, not
+    a scope chosen before searching — above the toolbar they would describe a
+    set the reader has not narrowed yet."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    toolbar = html.index('class="fbar fbar--ranked"')
+    tabs = html.index('id="lib-tabs"')
+    assert toolbar < tabs, "the toolbar must come first — the tabs read its results"
+
+
+def test_definitions_is_one_row_and_keeps_its_explanation():
+    """It went through a footer aside, a band, a one-line sign, a card with a
+    paragraph — and now one row with the paragraph on an info affordance.
+
+    The sentence is needed exactly once, the first time a reader meets the word
+    "Definitions"; after that it is four lines of chrome between the page's
+    lede and its controls, on a block that never changes. So it moves to a
+    hover, which is the whole point of this guard: the explanation must still
+    be IN the markup and reachable, not deleted. The counts stay visible —
+    they are the only part of the block that is a fact about this instance
+    rather than about the product.
+    """
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    macro = html.split("{% macro definitions_strip(defs) %}")[1].split("{% endmacro %}")[0]
+    assert "lib-defs__title" in macro
+    # Its OWN glyph. It borrowed the data-package cylinder, which on this very
+    # page marks the Data packages listed below — one mark for "a store of rows
+    # you can query" and for "the rule you apply to those rows", side by side.
+    assert "kind_glyph('definitions')" in macro
+    assert "kind_glyph('data')" not in macro
+    assert "lib-defs__counts" in macro and "lib-defs__cta" in macro
+
+    # The sentence survives, on the affordance rather than as a paragraph.
+    assert "lib-defs__desc" not in macro, "the paragraph is gone from the row"
+    assert "lib-defs__info" in macro
+    assert "what counts as revenue" in macro, "the explanation is one hover away, not lost"
+    assert "data-tip=" in macro, (
+        "the page's fast tooltip, never `title` — the OS delay is far too slow "
+        "for the affordance that explains a word"
+    )
+    assert "aria-label=" in macro, "the bubble is not what a screen reader reads"
+
+    rule = html.split("  .lib-defs {")[1].split("}")[0]
+    assert "border:" in rule and "border-radius:" in rule
+    assert "align-items: center;" in rule, "one baseline — a row, not a stack"
+    assert "border-bottom: 1px solid var(--ds-border);" not in rule, (
+        "a divider under a bordered block draws a second line 1px from the first"
+    )
+
+
+def test_a_match_in_the_other_tab_is_never_silent():
+    """The dangerous state is not an empty tab — that already offers a jump. It
+    is a tab with results while the other holds more: search 'margin' in
+    Knowledge, get hits, and never learn a Margin recipe sits in Capabilities.
+    A match you cannot see is worse than no match, because you stop looking."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert 'id="lib-crosstab"' in html
+    fn = html.split("function syncCrossTab()")[1].split("\n  }")[0]
+    assert "otherTabHit()" in fn, "reuse the empty state's own count, never a second one"
+    assert "thisTabEmpty" in fn, "the empty state owns that case — no double messaging"
+    assert "searching || filtered" in fn, "with nothing narrowed this only repeats the tab's own badge"
