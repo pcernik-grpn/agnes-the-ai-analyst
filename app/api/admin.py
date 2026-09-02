@@ -530,13 +530,13 @@ _CRAWLER_CONCURRENCY_MIN = 1
 # by tests rather than imported (no import-time dependency on the worker/
 # connector stacks from this module).
 # `_LANE_CONCURRENCY_MAX` MUST equal `app.worker.runtime._MAX_EXTRACTION_
-# CONCURRENCY` (currently 8) — a live run posted `extraction.concurrency=12`
+# CONCURRENCY` (currently 24) — a live run posted `extraction.concurrency=12`
 # through this endpoint (which accepted it, the cap here was 64), and the
-# worker runtime silently re-clamped it back down to 8 on its own, logging a
-# warning nobody saw until after the fact. Pinned equal by
+# worker runtime silently re-clamped it back down to the then-8 on its own,
+# logging a warning nobody saw until after the fact. Pinned equal by
 # `tests/test_admin_server_config_extraction_section.py::
 # test_caps_match_the_stages_own_clamps` rather than imported here.
-_LANE_CONCURRENCY_MAX = 8
+_LANE_CONCURRENCY_MAX = 24
 _FACTS_CONCURRENCY_MAX = 64
 _CRAWLER_CONCURRENCY_MAX = 64
 # `extraction.crawler.convert_child_memory_limit_mb` — the RLIMIT_AS

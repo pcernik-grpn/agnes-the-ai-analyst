@@ -229,9 +229,9 @@ class TestExtractionConcurrency:
     def test_value_above_max_is_clamped_and_warns(self, monkeypatch, caplog):
         from app.worker.runtime import _extraction_concurrency
 
-        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "20")
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "40")
         with caplog.at_level("WARNING"):
-            assert _extraction_concurrency() == 8
+            assert _extraction_concurrency() == 24
         assert "clamp" in caplog.text.lower()
 
     def test_zero_is_clamped_to_min_and_warns(self, monkeypatch, caplog):

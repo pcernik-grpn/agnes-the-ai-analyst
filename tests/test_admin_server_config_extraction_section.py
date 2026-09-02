@@ -674,7 +674,7 @@ def test_caps_match_the_stages_own_clamps():
     from connectors.sharepoint.facts_extraction import MAX_CONCURRENCY
 
     assert _FACTS_CONCURRENCY_MAX == MAX_CONCURRENCY == 64
-    assert _LANE_CONCURRENCY_MAX == _MAX_EXTRACTION_CONCURRENCY == 8
+    assert _LANE_CONCURRENCY_MAX == _MAX_EXTRACTION_CONCURRENCY == 24
 
 
 def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
@@ -704,7 +704,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     "patch",
     [
         {"concurrency": 0},
-        {"concurrency": 9},
+        {"concurrency": 25},
         {"facts": {"concurrency": 65}},
         {"facts": {"stream_every": -1}},
         {"facts": {"run_timeout_s": 5}},

@@ -197,11 +197,17 @@ _DEFAULT_EXTRACTION_CONCURRENCY = 1
 #: 4g/2cpu envelope which assumes exactly ONE concurrent producer run —
 #: raising this without also raising `AGNES_EXTRACTION_WORKER_MEM_LIMIT`/
 #: `AGNES_EXTRACTION_WORKER_CPUS` on that service risks OOM/CPU starvation
-#: under the resulting concurrent producer load. 8 is a sanity ceiling, not
+#: under the resulting concurrent producer load. 24 is a sanity ceiling, not
 #: a tuned number — an operator sizing for more should raise the compose
-#: limits well before approaching it.
+#: limits well before approaching it. It was 8 until a live whole-site
+#: backfill split one site into 7 parallel crawl connections: 7 crawls held
+#: 7 of the 8 lanes, and every streamed `sharepoint-facts-extraction` pass —
+#: which HOLDS its lane for as long as its Batches-API batches take to
+#: complete — serialized onto the one lane left, so facts fell hours behind
+#: the crawl. A lane count of (crawls + one facts pass per crawl) is the
+#: natural sizing for that shape; 24 leaves room for it on a large box.
 _MIN_EXTRACTION_CONCURRENCY = 1
-_MAX_EXTRACTION_CONCURRENCY = 8
+_MAX_EXTRACTION_CONCURRENCY = 24
 
 #: Every lane this build knows about, in spawn order — the valid-token set
 #: ``selected_lanes()`` checks an ``AGNES_WORKER_LANES`` token against.
