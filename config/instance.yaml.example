@@ -1465,6 +1465,21 @@ extraction:
     # the ceiling a single heavy document can still reach. 0 disables the
     # cap; not enforceable on every platform (notably macOS).
     convert_child_memory_limit_mb: 1536
+    # Ceiling on the CONVERTED MARKDOWN a conversion worker is allowed to
+    # send back to the crawl's main process, in MiB. A THIRD, separate
+    # guard from the two above: recycling and the RLIMIT_AS cap both hold
+    # the WORKER's own memory down, but neither bounds how big the
+    # converted TEXT itself gets before it crosses back into the crawl's
+    # main process -- where anonymize, storage and chunking each hold their
+    # own copy, on top of every OTHER document in flight at the same time.
+    # A spreadsheet's markdown table can stay comfortably under the
+    # worker's own memory ceiling the whole time while still being large
+    # enough, multiplied across `concurrency` documents at once, to exhaust
+    # the crawl's main process instead. Over the cap is counted
+    # `convert_failed` for that one file, exactly like any other
+    # unconvertible document -- never a crash, never collateral damage to a
+    # sibling. 0 disables the cap.
+    max_converted_mb: 200
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.
