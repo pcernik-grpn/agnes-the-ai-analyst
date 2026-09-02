@@ -251,3 +251,59 @@ class TestPeopleSearchIsOneImplementation:
         # thing allowed to.
         assert "USERS_LIST_API}?search=" not in html
 
+
+
+class TestPeopleSearchDistinguishesErrorFromEmpty:
+    """A non-ok response from `GET /api/users` (403/500/501, a network
+    failure) used to collapse into the SAME empty array a genuine
+    zero-match search produces — so a caller could not tell "nobody has
+    that account" from "the search itself is broken right now", and
+    rendered "No account matches that." for both. That is precisely what
+    would hide a real outage behind a wrong "no such person" reading: the
+    error text a reporter would need to diagnose the failure was thrown
+    away by the helper before either caller ever saw it.
+
+    `window.AgnesPeopleSearch.search()` now resolves `{ people, error }` —
+    `error` is null only on a genuine (possibly empty) result. These tests
+    pin that shape, and that BOTH callers render a distinct failure line
+    when `error` is set, keeping the "No account matches" text reserved
+    for `error === null`.
+    """
+
+    TEMPLATES = Path("app/web/templates")
+
+    def test_the_shared_lookup_reports_error_on_non_ok(self):
+        js = (STATIC / "js" / "people_search.js").read_text(encoding="utf-8")
+        # Success resolves error: null; a non-ok response and a network
+        # failure both set a human-readable error string instead of
+        # silently returning the same empty array as a real zero-match.
+        assert "error: null" in js
+        assert "error:" in js and "r.status" in js
+        assert "network error" in js
+
+    def test_group_drawer_renders_the_failure_distinctly_from_no_match(self):
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "result.error" in js
+        assert "gdw-found__error" in js
+        # The no-match copy must still exist, and only outside the error
+        # branch — an error must not fall through to "No account matches".
+        assert "No account matches that." in js
+
+    def test_group_drawer_error_css_uses_design_system_tokens(self):
+        css = (STATIC / "css" / "group_drawer.css").read_text(encoding="utf-8")
+        assert ".gdw-found__error" in css
+        assert "var(--ds-" in css.split(".gdw-found__error", 1)[1].split("}", 1)[0]
+
+    def test_group_detail_search_renders_the_failure_distinctly_from_no_match(self):
+        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
+        assert "const { people, error } = await window.AgnesPeopleSearch.search(" in html
+        assert "ax-res__msg--error" in html
+        # The no-match / invite copy must still exist, and only reached
+        # when the lookup succeeded with zero results.
+        assert "No account for" in html or "No account matches" in html
+
+    def test_admin_access_error_css_uses_design_system_tokens(self):
+        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
+        assert ".ax-res__msg--error" in html
+        after = html.split(".ax-res__msg--error", 1)[1].split("}", 1)[0]
+        assert "var(--ds-" in after

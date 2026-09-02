@@ -20,21 +20,34 @@
 window.AgnesPeopleSearch = {
   USERS_API: '/api/users',
 
-  // Resolves to an array of user objects. Never rejects: a blank query, a
-  // non-ok response and a network failure all resolve to `[]`, because
-  // every caller renders "no match" and "found nothing" identically — one
-  // outcome, not a separate error branch each caller has to remember.
+  // Resolves to `{ people, error }`, never rejects. `error` is null on a
+  // genuine (possibly empty) result — a caller renders "no account
+  // matches" ONLY when `error` is null and `people` is empty. A non-ok
+  // response or a network failure instead sets `error` to a short,
+  // human-readable string and leaves `people` empty, so a 403/500/501 is
+  // never silently indistinguishable from "nobody matched" — the bug that
+  // hid a real outage behind a wrong "no such person" reading.
   search(query, limit) {
     var q = String(query == null ? '' : query).trim();
-    if (!q) return Promise.resolve([]);
+    if (!q) return Promise.resolve({ people: [], error: null });
     var url = window.AgnesPeopleSearch.USERS_API +
       '?search=' + encodeURIComponent(q) + '&limit=' + (limit || 8);
     return fetch(url, { credentials: 'include' })
-      .then(function (r) { return r.ok ? r.json() : []; })
-      .then(function (people) {
-        if (!Array.isArray(people)) people = (people && people.users) || [];
-        return people;
+      .then(function (r) {
+        if (r.ok) {
+          return r.json().then(function (people) {
+            if (!Array.isArray(people)) people = (people && people.users) || [];
+            return { people: people, error: null };
+          });
+        }
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          var detail = body && typeof body.detail === 'string' ? body.detail : r.statusText;
+          var msg = 'HTTP ' + r.status + (detail ? ': ' + detail : '');
+          return { people: [], error: msg };
+        });
       })
-      .catch(function () { return []; });
+      .catch(function () {
+        return { people: [], error: 'network error' };
+      });
   },
 };

@@ -334,8 +334,19 @@
     if (!q) { closeFound(); return; }
     var seq = ++findSeq;
     window.AgnesPeopleSearch.search(q, FIND_LIMIT)
-      .then(function (people) {
+      .then(function (result) {
         if (seq !== findSeq || !st) return;
+        // A failed lookup (403/500/501, network error) is NOT "no account
+        // matches" — collapsing the two used to make an outage read as "that
+        // person doesn't exist". Say which one happened.
+        if (result.error) {
+          els.found.innerHTML = '<p class="gdw-found__none gdw-found__error">' +
+            'Could not search accounts: ' + esc(result.error) + '</p>';
+          els.found.hidden = false;
+          els.find.setAttribute('aria-expanded', 'true');
+          return;
+        }
+        var people = result.people;
         var taken = {};
         (st.picked || []).forEach(function (m) { taken[m.email] = true; });
         var rows = people.filter(function (u) { return !taken[u.email]; }).map(function (u) {
