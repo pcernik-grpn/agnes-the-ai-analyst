@@ -1179,6 +1179,29 @@ class TestRailCollapseCss:
             not in block
         ), "plain :focus pins a chip behind a mouse click"
 
+    def test_the_strips_labels_stay_in_the_accessibility_tree(self) -> None:
+        """A row a screen reader can only call "link" is not navigation.
+
+        The shared collapse rule parks every label at `visibility: hidden`,
+        which removes it from the accessibility tree as well as the screen.
+        That was survivable while the peek existed — reaching the rail restored
+        every label at once. With no peek, the strip would be permanently
+        unnamed, so on this rail the labels are screen-reader-only instead:
+        clipped to 1px, taking no space, still in the tree.
+
+        No `aria-label` anywhere: the row already contains its name, and a copy
+        in an attribute is a second source for one string. The guard checks that
+        too, because adding one is the tempting wrong fix."""
+        block = self._desktop_block()
+        sr = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i-label,', 1
+        )[1].split("{", 1)[1].split("}", 1)[0]
+        assert "visibility: visible" in sr, "a hidden label is not in the accessibility tree"
+        assert "display: none" not in sr, "nor is a display:none one"
+        assert "clip-path: inset(50%)" in sr and "width: 1px" in sr
+        assert 'aria-label="Library"' not in RAIL_HTML
+        assert 'aria-label="New chat"' not in RAIL_HTML
+
     def test_the_chips_host_row_unclips_itself(self) -> None:
         """The collapsed-only Chats stand-in clips itself (`overflow: hidden`, up
         with the fold rules) so its glyph cannot spill mid-fold — and that clip

@@ -2131,6 +2131,42 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         padding-right: 8px;
     }
 
+    /* ── The strip's labels stay READABLE, just not visible ─────────────────
+       The shared collapse rule parks every label at `visibility: hidden`,
+       which takes it out of the accessibility tree as well as off the screen.
+       That was survivable while the peek existed — `:focus-within` put every
+       label back the moment a caller reached the rail, so a screen reader got
+       names as soon as it needed them. This rail has no peek, so without this
+       the strip is a column of links a screen reader can only call "link":
+       verified in the accessibility tree, where New chat, Chats, Library,
+       Agents, Admin and the profile button all came back unnamed.
+
+       So on THIS rail the labels are screen-reader-only rather than hidden:
+       off-screen at 1px, clipped, taking no space in the 40px row — and still
+       in the accessibility tree, so every row is named at rest. No `aria-label`
+       anywhere, deliberately: the row already contains its name, and a copy in
+       an attribute is a second source for one string that drifts the first time
+       a row is renamed.
+
+       It can only be done here BECAUSE there is no peek: `visibility` is
+       load-bearing in the peek's choreography (it is what keeps the boxes in
+       flow so hover changes nothing but the rail's width, and what makes the
+       hidden conversation list refuse clicks). Nothing here animates, so
+       nothing here needs it. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-user-txt {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        opacity: 1;
+        visibility: visible;
+        transition: none;
+    }
+
     /* ── The label chip — what names a row where the column can't open ──────
        On a page carrying the admin secondary nav the hover peek is off
        (`.rail-strip-only`, see the gate in this section's header), so the
@@ -2191,6 +2227,11 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         flex: 0 0 auto;
         width: max-content;
         max-width: 180px;
+        /* Undo the screen-reader-only clip this overrides (see the rule above),
+           or the chip paints at 1px with its text sliced out of the middle. */
+        height: auto;
+        clip-path: none;
+        overflow: visible;
         padding: 5px 9px;
         border-radius: var(--ds-radius-btn, 9px);
         /* Inverted ink — a chip has to read as a layer above the column rather
