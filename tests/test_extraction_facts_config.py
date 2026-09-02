@@ -165,3 +165,53 @@ class TestAudit:
         assert params["retry_mode"] == "always"
         assert params["resolved"] == "always"
         assert params["source"] == "connection"
+
+
+class TestTransportOverride:
+    """`transport` rides the same PATCH but is only touched when PRESENT in
+    the body — so a retry-mode-only call cannot move a connection off the
+    Batches API by accident."""
+
+    def test_setting_batch_is_written_and_resolved_from_the_connection(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-transport-set")
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"transport": "batch"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["transport"] == {"value": "batch", "source": "connection"}
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["extraction"]["facts"]["transport"] == "batch"
+
+    def test_a_retry_mode_only_patch_leaves_the_transport_alone(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-transport-untouched")
+        client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"transport": "batch"}, headers=_auth(token))
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"retry_mode": "off"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["retry_mode"] == {"value": "off", "source": "connection"}
+        assert r.json()["transport"] == {"value": "batch", "source": "connection"}
+
+    def test_an_explicit_null_clears_the_transport_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-transport-clear")
+        client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"transport": "batch"}, headers=_auth(token))
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"transport": None}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["transport"] == {"value": "sync", "source": "instance"}
+
+    def test_an_invalid_transport_is_refused_with_422(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-transport-invalid")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"transport": "carrier-pigeon"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 422

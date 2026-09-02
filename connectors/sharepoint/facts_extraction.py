@@ -492,6 +492,39 @@ def resolve_retry_mode(connection: Optional[Dict[str, Any]] = None) -> Tuple[str
     return _retry_mode(), "instance"
 
 
+_VALID_TRANSPORTS = frozenset({"sync", "batch"})
+
+
+def resolve_transport(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(transport, source)`` for a PASS — a per-connection override first,
+    the instance-level :func:`_transport_mode` otherwise; the exact shape of
+    :func:`resolve_retry_mode`, for the same reason.
+
+    A small, high-value connection (curated folders, retries ON) wants the
+    synchronous transport — its facts land within minutes of the crawl and
+    a corrective retry is immediate — while the long-tail connection over
+    the rest of a large site wants the Batches API: no per-minute token
+    ceiling and half the price, at hours of latency nobody is waiting on.
+    The override lives at ``connection.config.extraction.facts.transport``,
+    a sibling of ``retry_mode`` there, set through the same
+    ``PATCH …/extraction/facts-config`` call.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("transport")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_TRANSPORTS:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.transport=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                sorted(_VALID_TRANSPORTS),
+            )
+    return _transport_mode(), "instance"
+
+
 def _retry_should_fire(
     retry_mode: str,
     *,
@@ -2475,7 +2508,10 @@ def run_facts_extraction(
     # Transport dispatch — the ONE branch point between the two transports.
     # Everything above this line (connection, ontology, prompt, model) is
     # shared; nothing below it runs for a batch-mode pass.
-    mode = transport if transport is not None else _transport_mode()
+    # An explicit `transport` (the test seam) wins; otherwise the
+    # connection's own override, then the instance default — so one site
+    # can run its curated connection sync and its long tail on batches.
+    mode = transport if transport is not None else resolve_transport(connection)[0]
     if mode == "batch":
         # Same precedence as the sync loop below: an explicit `retry_mode`
         # (the test seam) wins, else the connection's override, else the
@@ -3233,8 +3269,6 @@ def maybe_run_after_crawl(
             exc,
         )
         return None
-
-
 
 
 def run_standalone_facts_extraction(

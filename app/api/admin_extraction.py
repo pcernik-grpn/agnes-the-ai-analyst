@@ -727,6 +727,12 @@ class FactsConfigPatch(BaseModel):
     #: same thing (fall back to the instance-level default), which is the
     #: least surprising reading of "unset this".
     retry_mode: Optional[str] = None
+    #: `transport` is different: it is only touched when the field is PRESENT
+    #: in the body (``model_fields_set``) — `"sync"`/`"batch"` sets the
+    #: override, an explicit `null` clears it, and omitting it leaves it
+    #: alone — so a caller setting only `retry_mode` cannot silently move a
+    #: connection off the Batches API.
+    transport: Optional[str] = None
 
 
 @router.patch("/connections/{connection_id}/extraction/facts-config")
@@ -757,12 +763,23 @@ async def patch_extraction_facts_config(
     touches only ``source_connections``, never a PG-only table.
     """
     connection = _sharepoint_connection_or_404(connection_id)
-    from connectors.sharepoint.facts_extraction import _VALID_RETRY_MODES, resolve_retry_mode
+    from connectors.sharepoint.facts_extraction import (
+        _VALID_RETRY_MODES,
+        _VALID_TRANSPORTS,
+        resolve_retry_mode,
+        resolve_transport,
+    )
 
     if body.retry_mode is not None and body.retry_mode not in _VALID_RETRY_MODES:
         raise HTTPException(
             status_code=422,
             detail=f"retry_mode must be one of {sorted(_VALID_RETRY_MODES)} or null (to clear the override)",
+        )
+    transport_given = "transport" in body.model_fields_set
+    if transport_given and body.transport is not None and body.transport not in _VALID_TRANSPORTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"transport must be one of {sorted(_VALID_TRANSPORTS)} or null (to clear the override)",
         )
 
     from src.repositories import source_connections_repo
@@ -774,6 +791,11 @@ async def patch_extraction_facts_config(
         facts_cfg.pop("retry_mode", None)
     else:
         facts_cfg["retry_mode"] = body.retry_mode
+    if transport_given:
+        if body.transport is None:
+            facts_cfg.pop("transport", None)
+        else:
+            facts_cfg["transport"] = body.transport
     if facts_cfg:
         extraction["facts"] = facts_cfg
     else:
@@ -781,6 +803,7 @@ async def patch_extraction_facts_config(
     updated = repo.config_patch(connection_id, {"extraction": extraction})
 
     mode, source = resolve_retry_mode(updated)
+    transport_value, transport_source = resolve_transport(updated)
 
     # More than the fallback middleware can say (it sees only path params
     # and the response status, never the body) — the VALUE an admin set or
@@ -790,10 +813,21 @@ async def patch_extraction_facts_config(
         user_id=_user.get("id"),
         action="extraction.facts_retry_mode_set",
         resource=f"sharepoint_connection:{connection_id}",
-        params={"retry_mode": body.retry_mode, "resolved": mode, "source": source},
+        params={
+            "retry_mode": body.retry_mode,
+            "resolved": mode,
+            "source": source,
+            "transport": body.transport if transport_given else "(untouched)",
+            "transport_resolved": transport_value,
+            "transport_source": transport_source,
+        },
     )
 
-    return {"connection_id": connection_id, "retry_mode": {"value": mode, "source": source}}
+    return {
+        "connection_id": connection_id,
+        "retry_mode": {"value": mode, "source": source},
+        "transport": {"value": transport_value, "source": transport_source},
+    }
 
 
 @router.get("/connections/{connection_id}/extraction/runs")

@@ -393,32 +393,63 @@ def facts_config(
     clear: bool = typer.Option(
         False, "--clear", help="Remove the override — this connection falls back to the instance-level default."
     ),
+    transport: Optional[str] = typer.Option(
+        None,
+        "--transport",
+        help="Per-connection override for which API carries the extraction calls: sync (immediate, bound by the "
+        "account's per-minute token limit) or batch (Anthropic Batches API: no per-minute ceiling, half the price, "
+        "hours of latency). Left untouched when not given.",
+    ),
+    clear_transport: bool = typer.Option(
+        False, "--clear-transport", help="Remove the transport override — falls back to extraction.facts.transport."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
-    """Set (or clear) this connection's own ``extraction.facts.retry_mode``,
-    overriding the instance-level default (cost-levers task, lever A) — a
-    curated, high-stakes connection can keep the corrective retry ON (a
-    dropped quote there is a lost citation) while a long-tail connection
-    runs with it OFF, without an instance.yaml edit that would flip every
-    connection at once.
+    """Set (or clear) this connection's own ``extraction.facts.retry_mode``
+    and/or ``extraction.facts.transport``, overriding the instance-level
+    defaults (cost-levers task, lever A) — a curated, high-stakes
+    connection can keep the corrective retry ON and run sync (a dropped
+    quote there is a lost citation, and its facts should land in minutes)
+    while a long-tail connection runs with retries OFF on the Batches API,
+    without an instance.yaml edit that would flip every connection at once.
 
-    Exactly one of ``--retry-mode`` / ``--clear`` is required. Prints the
-    RESOLVED value and where it came from (``connection`` or ``instance``)
-    — the same shape the admin config drawer would show.
+    ``--retry-mode`` / ``--clear`` are mutually exclusive and one is
+    required unless ``--transport`` / ``--clear-transport`` is given.
+    Prints the RESOLVED values and where they came from (``connection`` or
+    ``instance``) — the same shape the admin config drawer would show.
     """
     if clear and retry_mode is not None:
         typer.echo("Error: pass either --retry-mode or --clear, not both", err=True)
         raise typer.Exit(1)
-    if not clear and retry_mode is None:
-        typer.echo("Error: one of --retry-mode or --clear is required", err=True)
+    if clear_transport and transport is not None:
+        typer.echo("Error: pass either --transport or --clear-transport, not both", err=True)
+        raise typer.Exit(1)
+    touching_transport = clear_transport or transport is not None
+    if not clear and retry_mode is None and not touching_transport:
+        typer.echo("Error: one of --retry-mode or --clear is required (or --transport / --clear-transport)", err=True)
         raise typer.Exit(1)
     if retry_mode is not None and retry_mode not in _RETRY_MODES:
         typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
         raise typer.Exit(1)
+    if transport is not None and transport not in ("sync", "batch"):
+        typer.echo("Error: --transport must be sync or batch", err=True)
+        raise typer.Exit(1)
+
+    # The retry policy keeps its original contract (omitted == cleared), so a
+    # transport-only call re-sends the connection's current retry override
+    # rather than wiping it.
+    payload: dict = {"retry_mode": retry_mode}
+    if not clear and retry_mode is None and touching_transport:
+        current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
+        if current.status_code == 200:
+            facts_now = (((current.json().get("config") or {}).get("extraction") or {}).get("facts")) or {}
+            payload["retry_mode"] = facts_now.get("retry_mode")
+    if touching_transport:
+        payload["transport"] = None if clear_transport else transport
 
     resp = api_patch(
         f"/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
-        json={"retry_mode": retry_mode},
+        json=payload,
     )
     if resp.status_code != 200:
         _fail(resp)
@@ -428,3 +459,6 @@ def facts_config(
         return
     resolved = body.get("retry_mode") or {}
     typer.echo(f"retry_mode: {resolved.get('value')} (source: {resolved.get('source')})")
+    resolved_t = body.get("transport") or {}
+    if resolved_t:
+        typer.echo(f"transport: {resolved_t.get('value')} (source: {resolved_t.get('source')})")

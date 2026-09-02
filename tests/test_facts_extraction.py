@@ -1834,3 +1834,34 @@ def test_a_document_ended_by_an_unavailable_model_still_counts_as_drained():
         "facts_failed is a reported metric about the DOCUMENT — an unavailable model must not inflate it"
     )
     assert "docs_extracted + report.facts_failed + docs_unavailable" in src, "the progress count must include it"
+
+
+# ---------------------------------------------------------------------------
+# Per-connection transport override (`config.extraction.facts.transport`) —
+# the same shape as the retry-mode override, so one site can run its curated
+# connection sync and its long tail on the Batches API.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_transport_with_no_connection_falls_back_to_instance(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_transport
+
+    _config(monkeypatch, {("extraction", "facts", "transport"): "batch"})
+    assert resolve_transport(None) == ("batch", "instance")
+    assert resolve_transport({"id": "c1", "config": {}}) == ("batch", "instance")
+
+
+def test_a_connection_transport_override_beats_the_instance_setting(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_transport
+
+    _config(monkeypatch, {("extraction", "facts", "transport"): "batch"})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"transport": "sync"}}}}
+    assert resolve_transport(conn) == ("sync", "connection")
+
+
+def test_an_invalid_connection_transport_falls_back_to_instance(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_transport
+
+    _config(monkeypatch, {})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"transport": "carrier-pigeon"}}}}
+    assert resolve_transport(conn) == ("sync", "instance")
