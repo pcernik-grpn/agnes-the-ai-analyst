@@ -14,7 +14,11 @@ already owns "the migration and the model agree".
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 
 def _make_repo(pg_engine, monkeypatch):
@@ -167,3 +171,102 @@ def test_saved_at_round_trips_as_an_isoformat_string(pg_engine, monkeypatch):
     parsed = datetime.fromisoformat(saved_at)
     assert parsed.tzinfo is not None
     assert abs(parsed - datetime.now(timezone.utc)) < timedelta(minutes=5)
+
+
+# ---------------------------------------------------------------------------
+# ``policy_write_lock`` — per-table serialization of "save the policy, then
+# append its revision" (#1979, review follow-up).
+#
+# The bug it closes: two concurrent PUTs on one table could commit policy A,
+# then policy B, then record B's revision, then record A's — leaving a
+# history whose newest row is A while the stored policy is B.
+# ---------------------------------------------------------------------------
+
+
+def _acquire_in_thread(repo, table_id: str, *, timeout: float = 5.0) -> bool:
+    """True when the lock for ``table_id`` could be taken within ``timeout``.
+
+    A hung acquisition must fail the test, not hang the suite — so the
+    attempt runs in a thread we can walk away from.
+    """
+    took = threading.Event()
+
+    def _try() -> None:
+        with repo.policy_write_lock(table_id):
+            took.set()
+
+    thread = threading.Thread(target=_try, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    return took.is_set()
+
+
+def test_policy_write_lock_serializes_two_writers_on_the_same_table(pg_engine, monkeypatch):
+    """Two concurrent savers of ONE table's policy never interleave: the
+    second waits for the first to commit, so "policy written" and "revision
+    appended" stay in the same order for both."""
+    repo = _make_repo(pg_engine, monkeypatch)
+
+    events: list[str] = []
+    events_lock = threading.Lock()
+    ready = threading.Barrier(2, timeout=15)
+    failures: list[BaseException] = []
+
+    def _worker(name: str) -> None:
+        try:
+            ready.wait()
+            with repo.policy_write_lock("orders"):
+                with events_lock:
+                    events.append(f"enter:{name}")
+                time.sleep(0.2)
+                with events_lock:
+                    events.append(f"exit:{name}")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(n,), daemon=True) for n in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+
+    assert not failures, failures
+    assert not any(t.is_alive() for t in threads), "a writer never got the lock"
+    # Intervals must not overlap — whoever entered first also exited first.
+    assert [e.split(":")[0] for e in events] == ["enter", "exit", "enter", "exit"], events
+
+
+def test_policy_write_lock_does_not_block_a_different_table(pg_engine, monkeypatch):
+    """Serialization is PER TABLE: policy saves on unrelated tables are
+    independent and must not queue behind each other."""
+    repo = _make_repo(pg_engine, monkeypatch)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        with repo.policy_write_lock("orders"):
+            holding.set()
+            release.wait(15)
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    assert holding.wait(15), "the holder never acquired the lock"
+    try:
+        assert _acquire_in_thread(repo, "invoices"), "an unrelated table blocked on another table's lock"
+    finally:
+        release.set()
+        holder.join(15)
+
+
+def test_policy_write_lock_is_released_when_the_body_raises(pg_engine, monkeypatch):
+    """The lock is transaction-scoped: a failure inside the ``with`` block
+    rolls the holding transaction back and releases it. A save that blew up
+    must never wedge every later save of that table."""
+    repo = _make_repo(pg_engine, monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        with repo.policy_write_lock("orders"):
+            raise RuntimeError("boom")
+
+    assert _acquire_in_thread(repo, "orders"), "the lock survived a failed body"

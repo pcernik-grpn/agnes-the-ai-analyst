@@ -5,6 +5,7 @@ which checks Admin user_group membership for both OAuth session and PAT
 callers via the same ``_user_group_ids`` lookup.
 """
 
+import contextlib
 import glob
 import json
 import logging
@@ -6206,6 +6207,45 @@ def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
     return None
 
 
+def _access_policy_write_lock(table_id: str):
+    """Serialize a table's policy write + history append across processes.
+
+    Two concurrent PUTs on one table could otherwise commit policy A, commit
+    policy B, record B's revision, then record A's — leaving a history whose
+    newest revision (A) is not the stored policy (B). The revision store's
+    ``policy_write_lock`` (a transaction-scoped Postgres advisory lock keyed
+    on the table id) makes the whole "set_access_policy / set_policy_mapping
+    then record the revision" sequence mutually exclusive per table.
+
+    **Ordering, not coupling.** The lock does not put the policy write and
+    the history append into one transaction: each keeps its own, exactly as
+    before. So the interaction between best-effort history and atomicity is
+    that there is none — a revision that cannot be written is still just a
+    missing history row (``_record_access_policy_revision`` swallows it), and
+    the policy save it belongs to has already landed. What the lock buys is
+    only that concurrent savers of ONE table cannot interleave those two
+    steps into a contradictory order.
+
+    When there is no revision store — a DuckDB-backed instance, where
+    resolving the PG-only repo raises ``RequiresPostgresBackend`` — this
+    returns ``nullcontext()`` and the save runs exactly as it did before the
+    lock existed. There is no history to misorder there, and the ability to
+    narrow access to a table must not depend on the history feature being
+    available.
+    """
+    try:
+        return access_policy_revisions_repo().policy_write_lock(table_id)
+    except RequiresPostgresBackend:
+        return contextlib.nullcontext()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not take the access-policy write lock for %s: %s -- saving unserialized",
+            table_id,
+            e,
+        )
+        return contextlib.nullcontext()
+
+
 def _record_access_policy_revision(
     table_id: str,
     *,
@@ -6217,10 +6257,16 @@ def _record_access_policy_revision(
 ) -> None:
     """Append the state a table's access policy was just saved in (#1979).
 
-    Called from ``update_table`` right after ``set_access_policy`` persisted
-    that state, i.e. on exactly the writes the history panel is about
-    (attach, edit, clear) — never on a PUT that merely carried the policy
-    fields through untouched.
+    Called from ``update_table`` right after the state was persisted, i.e.
+    on exactly the writes the history panel is about: a write through
+    ``set_access_policy`` (attach, edit, clear), and a write through
+    ``set_policy_mapping`` that actually FLIPPED the "referenceable from
+    other policies" switch — a revision carries ``policy_mapping`` and the
+    panel's diff calls a mapping toggle out by name, so a mapping-only edit
+    that recorded nothing would leave the panel diffing against a state
+    nothing ever recorded. Never called for a PUT that merely carried the
+    policy fields through untouched, mapping included: a no-op resend (the
+    Edit modal round-trips every field) must not manufacture a revision.
 
     **Never load-bearing.** ``access_policy_revisions`` is a post-A3 PG-only
     table, so on a DuckDB-backed instance resolving it raises
@@ -6753,41 +6799,73 @@ async def update_table(
 
         repo.register(id=table_id, **merged)
 
-        # Persist the access-policy fields through their dedicated setters
-        # (Task 2's set_access_policy/set_policy_mapping) — only called when
-        # this PUT actually touched one of them, so an unrelated edit never
-        # re-stamps access_policy_updated_at.
-        if "access_policy_sql" in updates or "access_policy_note" in updates:
-            repo.set_access_policy(
-                table_id,
-                sql=_final_access_policy_sql,
-                note=_final_access_policy_note,
-                updated_by=user.get("email"),
-            )
-        if "policy_mapping" in updates:
-            repo.set_policy_mapping(table_id, bool(updates["policy_mapping"]))
+        _policy_body_written = "access_policy_sql" in updates or "access_policy_note" in updates
+        _final_policy_mapping = bool(
+            updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
+        )
+        # finding 2 (follow-up review of PR #2023) — a mapping-only edit is a
+        # policy edit as far as the history is concerned: a revision stores
+        # ``policy_mapping`` and the panel's diff names a mapping toggle
+        # explicitly. Only an ACTUAL flip counts, though — the Edit modal
+        # round-trips every field, so `"policy_mapping" in updates` alone
+        # would fill the history with rows that changed nothing.
+        _policy_mapping_flipped = "policy_mapping" in updates and _final_policy_mapping != bool(
+            existing.get("policy_mapping")
+        )
 
-        # #1979 — record the state the policy was just saved in, so the
-        # editor's history panel can offer "restore this version". Keyed on
-        # the SAME condition as the setter call above: every write through
-        # ``set_access_policy`` gets exactly one revision, and a PUT that
-        # merely carried the policy fields through untouched gets none.
-        #
-        # Deliberately NOT derived from the audit row this handler writes
-        # below: ``audit_log.params`` redacts ``access_policy_sql`` (content
-        # never enters the trail), so the trail records THAT a policy changed
-        # but never what it was — and restoring needs the body.
-        if "access_policy_sql" in updates or "access_policy_note" in updates:
-            _record_access_policy_revision(
-                table_id,
-                existing=existing,
-                policy_sql=_final_access_policy_sql,
-                policy_note=_final_access_policy_note,
-                policy_mapping=bool(
-                    updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
-                ),
-                saved_by=user.get("email"),
-            )
+        # finding 1 (follow-up review of PR #2023) — hold a per-table lock
+        # across BOTH the policy write and its history append. Without it,
+        # two concurrent PUTs on this table can commit policy A, commit
+        # policy B, record B, then record A: a history whose newest revision
+        # is not the stored policy. The lock ORDERS the two steps; it does
+        # not couple them (they keep their own transactions), so a history
+        # append that fails still leaves the policy saved — see
+        # ``_access_policy_write_lock`` and ``_record_access_policy_revision``.
+        # A DuckDB instance has no revision store, hence nothing to misorder:
+        # there the lock is a nullcontext and this runs exactly as before.
+        # Taken only for a PUT that actually writes a policy field, so an
+        # unrelated edit neither waits on nor blocks a policy save.
+        _policy_lock = (
+            _access_policy_write_lock(table_id)
+            if (_policy_body_written or "policy_mapping" in updates)
+            else contextlib.nullcontext()
+        )
+        with _policy_lock:
+            # Persist the access-policy fields through their dedicated setters
+            # (Task 2's set_access_policy/set_policy_mapping) — only called when
+            # this PUT actually touched one of them, so an unrelated edit never
+            # re-stamps access_policy_updated_at.
+            if _policy_body_written:
+                repo.set_access_policy(
+                    table_id,
+                    sql=_final_access_policy_sql,
+                    note=_final_access_policy_note,
+                    updated_by=user.get("email"),
+                )
+            if "policy_mapping" in updates:
+                repo.set_policy_mapping(table_id, bool(updates["policy_mapping"]))
+
+            # #1979 — record the state the policy was just saved in, so the
+            # editor's history panel can offer "restore this version". Keyed on
+            # the writes that CHANGED something: a write through
+            # ``set_access_policy``, or a ``policy_mapping`` flip. Either gets
+            # exactly one revision, carrying the table's final policy body —
+            # and a PUT that merely carried the policy fields through
+            # untouched gets none.
+            #
+            # Deliberately NOT derived from the audit row this handler writes
+            # below: ``audit_log.params`` redacts ``access_policy_sql`` (content
+            # never enters the trail), so the trail records THAT a policy changed
+            # but never what it was — and restoring needs the body.
+            if _policy_body_written or _policy_mapping_flipped:
+                _record_access_policy_revision(
+                    table_id,
+                    existing=existing,
+                    policy_sql=_final_access_policy_sql,
+                    policy_note=_final_access_policy_note,
+                    policy_mapping=_final_policy_mapping,
+                    saved_by=user.get("email"),
+                )
 
     audit_repo().log(
         user_id=user.get("id"),
