@@ -2208,6 +2208,15 @@
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
   }
+  /* The grant list's own band, on the group list's label style so the two
+     lists speak one dialect. The hint is not uppercase and not bold: the
+     label names the section, the hint says what the section MEANS, and
+     shouting both makes neither readable. */
+  .ax-gsect{ display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .ax-gsect__hint{
+    font-size: 11px; font-weight: 400; letter-spacing: 0;
+    text-transform: none; color: var(--ds-text-secondary);
+  }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
@@ -3630,6 +3639,20 @@
       </div>`;
     };
 
+    /* Which of the two sections a row belongs in.
+       `grant.section` is the server's answer (`src/grant_sources.py::
+       section_for`), keyed on whether the writing surface RE-ASSERTS the
+       row — so a revoke on a `marketplace_sync` row comes back tonight.
+       Inheritance is the one case that field cannot describe: a via-Everyone
+       row is a client-side projection of Everyone's OWN grant, so it has no
+       source of its own, and the axis here is "can the admin act on this
+       row, here", which an inherited row fails — the act belongs on
+       Everyone. Its control already says `via Everyone` and its Manage cell
+       already points there; the section says it once at the top instead of
+       twice on every row. */
+    const sectionOf = (grant) =>
+      grant.inherited ? "set_elsewhere" : (grant.section || "change_here");
+
     const byFamily = new Map();
     for (const t of types) {
       const rows = [];
@@ -3640,7 +3663,7 @@
           if (!grant) continue;             // the holding, not the catalogue
           if (listKind && t.type_key !== listKind) continue;
           if (!hits(t, i)) continue;
-          rows.push(grantedRow(t, i, blockName, grant));
+          rows.push({ html: grantedRow(t, i, blockName, grant), sec: sectionOf(grant) });
         }
       }
       if (!rows.length) continue;
@@ -3663,9 +3686,36 @@
        Family order is kept — the rows still arrive Knowledge, then
        Capabilities, then Surfaces — so nothing about the reading order
        changes; only the furniture between them is gone. */
-    const sections = families
-      .map((f) => (byFamily.get(f.key) || []).join(""))
+    /* Two sections, split on whether the admin can act on the row HERE.
+       Family order is kept inside each, so the reading order within a
+       section is the one the flat list had.
+
+       Labelled only when BOTH sections have rows — the same rule the group
+       list above applies to GROUPS / SYSTEM, for the same reason: a lone
+       heading over every row there is categorises nothing. That holds in
+       both directions here, including the all-`set_elsewhere` group, and it
+       holds because the label is not what explains an unactionable row —
+       each one already carries its own `via Everyone →` or owning-surface
+       link in the Manage column, on the row, where the reader is looking
+       when they wonder why there is no Revoke. The label earns its place
+       only as the DIVIDER between two kinds of row, which is precisely when
+       both exist. */
+    const inSection = (want) => families
+      .map((f) => (byFamily.get(f.key) || [])
+        .filter((r) => r.sec === want).map((r) => r.html).join(""))
       .join("");
+    const changeHere = inSection("change_here");
+    const setElsewhere = inSection("set_elsewhere");
+    const sectionLabel = (t, hint) =>
+      `<div class="ax-glist__label ax-gsect">${esc(t)}${
+        hint ? `<span class="ax-gsect__hint">${esc(hint)}</span>` : ""}</div>`;
+    const sections = (changeHere && setElsewhere)
+      ? sectionLabel("Change here")
+        + changeHere
+        + sectionLabel("Set elsewhere",
+            "A revoke here cannot remove these — Manage points at the surface that owns them.")
+        + setElsewhere
+      : changeHere + setElsewhere;
 
     /* Above the list, not after it. At the foot it cost a scroll through
        everything the group already has to reach the thing that adds one

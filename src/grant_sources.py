@@ -121,7 +121,7 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
         surface="Library",
         href="/library",
         revocable=True,
-        reason="Written when the collection was created. Yours to change.",
+        reason="Written when the collection was created. Change it here.",
     ),
     "mcp_source_default": GrantSource(
         key="mcp_source_default",
@@ -145,7 +145,7 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
         surface="Access",
         href="",
         revocable=True,
-        reason="A one-time default so Everyone can use chat. Yours to change.",
+        reason="A one-time default so Everyone can use chat. Change it here.",
     ),
 }
 

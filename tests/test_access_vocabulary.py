@@ -364,3 +364,60 @@ class TestAnEveryoneAudienceIsNotARoster:
         """The fix must not cost the ordinary case its member count."""
         src = self._source()
         assert '=== 1 ? "person" : "people"' in src
+
+
+class TestTheGrantListSplitsOnWhatCanBeActedOn:
+    """Two sections, named for where the ACTION lives.
+
+    A group's grant list was one flat list mixing rows an admin can revoke
+    with rows a revoke cannot remove — a `marketplace_sync` row that comes
+    back tonight, a via-Everyone row whose tier is set on Everyone. Nothing
+    on the list said which was which except the absence of a Revoke button,
+    which reads as a bug rather than a rule.
+
+    The axis is "can the admin act on this row, here" rather than "who
+    wrote it" (`src/grant_sources.py::section_for`, keyed on `revocable`):
+    nine writers are not the admin but only two produce rows that
+    re-assert, so grouping by authorship would file the Library shares an
+    admin most often comes here to check under "not yours".
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_two_sections_are_named_for_the_action(self):
+        src = self._source()
+        assert 'sectionLabel("Change here")' in src
+        assert 'sectionLabel("Set elsewhere",' in src
+
+    def test_an_inherited_row_is_set_elsewhere(self):
+        """The one case the server's `section` field cannot describe.
+
+        A via-Everyone row is a client-side projection of Everyone's own
+        grant, so it carries no source of its own — and it fails the axis,
+        because the act belongs on Everyone.
+        """
+        src = self._source()
+        assert 'grant.inherited ? "set_elsewhere" : (grant.section || "change_here")' in src
+
+    def test_a_lone_section_is_not_labelled(self):
+        """A heading over every row there is categorises nothing.
+
+        The same rule the group list applies to GROUPS / SYSTEM. It holds in
+        both directions: an unactionable row is explained by its own Manage
+        cell (`via Everyone →`), on the row, not by a band above it.
+        """
+        src = self._source()
+        assert "(changeHere && setElsewhere)" in src
+
+    def test_one_vocabulary_for_the_actionable_side(self):
+        """The section and the row's own reason must not use two phrasings."""
+        from pathlib import Path
+
+        sources = Path("src/grant_sources.py").read_text(encoding="utf-8")
+        assert "Yours to change" not in sources
+        assert "Change it here." in sources
