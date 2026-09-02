@@ -320,6 +320,168 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("```"),
         {"type": "finish"},
     ],
+    # `agnes query` DEFAULTS to `--format table`, a rich box-drawing table, and
+    # `agnes catalog`/`describe` print the same way — so this, not JSON, is the
+    # shape most real tool results arrive in. Kept as a scenario because the
+    # renderer has to recognise it: the alignment IS the content, and run
+    # through markdown it collapses into one mangled paragraph.
+    #
+    # Written with the box characters literally (heavy header, light body —
+    # what rich actually emits) so a maintainer can see the table this is.
+    "console": [
+        _text("Listing what is registered.\n\n"),
+        _tool_call("call_console", "Bash", {"command": "agnes catalog"}),
+        _tool_output(
+            "call_console",
+            "\n".join(
+                [
+                    "┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┓",
+                    "┃ id             ┃ rows      ┃ query_mode ┃",
+                    "┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━┩",
+                ]
+                + [f"│ table_{i:<8} │ {i * 137:<9} │ local      │" for i in range(1, 19)]
+                + ["└────────────────┴───────────┴────────────┘"]
+            ),
+        ),
+        _text("\n\n18 tables are registered."),
+        {"type": "finish"},
+    ],
+    # EVERY renderable shape in one turn, for eyeballing the chat surface as a
+    # whole rather than one piece at a time. Covers: a lone tool step; a run of
+    # consecutive steps folding into a group, with a failure in it; all four
+    # result renderers (console box table, real table from a JSON *string*,
+    # JSON object via an MCP envelope, markdown table); both language arg
+    # panels (a shell command and a SQL statement); an internal URL in an error
+    # that must stay text; the full markdown vocabulary; and the sources /
+    # next_actions trailers with all three chip kinds.
+    #
+    # Deliberately NOT here: `approval` blocks the turn on a human decision and
+    # `deliverable` needs the sandbox file store, so both stay their own
+    # scenarios — folding them in would make this one impossible to just watch.
+    "everything": [
+        _text("Here is **every shape** at once — prose with `inline code`, *emphasis*, "),
+        _text("and a [link](https://example.com).\n\n"),
+        # A LONE step: never wrapped in a group, and its result is the console
+        # box table `agnes catalog` really prints.
+        _tool_call("call_e1", "Bash", {"command": "agnes catalog"}),
+        _tool_output(
+            "call_e1",
+            "\n".join(
+                [
+                    "┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┓",
+                    "┃ id             ┃ rows      ┃ query_mode ┃",
+                    "┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━┩",
+                ]
+                + [f"│ table_{i:<8} │ {i * 137:<9} │ local      │" for i in range(1, 16)]
+                + ["└────────────────┴───────────┴────────────┘"]
+            ),
+        ),
+        _text("\n\nNow a run of steps, which folds into one group:\n\n"),
+        # A RUN of four: consecutive, so they collapse behind one header, with
+        # a failure so the header reports it.
+        _tool_call("call_e2", "fact_search", {"query": "infra cost owners", "k": 10}),
+        _tool_error("call_e2", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_e3", "Read", {"file_path": "/workspace/notes/cost-review.md"}),
+        _tool_output("call_e3", "Reviewed 2026-08-30. Owner: platform team. No open actions."),
+        # A JSON *string* in a tabular shape — what `agnes query --json` over
+        # Bash actually returns, and what has to reach the table renderer.
+        _tool_call("call_e4", "Bash", {"command": 'agnes query --json "SELECT service, cost FROM infra_cost"'}),
+        _tool_output(
+            "call_e4",
+            json.dumps(
+                [
+                    {"service": "EC2", "cost": 441397},
+                    {"service": "SavingsPlans", "cost": 111963},
+                    {"service": "ECR", "cost": 53631},
+                    {"service": "RDS", "cost": 49108},
+                    {"service": "DataTransfer", "cost": 29493},
+                ]
+            ),
+        ),
+        # An internal endpoint inside an error: must render as TEXT, never a
+        # link the reader could follow (#1974).
+        _tool_call("call_e5", "Bash", {"command": 'agnes query "SELECT * FROM nope"'}),
+        _tool_error("call_e5", "Error executing tool query: 400 Bad Request for http://localhost:8000/api/query"),
+        _text("\n\nA SQL argument renders as SQL, not as escaped JSON:\n\n"),
+        _tool_call(
+            "call_e6",
+            "query",
+            {
+                "sql": "SELECT country, COUNT(*) AS sessions\nFROM web_sessions\nWHERE event_date >= CURRENT_DATE - 30\nGROUP BY 1 ORDER BY 2 DESC",
+                "limit": 100,
+            },
+        ),
+        _tool_output("call_e6", _mcp_envelope({"rows_returned": 6, "scanned_bytes": 41203, "cached": True})),
+        _text("\n\nAnd a tool whose output is markdown:\n\n"),
+        _tool_call("call_e7", "Bash", {"command": "agnes catalog --format md"}),
+        _tool_output("call_e7", "| table | rows |\n|---|---|\n| orders | 12043 |\n| users | 881 |"),
+        _text("\n\n# Infrastructure cost review\n\n"),
+        _text("The three findings below account for **82%** of the monthly bill.\n\n"),
+        _text("## 1. Compute dominates\n\n"),
+        _text("EC2 alone is `$441,397`, which is more than every other service combined.\n\n"),
+        _text("## 2. What to check first\n\n"),
+        _text("1. Reserved-instance coverage on the top five instance families\n"),
+        _text("2. Idle volumes older than 90 days\n"),
+        _text("3. Cross-AZ transfer between the two busiest subnets\n"),
+        _text("   - the staging mirror is the usual culprit\n"),
+        _text("   - it was last reviewed in June\n\n"),
+        _text("### The query behind it\n\n"),
+        _text(
+            "```sql\nSELECT service, SUM(cost) AS cost\nFROM infra_cost_aggregated\nWHERE month = DATE_TRUNC('month', CURRENT_DATE)\nGROUP BY 1 ORDER BY 2 DESC;\n```\n\n"
+        ),
+        _text("| Service | Cost | Share |\n|---|---|---|\n"),
+        _text("| EC2 | $441,397 | 63% |\n| SavingsPlans | $111,963 | 16% |\n| ECR | $53,631 | 8% |\n\n"),
+        _text("---\n\n"),
+        _text("> Figures are month-to-date and exclude committed-use discounts.\n\n"),
+        _text("```next_actions\n"),
+        _text("- Break the EC2 line down by instance family\n"),
+        _text("- Chart the last 90 days of DataTransfer\n"),
+        _text("```\n\n"),
+        # Six references on purpose: past _SOURCES_VISIBLE, so the row shows
+        # the cap and its "+N more" rather than wrapping to a second line.
+        _text("```sources\n"),
+        _text("table: infra_cost_aggregated\n"),
+        _text("metric: delivery/utilization\n"),
+        _text("table: aws_cost\n"),
+        _text("table: azure_cost\n"),
+        _text("table: gcp_cost\n"),
+        _text("metric: finops/unit_economics\n"),
+        _text("assumption: month-to-date, discounts excluded\n"),
+        _text("```"),
+        {"type": "finish"},
+    ],
+    # A DOCUMENT-shaped answer — headings, numbered steps, fenced code, a
+    # bullet list, a table, a rule. Nothing to do with tool calls: this is the
+    # message BODY, whose markdown had no styling of its own and fell through
+    # to browser defaults (a 2em h1 with 0.67em margins inside a chat bubble).
+    # Kept as a scenario because rhythm is only judgeable on a real document.
+    "doc": [
+        _text("# Minting a Personal Access Token (PAT)\n\n"),
+        _text("Based on the Agnes documentation:\n\n"),
+        _text("## 1. Open your Agnes instance in a browser\n\n"),
+        _text("```\nhttps://<your-instance>.example.com\n```\n\n"),
+        _text("## 2. Navigate to token management\n\n"),
+        _text(
+            'Log in, then go to **Settings → Personal Access Tokens** (or look for a "PAT" section in your profile).\n\n'
+        ),
+        _text("## 3. Create a new token\n\n"),
+        _text("- Click **Create** (or **New Token**)\n"),
+        _text("- Give it a descriptive name (e.g. `cli-laptop`)\n"),
+        _text("- Copy the token immediately — it is shown only once\n\n"),
+        _text("## 4. Use it with the CLI\n\n"),
+        _text(
+            "```bash\nagnes init --server-url https://<your-instance>.example.com --token <paste-token-here>\n```\n\n"
+        ),
+        _text("### Key things to know\n\n"),
+        _text("| Detail | Note |\n|---|---|\n"),
+        _text("| Scope | PATs are **per-instance** — a token from one deployment won't work on another |\n"),
+        _text("| Expiry | If you get `HTTP 401: unauthorized`, your PAT has expired — mint a new one |\n"),
+        _text("| Security | Treat it like a password — don't commit it to git or share it |\n\n"),
+        _text("---\n\n"),
+        _text('If you don\'t see a "Personal Access Tokens" section, your admin may need to grant you access.\n\n'),
+        _text("> Reach out to your instance administrator.\n"),
+        {"type": "finish"},
+    ],
     "markdown": [
         _text("Here is a table the model wrote itself:\n\n"),
         _tool_call("call_md", "Bash", {"command": "agnes catalog"}),
