@@ -8126,7 +8126,12 @@ function _extFailedOrSkippedItemsHtml(items, truncated, heading) {
 function _extRunRowHtml(connId, st) {
   const status = st.data;
   const run = status.running;
-  const last = status.last_completed;
+  // `last_failed` (a run whose OWNING JOB the worker itself marked
+  // `failed` — 2026-09 incident) wins over `last_completed` when both are
+  // present: the server already gates it to only exist when nothing is
+  // currently running and it postdates `last_completed`, so it is always
+  // the more recent, more relevant event to show here.
+  const last = status.last_failed || status.last_completed;
   let head;
   let sub = "";
 
@@ -8166,6 +8171,11 @@ function _extRunRowHtml(connId, st) {
       // fact, not a warning, distinct from the danger-toned line above.
       sub += `<div class="ext-sub">${_extNum(last.skipped_unsupported)} file${last.skipped_unsupported === 1 ? "" : "s"} skipped — unsupported type, not an error</div>`;
     }
+    // The JOB-level error (2026-09 incident: an attempts-exhausted job's
+    // own error text, e.g. "lease expired after max attempts") — distinct
+    // from `errors` above, which is per-file detail a healthy crawl can
+    // also accumulate. A `done`/`interrupted` run normally carries none.
+    if (last.error) sub += `<div class="ext-sub ext-danger">${_extEsc(last.error)}</div>`;
     if (last.skips_total) {
       sub += `<div class="ext-sub ext-warn">${_extNum(last.skips_total)} document${last.skips_total === 1 ? "" : "s"} not indexed — see the run</div>`;
     }

@@ -412,6 +412,55 @@ def _notify_agent_response_webhooks(job: dict, status: str) -> None:
         logger.warning("worker: agent_response webhook notify failed for job %s (non-fatal)", job["id"], exc_info=True)
 
 
+#: Job kinds that open an ``extraction_runs`` row (``connectors.sharepoint.
+#: crawler._RunRecorder``) — mirrors ``app/worker/kinds.py::
+#: _INJECT_JOB_ID_KINDS``, which is what makes that row's ``job_id``
+#: resolvable back to a claimed job in the first place. Only
+#: ``corpus-extraction`` qualifies today: the standalone
+#: ``sharepoint-facts-extraction`` job never opens a row of its own (it
+#: reads already-indexed documents under a self-releasing advisory lock,
+#: ``connectors.sharepoint.state_store.facts_pass_lock`` — a killed worker
+#: leaves nothing "running" behind for that kind to close), so a lookup for
+#: it would only ever cost a wasted query.
+_EXTRACTION_RUN_OWNING_KINDS = frozenset({"corpus-extraction"})
+
+
+def _finalize_extraction_run_for_job(job_id: str, kind: str, error: str) -> None:
+    """When a job that OWNS an ``extraction_runs`` row (see
+    :data:`_EXTRACTION_RUN_OWNING_KINDS`) reaches a terminal ``failed``
+    state, close that row too — in the SAME code path as the job's own
+    finalize, so the fleet view / source card can never keep showing a
+    run whose owning job died without a trace (2026-09 incident: a
+    reclaim-exhausted ``corpus-extraction`` job flipped to ``failed``
+    while its ``extraction_runs`` row stayed ``running`` forever).
+
+    Best-effort and raise-free, mirroring
+    ``connectors.sharepoint.crawler._RunRecorder``'s own posture for every
+    write to this table: closing out a run's bookkeeping is observability,
+    never load-bearing, and must never turn a job's own (already
+    committed) finalize into a worker crash. This also swallows the typed
+    ``RequiresPostgresBackend`` a DuckDB-backed instance raises resolving
+    ``extraction_runs_repo()`` — that table is post-A3 Postgres-only, and a
+    crawl on the frozen DuckDB app-state backend must keep failing exactly
+    as it always has, with no new exception from this cleanup step.
+    """
+    if kind not in _EXTRACTION_RUN_OWNING_KINDS:
+        return
+    try:
+        from src.repositories import extraction_runs_repo
+
+        closed = extraction_runs_repo().fail_for_job(job_id, error=error)
+    except Exception:
+        logger.debug(
+            "worker: could not close extraction_runs row for exhausted job %s (non-fatal)", job_id, exc_info=True
+        )
+        return
+    if closed:
+        logger.info(
+            "worker: job %s (kind=%s) exhausted — closed extraction_runs row %s as failed", job_id, kind, closed
+        )
+
+
 def _sweep_stale_scratch() -> None:
     """Best-effort orphaned-scratch sweep, run before each HEAVY job.
 
@@ -580,6 +629,11 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 # a *retrying* kind's attempts are actually exhausted — see
                 # `JobsRepository.fail`'s docstring.
                 _notify_agent_response_webhooks(job, "failed")
+                # Same `finalized` gate as the webhook notify above: only a
+                # job that ACTUALLY reached `'failed'` (not a requeue, not a
+                # stale-lease no-op) should close out its own run row — see
+                # `_finalize_extraction_run_for_job`'s docstring.
+                _finalize_extraction_run_for_job(job["id"], job["kind"], str(exc))
         else:
             # Same ordering rationale as the failure branch above.
             # `handler_result` is the handler's return value — `None` for
@@ -708,6 +762,11 @@ async def _reap_loop(poll_interval_s: float) -> None:
     `job.failed` that never comes after a worker crash on a job's last
     attempt. Mirrors ``_notify_agent_response_webhooks``'s no-op-for-other-
     kinds behavior; a non-``agent_response`` reaped job is a silent no-op.
+
+    For the same reason, this is also the ONLY place a reaped job's own
+    ``extraction_runs`` row can be closed — ``reap_exhausted()`` finalizes
+    every returned row unconditionally, so every one of them is a genuine
+    terminal ``'failed'`` (see :func:`_finalize_extraction_run_for_job`).
     """
     while True:
         try:
@@ -716,6 +775,9 @@ async def _reap_loop(poll_interval_s: float) -> None:
                 logger.info("worker: reaped %d stuck job(s) (lease expired at max attempts)", len(reaped))
                 for job in reaped:
                     _notify_agent_response_webhooks(job, "failed")
+                    _finalize_extraction_run_for_job(
+                        job["id"], job["kind"], job.get("error") or "lease expired after max attempts"
+                    )
         except Exception:
             logger.exception("worker: reap_exhausted sweep failed (non-fatal)")
         await asyncio.sleep(poll_interval_s)
@@ -831,6 +893,8 @@ async def _drain_in_flight(
                     # comment / `JobsRepository.fail`'s docstring.
                     if entry.kind_name == "agent_response" and finalized:
                         await _notify_in_flight_agent_response(job_id, "failed")
+                    if finalized:
+                        _finalize_extraction_run_for_job(job_id, entry.kind_name, str(exc))
                 else:
                     handler_result = fut.result()
                     mutated = await to_thread_drain_on_cancel(

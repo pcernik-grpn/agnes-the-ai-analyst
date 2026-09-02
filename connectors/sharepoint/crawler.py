@@ -4535,6 +4535,7 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     ingesting real documents.
     """
     from app.api.admin_sharepoint import _facts_extraction_idempotency_key, _facts_extraction_readiness
+    from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
     try:
@@ -4550,6 +4551,7 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
             _FACTS_EXTRACTION_JOB_KIND,
             {"connection_id": connection_id},
             idempotency_key=_facts_extraction_idempotency_key(connection_id),
+            max_attempts=job_max_attempts(_FACTS_EXTRACTION_JOB_KIND),
         )
     except Exception as exc:  # noqa: BLE001 — a bonus pass must never fail the crawl
         logger.debug(

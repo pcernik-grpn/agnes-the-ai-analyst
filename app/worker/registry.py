@@ -61,6 +61,50 @@ class JobKind:
 #: ``app/main.py`` lifespan ordering).
 JOB_KINDS: dict[str, JobKind] = {}
 
+#: ``JobsRepository``/``JobsPgRepository.enqueue()``'s own default
+#: ``max_attempts`` — named here so a call site never repeats the literal
+#: ``3`` it actually means. See :func:`job_max_attempts`.
+DEFAULT_JOB_MAX_ATTEMPTS = 3
+
+#: Per-kind ``max_attempts`` override for job kinds whose ``claim_next()``
+#: reclaim path (a lease expiring because the worker that held it is gone —
+#: an OOM kill, an image-swap recreate, any other lost worker) must not
+#: compete for the SAME small budget every other kind uses to detect a
+#: genuinely broken handler.
+#:
+#: ``corpus-extraction`` and ``sharepoint-facts-extraction`` are both
+#: registered with ``retry_in_seconds=None`` (``app/worker/kinds.py``) — a
+#: raised exception inside the handler always finalizes to ``'failed'`` on
+#: its FIRST attempt (``JobsRepository.fail``'s requeue branch requires
+#: ``retry_in_seconds is not None``), never consuming a second one. So for
+#: these two kinds specifically, every attempt past the first can ONLY be
+#: a crash-recovery reclaim of an expired lease — never a second try at a
+#: handler that already raised. Raising their budget therefore only ever
+#: widens how many worker restarts a long crawl survives; it cannot mask an
+#: actually-broken handler, which still fails on attempt 1 regardless of
+#: this value.
+#:
+#: 2026-09 incident: a live multi-hour SharePoint crawl lost 6 of 7
+#: `corpus-extraction` jobs to `"lease expired after max attempts"` after
+#: one OOM kill and two planned worker recreates on the same host — three
+#: reclaims exhausted the shared default of 3 attempts. 25 is generous
+#: headroom for a run spanning many hours and several restarts without
+#: being unbounded.
+JOB_MAX_ATTEMPTS_BY_KIND: dict[str, int] = {
+    "corpus-extraction": 25,
+    "sharepoint-facts-extraction": 25,
+}
+
+
+def job_max_attempts(kind: str) -> int:
+    """The ``max_attempts`` an ``enqueue()`` call for ``kind`` should pass —
+    :data:`JOB_MAX_ATTEMPTS_BY_KIND`'s override when one exists, otherwise
+    :data:`DEFAULT_JOB_MAX_ATTEMPTS`. ONE shared helper so every enqueue
+    call site reads the same number instead of repeating (and inevitably
+    drifting) a per-call literal.
+    """
+    return JOB_MAX_ATTEMPTS_BY_KIND.get(kind, DEFAULT_JOB_MAX_ATTEMPTS)
+
 
 def register_kind(kind: JobKind) -> None:
     """Register (or replace) a job kind.
