@@ -52,6 +52,18 @@
   // a SQL string. An empty filter list means "no filter", which the
   // registry stores as a NULL source_query (full-table export).
 
+  // The 422 the server answers when a Keboola *materialized* row's
+  // source_query starts with SELECT/WITH (app/api/admin.py — both the
+  // register validator and the PUT handler). Kept here, beside the mode
+  // config, because BOTH modals need it and neither may paraphrase it: the
+  // /admin/tables Edit modal validates its "Advanced: raw filter (JSON)"
+  // editor client-side with this exact wording, so an operator who hits it
+  // in the UI can search for the same string in the API's response (#1979).
+  var KEBOOLA_FILTER_NOT_SQL_MESSAGE =
+    'Keboola materialized source_query must be a JSON filter spec '
+    + '(columns/whereFilters/changedSince), not SQL. Use null for full-table '
+    + "export, or set query_mode='local' for DuckDB-based Keboola pulls.";
+
   var CONNECTORS = {
     keboola: {
       label: 'Keboola',
@@ -59,11 +71,20 @@
       hasConnectionPicker: true,
       bucketLabel: 'Bucket',
       tableLabel: 'Source table',
+      // ONE definition of the Keboola access modes (#1979). The Register
+      // wizard renders it here; the /admin/tables Edit modal renders the
+      // SAME array through `renderModeCards` below — a label or an outcome
+      // can no longer disagree between the two modals, which is exactly how
+      // "Filtered export (Storage API)" and "Custom SQL" ended up naming the
+      // same `query_mode='materialized' + JSON filter` row.
+      // `queryMode` is what the option actually persists; it is printed
+      // under every card so the operator sees the consequence, not just the
+      // marketing name.
       modes: [
-        { value: 'whole', title: 'Whole table (extension)', desc: 'DuckDB Keboola extension pulls the full table each tick.' },
-        { value: 'direct', title: 'Direct extract (Storage API)', desc: 'Supports incremental, partitioned, where_filters.' },
-        { value: 'custom', title: 'Filtered export (Storage API)', desc: 'Optional server-side row filter before the export.' },
-        { value: 'remote', title: 'Live (remote)', desc: 'Every query goes straight to Keboola. Nothing syncs.' },
+        { value: 'whole', title: 'Whole table (extension)', queryMode: 'materialized', desc: 'DuckDB Keboola extension pulls the full table each tick.' },
+        { value: 'direct', title: 'Direct extract (Storage API)', queryMode: 'local', desc: 'Supports incremental, partitioned, where_filters.' },
+        { value: 'custom', title: 'Filtered export (Storage API)', queryMode: 'materialized', desc: 'Optional server-side row filter (JSON spec) before the export.' },
+        { value: 'remote', title: 'Live (remote)', queryMode: 'remote', desc: 'Every query goes straight to Keboola. Nothing syncs.' },
       ],
       defaultMode: 'whole',
       modeShape: function (mode) {
@@ -794,9 +815,63 @@
     }
   }
 
-  function _renderModeGroup(selectionCount) {
-    var host = document.getElementById('rtfModeGroup');
+  /** The secondary line printed under a mode card: the `query_mode` the
+   *  option actually persists. One formatter, so the wizard, the Edit
+   *  modal's cards and the Edit modal's "Currently:" header cannot word
+   *  the same outcome three ways (#1979). Returns '' for a connector whose
+   *  modes don't declare a `queryMode` yet. */
+  function modeOutcome(m) {
+    return m && m.queryMode ? ('→ query_mode: ' + m.queryMode) : '';
+  }
+
+  /** Render a radio-card group for a list of modes into `opts.host`.
+   *
+   *  Shared by the Register wizard (`#rtfModeGroup`) and the /admin/tables
+   *  Keboola Edit modal (`#editKbSyncModeGroup`), so one `modes` array
+   *  drives both. Options:
+   *    host        element to fill (cleared first)
+   *    modes       the mode definitions ({value, title, desc, queryMode})
+   *    radioName   the radio group's `name` — the Edit modal's save path
+   *                still reads its selection by name
+   *    current     value to pre-check
+   *    isDisabled  optional (mode) -> bool
+   *    disabledNote optional suffix appended to a disabled card's desc
+   *    onSelect    optional (value) -> void, fired on change
+   */
+  function renderModeCards(opts) {
+    var host = opts.host;
+    if (!host) return;
     host.innerHTML = '';
+    (opts.modes || []).forEach(function (m) {
+      var disabled = typeof opts.isDisabled === 'function' ? !!opts.isDisabled(m) : false;
+      var card = document.createElement('label');
+      card.className = 'ds-drawer__mode-card';
+      if (disabled) card.style.opacity = '0.5';
+      var input = document.createElement('input');
+      input.type = 'radio'; input.name = opts.radioName; input.value = m.value;
+      input.checked = m.value === opts.current;
+      input.disabled = disabled;
+      input.addEventListener('change', function () {
+        if (typeof opts.onSelect === 'function') opts.onSelect(m.value);
+      });
+      var title = document.createElement('div');
+      title.className = 'ds-drawer__mode-title'; title.textContent = m.title;
+      var desc = document.createElement('div');
+      desc.className = 'ds-drawer__mode-desc';
+      desc.textContent = disabled ? (m.desc + (opts.disabledNote || '')) : m.desc;
+      card.appendChild(input); card.appendChild(title); card.appendChild(desc);
+      var outcome = modeOutcome(m);
+      if (outcome) {
+        var out = document.createElement('div');
+        out.className = 'ds-drawer__mode-outcome';
+        out.textContent = outcome;
+        card.appendChild(out);
+      }
+      host.appendChild(card);
+    });
+  }
+
+  function _renderModeGroup(selectionCount) {
     var modes = state.connector.modes;
     var current = modes.some(function (m) { return m.value === state.mode; }) ? state.mode : state.connector.defaultMode;
     // A "custom query" mode is single-table by nature (one SQL statement /
@@ -808,24 +883,16 @@
       current = state.connector.defaultMode;
       state.mode = current;
     }
-    modes.forEach(function (m) {
-      var shape = state.connector.modeShape(m.value);
-      var disabled = !!(shape.customQuery && selectionCount > 1);
-      var card = document.createElement('label');
-      card.className = 'ds-drawer__mode-card';
-      if (disabled) card.style.opacity = '0.5';
-      var input = document.createElement('input');
-      input.type = 'radio'; input.name = 'rtfMode'; input.value = m.value;
-      input.checked = m.value === current;
-      input.disabled = disabled;
-      input.addEventListener('change', function () { state.mode = m.value; _applyModeVisibility(); });
-      var title = document.createElement('div');
-      title.className = 'ds-drawer__mode-title'; title.textContent = m.title;
-      var desc = document.createElement('div');
-      desc.className = 'ds-drawer__mode-desc';
-      desc.textContent = disabled ? (m.desc + ' (select one table to use this mode)') : m.desc;
-      card.appendChild(input); card.appendChild(title); card.appendChild(desc);
-      host.appendChild(card);
+    renderModeCards({
+      host: document.getElementById('rtfModeGroup'),
+      modes: modes,
+      radioName: 'rtfMode',
+      current: current,
+      isDisabled: function (m) {
+        return !!(state.connector.modeShape(m.value).customQuery && selectionCount > 1);
+      },
+      disabledNote: ' (select one table to use this mode)',
+      onSelect: function (value) { state.mode = value; _applyModeVisibility(); },
     });
   }
 
@@ -965,6 +1032,9 @@
 
   window.RegisterTableForm = {
     CONNECTORS: CONNECTORS,
+    KEBOOLA_FILTER_NOT_SQL_MESSAGE: KEBOOLA_FILTER_NOT_SQL_MESSAGE,
+    modeOutcome: modeOutcome,
+    renderModeCards: renderModeCards,
     open: open,
     close: close,
     goToStep: goToStep,

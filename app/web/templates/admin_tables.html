@@ -2075,39 +2075,24 @@
                             <label class="form-label" for="editKbProjectSelect">Keboola project</label>
                             <select class="form-select ds-dropdown-native" id="editKbProjectSelect"></select>
                             {{ ds.dropdown(id='editKbProjectSelect-dd', target='editKbProjectSelect', aria_label='Keboola project', options=[]) }}
-                            <div class="form-hint">Discover, List tables and Use table as base run against this project. Not sent on save — it only steers where these buttons look.</div>
+                            <div class="form-hint">Discover and List tables run against this project. Not sent on save — it only steers where these buttons look.</div>
                         </div>
 
-                        {# Three sync-mode radios (mirror of Register). #}
+                        {# The access-mode picker is NOT authored here (#1979).
+                           Register and Edit used to keep two hand-written option
+                           lists, which is how the same materialized-with-a-filter
+                           row came to be called "Filtered export (Storage API)" in
+                           one modal and "Custom SQL" in the other — the latter
+                           offering a raw-SQL textarea the server refuses outright.
+                           Both modals now render `CONNECTORS.keboola.modes`
+                           (register_table_form.js) through the shared
+                           `RegisterTableForm.renderModeCards`, so the four labels,
+                           their order and the `→ query_mode:` line under each are
+                           one definition. Filled by `_renderEditKbSyncModes`. #}
                         <div class="form-group">
-                            <label class="form-label">What to sync?</label>
-                            <div class="bq-sync-radio-group" style="display:flex; gap:12px; margin-top:6px; flex-wrap:wrap;">
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="whole"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Whole table (extension)</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        DuckDB Keboola extension; full overwrite each tick.
-                                    </div>
-                                </label>
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="direct"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Direct extract (Storage API)</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        Storage API SDK. Supports incremental, partitioned,
-                                        <code>where_filters</code>.
-                                    </div>
-                                </label>
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="custom"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Custom SQL</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        Pre-aggregate or filter with your own SELECT.
-                                    </div>
-                                </label>
-                            </div>
+                            <label class="form-label">How should analysts access this data?</label>
+                            <div class="form-hint" id="editKbCurrentMode"></div>
+                            <div class="ds-drawer__mode-group" id="editKbSyncModeGroup"></div>
                         </div>
 
                         {# Discover/List tables backend routes by instance's data_source.type, ignoring
@@ -2138,20 +2123,53 @@
                                    list="editKbTableList" placeholder="e.g. orders">
                             <datalist id="editKbTableList"></datalist>
                         </div>
+                        {# "Filtered export (Storage API)" — the same structured
+                           where_filters builder the Register wizard uses for this
+                           mode (#408 / #1979), writing into the hidden
+                           #editKbCustomFilters textarea; the save path wraps its
+                           array as the `{"where_filters": [...]}` object
+                           `ExportFilter.from_dict` expects.
+
+                           The escape hatch below is deliberately JSON, not SQL.
+                           A Keboola *materialized* row is exported through the
+                           Storage API, whose filter is a structured spec — the
+                           server 422s any source_query starting with SELECT/WITH
+                           (app/api/admin.py) and the extractor raises on the same
+                           shape at sync time — so a "raw SQL" advanced editor could
+                           not produce a saveable row at all. What it exposes is the
+                           exact JSON spec the server accepts. #}
                         <div class="form-group editkb-source-custom" style="display:none;">
-                            <label class="form-label" for="editKbSourceQuery">
-                                SQL
-                                <button type="button" class="btn btn-secondary btn-sm"
-                                        {% if 'keboola' in (connected_sources or []) %}onclick="prefillFromKeboolaTable('editKbSourceQuery')"
-                                        title="Prefill SELECT * FROM kbc.bucket.table so you only edit the WHERE / projection"{% else %}disabled data-tooltip="Keboola not connected — connect a project in Data sources"{% endif %}
-                                        style="float:right; margin-top:-3px;">
-                                    Use table as base
-                                </button>
-                            </label>
-                            <textarea class="form-textarea" id="editKbSourceQuery" rows="8"></textarea>
+                            <label class="form-label">Storage API filter
+                                <span class="optional">(optional)</span></label>
+                            <div id="editKbCustomFiltersBuilder" class="where-filters-builder"></div>
+                            <textarea class="wfb-raw" id="editKbCustomFilters" rows="3" style="display:none;"></textarea>
+                            <div class="form-hint">
+                                Server-side row filter run by the Keboola Storage API export.
+                                Leave empty for a full-table export. Operators:
+                                <code>eq, ne, gt, ge, lt, le</code>. Date placeholders
+                                (<code>{{ '{{today}}' }}</code>, <code>{{ '{{last_3_months}}' }}</code>, etc.)
+                                resolved at sync time.
+                                <a href="#" class="wfb-raw-toggle"
+                                   onclick="toggleEditKbFilterSpecRaw(event)">Advanced: raw filter (JSON)</a>
+                            </div>
+                            <div class="alert-v2 alert-warning-v2" id="editKbFilterSpecWarning" hidden
+                                 style="font-size:13px; margin-top:8px;"></div>
+                            <div id="editKbFilterSpecRaw" style="display:none; margin-top:8px;">
+                                <textarea class="form-textarea" id="editKbSourceQuery" rows="6"
+                                          placeholder='{"where_filters": [{"column": "date", "operator": "ge", "values": ["{{ '{{last_3_months}}' }}"]}]}'></textarea>
+                                <div class="form-hint">The stored <code>source_query</code>, verbatim.
+                                    Keys: <code>where_filters</code>, <code>columns</code>,
+                                    <code>changed_since</code>, <code>changed_until</code>,
+                                    <code>limit</code>, <code>file_type</code>. SQL is not accepted
+                                    here — a Keboola materialized row is a Storage API export, not a
+                                    query; use <strong>Direct extract</strong> for DuckDB-SQL pulls.</div>
+                            </div>
                         </div>
 
-                        <div class="form-group">
+                        {# Live (remote) never syncs, so the schedule is hidden for it
+                           (mirror of the Register wizard, whose `modeShape` drops the
+                           whole schedule row for `remote`). #}
+                        <div class="form-group editkb-synced-only">
                             <label class="form-label" for="editKbSyncSchedule">Sync Schedule
                                 <span class="optional">(optional)</span></label>
                             <input type="text" class="form-input" id="editKbSyncSchedule" placeholder="every 6h">
@@ -4283,6 +4301,12 @@
         // into the shared _register_table_form.html drawer (D4) —
         // register_table_form.js attaches it lazily on open, not here.
         _initWhereFiltersBuilder('editKbWhereFiltersBuilder', 'editKbWhereFilters');
+        // Second instance of the SAME builder for the Keboola edit modal's
+        // "Filtered export (Storage API)" mode (#1979) — the wizard already
+        // reused it there; the edit modal used to offer a raw-SQL textarea
+        // the server refuses. Its array is wrapped as {"where_filters": [...]}
+        // on save (see _editKbFilterSourceQuery).
+        _initWhereFiltersBuilder('editKbCustomFiltersBuilder', 'editKbCustomFilters');
     });
 
     // ── Keboola test connection (#402) — verify the instance's Keboola
@@ -4655,6 +4679,201 @@
     // discover/prefill helpers (which hit the keboola-typed
     // /api/admin/discover-tables endpoint) stay gated above + below.
 
+    // ── #1979 pure edit-modal helpers — node-tested slice start ──
+    // No DOM and no page globals in here (only the shared Keboola contract
+    // published by register_table_form.js), so
+    // tests/test_keboola_edit_modal_access_modes.py can slice the source
+    // between these two markers and run the SHIPPED functions under plain
+    // `node` — the same "exercise the real code, don't copy it" pattern
+    // tests/test_register_table_form.py uses for the selection helpers.
+
+    /** The access mode a registry row IS — what the picker must open on.
+     *
+     *  Pre-#1979 this fell through to 'whole' for anything that wasn't
+     *  local-with-SQL, so a `query_mode='remote'` Keboola row opened on
+     *  "Whole table" and Save silently rewrote it to materialized, and a
+     *  materialized row carrying a JSON filter opened in a textarea labelled
+     *  SQL.
+     *
+     *  The one deliberate fall-through that stays: a row whose source_query
+     *  is the legacy auto-synthesized `SELECT * FROM kbc."b"."t"` still opens
+     *  on "Whole table", whose Save posts an explicit null — that is the only
+     *  way to clear a shape the server now refuses. */
+    function _editKbModeForRow(table) {
+        table = table || {};
+        var queryMode = table.query_mode || 'materialized';
+        if (queryMode === 'remote') return 'remote';
+        if (queryMode === 'local') return 'direct';
+        var sourceQuery = (table.source_query || '').trim();
+        if (!sourceQuery) return 'whole';
+        var bucket = table.bucket || '';
+        var sourceTable = table.source_table || '';
+        if (bucket && sourceTable) {
+            var auto = 'SELECT * FROM kbc."' + bucket + '"."' + sourceTable + '"';
+            if (sourceQuery.replace(/\s+/g, ' ').trim() === auto) return 'whole';
+        }
+        return 'custom';
+    }
+
+    /** How to present a stored `source_query` in the Filtered-export widget.
+     *
+     *  Returns {raw, value, filters, warning}: `filters` is the JSON array the
+     *  structured builder hydrates from, `value` the verbatim text for the
+     *  advanced editor, and `raw` true when the spec is something the builder
+     *  cannot draw losslessly — a legacy non-JSON string, a key the builder
+     *  doesn't own, or a comma-bearing value its CSV row editor would split.
+     *  Such a spec is SHOWN with a warning, never silently dropped. */
+    function _editKbFilterSpecShape(sourceQuery) {
+        var raw = (sourceQuery == null ? '' : String(sourceQuery)).trim();
+        var out = { raw: false, value: raw, filters: '', warning: '' };
+        if (!raw) return out;
+        var parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { parsed = undefined; }
+        if (parsed === undefined || parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            out.raw = true;
+            out.warning = 'This table\u2019s saved filter is not a JSON spec \u2014 most likely SQL left by the '
+                + 'old "Custom SQL" editor. It is shown below unchanged; a Keboola export takes a JSON '
+                + 'filter, so saving it as is will be refused.';
+            return out;
+        }
+        var keys = Object.keys(parsed);
+        var list = parsed.where_filters;
+        var onlyWhereFilters = keys.every(function (k) { return k === 'where_filters'; });
+        if (onlyWhereFilters && (list === undefined || Array.isArray(list))) {
+            var rows = list || [];
+            var lossy = rows.some(function (f) {
+                return f && Array.isArray(f.values) && f.values.some(function (v) {
+                    return typeof v === 'string' && v.indexOf(',') !== -1;
+                });
+            });
+            if (!lossy) {
+                out.filters = JSON.stringify(rows);
+                return out;
+            }
+            out.raw = true;
+            out.warning = 'A filter value contains a comma, which the structured editor cannot represent. '
+                + 'Edit this filter as raw JSON below.';
+            return out;
+        }
+        out.raw = true;
+        out.warning = 'This filter uses keys the structured editor cannot draw (' + keys.join(', ')
+            + '). Edit it as raw JSON below.';
+        return out;
+    }
+
+    /** The `source_query` the Filtered-export mode saves.
+     *
+     *  `useRaw` picks the advanced JSON editor over the structured builder.
+     *  Empty means NULL — a full-table export, same as "Whole table". Throws
+     *  with the server's OWN message when the advanced editor holds SQL, so
+     *  the operator meets one wording rather than two. */
+    function _editKbFilterSourceQuery(useRaw, rawText, builderRowsJSON) {
+        if (useRaw) {
+            var raw = (rawText || '').trim();
+            if (!raw) return null;
+            if (/^(SELECT|WITH)\b/i.test(raw)) {
+                throw new Error(window.RegisterTableForm.KEBOOLA_FILTER_NOT_SQL_MESSAGE);
+            }
+            var parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                throw new Error('Storage API filter must be valid JSON \u2014 ' + e.message);
+            }
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Storage API filter must be a JSON object, e.g. {"where_filters": [ ... ]}.');
+            }
+            return raw;
+        }
+        var rows = [];
+        try { rows = JSON.parse(builderRowsJSON || '[]'); } catch (e) { rows = []; }
+        if (!Array.isArray(rows) || !rows.length) return null;
+        return JSON.stringify({ where_filters: rows });
+    }
+    // ── #1979 pure edit-modal helpers — node-tested slice end ──
+
+    // True when the advanced JSON editor owns the filter (the structured
+    // builder cannot represent what is stored) — see _editKbFilterSpecShape.
+    var _editKbFilterRawOwned = false;
+
+    function _editKbShowFilterSpecRaw(show) {
+        document.getElementById('editKbFilterSpecRaw').style.display = show ? '' : 'none';
+        document.getElementById('editKbCustomFiltersBuilder').style.display =
+            _editKbFilterRawOwned ? 'none' : '';
+    }
+
+    function _editKbApplyFilterSpecShape(shape) {
+        _editKbFilterRawOwned = !!shape.raw;
+        document.getElementById('editKbSourceQuery').value = shape.value;
+        document.getElementById('editKbCustomFilters').value = shape.filters || '';
+        _rebuildWhereFiltersBuilder('editKbCustomFiltersBuilder');
+        var warn = document.getElementById('editKbFilterSpecWarning');
+        warn.textContent = shape.warning || '';
+        warn.hidden = !shape.warning;
+        _editKbShowFilterSpecRaw(_editKbFilterRawOwned);
+    }
+
+    // "Advanced: raw filter (JSON)" — the escape hatch. Deliberately JSON and
+    // not SQL: a Keboola materialized row exports through the Storage API,
+    // whose filter is a structured spec, and the server 422s a source_query
+    // starting with SELECT/WITH, so a raw-SQL editor here could only produce
+    // unsaveable rows.
+    function toggleEditKbFilterSpecRaw(ev) {
+        if (ev) ev.preventDefault();
+        var showing = document.getElementById('editKbFilterSpecRaw').style.display !== 'none';
+        if (showing) {
+            // Closing: re-derive the structured rows from what was typed so the
+            // two views can never disagree. A spec the builder can't draw keeps
+            // the raw editor open, with the warning saying why.
+            _editKbApplyFilterSpecShape(
+                _editKbFilterSpecShape(document.getElementById('editKbSourceQuery').value)
+            );
+            return;
+        }
+        if (!_editKbFilterRawOwned) {
+            // Opening: seed it from the builder, so the operator edits what is
+            // actually about to be saved rather than a stale string.
+            var sq = null;
+            try {
+                sq = _editKbFilterSourceQuery(false, '', document.getElementById('editKbCustomFilters').value);
+            } catch (e) { sq = null; }
+            document.getElementById('editKbSourceQuery').value = sq || '';
+        }
+        _editKbShowFilterSpecRaw(true);
+        document.getElementById('editKbSourceQuery').focus();
+    }
+
+    function _editKbCollectFilterSourceQuery() {
+        var rawVisible = document.getElementById('editKbFilterSpecRaw').style.display !== 'none';
+        return _editKbFilterSourceQuery(
+            _editKbFilterRawOwned || rawVisible,
+            document.getElementById('editKbSourceQuery').value,
+            document.getElementById('editKbCustomFilters').value
+        );
+    }
+
+    /** Render the four access-mode cards from the ONE shared definition
+     *  (`CONNECTORS.keboola.modes` in register_table_form.js) and name the
+     *  row's current mode above them. Both modals therefore print the same
+     *  labels, the same order and the same `→ query_mode:` outcome. */
+    function _renderEditKbSyncModes(current) {
+        if (!window.RegisterTableForm) return;
+        var modes = window.RegisterTableForm.CONNECTORS.keboola.modes;
+        window.RegisterTableForm.renderModeCards({
+            host: document.getElementById('editKbSyncModeGroup'),
+            modes: modes,
+            radioName: 'editKbSyncMode',
+            current: current,
+            onSelect: onEditKbSyncModeChange,
+        });
+        var line = document.getElementById('editKbCurrentMode');
+        if (!line) return;
+        var m = modes.filter(function (x) { return x.value === current; })[0];
+        line.textContent = m
+            ? ('Currently: ' + m.title + ' ' + window.RegisterTableForm.modeOutcome(m))
+            : '';
+    }
+
     function _getEditKbSyncMode() {
         var el = document.querySelector('input[name="editKbSyncMode"]:checked');
         return el ? el.value : 'whole';
@@ -4662,15 +4881,25 @@
 
     function onEditKbSyncModeChange() {
         var mode = _getEditKbSyncMode();
-        document.querySelectorAll('.editkb-source-table').forEach(function(el) {
-            el.style.display = (mode === 'custom') ? 'none' : '';
-        });
+        // Bucket + source table stay visible for every mode: the filtered
+        // export needs them beside its JSON filter (materialize_query exports
+        // a physical table), and Live (remote) ATTACHes exactly that pair.
         document.querySelectorAll('.editkb-source-custom').forEach(function(el) {
             el.style.display = (mode === 'custom') ? '' : 'none';
         });
         document.querySelectorAll('.editkb-direct-only').forEach(function(el) {
             el.style.display = (mode === 'direct') ? '' : 'none';
         });
+        document.querySelectorAll('.editkb-synced-only').forEach(function(el) {
+            el.style.display = (mode === 'remote') ? 'none' : '';
+        });
+        // The server refuses server_only=true on a remote row (422) — mirror
+        // the wizard, which drops the control entirely for Live.
+        var serverOnly = document.getElementById('editKbServerOnly');
+        if (serverOnly) {
+            serverOnly.disabled = (mode === 'remote');
+            if (mode === 'remote') serverOnly.checked = false;
+        }
         if (mode === 'direct') onEditKbStrategyChange();
     }
 
@@ -4697,20 +4926,15 @@
         });
     }
 
-    function _setEditKbRadio(value) {
-        var el = document.querySelector('input[name="editKbSyncMode"][value="' + value + '"]');
-        if (el) el.checked = true;
-    }
-
     function openEditKeboolaModal(table) {
-        // Populate fields from a registry row. Mode detection:
-        //   - query_mode='local' → 'direct' (v26 sync-strategy path)
-        //   - query_mode='materialized' + auto SELECT * → 'whole'
-        //   - query_mode='materialized' + custom SQL  → 'custom'
+        // Populate fields from a registry row. Mode detection lives in the
+        // pure `_editKbModeForRow` above — see its comment for the shapes and
+        // for the two bugs it fixes (a remote row opening on "Whole table",
+        // a JSON filter opening in a SQL textarea).
         table = table || {};
         document.getElementById('editKbTableId').value = table.id || '';
-        // Preselect the row's own project so Discover/List/Use-as-base look
-        // at the project this table actually came from, not whichever the
+        // Preselect the row's own project so Discover / List tables look at
+        // the project this table actually came from, not whichever the
         // picker happened to default to. Informational only — saving does
         // not change a row's connection_id: `UpdateTableRequest` accepts the
         // field (an admin can re-pin a row via `agnes admin update-table
@@ -4720,35 +4944,25 @@
         var bucket = table.bucket || '';
         var sourceTable = table.source_table || '';
         var sourceQuery = table.source_query || '';
-        var queryMode = table.query_mode || 'materialized';
-        var isAutoSelectStar = false;
-        if (sourceQuery && bucket && sourceTable) {
-            var auto = 'SELECT * FROM kbc."' + bucket + '"."' + sourceTable + '"';
-            isAutoSelectStar = sourceQuery.replace(/\s+/g, ' ').trim() === auto;
-        }
-        var mode;
-        if (queryMode === 'local') {
-            mode = 'direct';
-        } else if (sourceQuery && !isAutoSelectStar) {
-            mode = 'custom';
-        } else {
-            mode = 'whole';
-        }
-        _setEditKbRadio(mode);
+        var mode = _editKbModeForRow(table);
+        _renderEditKbSyncModes(mode);
+        // Only a Filtered-export row's source_query belongs in the filter
+        // widget. A "Whole table" row's legacy synthesized SELECT does not —
+        // its Save clears the field, and pre-filling the editor with SQL that
+        // is about to be dropped would only look like a pending edit.
+        _editKbApplyFilterSpecShape(_editKbFilterSpecShape(mode === 'custom' ? sourceQuery : ''));
         document.getElementById('editKbBucket').value = bucket;
         document.getElementById('editKbSourceTable').value = sourceTable;
-        document.getElementById('editKbSourceQuery').value = sourceQuery;
         document.getElementById('editKbSyncSchedule').value = table.sync_schedule || '';
         document.getElementById('editKbDescription').value = table.description || '';
         document.getElementById('editKbFolder').value = table.folder || '';
         document.getElementById('editKbPrimaryKey').value = (table.primary_key || []).join(', ');
-        // #607 — server_only checkbox. Disabled for live (remote) rows since
-        // the flag is meaningless there (backend rejects true + remote).
+        // #607 — server_only checkbox. Disabling it for Live (remote) rows,
+        // where the flag is meaningless (the backend rejects true + remote),
+        // is onEditKbSyncModeChange's job now: it has to follow the picker,
+        // not just the mode the row arrived in.
         var editServerOnlyEl = document.getElementById('editKbServerOnly');
-        if (editServerOnlyEl) {
-            editServerOnlyEl.checked = !!table.server_only;
-            editServerOnlyEl.disabled = (queryMode === 'remote');
-        }
+        if (editServerOnlyEl) editServerOnlyEl.checked = !!table.server_only;
 
         // v26 fields
         document.getElementById('editKbStrategy').value = table.sync_strategy || 'full_refresh';
@@ -4817,10 +5031,27 @@
         var primaryKey = pk
             ? pk.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
             : [];
-        // #607 — both edit branches map to synced (local/materialized) modes,
-        // so server_only is always valid here.
         var editServerOnlyEl = document.getElementById('editKbServerOnly');
         var serverOnly = !!(editServerOnlyEl && editServerOnlyEl.checked);
+
+        if (mode === 'remote') {
+            // Live (remote) — the wizard's remote branch, on the PUT shape
+            // (#1979). `server_only` must be sent as an EXPLICIT false: it is
+            // validated against the MERGED record, so omitting it on a row
+            // that is currently server-only keeps the stored `true` and the
+            // update 422s. `source_query` needs no null here — update_table
+            // clears it itself for any non-materialized merged record — and
+            // the sync schedule is left untouched because nothing syncs.
+            return {
+                query_mode: 'remote',
+                bucket: bucket,
+                source_table: sourceTable,
+                primary_key: primaryKey,
+                server_only: false,
+                description: (document.getElementById('editKbDescription').value || '').trim() || null,
+                folder: (document.getElementById('editKbFolder').value || '').trim() || null,
+            };
+        }
 
         if (mode === 'direct') {
             var strategy = _getEditKbStrategy();
@@ -4868,8 +5099,16 @@
             folder: (document.getElementById('editKbFolder').value || '').trim() || null,
         };
         if (mode === 'custom') {
+            // Filtered export (Storage API) — a JSON filter spec, never SQL
+            // (the server 422s a SELECT/WITH source_query on a Keboola
+            // materialized row). `bucket`/`source_table` ride along because
+            // `materialize_query` exports a physical table and the filter only
+            // narrows it; an empty filter is an explicit null, i.e. the same
+            // full-table export "Whole table" performs.
             return Object.assign({}, common, {
-                source_query: (document.getElementById('editKbSourceQuery').value || '').trim(),
+                bucket: bucket,
+                source_table: sourceTable,
+                source_query: _editKbCollectFilterSourceQuery(),
             });
         }
         // Whole — an EXPLICIT null, not an omitted key. Keboola materialized
@@ -4941,31 +5180,15 @@
         })();
     }
 
-    // prefillFromKeboolaTable is defined here, OUTSIDE the discover-helpers
-    // Jinja guard above ('keboola' in connected_sources) — it must exist
-    // whenever the Register or Edit modal is open, on ANY instance, because
-    // Edit is per-row and not gated by the instance's connectedness. What
-    // IS gated is the button's onclick attribute that calls it (see the
-    // Register/Edit button guards above) — a disconnected instance never
-    // wires up the onclick, so this definition existing unconditionally is
-    // harmless dead code for it, not a live call path.
-    async function prefillFromKeboolaTable(textareaId) {
-        // Edit-modal callers may pass an editKbBucket / editKbSourceTable
-        // pair instead of the Register modal's kbBucket / kbSourceTable.
-        // Detect the modal via the textarea id prefix.
-        var prefix = textareaId.indexOf('editKb') === 0 ? 'editKb' : 'kb';
-        var bucket = (document.getElementById(prefix + 'Bucket').value || '').trim();
-        var sourceTable = (document.getElementById(prefix + 'SourceTable').value || '').trim();
-        if (!bucket || !sourceTable) {
-            showToast('Fill bucket + source table first', 'error');
-            return;
-        }
-        var ta = document.getElementById(textareaId);
-        if (ta.value.trim()) {
-            if (!(await confirmModal('Replace existing SQL?'))) return;
-        }
-        ta.value = 'SELECT *\nFROM kbc."' + bucket + '"."' + sourceTable + '"\nWHERE -- your filter here';
-    }
+    // #1979 removed `prefillFromKeboolaTable`. Its only caller was the Keboola
+    // Edit modal's "Use table as base" button, next to a SQL textarea that no
+    // longer exists: it seeded `SELECT * FROM kbc."b"."t" WHERE …` into
+    // `source_query`, which is precisely the payload the server refuses on a
+    // Keboola materialized row ("must be a JSON filter spec …, not SQL"). The
+    // mode it belonged to is now "Filtered export (Storage API)", whose editor
+    // is the structured filter builder plus a raw-JSON hatch, so there is no
+    // SQL left to prefill. BigQuery's equivalent (`prefillFromTable`, above)
+    // is untouched — BQ materialized rows really do take SQL.
 
     // C3: removed dead helper _buildKeboolaLegacyPayload — the Phase F
     // _buildKeboolaPayload (above) replaced it.

@@ -133,7 +133,25 @@ agnes admin register-table users \
     --query-mode local
 ```
 
-**`query_mode: remote` for Keboola** is architecturally supported via the `_remote_attach` mechanism (the orchestrator can ATTACH the Keboola DuckDB extension on demand the same way it does for BQ), but **not in active deployment use today**. If you have an analyst workflow against a Keboola table that's too big to sync, file an issue — the architecture is in place but the registration UX hasn't been polished.
+### Keboola — `query_mode: materialized` (full or filtered export)
+
+The server exports the table through the Storage API's `export-async` endpoint and writes a parquet on the Agnes filesystem — same distribution as `local` from there on. Two shapes:
+
+- **Full export** — no `source_query` at all (NULL). The whole table, every scheduled run.
+- **Filtered export** — `source_query` holds a **JSON filter spec**, never SQL: `{"where_filters": [{"column": "date", "operator": "ge", "values": ["{{last_3_months}}"]}]}`. Accepted keys are `where_filters`, `columns`, `changed_since`, `changed_until`, `limit` and `file_type`; operators are `eq, ne, gt, ge, lt, le`, and the date placeholders resolve at sync time. A `source_query` starting with `SELECT`/`WITH` is refused at registration and at update time — for DuckDB-SQL pulls use `query_mode: local` (Direct extract) instead.
+
+The export asks for parquet and falls back to CSV automatically on projects whose backend refuses it; either way the columns are retyped from the source schema — see [`docs/DATA_SOURCES.md`](../DATA_SOURCES.md) → *Materialized rows: parquet export, with an automatic CSV fallback*.
+
+**Which UI option yields which mode.** `/admin/tables` offers the same four Keboola access modes in the Register wizard and the Edit modal, and each one names its outcome:
+
+| Option | `query_mode` | What it stores |
+|---|---|---|
+| Whole table (extension) | `materialized` | full export, no `source_query` |
+| Direct extract (Storage API) | `local` | the sync-strategy path (full refresh / incremental / partitioned) with `where_filters` |
+| Filtered export (Storage API) | `materialized` | the JSON filter spec above, in `source_query` |
+| Live (remote) | `remote` | nothing syncs — see below |
+
+**`query_mode: remote` for Keboola** is supported via the `_remote_attach` mechanism (the orchestrator ATTACHes the Keboola DuckDB extension on demand, the same way it does for BQ) and registrable from both `/admin/tables` modals as **Live (remote)**, but it is **not in wide deployment use today** — expect rougher edges than the BigQuery remote path. `server_only` is rejected with it: a remote row has no server-stored parquet to withhold.
 
 ### Jira — `query_mode: local` only
 
