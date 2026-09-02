@@ -642,6 +642,73 @@ def test_missing_backend_raises_a_typed_error_naming_the_extra(tmp_path, monkeyp
     assert isinstance(excinfo.value, ConversionError)
 
 
+class _RaisingMetaPathFinder:
+    """A ``sys.meta_path`` entry that raises ``exc`` instead of resolving
+    ``module_name`` — simulates a lazy import failing with an arbitrary
+    exception type (not just ``ImportError``), for both an ``import x`` and
+    a ``from x import y`` statement, since it intercepts before ``x`` is
+    even bound into ``sys.modules``."""
+
+    def __init__(self, module_name: str, exc: BaseException) -> None:
+        self._module_name = module_name
+        self._exc = exc
+
+    def find_spec(self, fullname, path, target=None):  # noqa: ANN001, ANN201
+        if fullname == self._module_name:
+            raise self._exc
+        return None
+
+
+@pytest.mark.parametrize(
+    "module, name, mime",
+    [
+        ("markitdown", "handbook.docx", "application/octet-stream"),
+        ("pypdfium2", "report.pdf", "application/pdf"),
+    ],
+)
+def test_missing_backend_import_failure_carries_the_causes_type_and_text(tmp_path, monkeypatch, module, name, mime):
+    """A live finding: a MemoryError surfacing from deep inside a lazy
+    ``import markitdown``/``import pypdfium2`` (a conversion child's own
+    numpy/OpenBLAS init failing under its RLIMIT_AS) must not read as a
+    plain "not installed" — that cost 30 minutes to diagnose. The message
+    must name the real exception type and carry its text."""
+    monkeypatch.delitem(sys.modules, module, raising=False)
+    finder = _RaisingMetaPathFinder(
+        module, MemoryError("OpenBLAS error: Memory allocation still failed after 10 retries.")
+    )
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+    path = tmp_path / name
+    path.write_bytes(b"irrelevant, the import fails first")
+
+    with pytest.raises(MissingConversionDependency) as excinfo:
+        convert_to_markdown(path, mime)
+
+    assert excinfo.value.package == module
+    message = str(excinfo.value)
+    assert "MemoryError" in message
+    assert "OpenBLAS error: Memory allocation still failed after 10 retries." in message
+    assert "conversion child's memory limit" in message
+    assert isinstance(excinfo.value, ConversionError)
+
+
+def test_missing_backend_import_failure_message_truncates_a_long_cause(tmp_path, monkeypatch):
+    """The cause's text is capped at 200 chars so one pathological exception
+    message can't blow up the crawl's error log/report."""
+    monkeypatch.delitem(sys.modules, "markitdown", raising=False)
+    long_text = "x" * 500
+    finder = _RaisingMetaPathFinder("markitdown", RuntimeError(long_text))
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+    path = tmp_path / "handbook.docx"
+    path.write_bytes(b"irrelevant, the import fails first")
+
+    with pytest.raises(MissingConversionDependency) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    message = str(excinfo.value)
+    assert ("x" * 200) in message
+    assert ("x" * 201) not in message
+
+
 def test_module_imports_without_the_extraction_extra(monkeypatch):
     """Import-time cost is zero: the backends are only imported on demand."""
     monkeypatch.setitem(sys.modules, "markitdown", None)

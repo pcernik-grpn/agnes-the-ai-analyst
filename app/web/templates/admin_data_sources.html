@@ -7828,6 +7828,11 @@ function _extRunLine(run) {
   if (run.changed != null) bits.push(`${_extNum(run.changed)} changed`);
   if (run.unchanged != null) bits.push(`${_extNum(run.unchanged)} unchanged`);
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
+  // `extraction.crawl.min_modified` age filter — so an operator can tell
+  // mid-run whether the cutoff is doing anything, not only after the run
+  // finishes. Absent/zero (no cutoff configured, or nothing skipped) says
+  // nothing rather than a "0 filtered by age" that reads as a claim.
+  if (run.filtered_by_age) bits.push(`${_extNum(run.filtered_by_age)} filtered by age`);
   if (run.bytes_downloaded_human) bits.push(`${run.bytes_downloaded_human} downloaded`);
   // NER token accounting (usage or the report's ner_usage): a token COUNT is a
   // fact, and `estimated_cost_usd` (src.llm_pricing.cost_usd, when the stage

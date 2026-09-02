@@ -79,6 +79,8 @@ def test_a_live_run_surfaces_with_absolute_counters(tmp_path, monkeypatch, pg_en
             "throttle_wait_s": 38.0,
             "elapsed_s": 391.0,
             "activity": activity,
+            "filtered_by_age": 40,
+            "age_unknown": 3,
         },
     )
 
@@ -93,6 +95,11 @@ def test_a_live_run_surfaces_with_absolute_counters(tmp_path, monkeypatch, pg_en
     assert running["checkpoint_at"]
     # What the crawl is touching RIGHT NOW (owner-frustration fix, 2026-09-01).
     assert running["activity"] == activity
+    # An operator watching a LIVE run must be able to tell whether
+    # `extraction.crawl.min_modified` is doing anything — not only once the
+    # run finishes and `report()` becomes readable.
+    assert running["filtered_by_age"] == 40
+    assert running["age_unknown"] == 3
     # A cooperative stop (`POST .../extraction/stop`) always exists — it
     # lives on `source_connections`, not this PG-only table.
     assert body["can_stop"] is True
@@ -316,6 +323,28 @@ def test_fleet_row_carries_the_facts_stage_from_the_same_run(tmp_path, monkeypat
     assert row["facts"]["docs_total"] == 340
 
 
+def test_fleet_row_carries_the_age_filter_counters_from_the_same_run(tmp_path, monkeypatch, pg_engine):
+    """The fleet row is `_run_out` on the same run — an operator scanning
+    the fleet table must be able to tell a connection's `min_modified`
+    cutoff is doing something without opening its source card."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-age-filtered")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.checkpoint(
+        run_id,
+        files_seen=100,
+        files_done=100,
+        progress={"filtered_by_age": 40, "age_unknown": 3},
+    )
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    row = body["connections"][0]
+    assert row["run"]["filtered_by_age"] == 40
+    assert row["run"]["age_unknown"] == 3
+
+
 def test_fleet_row_flags_a_stuck_run_past_the_fleet_threshold(tmp_path, monkeypatch, pg_engine):
     import sqlalchemy as sa
 
@@ -375,6 +404,7 @@ def test_fleet_requires_admin(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     r = client.get(FLEET_URL)
     assert r.status_code == 401
+
 
 def test_status_reports_an_in_flight_facts_pass_off_the_job_queue(tmp_path, monkeypatch, pg_engine):
     """The standalone facts pass never opens an `extraction_runs` row, so

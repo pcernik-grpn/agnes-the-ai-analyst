@@ -381,6 +381,35 @@ class TestRunProjection:
         for forbidden in ("percent", "progress_pct", "eta_s", "eta"):
             assert forbidden not in out
 
+    def test_run_out_surfaces_the_age_filter_counters_from_a_running_checkpoint(self):
+        """An operator watching a LIVE run must be able to tell whether
+        `min_modified` is doing anything mid-run, not only after `report()`
+        becomes readable."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "running",
+                "progress": {"filtered_by_age": 40, "age_unknown": 3},
+            }
+        )
+        assert out["filtered_by_age"] == 40
+        assert out["age_unknown"] == 3
+
+    def test_run_out_surfaces_the_age_filter_counters_from_a_finished_report(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"filtered_by_age": 12, "age_unknown": 0},
+            }
+        )
+        assert out["filtered_by_age"] == 12
+        assert out["age_unknown"] == 0
+
     def test_run_out_never_restamps_freshness(self):
         """`checkpoint_at` is when the numbers were last TRUE — a read must
         not quietly refresh it to now."""
@@ -732,6 +761,7 @@ class TestFleetRoute:
         r = client.get(FLEET_URL, headers=_auth(token))
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
+
 
 class TestFactsJobInFlight:
     """The standalone facts pass (``sharepoint-facts-extraction``) writes no

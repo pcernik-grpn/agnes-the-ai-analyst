@@ -538,23 +538,36 @@ def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, mon
 
 
 def test_caps_match_the_stages_own_clamps():
+    """`extraction.concurrency` (the LANE cap) must equal the worker
+    runtime's own clamp — a live run posted 12, the runtime silently
+    re-clamped it to 8 and logged a warning nobody saw until after the
+    fact. `extraction.facts.concurrency` is a different stage (document
+    concurrency inside one facts pass) with its own, unrelated ceiling."""
     from app.api.admin import _FACTS_CONCURRENCY_MAX, _LANE_CONCURRENCY_MAX
+    from app.worker.runtime import _MAX_EXTRACTION_CONCURRENCY
     from connectors.sharepoint.facts_extraction import MAX_CONCURRENCY
 
     assert _FACTS_CONCURRENCY_MAX == MAX_CONCURRENCY == 64
-    assert _LANE_CONCURRENCY_MAX == 64
+    assert _LANE_CONCURRENCY_MAX == _MAX_EXTRACTION_CONCURRENCY == 8
 
 
 def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     client, token = _client(seeded_app, monkeypatch)
     resp = client.post(
         "/api/admin/server-config",
-        json={"sections": {"extraction": {"concurrency": 12, "facts": {"stream_every": 300, "transport": "batch", "retry_mode": "off", "run_timeout_s": 7200}}}},
+        json={
+            "sections": {
+                "extraction": {
+                    "concurrency": 6,
+                    "facts": {"stream_every": 300, "transport": "batch", "retry_mode": "off", "run_timeout_s": 7200},
+                }
+            }
+        },
         headers=_auth(token),
     )
     assert resp.status_code == 200, resp.text
     got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
-    assert got["concurrency"] == 12
+    assert got["concurrency"] == 6
     assert got["facts"]["stream_every"] == 300
     assert got["facts"]["transport"] == "batch"
     assert got["facts"]["retry_mode"] == "off"
@@ -565,7 +578,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     "patch",
     [
         {"concurrency": 0},
-        {"concurrency": 65},
+        {"concurrency": 9},
         {"facts": {"concurrency": 65}},
         {"facts": {"stream_every": -1}},
         {"facts": {"run_timeout_s": 5}},

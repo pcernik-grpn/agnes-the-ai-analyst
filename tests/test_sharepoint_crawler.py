@@ -3031,6 +3031,31 @@ class TestRunRecording:
         for forbidden in ("percent", "progress_pct", "eta_s", "eta", "files_per_s"):
             assert forbidden not in progress
 
+    def test_progress_surfaces_the_age_filter_counters(self, crawl_env, monkeypatch):
+        """An operator watching a LIVE run must be able to tell whether
+        `extraction.crawl.min_modified` is doing anything mid-run — not only
+        after the run finishes and `report()` becomes readable."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-30T23:59:59Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        _run(conn, monkeypatch)
+
+        progress = runs.checkpoints[-1]["progress"]
+        assert progress["filtered_by_age"] == 1
+        assert progress["age_unknown"] == 0
+
     def test_a_crashed_crawl_records_failed_not_interrupted(self, crawl_env, monkeypatch):
         """Severity-first: a crash is both "did not finish" and "broke". The
         more severe word wins, or the card invites an operator to trust a

@@ -206,6 +206,13 @@ function renderRow(row) {
   const filesSeen = run ? (run.files_seen ?? 0) : null;
   const usage = run ? (run.usage || {}) : {};
   const cost = row.estimated_cost_usd || 0;
+  // `extraction.crawl.min_modified` age filter — an operator scanning the
+  // fleet table must be able to tell a connection's cutoff is doing
+  // something without opening its source card. Absent/zero says nothing
+  // rather than a "0 filtered by age" that reads as a claim.
+  const filteredByAge = run && run.filtered_by_age
+    ? ` <span class="ext-sub">(${run.filtered_by_age.toLocaleString()} filtered by age)</span>`
+    : "";
   const tr = document.createElement("tr");
   tr.className = row.stuck ? "ext-row--stuck" : "";
   tr.innerHTML = `
@@ -214,7 +221,7 @@ function renderRow(row) {
       <div class="ext-sub">${esc(row.connection_id)}</div>
     </td>
     <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}</td>
-    <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}`}</td>
+    <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}${filteredByAge}`}</td>
     <td class="ext-num">${fmtRate(row.files_per_min)}</td>
     <td class="ext-num">${factsCell(row.facts)}</td>
     <td class="ext-num">${tokenTotals(usage)}</td>

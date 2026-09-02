@@ -201,6 +201,25 @@ class TestRunRow:
         assert "4× HTTP 429" in html
         assert "38s waited" in html
 
+    def test_a_live_run_shows_how_many_were_filtered_by_age(self):
+        """An operator watching `extraction.crawl.min_modified` must be able
+        to tell mid-run whether the cutoff is doing anything — not only
+        after the run finishes."""
+        running = json.loads(json.dumps(_RUNNING))
+        running["running"]["filtered_by_age"] = 40
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=running),
+        )
+        assert "40 filtered by age" in out["html"]
+
+    def test_a_run_with_no_age_filtering_says_nothing_about_it(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "filtered by age" not in out["html"]
+
     def test_no_stop_button_is_drawn_and_the_absence_is_explained(self):
         """v1 has no cooperative cancel flag; a button without a mechanism
         would be a lie, so the row says so in words instead."""

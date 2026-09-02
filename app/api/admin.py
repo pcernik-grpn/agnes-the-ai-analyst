@@ -529,7 +529,14 @@ _CRAWLER_CONCURRENCY_MIN = 1
 # per-pass document concurrency — the cap each stage clamps to itself, pinned
 # by tests rather than imported (no import-time dependency on the worker/
 # connector stacks from this module).
-_LANE_CONCURRENCY_MAX = 64
+# `_LANE_CONCURRENCY_MAX` MUST equal `app.worker.runtime._MAX_EXTRACTION_
+# CONCURRENCY` (currently 8) — a live run posted `extraction.concurrency=12`
+# through this endpoint (which accepted it, the cap here was 64), and the
+# worker runtime silently re-clamped it back down to 8 on its own, logging a
+# warning nobody saw until after the fact. Pinned equal by
+# `tests/test_admin_server_config_extraction_section.py::
+# test_caps_match_the_stages_own_clamps` rather than imported here.
+_LANE_CONCURRENCY_MAX = 8
 _FACTS_CONCURRENCY_MAX = 64
 _CRAWLER_CONCURRENCY_MAX = 64
 
@@ -1174,7 +1181,9 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Extraction LANE slots on the worker — how many extraction jobs (crawls and "
                 "fact passes, across all connections) run at the same time. 1 serialises "
                 "everything; raise it so a streamed facts pass can overlap a crawl still "
-                "running, or so several connections crawl in parallel. Clamped to [1, 64]."
+                "running, or so several connections crawl in parallel. Clamped to [1, 8] — "
+                "same ceiling the worker runtime itself clamps to, so a value accepted here "
+                "is never silently re-clamped on the worker."
             ),
         },
         "timeout_s": {

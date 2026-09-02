@@ -846,6 +846,14 @@ def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
         "http_429": stats.http_429,
         "throttle_wait_s": round(stats.throttle_wait_s, 1),
         "oversize_files": stats.oversize_files,
+        # `extraction.crawl.min_modified` age filter — see `CrawlStats.
+        # filtered_by_age`/`age_unknown` and the gate in `_process_item`.
+        # Surfaced mid-run (not only in the finished `report()`) so an
+        # operator watching a live crawl can tell whether the cutoff is
+        # doing anything before the run finishes. Both zero when no cutoff
+        # is configured.
+        "filtered_by_age": stats.filtered_by_age,
+        "age_unknown": stats.age_unknown,
         "elapsed_s": round(max(time.monotonic() - stats.started, 0.0), 1),
         # What the crawl is touching RIGHT NOW (owner-frustration fix,
         # 2026-09-01: "I can't see what's happening in the extraction") —
