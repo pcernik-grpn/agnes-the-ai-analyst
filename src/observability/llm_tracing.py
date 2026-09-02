@@ -1,13 +1,20 @@
-"""LLM call instrumentation that emits PostHog ``$ai_generation`` events.
+"""LLM call instrumentation — one structured log record per generation.
 
-PostHog's LLM Observability product consumes events with a documented
-property schema (``$ai_provider``, ``$ai_model``, ``$ai_input_tokens``,
-``$ai_output_tokens``, ``$ai_latency``, ``$ai_trace_id``, ``$ai_input``,
-``$ai_output_choices``, ``$ai_is_error``).
+Wrap the synchronous provider call in :func:`trace_generation`; on exit it
+emits a single ``llm_generation`` record carrying provider, model, token
+counts, latency and whether the call failed. There is no second sink and no
+vendor account: the record goes to the logger every deployment already has,
+and ``app/logging_config.py``'s JSON formatter promotes the fields so they
+stay filterable.
 
-Use the :func:`trace_generation` context manager around the synchronous
-provider call. The capture object lets the caller record token counts
-and (when ``POSTHOG_LLM_PAYLOADS=1``) prompt/completion content.
+Prompts and completions are deliberately not recorded — in this product they
+routinely carry customer data, and a log pipeline is the wrong place to hold
+it. Their *sizes* are recorded, because a size is the part that explains a
+cost or a latency.
+
+Nothing in here may break the call it wraps: every accessor on a provider
+response is defensive, and a failure inside the instrumentation is logged and
+swallowed.
 
 Example::
 
@@ -22,206 +29,107 @@ Example::
 from __future__ import annotations
 
 import logging
-import os
 import time
-import uuid
 from contextlib import contextmanager
 from typing import Any, Iterator
-
-from src.observability.posthog_client import get_posthog
 
 logger = logging.getLogger(__name__)
 
 
-# Default character cap for LLM prompt / completion payloads. Sized to
-# leave ~2 KB of headroom under PostHog's ~32 KB per-event ingest limit
-# for the surrounding event envelope (provider, model, tokens, request
-# id, super-properties, etc.). Override via the env var below.
-_DEFAULT_LLM_PAYLOAD_MAX_CHARS = 30_000
-
-
-def _llm_payload_cap() -> int:
-    raw = os.environ.get("POSTHOG_LLM_PAYLOAD_MAX_CHARS", "").strip()
-    if not raw:
-        return _DEFAULT_LLM_PAYLOAD_MAX_CHARS
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "POSTHOG_LLM_PAYLOAD_MAX_CHARS=%r is not an int; falling back to %d",
-            raw, _DEFAULT_LLM_PAYLOAD_MAX_CHARS,
-        )
-        return _DEFAULT_LLM_PAYLOAD_MAX_CHARS
-    if value <= 0:
-        return _DEFAULT_LLM_PAYLOAD_MAX_CHARS
-    return value
-
-
-def _truncate(value: Any, max_chars: int) -> Any:
-    """Return ``value`` clipped to ``max_chars`` characters as a string.
-
-    Lists / dicts / non-string scalars get ``str()``-converted because
-    PostHog stores event properties as JSON and a multi-megabyte nested
-    structure would just silently get rejected at ingest. Truncated
-    payloads carry an explicit ``…[truncated N chars]`` suffix so a
-    reader doesn't mistake them for a complete capture.
-    """
-    if value is None:
-        return None
-    text = value if isinstance(value, str) else str(value)
-    if len(text) <= max_chars:
-        return text
-    dropped = len(text) - max_chars
-    return text[:max_chars] + f"…[truncated {dropped} chars]"
-
-
 class _Capture:
-    """Per-call mutable bag the wrapped code uses to report token counts.
-
-    All setters are best-effort — exceptions are swallowed so a tracing
-    bug never breaks the LLM call itself.
-    """
+    """Collects what the record will carry. Every setter is best-effort: an
+    unreadable response shape costs the numbers, never the LLM call."""
 
     def __init__(self) -> None:
         self.input_tokens: int | None = None
         self.output_tokens: int | None = None
-        self.prompt: Any = None
-        self.output: Any = None
+        self.prompt_chars: int | None = None
+        self.completion_chars: int | None = None
         self.extra: dict[str, Any] = {}
 
-    def set_input(self, prompt: Any) -> None:
+    @staticmethod
+    def _size(value: Any) -> int | None:
         try:
-            self.prompt = prompt
-        except Exception:
-            pass
+            if value is None:
+                return None
+            return len(value if isinstance(value, str) else str(value))
+        except Exception:  # noqa: BLE001 - a size is never worth an exception
+            return None
+
+    def set_input(self, prompt: Any) -> None:
+        self.prompt_chars = self._size(prompt)
 
     def set_output(self, output: Any) -> None:
-        try:
-            self.output = output
-        except Exception:
-            pass
+        self.completion_chars = self._size(output)
 
     def set_tokens(self, input_tokens: int | None, output_tokens: int | None) -> None:
-        try:
-            self.input_tokens = input_tokens
-            self.output_tokens = output_tokens
-        except Exception:
-            pass
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
     def set_output_from_anthropic(self, response: Any) -> None:
-        """Pull token counts + completion text from an Anthropic response.
-
-        Tolerates SDK version differences and partial responses.
-        """
         try:
             usage = getattr(response, "usage", None)
             if usage is not None:
                 self.input_tokens = getattr(usage, "input_tokens", None)
                 self.output_tokens = getattr(usage, "output_tokens", None)
-            content = getattr(response, "content", None)
-            if content is not None:
-                # Anthropic returns a list of blocks; capture text payloads.
-                texts: list[str] = []
-                for block in content:
-                    text = getattr(block, "text", None)
-                    if isinstance(text, str):
-                        texts.append(text)
-                if texts:
-                    self.output = texts if len(texts) > 1 else texts[0]
-        except Exception:
-            logger.debug("set_output_from_anthropic: extraction failed", exc_info=True)
+            texts = [
+                block.text
+                for block in (getattr(response, "content", None) or [])
+                if getattr(block, "type", None) == "text" and getattr(block, "text", None)
+            ]
+            if texts:
+                self.completion_chars = sum(len(t) for t in texts)
+        except Exception:  # noqa: BLE001 - see the class docstring
+            logger.debug("llm tracing: unreadable anthropic response shape", exc_info=True)
 
     def set_output_from_openai(self, response: Any) -> None:
-        """Pull token counts + completion text from an OpenAI-compat response."""
         try:
             usage = getattr(response, "usage", None)
             if usage is not None:
                 self.input_tokens = getattr(usage, "prompt_tokens", None)
                 self.output_tokens = getattr(usage, "completion_tokens", None)
-            choices = getattr(response, "choices", None)
+            choices = getattr(response, "choices", None) or []
             if choices:
-                first = choices[0]
-                msg = getattr(first, "message", None)
-                if msg is not None:
-                    self.output = getattr(msg, "content", None)
-        except Exception:
-            logger.debug("set_output_from_openai: extraction failed", exc_info=True)
-
-
-class _Noop:
-    """Same surface as :class:`_Capture`; all setters drop on the floor."""
-
-    def set_input(self, prompt: Any) -> None: ...
-    def set_output(self, output: Any) -> None: ...
-    def set_tokens(self, input_tokens: int | None, output_tokens: int | None) -> None: ...
-    def set_output_from_anthropic(self, response: Any) -> None: ...
-    def set_output_from_openai(self, response: Any) -> None: ...
-
-    extra: dict[str, Any] = {}
+                message = getattr(choices[0], "message", None)
+                self.completion_chars = self._size(getattr(message, "content", None))
+        except Exception:  # noqa: BLE001 - see the class docstring
+            logger.debug("llm tracing: unreadable openai response shape", exc_info=True)
 
 
 @contextmanager
 def trace_generation(
+    *,
     provider: str,
     model: str,
     distinct_id: str | None = None,
-    parent_trace_id: str | None = None,
-) -> Iterator[Any]:
-    """Wrap an LLM call and emit one ``$ai_generation`` event on exit.
-
-    Yields a capture object; the caller fills it in from the response.
-    Disabled state yields a :class:`_Noop`. Exceptions in the wrapped
-    block are re-raised after emitting an error variant of the event.
-    """
-    pc = get_posthog()
-    if not pc.enabled:
-        yield _Noop()
-        return
-
-    cap = _Capture()
-    trace_id = parent_trace_id or uuid.uuid4().hex
-    started = time.perf_counter()
-    error: BaseException | None = None
+) -> Iterator[_Capture]:
+    """Time one LLM call and emit its record. Re-raises whatever the call raises."""
+    capture = _Capture()
+    started = time.monotonic()
+    error_type: str | None = None
     try:
-        yield cap
+        yield capture
     except BaseException as exc:
-        error = exc
+        error_type = type(exc).__name__
         raise
     finally:
-        latency_s = time.perf_counter() - started
-        props: dict[str, Any] = {
-            "$ai_provider": provider,
-            "$ai_model": model,
-            "$ai_trace_id": trace_id,
-            "$ai_latency": latency_s,
+        fields: dict[str, Any] = {
+            "event": "llm_generation",
+            "provider": provider,
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "input_tokens": capture.input_tokens,
+            "output_tokens": capture.output_tokens,
+            "prompt_chars": capture.prompt_chars,
+            "completion_chars": capture.completion_chars,
+            "is_error": error_type is not None,
+            **capture.extra,
         }
-        if cap.input_tokens is not None:
-            props["$ai_input_tokens"] = cap.input_tokens
-        if cap.output_tokens is not None:
-            props["$ai_output_tokens"] = cap.output_tokens
-        if pc.llm_payloads_enabled:
-            # PostHog drops events past its per-event ingest size limit
-            # (~32 KB by default; the SDK does not chunk and 413 responses
-            # are best-effort log lines only — oversized captures land on
-            # the floor with no signal). Agnes prompts routinely include
-            # sample rows / table schemas / analyst SQL that exceed this
-            # limit, which is *exactly* when an operator wants to inspect
-            # them. Truncate so the metadata (provider, model, tokens,
-            # latency, error) keeps flowing while bounding payload size.
-            # PR #231 review (minasarustamyan).
-            #
-            # Cap is overridable via ``POSTHOG_LLM_PAYLOAD_MAX_CHARS``; the
-            # default of 30_000 leaves headroom under the 32 KB ceiling
-            # for the rest of the event envelope.
-            cap_chars = _llm_payload_cap()
-            if cap.prompt is not None:
-                props["$ai_input"] = _truncate(cap.prompt, cap_chars)
-            if cap.output is not None:
-                props["$ai_output_choices"] = _truncate(cap.output, cap_chars)
-        for key, value in cap.extra.items():
-            props.setdefault(key, value)
-        if error is not None:
-            props["$ai_is_error"] = True
-            props["$ai_error"] = repr(error)
-
-        pc.capture("$ai_generation", distinct_id or "system", props)
+        if error_type is not None:
+            fields["error_type"] = error_type
+        if distinct_id:
+            fields["user_id"] = distinct_id
+        try:
+            logger.info("llm generation", extra=fields)
+        except Exception:  # noqa: BLE001 - instrumentation never fails the call
+            logger.debug("llm tracing: could not emit the generation record", exc_info=True)

@@ -142,7 +142,7 @@ This clears `session_processor_state` rows for `processor_name IN ('usage', 'mar
   > - It does **not** remove previously-uploaded sessions from the server. Once a session reaches the server, the `UsageProcessor` will extract its events and admins can access it via `/admin/users/<id>/sessions`.
   > - If you need to redact a previously-uploaded session, contact your operator — they can delete the JSONL from `${SESSION_DATA_DIR}/<user>/` **and** run `agnes admin usage reprocess` to wipe extracted events.
 - **Audit log**: every admin action, every telemetry export, and every `agnes admin ask` query is written to `audit_log`. Visible at `/admin/activity`.
-- **PostHog (optional)**: opt-in via `POSTHOG_API_KEY`. Sends backend exceptions, frontend errors, and masked session replay (sensitive CSS selectors auto-masked). LLM payloads are off by default — set `POSTHOG_LLM_PAYLOADS=1` to enable.
+- **Structured logs**: one JSON object per line on stdout (`severity`, `message`, `time`, `service`, `env`, `request_id`), so whatever already collects the container's output can filter them. No telemetry account to configure — see [`observability.md`](observability.md).
 
 ## 7. Operator daily routine
 
