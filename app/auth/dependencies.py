@@ -236,7 +236,7 @@ def _stash_chat_session_id_from_token(request: Optional[Request], token: str) ->
 def _stash_user(request: Optional[Request], user: dict) -> dict:
     """Park the resolved user on ``request.state.user``.
 
-    Read by response-phase middleware (e.g. the PostHog snippet injector
+    Read by response-phase middleware (e.g. the unhandled-exception handler
     and the 500 handler) so they can identify the actor without re-running
     the auth dependency. Tolerant of ``None`` requests (background paths
     that call this helper from non-HTTP contexts).

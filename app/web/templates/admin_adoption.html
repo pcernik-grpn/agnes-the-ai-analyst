@@ -7,15 +7,16 @@
 {% set page_hero_subtitle = "How the system is really being used — active users, time spent, skills, and sessions. The cards reflect the selected window; trends below always cover the last 30 days." %}
 
 {% block head_extra %}
+{# The design-system dropdown is a stylesheet AND a script: without the
+   script the custom control renders, opens, and quietly does nothing,
+   because it is the script that pushes a pick onto the paired <select>. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <style>
 /* Page-local component styles. Mirrors the .obs-* family from
    admin_usage.html, re-pointed at --ds-* design tokens. */
 .adopt{ font: 14px/1.5 var(--ds-font); color: var(--ds-text-primary); }
 
-.adopt-window{ display:inline-flex; border:1px solid var(--ds-border); border-radius:999px; overflow:hidden; }
-.adopt-window button{ border:0; padding:7px 16px; font:inherit; font-size:13px; background:var(--ds-surface);
-  color:var(--ds-text-secondary); cursor:pointer; }
-.adopt-window button.is-active{ background:var(--ds-primary); color:#fff; font-weight:600; }
 
 .obs-kpis{ display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:8px; }
 @media(max-width:1100px){ .obs-kpis{ grid-template-columns:repeat(3,1fr); } }
@@ -65,10 +66,28 @@
 {% endblock %}
 
 {% block toolbar %}
-<div class="adopt-window" id="adoptWindow" role="tablist" aria-label="Time window">
-  <button type="button" role="tab" aria-selected="false" data-win="24h">24h</button>
-  <button type="button" role="tab" aria-selected="true" class="is-active" data-win="7d">7d</button>
-  <button type="button" role="tab" aria-selected="false" data-win="30d">30d</button>
+<div class="apg-timerange">
+  <span class="apg-timerange__label">Time range</span>
+  {# The real <select> is what the JS reads and listens on; the `ds.dropdown`
+     beside it is a visual replacement only, and which of the two is visible is
+     a theme decision (paper-skin.css). Deliberately NOT wrapped in a <label>:
+     a click on the dropdown button would also fire the browser's implicit
+     label-to-control forwarding onto the now-hidden native select. Same
+     construction and same reasoning as the Audit log's own control. #}
+  <select id="adoptWindow" class="ds-dropdown-native" aria-label="Time range">
+    <option value="24h">Last 24h</option>
+    <option value="7d" selected>Last 7d</option>
+    <option value="30d">Last 30d</option>
+  </select>
+  {{ ds.dropdown(
+    id='adoptWindow-dd', target='adoptWindow',
+    aria_label='Time range', selected='7d',
+    options=[
+      {'value': '24h', 'label': 'Last 24h'},
+      {'value': '7d', 'label': 'Last 7d'},
+      {'value': '30d', 'label': 'Last 30d'},
+    ],
+  ) }}
 </div>
 {% endblock %}
 
@@ -238,14 +257,8 @@
 
   // ── wiring ─────────────────────────────────────────────────
   function refreshWindowed(){ loadKpis().catch(()=>{}); loadSkills().catch(()=>{}); loadUsers().catch(()=>{}); }
-  $('adoptWindow').addEventListener('click', e=>{
-    const btn = e.target.closest('button'); if(!btn) return;
-    [...e.currentTarget.children].forEach(x=>{
-      const selected = x===btn;
-      x.classList.toggle('is-active', selected);
-      x.setAttribute('aria-selected', selected ? 'true' : 'false');
-    });
-    state.window = btn.dataset.win;
+  $('adoptWindow').addEventListener('change', e=>{
+    state.window = e.currentTarget.value;
     refreshWindowed();
   });
   let searchTimer;

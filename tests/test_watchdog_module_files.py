@@ -55,10 +55,10 @@ def test_watchdog_checks_incident_signatures():
 def test_watchdog_label_precedence_and_webhook_optional():
     sh = (FILES / "agnes-watchdog.sh").read_text()
     # Environment label: explicit override > module-written stage >
-    # POSTHOG_ENVIRONMENT (when the deployment sets it) > hostname.
+    # AGNES_DEPLOYMENT_ENV (when the deployment sets it) > hostname.
     assert "ENV_LABEL" in sh
     assert "ENV_STAGE" in sh
-    assert "POSTHOG_ENVIRONMENT" in sh
+    assert "AGNES_DEPLOYMENT_ENV" in sh
     # Empty webhook must mean log-only, not a crash.
     assert 'WEBHOOK_URL="${WEBHOOK_URL:-}"' in sh
     # Anti-spam hash must cover only the alert-type prefixes, one per line:

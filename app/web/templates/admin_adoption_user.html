@@ -7,16 +7,17 @@
 {% set page_hero_subtitle = "Per-user adoption — time spent, sessions, skills, and tools." %}
 
 {% block head_extra %}
+{# The design-system dropdown is a stylesheet AND a script: without the
+   script the custom control renders, opens, and quietly does nothing,
+   because it is the script that pushes a pick onto the paired <select>. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <style>
 .adopt{ font: 14px/1.5 var(--ds-font); color: var(--ds-text-primary); }
 .adopt-bar{ display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 .adopt-back{ color:var(--ds-primary-dark); text-decoration:none; font-size:13px; }
 .adopt-back:hover{ text-decoration:underline; }
 
-.adopt-window{ display:inline-flex; border:1px solid var(--ds-border); border-radius:999px; overflow:hidden; }
-.adopt-window button{ border:0; padding:7px 16px; font:inherit; font-size:13px; background:var(--ds-surface);
-  color:var(--ds-text-secondary); cursor:pointer; }
-.adopt-window button.is-active{ background:var(--ds-primary); color:#fff; font-weight:600; }
 
 .obs-kpis{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:8px; }
 @media(max-width:1100px){ .obs-kpis{ grid-template-columns:repeat(3,1fr); } }
@@ -66,10 +67,25 @@
 {% block toolbar %}
 <div class="adopt-bar">
   <a class="adopt-back" href="/admin/adoption">← Adoption</a>
-  <div class="adopt-window" id="adoptWindow" role="tablist" aria-label="Time window">
-    <button type="button" role="tab" aria-selected="false" data-win="24h">24h</button>
-    <button type="button" role="tab" aria-selected="true" class="is-active" data-win="7d">7d</button>
-    <button type="button" role="tab" aria-selected="false" data-win="30d">30d</button>
+  <div class="apg-timerange">
+    <span class="apg-timerange__label">Time range</span>
+    {# See the note on the same control in admin_adoption.html — the native
+       select is what the JS reads; the dropdown beside it is the visible one
+       under the paper skin, and neither is wrapped in a <label>. #}
+    <select id="adoptWindow" class="ds-dropdown-native" aria-label="Time range">
+      <option value="24h">Last 24h</option>
+      <option value="7d" selected>Last 7d</option>
+      <option value="30d">Last 30d</option>
+    </select>
+    {{ ds.dropdown(
+      id='adoptWindow-dd', target='adoptWindow',
+      aria_label='Time range', selected='7d',
+      options=[
+        {'value': '24h', 'label': 'Last 24h'},
+        {'value': '7d', 'label': 'Last 7d'},
+        {'value': '30d', 'label': 'Last 30d'},
+      ],
+    ) }}
   </div>
 </div>
 {% endblock %}
@@ -197,14 +213,9 @@
   }
 
   function refreshWindowed(){ loadKpis().catch(()=>{}); loadSkills().catch(()=>{}); loadTools().catch(()=>{}); }
-  $('adoptWindow').addEventListener('click', e=>{
-    const btn=e.target.closest('button'); if(!btn) return;
-    [...e.currentTarget.children].forEach(x=>{
-      const selected = x===btn;
-      x.classList.toggle('is-active', selected);
-      x.setAttribute('aria-selected', selected ? 'true' : 'false');
-    });
-    state.window=btn.dataset.win; refreshWindowed();
+  $('adoptWindow').addEventListener('change', e=>{
+    state.window = e.currentTarget.value;
+    refreshWindowed();
   });
 
   // Hydrate the avatar circle from the shared helper. Runs on
