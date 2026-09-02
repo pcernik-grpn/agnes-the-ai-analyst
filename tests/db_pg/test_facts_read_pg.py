@@ -2557,6 +2557,166 @@ def test_no_facet_types_requested_is_an_empty_result_not_a_full_scan(pg_env, rep
     assert repo.facet_values(_dict_user("uploader1"), types=[]) == {}
 
 
+# ---------------------------------------------------------------------------
+# facet_values_for_collections — which values each Library ROW carries
+# (TCRD-250 piece 4). The menu's vocabulary is `facet_values` above; this is
+# the per-row half the toolbar slices on.
+# ---------------------------------------------------------------------------
+
+
+def _seed_client(repo, *, corpus_id, file_id, sha, natural_key, fact_type="client", attributed=True):
+    fact_id = repo.create_fact(type=fact_type)
+    repo.add_alias(
+        fact_id=fact_id,
+        type=fact_type,
+        natural_key=natural_key,
+        corpus_id=corpus_id if attributed else None,
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256=sha,
+        quote=f"{natural_key} appears in {file_id}.",
+        attrs={},
+    )
+    return fact_id
+
+
+def test_collection_facets_group_values_under_the_collection_that_evidences_them(pg_env, repo):
+    """The Library renders one row per collection; a value on the wrong row
+    filters the reader to a collection that never mentions it."""
+    _seed_full_fixture()
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="N.B. Handy")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert out == {CORPUS_A: {"client": ["Parts Authority"]}, CORPUS_B: {"client": ["N.B. Handy"]}}
+
+
+def test_a_collection_carries_every_value_its_documents_name(pg_env, repo):
+    """`multi` on the facet: a collection is about as many clients as its
+    files name, and picking either one must keep the row."""
+    _seed_full_fixture()
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2", sha256="sha2")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a2", sha="sha2", natural_key="N.B. Handy")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"])
+    assert out[CORPUS_A]["client"] == ["N.B. Handy", "Parts Authority"], "sorted, both kept"
+
+
+def test_collection_facets_separate_the_types(pg_env, repo):
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(
+        repo,
+        corpus_id=CORPUS_A,
+        file_id="cf_a1",
+        sha="sha1",
+        natural_key="Logistics",
+        fact_type="industry",
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client", "industry"])
+    assert out[CORPUS_A] == {"client": ["Parts Authority"], "industry": ["Logistics"]}
+
+
+def test_collection_facets_are_caller_scoped(pg_env, repo):
+    """S1 applied to the row attributes. Fails if a caller with no grant on
+    the collection can read what it is about off the filter menu — the same
+    existence oracle `facet_values` closes, one surface down."""
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.facet_values_for_collections(_dict_user("alice"), [CORPUS_A], types=["client"]) == {}
+
+
+def test_an_unreadable_collection_in_the_id_list_contributes_nothing(pg_env, repo):
+    """The page passes every id it is rendering; one the caller cannot read
+    must drop out rather than widen what the repo answers."""
+    _seed_full_fixture()
+    _seed_uploader("uploader2")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader2")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="Secret Client")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert set(out) == {CORPUS_A}, "uploader1 owns A only"
+    assert "Secret Client" not in str(out)
+
+
+def test_a_collection_the_graph_says_nothing_about_is_absent_not_empty(pg_env, repo):
+    """`.get(corpus_id, {})` is the page's read; an entry of empty dicts per
+    collection would cost a graph-less instance a dict per row for nothing."""
+    _seed_full_fixture()
+    assert repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"]) == {}
+
+
+def test_no_ids_or_no_types_is_an_empty_result_not_a_full_scan(pg_env, repo):
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    u = _dict_user("uploader1")
+    assert repo.facet_values_for_collections(u, [], types=["client"]) == {}
+    assert repo.facet_values_for_collections(u, [CORPUS_A], types=[]) == {}
+
+
+def test_collection_facets_fall_back_to_the_opaque_id_for_an_unattributed_alias(pg_env, repo):
+    """Same rule as `facet_values`: a label whose provenance the caller
+    cannot read is itself evidence, so the row carries the id instead. Looks
+    like a bug, is a leak if 'fixed'."""
+    _seed_full_fixture()
+    fact_id = _seed_client(
+        repo,
+        corpus_id=CORPUS_A,
+        file_id="cf_a1",
+        sha="sha1",
+        natural_key="Unattributed Client",
+        attributed=False,
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"])
+    assert out[CORPUS_A]["client"] == [fact_id]
+
+
+def test_endpoint_only_visibility_does_not_attribute_a_subject_to_a_collection(pg_env, repo):
+    """A subject reachable only through an incident edge earns a place in the
+    MENU (`facet_values` lists it) but must not label a row: saying "this
+    collection is about X" on evidence the caller cannot open is a claim the
+    page cannot support."""
+    _seed_full_fixture()
+    _seed_uploader("uploader2")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader2")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    # The subject's only OWN claim sits in the collection uploader1 cannot read.
+    hidden = _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="Hidden Client")
+    # ...while a readable edge claim in CORPUS_A reveals it to search().
+    other = repo.create_fact(type="client")
+    edge_id = repo.create_edge(src=other, type="mentions", dst=hidden)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="An edge claim readable to uploader1.",
+        attrs={},
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert "Hidden Client" not in str(out)
+    assert hidden not in str(out.get(CORPUS_A, {}))
+
+
 def test_an_unattributed_alias_falls_back_to_the_opaque_id(pg_env, repo):
     """An alias with no recorded corpus is admin-only-visible — the same rule
     `search()` applies. A facet must then show the id rather than invent a

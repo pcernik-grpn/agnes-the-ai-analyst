@@ -93,6 +93,161 @@ def test_facts_section_absent_when_zero_facts_on_pg(seeded_app_both, state_backe
 
 
 # ---------------------------------------------------------------------------
+# Library entity facets — Client / Industry / Offering / Document type
+# (TCRD-250 piece 4). The absence contract is asserted on BOTH backends, the
+# content on PG only, matching this module's own convention above.
+# ---------------------------------------------------------------------------
+
+
+def _seed_entity(corpus_id: str, file_id: str, fact_type: str, label: str) -> str:
+    from src.repositories import facts_repo
+
+    fact_id = facts_repo().create_fact(type=fact_type)
+    facts_repo().add_alias(fact_id=fact_id, type=fact_type, natural_key=label, corpus_id=corpus_id)
+    facts_repo().add_claim(
+        fact_id=fact_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256="sha_a.md",
+        quote=f"{label} appears in this document.",
+    )
+    return fact_id
+
+
+def test_library_entity_facets_absent_when_flag_off(seeded_app_both):
+    """Default instance: no graph, so no Client category — and, critically,
+    no dangling `data-client` attribute on a row either. A row carrying a
+    facet the menu does not offer is how a filter that matches nothing gets
+    shipped."""
+    s = seeded_app_both
+    corpus_id = _new_corpus("Facetless", "facetless")
+    _new_file(corpus_id)
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert 'data-cat="client"' not in r.text
+    assert "data-client=" not in r.text
+
+
+def test_library_entity_facets_absent_on_duckdb_even_with_flag_on(seeded_app_both, state_backend, monkeypatch):
+    """The facts repo is PG-only under the A3 ratchet; the flag alone must
+    not surface a category the backend cannot answer."""
+    if state_backend != "duckdb":
+        pytest.skip("DuckDB-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Duck Facets", "duck-facets")
+    _new_file(corpus_id)
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert 'data-cat="client"' not in r.text
+    assert "data-client=" not in r.text
+
+
+def test_library_entity_facets_render_from_the_graph_on_pg(seeded_app_both, state_backend, monkeypatch):
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Client Work", "client-work")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+    _seed_entity(corpus_id, file_id, "industry", "Logistics")
+    _seed_entity(corpus_id, file_id, "service_offering", "Warehouse migration")
+    _seed_entity(corpus_id, file_id, "doc_type", "sow")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    for cat in ("client", "industry", "offering", "doctype"):
+        assert f'data-cat="{cat}"' in r.text, f"{cat} category missing from the filter menu"
+    # The menu offers the value...
+    assert 'data-facet="client" value="Parts Authority"' in r.text
+    # ...and the row carries it, which is what makes the filter bite.
+    assert 'data-client="Parts Authority"' in r.text
+    assert 'data-doctype="sow"' in r.text
+
+
+def test_library_entity_facet_values_are_caller_scoped(seeded_app_both, state_backend, monkeypatch):
+    """The filter menu must not become the existence oracle the read path
+    closes: a caller with no grant on the collection sees neither the value
+    nor a row carrying it."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Secret Work", "secret-work", created_by="admin1")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Undisclosed Bank")
+
+    r = s["client"].get("/library", headers=_headers(s["analyst_token"]))
+    assert r.status_code == 200
+    assert "Undisclosed Bank" not in r.text
+
+
+def test_a_label_containing_the_separator_stays_filterable(seeded_app_both, state_backend, monkeypatch):
+    """`|` separates a `multi` facet's values on the row. A label carrying
+    one would split into junk while the menu offered it whole — a filter
+    that matches nothing, on data nobody controls. The row and the option
+    must agree, whatever the label."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Piped", "piped")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Smith | Sons")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    row = _re.search(r'data-client="([^"]*)"', r.text)
+    assert row and "|" not in row.group(1), "a raw pipe on the row splits the value"
+    offered = _re.findall(r'data-facet="client" value="([^"]*)"', r.text)
+    assert offered == [row.group(1)], "the menu must offer exactly what the row carries"
+
+
+def test_the_type_map_is_not_on_the_library(seeded_app_both, state_backend, monkeypatch):
+    """The node-type counts describe what was pulled OUT of documents, which is
+    a setup question — did the crawl work, what did it find — asked by whoever
+    configured extraction. On the Library they headed a page whose reader wants
+    their documents, and their chips were a filter-shaped control that only
+    opened a menu. The vocabulary reaches analysts as entity facets instead."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("No Map", "no-map")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+
+    r = s["client"].get("/library", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert "What the graph knows" not in r.text
+    assert 'id="lib-typemap"' not in r.text
+    # …while the vocabulary it described is still reachable, as a filter.
+    assert 'data-facet="client" value="Parts Authority"' in r.text
+
+
+def test_the_type_map_is_on_the_ontology_admin_page(seeded_app_both, state_backend, monkeypatch):
+    """Where the counts are actionable: the reader configuring extraction, next
+    to the controls that fix a bad number."""
+    if state_backend != "pg":
+        pytest.skip("PG-only assertion")
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    s = seeded_app_both
+    corpus_id = _new_corpus("Mapped", "mapped")
+    file_id = _new_file(corpus_id)
+    _seed_entity(corpus_id, file_id, "client", "Parts Authority")
+
+    r = s["client"].get("/admin/ontology", headers=_admin_headers(s))
+    assert r.status_code == 200
+    assert "What this ontology has extracted" in r.text
+    assert ">client<" in r.text
+    # Static: this page has no list for a type to narrow, so a chip that looked
+    # clickable would promise a filter that does not exist here.
+    assert "?type=client" not in r.text
+    assert "tmap-chip--static" in r.text
+
+
+# ---------------------------------------------------------------------------
 # Collection detail — facts section content + caller scoping (PG only).
 # ---------------------------------------------------------------------------
 
@@ -477,6 +632,7 @@ def test_library_card_fact_counts_do_not_grow_with_the_number_of_collections(
         "the readable set must be resolved a fixed number of times per page, "
         f"not once per card (4 collections -> {n4} resolutions, 8 -> {n8})"
     )
+
 
 def test_library_card_fact_count_zero_for_ungranted_caller(seeded_app_both, state_backend, monkeypatch):
     """A caller who cannot reach a collection at all never sees its row —

@@ -40571,7 +40571,7 @@
         ]
       },
       "get": {
-        "description": "Return a collection's metadata + file list.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.",
+        "description": "Return a collection's metadata + a bounded preview of its files.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.\n\n``files`` is capped at ``DEFAULT_FILE_LIST_LIMIT`` (oldest-first, the\nordering this endpoint always used) \u2014 ``files_total`` is the collection's\nreal file count and ``files_truncated`` says whether ``files`` is the\nwhole thing or a preview of it. A caller that needs the rest, or wants to\nsearch/paginate/filter, uses ``GET /{collection_id}/files``.",
         "operationId": "get_collection_api_collections__collection_id__get",
         "parameters": [
           {
@@ -40705,7 +40705,7 @@
     },
     "/api/collections/{collection_id}/files": {
       "get": {
-        "description": "List all files in a collection (all processing statuses).",
+        "description": "List files in a collection (all processing statuses) \u2014 paginated,\noptionally filtered by filename/path substring (``q``) and/or exact\n``processing_status`` (``status``), in ``order`` (``newest`` here by\ndefault \u2014 the dashboard's most useful default; see\n``corpus_files_repo().list_for_corpus`` for the full set and its\n``, id ASC`` tie-break).\n\n``limit``/``offset`` are clamped, never rejected \u2014 see\n``_clamp_file_list_limit``/``_clamp_file_list_offset``. A blank ``q`` or\n``status`` (``?q=``, what every HTML form sends for an unset optional)\nmeans \"no filter\", exactly like the ``corpus_id`` handling in\n``search_collections`` above.\n\n``total`` is the row count AFTER the ``q``/``status`` filters and BEFORE\n``limit``/``offset`` \u2014 the number of matches a caller paging through\n``q`` can trust, not the collection's whole file count.",
         "operationId": "list_files_api_collections__collection_id__files_get",
         "parameters": [
           {
@@ -40714,6 +40714,68 @@
             "required": true,
             "schema": {
               "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "newest",
+              "title": "Order",
               "type": "string"
             }
           },
@@ -62520,6 +62582,48 @@
               "default": 1,
               "title": "Facts Page",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "files_page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Files Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           },
           {

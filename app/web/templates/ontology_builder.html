@@ -95,6 +95,7 @@
   .ont-toast.ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border: 1px solid var(--ds-accent-success-line); }
   .ont-toast.fail { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); border: 1px solid var(--ds-accent-danger-line); }
 </style>
+<link rel="stylesheet" href="{{ static_url('css/type_map.css') }}">
 {% endblock %}
 
 {% block toolbar %}
@@ -105,6 +106,20 @@
 {% endblock %}
 
 {% block page %}
+{# What the extraction pass actually produced — the answer to "did the crawl
+   work, and what did it find", on the page of the person who configured it.
+   It used to head the Library, where it answered a question no analyst was
+   asking: a reader there wants their documents, while these counts describe
+   what was pulled OUT of documents.
+
+   Static chips, no `base_url`: on the Library each type was a way in to a
+   filter, and this page has no list for one to narrow. A number that looks
+   clickable and is not is worse than a number. #}
+{% if library_type_map %}
+{% from "macros/_type_map.html" import type_map %}
+{{ type_map(library_type_map, library_type_map | sum(attribute="count"),
+            heading='What this ontology has extracted') }}
+{% endif %}
 {% if not facts_enabled %}
 <div class="ont-empty">
   The ontology builder is part of the fact-graph feature, which is off on this instance

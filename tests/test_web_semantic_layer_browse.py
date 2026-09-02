@@ -1102,23 +1102,29 @@ class TestObjectDetailLegacyTheme:
 
 class TestLibraryEntryPoint:
     """Inbound-link guard, same bug class ``tests/test_web_nav_agents.py``
-    guards against: a route is not a shipped page until something links to
-    it. `/semantic-layer` is not a rail row (design-system.md's rail is
-    fixed rows; a new content surface reaches the caller through an existing
-    destination) — the Library's own "Semantic models" section is where it
-    hangs, for both admin and non-admin (this is a read-tier page, not
-    admin-only). Each readable model is a ROW linking to its own detail page
-    (#1707 N3), so a caller who can read none is offered no model link at all
-    and never dead-ends on the "No semantic model available" empty state
-    (Devin #1398)."""
+    guards against: a route is not a shipped page until something links to it.
+    `/semantic-layer` is not a rail row (design-system.md's rail is fixed rows;
+    a new content surface reaches the caller through an existing destination),
+    so the Library is where it hangs — for both admin and non-admin, since this
+    is a read-tier page and not admin-only.
+
+    WHERE it hangs changed. #1707 N3 hung it on per-model ROWS in a "Semantic
+    models" section, which meant a caller who could read no document was
+    offered no link at all (Devin #1398 — correct, given rows). The layer is
+    now a page-level Definitions row whose door is the flat registry, so the
+    link no longer depends on document readability: everyone with definitions
+    gets in, and the models are one tab away once they are there. The negative
+    guard survives in the form that still means something — no MODEL link for
+    a caller who cannot read that model."""
 
     def test_semantic_layer_linked_from_library_for_non_admin_with_a_grant(self, seeded_app):
         row = _seed_model()
         _grant_model(row["id"])
+        _seed_metric()
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer/retail"' in r.text
+        assert 'class="lib-defs__cta" href="/semantic-layer' in r.text
 
     def test_no_link_for_a_non_admin_who_can_read_no_model(self, seeded_app):
         """Devin #1398: the footer link is gated on readability, so a caller
@@ -1147,7 +1153,7 @@ class TestLibraryEntryPoint:
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer/retail"' in r.text
+        assert 'class="lib-defs__cta" href="/semantic-layer' in r.text
 
 
 class TestRegistryBackLink:
@@ -1435,29 +1441,74 @@ class TestFlatProjectionTabsFold:
 
 
 class TestLibrarySemanticSection:
-    """N3 (issue #1707): the semantic layer is a NAMED Library section.
+    """The semantic layer is NOT a Library section any more — it is a row.
 
-    It used to be a footer aside below an unbounded list — the last thing on
-    the page, after every row, which is where a reader stops looking. It is
-    now one of the Library's own sections, in a fixed slot of the section
-    order, carrying the caller's readable models as rows and the two flat
-    projections as links into their tabs.
+    #1707 N3 made it one: a named section in a fixed slot, carrying the
+    caller's readable models as rows. That was right about the footer aside it
+    replaced (the last thing on an unbounded page, where a reader stops
+    looking) and wrong about the section, for a reason the section could not
+    express.
+
+    A semantic model is not opt-in. ``src/claude_md.py`` writes every model the
+    caller can read into the workspace document at session start, visibility
+    comes from Data Package grants, and there is no ``semantic_model`` type in
+    the Stack — so no "Add to my agents" exists for one. Every OTHER row in the
+    Library has that opt-in state, and it is the defining property of the
+    region. A block that is always on, sitting among rows whose whole point is
+    that you chose them, reads as a member of a set it is not in.
+
+    So it is stated once, above the toolbar, as a page-level row — and the
+    models are listed by ``/semantic-layer``'s own Models tab, which can show
+    their object counts, dialects and validation status. The tests below pin
+    that inversion, and the two #1955 description-fallback tests move with it:
+    the fallback still matters, it just has to be asserted where the model is
+    rendered now.
     """
 
-    def test_the_section_is_named_and_carries_its_models_as_rows(self, seeded_app):
+    def test_the_layer_is_not_a_section_and_carries_no_model_rows(self, seeded_app):
         row = _seed_model()
         _grant_model(row["id"])
         body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert 'data-lib-sec="semantic_model"' in body
-        assert "Semantic models" in body
-        assert 'href="/semantic-layer/retail"' in body
+        assert 'data-lib-sec="semantic_model"' not in body
+        assert 'href="/semantic-layer/retail"' not in body, (
+            "a model is listed by /semantic-layer's Models tab, not as a Library row"
+        )
+
+    def test_the_definitions_row_is_there_instead(self, seeded_app):
+        _seed_metric()
+        _seed_model()
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        assert 'id="lib-defs"' in body
+        # Above the toolbar, not among the rows: it has no opt-in state, so it
+        # cannot belong to the region whose rows are defined by having one.
+        assert body.index('id="lib-defs"') < body.index('id="lib-item-count"')
+
+    def test_the_row_states_the_counts_and_opens_them(self, seeded_app):
+        """The counts are the only part of the block that is a fact about THIS
+        instance rather than about the product, so they stay visible; the door
+        lands on the tab they name."""
+        _seed_metric()
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        counts = body.split('class="lib-defs__counts"', 1)[1].split("</span>", 1)[0]
+        assert "metric" in counts
+        assert 'class="lib-defs__cta" href="/semantic-layer?tab=all_metrics"' in body
+        assert "/catalog/semantics" not in body, "the retired URL is a 308, never a link"
+
+    def test_the_row_appears_with_definitions_but_no_readable_model(self, seeded_app):
+        """A caller with visible metrics but no readable document still needs
+        the door — the flat projection is what they can reach."""
+        _seed_metric()
+        _seed_model()  # no grant for this analyst
+        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
+        assert 'id="lib-defs"' in body
+        assert "/semantic-layer?tab=all_metrics" in body
+        assert 'href="/semantic-layer/retail"' not in body
 
     def test_imported_model_with_a_blank_row_description_falls_back_to_the_document(self, seeded_app):
-        """#1955: a row whose own ``description`` column is blank (every
-        model a sync wrote before the import-time projection existed, or one
-        written by a sync path outside it) used to render with no subtitle
-        even though its document carries a description. The Library row
-        falls back to the document's own model-level description."""
+        """#1955, asserted where the model is rendered now. A row whose own
+        ``description`` column is blank (every model a sync wrote before the
+        import-time projection existed) used to render with no subtitle even
+        though its document carries one."""
         doc = {
             "semantic_model": [
                 {
@@ -1468,13 +1519,12 @@ class TestLibrarySemanticSection:
             ]
         }
         _seed_document("kb_retail", doc, source="keboola_metastore")
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
         assert "Imported from Keboola: retail domain." in body
 
     def test_a_rows_own_description_is_not_overridden_by_the_document(self, seeded_app):
         """The row's own ``description`` column wins when both exist — the
-        fallback is only for a blank column, never a silent override of a
-        value the row already carries."""
+        fallback is only for a blank column, never a silent override."""
         from src.repositories import semantic_model_repo
 
         row = _seed_model()  # stored description: "Retail domain: orders and customers."
@@ -1488,34 +1538,6 @@ class TestLibrarySemanticSection:
             content_hash=row["content_hash"],
             validated_at=None,
         )
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
+        body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
         assert "Hand-edited row description." in body
         assert "Retail domain: orders and customers." not in body
-
-    def test_the_footer_aside_is_gone(self, seeded_app):
-        _seed_metric()
-        _seed_model()
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
-        assert 'class="lib-defs"' not in body, "the Definitions aside was promoted to a section"
-
-    def test_the_section_links_at_the_folded_tabs_not_the_old_url(self, seeded_app):
-        _seed_metric()
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
-        assert "/semantic-layer?tab=all_metrics" in body
-        assert "/semantic-layer?tab=all_glossary" in body
-        assert "/catalog/semantics" not in body
-
-    def test_a_model_the_caller_cannot_read_is_not_a_row(self, seeded_app):
-        _seed_model()  # no grant for this analyst
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert 'href="/semantic-layer/retail"' not in body
-
-    def test_the_section_still_appears_with_definitions_but_no_readable_model(self, seeded_app):
-        """A caller with visible metrics but no readable document still needs
-        the door — the flat projection is what they can reach."""
-        _seed_metric()
-        _seed_model()
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert "Semantic models" in body
-        assert "/semantic-layer?tab=all_metrics" in body
-        assert 'href="/semantic-layer/retail"' not in body
