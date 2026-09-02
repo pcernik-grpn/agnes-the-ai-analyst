@@ -86,6 +86,15 @@ def _chain_ids_missing_from_manifest(script, manifest_ids: list[str]) -> list[st
 # ---------------------------------------------------------------------------
 
 
+def _resolves(script, revision_id: str) -> bool:
+    """Whether `ScriptDirectory` still knows this id — the same question the
+    ratchet above asks, reused so the two cannot drift."""
+    try:
+        return script.get_revision(revision_id) is not None
+    except Exception:
+        return False
+
+
 def test_every_manifest_id_still_resolves_in_the_live_chain():
     """A renumbered or deleted shipped id must fail loudly, not silently."""
     script = _script_directory()
@@ -182,3 +191,60 @@ def test_ratchet_manifest_ids_are_unique():
     duplicates = sorted({rev_id for rev_id in manifest_ids if manifest_ids.count(rev_id) > 1})
 
     assert not duplicates, f"duplicate id(s) in {MANIFEST_PATH.relative_to(REPO_ROOT)}: {duplicates}"
+
+
+# ---------------------------------------------------------------------------
+# (c) the repair map's own shape. `RENUMBERED_REVISION_REPAIRS` is read by
+# `ensure_pg_at_head()`, which runs DDL and re-stamps `alembic_version` at
+# BOOT. Nothing checked that the map's ids line up with the chain and the
+# manifest, and each way of getting one wrong misfires differently.
+# ---------------------------------------------------------------------------
+
+
+def test_a_repair_key_is_a_revision_the_chain_no_longer_has():
+    """The key is the STRANDED id — the string a database is stuck on because
+    that id was renumbered away.
+
+    A key that still resolves is not stranded at all, and the boot path would
+    then run a repair's DDL and re-stamp `alembic_version` on a database
+    sitting at a perfectly good revision. That is the one way to get this map
+    wrong that damages a healthy instance rather than failing to help a broken
+    one, so it is worth a guard of its own.
+    """
+    from src.db_pg import RENUMBERED_REVISION_REPAIRS
+
+    script = _script_directory()
+    resolvable = sorted(k for k in RENUMBERED_REVISION_REPAIRS if _resolves(script, k))
+    assert not resolvable, (
+        "these RENUMBERED_REVISION_REPAIRS keys still resolve in the current "
+        "chain, so they name revisions no database is stranded on — "
+        f"ensure_pg_at_head() would run their DDL against a healthy schema: {resolvable}"
+    )
+    for key in RENUMBERED_REVISION_REPAIRS:
+        assert key not in _parse_manifest(MANIFEST_PATH.read_text()), (
+            f"{key!r} is a stranded id and cannot resolve, so listing it in the "
+            "manifest would fail the resolve ratchet; it belongs only in the repair map"
+        )
+
+
+def test_a_repair_only_names_revisions_that_still_exist():
+    """Everything a repair APPLIES and the id it STAMPS TO must be part of the
+    current chain.
+
+    A stamp target that no longer resolves would move a stranded database from
+    one unknown id to another — stranding it again, this time with no entry to
+    recover it. An `apply` id that no longer resolves fails at boot, inside the
+    transaction, on an instance that is already broken.
+    """
+    from src.db_pg import RENUMBERED_REVISION_REPAIRS
+
+    script = _script_directory()
+    missing: dict = {}
+    for key, repair in RENUMBERED_REVISION_REPAIRS.items():
+        gone = [r for r in (*repair["apply"], repair["stamp"]) if not _resolves(script, r)]
+        if gone:
+            missing[key] = gone
+    assert not missing, (
+        "a repair may only reference revisions the current chain still has — "
+        f"otherwise it strands the database it was meant to rescue: {missing}"
+    )
