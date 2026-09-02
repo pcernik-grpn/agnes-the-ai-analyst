@@ -4869,9 +4869,14 @@ def _v37_to_v38_migrate(conn: duckdb.DuckDBPyConnection) -> None:
 # ``scope='everyone'``, ``requirement='required'``. The step stays exactly as
 # it shipped because this ladder is FROZEN (A3) and a DuckDB file that has
 # been through v39 has the column regardless — rewriting history here would
-# only make old files disagree with the code that migrated them. The
-# Postgres ladder dropped its copy in 0098; on DuckDB it lingers, unused and
-# always FALSE on any instance that upgraded past this.
+# only make old files disagree with the code that migrated them.
+#
+# The column is still PRESENT on both backends: dropping it is the contract
+# half of an expand/contract pair and ships in a later release (see 0098's
+# MID-FLIGHT note). A DuckDB instance's `is_system=TRUE` rows are converted
+# into the equivalent grant by
+# `src.system_plugin_reconcile.reconcile_system_plugin_flags`, which is the
+# frozen ladder's stand-in for 0098's step 4 — Alembic never runs here.
 _V38_TO_V39_MIGRATIONS = [
     "ALTER TABLE marketplace_plugins ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE",
     "UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system IS NULL",

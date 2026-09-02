@@ -11,14 +11,23 @@ check that isn't satisfied by Admin short-circuit.
 Two columns the Postgres sibling has and this one does not, because the
 DuckDB app-state ladder is frozen (A3): ``source`` (0096) and ``scope``
 (0097). Both are ACCEPTED and DROPPED by the write methods, so a caller
-never has to ask which backend is active. For ``scope`` that is not a
-silent loss of meaning: an everyone-grant is written against the carrier
-group (``src.grant_scopes.carrier_group_id`` — the seeded ``Everyone``),
-every account is auto-joined to it at creation, and the per-group reads
-below therefore already reach everyone. The one case the two backends
-answer differently is an account an admin has REMOVED from ``Everyone``:
-on Postgres the scope still reaches them, here it does not. Reads that are
-ABOUT the column rather than merely carrying it raise
+never has to ask which backend is active.
+
+``scope`` being dropped here IS a loss of meaning, and it is made up for
+with data rather than pretended away. An everyone-grant lands as an
+ordinary grant on the carrier group (``src.grant_scopes.carrier_group_id``
+— the seeded ``Everyone``), so reaching it here requires membership.
+``src.system_plugin_reconcile`` runs at boot on this backend and is the
+frozen ladder's stand-in for migration 0098: it makes that group genuinely
+hold every account, which is what makes the per-group reads below reach
+everyone. Until it has run — or if it soft-fails — they do not.
+
+What still differs afterwards: an account removed from the carrier group
+keeps everyone-scoped grants on Postgres and loses them here. No admin path
+can do that (``remove_member`` takes ``require_source='admin'`` and cannot
+strip a ``system_seed`` auto-join), so it takes direct SQL.
+
+Reads that are ABOUT the column rather than merely carrying it raise
 ``RequiresPostgresBackend`` instead of guessing.
 """
 

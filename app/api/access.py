@@ -925,27 +925,16 @@ async def create_grant(
             status_code=422,
             detail=f"resource_type {rt.value!r} does not take an everyone scope",
         )
+    # The CARRIER is an invariant, and it is enforced in the REPOSITORY
+    # (`ResourceGrantsPgRepository._carrier_or`) rather than here — this
+    # endpoint is not the only writer of an everyone-scoped grant, so an
+    # override at this one call site made the invariant true by coincidence
+    # rather than by construction. All that is left to do here is refuse
+    # early when there is no carrier to store the scope on, so the caller
+    # gets a 409 instead of a row whose `group_id` is their own guess.
+    if scope is not None and carrier_group_id() is None:
+        raise HTTPException(status_code=409, detail="everyone_carrier_group_missing")
     group_id = payload.group_id
-    if scope is not None:
-        # The CARRIER is an invariant, not the caller's choice. `group_id` is
-        # NOT NULL and means nothing on an everyone-scoped row, so whatever
-        # the caller sent is overridden with the one carrier every such row
-        # uses. Two reasons it has to be forced rather than trusted:
-        #
-        #   - UNIQUE (group_id, resource_type, resource_id) is what stops a
-        #     resource collecting two everyone-grants. Let callers pick the
-        #     group and the index guards nothing.
-        #   - `reports._NOT_SYSTEM` identifies "reaches every account" by the
-        #     carrier, which is the ONE spelling that works on both backends
-        #     (the frozen DuckDB ladder has no `scope` column). A row on some
-        #     other group would be invisible to it.
-        carrier = carrier_group_id()
-        if carrier is None:
-            raise HTTPException(
-                status_code=409,
-                detail="everyone_carrier_group_missing",
-            )
-        group_id = carrier
     try:
         grant_id = grants.create(
             # This page IS the source. Recorded rather than left NULL: "an

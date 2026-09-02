@@ -582,9 +582,20 @@ def test_0098_step4_drops_fanned_out_rows_but_never_source_less_ones(pg_engine, 
         ), "a source-less row was deleted — it cannot be told from a hand-set grant"
 
 
-def test_0098_drops_the_is_system_column(pg_engine, monkeypatch):
-    """The flag is gone, not merely unread. Two spellings of one idea is the
-    defect; leaving the column would leave the second one."""
+def test_0098_leaves_the_is_system_column_in_place_but_inert(pg_engine, monkeypatch):
+    """The flag is dead but PRESENT, and that is deliberate.
+
+    An earlier draft dropped it here. Nothing in this repo can stage a column
+    drop within a release: ``ensure_pg_at_head`` self-migrates to head at
+    boot, and the role-split recreate walks the ``api`` replicas one at a
+    time — so old code would still be selecting ``is_system`` after it was
+    gone and get ``UndefinedColumn``, not a graceful degrade. This is the
+    EXPAND half; the drop ships as its own release once the fleet has
+    converged on readers that ignore it.
+
+    So what matters is that the column is INERT, not absent: no row still
+    carries TRUE, and nothing can read a stale mandatory state out of it.
+    """
     _run(pg_engine, monkeypatch, everyone_email=None)
     with pg_engine.connect() as conn:
         cols = {
@@ -593,8 +604,17 @@ def test_0098_drops_the_is_system_column(pg_engine, monkeypatch):
                 sa.text("SELECT column_name FROM information_schema.columns WHERE table_name = 'marketplace_plugins'")
             ).all()
         }
-    assert "is_system" not in cols
+        still_flagged = conn.execute(
+            sa.text("SELECT COUNT(*) FROM marketplace_plugins WHERE is_system = TRUE")
+        ).scalar_one()
+    assert "is_system" in cols, (
+        "the drop belongs in a later release — an old replica mid-rollout still selects this column"
+    )
     assert "admin_disabled" in cols, "availability is a different question and stays"
+    assert still_flagged == 0, (
+        "a plugin is still flagged after the cutover, so the column and the grants "
+        "disagree about who gets it"
+    )
 
 
 def test_0098_downgrade_restores_the_flag_and_unscopes_the_grants(pg_engine, monkeypatch):

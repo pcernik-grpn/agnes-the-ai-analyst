@@ -427,7 +427,8 @@ class ReportsPgRepository:
     # byte-identical to the DuckDB sibling's and the drift guard in
     # `tests/db_pg/test_reports_contract.py` can keep pinning them equal.
     # Correct on both: every everyone-scoped row is written against that one
-    # group (the writer forces it — see `app/api/access.py::create_grant`),
+    # group, forced in the repository itself
+    # (`ResourceGrantsPgRepository._carrier_or`) so no writer can opt out,
     # and a plain required grant on the group reaches every account too,
     # because membership in it is automatic. The frozen DuckDB ladder has no
     # `scope` column at all, which is why the column cannot be the shared

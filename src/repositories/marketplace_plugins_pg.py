@@ -153,19 +153,21 @@ class MarketplacePluginsPgRepository:
         skip: int = 0,
         limit: int = 24,
     ) -> Tuple[List[Dict[str, Any]], int]:
+        # No early return on an empty group set, and the audience test below
+        # is the same one `list_granted_for_groups` uses. These two used to
+        # disagree: this method matched `group_id IN (...)` alone, so the
+        # browse tab and the served feed showed a different set to any
+        # account an everyone-scoped grant reached without a membership.
         gids = list(group_ids)
-        if not gids:
-            return ([], 0)
-
         gid_keys: List[str] = []
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"everyone_scope": SCOPE_EVERYONE}
         for i, gid in enumerate(gids):
             k = f"g_{i}"
             gid_keys.append(f":{k}")
             params[k] = gid
 
         where = [
-            f"rg.group_id IN ({','.join(gid_keys)})",
+            f"(rg.scope = :everyone_scope OR rg.group_id IN ({','.join(gid_keys) or 'NULL'}))",
             "rg.resource_type = 'marketplace_plugin'",
             "rg.resource_id = mp.marketplace_id || '/' || mp.name",
             # Admin-disabled built-in plugins are hidden from the browse listing
@@ -228,11 +230,12 @@ class MarketplacePluginsPgRepository:
         *,
         group_ids: Iterable[str],
     ) -> Dict[str, int]:
+        # Same audience test as `list_with_filters` and
+        # `list_granted_for_groups` — the category pills must count the set
+        # the listing actually shows.
         gids = list(group_ids)
-        if not gids:
-            return {}
         gid_keys: List[str] = []
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"everyone_scope": SCOPE_EVERYONE}
         for i, gid in enumerate(gids):
             k = f"g_{i}"
             gid_keys.append(f":{k}")
@@ -245,7 +248,8 @@ class MarketplacePluginsPgRepository:
                     f"FROM marketplace_plugins mp "
                     f"JOIN resource_grants rg "
                     f"  ON rg.resource_id = mp.marketplace_id || '/' || mp.name "
-                    f"WHERE rg.group_id IN ({','.join(gid_keys)}) "
+                    f"WHERE (rg.scope = :everyone_scope "
+                    f"       OR rg.group_id IN ({','.join(gid_keys) or 'NULL'})) "
                     f"  AND rg.resource_type = 'marketplace_plugin' "
                     f"  AND mp.admin_disabled = FALSE "
                     f"GROUP BY cat"

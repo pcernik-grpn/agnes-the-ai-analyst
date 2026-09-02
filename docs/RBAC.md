@@ -127,11 +127,27 @@ documents them.
 
 **Postgres only**, like `resource_grants.source`. The DuckDB app-state ladder
 is frozen (A3), so that backend accepts `scope=` and drops it: the row is an
-ordinary grant on the carrier, which every account is auto-joined to at
-creation, so the same people are reached. The one case the backends answer
-differently is an account an admin has removed from that group. Reads that
-are ABOUT the column (`count_everyone_scoped`, `list_everyone_scoped`) raise
-`RequiresPostgresBackend` → 501 there rather than answering "nobody".
+ordinary grant on the carrier group, and reaching it there DOES require
+membership. Reads that are ABOUT the column (`count_everyone_scoped`,
+`list_everyone_scoped`) raise `RequiresPostgresBackend` → 501 rather than
+answering "nobody".
+
+So the two backends do not mean quite the same thing by "everyone", and the
+gap is closed by data rather than by the column:
+`src/system_plugin_reconcile.py` runs at boot on DuckDB only and is that
+ladder's stand-in for `0098` — it converts the Workspace narrowing, then
+makes the carrier group genuinely hold every account (in that order; the
+reverse hands the narrowed group's grants to the whole instance), then turns
+each `is_system` plugin into a required grant on it. After it has run,
+"everyone" means every account on both backends.
+
+What still differs: an account created on DuckDB and then removed from the
+carrier group stops receiving everyone-scoped grants, where on Postgres it
+would keep them. In practice no admin path can do that — `remove_member`
+takes `require_source='admin'` and cannot strip the `system_seed` auto-join
+(see [Group membership sources](#group-membership-sources)) — so it takes
+direct SQL. It is a real difference, not a reassuring one; it is just not
+one an operator can reach by accident.
 
 `count_for_group` excludes everyone-scoped rows: the carrier holds them but
 does not decide their reach.
@@ -471,7 +487,7 @@ Schema v49 (unified Browse + My Stack for Data Packages and Memory):
   - `DATA_PACKAGE` — admin-curated bundle of tables (`data_packages` table; M:N to `table_registry` via `data_package_tables`). At v49 the effective `TABLE` set for a user was `(direct TABLE grants) ∪ (tables in DATA_PACKAGE grants the user has)`. This was later hardened: analyst table visibility now flows through Data Packages **only** (`src/rbac.py::can_access_table` / `get_accessible_tables`) — a direct `TABLE` grant no longer contributes to it at all. See [Table grants: agent-scope and co-session ceilings](#table-grants-agent-scope-and-co-session-ceilings) for what a direct `TABLE` grant is still for.
   - `MEMORY_ITEM` — per-group item-level Required override. Default for an item comes from `knowledge_items.is_required` flag; a `MEMORY_ITEM` grant flips that for the specified group.
 - `MEMORY_DOMAIN` grants migrated from slug strings to `memory_domains.id` references. Orphan grants (pointing at non-existent domains) preserved for admin cleanup.
-- Marketplace plugins: v49 originally left them out (`marketplace_plugins.is_system` was the only mandatory path), but the tier now applies to `marketplace_plugin` grants too — `resolve_user_marketplace` serves `granted ∩ (subscribed ∪ required)`, so a required grant puts the plugin in every group member's served set without a subscription row (unsubscribe/uninstall return 409). `is_system` remains the *global* (all-users) mandatory flag; `requirement='required'` is the *group-scoped* one.
+- Marketplace plugins: v49 originally left them out (`marketplace_plugins.is_system` was the only mandatory path), but the tier now applies to `marketplace_plugin` grants too — `resolve_user_marketplace` serves `granted ∩ (subscribed ∪ required)`, so a required grant puts the plugin in every group member's served set without a subscription row (unsubscribe/uninstall return 409). There is no longer a second mandatory path: `marketplace_plugins.is_system` was the *global* (all-users) flag beside this *group-scoped* tier, and since `0098` "all users" is the same tier at `scope='everyone'`. The column survives, dead and unread, until the contract half of the expand/contract pair drops it in a later release.
 
 Effective Required = OR across grants. Any grant with `requirement='required'` wins for the user.
 

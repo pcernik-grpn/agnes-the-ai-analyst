@@ -40,8 +40,8 @@ Steps, in order:
    group, which reaches the same people. So does everything, on the rare
    instance where some account sits outside the group — see the step's
    docstring for why that is a skip rather than a conversion.
-4. THE CUTOVER. Each ``is_system`` plugin becomes one everyone-scoped,
-   required grant. Then the rows the OLD fanout wrote are dropped, matched
+4. Each ``is_system`` plugin becomes one everyone-scoped, required grant,
+   and the flag is then cleared so the column cannot contradict it. Then the rows the OLD fanout wrote are dropped, matched
    by ``source='marketplace_required'`` (0096) — an exact match, not a
    guess. Rows with NULL ``source`` are LEFT ALONE: they predate the column,
    cannot be told from a grant an admin typed, and deleting a hand-set grant
@@ -49,7 +49,9 @@ Steps, in order:
    was removed in the same change that added the column — so the DELETE is a
    safety net rather than the mechanism; the redundant pre-0096 rows simply
    survive as ordinary, now-visible grants.
-5. Drop the flag.
+5. NOT HERE. Dropping ``marketplace_plugins.is_system`` is a separate
+   RELEASE, not merely a later revision — see MID-FLIGHT below. The column
+   survives this migration, dead and unread.
 
 IRREVERSIBLE IN PRACTICE. ``downgrade`` restores the columns and the
 plugin marks, but not step 2: which of the converted group's members were
@@ -57,11 +59,37 @@ originally ``Everyone``'s is not recorded, and on pre-0096 data the
 distinction between a fanned-out row and a hand-set one is gone for good.
 The release note says so rather than implying a clean rollback.
 
-MID-FLIGHT. Steps 2 and 3 are safe under the old code (an ``Everyone`` grant
-and an everyone-scoped grant reach the same people while every account is
-auto-joined to ``Everyone``). Step 4 is not: an old worker still reads
-``is_system``, which this drops. Sequence the release so the readers land
-before the writer changes.
+MID-FLIGHT, and this is why the flag is still here. Every step below is safe
+to run while OLD code is still serving:
+
+- steps 2 and 3 — an ``Everyone`` grant and an everyone-scoped grant reach the
+  same people while every account is auto-joined to ``Everyone``;
+- step 4's INSERT — an extra required grant on the carrier reaches exactly who
+  the flag already reached, so an old replica serves the same set either way.
+
+``DROP COLUMN is_system`` is the one statement that is NOT, and it is
+deliberately absent. An earlier draft of this revision dropped it here and
+told the operator to "sequence the release so the readers land before the
+writer changes". Nothing in this repo can do that:
+
+- ``src/db_pg.py::ensure_pg_at_head`` self-migrates to ``head`` at app boot
+  by default, so the FIRST container on the new image runs the whole
+  revision, drop included;
+- running ``alembic upgrade head`` from a pre-deploy pipeline step
+  (``docs/migrations.md``) is worse, not better — the drop then lands before
+  any container is recreated;
+- ``scripts/ops/agnes-auto-upgrade.sh``'s role-split recreate takes
+  worker+gateway first and then walks the ``api`` replicas ONE AT A TIME,
+  each gated on its own ``/readyz`` — a window of minutes in which old-code
+  replicas are still serving and still selecting ``is_system``. After the
+  drop that is a Postgres ``UndefinedColumn``, not a graceful degrade.
+- ``docs/migrations.md`` lists expand/contract discipline — the mechanism
+  that would make a staged drop safe — under future work, not landed.
+
+So this is the EXPAND half. The contract half ships in a later release, once
+the fleet has converged on code that does not read the column. Until then the
+column sits unread on Postgres, and unread on DuckDB too, where the ladder is
+frozen and could not have dropped it anyway.
 """
 
 import logging
@@ -367,22 +395,36 @@ def _step4_system_flag_becomes_a_grant(conn) -> None:
         {"src": SOURCE_MARKETPLACE_FANOUT},
     )
 
+    # Clear the flag LAST, and clear it even where nothing was converted (a
+    # disabled-and-flagged row). The column outlives this migration — the
+    # drop is a later release — so leaving TRUE behind would leave the column
+    # and the grants disagreeing about who gets the plugin, with nothing
+    # reading the column to notice.
+    #
+    # Safe mid-flight, which the DROP was not: an old replica reads
+    # `is_system = TRUE OR EXISTS (grant)` for visibility and unions
+    # `list_system_keys()` into the tier. Flipping TRUE to FALSE moves a
+    # plugin from the first half of that OR to the second, and step 4 has
+    # just written the grant that satisfies it.
+    conn.execute(sa.text("UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system = TRUE"))
+
 
 def upgrade() -> None:
     conn = op.get_bind()
     _step2_convert_workspace_narrowing(conn)
     _step3_scope_everyone_grants(conn)
     _step4_system_flag_becomes_a_grant(conn)
-    op.drop_column("marketplace_plugins", "is_system")
+    # No `op.drop_column("marketplace_plugins", "is_system")`. See MID-FLIGHT
+    # in the module docstring: it is the only statement here an old replica
+    # cannot survive, and this repo has no way to stage it within a release.
 
 
 def downgrade() -> None:
-    """Restore the flag and un-scope the grants. Step 2 does NOT come back —
-    see the module docstring."""
-    op.add_column(
-        "marketplace_plugins",
-        sa.Column("is_system", sa.Boolean(), nullable=False, server_default=sa.text("FALSE")),
-    )
+    """Re-flag the plugins and un-scope the grants. Step 2 does NOT come back —
+    see the module docstring.
+
+    No ``add_column`` here: ``upgrade`` never dropped it.
+    """
     conn = op.get_bind()
     conn.execute(
         sa.text(

@@ -46,6 +46,34 @@ class ResourceGrantsPgRepository:
         self._engine = engine
 
     @staticmethod
+    def _carrier_or(group_id: str, scope: Optional[str]) -> str:
+        """The group an everyone-scoped row MUST be stored against.
+
+        Enforced here rather than at the endpoint, because the endpoint is
+        not the only writer: the built-in marketplace seed, the collections
+        auto-share and the chat-grant seed all write ``scope='everyone'``
+        too, each resolving the group by name on its own. They agree today
+        only because ``user_groups.name`` is unique — an invariant nothing
+        checks at write time, so a fifth writer passing an arbitrary
+        ``group_id`` would silently break the two readers that identify
+        "reaches everyone" BY the carrier group rather than by the column:
+        ``reports._NOT_SYSTEM`` (byte-identical across both backends, since
+        the frozen DuckDB ladder has no ``scope``) and
+        ``marketplace_filter.everyone_required_plugin_keys``.
+
+        Overriding beats raising: every caller that passes a scope means
+        "everyone", and none of them has a reason to care which row carries
+        it. Falls back to the caller's ``group_id`` only if the carrier
+        cannot be resolved, which keeps the NOT NULL constraint satisfiable
+        on an instance whose seeded group is missing.
+        """
+        if scope is None:
+            return group_id
+        from src.grant_scopes import carrier_group_id
+
+        return carrier_group_id() or group_id
+
+    @staticmethod
     def _audience_clause(
         group_ids: List[str],
         params: Dict[str, Any],
@@ -238,14 +266,16 @@ class ResourceGrantsPgRepository:
 
         ``scope`` names WHO the grant reaches (``src.grant_scopes``): ``None``
         for the members of ``group_id``, ``'everyone'`` for every account.
-        Pass ``group_id=carrier_group_id()`` with an everyone-scope — the
-        column stays NOT NULL and is ignored on read, and using one carrier
-        for every everyone-grant is what makes the UNIQUE index reject a
-        second one for the same resource. Postgres-only (migration 0097).
+        With an everyone-scope, ``group_id`` is OVERRIDDEN with the carrier
+        (see :meth:`_carrier_or`) — the column stays NOT NULL and is ignored
+        on read, and every everyone-grant sharing one carrier is what makes
+        the UNIQUE index reject a second one for the same resource.
+        Postgres-only (migration 0097).
         """
         if requirement is not None and requirement not in ("available", "required"):
             raise ValueError(f"requirement must be 'available' or 'required', got {requirement!r}")
         scope = normalize_scope(scope)
+        group_id = self._carrier_or(group_id, scope)
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
 
@@ -329,6 +359,7 @@ class ResourceGrantsPgRepository:
         for a resource shares one carrier group.
         """
         scope = normalize_scope(scope)
+        group_id = self._carrier_or(group_id, scope)
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
         params: Dict[str, Any] = {

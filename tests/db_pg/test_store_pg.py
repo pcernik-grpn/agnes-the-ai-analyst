@@ -402,3 +402,126 @@ def test_store_submission_list_for_admin_default_hides_lifecycle_end(store_engin
     # Explicit deleted chip surfaces the dead row
     items, _ = repo.list_for_admin(lifecycle="deleted")
     assert {i["name"] for i in items} == {"dead"}
+
+
+def test_browse_listing_and_category_counts_see_an_everyone_scoped_grant(store_engine):
+    """The served feed and the browse tab must answer for the same audience.
+
+    `list_granted_for_groups` (the feed) gained the `scope='everyone'` term
+    when everyone became a scope. `list_with_filters` (the browse tab) and
+    `category_counts` (its category pills) sat directly below it in the same
+    class and did NOT — they matched `group_id IN (...)` alone and
+    early-returned on an empty group set. So an account an everyone-scoped
+    grant reached without a membership was served a plugin the browse tab
+    told it did not exist, and the pills counted a different set from the
+    list beneath them.
+
+    Postgres-only: the column is (migration 0097).
+    """
+    from src.repositories.marketplace_plugins_pg import MarketplacePluginsPgRepository
+    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+    from src.repositories.user_groups_pg import UserGroupsPgRepository
+
+    import sqlalchemy as sa
+
+    groups = UserGroupsPgRepository(store_engine)
+    plugins = MarketplacePluginsPgRepository(store_engine)
+    grants = ResourceGrantsPgRepository(store_engine)
+    carrier = groups.create(name="Everyone")
+    stranger = groups.create(name="g-no-grants")
+
+    with store_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO marketplace_registry (id, name, url, registered_at) "
+                "VALUES ('m2', 'm2', 'https://example.test/m2.git', CURRENT_TIMESTAMP)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO marketplace_plugins (marketplace_id, name, category, admin_disabled) "
+                "VALUES ('m2', 'everybody', 'Ops', FALSE), ('m2', 'hidden', 'Ops', TRUE)"
+            )
+        )
+    for name in ("everybody", "hidden"):
+        grants.create(
+            group_id=carrier["id"],
+            resource_type="marketplace_plugin",
+            resource_id=f"m2/{name}",
+            scope="everyone",
+        )
+
+    # A caller whose own group was granted nothing.
+    items, total = plugins.list_with_filters(group_ids=[stranger["id"]])
+    names = {r["name"] for r in items}
+    assert "everybody" in names, "the browse tab hid a plugin the served feed serves"
+    assert "hidden" not in names, "a disabled plugin surfaced in the browse tab"
+    assert total == 1
+
+    counts = plugins.category_counts(group_ids=[stranger["id"]])
+    assert counts.get("Ops") == 1, f"the category pills disagree with the listing: {counts}"
+
+    # And with NO groups at all — the audience the group model could not express.
+    items, total = plugins.list_with_filters(group_ids=[])
+    assert {r["name"] for r in items} == {"everybody"}
+    assert total == 1
+    assert plugins.category_counts(group_ids=[]).get("Ops") == 1
+
+
+def test_an_everyone_scope_is_forced_onto_the_carrier_group(store_engine):
+    """The carrier is an invariant, enforced in the repository.
+
+    `create_grant` overrode the caller's `group_id`, but it is not the only
+    writer — the built-in marketplace seed, the collections auto-share and
+    the chat-grant seed each write `scope='everyone'` and each resolve the
+    group by name independently. So the invariant was true by coincidence,
+    and two readers depend on it being true by construction:
+    `reports._NOT_SYSTEM` (byte-identical on both backends, because the
+    frozen DuckDB ladder has no `scope` column) and
+    `marketplace_filter.everyone_required_plugin_keys` both identify
+    "reaches everyone" BY the carrier group.
+
+    So the repository forces it, and a caller passing some other group with
+    a scope gets the carrier anyway.
+    """
+    from src.grant_scopes import carrier_group_id
+    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
+    from src.repositories.user_groups_pg import UserGroupsPgRepository
+
+    groups = UserGroupsPgRepository(store_engine)
+    grants = ResourceGrantsPgRepository(store_engine)
+    carrier = groups.create(name="Everyone")
+    wrong = groups.create(name="g-not-the-carrier")
+
+    assert carrier_group_id() == carrier["id"], "fixture sanity: the carrier resolves"
+
+    created = grants.create(
+        group_id=wrong["id"],
+        resource_type="marketplace_plugin",
+        resource_id="m3/everybody",
+        scope="everyone",
+    )
+    row = grants.get(created)
+    assert row is not None
+    assert row["group_id"] == carrier["id"], (
+        "the repository stored an everyone-scoped grant against the caller's group; "
+        "the carrier-based readers would never find it"
+    )
+    assert row["scope"] == "everyone"
+
+    # ensure_grant too — it is the seeders' entry point, and they are the
+    # writers that made this true only by coincidence before.
+    assert grants.ensure_grant(
+        wrong["id"], "marketplace_plugin", "m3/also-everybody", "system", scope="everyone"
+    ) is True
+    seeded = next(
+        r for r in grants.list_everyone_scoped("marketplace_plugin")
+        if r["resource_id"] == "m3/also-everybody"
+    )
+    assert seeded["group_id"] == carrier["id"]
+
+    # A scope-less grant is left exactly where the caller put it.
+    plain = grants.create(
+        group_id=wrong["id"], resource_type="marketplace_plugin", resource_id="m3/one-team"
+    )
+    assert grants.get(plain)["group_id"] == wrong["id"]
