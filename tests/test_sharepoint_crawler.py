@@ -1568,6 +1568,114 @@ class TestConvertChildMemoryLimit:
             pool.shutdown()
 
 
+class TestConvertedOutputSizeCap:
+    """The cap on what a conversion CHILD is allowed to send back across the
+    pipe (`extraction.crawler.max_converted_mb`) — a separate safety net
+    from `TestConvertChildMemoryLimit`'s `RLIMIT_AS`.
+
+    Live-deployment finding, 2026-09-02: with recycling and `RLIMIT_AS` both
+    already in place, a full crawl run OOM-killed the PARENT (uvicorn) at
+    12.3 GiB while `docker top` showed all ten conversion children idle at
+    0.0% CPU and ~240 MB each — neither existing safeguard bounds how big
+    the CONVERTED TEXT itself is allowed to get before it crosses back into
+    the parent, where `_prepare_document` (anonymize), `_Ingestor.ingest`
+    (encode, store) and `ingest_file` (re-read, chunk) each hold their own
+    copy on a parent thread. A spreadsheet that converts to a multi-hundred-
+    MB markdown table can stay comfortably under the child's own `RLIMIT_AS`
+    ceiling the whole time — nothing there ever fires — while still being
+    large enough, multiplied across the documents concurrency lets run at
+    once, to exhaust the parent. This cap refuses the oversized result
+    INSIDE the child, before `_ConvertReply` is ever built, so the giant
+    string never crosses the pipe at all — the parent never sees it, let
+    alone holds several copies of it.
+    """
+
+    def test_a_converted_output_over_the_cap_is_refused_before_it_crosses_the_pipe(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert not outcome.ok
+            assert outcome.detail_type == "ConvertedTooLarge"
+            # The whole point of this cap: the oversized text never leaves
+            # the child, so the parent-side outcome never carries it either.
+            assert outcome.markdown == ""
+        finally:
+            pool.shutdown()
+
+    def test_a_converted_output_within_the_cap_is_returned_normally(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("small"))
+        pool = crawler._ConvertProcessPool(1, max_output_bytes=1_000_000)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+            assert outcome.markdown == "small"
+        finally:
+            pool.shutdown()
+
+    def test_zero_disables_the_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        pool = crawler._ConvertProcessPool(1, max_output_bytes=0)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+            assert len(outcome.markdown) == 5000
+        finally:
+            pool.shutdown()
+
+    def test_prepare_document_words_it_the_same_regardless_of_anonymize(self, tmp_path, monkeypatch):
+        """Unlike an ordinary conversion exception's `detail_message` (gated
+        by the scope's `anonymize` flag because it may quote the document),
+        this cap's message never carries document content — only byte
+        counts — so it is safe to show verbatim on BOTH kinds of scope, the
+        same way a `MemoryError` outcome already is."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            for anonymize in (False, True):
+                prepared = crawler._prepare_document(
+                    f,
+                    mime="text/plain",
+                    path="folder/doc.txt",
+                    name="doc.txt",
+                    anonymize=anonymize,
+                    anonymization_key=b"k" * 32 if anonymize else None,
+                    detector=None,
+                    convert_pool=pool,
+                    convert_slot=0,
+                )
+                assert prepared.outcome == "convert_failed"
+                assert "exceeds" in prepared.detail
+        finally:
+            pool.shutdown()
+
+    def test_a_crawl_end_to_end_counts_an_oversized_conversion_as_convert_failed(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        monkeypatch.setattr(crawler, "_max_converted_output_bytes", lambda: 1000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+
+
 # --------------------------------------------------------------------------
 # Oversize accounting
 # --------------------------------------------------------------------------
@@ -4478,3 +4586,33 @@ class TestRetryUsesTheConversionPool:
         assert "convert_pool=convert_pool" in call, (
             "_crawl_drive must pass its run's pool into the backlog replay"
         )
+def test_the_converted_size_cap_is_reachable_by_the_converter():
+    """A byte ceiling above what the converter can emit guards nothing.
+
+    `convert.DEFAULT_MAX_CHARS` bounds a conversion at 5,000,000 CHARACTERS,
+    so the largest reply that can exist is that many characters encoded as
+    UTF-8 — at most four bytes each. The shipped `max_converted_mb` was 200,
+    an order of magnitude above that worst case, so no result could ever
+    reach it and the parent OOM the cap was written for stayed unaddressed
+    (Devin Review on #2078).
+
+    This pins the two ceilings to each other: whichever one moves, the cap
+    has to stay reachable, and it has to stay above an ordinary single-byte
+    document so the common case is never refused.
+    """
+    from connectors.sharepoint.convert import DEFAULT_MAX_CHARS
+    from connectors.sharepoint.crawler import _DEFAULT_MAX_CONVERTED_MB
+
+    cap_bytes = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024
+    worst_case_bytes = DEFAULT_MAX_CHARS * 4  # UTF-8 maximum per character
+    single_byte_bytes = DEFAULT_MAX_CHARS  # the same document in ASCII
+
+    assert cap_bytes < worst_case_bytes, (
+        f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} ({cap_bytes} bytes) is above the "
+        f"largest reply the converter can produce ({worst_case_bytes} bytes at "
+        f"DEFAULT_MAX_CHARS={DEFAULT_MAX_CHARS}), so the guard can never fire"
+    )
+    assert cap_bytes > single_byte_bytes, (
+        f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} would refuse an ordinary "
+        f"single-byte document at the character cap ({single_byte_bytes} bytes)"
+    )

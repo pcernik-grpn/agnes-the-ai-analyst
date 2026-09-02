@@ -414,6 +414,40 @@ class TestTheTickNamesTheRightCause:
         )
 
 
+class TestTheTickCanAlwaysDeliverItsOwnFix:
+    """The self-update must not sit behind an early exit.
+
+    Observed on the fleet 2026-09-02: a long-running data refresh made every
+    tick take the `sync/refresh in flight — deferring recreate` branch, which
+    `exit 0`s. Host artifacts are refreshed well before that point, so the VM
+    took the new Cloud Logging overlay; the script's own self-update sits
+    after it, so the fix for that overlay could not arrive — for over four
+    hours, and for as long as the refresh kept running. The first tick that
+    finally gets through then recreates containers on the un-fixed logic and
+    only self-updates afterwards.
+
+    That is the "self-perpetuating old script" problem the self-update block
+    exists to prevent, reintroduced by ordering. A tick must be able to
+    deliver its own replacement on any path that reached the image.
+    """
+
+    def test_self_update_precedes_the_deferral_exit(self):
+        body = AUTO_UPGRADE.read_text()
+        self_update = body.index("agnes-auto-upgrade.sh.new")
+        defer_exit = body.index("deferring recreate")
+        assert self_update < defer_exit, (
+            "the self-update must run before the deferral's `exit 0` — behind "
+            "it, a VM that defers every tick can never receive a fixed script"
+        )
+
+    def test_self_update_follows_the_artifact_extraction(self):
+        """It needs the extract container the refresh block creates."""
+        body = AUTO_UPGRADE.read_text()
+        extract = body.index("EXTRACT_CID=")
+        self_update = body.index("agnes-auto-upgrade.sh.new")
+        assert extract < self_update
+
+
 class TestOverlayCoversEveryBaseComposeService:
     """The overlay's service list must track `docker-compose.yml`, both ways.
 
