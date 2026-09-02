@@ -1127,3 +1127,193 @@ _extRenderFactsButton('sp1', { facts_job: null });
 console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }));
 """
         assert _run_js(body)["disabled"] is True
+
+
+# --------------------------------------------------------------------------
+# Facts policy control (retry_mode / transport) — the admin-UI control for
+# `PATCH .../extraction/facts-config`
+# (`app/api/admin_extraction.py::patch_extraction_facts_config`), so an admin
+# without server or CLI access can set a per-connection override. Own render
+# helper (`_extRenderFactsPolicy`) and own save function (`saveSpFactsPolicy`)
+# so this control never entangles with the run-options row or the "Extract
+# facts now" button next to it.
+# --------------------------------------------------------------------------
+
+
+def _run_facts_policy_js(body: str) -> dict:
+    tpl = TEMPLATE.read_text(encoding="utf-8")
+    fns = "\n".join(_extract_block(tpl, sig) for sig in ("function _esc(s) {", "function _extRenderFactsPolicy(row) {"))
+    script = f"""
+{fns}
+{body}
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    if proc.returncode == 127:
+        pytest.skip("node unavailable")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
+
+
+class TestFactsPolicyControlRendering:
+    def test_renders_both_selects_with_the_connection_override_preselected(self):
+        row = {
+            "id": "sp1",
+            "name": "Finance SharePoint",
+            "config": {"extraction": {"facts": {"retry_mode": "always", "transport": "batch"}}},
+        }
+        out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
+        html = out["html"]
+        assert 'id="ds-sp-factspolicy-retry-sp1"' in html
+        assert 'id="ds-sp-factspolicy-transport-sp1"' in html
+        assert '<option value="always" selected>' in html
+        assert '<option value="batch" selected>' in html
+        assert "saveSpFactsPolicy('sp1')" in html
+
+    def test_no_override_leaves_instance_default_selected(self):
+        row = {"id": "sp2", "name": "Ops SharePoint", "config": {}}
+        out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
+        html = out["html"]
+        # Both selects default to the empty "Instance default" option — twice,
+        # once per select — never a value that reads as a chosen policy.
+        assert html.count('<option value="" selected>Instance default</option>') == 2
+        assert '<option value="off"' in html
+        assert '<option value="on_gate_fail"' in html
+        assert '<option value="sync"' in html
+
+    def test_offers_exactly_the_three_retry_modes_and_two_transports(self):
+        """Pinned against the API's own vocabulary
+        (`connectors.sharepoint.facts_extraction._VALID_RETRY_MODES` /
+        `_VALID_TRANSPORTS`) — a fourth option here would be a value the
+        server refuses with 422."""
+        row = {"id": "sp3", "config": {}}
+        html = _run_facts_policy_js(
+            f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));"
+        )["html"]
+        # "Instance default" + off/on_gate_fail/always (retry) = 4, plus
+        # "Instance default" + sync/batch (transport) = 3.
+        assert html.count("<option") == 4 + 3
+
+    def test_an_untrusted_name_is_escaped_not_injected(self):
+        row = {"id": "sp4", "name": "<img src=x onerror=alert(1)>", "config": {}}
+        html = _run_facts_policy_js(
+            f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));"
+        )["html"]
+        assert "<img" not in html
+        assert "&lt;img" in html
+
+
+class TestFactsPolicySave:
+    """`saveSpFactsPolicy` — the empty "Instance default" option must map to
+    `null` (clear the override), a chosen value must be sent verbatim, and
+    the response's resolved `{value, source}` pair must land in the status
+    line, never the raw request echoed back."""
+
+    def _run(self, *, retry_value, transport_value, response_status=200, response_body=None, prior_config=None):
+        tpl = TEMPLATE.read_text(encoding="utf-8")
+        fn = _extract_block(tpl, "async function saveSpFactsPolicy(id) {")
+        response_body = response_body if response_body is not None else {}
+        script = f"""
+const _elements = {{
+  "ds-sp-factspolicy-retry-sp1": {{ value: {json.dumps(retry_value)} }},
+  "ds-sp-factspolicy-transport-sp1": {{ value: {json.dumps(transport_value)} }},
+  "ds-sp-factspolicy-status-sp1": {{ textContent: "" }},
+}};
+const document = {{ getElementById: (id) => _elements[id] || null }};
+let _connections = [{{ id: "sp1", config: {json.dumps(prior_config or {})} }}];
+const requests = [];
+const toasts = [];
+function encodeURIComponent(s) {{ return s; }}
+function showToast(msg, ok) {{ toasts.push({{ msg, ok }}); }}
+function detailMessage(body, fallback) {{ return (body && body.detail) || fallback; }}
+async function fetch(url, opts) {{
+  requests.push({{ url, method: opts.method, body: JSON.parse(opts.body) }});
+  return {{
+    ok: {str(response_status < 400).lower()},
+    status: {response_status},
+    json: async () => ({json.dumps(response_body)}),
+  }};
+}}
+
+{fn}
+
+(async () => {{
+  await saveSpFactsPolicy("sp1");
+  console.log(JSON.stringify({{
+    requests,
+    toasts,
+    status: _elements["ds-sp-factspolicy-status-sp1"].textContent,
+    conn: _connections[0],
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_an_empty_selection_sends_null_for_both_fields(self):
+        out = self._run(retry_value="", transport_value="")
+        assert out["requests"][0]["body"] == {"retry_mode": None, "transport": None}
+
+    def test_a_chosen_value_is_sent_verbatim(self):
+        out = self._run(retry_value="always", transport_value="batch")
+        assert out["requests"][0]["body"] == {"retry_mode": "always", "transport": "batch"}
+
+    def test_it_patches_the_facts_config_endpoint(self):
+        out = self._run(retry_value="off", transport_value="sync")
+        assert out["requests"][0]["url"] == "/api/admin/sharepoint/connections/sp1/extraction/facts-config"
+        assert out["requests"][0]["method"] == "PATCH"
+
+    def test_the_resolved_value_and_source_are_shown_after_save(self):
+        out = self._run(
+            retry_value="always",
+            transport_value="",
+            response_body={
+                "retry_mode": {"value": "always", "source": "connection"},
+                "transport": {"value": "sync", "source": "instance"},
+            },
+        )
+        assert "always" in out["status"]
+        assert "connection" in out["status"]
+        assert "sync" in out["status"]
+        assert "instance" in out["status"]
+
+    def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
+        out = self._run(
+            retry_value="off",
+            transport_value="",
+            response_status=422,
+            response_body={"detail": "retry_mode must be one of ..."},
+        )
+        assert out["status"] == ""
+        assert out["toasts"][0]["ok"] is False
+        assert "retry_mode must be one of" in out["toasts"][0]["msg"]
+
+    def test_a_successful_save_updates_the_in_memory_row_for_the_next_repaint(self):
+        out = self._run(
+            retry_value="always",
+            transport_value="",
+            prior_config={"extraction": {"facts": {"retry_mode": "off", "transport": "batch"}}},
+            response_body={
+                "retry_mode": {"value": "always", "source": "connection"},
+                "transport": {"value": "sync", "source": "instance"},
+            },
+        )
+        facts = out["conn"]["config"]["extraction"]["facts"]
+        assert facts["retry_mode"] == "always"
+        # transport was cleared (sent null) — the override is removed, not
+        # left at its stale prior value.
+        assert "transport" not in facts
