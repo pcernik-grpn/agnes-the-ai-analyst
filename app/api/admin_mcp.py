@@ -1368,7 +1368,7 @@ async def register_oauth_client(
     # registration access token — passing those through wipes both. Losing the
     # RAT silently disables upstream deregistration (best_effort_revoke_
     # registration no-ops without one); losing the secret is worse, demoting a
-    # confidential registration to a public one so _client_auth_kwargs stops
+    # confidential registration to a public one so _post_token_request stops
     # sending Basic auth and every token call fails. A DIFFERENT client_id is
     # a new registration and replaces both wholesale (Devin Review on #1124
     # for the RAT; the secret has the same exposure).
@@ -1541,7 +1541,7 @@ async def set_oauth_client_config(
     # the request where it matters most: repointing issuer/token_endpoint at a
     # DIFFERENT authorization server while re-typing the same client name
     # purged the user tokens (identity changed) yet kept the previous
-    # provider's client secret — which _client_auth_kwargs then sends as HTTP
+    # provider's client secret — which _post_token_request then sends as HTTP
     # Basic to the new token_endpoint, and best_effort_revoke_registration
     # bearer-sends the retained registration token to the new provider too
     # (Devin Review on #1124).
@@ -1573,7 +1573,7 @@ async def set_oauth_client_config(
             # The column holds ciphertext we can no longer open (vault key
             # rotated). Carrying the decrypted None forward would write NULL
             # and silently demote a confidential registration to a public
-            # PKCE-only one — _client_auth_kwargs would stop sending Basic
+            # PKCE-only one — _post_token_request would stop sending Basic
             # auth. Refusing is the honest move: the admin either re-enters
             # the secret or clears it deliberately (Devin Review on #1124).
             raise HTTPException(
