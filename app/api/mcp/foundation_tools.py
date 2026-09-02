@@ -28,7 +28,12 @@ from pydantic import Field
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
+from src.mcp_tooling import (
+    compact_search_results,
+    ensure_output_size,
+    ensure_query_output_size,
+    progressive_tool,
+)
 
 
 def _raise_for_status_with_detail(r: httpx.Response) -> None:
@@ -531,6 +536,14 @@ def register_foundation_tools(
         higher-risk change since other features (e.g. the /agents knowledge
         picker) share this endpoint.
 
+        Long passages are shortened to fit the tool output budget rather than
+        failing the call. When the response carries ``truncated: true``, each hit
+        whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+        ``…``) — never summarise a prefix as the whole passage. Read the document
+        in full with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        lower ``k``; ``truncated_note`` says exactly what was cut.
+
         Args:
             query: Natural-language or keyword query.
             k: Max results (default 10).
@@ -547,7 +560,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            return compact_search_results(r.json(), "collections_search")
 
     @tool(read_only=True)
     async def knowledge_search(query: str, k: int = 10) -> dict:
@@ -576,6 +589,14 @@ def register_foundation_tools(
         ``searched_tables`` and a ``hint`` saying which of the two it is;
         read the hint before telling anyone they have no access.
 
+        Long passages are shortened to fit the tool output budget rather than
+        failing the call. When the response carries ``truncated: true``, each hit
+        whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+        ``…``) — never summarise a prefix as the whole passage. Read the document
+        in full with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        lower ``k``; ``truncated_note`` says exactly what was cut.
+
         Args:
             query: Natural-language or keyword query.
             k: Max results (default 10).
@@ -588,7 +609,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            return compact_search_results(r.json(), "knowledge_search")
 
     @tool(read_only=True)
     async def glossary_search(query: str, k: int = 10) -> dict:
