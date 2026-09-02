@@ -2736,6 +2736,7 @@ async def _process_item(
     anonymization_key: Optional[bytes],
     detector: Any = None,
     pool: Optional[ThreadPoolExecutor] = None,
+    force_reprocess: bool = False,
     convert_pool: Optional[_ConvertProcessPool] = None,
     convert_slot: int = 0,
 ) -> None:
@@ -2743,6 +2744,12 @@ async def _process_item(
     per-file fault: a locked, vanished, unconvertible, or un-anonymizable
     document is COUNTED and skipped, because one bad file must not cost a
     100k-file pass.
+
+    ``force_reprocess`` (the operator "re-process everything" run option)
+    bypasses ONLY the cTag-equality skip below — the item is downloaded,
+    converted and re-ingested even when its cTag already matches what is on
+    record. Everything else about the item (oversize cap, exclusions,
+    anonymize-fail-closed, the retry queue) is unaffected.
 
     Safe to run concurrently with itself: every counter goes through
     :meth:`CrawlStats.add`, and the two state mutations (this item's cTag) are
@@ -2778,7 +2785,7 @@ async def _process_item(
 
     ctag = item.get("cTag") or item.get("eTag")
     with _state_lock:
-        already = bool(ctag) and ctags.get(stable_id) == ctag
+        already = bool(ctag) and ctags.get(stable_id) == ctag and not force_reprocess
     if already:
         stats.add(unchanged=1)
         return
@@ -3041,6 +3048,7 @@ async def _process_page(
     deadline: Optional[_Deadline] = None,
     concurrency: int = 1,
     stop_watcher: Optional["_StopWatcher"] = None,
+    force_reprocess: bool = False,
     convert_pool: Optional[_ConvertProcessPool] = None,
     recorder: Optional["_RunRecorder"] = None,
 ) -> None:
@@ -3112,6 +3120,7 @@ async def _process_page(
                     max_file_mb=max_file_mb,
                     anonymization_key=anonymization_key,
                     detector=detector,
+                    force_reprocess=force_reprocess,
                     convert_pool=convert_pool,
                     convert_slot=0,
                 )
@@ -3178,6 +3187,7 @@ async def _process_page(
                     anonymization_key=anonymization_key,
                     detector=detector,
                     pool=pool,
+                    force_reprocess=force_reprocess,
                     convert_pool=convert_pool,
                     convert_slot=slot,
                 )
@@ -3320,6 +3330,7 @@ async def _crawl_drive(
     deadline: Optional[_Deadline] = None,
     governor: Optional[_ConcurrencyGovernor] = None,
     stop_watcher: Optional["_StopWatcher"] = None,
+    force_reprocess: bool = False,
     convert_pool: Optional[_ConvertProcessPool] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
@@ -3339,6 +3350,17 @@ async def _crawl_drive(
     must not be persisted before the current page's rows are on disk. Drives,
     likewise, remain sequential — see the note in :func:`_run_crawl_async`.
 
+    ``force_reprocess`` (the operator "re-process everything" run option, see
+    :func:`_run_crawl_async`) makes this drive start from the bare delta
+    base regardless of a persisted ``deltaLink`` — Graph's delta feed only
+    re-offers items that changed, so consulting the resume link would never
+    even hand back an unchanged item for :func:`_process_page`'s own
+    ``force_reprocess`` bypass to see. NEVER writes ``delta_links`` (or pops
+    the entry) up front to get this behaviour — it is a bypass, not a
+    reset: an interrupted forced run leaves the previous, still-valid
+    resume link in place, exactly the same "don't destroy what a stop can't
+    undo" contract the rest of this module keeps.
+
     ``convert_pool`` is repaired HERE, right after each page, not inside
     :func:`_process_page`: by the time a page returns its own
     item-concurrency thread pool (if any) has already been joined, which is
@@ -3347,7 +3369,7 @@ async def _crawl_drive(
     governor = governor or _ConcurrencyGovernor(1)
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
-    url: Optional[str] = delta_links.get(target.state_key) or base
+    url: Optional[str] = base if force_reprocess else (delta_links.get(target.state_key) or base)
     resynced = False
     stats.add(drives=1)
     # Retry this drive's OWN backlog first — see `_retry_failed_items`. It
@@ -3435,6 +3457,7 @@ async def _crawl_drive(
             deadline=deadline,
             concurrency=governor.current(),
             stop_watcher=stop_watcher,
+            force_reprocess=force_reprocess,
             convert_pool=convert_pool,
             recorder=recorder,
         )
@@ -3745,6 +3768,7 @@ async def _run_crawl_async(
     job_id: Optional[str] = None,
     timeout_s: Optional[float] = None,
     concurrency: Optional[int] = None,
+    force_reprocess: bool = False,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     # A stop requested for a PREVIOUS run (already finished, failed, or one
@@ -3879,6 +3903,7 @@ async def _run_crawl_async(
                         governor=governor,
                         stop_watcher=stop_watcher,
                         convert_pool=convert_pool,
+                        force_reprocess=force_reprocess,
                     )
         finally:
             # Done converting for this run either way (success, a scope
@@ -4060,11 +4085,21 @@ def run_builtin_crawl(payload: dict) -> dict:
     overriding ``extraction.crawler.concurrency``, clamped to
     ``[1, 16]`` — the same one-run override shape ``timeout_s`` has; the
     report's ``concurrency`` block names the effective value and its source),
-    and ``resync`` (truthy — drops this connection's persisted deltaLinks
+    ``resync`` (truthy — drops this connection's persisted deltaLinks
     and item-failure queue before crawling, so every drive re-enumerates
     from scratch; see :func:`_apply_resync`. The supported way to recover a
-    connection stuck believing it has nothing left to do). Credentials are
-    resolved from the row, never from the payload.
+    connection stuck believing it has nothing left to do), and
+    ``force_reprocess`` (truthy — ignores the persisted deltaLinks AND
+    cTags for this run only, so every item Graph still has is
+    downloaded, converted and re-ingested regardless of whether it looks
+    unchanged. The operator control for "the content on disk is the same
+    but I need it re-processed anyway" — e.g. a converter or anonymizer
+    setting changed. Unlike ``resync`` this never writes to the state file
+    up front: an interrupted forced run leaves the connection exactly as
+    resumable as before the run started, and the fresh deltaLink/cTags a
+    completed forced run observes are what land in state at the end, the
+    same as any other run). Credentials are resolved from the row, never
+    from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
@@ -4101,6 +4136,7 @@ def run_builtin_crawl(payload: dict) -> dict:
                 job_id=payload.get("job_id"),
                 timeout_s=payload.get("timeout_s"),
                 concurrency=payload.get("concurrency"),
+                force_reprocess=bool(payload.get("force_reprocess")),
             )
         )
     except SharePointSettingsError as exc:

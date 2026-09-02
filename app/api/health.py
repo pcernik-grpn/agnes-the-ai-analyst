@@ -595,10 +595,10 @@ async def debug_throw(
 
     Gated by ``DEBUG=1`` — returns 404 in production. Always raises after
     the auth dependency resolves, so ``request.state.user`` is populated
-    by the time the unhandled-exception handler captures the event. Use
-    to confirm that PostHog receives the exception with full user context
-    (``distinct_id``, ``user_id``, ``user_email``) and not just
-    ``request_id``.
+    by the time the unhandled-exception handler runs. Use it to confirm
+    that a real unhandled exception reaches the log pipeline with the
+    request context attached (``request_id``, path, method) and renders
+    the error page you expect.
 
     Optional query params let you pick the exception type and message:
         /api/debug/throw?kind=ValueError&msg=hello

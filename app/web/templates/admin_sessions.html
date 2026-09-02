@@ -39,12 +39,28 @@
 .obs-filter-grow { flex: 1; min-width: 200px; }
 .obs-filter label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--text-secondary, #6b7280); }
-.obs-select, .obs-filter input[type=search] { padding: 6px 8px;
+/* One height for every control in this row. The row holds three kinds — a
+   `ds.dropdown` (38px, `.ds-dropdown-btn`, which is what the paper skin
+   actually renders in place of the native select), a search box, and a
+   checkbox — and they disagreed: 38 / 35 / whatever a checkbox is. Aligning
+   the checkbox to the search box left it off the dropdowns; aligning it to
+   the dropdowns left it off the search box. Naming ONE height is the only
+   version that is right for all three, and right in every theme rather than
+   in whichever one the author happened to be looking at. */
+.obs-select, .obs-filter input[type=search] { padding: 6px 8px; min-height: 38px;
   border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
   background: var(--surface, #fff); font: inherit; }
+/* The row aligns on `flex-end`, so every filter's control must end on the
+   same line. A dropdown's cell is `label + gap + control`; this one has no
+   label above it, so it stood the height of a bare checkbox and sat below
+   the selects it filters alongside (#1956 item 10). `padding-top: 14px` was
+   the old attempt at the difference — it guessed at the LABEL's height when
+   what has to match is the CONTROL's, which is why it still landed short.
+   38px is the row's one control height, set on the selects and the search box
+   right above. */
 .obs-checkbox { display: flex; align-items: center; gap: 6px;
   text-transform: none; letter-spacing: 0; font-size: 13px;
-  color: var(--text-primary, #111827); cursor: pointer; padding-top: 14px; }
+  color: var(--text-primary, #111827); cursor: pointer; min-height: 38px; }
 .obs-filter-actions { display: flex; align-items: flex-end; }
 .obs-table-wrap { border: 1px solid var(--border, #e5e7eb); border-radius: 8px;
   overflow: hidden; background: var(--surface, #fff); }

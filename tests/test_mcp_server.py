@@ -484,8 +484,7 @@ class TestWireDescriptions:
         for t in srv.mcp._tool_manager.list_tools():
             assert t.description, f"{t.name} has no description"
             assert len(t.description) <= 500, (
-                f"{t.name}: {len(t.description)} chars (>500) — trim the "
-                f"docstring's first paragraph"
+                f"{t.name}: {len(t.description)} chars (>500) — trim the docstring's first paragraph"
             )
 
     def test_query_description_points_to_tool_docs(self):
@@ -537,3 +536,80 @@ class TestOutputGuard:
         with patch("cli.mcp.server.api_get_json", return_value=wide):
             with pytest.raises(MCPOutputTooLarge, match="rows"):
                 srv.describe("t1")
+
+
+# ── search-result compaction (TCRD-287) ────────────────────────────────────────
+
+
+def _big_search_payload(k: int = 10) -> dict:
+    return {
+        "query": "kůň",
+        "results": [
+            {
+                "chunk_id": f"ch_{i}",
+                "corpus_id": "col_0123456789abcdef",
+                "file_id": f"cf_{i}",
+                "filename": f"report-{i}.pdf",
+                "ordinal": i,
+                "text": ("Příliš žluťoučký kůň úpěl ďábelské ódy. " * 200)[:3_200],
+                "score": 1.0,
+                "confidence": "high",
+                "matched_on": "body",
+                "type": "chunk",
+            }
+            for i in range(k)
+        ],
+        "retrieval": "hybrid",
+    }
+
+
+class TestSearchCompaction:
+    """The stdio server backs the in-chat agent under the docker provider —
+    the same model reads its output, so it must apply the same budget."""
+
+    def test_knowledge_search_oversized_result_is_compacted(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        srv = _import_server()
+        big = _big_search_payload()
+        with patch("cli.mcp.server.api_get_json", return_value=big):
+            out = srv.knowledge_search("kůň")
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert len(out["results"]) == 10
+        assert "knowledge_search" in out["truncated_note"]
+
+    def test_collections_search_oversized_result_is_compacted(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        srv = _import_server()
+        big = _big_search_payload()
+        with patch("cli.mcp.server.api_get_json", return_value=big):
+            out = srv.collections_search("kůň")
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert "collections_search" in out["truncated_note"]
+
+    def test_small_result_passes_through(self):
+        srv = _import_server()
+        small = _big_search_payload(1)
+        with patch("cli.mcp.server.api_get_json", return_value=small):
+            assert srv.knowledge_search("kůň") == small
+
+    def test_offline_fallback_applies_the_same_budget(self, tmp_path):
+        """The laptop-side artifacts hold the same 3.2k-char chunks; an offline
+        answer must not be the one path that still floods the model."""
+        import httpx
+
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        srv = _import_server()
+        with (
+            patch("cli.mcp.server.api_get_json", side_effect=httpx.ConnectError("down")),
+            patch("cli.config.get_workspace_root", return_value=str(tmp_path)),
+            patch("src.search.local.local_search", return_value=_big_search_payload()["results"]),
+        ):
+            out = srv.knowledge_search("kůň")
+        assert out["source"] == "local"
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert len(out["results"]) == 10

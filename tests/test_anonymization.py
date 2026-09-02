@@ -882,3 +882,32 @@ def test_custom_terms_that_is_not_a_list_is_refused(monkeypatch):
     )
     with pytest.raises(CustomTermError):
         rules_from_config()
+
+
+class TestHighConfidenceSubset:
+    """`RegexDetector.high_confidence` — the subset a caller may reason
+    BACKWARDS from ("regex found a name, so there is one here"). The full
+    tier cannot carry that weight: it over-detects by design."""
+
+    def test_title_cased_headings_are_not_high_confidence(self):
+        doc = "# Quarterly Report\n\n## Executive Summary\n\nSee the Data Warehouse dashboard.\n"
+        tier = RegexDetector()
+        assert tier(doc), "precondition: the full tier does fire here"
+        assert tier.high_confidence(doc) == []
+
+    def test_an_honorific_person_is_high_confidence(self):
+        found = RegexDetector().high_confidence("Jednani vedl Ing. Tomas Kovar.")
+        assert [e.text for e in found] == ["Tomas Kovar"]
+
+    def test_a_legal_form_company_is_high_confidence(self):
+        found = RegexDetector().high_confidence("Dodavatelem je Nexbyte Technologies SE.")
+        assert any(e.text == "Nexbyte Technologies SE" for e in found)
+
+    def test_a_bare_full_name_is_not_high_confidence(self):
+        """Deliberate: two capitalized tokens is also every heading."""
+        assert RegexDetector().high_confidence("Sarah Mitchell approved the plan.") == []
+
+    def test_high_confidence_is_a_subset_of_the_full_tier(self):
+        doc = "Ing. Tomas Kovar of Nexbyte Technologies SE met Sarah Mitchell.\n# Weekly Standup\n"
+        tier = RegexDetector()
+        assert {e.text for e in tier.high_confidence(doc)} <= {e.text for e in tier(doc)}

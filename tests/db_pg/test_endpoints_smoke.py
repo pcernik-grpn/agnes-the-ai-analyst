@@ -473,6 +473,69 @@ class TestAdminLibraryPreviewSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Admin — force-end a user's sessions without deactivating (issue #1676
+# remainder)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminRevokeSessionsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/users/{user_id}/revoke-sessions",
+    }
+
+    def test_revoke_sessions_honest_per_backend(self, seeded_app_both):
+        """200 on both backends. PG actually bumps `session_revoked_before`;
+        DuckDB has no such column (A3 ratchet) and stays a documented no-op —
+        the response body says which happened rather than always claiming
+        success."""
+        from src.repositories import users_repo
+
+        backend = seeded_app_both["backend"]
+        before = users_repo().get_by_id("analyst1")
+        assert before.get("session_revoked_before") is None
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["revoked"] is (backend == "pg"), body
+        assert body["backend_supports_revocation"] is (backend == "pg"), body
+
+        after = users_repo().get_by_id("analyst1")
+        if backend == "pg":
+            assert after["session_revoked_before"] is not None
+        else:
+            assert after.get("session_revoked_before") is None
+
+    def test_revoke_sessions_denied_for_non_admin(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_analyst_headers(seeded_app_both),
+        )
+        assert r.status_code == 403, r.text
+
+    def test_revoke_sessions_unknown_user_404(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/nope-does-not-exist/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 404, r.text
+
+    def test_revoke_sessions_writes_an_audit_row(self, seeded_app_both):
+        from src.repositories import audit_repo
+
+        r = seeded_app_both["client"].post(
+            "/api/admin/users/analyst1/revoke-sessions",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200, r.text
+        rows, _ = audit_repo().query(action_in=["user.revoke_sessions"])
+        assert any(row.get("resource", "").endswith("analyst1") for row in rows), rows
+
+
+# ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
 
@@ -2502,8 +2565,6 @@ KNOWN_UNTESTED = {
     # DB state (internal migration endpoint)
     "GET /api/admin/db-state",
     "POST /api/admin/db-state/migrate",
-    # Observability (PostHog proxy) — external service
-    "POST /api/observability/capture",
     # Admin adoption / usage dashboards — DuckDB analytics, not business state
     "GET /api/admin/adoption",
     "GET /api/admin/usage",
@@ -3423,6 +3484,20 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}",
+    # Corporate-memory detection observability (issue #1971 Part 3/4) — same
+    # shape as the extraction-observability trio above: read-only run
+    # history backed by a PG-only table (`memory_detection_runs`), so its
+    # per-backend behaviour IS the point and is asserted directly (200 +
+    # shape on PG, typed 501 on DuckDB, 403 for a non-admin) by
+    # tests/test_memory_detection_runs_api.py (DuckDB) and
+    # tests/db_pg/test_memory_detection_runs_api_pg.py (PG); not duplicated
+    # in this generic smoke sweep. The dry-run trigger writes nothing to
+    # knowledge_items and answers identically on both backends by
+    # construction (its optional run-log write degrades to a warning on
+    # DuckDB rather than changing the response), covered by
+    # tests/test_memory_detection_dry_run.py.
+    "GET /api/memory/admin/detection-runs",
+    "POST /api/memory/admin/detection-dry-run",
     # The config read-out touches no run rows at all (it reads instance
     # config + the switch registry + the connection's own scopes), so it
     # answers identically on both backends by construction; covered by

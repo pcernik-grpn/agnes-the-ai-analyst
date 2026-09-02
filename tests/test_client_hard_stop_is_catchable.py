@@ -38,6 +38,8 @@ import json
 from datetime import timedelta
 
 import httpx
+import logging
+
 import pytest
 from typer.testing import CliRunner
 
@@ -313,17 +315,22 @@ class TestTheUserFacingContractIsUnchanged:
         assert err.startswith("error: "), f"prefix changed: {err[:40]!r}"
         assert "new.example" in err
 
-    def test_a_hard_stop_is_not_forwarded_to_telemetry(self, monkeypatch):
+    def test_a_hard_stop_is_not_reported_as_an_error(self, monkeypatch, caplog):
         """It was a `SystemExit`, which this wrapper never reported.
 
-        Making it catchable must not also start a new telemetry stream as a
-        side effect — that is a separate decision, not a refactor.
+        Making it catchable must not also start reporting it as a failure —
+        that is a separate decision, not a refactor. This used to be pinned
+        against the CLI's telemetry forwarder; that forwarder is gone, so
+        the surviving way to report a hard stop is a log record, and a
+        redirect the CLI declines to follow is a message to the user, not a
+        failure of the run.
         """
         import cli.main as m
 
-        captured: list = []
-        monkeypatch.setattr(m, "_capture_cli_exception", lambda *a, **k: captured.append(a))
         monkeypatch.setattr(m, "app", lambda: (_ for _ in ()).throw(RedirectHardStop("moved")))
-        with pytest.raises(SystemExit):
-            m.main()
-        assert captured == [], "a structural fix quietly started reporting to telemetry"
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(SystemExit):
+                m.main()
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == [], (
+            "a structural fix quietly started reporting a hard stop as an error"
+        )

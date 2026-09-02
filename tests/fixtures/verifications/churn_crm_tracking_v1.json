@@ -4,10 +4,15 @@
       "detection_type": "correction",
       "title": "Forecasted churn tracking requirement in CRM",
       "content": "We need to track forecasted churn on orders in the CRM: record the reason a client may leave and roll that up into internal reporting.",
-      "user_quote": "We need to track forecasted churn on orders in the CRM — record the reason a client may leave and roll that up into internal reporting.",
+      "user_quote": "We need to track forecasted churn on orders in the CRM \u2014 record the reason a client may leave and roll that up into internal reporting.",
       "domain": "operations",
-      "entities": ["churn", "CRM", "orders"],
-      "base_confidence": 0.90
+      "entities": [
+        "churn",
+        "CRM",
+        "orders"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

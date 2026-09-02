@@ -1,4 +1,4 @@
-# Observability — PostHog integration
+# Observability — logs, cost, and metrics
 
 ## Audit & activity trails (retention status)
 
@@ -218,126 +218,80 @@ own `DATA_DIR` rather than relying on the figures above; they exist to show
 the methodology and a plausible order of magnitude, not to stand in for a
 measurement of your instance.
 
-Optional integration that wires four signals into a single PostHog project:
+Agnes writes one JSON object per log line and nothing else. There is no
+telemetry sink to configure, no key to set, and no data leaving the host on
+Agnes's account: whatever already collects the container's stdout — a
+platform log service, a sidecar collector, `docker logs` — is the whole
+pipeline.
 
-1. **Backend exceptions** — every unhandled FastAPI exception, plus rebuild
-   failures from `src/orchestrator.py` and HTTP-job failures from
-   `services/scheduler/`.
-2. **LLM tracing** — every Anthropic / OpenAI-compat call emits a
-   `$ai_generation` event with provider, model, latency, and token counts.
-3. **Frontend errors + pageviews** — `window.error` /
-   `unhandledrejection` forwarded via `posthog.captureException`; automatic
-   `$pageview` and `$pageleave`.
-4. **Session replay (masked) + feature flags** — both gated behind the same
-   single `POSTHOG_API_KEY`.
+## Structured logs
 
-The integration ships **off by default**. Setting one environment variable
-turns everything on.
+In production (`DEBUG` unset) every process installs a JSON formatter
+(`app/logging_config.py`). One record per line:
 
-## Enabling the integration
-
-```bash
-# Required — the only switch that controls on/off.
-# Use a PROJECT key (publishable phc_…), never a personal API key.
-POSTHOG_API_KEY=phc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-That's the entire minimum. Defaults will:
-
-- Send to `https://eu.i.posthog.com` (override with `POSTHOG_HOST`).
-- Identify logged-in users by id + email (override with `POSTHOG_IDENTIFY_PII`).
-- Record session replay with all inputs and known data surfaces masked
-  (override with `POSTHOG_REPLAY=false` or
-  `POSTHOG_REPLAY_MASK_SELECTOR=…`).
-- Skip prompt / completion bodies in LLM events; emit token counts + latency
-  only (override with `POSTHOG_LLM_PAYLOADS=1` if you accept the privacy
-  trade-off — LLM prompts in this product routinely include customer SQL
-  and data).
-
-## All knobs
-
-| Variable | Default | Notes |
-|---|---|---|
-| `POSTHOG_API_KEY` | unset | **The on/off switch.** Unset = integration is fully off. Project key only. |
-| `POSTHOG_HOST` | `https://eu.i.posthog.com` | Full URL. Use `https://us.i.posthog.com` for the US region or your own host. |
-| `POSTHOG_IDENTIFY_PII` | `email` | `none` / `id` / `email` / `full`. |
-| `POSTHOG_REPLAY` | `true` | Disable replay only, keeping errors / events / flags. |
-| `POSTHOG_REPLAY_MASK_SELECTOR` | empty | CSS selector appended to the default mask list. |
-| `POSTHOG_LLM_PAYLOADS` | `0` | `1` adds `$ai_input` + `$ai_output_choices` to LLM events. Off by default. |
-| `POSTHOG_ENVIRONMENT` | auto | Tagged on every event as the `environment` super-property. Auto-resolves to `local` when `LOCAL_DEV_MODE=1`, else `RELEASE_CHANNEL`, else `AGNES_DEPLOYMENT_ENV`, else `unknown`. |
-
-## Splitting traffic by environment
-
-Every captured event — backend exceptions, `$ai_generation`, browser
-`$pageview`, JS errors, custom events — is tagged with two super
-properties so PostHog dashboards can slice cleanly:
-
-- `environment` — resolved at startup (see table above). Operators
-  typically set this to `local`, `staging`, or `production` explicitly,
-  or rely on the auto-resolver.
-- `release` — the running `AGNES_VERSION`, falling back to
-  `RELEASE_CHANNEL`. Useful for "is this error new in this release?"
-  cohorting.
-
-Both apply to backend events via the SDK's `super_properties` and to
-browser events via `posthog.register({...})` in the loaded callback, so
-filtering by `environment = production` in PostHog hides every event
-generated from a developer laptop, CI, or staging.
-
-## Privacy posture
-
-- The PostHog **project key** is publishable — it's safe in browser HTML.
-  PostHog uses a separate **personal API key** for admin operations. This
-  integration only ever exposes the project key. Treat the personal key like
-  any other secret and never set it as `POSTHOG_API_KEY`.
-- Session replay defaults: `maskAllInputs: true`, plus a CSS-selector mask
-  for known data-bearing classes (`.data-cell`, `.query-result`,
-  `.sql-output`, plain `<code>` and `<pre>`, and any element marked
-  `data-sensitive`). Add your own with `POSTHOG_REPLAY_MASK_SELECTOR`.
-- LLM payloads are **off by default** because the prompts and completions
-  in this product include customer SQL, query results, and table samples.
-  Token counts and latency are always sent (no payload contents in them).
-- `person_profiles: 'identified_only'` — anonymous visits do not create
-  person records.
-
-## Where the events come from
-
-| Event | Code path |
+| field | what it carries |
 |---|---|
-| `$exception` (unhandled 500) | `app/main.py:_unhandled_exception_handler` |
-| `$exception` (orchestrator rebuild) | `src/orchestrator.py:_capture_orchestrator_exception` |
-| `$exception` (scheduler job) | `services/scheduler/__main__.py:_call_api` |
-| `$exception` (CLI uncaught) | `cli/main.py:main` |
-| `$ai_generation` | `src/observability/llm_tracing.py:trace_generation` wrapped at `connectors/llm/anthropic_provider.py:_attempt_extraction` and `connectors/llm/openai_compat.py` |
-| `$pageview`, `$pageleave`, JS errors | injected into every `text/html` response by `app/middleware/posthog_inject.py` |
+| `severity` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
+| `message` | the formatted log message |
+| `time` | UTC ISO-8601 |
+| `logger` | the module's logger name |
+| `service` | `app`, `scheduler`, … — which process wrote it |
+| `env` | `AGNES_DEPLOYMENT_ENV`, else `RELEASE_CHANNEL`, else `unknown` |
+| `replica` | `hostname:pid`, for correlating across replicas |
+| `request_id` | present when the line was written inside a request |
+| `exc` | the formatted traceback, when the record carries one |
 
-## CLI coverage
+The names are the ones a collector looks for when deciding whether a line is
+a structured entry or just text. Under this project's older `lvl`/`msg`/`ts`
+every line arrived at its collector's default severity with the payload as
+one opaque string — filterable by substring only, which is the same as
+having no levels at all.
 
-The `da` CLI (`cli/main.py:main`) catches every uncaught exception from a
-command, forwards it to PostHog with `component=cli` and the invoked
-command name, then flushes the client before re-raising for Typer's
-default error printer. Normal Typer / Click exits, `SystemExit`, and
-`KeyboardInterrupt` are intentionally skipped.
+Anything a caller passes as `extra={...}` is promoted to a real field
+alongside these, so numbers stay filterable instead of being formatted into
+the message. Core fields win a name collision: an `extra` cannot relabel its
+own line's `severity` or `service`.
 
-Operators must surface `POSTHOG_API_KEY` (and any other `POSTHOG_*` knob)
-into the shell that runs `da` — typically by sourcing the same `.env` the
-server uses, or by setting the variable in their shell profile. The CLI
-respects exactly the same env-var contract as the server.
+In development (`DEBUG=1`) the same records render through `rich` with
+colour and tracebacks instead.
 
-LLM calls made by CLI commands (`da query`, `da explore`, etc.) flow
-through the provider wrappers in `connectors/llm/` and therefore emit
-`$ai_generation` events via the same tracing path the server uses.
+### What is emitted, and from where
 
-## Testing the integration
+- **Unhandled exceptions** — the FastAPI 500 handler logs the exception with
+  the request's method, path and `request_id`. Rebuild failures
+  (`src/orchestrator.py`) and HTTP-job failures (`services/scheduler/`) log
+  as `event: component_error` with the component named.
+- **LLM calls** — every Anthropic / OpenAI-compat generation emits one
+  `event: llm_generation` record (`src/observability/llm_tracing.py`) with
+  `provider`, `model`, `latency_ms`, `input_tokens`, `output_tokens`,
+  `prompt_chars`, `completion_chars` and `is_error`. Prompts and completions
+  are **never** recorded — in this product they routinely carry customer
+  data, and a log pipeline is the wrong place to hold it. Their sizes are,
+  because a size is the part that explains a cost or a latency. For per-turn
+  cost as a measurement rather than a sample, use *Chat cost* above.
 
-Boot the app with the key set, hit `/`, then provoke a 500 (e.g. via a
-debug-only route). One **Errors** event should arrive within seconds along
-with one `$pageview` per page load. Open **Session replay** and pick the
-session — every `<input>` should show as a masked rectangle.
+### Splitting traffic by environment
 
-The unit tests in `tests/test_posthog_*.py` cover the disabled and enabled
-configurations; `tests/test_llm_tracing.py` exercises the success and error
-variants of the LLM event.
+Set `AGNES_DEPLOYMENT_ENV` per deployment (`production`, `staging`, a
+developer's name) and filter on `env`. It falls back to `RELEASE_CHANNEL`
+and finally to the literal `unknown` — never absent, so `env != "production"`
+keeps matching a deployment that forgot to label itself. The same variable
+is what the host-side operator scripts (`agnes-watchdog.sh`,
+`agnes-db-backup.sh`) read to tag their alerts.
+
+### Shipping the logs somewhere
+
+Nothing in Agnes decides this — it writes to stdout and stops. On the
+GCE-hosted deployments the Terraform module wires it up; see
+[`gcp-logging.md`](gcp-logging.md).
+
+### Verifying the wiring
+
+With `DEBUG=1`, `GET /api/debug/throw?kind=ValueError&msg=hello` raises after
+authentication resolves, so you can confirm a real unhandled exception
+reaches your collector with the request context attached. It returns 404
+whenever `DEBUG` is unset.
+
 
 ## Prometheus `/metrics`
 
@@ -400,7 +354,13 @@ caveat on cAdvisor's fidelity. A production deployment that doesn't use
 this profile should scrape the same `/metrics` path on whatever ports each
 role's `/healthz`/`/readyz` already answer on, at a similar interval.
 
-## Self-hosting note
+## No telemetry vendor
 
-PostHog is itself open source — operators with a self-hosted PostHog instance
-just point `POSTHOG_HOST` at their endpoint. No code changes required.
+Agnes sends nothing to a third-party analytics or error-tracking service, and
+has no key for one. An optional integration with a hosted product-analytics
+vendor existed until 0.96 and was removed (see `CHANGELOG.md`): it was off on
+every deployment, it never saw the failures that mattered — a handled error
+is not a 500, so it was never captured — and it asked operators to ship
+prompts and session replays off-host to get numbers the log pipeline already
+carries. What it did well, LLM call metadata and an environment label, is
+above, in logs.

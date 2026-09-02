@@ -2,7 +2,7 @@
 paths via the shared ``SSE_BYPASS_PREFIXES`` tuple — BaseHTTPMiddleware
 buffers the whole body, which re-collapses a token stream into one burst
 (and can crash on Python 3.13). The broker LLM proxy regression: GZip was
-skip-listed but PostHog + rate-limit still buffered the stream.
+skip-listed but the rate-limit middleware still buffered the stream.
 """
 
 from __future__ import annotations
@@ -36,12 +36,6 @@ def _passes_through_untouched(mw_cls, path: str) -> bool:
     scope = {"type": "http", "method": "POST", "path": path, "headers": []}
     asyncio.run(mw(scope, receive, send))
     return hit.get("inner", False)
-
-
-def test_posthog_middleware_bypasses_broker_sse():
-    from app.middleware.posthog_inject import PosthogInjectionMiddleware
-
-    assert _passes_through_untouched(PosthogInjectionMiddleware, "/api/broker/anthropic")
 
 
 def test_rate_limit_middleware_bypasses_broker_sse():

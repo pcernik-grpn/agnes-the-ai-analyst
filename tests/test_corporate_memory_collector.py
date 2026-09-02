@@ -1323,3 +1323,149 @@ class TestDuplicateProposalGuardIntegration:
         assert stats["items_new"] == 1
         assert stats["items_duplicate_skipped"] == 0
         mock_repo.create.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1971 Part 6 — wiring three previously-inert corporate_memory.* knobs
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeLocalMdEnabledKnob:
+    def test_disabled_skips_the_whole_run_without_calling_the_llm(self, tmp_path, monkeypatch):
+        response = {"items": []}
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"sources": {"claude_local_md": {"enabled": False}}}},
+            raising=False,
+        )
+        extractor_calls = []
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda *a, **kw: extractor_calls.append(1) or MockLLMProvider(response),
+            raising=False,
+        )
+
+        stats = collector.collect_all(dry_run=False)
+
+        assert stats["skipped"] is True
+        assert extractor_calls == []  # no LLM cost paid at all
+
+    def test_enabled_true_is_unaffected(self, tmp_path, monkeypatch):
+        """Default / explicit True keeps existing behavior byte-identical."""
+        response = {
+            "items": [
+                {
+                    "existing_id": None,
+                    "title": "Tip",
+                    "content": "Use indexes",
+                    "category": "workflow",
+                    "tags": [],
+                    "source_users": ["alice"],
+                }
+            ]
+        }
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"sources": {"claude_local_md": {"enabled": True}}}},
+            raising=False,
+        )
+        with patch.object(collector, "check_sensitivity", return_value=True):
+            stats = collector.collect_all(dry_run=True)
+        assert stats["skipped"] is False
+
+
+class TestExtractionModelOverrideKnob:
+    def test_corporate_memory_extraction_model_overrides_the_global_ai_model(self, tmp_path, monkeypatch):
+        """Mirrors the extraction.facts.model precedent — a per-feature
+        override on top of the shared ai: block, not a second source of
+        truth that silently wins or loses."""
+        response = {"items": []}
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {
+                "ai": {"model": "global-model", "provider": "anthropic"},
+                "corporate_memory": {"extraction": {"model": "cm-override-model"}},
+            },
+            raising=False,
+        )
+        captured_ai_configs = []
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda ai_config=None, **kw: captured_ai_configs.append(ai_config) or MockLLMProvider(response),
+            raising=False,
+        )
+
+        collector.collect_all(dry_run=True)
+
+        assert captured_ai_configs, "extractor factory was never called"
+        assert captured_ai_configs[0]["model"] == "cm-override-model"
+        # The rest of the ai: block (provider, credentials) is untouched.
+        assert captured_ai_configs[0]["provider"] == "anthropic"
+
+    def test_no_override_leaves_the_global_ai_config_untouched(self, tmp_path, monkeypatch):
+        response = {"items": []}
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"ai": {"model": "global-model"}},
+            raising=False,
+        )
+        captured_ai_configs = []
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda ai_config=None, **kw: captured_ai_configs.append(ai_config) or MockLLMProvider(response),
+            raising=False,
+        )
+
+        collector.collect_all(dry_run=True)
+
+        assert captured_ai_configs[0]["model"] == "global-model"
+
+
+class TestSensitivityCheckKnob:
+    def test_disabled_skips_the_sensitivity_llm_call(self, tmp_path, monkeypatch):
+        response = {
+            "items": [
+                {
+                    "existing_id": None,
+                    "title": "Tip",
+                    "content": "Use indexes",
+                    "category": "workflow",
+                    "tags": [],
+                    "source_users": ["alice"],
+                }
+            ]
+        }
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"corporate_memory": {"extraction": {"sensitivity_check": False}}},
+            raising=False,
+        )
+        with patch.object(collector, "check_sensitivity") as mock_check:
+            stats = collector.collect_all(dry_run=True)
+
+        mock_check.assert_not_called()
+        assert stats["items_new"] == 1  # still added — just not LLM-vetted
+
+    def test_default_still_runs_the_sensitivity_check(self, tmp_path, monkeypatch):
+        response = {
+            "items": [
+                {
+                    "existing_id": None,
+                    "title": "Tip",
+                    "content": "Use indexes",
+                    "category": "workflow",
+                    "tags": [],
+                    "source_users": ["alice"],
+                }
+            ]
+        }
+        collector = _make_collect_all_env(tmp_path, monkeypatch, response)
+        with patch.object(collector, "check_sensitivity", return_value=True) as mock_check:
+            collector.collect_all(dry_run=True)
+
+        mock_check.assert_called_once()

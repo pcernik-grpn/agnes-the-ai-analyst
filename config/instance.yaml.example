@@ -138,8 +138,8 @@ instance:
   #                                  # AGNES_HOME_SHOW_STATUS_FRAME.
   # custom_scripts:                  # Operator-injected HTML/JS blocks rendered into every
   #                                  # page that extends base.html. Use for feedback widgets
-  #                                  # (Marker.io), analytics (GTM, PostHog), error capture
-  #                                  # (Sentry), etc. Each entry needs name + enabled +
+  #                                  # analytics tags, error-capture snippets, etc. Each
+  #                                  # entry needs name + enabled +
   #                                  # placement + html. Admin-only; rendered with `| safe`.
   #                                  # Review the widget's privacy posture before enabling —
   #                                  # most third-party widgets capture screenshots, console
@@ -350,6 +350,19 @@ auth:
 #   # clients regardless. See docs/DEPLOYMENT.md. Env override:
 #   # AGNES_MCP_CONNECTOR_UI_ENABLED.
 #   connector_ui_enabled: true
+#
+#   # Accept the MCP bearer token as a `?token=` query parameter on the SSE
+#   # transport (/api/mcp/sse), for a legacy client that cannot set the
+#   # Authorization header on a GET. OFF by default (#1656 audit follow-up):
+#   # a token in the query string is captured by every request-logging
+#   # intermediary — reverse proxy, uvicorn access log, SIEM — and by browser
+#   # history (CWE-598). Prefer the Authorization header; every connection
+#   # snippet Agnes hands out (/mcp-connect) is header-based already. Turn
+#   # this on only for a documented client that genuinely cannot send a
+#   # header — Agnes still logs a one-time warning naming the exposure the
+#   # first time the fallback is actually used. Env override:
+#   # AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN.
+#   allow_query_param_token: false
 
 # --- Access control (optional) ---
 # access:
@@ -814,7 +827,10 @@ ai:
 #   auto_publish_min_confidence: 0.80
 #
 #   # Default review period for approved/mandatory items (months).
-#   # Not yet wired (#1971) — no scheduled job reads this or expires items yet.
+#   # Not yet wired (#1971) — no scheduled job reads this or expires items
+#   # yet. Real item expiry is a standalone feature (see
+#   # docs/ADR-corporate-memory-v1.md -> "Knowledge Freshness & Expiry"),
+#   # out of scope for #1971's detection-observability/routing work.
 #   review_period_months: 6
 #
 #   # Notify every Admin-group member's desktop when a collection run
@@ -824,22 +840,23 @@ ai:
 #   # --- V1 Context Engineering ---
 #
 #   sources:
-#     # Not yet wired (#1971): the nightly collector always runs regardless
-#     # of enabled, and always scores items from confidence.base.claude_local_md
-#     # below, not confidence_base here.
 #     claude_local_md:
+#       # Live — false skips the nightly collector run entirely (no LLM
+#       # call, no catalog refresh).
 #       enabled: true
-#       confidence_base: 0.50
+#       # DEAD — remove if present. The collector has only ever scored
+#       # items from confidence.base.claude_local_md below; this key was
+#       # never read. Use that one.
 #     session_transcripts:
 #       # Live — read fresh on every verification-processor run (every 15
 #       # minutes): false skips session-transcript extraction entirely.
 #       enabled: true
-#       # Not yet wired (#1971) — extracted items are scored from
-#       # confidence.base['user_verification.<detection_type>'] below.
-#       confidence_base: 0.60
-#       # Not yet wired (#1971) — the truncation window is the hardcoded
-#       # MAX_TURNS_PER_SESSION constant in
-#       # services/verification_detector/detector.py (100).
+#       # DEAD — remove if present. Extracted items are scored from
+#       # confidence.base['user_verification.<detection_type>'] below; this
+#       # key was never read.
+#       # Live — the per-session truncation window, read fresh on every
+#       # run. Falls back to the built-in default (100) when unset or not a
+#       # positive integer.
 #       max_turns_per_session: 100
 #       # Live — extracted items whose detection_type isn't listed here are
 #       # dropped before dedup/insert.
@@ -848,12 +865,24 @@ ai:
 #         - confirmation
 #         - unprompted_definition
 #
-#   # Not yet wired (#1971): the collector and verification processor build
-#   # their LLM extractor from the top-level ai.* section, and both run their
-#   # sensitivity/contradiction checks unconditionally.
 #   extraction:
+#     # Live — per-feature override of the top-level ai.model for BOTH
+#     # extraction paths (mirrors the extraction.facts.model override
+#     # elsewhere in this file). Unset uses whatever model the ai: block
+#     # configures; only the model changes, credentials/provider are still
+#     # the shared ai: block's.
 #     model: "claude-haiku-4-5-20251001"
+#     # Live (collector path only) — false skips the per-item LLM
+#     # sensitivity check entirely (a cost switch; the item is still
+#     # added, just not LLM-vetted). The session-transcript path has no
+#     # equivalent check to gate.
 #     sensitivity_check: true
+#     # Still not wired — contradiction_module.detect_and_record() runs
+#     # unconditionally on the session-transcript path today (the collector
+#     # runs no contradiction check at all). Out of scope for issue #1971;
+#     # contradiction_detection.enabled/max_candidates below are likewise
+#     # still unread — both are one coherent future "wire contradiction
+#     # config" pass, not two.
 #     contradiction_check: true
 #
 #   confidence:
@@ -885,12 +914,18 @@ ai:
 #         user_verification: 0.40       # user-verified facts never fall below 0.40
 #         default: 0.0
 #
+#   # Still not wired — see the extraction.contradiction_check note above;
+#   # this is the other half of the same unwired knob.
 #   contradiction_detection:
 #     enabled: true
 #     max_candidates: 10
 #
-#   # Not yet wired (#1971) — no extraction or resolution path reads this
-#   # section yet; entity names are extracted freeform per item instead.
+#   # Still not wired — no extraction or resolution path reads this
+#   # section; entity names are extracted freeform per item instead. The
+#   # matching logic already exists and is unit-tested
+#   # (services/corporate_memory/entities.py::resolve_and_merge) but is
+#   # never called from either extraction path. Out of scope for issue
+#   # #1971 (detection observability/routing, not entity tagging).
 #   entity_resolution:
 #     enabled: true
 #     entities:
@@ -1104,9 +1139,18 @@ chat:
   idle_ttl_seconds: 1800              # 30 min
   per_tool_call_seconds: 90
   per_session_bq_scan_bytes: 21474836480   # 20 GiB
+  # Per-sender daily spend estimate (USD; a message with no recorded model is
+  # priced at the most expensive general-purpose tier). 0 disables.
   daily_anthropic_spend_usd: 20.0
   max_session_seconds: 14400
-  max_session_tokens: 200000
+  # Tokens billed over ONE conversation's whole life (input + output + cache
+  # writes, summed over every turn) — NOT its context window, which the
+  # engine compacts on its own. An agentic turn re-sends the context on every
+  # tool call, so a busy conversation bills several hundred thousand tokens
+  # per turn and a value near the model's context size trips mid-conversation.
+  # A runaway-conversation guard, not the cost control (that is
+  # daily_anthropic_spend_usd). 0 disables.
+  max_session_tokens: 2000000
   rate_messages_per_hour: 100
   tool_calls_per_turn_budget: 50
   # How long the in-runner approval gate waits for the user to answer an
@@ -1494,6 +1538,55 @@ extraction:
     # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
     # the recall is worth that per-corpus bill.
     detector: "regex"
+    # OPTIONAL: point the `llm` tier at a SELF-HOSTED endpoint instead of the
+    # instance's cloud model credentials. Leave `base_url` empty (the
+    # default) and nothing here applies — the tier uses ANTHROPIC_API_KEY /
+    # LLM_API_KEY / Vertex ADC exactly as before.
+    #
+    # The endpoint must speak the Anthropic Messages shape
+    # (`POST {base_url}/v1/messages`); LiteLLM, vLLM's Anthropic route and
+    # similar proxies all expose it in front of a local model. That surface
+    # rather than OpenAI chat-completions because this tier needs per-call
+    # token `usage` and a cacheable system-prompt breakpoint.
+    #
+    # TWO GATES, both server-side and neither optional, because this whole
+    # section is admin-writable and this endpoint receives document text
+    # BEFORE anonymization — names, emails, account numbers:
+    #
+    #   1. The host of `base_url` must be listed in
+    #      AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST (comma-separated
+    #      host or host:port) in the server's environment. DEFAULT-CLOSED:
+    #      unset allows nothing, so an edited `base_url` cannot quietly
+    #      redirect documents off-network.
+    #   2. `api_key_env` may only name a variable under the
+    #      AGNES_ANONYMIZATION_LLM_ prefix. It is checked BEFORE the value is
+    #      read, so config cannot point it at the vault key, the anonymization
+    #      HMAC key, or a connector certificate and have that sent as a bearer
+    #      token — those are outside the namespace by construction.
+    #
+    # A misconfiguration here FAILS the anonymize pass; it never falls back
+    # to the cloud path. Falling back would either start billing a model the
+    # operator did not choose or ship documents somewhere they did not intend.
+    llm:
+      base_url: ""              # e.g. "https://llm.internal:8443"
+      # The id the endpoint serves, used VERBATIM — no tier resolution, so
+      # non-Claude ids are fine and required (e.g. "qwen3.5-9b").
+      model: ""
+      # Omit or leave empty for the default name
+      # (AGNES_ANONYMIZATION_LLM_API_KEY); any other AGNES_ANONYMIZATION_LLM_*
+      # name works too, for a deployment running more than one endpoint. An
+      # endpoint that wants no auth is fine — the variable simply stays unset.
+      api_key_env: ""
+      # Per-call output ceiling; 0 or unset uses the built-in 4096.
+      #
+      # Size this to the DEPLOYED MODEL, not to the expected answer. A model
+      # with a reasoning channel spends this same budget thinking before it
+      # answers and can exhaust it mid-thought, which arrives here as an
+      # empty reply and fails the document closed. A 20B reasoning model
+      # measured on real documents needed >16384 and still failed under
+      # concurrency; a model with no reasoning channel answered the same
+      # documents in ~200 tokens.
+      max_output_tokens: 0
     # Deterministic identifier tiers — the shapes a *name* detector cannot
     # find, because they are not names: they are decided from characters
     # alone. Each runs before entity substitution and each is individually

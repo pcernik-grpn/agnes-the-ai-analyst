@@ -212,6 +212,11 @@ class TestLlmDetector:
             def __call__(self, _markdown):
                 return []
 
+            def detect_by_chunk(self, markdown):
+                # The gate corroborates per chunk, so a stand-in for
+                # `LLMDetector` has to report per chunk too — one chunk here.
+                return [(markdown, [])]
+
         monkeypatch.setattr(ner, "LLMDetector", _StubLLM)
         r = seeded_app["client"].post(
             URL, json={"text": SAMPLE, "detector": "llm"}, headers=_auth(seeded_app["admin_token"])
@@ -233,6 +238,9 @@ class TestLlmDetector:
                 self.last_usage = {}
 
             def __call__(self, _markdown):
+                raise ner.DetectionUnavailable("no credentials configured")
+
+            def detect_by_chunk(self, _markdown):
                 raise ner.DetectionUnavailable("no credentials configured")
 
         monkeypatch.setattr(ner, "LLMDetector", _DeadLLM)
