@@ -1176,25 +1176,56 @@ class _Report:
         self.ingest_failures: List[Dict[str, Any]] = []
         self.interrupted = False
         self.interrupted_reason: Optional[str] = None
+        #: How many documents' FINAL completion came from each transport —
+        #: "final" because a batch-mode document whose corrective retry
+        #: fell back to sync (``retry_transport: sync``) still counts as
+        #: ``docs_via_batch``, its INITIAL (and dominant-cost) completion.
+        #: Sync-mode passes leave `docs_via_batch` at 0.
+        self.docs_via_batch = 0
+        self.docs_via_sync = 0
 
     def render(
-        self, *, model: str, prompt_origin: str, ontology: Dict[str, Any], usage: Dict[str, Any]
+        self,
+        *,
+        model: str,
+        prompt_origin: str,
+        ontology: Dict[str, Any],
+        usage: Dict[str, Any],
+        batch_usage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """``batch_usage`` is the SUBSET of ``usage`` that came from the
+        Batches API (a batch-mode pass whose corrective retry fell back to
+        ``retry_transport: sync`` mixes both within one run) — priced at
+        :data:`src.llm_pricing.BATCH_PRICE_MULTIPLIER`, the remainder at
+        the synchronous rate, and summed. ``None`` (every sync-mode call
+        site) prices the whole of ``usage`` at the synchronous rate, exactly
+        as before this parameter existed.
+        """
         from src.llm_pricing import cost_usd
 
         elapsed = max(time.monotonic() - self.started, 1e-6)
         priced = dict(usage)
         priced["model"] = model
-        priced["estimated_cost_usd"] = round(
-            cost_usd(
-                model=model,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-            ),
-            4,
+        batch_usage = batch_usage or {}
+        sync_portion = {
+            field: int(usage.get(field, 0)) - int(batch_usage.get(field, 0))
+            for field in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        }
+        cost = cost_usd(
+            model=model,
+            input_tokens=sync_portion["input_tokens"],
+            output_tokens=sync_portion["output_tokens"],
+            cache_read_tokens=sync_portion["cache_read_input_tokens"],
+            cache_creation_tokens=sync_portion["cache_creation_input_tokens"],
+        ) + cost_usd(
+            model=model,
+            input_tokens=batch_usage.get("input_tokens", 0),
+            output_tokens=batch_usage.get("output_tokens", 0),
+            cache_read_tokens=batch_usage.get("cache_read_input_tokens", 0),
+            cache_creation_tokens=batch_usage.get("cache_creation_input_tokens", 0),
+            batch=True,
         )
+        priced["estimated_cost_usd"] = round(cost, 4)
         return {
             "started_at": self.started_at,
             "finished_at": _now_iso(),
@@ -1229,6 +1260,8 @@ class _Report:
             "claims_rejected": self.claims_rejected,
             "ingest_batches": self.ingest_batches,
             "ingest_failures": self.ingest_failures,
+            "docs_via_batch": self.docs_via_batch,
+            "docs_via_sync": self.docs_via_sync,
             "facts_usage": priced,
         }
 
@@ -1374,6 +1407,75 @@ class _IngestRefused(RuntimeError):
         self.status_code = getattr(exc, "status_code", None)
         self.detail = getattr(exc, "detail", None)
         super().__init__(f"ingest refused: {self.status_code} {self.detail}")
+
+
+def _ontology_report(ontology_models: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The report's ``ontology`` block — shared by both transports so they
+    can never describe the same ontology differently."""
+    return {
+        "models": [m.get("slug") for m in ontology_models],
+        "node_types": sum(
+            1
+            for m in ontology_models
+            for d in (m["model"].get("datasets") or [])
+            if str((d or {}).get("source") or "").startswith("ontology_node_type:")
+        ),
+        "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
+    }
+
+
+def _fold_accepted_result(
+    *,
+    report: "_Report",
+    shipper: "_BatchShipper",
+    docs_state: Dict[str, Any],
+    result: "_DocResult",
+    model: str,
+    fingerprint: str,
+) -> None:
+    """Fold one finished document into the report, the batch shipper and
+    the per-document state — the SAME "done" shape and the SAME counters
+    regardless of which transport produced ``result``, so a document's
+    final state can never reveal which one ran. Shared by
+    :func:`run_facts_extraction`'s sync loop and :func:`_run_batch_pass`.
+    """
+    from connectors.sharepoint.facts_prompt import PROMPT_VERSION
+
+    work = result.work
+    report.parse_errors += result.parse_errors
+    report.facts_retries += 1 if result.retried else 0
+    report.facts_quotes_dropped += result.dropped
+    report.facts_quotes_repaired += result.repaired
+    claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
+    shipper.add(
+        document={
+            "doc_id": work.doc_id,
+            "corpus_id": work.collection_id,
+            "stable_id": work.mapping.get("source_stable_id"),
+            "path": work.path,
+            "name": work.filename,
+            "sha256": work.mapping.get("source_sha256") or work.sha256,
+        },
+        nodes=result.nodes,
+        edges=result.edges,
+        claim_count=claim_count,
+    )
+    report.docs_extracted += 1
+    report.nodes_emitted += len(result.nodes)
+    report.edges_emitted += len(result.edges)
+    docs_state[work.file_id] = {
+        "status": "done",
+        "doc_id": work.doc_id,
+        "extracted_sha": work.sha256,
+        "model": model,
+        "prompt_fingerprint": fingerprint,
+        "prompt_version": PROMPT_VERSION,
+        "nodes": len(result.nodes),
+        "edges": len(result.edges),
+        "dropped": result.dropped,
+        "seconds": result.seconds,
+        "at": _now_iso(),
+    }
 
 
 class _Work:
@@ -1605,7 +1707,7 @@ def run_facts_extraction(
         )
     ontology_text = render_ontology(ontology_models)
 
-    from connectors.sharepoint.facts_prompt import PROMPT_VERSION, prompt_fingerprint, resolve_extraction_prompt
+    from connectors.sharepoint.facts_prompt import prompt_fingerprint, resolve_extraction_prompt
 
     prompt_text, prompt_origin = resolve_extraction_prompt()
     system_prompt = build_system_prompt(prompt_text, ontology_text)
@@ -1750,42 +1852,13 @@ def run_facts_extraction(
         """Fold one finished document into the report, the batch and the
         state file. Main thread only — which is what makes the report
         counters, the shipper and ``docs_state`` need no locks of their
-        own."""
-        work = result.work
-        report.parse_errors += result.parse_errors
-        report.facts_retries += 1 if result.retried else 0
-        report.facts_quotes_dropped += result.dropped
-        report.facts_quotes_repaired += result.repaired
-        claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
-        shipper.add(
-            document={
-                "doc_id": work.doc_id,
-                "corpus_id": work.collection_id,
-                "stable_id": work.mapping.get("source_stable_id"),
-                "path": work.path,
-                "name": work.filename,
-                "sha256": work.mapping.get("source_sha256") or work.sha256,
-            },
-            nodes=result.nodes,
-            edges=result.edges,
-            claim_count=claim_count,
+        own. The fold itself is :func:`_fold_accepted_result`, shared with
+        :func:`_run_batch_pass` so a document's final "done" shape can
+        never drift between transports."""
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
         )
-        report.docs_extracted += 1
-        report.nodes_emitted += len(result.nodes)
-        report.edges_emitted += len(result.edges)
-        docs_state[work.file_id] = {
-            "status": "done",
-            "doc_id": work.doc_id,
-            "extracted_sha": work.sha256,
-            "model": model,
-            "prompt_fingerprint": fingerprint,
-            "prompt_version": PROMPT_VERSION,
-            "nodes": len(result.nodes),
-            "edges": len(result.edges),
-            "dropped": result.dropped,
-            "seconds": result.seconds,
-            "at": _now_iso(),
-        }
+        report.docs_via_sync += 1
         if shipper.should_flush():
             _flush()
 
@@ -1896,16 +1969,7 @@ def run_facts_extraction(
     rendered = report.render(
         model=model,
         prompt_origin=prompt_origin,
-        ontology={
-            "models": [m.get("slug") for m in ontology_models],
-            "node_types": sum(
-                1
-                for m in ontology_models
-                for d in (m["model"].get("datasets") or [])
-                if str((d or {}).get("source") or "").startswith("ontology_node_type:")
-            ),
-            "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
-        },
+        ontology=_ontology_report(ontology_models),
         usage=usage,
     )
     logger.info(

@@ -986,6 +986,46 @@ def test_fact_key_is_stable_regardless_of_key_order():
     assert _fact_key({"a": 1, "b": 2}) == _fact_key({"b": 2, "a": 1})
 
 
+# ---------------------------------------------------------------------------
+# Report — via_batch/via_sync split, batch-priced cost
+# ---------------------------------------------------------------------------
+
+
+def test_report_counts_default_to_zero_and_render_is_backward_compatible():
+    report = fe._Report()
+    rendered = report.render(model="claude-haiku-4-5", prompt_origin="builtin", ontology={}, usage=fe._empty_usage())
+    assert rendered["docs_via_batch"] == 0
+    assert rendered["docs_via_sync"] == 0
+    assert rendered["facts_usage"]["estimated_cost_usd"] == 0.0
+
+
+def test_report_prices_batch_usage_at_the_batch_multiplier():
+    report = fe._Report()
+    usage = fe._empty_usage()
+    usage["input_tokens"] = 2_000_000
+    batch_usage = fe._empty_usage()
+    batch_usage["input_tokens"] = 1_000_000
+    rendered = report.render(
+        model="claude-sonnet-5", prompt_origin="builtin", ontology={}, usage=usage, batch_usage=batch_usage
+    )
+    # 1M tokens sync-priced ($3) + 1M tokens batch-priced at half ($1.5)
+    assert rendered["facts_usage"]["estimated_cost_usd"] == 4.5
+
+
+def test_ontology_report_shares_the_shape_used_by_the_pass():
+    models = [
+        {
+            "slug": "corpus-ontology",
+            "model": {
+                "datasets": [{"name": "engagement", "source": "ontology_node_type:engagement"}],
+                "relationships": [{"name": "for_client"}],
+            },
+        }
+    ]
+    out = fe._ontology_report(models)
+    assert out == {"models": ["corpus-ontology"], "node_types": 1, "edge_types": 1}
+
+
 class TestDeadlineExpiryIsCalledNotTruthinessTested:
     """`_Deadline.expired` is a METHOD, not a property.
 
