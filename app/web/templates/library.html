@@ -2738,11 +2738,18 @@
      between the title and the first row on every visit, and it out-ranked the
      page's own subject. Here it is the thing you meet once you have finished
      looking, which is when "take this with you" is worth reading. #}
+  {# Not shown to a reader who has already done it — the invitation was
+     permanent and state-blind, and the same door stands in the rail on every
+     page anyway, so for them it was a promo they could not answer or silence
+     (#1956 item 2). Dismissible for everyone else. #}
+  {% if not library_connected %}
   <div class="lib-connect lib-connect--foot">
     {{ connect_banner('bar', cta_href='/how-it-works#connect',
          cta_label='Take ' ~ (instance_brand_short or 'Agnes') ~ ' to your tools →',
-         copy='Connect your AI tools to give them access to the same knowledge.') }}
+         copy='Connect your AI tools to give them access to the same knowledge.',
+         dismiss_key='library-foot') }}
   </div>
+  {% endif %}
 
 {% endblock %}
 
