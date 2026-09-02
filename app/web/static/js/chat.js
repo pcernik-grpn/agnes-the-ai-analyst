@@ -3204,10 +3204,65 @@ function _streamingSafeText(text) {
     }
     i = f + 3;
   }
-  if (openAt === -1) return t; // every fence is closed
-  if (openLang === null) return t.slice(0, openAt); // language id still streaming
+  if (openAt === -1) return _withholdOpenTableHead(t); // every fence is closed
+  if (openLang === null) return _withholdOpenTableHead(t.slice(0, openAt)); // language id still streaming
   if (openLang && ("sources".startsWith(openLang) || "next_actions".startsWith(openLang))) {
-    return t.slice(0, openAt);
+    return _withholdOpenTableHead(t.slice(0, openAt));
+  }
+  // An open code fence with a language and a body: the trailing lines are
+  // CODE, so a pipe there is not a table head — nothing to withhold.
+  return t;
+}
+
+/** A line that can only be a GFM table row: it opens with a pipe. GFM also
+ *  accepts a header without a leading pipe, and a table nested in a
+ *  blockquote or list item (`> | a |`, `- | a |`); models rarely write either,
+ *  and a false negative here costs a brief raw-pipes flash, nothing more. */
+const _TABLE_ROW_RE = /^ {0,3}\|/;
+/** The other direction — prose that happens to open with a pipe — would be
+ *  hidden until its newline. A header row's FIRST cell is never this long, so
+ *  a lone pipe line that has run this far without a second pipe is released
+ *  as prose; the worst case is that many characters withheld, not a line. */
+const _TABLE_HEAD_FIRST_CELL_MAX = 80;
+/** A delimiter row that may still be streaming: pipes, dashes, colons and
+ *  spaces only — `|`, `|-`, `|---|:--`, and the empty string right after the
+ *  header's newline all match; a data row (`| Acme |`) does not. */
+const _TABLE_DELIMITER_PARTIAL_RE = /^ {0,3}\|?[ :|-]*$/;
+
+/** Hold back a table head that marked cannot render as a table yet
+ *  (TCRD-288). A GFM table exists only once its delimiter row carries one
+ *  cell per header cell; until then marked emits the header line — and then
+ *  the growing delimiter row — as a paragraph of raw `| Client | Sponsor |`
+ *  pipes, which is what the reader saw for every table while it streamed.
+ *  Two shapes are withheld, both at the very end of the text:
+ *
+ *    - a lone pipe line with no table row above it — a header waiting for
+ *      its delimiter;
+ *    - that header plus a second line that is still a delimiter in progress.
+ *
+ *  The newline that ends the delimiter row releases both: from there marked
+ *  renders a table, and every later token lands in a cell. A data row is
+ *  never withheld (it has table rows above it), so a table already on screen
+ *  keeps growing row by row. */
+function _withholdOpenTableHead(text) {
+  const t = text || "";
+  const lastNl = t.lastIndexOf("\n");
+  const last = t.slice(lastNl + 1);
+  const prevNl = lastNl === -1 ? -1 : t.lastIndexOf("\n", lastNl - 1);
+  const prev = lastNl === -1 ? null : t.slice(prevNl + 1, lastNl);
+  const prevIsRow = prev !== null && _TABLE_ROW_RE.test(prev);
+  if (_TABLE_ROW_RE.test(last) && !prevIsRow) {
+    const firstPipe = last.indexOf("|");
+    const secondPipe = last.indexOf("|", firstPipe + 1);
+    if (secondPipe === -1 && last.length > _TABLE_HEAD_FIRST_CELL_MAX) return t; // prose, not a head
+    return t.slice(0, lastNl + 1); // header candidate, no delimiter yet
+  }
+  if (prevIsRow && _TABLE_DELIMITER_PARTIAL_RE.test(last)) {
+    const prev2Nl = prevNl === -1 ? -1 : t.lastIndexOf("\n", prevNl - 1);
+    const prev2 = prevNl === -1 ? null : t.slice(prev2Nl + 1, prevNl);
+    if (prev2 === null || !_TABLE_ROW_RE.test(prev2)) {
+      return t.slice(0, prevNl + 1); // header + delimiter still streaming
+    }
   }
   return t;
 }
@@ -3236,6 +3291,17 @@ function _renderStreamingMarkdown() {
   }
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
+    // Tables are part of the answer's SHAPE, not a finishing touch: marked's
+    // bare <table> has no border, no padding and a centered bold header, so
+    // until finalize a streamed table looked like a different widget from
+    // the one the turn ends with (TCRD-288). The pass is cheap — a wrap, a
+    // class, a click handler per header cell — and idempotent, so running
+    // it on every repaint costs nothing the reader can measure; the heavy
+    // passes (highlight.js, mermaid) still wait for the final content. The
+    // repaint replaces the DOM, so a sort or a horizontal scroll made while
+    // the table is still growing lasts until the next tick — the table
+    // settles at finalize, which is when those are worth doing anyway.
+    enhanceTables(currentAssistantBody);
   } catch (_e) {
     currentAssistantBody.textContent = visible;
   }
@@ -3280,6 +3346,10 @@ function _flushStreamingTail() {
   if (!currentAssistantBody) return;
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(currentAssistantText);
+    // Same light table pass as the live painter: this repaint replaces the
+    // DOM, and a cancelled/error frame that is the turn's last word must not
+    // leave the table LESS finished than it was a tick earlier.
+    enhanceTables(currentAssistantBody);
   } catch (_e) {
     currentAssistantBody.textContent = currentAssistantText;
   }
