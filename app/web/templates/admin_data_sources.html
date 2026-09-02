@@ -7560,6 +7560,31 @@ function _extDot(outcome) {
   return `<span class="ext-dot ${EXT_DOT[outcome] || "ext-dot--idle"}" aria-hidden="true"></span>`;
 }
 
+/* Whether a live run is currently in the facts (LLM graph-extraction)
+   phase rather than the crawl phase — read from `activity.phase`, which
+   rides the SAME checkpoint `run.files_done` does (owner-frustration fix,
+   2026-09-02: a healthy multi-hour facts pass read "stalled · 24 files"
+   for its whole run because nothing distinguished "the crawl is still
+   going" from "the crawl finished ages ago and a different, much longer
+   stage is"). Older rows (recorded before this field existed) carry no
+   `activity` at all and fall back to the crawl wording — never a claim
+   this function cannot back up. */
+function _extIsFactsPhase(run) {
+  return !!(run && run.activity && run.activity.phase === "facts");
+}
+
+/* "<done>/<total> documents" for the facts phase, or the crawl's own
+   "<files> files" everywhere else. `docs_total` is a GROWING count (see
+   `facts_progress`'s doc comment server-side) — shown plainly, without a
+   percentage or a bar, the same "no fraction over a moving denominator"
+   rule the crawl's own file counts already follow. */
+function _extPhaseCountText(run) {
+  if (_extIsFactsPhase(run) && run.facts_progress) {
+    return `${_extNum(run.facts_progress.docs_done)}/${_extNum(run.facts_progress.docs_total)} documents`;
+  }
+  return `${_extNum(run.files_done)} files`;
+}
+
 /* The pipeline strip's Crawl cell gains a live line ONLY while there is a
    live run to describe; otherwise it stays exactly the document count it
    always was. */
@@ -7568,9 +7593,9 @@ function _extRenderCrawlCell(connId, status) {
   if (!el) return;
   const run = status && status.running;
   if (!run) { el.hidden = true; el.innerHTML = ""; return; }
-  const label = run.outcome === "stalled" ? "stalled" : "crawling";
+  const label = run.outcome === "stalled" ? "stalled" : (_extIsFactsPhase(run) ? "extracting facts" : "crawling");
   el.hidden = false;
-  el.innerHTML = `${_extDot(run.outcome)}<span class="ext-sub">${_extEsc(label)} · ${_extNum(run.files_done)} files</span>`;
+  el.innerHTML = `${_extDot(run.outcome)}<span class="ext-sub">${_extEsc(label)} · ${_extPhaseCountText(run)}</span>`;
 }
 
 /* The "In-Agnes extraction" fact row's own trigger button is server-
@@ -7754,8 +7779,10 @@ function _extRunRowHtml(connId, st) {
   let sub = "";
 
   if (run) {
-    const verb = run.outcome === "stalled" ? "no longer reporting" : "running";
-    head = `${_extDot(run.outcome)} <strong>${_extEsc(verb)}</strong> · ${_extNum(run.files_done)} files processed`;
+    const verb = run.outcome === "stalled"
+      ? "no longer reporting"
+      : (_extIsFactsPhase(run) ? "extracting facts" : "running");
+    head = `${_extDot(run.outcome)} <strong>${_extEsc(verb)}</strong> · ${_extPhaseCountText(run)} processed`;
     const started = `started ${_extEsc(_extTime(run.started_at))}`;
     const elapsed = run.elapsed_s != null ? ` · ${_extEsc(_extDuration(run.elapsed_s))} elapsed` : "";
     sub += `<div class="ext-sub">${started}${elapsed} · as of ${_extEsc(_extTime(run.checkpoint_at))}</div>`;

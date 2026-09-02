@@ -122,15 +122,26 @@ def test_history_reload_restores_chips_only_when_the_answer_is_the_tail():
     )
 
 
-def test_next_action_chip_styles_use_ds_tokens():
+def test_next_action_chips_are_the_landing_chip_not_a_lookalike():
+    """The follow-ups under an answer and the "Suggested for you" chips on the
+    landing screen are the same offer — a question you can ask next — and were
+    two visibly different components: 9px radius against 11px, an opaque
+    surface against a translucent one, a hover that recoloured the text against
+    one that tinted the background. The answer's chips now ARE the landing
+    chip (`.rdb-action`), applied rather than re-described, so they cannot
+    drift apart again."""
+    js = _read(CHAT_JS)
+    assert 'btn.className = "rdb-action cloud-chat-next-action"' in js
+    assert 'label.className = "rdb-action-title"' in js, "the chip's own label class, so the type matches too"
+
+    # Only the genuinely-different bits may remain local: the mid-stream
+    # disabled state and the row's placement under an answer.
     css = _read(CHAT_CSS)
-    assert ".cloud-chat-next-actions" in css
-    block = css[css.index(".cloud-chat-next-action {") :]
+    block = css[css.index(".cloud-chat-next-actions {") :]
     block = block[: block.index("}")]
-    assert "var(--ds-radius-btn)" in block, (
-        "a labelled button wears --ds-radius-btn — the design system reserves pill for badges"
-    )
-    assert "--ds-radius-pill" not in block
+    assert "margin-top:" in block
+    for prop in ("border-radius", "background", "padding"):
+        assert prop not in block, f"`{prop}` re-describes the chip instead of reusing it"
 
 
 def test_the_prompt_mandates_the_next_actions_trailer():
@@ -232,17 +243,26 @@ def test_live_and_history_headers_use_the_label():
     assert "_toolLabel(tc.tool, tc.args)" in js, "history formatToolCall must agree"
 
 
-def test_summarize_args_shows_the_command_line():
+def test_a_collapsed_step_carries_no_args_only_an_outcome():
+    """A collapsed step is one quiet line: a verb and an outcome. The whole
+    command used to sit on it, which made it the single longest thing in a
+    settled transcript — `agnes query "SELECT sum(total) FROM orders"` beside
+    every row of a six-step run is most of what made the trail feel crowded.
+    The args moved into the body, one click away.
+
+    The summary ELEMENT stays, because a failed call writes its diagnosis there
+    (_setToolCardError): on an error, what went wrong is the one thing worth a
+    collapsed line, and it is now the only thing this slot ever holds. The
+    summarizer that used to fill it is gone rather than left unused."""
     js = _read(CHAT_JS)
-    fn = js[js.index("function _summarizeArgs") : js.index("const _TOOL_LABELS")]
-    cases = {"cmd": {"command": "agnes schema hr_headcount"}, "sql": {"sql": "SELECT 1"}}
-    script = (
-        fn
-        + f"\nprocess.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)}).map(([k, v]) => [k, _summarizeArgs(v)]))));\n"
-    )
-    res = json.loads(_node_run(script))
-    assert res["cmd"] == "agnes schema hr_headcount"
-    assert res["sql"] == "SELECT 1"
+    assert "_summarizeArgs" not in js, "dead once the header stopped showing args — deleted, not orphaned"
+
+    card = js[js.index("function _buildToolCard") : js.index("function _toolErrorLine")]
+    assert 'summary.className = "cloud-chat-tool-summary"' in card, "the slot survives for the error line"
+    assert "summary.textContent" not in card, "nothing but the error line may fill it"
+
+    err = js[js.index("function _setToolCardError") : js.index("// ---------- Tool-call groups")]
+    assert "summary.textContent = line;" in err, "the diagnosis is what the slot is for now"
 
 
 # ── tool results: JSON is one click away, never the primary rendering ───────
@@ -273,13 +293,40 @@ def test_json_panel_is_highlighted_capped_and_keeps_a_full_route():
     assert "enhanceCodeBlocks(" in fn, "the shared pass adds highlight + copy button"
 
 
-def test_args_render_as_formatted_json_on_card_expand():
-    """One click total: expanding the card shows the args as formatted JSON —
-    the old nested args toggle was a second click inside a collapsed card."""
+def test_args_render_on_card_expand_with_no_nested_toggle():
+    """One click total: expanding the card shows the args — the old nested args
+    toggle was a second click inside a collapsed card."""
     js = _read(CHAT_JS)
     card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
-    assert '_jsonPanel("Args"' in card
+    assert "_argsPanels(args)" in card
     assert "Show args" not in js, "no nested args toggle on either path"
+
+
+def test_a_command_arg_is_a_code_block_not_escaped_json():
+    """`{"command": "agnes query \\"SELECT * FROM orders\\""}` made the reader
+    undo the escaping in their head to reach the SQL they opened the card for.
+    A command / SQL arg renders as a code block in its own language; anything
+    LEFT OVER still gets the JSON panel, so no arg drops out of the record."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("const _ARG_LANGUAGES") : js.index("function _toolCallId")]
+    assert '{ command: ["Command", "bash"], sql: ["SQL", "sql"] }' in js, (
+        "the two language args, each with the language to highlight it as"
+    )
+    assert "_codePanel(label, value, language" in fn, "a language arg goes to the code panel"
+    assert '_jsonPanel(panels.length ? "Other args" : "Args", rest' in fn, (
+        "leftovers keep the JSON panel, and a call with no language arg is unchanged"
+    )
+    code = js[js.index("function _codePanel") : js.index("const _ARG_LANGUAGES")]
+    assert "code.textContent = text" in code, "the command text is set verbatim — never re-escaped"
+    assert "enhanceCodeBlocks(" in code, "the shared pass adds the copy button"
+
+
+def test_a_language_arg_is_only_taken_when_it_is_a_non_empty_string():
+    """`{command: ""}` / `{command: {…}}` must fall back to the JSON panel
+    rather than render an empty or `[object Object]` code block."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _argsPanels") : js.index("function _toolCallId")]
+    assert 'typeof value !== "string" || value.trim() === ""' in fn
 
 
 def test_mcp_envelope_unwraps_to_its_payload():
@@ -299,10 +346,12 @@ def test_mcp_envelope_unwraps_to_its_payload():
         # renderToolCallEnd gets frame.result, the raw wire string.
         "string_envelope": '{"content": [{"type": "text", "text": "{\\"status\\": \\"ok\\"}"}]}',
         "markdown_string": "| a | b |\n|---|---|\n| 1 | 2 |",
-        # A JSON string that is NOT an envelope must survive as a string:
-        # parsing every JSON-shaped result here would re-route unrelated
-        # tools (`agnes … --json`) through the table/JSON panel, a far wider
-        # behaviour change than unwrapping an envelope.
+        # A JSON string that is NOT an envelope must survive as a string
+        # THROUGH THIS FUNCTION: unwrapping is about envelopes only. The
+        # decision to parse `agnes … --json` output lives one layer out, in
+        # _tabularToolResult, and is narrowed to strings that coerce to a
+        # table — see test_a_tabular_result_that_arrived_as_text_still_
+        # becomes_a_table.
         "json_string_not_envelope": '{"rows": 3, "table": "orders"}',
         "json_scalar_string": "123",
     }
@@ -327,13 +376,194 @@ def test_mcp_envelope_unwraps_to_its_payload():
     )
 
 
+def test_a_tabular_result_that_arrived_as_text_still_becomes_a_table():
+    """The path most turns actually take: the agent reaches data through `agnes
+    query` over **Bash**, whose stdout is a string, so the object-shaped check
+    never saw it and a 400-row answer rendered as one line of JSON in a
+    paragraph. The preview now tests the payload AS AN OBJECT, parsing a string
+    first — through the SAME `_asToolResultObject` the fact_claims route uses,
+    not a second near-copy of it.
+
+    Narrow by construction: parsing decides nothing on its own. Only a payload
+    that ALSO coerces to a table renders differently, so a markdown table, CLI
+    prose and a JSON string of any other shape keep what they had."""
+    js = _read(CHAT_JS)
+    preview = js[
+        js.index("function _renderToolResultPreview") : js.index(
+            "/** Console output whose alignment carries the meaning"
+        )
+    ]
+    assert "const parsed = _asToolResultObject(result);" in preview, "reuse the existing parser, do not clone it"
+    assert "const table = payload ? _coerceToTablePreview(payload) : null;" in preview, (
+        "the table decision — and the whole behaviour change — stays with _coerceToTablePreview"
+    )
+    assert "_appendSemanticValidationNotice(table, payload)" in preview, (
+        "the notice reads the PARSED payload, not the string it arrived as"
+    )
+    assert "JSON.parse(result)" not in preview, (
+        "one parse per result: the string branch's notice reads the same `payload`"
+    )
+
+    # The parse itself, executed: `_asToolResultObject` composed with the
+    # narrowing at the call site must accept the two real query shapes and
+    # reject everything the string path still owns.
+    fn = js[js.index("function _unwrapMcpEnvelope") : js.index("/** Build the preview block")]
+    cases = {
+        # `agnes query --json` prints exactly this
+        "json_string_array": json.dumps([{"a": 1, "b": 2}, {"a": 3, "b": 4}]),
+        # `POST /api/query` answers exactly this
+        "json_string_colrows": json.dumps({"columns": ["c"], "rows": [[1]]}),
+        "object": {"columns": ["c"], "rows": [[1]]},
+        "markdown_table": "| a | b |\n|---|---|\n| 1 | 2 |",
+        "cli_prose": "no rows found",
+        "json_scalar_string": "123",
+        "number": 42,
+    }
+    script = (
+        fn
+        + "\nconst narrow = (v) => { const p = _asToolResultObject(v);"
+        + ' return p && typeof p === "object" ? p : null; };\n'
+        + f"process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)})"
+        + ".map(([k, v]) => [k, narrow(v)]))));\n"
+    )
+    res = json.loads(_node_run(script))
+    assert res["json_string_array"] == [{"a": 1, "b": 2}, {"a": 3, "b": 4}], "parsed, so it can reach the table"
+    assert res["json_string_colrows"] == {"columns": ["c"], "rows": [[1]]}
+    assert res["object"] == cases["object"], "an object result is handed straight through"
+    assert res["markdown_table"] is None, "marked keeps markdown tables"
+    assert res["cli_prose"] is None
+    assert res["json_scalar_string"] is None, "`123` parses, but a number is not a table"
+    assert res["number"] is None
+
+
+def test_console_output_keeps_its_alignment():
+    """`agnes query` defaults to `--format table` — a rich box table — and
+    `agnes catalog`/`describe` print the same way. Run through marked it came
+    out as one mangled paragraph: newlines collapsed, and the column alignment
+    IS the content. Box-drawing characters route it to a <pre> instead.
+
+    Deliberately not a pipe/dash test: a markdown table is pipes and dashes
+    too, and marked should keep that one."""
+    js = _read(CHAT_JS)
+    assert "const _CONSOLE_TABLE_RE = /[\\u2500-\\u257F]/;" in js, "box-drawing range, nothing wider"
+    script = (
+        js[js.index("const _CONSOLE_TABLE_RE") : js.index("/** Build the preview block")]
+        + "const cases = {"
+        + '  rich_table: "\\u250f\\u2501\\u2513\\n\\u2503 a \\u2503",'
+        + '  record_view: "\\u2500\\u2500\\u2500 row 1 \\u2500\\u2500\\u2500\\n  id : 1",'
+        + '  markdown_table: "| a | b |\\n|---|---|\\n| 1 | 2 |",'
+        + '  ascii_plus_table: "+---+\\n| a |\\n+---+",'
+        + '  prose: "no rows found",'
+        + "};"
+        + "process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(cases)"
+        + ".map(([k, v]) => [k, _CONSOLE_TABLE_RE.test(v)]))));"
+    )
+    res = json.loads(_node_run(script))
+    assert res["rich_table"] is True
+    assert res["record_view"] is True, "the psql-style wide-table fallback is aligned output too"
+    assert res["markdown_table"] is False, "marked keeps markdown tables"
+    assert res["ascii_plus_table"] is False, "+---+ is ambiguous with markdown — left on the markdown path"
+    assert res["prose"] is False
+
+    fn = js[js.index("function _renderConsoleTableResult") : js.index("/** Append a small advisory note")]
+    css = _read(CHAT_CSS)
+    assert "pre.textContent =" in fn, "plain text — no markdown, no highlighting"
+    assert "_expandInPlace" not in fn, (
+        "no line cap and no 'show all' step: the block is already bounded on screen by its "
+        "own max-height, so capping the content too only put it behind a click"
+    )
+    assert fn.count('className = "cloud-chat-tool-console"') == 1, "one <pre>, holding all of it"
+
+    # Bounded by the scroll region rather than by a content cap — which is the
+    # whole reason the cap could go.
+    console_css = css[css.index(".cloud-chat-tool-console {") :]
+    console_css = console_css[: console_css.index("}")]
+    assert "max-height:" in console_css and "overflow: auto;" in console_css
+
+
+def test_the_console_pre_does_not_reflow():
+    """A wrapped column is a broken column: the <pre> scrolls sideways."""
+    css = _read(CHAT_CSS)
+    rule = css[
+        css.index(".cloud-chat-tool-console {") : css.index(".cloud-chat-tool-result-full .cloud-chat-tool-console")
+    ]
+    assert "white-space: pre;" in rule, "never pre-wrap — that destroys the alignment"
+    assert "overflow: auto;" in rule
+
+
+def test_a_tool_card_code_panel_wears_the_card_surface():
+    """The panel rules ask for `background: transparent` over the panel's own
+    --ds-surface, but `.cloud-chat-messages details pre.code-block-wrap`
+    outranks them (0,2,2 vs 0,1,1) and repainted every panel --ds-code-bg — a
+    dark slab dropped into a light card, for what is usually one line of shell.
+    The correcting selectors must keep out-ranking it, and must NOT drag the
+    --ds-code-* tokens onto that surface: every value in that family is tuned
+    against the near-black --ds-code-bg."""
+    css = _read(CHAT_CSS)
+    assert ".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {" in css, (
+        "three classes, so the card's own intent wins the cascade"
+    )
+    rule = css[
+        css.index(".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {") : css.index(
+            ".cloud-chat-tool-console {"
+        )
+    ]
+    assert "background: var(--ds-surface-dim);" in rule, (
+        "a quiet tint sized to the code — not the transcript's slab, and not nothing "
+        "at all: the hover copy button needs somewhere to sit"
+    )
+    assert "--ds-code-bg" not in rule, "the dark code surface must not follow the panel"
+    # Geometry as well as paint. The shared rule's --space-3 padding and
+    # --space-2 margin used to nest inside the panel's own, which is most of
+    # why one line of shell painted a box five lines tall.
+    assert "margin: 0;" in rule, "no nested margin — the panel owns the spacing"
+    assert "display: inline-block;" in rule and "max-width: 100%;" in rule, (
+        "the tint sizes to the code, not to the reading column, and still stops at it"
+    )
+    assert '[class*="hljs-"]' in rule and "color: inherit;" in rule, (
+        "hljs token colours fall back to the card's ink instead of being remapped"
+    )
+
+
 def test_show_all_rows_is_a_table_not_json():
     js = _read(CHAT_JS)
     assert "function _buildResultTable" in js
     body = js[js.index("function _coerceToTablePreview") : js.index("// ---------- Data-app split-pane preview")]
     assert "Show all rows (JSON)" not in body, "the expansion is a table now"
     assert "_TOOL_RESULT_FULL_ROWS_MAX" in body, "a DOM cap must exist for huge results"
-    assert body.count("_buildResultTable(") == 2, "preview and expansion share one builder"
+    assert "tableWrap.replaceChildren(" in body, (
+        "the expansion replaces the preview's rows in the SAME wrapper rather than appending a second table under it"
+    )
+    assert "fullWrap" not in body, "a second table wrapper is the duplication this replaced"
+
+
+def test_expanding_a_capped_preview_grows_it_instead_of_copying_it():
+    """The old shape rendered the preview and then, behind a toggle, a second
+    copy of the same payload starting over from its first row — so "Show full
+    output" on a 22-line listing showed lines 1-12, then lines 1-22 underneath,
+    the first twelve of them twice. Both the console preview and the table
+    preview did it. There is one payload, so there is one element.
+
+    Also strictly cheaper: nothing past the preview is built until asked for,
+    where the table's full copy used to be built eagerly at construction."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _expandInPlace") : js.index("/** Console output whose alignment carries the meaning")]
+    assert "paint(expanded)" in fn, "one element, repainted — not two rendered"
+    assert 'setAttribute("aria-expanded"' in fn, "a control that is not a <details> must say so itself"
+    assert "metaEl.hidden = !line" in fn, (
+        "expanded, 'Showing 12 of 22' is stale — it reports the cap only while one applies"
+    )
+
+    # The table is the caller that still needs it. A long console dump is one
+    # text node and simply scrolls (test_console_output_keeps_its_alignment);
+    # a long table is hundreds of elements, so it still earns a cap.
+    table = js[js.index("function _coerceToTablePreview") : js.index("// ---------- Data-app split-pane preview")]
+    assert "_expandInPlace({" in table
+    # The over-cap raw-JSON route IS additional content (the rows the table
+    # drops), so it stays a real disclosure.
+    assert 'rawDet.className = "cloud-chat-tool-result-full"' in table, (
+        "past the cap the dropped rows must still be reachable"
+    )
 
 
 # ── streaming: markdown renders as it arrives ────────────────────────────────
@@ -438,15 +668,52 @@ def test_reset_finalizes_an_orphan_bubble():
     assert "renderSourcesChips" not in reset, "no server verdict exists for an unfinalized turn"
 
 
-def test_reload_chips_sit_above_the_actions_row():
-    """Live order is chips-then-actions (finalize renders chips before
-    attachMessageActions appends the row). On reload, renderMessage has
-    already appended .msg-actions before loadAndRenderHistory adds the chips
-    — so renderNextActions must insert BEFORE an existing actions row, or the
-    two paths disagree about the bubble's tail."""
+def test_the_bubble_tail_reads_sources_then_actions_then_suggestions():
+    """The tail is three things in a fixed order: what the answer rested on
+    (sources / assumes), what you can do with the ANSWER (time, copy, ask
+    again), and what you might ask NEXT. The suggestions are the only
+    forward-looking part, so they close the bubble — with them above the
+    actions row, a timestamp sat underneath an invitation and the row read as
+    belonging to the suggestions rather than to the message.
+
+    The order must hold on BOTH paths, which arrive in opposite sequences:
+    live, finalize renders sources and suggestions before
+    attachMessageActions; on reload, renderMessage has already appended
+    .msg-actions before loadAndRenderHistory adds either. So no appender may
+    assume it ran first — each places itself relative to what is already
+    there, and the three rules compose to one order either way."""
     js = _read(CHAT_JS)
-    body = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
-    assert ".msg-actions" in body and "insertBefore" in body
+
+    # The order is declared ONCE, and `_placeInTail` is the only way to honour
+    # it. Hand-rolling the placement per appender is what let the facts-scope
+    # line land under the suggestions it is supposed to precede (review on
+    # #2049) — so the guard is that nothing in the tail appends by hand.
+    order = js[js.index("const _BUBBLE_TAIL_ORDER") : js.index("function _placeInTail")]
+    for sel in (
+        ".msg-sources",
+        # TCRD-289's assumptions row, which landed while this was in review
+        # and supersedes the prose line this branch first drew.
+        ".msg-sources.is-assumptions",
+        ".msg-facts-scope",
+        ".msg-actions",
+        ".cloud-chat-next-actions",
+    ):
+        assert f'"{sel}"' in order, f"{sel} is part of the tail and must declare its rank"
+    assert order.index('".msg-sources"') < order.index('".msg-actions"') < order.index('".cloud-chat-next-actions"'), (
+        "what the answer rested on, then what you can do with it, then what to ask next"
+    )
+
+    for fn_name, end in (
+        ("function renderSourcesChips", "// ---------- Next-actions block"),
+        ("function renderFactsScopeLine", "function renderNextActions"),
+        ("function attachMessageActions", "/** Whether a persisted assistant row"),
+        ("function renderNextActions", "function _clearNextActions"),
+    ):
+        body = js[js.index(fn_name) : js.index(end)]
+        assert "_placeInTail(" in body, f"{fn_name} must place itself through the shared contract"
+        assert "bubble.appendChild(" not in body, (
+            f"{fn_name} appends by hand — that is how a tail element ends up in the wrong place"
+        )
 
 
 def test_over_cap_result_keeps_a_raw_json_route():
@@ -636,12 +903,18 @@ def test_errors_and_cancels_reach_the_transcript():
     assert "textContent" in body and ".innerHTML" not in body
 
 
-def test_next_action_chips_wear_the_button_radius():
+def test_suggestion_chips_wear_the_button_radius():
     """Design-system shape rule: pill radius is badge language; every labelled
-    button wears --ds-radius-btn. (Devin Review on this PR.)"""
-    css = _read(CHAT_CSS)
-    rule = css[css.index(".cloud-chat-next-action {") : css.index(".cloud-chat-next-action:hover")]
-    assert "var(--ds-radius-btn)" in rule
+    button wears --ds-radius-btn. (Devin Review on #1974.)
+
+    Asserted where the shape now lives. Making the answer's follow-ups match
+    the landing chip surfaced that the LANDING one was the rule-breaker — a
+    hand-set 11px — so it moved onto the token rather than the rule being
+    dropped to accommodate it."""
+    dash = Path("app/web/static/css/chat_dashboard.css").read_text(encoding="utf-8")
+    rule = dash[dash.index(".rdb-action {") :]
+    rule = rule[: rule.index("}")]
+    assert "border-radius: var(--ds-radius-btn);" in rule
     assert "radius-pill" not in rule
 
 
@@ -764,7 +1037,7 @@ def test_a_failed_card_puts_its_diagnosis_on_the_header_as_plain_text():
     assert "innerHTML" not in setter
 
     preview = js[js.index("function _renderToolResultPreview") : js.index("function _appendSemanticValidationNotice")]
-    err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular JSON shapes")]
+    err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular shapes")]
     assert "pre.textContent = result" in err_branch, "an error body renders as text"
     assert "renderMarkdownSafe" not in err_branch, (
         "markdown on an error string only adds a clickable internal URL (#1974)"
@@ -890,20 +1163,16 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     assert "if (icon.firstChild) head.appendChild(icon)" in fn, (
         "a stateless (pre-v123) part must not get an empty icon slot"
     )
+    # A step has no status edge to neutralise any more (a step is a line, not a
+    # card), so `.is-replayed` now carries NO rule at all — which is strictly
+    # stronger than the neutral-edge rule it replaced: there is nothing left to
+    # accidentally claim an outcome with, and nothing to override the live
+    # card's geometry with either. The class is still set and still means the
+    # same thing; the honesty is enforced in JS, by withholding the icon.
     css = re.sub(r"/\*.*?\*/", "", _read(CHAT_CSS), flags=re.DOTALL)
-    replayed = css[css.index(".cloud-chat-tool.is-replayed") :]
-    replayed = replayed[: replayed.index("}")]
-    assert "accent-success" not in replayed and "accent-info" not in replayed, (
-        "the stateless fallback's edge must stay neutral"
+    assert ".cloud-chat-tool.is-replayed" not in css, (
+        "a step draws no status edge, so a replayed one needs no rule to neutralise"
     )
-    # Status only. Layout overrides here mean the card is being nested
-    # somewhere with different geometry than the live stream's — which is how
-    # replayed cards ended up as wide as each message's longest line.
-    for prop in ("margin", "max-width", "width"):
-        assert prop not in replayed, (
-            f"`{prop}` on .is-replayed — a replayed card must inherit the live card's "
-            "geometry by being appended in the same place, not by overriding it"
-        )
 
 
 def test_replayed_cards_are_siblings_in_the_messages_column():
@@ -1218,6 +1487,12 @@ function mkEl(tag) {
       toggle: (c, on) => { if (on) node._cls.add(c); else node._cls.delete(c); },
     },
     setAttribute(k, v) { node.attrs[k] = String(v); },
+    // The group registers a `toggle` handler to re-derive its Show/Hide label
+    // (chat.js -> _buildToolGroup). Recorded rather than ignored so a test can
+    // fire it and assert the flip, which is the whole point of the label.
+    _listeners: {},
+    addEventListener(type, fn) { (node._listeners[type] ||= []).push(fn); },
+    dispatch(type) { (node._listeners[type] || []).forEach((fn) => fn()); },
     appendChild(c) {
       if (c.parentNode) c.parentNode.children = c.parentNode.children.filter((k) => k !== c);
       c.parentNode = node; node.children.push(c); return c;
@@ -1295,7 +1570,10 @@ process.stdout.write(JSON.stringify({
     assert res["alone"] == ["details:cloud-chat-tool is-done"], "a lone call is not worth a group header"
     assert res["run_len"] == 1 and res["run_cards"] == 3, "the whole run becomes one node"
     assert "cloud-chat-tool-group" in res["run_cls"]
-    assert res["run_label"] == "3 steps"
+    assert res["run_label"] == "Show 3 steps", (
+        "collapsed, the label says what clicking it does — with the box gone there is "
+        "nothing else on the line that looks like a control"
+    )
     assert res["run_meta"] == "2 failed" or res["run_meta"] == "1 failed"
     assert not res["run_open"], "a replayed group opens collapsed — it is the compact form"
     assert res["split"] == ["cloud-chat-tool is-done", "article", "cloud-chat-tool is-done"], (
@@ -1342,7 +1620,7 @@ process.stdout.write(JSON.stringify({
     )
     res = json.loads(_node_run(script))
     assert "is-error" in res["settled"][0], "a run with a failure in it says so on its edge"
-    assert res["settled"][1] == "3 steps"
+    assert res["settled"][1] == "Show 3 steps"
     assert res["settled"][2] == "2 failed"
     assert res["settled"][3] == ["icon-triangle-alert"]
     assert "is-running" in res["live"][0]
@@ -1413,9 +1691,231 @@ def test_a_run_is_ended_by_everything_that_is_not_another_tool_card():
         assert "_endToolGroup()" in tail, "clearing the transcript must clear the open run"
 
 
+def test_a_step_is_a_line_and_the_two_cards_keep_their_box():
+    """`.cloud-chat-tool` is worn by THREE things — a tool-call step, an
+    approval gate, a question card. The step is a trace line the reader skims
+    past; the other two are surfaces they have to act on. Sharing one box made
+    a turn's machinery shout as loudly as its answer, so the chrome moved off
+    the shared class onto the two that need it, and the step keeps nothing.
+
+    Both halves are asserted, because dropping either is the regression: a step
+    that regains a box is the original complaint, and an approval gate that
+    LOSES one is a decision prompt rendered as a log line."""
+    js = _read(CHAT_JS)
+    card = js[js.index("function _buildToolCard") : js.index("function renderToolCallStart")]
+    assert "cloud-chat-tool cloud-chat-tool--step" in card, "the step marks itself as one"
+
+    css = _read(CHAT_CSS)
+    shared = css[css.index(".cloud-chat-tool {") :]
+    shared = shared[: shared.index("}")]
+    for prop in ("border", "border-radius", "background", "padding"):
+        assert prop not in shared, f"`{prop}` on the shared class puts a box back on the step"
+
+    chrome = css[css.index(".cloud-chat-approval,\n.cloud-chat-question {") :]
+    chrome = chrome[: chrome.index("}")]
+    for prop in ("padding", "border", "border-radius", "background"):
+        assert prop in chrome, f"the approval/question card lost `{prop}` — it is a surface, not a line"
+    # And they opt OUT of the step's negative margin: an approval gate or a
+    # question is a thing to stop at, so it keeps the container's own spacing.
+    assert "margin-top: 0;" in chrome and "margin-bottom: 0;" in chrome
+
+
+def test_a_step_sits_tighter_to_its_prose_than_two_messages_do():
+    """`.cloud-chat-messages` is a flex column with a uniform `gap:
+    var(--space-5)` (20px) that cannot be targeted per pair. With a positive
+    8px margin a step sat 28px from the sentence above it — WIDER than the 20px
+    between two separate messages — which is backwards: a step belongs to the
+    turn it sits inside.
+
+    Hence the NEGATIVE margin, which claws 8px back off the container gap and
+    lands at 12px. It looks like a mistake and is not; this pins it so a tidy-up
+    cannot quietly restore the inversion."""
+    css = _read(CHAT_CSS)
+    for sel in (".cloud-chat-tool {", ".cloud-chat-tool-group {"):
+        rule = css[css.index(sel) :]
+        rule = rule[: rule.index("}")]
+        assert "margin: calc(var(--space-2) * -1) auto;" in rule, (
+            f"{sel} lost the negative margin — a step would space wider than a message again"
+        )
+    # The premise: the gap it is compensating for.
+    assert "gap: var(--space-5);" in css
+
+    # And the place that gap does NOT exist. Inside the group body a step is an
+    # ordinary block child, so the compensation has nothing to compensate for
+    # and collapsed every row into the one above it — measured at -8px on each
+    # boundary, header included. The override has to reset all FOUR sides; when
+    # it reset only the horizontal pair the vertical margins stayed negative.
+    grouped = css[css.index(".cloud-chat-tool-group-body > .cloud-chat-tool {") :]
+    grouped = grouped[: grouped.index("}")]
+    assert "margin: 0;" in grouped, (
+        "grouped steps must reset all four margins — the negative vertical pair overlaps them"
+    )
+    assert "margin-left" not in grouped, "the horizontal-only reset is what left the overlap"
+
+    step = css[css.index(".cloud-chat-tool--step {") :]
+    step = step[: step.index("}")]
+    assert "padding: 0" in step
+    # Status has to live somewhere: with no edge to tint, it is the icon, which
+    # makes each of these a meaningful graphic owing 3:1 (WCAG 1.4.11). Success
+    # takes -ink because -line measured only 3.30:1 against the chat surface;
+    # the other two measure 3.82 and 4.83 and stay on -line, which also keeps
+    # them distinguishable from the label's secondary ink beside them.
+    #
+    # Asserted on `.cloud-chat-tool.is-*`, NOT a `--step` variant. The two carry
+    # identical specificity (0,3,0), so a `--step` copy placed above this block
+    # is dead CSS that still reads as though it worked — which is exactly what
+    # shipped here once, and what the count assertion below now prevents.
+    # Whitespace-normalised: the rules are column-aligned in the sheet.
+    flat = re.sub(r"\s+", " ", css)
+    for state, token in (
+        ("is-running", "--ds-accent-info-line"),
+        ("is-done", "--ds-accent-success-ink"),
+        ("is-error", "--ds-accent-danger-line"),
+    ):
+        assert f".cloud-chat-tool.{state} .cloud-chat-tool-icon {{ color: var({token}); }}" in flat, (
+            f"{state} has no way to show itself once the status edge is gone"
+        )
+        assert flat.count(f".{state} .cloud-chat-tool-icon {{ color:") == 1, (
+            f"two rules colour the {state} icon at the same specificity — one of them is dead, "
+            "and which one depends only on file order"
+        )
+
+
+def test_a_step_label_is_quieter_than_the_answer_it_sits_under():
+    """It was set in the ANSWER's own --ds-text-primary and at a HEAVIER weight
+    than the answer itself (500 against 400), so the line whose whole job is to
+    be skippable was the most emphatic text in the transcript. Secondary ink at
+    normal weight measures 7.87:1 here and 9.57:1 in dark — subordinate, still
+    well clear of AA."""
+    css = _read(CHAT_CSS)
+    rule = css[css.index(".cloud-chat-tool--step .cloud-chat-tool-name {") :]
+    rule = rule[: rule.index("}")]
+    assert "color: var(--ds-text-secondary);" in rule
+    assert "font-weight: var(--font-normal);" in rule, "not heavier than the prose above it"
+    assert "--ds-text-primary" not in rule, "the answer's ink belongs to the answer"
+
+
+def test_the_settled_group_label_is_the_control_and_flips_on_toggle():
+    """Collapsed, the label reads "Show 6 steps"; open, "Hide 6 steps". It is a
+    function of `open`, so it has to be re-derived when the reader toggles —
+    otherwise an opened group still invites you to open it. While the run is
+    still going the label stays the name of the step in progress, which is a
+    status and not something to click."""
+    js = _read(CHAT_JS)
+    build = js[js.index("function _buildToolGroup") : js.index("function _updateToolGroupSummary")]
+    assert 'group.addEventListener("toggle"' in build, "the label depends on `open`; it must follow it"
+
+    fn = js[js.index("function _updateToolGroupSummary") : js.index("function _appendToolCard")]
+    assert 'group.open ? "Hide" : "Show"' in fn
+    assert "activeName ? activeName.textContent" in fn, "a running group still names the live step"
+
+    css = _read(CHAT_CSS)
+    assert (
+        ".cloud-chat-tool-group:not(.is-running) > .cloud-chat-tool-group-head .cloud-chat-tool-group-label {" in css
+    ), "only the settled label is inked as a control — the live one is a status"
+
+
+def test_nothing_on_a_step_line_is_pinned_to_the_right_edge():
+    """With the box gone there is no edge for a count, a duration or a caret to
+    sit against, and pinning them right left a rail of marks floating in
+    whitespace. Everything packs left; the leftover width is simply empty."""
+    css = _read(CHAT_CSS)
+    summary = css[css.index(".cloud-chat-tool--step > .cloud-chat-tool-head > .cloud-chat-tool-summary {") :]
+    summary = summary[: summary.index("}")]
+    assert "flex: 0 1 auto" in summary, "a growing summary pushes the caret to the far edge"
+    meta = css[css.index(".cloud-chat-tool-group-meta {") :]
+    meta = meta[: meta.index("}")]
+    assert "flex: 0 1 auto" in meta
+
+
+def test_an_open_step_shows_one_rule_not_a_stack_of_boxes():
+    """Opening a step used to reveal three stacked white rectangles — the
+    command panel, the output panel and the "show full output" panel — each
+    bordered and full width, which put back at the payload level exactly the
+    weight the row had just shed. The panels are plain now, tied together by
+    one continuous hairline down their left; they abut at zero margin so those
+    rule segments join into a single line instead of a dashed ladder."""
+    css = _read(CHAT_CSS)
+    detail = css[css.index(".cloud-chat-tool--step[open] > .cloud-chat-tool-args,") :]
+    detail = detail[: detail.index("}")]
+    assert "border-left: 1px solid var(--ds-border);" in detail
+    assert "margin: 0 0 0 var(--space-3);" in detail, "any vertical margin between panels breaks the rule into segments"
+
+    panel = css[css.index(".cloud-chat-tool-args,\n.cloud-chat-tool-json,") :]
+    panel = panel[: panel.index("}")]
+    for prop in ("border", "background", "border-radius"):
+        assert prop not in panel, f"`{prop}` on a panel is a rectangle inside the rule"
+
+    # "Show full output" is a control, so it reads like one rather than like a
+    # caption in a box of its own.
+    full = css[css.index(".cloud-chat-tool-result-full > summary,") :]
+    full = full[: full.index("}")]
+    assert "color: var(--ds-primary);" in full
+    assert "text-transform: uppercase" not in full, "a link, not a label"
+
+
+def test_an_answer_that_is_a_document_reads_like_one():
+    """An answer arriving as a document — headings, steps, code, a table — had
+    NO rules of its own, so it fell through to the browser's defaults: `h1` at
+    2em (30px against a 15px body) and `h2` at 1.5em, both with the app reset's
+    margin zeroed. Big enough to shout, with no space to group anything, which
+    is the specific way it was hard to scan.
+
+    Two properties are pinned. The scale stays at reading sizes — a reply is
+    not a page and never competes with a page title. And every heading carries
+    more space ABOVE than below, which is the asymmetry that makes it read as
+    belonging to the block it introduces rather than floating between two."""
+    css = _read(CHAT_CSS)
+
+    def rule(sel):
+        block = css[css.index(sel + " {") :]
+        return block[: block.index("}")]
+
+    assert "font-size: var(--text-lg);" in rule(".msg-body h1"), "h1 is 18px, not the UA's 2em"
+    assert "font-size: var(--text-md);" in rule(".msg-body h2")
+
+    # The asymmetry, read off the shorthand: `margin: <top> 0 <bottom>`.
+    for sel, top, bottom in ((".msg-body h1", 20, 8), (".msg-body h2", 20, 6)):
+        margin = re.search(r"margin: (\d+)px 0 (\d+)px", rule(sel))
+        assert margin, f"{sel} must set an explicit top/bottom margin"
+        assert int(margin.group(1)) == top and int(margin.group(2)) == bottom
+        assert int(margin.group(1)) > int(margin.group(2)), (
+            f"{sel} has no more room above than below — it groups with nothing"
+        )
+
+    # The elements that had no rule at all and inherited page chrome.
+    for sel in (".msg-body hr", ".msg-body blockquote"):
+        assert sel + " {" in css, f"{sel} still falls through to the browser default"
+
+
+def test_every_shrink_to_content_payload_still_stops_at_the_column():
+    """`display: inline-block` takes the element's INTRINSIC width. Three tool
+    payloads use it so a short one does not paint a full-width band — and every
+    one of them also holds content that does not wrap (`white-space: pre`, long
+    JSON strings, long command lines). Without `max-width` the block grows past
+    the reading column on one long line instead of scrolling inside its own
+    `overflow`, which is the whole point of the scroll region.
+
+    The code panel had this from the start; the console block and the JSON
+    payload did not, which is the inconsistency this pins. (Review on #2049.)"""
+    css = _read(CHAT_CSS)
+    for sel in (
+        ".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {",
+        ".cloud-chat-tool-console {",
+        ".cloud-chat-tool-result.is-json pre {",
+    ):
+        rule = css[css.index(sel) :]
+        rule = rule[: rule.index("\n}")]
+        assert "display: inline-block;" in rule, f"{sel} no longer shrinks to content — re-point this guard"
+        assert "max-width: 100%;" in rule, f"{sel} shrinks to content but is unbounded — a long line escapes the column"
+
+
 def test_tool_group_css_uses_ds_tokens_only():
     css = _read(CHAT_CSS)
-    block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-head {")]
+    # Anchored on the group's own last rule rather than on ".cloud-chat-tool-head
+    # {", which now also matches inside ".cloud-chat-tool--step > .cloud-chat-tool-head {"
+    # further up the file and sliced the block to nothing.
+    block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-group-body > .cloud-chat-tool")]
     assert re.search(r"#[0-9a-fA-F]{3,8}\b", block) is None, "raw hex — the group is --ds-* like everything else"
     assert "var(--primary)" not in block, "the design system's token is --ds-primary"
     assert "--ds-accent-danger-line" in block and "--ds-accent-success-line" in block
@@ -1445,3 +1945,35 @@ def test_transcript_reserves_the_composer_s_measured_height():
     rule = rule[: rule.index("}")]
     assert "var(--chat-composer-h" in rule, "the reserved space must track the measurement"
     assert "116px" not in rule, "the constant this replaced"
+
+
+def test_a_follow_up_label_can_shrink_inside_a_narrow_bubble():
+    """A suggested-action label must sit inside `.rdb-action-txt`, not straight
+    in the button.
+
+    `.rdb-action-title` is `flex-shrink: 0` with `white-space: nowrap`
+    (chat_dashboard.css), so on its own it cannot give up width: a long
+    follow-up overflows a narrow chat bubble or viewport instead of being
+    clipped. The wrapper is the shrinkable half — `flex: 0 1 auto`,
+    `min-width: 0`, `overflow: hidden` — and the landing row already nests
+    them that way (chat_dashboard.js). Reusing the same nesting is what keeps
+    the two rows from drifting apart, which is the reason this PR moved the
+    chip onto the shared class in the first place (Devin Review on #2049).
+
+    Pins the nesting, not the CSS: the properties live in
+    chat_dashboard.css and are asserted here only as the reason the wrapper
+    is load-bearing."""
+    js = Path("app/web/static/js/chat.js").read_text(encoding="utf-8")
+    block = js.split('label.className = "rdb-action-title"', 1)[0][-600:]
+    assert 'rdb-action-txt' in block, (
+        "the follow-up title must be wrapped in .rdb-action-txt — without it "
+        "a nowrap, non-shrinking label overflows the bubble"
+    )
+    assert "text.appendChild(label)" in js and "btn.appendChild(text)" in js, (
+        "the title must go into the wrapper and the wrapper into the button"
+    )
+    css = Path("app/web/static/css/chat_dashboard.css").read_text(encoding="utf-8")
+    wrapper = css.split(".rdb-action-txt {", 1)[1].split("}", 1)[0]
+    assert "min-width: 0" in wrapper and "overflow: hidden" in wrapper, (
+        "the wrapper is only load-bearing while it carries the shrink rules"
+    )

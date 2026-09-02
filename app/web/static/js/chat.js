@@ -673,6 +673,48 @@ function _bubbleHasFigure(bubble) {
   return false;
 }
 
+//: The category icon a chip wears instead of spelling its category out. With
+//: five tables cited, "table" was read five times; the glyph says it in a
+//: fraction of the width, and the WORD survives in the chip's aria-label and
+//: tooltip, so nothing is lost to a screen reader.
+const _CLAIM_ICON = { table: "table", metric: "chart-line" };
+
+//: How many references the row shows before the rest fold behind "+N more".
+//: Four covers the overwhelming majority of answers outright — under it there
+//: is no control at all and nothing about the row changes.
+const _SOURCES_VISIBLE = 4;
+
+//: The bubble's tail, in the order it reads: what the answer rested on, then
+//: what you can do with the ANSWER, then what you might ask NEXT. Every piece
+//: arrives on its own schedule and the two render paths deliver them in
+//: OPPOSITE orders — live, finalize renders provenance before the actions row
+//: exists; on a history reload the actions row is already there before any of
+//: it. So no appender may assume it ran first.
+//:
+//: This list is the contract, and `_placeInTail` is the only way to honour it:
+//: each piece inserts before the first LATER kind already present, and falls
+//: back to appending. Hand-rolling that per appender is what let the
+//: facts-scope line land under the suggestions it is supposed to precede.
+const _BUBBLE_TAIL_ORDER = [
+  ".msg-sources",
+  ".msg-sources.is-assumptions",
+  ".msg-facts-scope",
+  ".msg-actions",
+  ".cloud-chat-next-actions",
+];
+
+function _placeInTail(bubble, node, selector) {
+  const rank = _BUBBLE_TAIL_ORDER.indexOf(selector);
+  for (let i = rank + 1; rank !== -1 && i < _BUBBLE_TAIL_ORDER.length; i++) {
+    const later = bubble.querySelector(`:scope > ${_BUBBLE_TAIL_ORDER[i]}`);
+    if (later) {
+      bubble.insertBefore(node, later);
+      return;
+    }
+  }
+  bubble.appendChild(node);
+}
+
 /** One `assumes …` chip: the kind label, the origin badge, the statement,
  *  and — when the answer gave one — the rationale on its own line. Never a
  *  link: an assumption names nothing to open (see _claimHref). */
@@ -747,36 +789,75 @@ function renderSourcesChips(bubble, verdict) {
     wrap.appendChild(none);
   }
 
-  for (const c of provenance) {
-    // A table or metric claim is a link to the thing it names; an assumption
-    // has nothing to open and stays a <span> (see _claimHref).
+  const list = document.createElement("span");
+  list.className = "msg-sources-list";
+  wrap.appendChild(list);
+
+  const chips = provenance.map((c) => {
     const href = _claimHref(c);
     const chip = document.createElement(href ? "a" : "span");
     if (href) chip.href = href;
     // Three states, and the middle one is the point of the whole feature:
     // verified (a tool call supports it), unverified (the answer named
-    // something nothing ran touched), and neutral (an assumption, which there
-    // is nothing to check against).
+    // something nothing ran touched), and neutral (nothing to check against).
     const state = c.verified === true ? "is-ok" : c.verified === false ? "is-unverified" : "is-neutral";
     chip.className = `msg-source-chip ${state}${href ? " is-link" : ""}`;
-    const kind = document.createElement("span");
-    kind.className = "msg-source-kind";
-    kind.textContent = _CLAIM_LABEL[c.kind] || c.kind;
-    chip.appendChild(kind);
+    const iconName = _CLAIM_ICON[c.kind];
+    if (iconName) {
+      const icon = document.createElement("span");
+      icon.className = "msg-source-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.appendChild(iconEl(iconName));
+      chip.appendChild(icon);
+    }
     chip.appendChild(document.createTextNode(c.ref));
+    // The category and the verdict left the chip's FACE; they must not leave
+    // the chip. Both ride the accessible name, and the verdict keeps the
+    // tooltip it always had.
+    const kindWord = _CLAIM_LABEL[c.kind] || c.kind;
     if (c.verified === false) {
       chip.title = "No tool call in this turn touched this — the answer named it, nothing ran on it.";
-      const mark = document.createElement("span");
-      mark.className = "msg-source-flag";
-      mark.textContent = "unverified";
-      chip.appendChild(mark);
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}, unverified`);
     } else if (c.verified === true) {
       chip.title = "A tool call in this turn used this.";
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}, verified`);
+    } else {
+      chip.setAttribute("aria-label", `${kindWord} ${c.ref}`);
     }
-    wrap.appendChild(chip);
-  }
-  bubble.appendChild(wrap);
+    return chip;
+  });
 
+  if (chips.length <= _SOURCES_VISIBLE) {
+    list.replaceChildren(...chips);
+  } else {
+    const [, more] = _expandInPlace({
+      paint: (expanded) => list.replaceChildren(...(expanded ? chips : chips.slice(0, _SOURCES_VISIBLE))),
+      expandLabel: `+${chips.length - _SOURCES_VISIBLE} more`,
+      collapseLabel: "Show fewer",
+      className: "msg-source-more",
+    });
+    wrap.appendChild(more);
+  }
+  // The verdict, said ONCE. It used to be shouted on every unverified chip,
+  // which inverted the salience of the whole row: the model names more than
+  // it queries, so the exception colour became the row's dominant colour and
+  // the genuinely-checked sources had no way to look calm. The chips still
+  // differ (dashed, amber ink); only the WORD is summarised.
+  const unverified = provenance.filter((c) => c.verified === false).length;
+  if (unverified) {
+    const flag = document.createElement("span");
+    flag.className = "msg-source-flag";
+    flag.title = "No tool call in this turn touched these — the answer named them, nothing ran on them.";
+    flag.appendChild(iconEl("triangle-alert"));
+    flag.appendChild(document.createTextNode(`${unverified} unverified`));
+    wrap.appendChild(flag);
+  }
+  _placeInTail(bubble, wrap, ".msg-sources");
+
+  // The assumptions row is TCRD-289's, not a prose line of mine: an origin
+  // badge and a rationale per assumption say strictly more than "Assumes: …"
+  // could. It only joins the tail contract here (_placeInTail) so it cannot
+  // land under the follow-ups when those arrive first.
   if (!assumptions.length) return;
   const arow = document.createElement("div");
   arow.className = "msg-sources is-assumptions";
@@ -785,7 +866,7 @@ function renderSourcesChips(bubble, verdict) {
   alabel.textContent = "Assumptions";
   arow.appendChild(alabel);
   for (const c of assumptions) arow.appendChild(_renderAssumptionChip(c));
-  bubble.appendChild(arow);
+  _placeInTail(bubble, arow, ".msg-sources.is-assumptions");
 }
 
 // ---------- Next-actions block ---------------------------------------------
@@ -881,7 +962,11 @@ function renderFactsScopeLine(bubble) {
     const docWord = docCount === 1 ? "document" : "documents";
     const colWord = colCount === 1 ? "collection" : "collections";
     line.textContent = `Answered from ${docCount} ${docWord} in ${colCount} ${colWord} you can access.`;
-    bubble.appendChild(line);
+    // Provenance, so it belongs with the sources — above the actions row and
+    // above the follow-ups. A bare append put it UNDER the suggestions
+    // whenever they arrived first, contradicting the tail order the rest of
+    // the file documents. (Review on #2049.)
+    _placeInTail(bubble, line, ".msg-facts-scope");
   }
   _resetFactsTurnEvidence();
 }
@@ -891,11 +976,44 @@ function renderNextActions(bubble, actions, pending = false) {
   if (!bubble || !actions || actions.length === 0) return;
   const row = document.createElement("div");
   row.className = "cloud-chat-next-actions";
+  // Named, like the landing screen's row and like SOURCES beside it: a bare
+  // stack of buttons under an answer does not say whose suggestions they are
+  // or that they are optional. Reuses the landing row's own heading class so
+  // the two rows are labelled in one voice.
+  const heading = document.createElement("p");
+  heading.className = "rdb-actions-hd cloud-chat-next-actions-hd";
+  heading.textContent = "Suggested actions";
+  row.appendChild(heading);
   for (const action of actions) {
+    // Built as the landing screen's own suggestion chip (`.rdb-action`, see
+    // chat_dashboard.css) rather than as a lookalike: these are the same
+    // offer — a question you can ask next — and they were reading as two
+    // different components, one at the top of the page and one under every
+    // answer. Reusing the class means they cannot drift apart again, and
+    // `.cloud-chat-next-action` is left holding only what is genuinely
+    // different here: the mid-stream disabled state below.
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "cloud-chat-next-action";
-    btn.textContent = action;
+    btn.className = "rdb-action cloud-chat-next-action";
+    const icon = document.createElement("span");
+    icon.className = "rdb-action-icon";
+    icon.setAttribute("aria-hidden", "true");
+    icon.appendChild(iconEl("arrow-right"));
+    btn.appendChild(icon);
+    // The title goes inside `.rdb-action-txt`, not straight into the button —
+    // the same nesting the landing row builds (chat_dashboard.js). It is not
+    // decoration: `.rdb-action-title` is `flex-shrink: 0` + `white-space:
+    // nowrap`, so on its own it cannot give up width, and a long follow-up
+    // overflows a narrow bubble or viewport. The wrapper is the shrinkable
+    // half — `flex: 0 1 auto; min-width: 0; overflow: hidden` — and reusing
+    // it keeps the two rows from drifting apart again (Devin Review on #2049).
+    const text = document.createElement("span");
+    text.className = "rdb-action-txt";
+    const label = document.createElement("span");
+    label.className = "rdb-action-title";
+    label.textContent = action;
+    text.appendChild(label);
+    btn.appendChild(text);
     // `pending` is the mid-stream draw: the trailer has closed but the turn
     // has not. Showing the row there is the point — the reader learns the
     // follow-ups exist while the tail is still arriving — but CLICKING it
@@ -919,13 +1037,11 @@ function renderNextActions(bubble, actions, pending = false) {
     });
     row.appendChild(btn);
   }
-  // Live order is chips-then-actions (finalize renders chips BEFORE
-  // attachMessageActions appends the row). On a history reload the actions
-  // row already exists when the chips arrive — insert above it so both
-  // paths agree about the bubble's tail.
-  const actionsRow = bubble.querySelector(":scope > .msg-actions");
-  if (actionsRow) bubble.insertBefore(row, actionsRow);
-  else bubble.appendChild(row);
+  // Last in `_BUBBLE_TAIL_ORDER`: the suggestions are the only forward-looking
+  // thing in the tail, so they close the bubble. Sitting them above the
+  // actions row put a timestamp underneath an invitation and made the row look
+  // like it belonged to the suggestions rather than to the message.
+  _placeInTail(bubble, row, ".cloud-chat-next-actions");
 }
 
 function _clearNextActions() {
@@ -2337,6 +2453,26 @@ function chatErrorCopy(raw, kind) {
   if (/concurrency_cap/i.test(both)) {
     return "Too many conversations are running right now. Try again in a moment.";
   }
+  // Agnes's OWN sender limits (enforce_sender_limits in app/chat/manager.py),
+  // delivered to the sender's own sockets only (so "you" is the reader),
+  // matched on the frame's kind before the agent-budget family below: they
+  // are not engine errors, so the fallback's "The engine reported:" would
+  // send the reader — and whoever they ask — to the wrong place. The
+  // per-conversation one is a budget of tokens billed across every turn,
+  // not a context limit, so the copy must not suggest the answer was too
+  // long or that the conversation should have been compacted (TCRD-291).
+  if (/max_session_tokens/i.test(both)) {
+    return "This conversation has reached its token budget, so it can't take another turn. " +
+      "Start a new conversation to keep going. An admin can raise the per-conversation budget.";
+  }
+  if (/daily_budget/i.test(both)) {
+    // Keyed on the SENDER (enforce_sender_limits sums the sender's own day),
+    // so it is "your" cap, not the instance's.
+    return "You've reached your daily spend cap on this instance. Try again tomorrow, or ask an admin to raise it.";
+  }
+  if (/rate_limit/i.test(both)) {
+    return "You're sending messages faster than this instance allows. Wait a few minutes and try again.";
+  }
   if (/budget|429/i.test(both)) {
     return "This instance has used its message budget for the month. An admin can raise it.";
   }
@@ -2755,6 +2891,10 @@ function attachMessageActions(article, copyText) {
 
   const wrap = document.createElement("div");
   wrap.className = "msg-actions";
+  // This row belongs to the MESSAGE, so it sits above any follow-up
+  // suggestions rather than below them — see `_BUBBLE_TAIL_ORDER`, which is
+  // where that order is declared for every piece of the tail.
+  const appendRow = () => _placeInTail(bubble, wrap, ".msg-actions");
 
   const ts = article.dataset.createdAt
     ? new Date(article.dataset.createdAt)
@@ -2810,7 +2950,7 @@ function attachMessageActions(article, copyText) {
     wrap.appendChild(regen);
   }
 
-  bubble.appendChild(wrap);
+  appendRow();
 }
 
 /** Whether a persisted assistant row is a partial-save of an interrupted turn
@@ -3710,6 +3850,61 @@ function _jsonPanel(label, value, className) {
   return panel;
 }
 
+/** A code panel for one arg that IS a language — a shell command line, a SQL
+ *  statement — in its own language, at full length, with the shared copy
+ *  button. */
+function _codePanel(label, text, language, className) {
+  const panel = document.createElement("div");
+  panel.className = className;
+  const lab = document.createElement("div");
+  lab.className = "cloud-chat-tool-panel-label";
+  lab.textContent = label;
+  panel.appendChild(lab);
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.className = `language-${language}`;
+  code.textContent = text;
+  pre.appendChild(code);
+  panel.appendChild(pre);
+  enhanceCodeBlocks(panel);
+  return panel;
+}
+
+//: The args a tool takes that are a LANGUAGE rather than a value, and the
+//: language each one is. These two are what a reader opens a step FOR, so they
+//: get a code panel of their own; everything else is a value and stays JSON.
+const _ARG_LANGUAGES = { command: ["Command", "bash"], sql: ["SQL", "sql"] };
+
+/** The card body's account of what the tool was ASKED to do, as one or two
+ *  panels.
+ *
+ *  Nearly every call in this product is a command line — the agent does its
+ *  data work through the agnes CLI inside Bash — and a command line inside a
+ *  JSON object is the worst of both: `{"command": "agnes query \"SELECT *
+ *  FROM orders\""}` makes the reader undo the escaping in their head to read
+ *  the SQL they opened the card for. So `command` / `sql` render as a code
+ *  block in their own language, unescaped and untruncated (the header shows
+ *  the same string, but clipped to a line — this is where the rest of a long
+ *  statement actually becomes readable).
+ *
+ *  Any REMAINING args still get the formatted-JSON panel, so nothing the tool
+ *  was passed is dropped from the record; a call with no language arg is
+ *  entirely unchanged. Still one click total either way — no nested toggle. */
+function _argsPanels(args) {
+  const panels = [];
+  const rest = { ...args };
+  for (const [key, [label, language]] of Object.entries(_ARG_LANGUAGES)) {
+    const value = args[key];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    panels.push(_codePanel(label, value, language, "cloud-chat-tool-args"));
+    delete rest[key];
+  }
+  if (panels.length === 0 || Object.keys(rest).length > 0) {
+    panels.push(_jsonPanel(panels.length ? "Other args" : "Args", rest, "cloud-chat-tool-args"));
+  }
+  return panels;
+}
+
 function _toolCallId(frame) {
   // Pair tool_call ↔ tool_result via the runner's dedicated tool_use_id:
   // frame.id is NOT usable — the server's frame envelope overwrites it
@@ -3717,35 +3912,6 @@ function _toolCallId(frame) {
   // so pairing on it left every tool block stuck on "running…" forever.
   // Fall back to id (pre-envelope runners) then tool name.
   return frame.tool_use_id || frame.id || frame.tool;
-}
-
-function _summarizeArgs(args) {
-  if (args == null) return "";
-  if (typeof args === "string") return args.length > 80 ? args.slice(0, 78) + "…" : args;
-  if (typeof args !== "object") return String(args);
-  const keys = Object.keys(args);
-  if (keys.length === 0) return "";
-  // Heuristic: prefer the SQL arg if present (run_query, agnes query)
-  // — that's what the user actually wants to see. Otherwise show the
-  // first scalar value or a "k=v, k=v" sketch.
-  if (typeof args.command === "string") {
-    const cmd = args.command.replace(/\s+/g, " ").trim();
-    return cmd.length > 100 ? cmd.slice(0, 98) + "…" : cmd;
-  }
-  if (typeof args.sql === "string") {
-    const sql = args.sql.replace(/\s+/g, " ").trim();
-    return sql.length > 100 ? sql.slice(0, 98) + "…" : sql;
-  }
-  if (typeof args.table === "string") return args.table;
-  if (typeof args.name === "string") return args.name;
-  const parts = [];
-  for (const k of keys.slice(0, 3)) {
-    const v = args[k];
-    if (v == null) continue;
-    const text = typeof v === "object" ? JSON.stringify(v) : String(v);
-    parts.push(`${k}=${text.length > 30 ? text.slice(0, 28) + "…" : text}`);
-  }
-  return parts.join(", ");
 }
 
 // ---------- Tool labels -----------------------------------------------------
@@ -4231,7 +4397,11 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   else if (state === "output-error" || isError) statusClass = "is-error";
   else if (state === "output-available") statusClass = "is-done";
   const wrapIsError = statusClass === "is-error";
-  wrap.className = `cloud-chat-tool ${statusClass}`;
+  // `--step` marks this as a trace LINE rather than a card. The class is
+  // shared with the approval gate and the question card, which are surfaces
+  // the reader has to act on and keep the box; a step has no box at all
+  // (chat.css → "A tool-call step: a line, not a card").
+  wrap.className = `cloud-chat-tool cloud-chat-tool--step ${statusClass}`;
   wrap.dataset.tool = tool || "";
 
   // Header line — status + tool name + args summary. Always visible, even
@@ -4268,9 +4438,17 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   }
   head.appendChild(name);
 
+  // Deliberately EMPTY of args. A collapsed step is one quiet line — a verb
+  // and an outcome — and the whole command on it was the single longest thing
+  // in a settled transcript: `agnes query "SELECT sum(total) FROM orders"` set
+  // beside every row of a six-step run is most of what made the trail feel
+  // crowded. The args live in the body, one click away (see _argsPanels).
+  //
+  // The element stays, because a FAILED call writes its diagnosis here
+  // (_setToolCardError): on an error the one thing worth a collapsed line is
+  // what went wrong, and that is the only thing this slot now ever holds.
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
-  summary.textContent = _summarizeArgs(args);
   head.appendChild(summary);
 
   if (status === "running") {
@@ -4297,11 +4475,11 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // its args sketch where its error should be.
   if (wrapIsError) _setToolCardError(wrap, result);
 
-  // Args — formatted JSON, visible the moment the card is expanded. The
-  // card header is the one click now; the old nested args toggle inside a
-  // collapsed card was two clicks to see what a tool was asked to do.
+  // Args — visible the moment the card is expanded. The card header is the
+  // one click now; the old nested args toggle inside a collapsed card was two
+  // clicks to see what a tool was asked to do.
   if (args && Object.keys(args).length > 0) {
-    wrap.appendChild(_jsonPanel("Args", args, "cloud-chat-tool-args"));
+    for (const panel of _argsPanels(args)) wrap.appendChild(panel);
   }
 
   // A replayed card's result, from the persisted part. Routed through the
@@ -4395,6 +4573,10 @@ function _buildToolGroup() {
   const body = document.createElement("div");
   body.className = "cloud-chat-tool-group-body";
   group.appendChild(body);
+  // The settled label reads "Show N steps" / "Hide N steps", so it is a
+  // function of `open` and has to be re-derived when the reader toggles it —
+  // otherwise an opened group still invites you to open it.
+  group.addEventListener("toggle", () => _updateToolGroupSummary(group));
   return group;
 }
 
@@ -4447,7 +4629,12 @@ function _updateToolGroupSummary(group) {
       }
     }
     const activeName = active ? active.querySelector(".cloud-chat-tool-name") : null;
-    label.textContent = activeName ? activeName.textContent : steps;
+    // Settled, the label is the CONTROL and says what clicking it does —
+    // "Show 6 steps" / "Hide 6 steps" — because with the box gone there is
+    // nothing else on the line that looks clickable. Live, it stays the name
+    // of the step in progress: a run still going has something better to say
+    // than how to fold it.
+    label.textContent = activeName ? activeName.textContent : `${group.open ? "Hide" : "Show"} ${steps}`;
   }
   const meta = group.querySelector(".cloud-chat-tool-group-meta");
   if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
@@ -4811,18 +4998,33 @@ function _renderFactClaimsPreview(result) {
   return wrap;
 }
 
+/** Box-drawing characters (U+2500–U+257F) — the signature of a CONSOLE table.
+ *  `agnes query` defaults to `--format table`, which is a rich box table, and
+ *  `agnes catalog` / `agnes describe` print the same way, so this is among the
+ *  most common tool results in the product. Run through renderMarkdownSafe it
+ *  came out as one mangled paragraph: marked collapses the newlines, and the
+ *  column alignment IS the content. A <pre> keeps it.
+ *
+ *  Deliberately not a pipe-and-dash test: a markdown table is pipes and
+ *  dashes too, and that one really does belong in marked. */
+const _CONSOLE_TABLE_RE = /[\u2500-\u257F]/;
+
 /** Build the preview block for a tool result. The CLI tools route
  *  most JSON / table output via agnes which speaks Markdown — so
  *  result strings often contain `|---|---|` table markup that
  *  marked.parse() can render natively. We:
  *
  *  1. unwrap an MCP text envelope down to its payload;
- *  2. attempt to extract a tabular preview from a parsed JSON result
- *     (array of objects, or a {columns, rows} shape);
- *  3. fall back to running ``marked.parse`` over a string result so
+ *  2. attempt to extract a tabular preview from the result AS AN OBJECT —
+ *     parsing it first when it arrived as JSON text, which is what a CLI
+ *     tool's stdout is (array of objects, or a {columns, rows} shape);
+ *  3. keep console output — a rich box table, the shape `agnes query`
+ *     prints by default — in a monospace <pre>, since its alignment is
+ *     the content and markdown would collapse it;
+ *  4. fall back to running ``marked.parse`` over a string result so
  *     embedded Markdown tables get rendered as real <table>s with the
  *     `.ds-table` sort+sticky-header enhancement; and
- *  4. render everything else as a formatted, highlighted JSON block —
+ *  5. render everything else as a formatted, highlighted JSON block —
  *     shown directly: the collapsed card's header is the one click.
  *
  *  Returns a DOM element ready to append, or null if the result is
@@ -4863,11 +5065,37 @@ function _renderToolResultPreview(result, toolName, isError) {
     return wrap;
   }
 
-  // Already-tabular JSON shapes — render a real <table> preview.
-  const table = _coerceToTablePreview(result);
+  // The payload as an OBJECT when it can be one — which for a string means
+  // parsing it. This is the path most turns actually take and the one the
+  // table renderer was missing: the workspace prompt teaches the agent to
+  // reach data through `agnes query` over **Bash**, whose stdout is a string,
+  // so the object-shaped check below never saw it and a 400-row answer
+  // rendered as a single line of JSON in a paragraph, the rest behind "Show
+  // full result". (`agnes query --json` prints `[{col: val}, …]`; `POST
+  // /api/query` answers `{columns, rows}` — both shapes _coerceToTablePreview
+  // already knew, simply never handed to it.)
+  //
+  // Narrow by construction: parsing decides nothing on its own. The only
+  // strings whose rendering changes are the ones that ALSO coerce to a table
+  // below; CLI prose, a markdown table and a JSON string of any other shape
+  // fall through to the string path exactly as before. The parse is also what
+  // the semantic-validation notice reads, on both routes, so it happens once.
+  const parsed = _asToolResultObject(result);
+  const payload = parsed && typeof parsed === "object" ? parsed : null;
+
+  // Already-tabular shapes — render a real <table> preview.
+  const table = payload ? _coerceToTablePreview(payload) : null;
   if (table) {
-    _appendSemanticValidationNotice(table, result);
+    _appendSemanticValidationNotice(table, payload);
     return table;
+  }
+
+  // A console table — alignment, not markup. Monospace in a <pre>, with the
+  // same preview/full split the markdown path uses, so a long catalog listing
+  // still can't push the answer off the screen. Sliced on LINES rather than
+  // characters: a table cut mid-row reads as corrupt output.
+  if (typeof result === "string" && _CONSOLE_TABLE_RE.test(result)) {
+    return _renderConsoleTableResult(result);
   }
 
   // String result. Most agnes CLI tool output is Markdown-ish; let
@@ -4911,17 +5139,11 @@ function _renderToolResultPreview(result, toolName, isError) {
       det.appendChild(full);
       wrap.appendChild(det);
     }
-    // `agnes query`'s real stdout is exactly this: JSON text on a Bash tool
-    // call, never pre-parsed into an object the way an MCP tool's result
-    // is — so the object-shaped check above never sees it, and this is the
-    // path most turns actually take (the workspace prompt teaches `agnes
-    // query "<SQL>"` over Bash first). Parse defensively; anything that
-    // isn't the query response shape leaves this a no-op.
-    try {
-      _appendSemanticValidationNotice(wrap, JSON.parse(result));
-    } catch (_) {
-      // Not JSON (the common case for ordinary CLI text output) — fine.
-    }
+    // `agnes query`'s real stdout is JSON text on a Bash tool call, never
+    // pre-parsed into an object the way an MCP tool's result is — so a
+    // soft-enforce warning on it is only reachable through the parse above.
+    // `payload` is null for ordinary CLI text output, which this no-ops on.
+    _appendSemanticValidationNotice(wrap, payload);
     return wrap;
   }
 
@@ -4933,6 +5155,69 @@ function _renderToolResultPreview(result, toolName, isError) {
   wrap.className = "cloud-chat-tool-result is-json";
   wrap.appendChild(_jsonPanel("Result", result, "cloud-chat-tool-json"));
   _appendSemanticValidationNotice(wrap, result);
+  return wrap;
+}
+
+/** Wire a capped preview to a control that grows it IN PLACE.
+ *
+ *  What this replaces rendered the preview and then, behind a toggle, a SECOND
+ *  copy of the same payload starting over from its first row — so "Show full
+ *  output" on a 22-line listing showed you lines 1-12, then lines 1-22
+ *  underneath, the first twelve of them twice. There is one payload, so there
+ *  is one element: `paint(expanded)` repaints it, `meta(expanded)` is the line
+ *  above it (null while there is nothing left to report), and the control says
+ *  how to get back.
+ *
+ *  Also strictly cheaper than the shape it replaces, which built the full
+ *  table eagerly at construction: nothing beyond the preview is built until
+ *  someone asks for it.
+ *
+ *  Returns `[metaEl, button]`; `metaEl` is null when no `meta` was given (the
+ *  sources row is inline and has nowhere to put a block-level line), so a
+ *  caller that wants only the control can ignore it. */
+function _expandInPlace({ paint, meta, expandLabel, collapseLabel, className }) {
+  const metaEl = meta ? document.createElement("p") : null;
+  if (metaEl) metaEl.className = "cloud-chat-tool-result-meta";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className || "cloud-chat-tool-result-more";
+  let expanded = false;
+  const sync = () => {
+    paint(expanded);
+    if (metaEl) {
+      const line = meta(expanded);
+      metaEl.textContent = line || "";
+      metaEl.hidden = !line;
+    }
+    btn.textContent = expanded ? collapseLabel : expandLabel;
+    btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+  };
+  btn.onclick = () => {
+    expanded = !expanded;
+    sync();
+  };
+  sync();
+  return [metaEl, btn];
+}
+
+/** Console output whose alignment carries the meaning: the whole thing, in a
+ *  <pre> that scrolls. No markdown and no syntax highlighting — there is no
+ *  language here to highlight, only columns to keep straight.
+ *
+ *  Deliberately UNCAPPED, unlike the table preview next to it. A line cap here
+ *  bought nothing and cost a click: the block is already bounded on screen by
+ *  its own `max-height` (chat.css → .cloud-chat-tool-console), so capping the
+ *  CONTENT as well only meant the reader had to ask for the rest of something
+ *  that was going to be behind a scrollbar either way. The cost is a text node
+ *  — a long dump is one string, not the hundreds of elements a long table is,
+ *  which is why the table still caps and this does not. */
+function _renderConsoleTableResult(result) {
+  const wrap = document.createElement("div");
+  wrap.className = "cloud-chat-tool-result is-console";
+  const pre = document.createElement("pre");
+  pre.className = "cloud-chat-tool-console";
+  pre.textContent = result.replace(/\s+$/, "");
+  wrap.appendChild(pre);
   return wrap;
 }
 
@@ -5028,36 +5313,43 @@ function _coerceToTablePreview(result) {
 
   const tableWrap = document.createElement("div");
   tableWrap.className = "cloud-chat-table-wrap";
-  tableWrap.appendChild(_buildResultTable(columns, preview));
   wrap.appendChild(tableWrap);
+  // Filled by the expansion's own repaint below when there is one, so the
+  // preview table is built once rather than built and immediately replaced.
+  if (total <= preview.length) tableWrap.appendChild(_buildResultTable(columns, preview));
 
-  // The expansion is a REAL table too — the same shape the preview showed,
-  // just all of it (capped so a huge result can't flood the DOM). It used to
-  // be a JSON dump, which contradicted the preview right above it.
+  // The expansion is the SAME table, grown: one <table> that gains its rows,
+  // not a preview with a second full copy stacked under it (see
+  // _expandInPlace). Still capped, so a huge result can't flood the DOM.
   if (total > preview.length) {
-    const meta = document.createElement("p");
-    meta.className = "cloud-chat-tool-result-meta";
-    meta.textContent = `Showing ${preview.length} of ${total} rows.`;
-    wrap.appendChild(meta);
-    const det = document.createElement("details");
-    det.className = "cloud-chat-tool-result-full";
-    const sum = document.createElement("summary");
     const shown = Math.min(total, _TOOL_RESULT_FULL_ROWS_MAX);
-    sum.textContent = total > _TOOL_RESULT_FULL_ROWS_MAX
-      ? `Show first ${shown} of ${total} rows`
-      : `Show all ${total} rows`;
-    det.appendChild(sum);
-    const fullWrap = document.createElement("div");
-    fullWrap.className = "cloud-chat-table-wrap";
-    fullWrap.appendChild(_buildResultTable(columns, rows.slice(0, _TOOL_RESULT_FULL_ROWS_MAX)));
-    det.appendChild(fullWrap);
-    wrap.appendChild(det);
-    enhanceTables(det);
+    const [meta, more] = _expandInPlace({
+      paint: (expanded) => {
+        tableWrap.replaceChildren(
+          _buildResultTable(columns, expanded ? rows.slice(0, _TOOL_RESULT_FULL_ROWS_MAX) : preview)
+        );
+        enhanceTables(tableWrap);
+      },
+      // Expanded there is nothing left to report unless the cap actually
+      // dropped rows — in which case saying so is the point.
+      meta: (expanded) =>
+        expanded
+          ? (total > _TOOL_RESULT_FULL_ROWS_MAX ? `Showing ${shown} of ${total} rows.` : null)
+          : `Showing ${preview.length} of ${total} rows.`,
+      expandLabel: total > _TOOL_RESULT_FULL_ROWS_MAX
+        ? `Show first ${shown} of ${total} rows`
+        : `Show all ${total} rows`,
+      collapseLabel: "Show less",
+    });
+    wrap.appendChild(meta);
+    wrap.appendChild(more);
 
     // Past the cap the table genuinely drops rows — keep a route to ALL of
-    // them (the old JSON dump had them; the cap must not lose data). Built
-    // lazily on first open so a huge dump costs no memory or DOM until
-    // asked for, and via textContent so the payload can never execute.
+    // them (the cap must not lose data). This one stays a <details> rather
+    // than growing in place, because unlike the expansion above it is
+    // genuinely ADDITIONAL content and not a second copy of what is already
+    // on screen. Built lazily on first open so a huge dump costs no memory or
+    // DOM until asked for, and via textContent so it can never execute.
     if (total > _TOOL_RESULT_FULL_ROWS_MAX) {
       const rawDet = document.createElement("details");
       rawDet.className = "cloud-chat-tool-result-full";
