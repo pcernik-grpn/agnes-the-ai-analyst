@@ -200,7 +200,7 @@ def assert_policied_reads_unique(conn, policied_table_ids, principal) -> None:
             continue
         try:
             described = conn.execute(f"DESCRIBE ({relation.relation_sql})", relation.params).fetchall()
-        except Exception as exc:  # noqa: BLE001 — any resolve/describe failure denies
+        except Exception as exc:
             raise PolicyError(table_id) from exc
         assert_unique_output_columns([r[0] for r in described], table_id)
 
@@ -1022,7 +1022,7 @@ def effective_schema(table_id: str, principal) -> list[dict] | None:
 # ---------------------------------------------------------------------------
 
 
-def row_scope_payload(policied_table_ids: "list[str] | tuple[str, ...] | None") -> dict | None:
+def row_scope_payload(policied_table_ids: list[str] | tuple[str, ...] | None) -> dict | None:
     """Build the ``row_scope`` disclosure envelope (§10) for a response that
     read through one or more policied tables.
 
@@ -1082,12 +1082,19 @@ def raise_if_policy_mapping_empty(policy_sql: str) -> None:
         statement = sqlglot.parse_one(policy_sql, read="duckdb")
     except Exception:
         return
-    referenced_names = {t.name for t in statement.find_all(exp.Table) if t.name}
+    # DuckDB identifiers are case-insensitive, so the match below must be
+    # too -- lower-case both sides. Without this, a policy body joining
+    # `Cost_Centres` while the registry row is named `cost_centres` (or vice
+    # versa) silently misses the mapping row, and this whole check no-ops
+    # (PR #2023 review, finding 1).
+    referenced_names = {t.name.lower() for t in statement.find_all(exp.Table) if t.name}
     if not referenced_names:
         return
 
     mapping_rows = [
-        r for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name") in referenced_names
+        r
+        for r in table_registry_repo().list_all()
+        if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
     ]
     for mapping_row in mapping_rows:
         state = sync_state_repo().get_table_state(mapping_row["id"])
