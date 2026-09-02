@@ -1105,6 +1105,44 @@ class TestRailCollapseCss:
                 continue
             assert "var(--rail-peek-text-delay)" in rule, rule
 
+    def test_the_admin_peek_makes_its_contents_wait_with_it(self) -> None:
+        """An admin page delays the rail's own width by 400ms (anti
+        pass-through, sized for a navigation column beside it rather than a
+        page). The descendants must wait the same 400ms.
+
+        They all read ``--rail-peek-text-delay``, defined once at .14s, so
+        without a redefinition inside the admin-hover block the labels, rows
+        and icons rearrange on the ordinary beat while the panel is still
+        waiting — a pointer merely passing through scrambles the column the
+        admin was reading, and the peek it was waiting for never opens
+        (Devin Review on #1989).
+
+        One line closes it, precisely because the descendants already share
+        the token; this pins that the redefinition is inside the admin-hover
+        rule and matches the width's own delay."""
+        rule = re.search(
+            r'\.rail\[data-rail-context="admin"\][^{]*:hover\s*\{([^}]*)\}', RAIL_CSS
+        )
+        assert rule, "the admin-context hover rule must exist"
+        body = rule.group(1)
+        # The width segment ends at the comma that follows its delay; the
+        # `var(--ds-motion-fast, .16s)` inside it carries a comma of its own,
+        # so match the whole segment and take its LAST duration.
+        width_seg = re.search(r"transition:\s*width\b(.*?)\bbox-shadow\b", body, re.S)
+        assert width_seg, f"the admin hover rule must transition width: {body}"
+        durations = re.findall(r"([\d.]+)s", width_seg.group(1))
+        width_delay = durations[-1] if durations else None
+        assert width_delay, f"the admin hover rule must delay width: {body}"
+        token = re.search(r"--rail-peek-text-delay:\s*([\d.]+)s", body)
+        assert token, (
+            "the admin hover rule must redefine --rail-peek-text-delay — otherwise "
+            "the rail's contents move on the default beat while the panel waits"
+        )
+        assert token.group(1) == width_delay, (
+            f"contents ({token.group(1)}s) must wait exactly as long as the width "
+            f"({width_delay}s), so nothing moves before the panel does"
+        )
+
     def test_body_clearance_is_the_icon_width_and_constant(self) -> None:
         """The 56px reservation must NOT change on hover/focus — the peeked
         rail is an overlay, so the page's own layout never moves."""
