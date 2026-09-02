@@ -92,12 +92,24 @@ spot-check shows pseudonyms, not names.
 |---|---|---|---|
 | LLM name detection | `extraction.anonymization.detector: "llm"` | recall on names regex can't pattern-match | ~$5 / 1 000 docs (Haiku) |
 | Scan OCR | `extraction.scan_ocr.enabled` | text from image-only PDFs | ~$0.006 / page |
-| Facts extraction | `extraction.facts.enabled` (+ `facts.enabled`) | knowledge-graph facts with verbatim evidence | ~$0.011 / doc (Haiku) |
+| Facts extraction | `extraction.facts.enabled` (+ `facts.enabled`) | knowledge-graph facts with verbatim evidence | ~$0.05 / doc (Haiku), measured live — see `config/instance.yaml.example`'s `facts` block |
 
 All three can run against a self-hosted OpenAI-compatible endpoint instead
 of the Anthropic API — globally (`extraction.llm`) or per stage, e.g. the
 NER detector local while facts stay hosted:
 [`self-hosted-llm.md`](self-hosted-llm.md).
+
+Facts extraction normally runs as the tail of a crawl (`corpus-extraction`),
+so a document only gets a model call once it has been crawled and ingested
+in the SAME run. To (re)build the graph over a corpus that is already
+indexed — after turning `extraction.facts.enabled` on for the first time
+over an existing connection, or after a prompt/ontology change — trigger it
+on its own, with its own wall-clock budget
+(`extraction.facts.run_timeout_s`, independent of the crawl's own
+`extraction.timeout_s`): `POST /api/admin/sharepoint/connections/{id}
+/facts-extract` or `agnes admin sharepoint facts-extract <connection_id>`
+(`--doc-id` narrows it to one document, e.g. to test a prompt change
+cheaply; `--timeout-s` overrides the budget for that one run).
 
 ## Troubleshooting quick table
 

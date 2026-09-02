@@ -1315,6 +1315,24 @@ _EXEMPT: dict[str, str] = {
         "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "
         "the acl-sync exemption right above; no analyst CLI/MCP analogue"
     ),
+    # Standalone fact-graph trigger — build the graph over an already-indexed
+    # corpus, no crawl required. Same admin/ops maintenance-op class as the
+    # extract/acl-sync/subtree-sweep triggers above, EXCEPT this one IS
+    # CLI-reachable (`agnes admin sharepoint facts-extract`), for an ops
+    # engineer scripting a rebuild without opening the admin UI — the
+    # triple-surface mechanism only gates MCP + REST classification, so a
+    # CLI command can exist on an _EXEMPT row. Deliberately still not
+    # MCP-exposed: an agent-invokable tool that can kick off an LLM pass
+    # spending the instance's own budget over an entire corpus on a whim is
+    # a cost/abuse surface no analyst query needs, the same reasoning as the
+    # admin credential-provisioning and security-posture exemptions in
+    # CONTRIBUTING.md.
+    "/api/admin/sharepoint/connections/{connection_id}/facts-extract": (
+        "admin/ops trigger for the sharepoint-facts-extraction job — CLI-reachable "
+        "(agnes admin sharepoint facts-extract) but deliberately not MCP-exposed: "
+        "an agent should not be able to spend the instance's LLM budget over an "
+        "entire corpus with one tool call"
+    ),
     # The config drawer's "Preview redaction" panel: paste a sample, see what
     # the anonymizer would do to it before a crawl runs over thousands of
     # documents. Same exemption class as the drawer it lives in — an admin

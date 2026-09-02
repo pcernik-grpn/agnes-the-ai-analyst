@@ -317,6 +317,83 @@ def test_a_fabricated_quote_never_reaches_the_server(pg_env):
 
 
 # ---------------------------------------------------------------------------
+# Deterministic quote repair, end to end through the REAL verbatim gate —
+# cost-levers spec 2026-09-02 §2.1/§2.2. Proves the repaired quote is not
+# just accepted by the in-process pre-check but also by
+# `FactsPgRepository.ingest_batch`'s own, independent gate.
+# ---------------------------------------------------------------------------
+
+
+def test_a_normalization_artifact_is_repaired_with_no_retry(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The client’s rollout began in March.")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        # Straight apostrophe; the stored chunk has a curly one.
+        "evidence": [{"doc_id": "doc1", "quote": "client's rollout"}],
+    }
+    extractor = StubExtractor([_stream(node)])
+    report = _run(extractor)
+
+    assert extractor.usage["calls"] == 1, "repaired before any retry — zero extra model calls"
+    assert report["facts_retries"] == 0
+    assert report["facts_quotes_repaired"] == 1
+    assert report["facts_quotes_dropped"] == 0
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == 0
+
+
+def test_a_quote_spanning_two_chunks_ships_with_no_retry(pg_env):
+    """A quote crossing what the extraction happened to split as two
+    separate chunks, but present verbatim in the joined text the model was
+    shown, passes on the FIRST attempt — no retry, no drop."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="")  # corpus_files row only
+
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        for ordinal, chunk_text in enumerate(
+            ["The Northwind rollout began in March", "and concluded successfully in April."]
+        ):
+            conn.execute(
+                sa.text(
+                    "INSERT INTO corpus_chunks (id, corpus_id, file_id, ordinal, text) "
+                    "VALUES (:id, :corpus_id, :file_id, :ordinal, :text)"
+                ),
+                {
+                    "id": "ck_" + secrets.token_hex(8),
+                    "corpus_id": CORPUS_A,
+                    "file_id": "cf_1",
+                    "ordinal": ordinal,
+                    "text": chunk_text,
+                },
+            )
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "began in March\n\nand concluded successfully"}],
+    }
+    extractor = StubExtractor([_stream(node)])
+    report = _run(extractor)
+
+    assert extractor.usage["calls"] == 1
+    assert report["facts_retries"] == 0
+    assert report["facts_quotes_dropped"] == 0
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Idempotent re-runs
 # ---------------------------------------------------------------------------
 
@@ -739,3 +816,104 @@ def test_an_expired_deadline_stops_between_documents_and_keeps_what_it_paid_for(
     second = _run(Scripted([]))
     assert second["docs_extracted"] == 3
     assert second["docs_unchanged"] == 1
+
+
+# ---------------------------------------------------------------------------
+# `on_progress` — the liveness seam (owner-frustration fix, 2026-09-02): a
+# healthy multi-hour facts pass never checkpointed at all, so the crawl's own
+# `_STALL_AFTER_S`-derived liveness check declared it dead the longer (and
+# more expensive) it ran. This proves the REAL walk/submit/drain loop calls
+# it, not just the wiring closure on the crawler side (covered separately in
+# `tests/test_sharepoint_crawler.py::TestFactsProgressCheckpointing`).
+# ---------------------------------------------------------------------------
+
+
+def test_on_progress_fires_before_the_first_document_and_after_each_one(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+    _seed_document(file_id="cf_2", doc_id="doc2", text="The Contoso rollout began in April.")
+
+    node1 = {
+        "id": "engagement:a",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "began in March"}],
+    }
+    node2 = {
+        "id": "engagement:b",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc2", "quote": "began in April"}],
+    }
+
+    updates: list[dict] = []
+    _run(
+        StubExtractor([_stream(node1), _stream(node2)]),
+        concurrency=1,  # deterministic submission/drain order
+        on_progress=lambda update: updates.append(dict(update)),
+    )
+
+    # Fired once BEFORE the first submission — the honest "we don't know
+    # yet" value — so a caller wired to a run recorder can flip its row's
+    # phase to "facts" immediately rather than only once a (possibly slow)
+    # first document finishes.
+    assert updates[0] == {"docs_done": 0, "docs_total": 0, "current_path": None}
+    # …then once per document, `docs_total` GROWING as the walk discovers
+    # more candidates — never invented ahead of what has actually been
+    # submitted (the same honesty rule `files_seen` follows on the crawl
+    # side).
+    assert updates[1] == {"docs_done": 1, "docs_total": 1, "current_path": "cf_1.md"}
+    assert updates[2] == {"docs_done": 2, "docs_total": 2, "current_path": "cf_2.md"}
+    assert len(updates) == 3
+
+
+def test_on_progress_counts_a_failed_document_as_done_too(pg_env):
+    """A document that errors is still one fewer left — the checkpoint this
+    drives must move even on a run that is about to fail one document."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+    _seed_document(file_id="cf_2", doc_id="doc2", text="The Contoso rollout began in April.")
+
+    good = {
+        "id": "engagement:b",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc2", "quote": "began in April"}],
+    }
+
+    class Flaky(StubExtractor):
+        def call(self, user_message: str) -> str:
+            if "doc1" in user_message:
+                self.seen.append(user_message)
+                raise ValueError("model returned nonsense")
+            return super().call(user_message)
+
+    updates: list[dict] = []
+    report = _run(
+        Flaky([_stream(good)]),
+        concurrency=1,
+        on_progress=lambda update: updates.append(dict(update)),
+    )
+
+    assert report["facts_failed"] == 1
+    docs_done_sequence = [u["docs_done"] for u in updates]
+    assert docs_done_sequence == [0, 1, 2], "the failed document still advances docs_done"
+
+
+def test_on_progress_is_never_called_when_the_stage_refuses_to_run(pg_env):
+    """No corpus was walked, so there is nothing to report progress on —
+    never a call with invented zeros for a pass that never started."""
+    from connectors.sharepoint.facts_extraction import FactsExtractionUnavailable
+
+    _seed_collection()
+    _seed_connection()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="Some text.")
+
+    updates: list[dict] = []
+    with pytest.raises(FactsExtractionUnavailable, match="no ontology"):
+        _run(StubExtractor([_stream()]), on_progress=lambda update: updates.append(dict(update)))
+    assert updates == []
