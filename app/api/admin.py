@@ -5398,6 +5398,46 @@ def register_table(
         exclude_id=None,
     )
 
+    # #1979 (PR #2023 review, finding 3; hardened per finding A of the
+    # follow-up review) — defense in depth, purge-BEFORE-insert, symmetric
+    # with `unregister_table`. Table ids are derived from names (see
+    # `table_id` above), so a table unregistered and then re-registered
+    # under the same name reuses the same id. This row is confirmed
+    # brand-new here (the 409 check above proved no registry row existed
+    # for `table_id`) regardless of how it got here — so any revision still
+    # sitting under this id is, by construction, an orphan from before this
+    # registration and must not be offered as this table's restorable
+    # history. Purging before the registry insert (rather than after) means
+    # a genuine purge failure aborts the registration cleanly instead of
+    # committing a row whose "history" can resurrect a previous table's
+    # policy bodies. `RequiresPostgresBackend` is the one exception
+    # swallowed (the frozen DuckDB backend has no store to purge at all);
+    # everything else is a structured 500, matching unregister_table.
+    try:
+        _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
+        if _orphaned:
+            logger.warning(
+                "register_table: purged %d orphaned access-policy revision(s) "
+                "for reused table id %s",
+                _orphaned,
+                table_id,
+            )
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:
+        logger.error(
+            "Could not purge pre-existing access-policy revisions for newly "
+            "registered table %s before inserting the registry row -- "
+            "aborting the registration rather than risk offering a previous "
+            "table's history as this one's: %s",
+            table_id,
+            e,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+        )
+
     repo.register(
         id=table_id,
         name=request.name,
@@ -5425,39 +5465,6 @@ def register_table(
         server_only=request.server_only,
         connection_id=request.connection_id,
     )
-
-    # #1979 (PR #2023 review, finding 3) — defense in depth. Table ids are
-    # derived from names (see `table_id` above), so a table unregistered and
-    # then re-registered under the same name reuses the same id. The
-    # unregister path already purges `access_policy_revisions` for that id
-    # up front (before dropping the registry row), but this row is
-    # confirmed brand-new here (the 409 check above proved no registry row
-    # existed for `table_id`) regardless of how it got here — so any
-    # revision still sitting under this id is, by construction, an orphan
-    # from before this registration and must not be offered as this table's
-    # restorable history. `RequiresPostgresBackend` is the one exception
-    # swallowed (the frozen DuckDB backend has no store); anything else is
-    # logged, not load-bearing — a purge failure here must not block a
-    # registration that already committed.
-    try:
-        _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
-        if _orphaned:
-            logger.warning(
-                "register_table: purged %d orphaned access-policy revision(s) "
-                "for reused table id %s",
-                _orphaned,
-                table_id,
-            )
-    except RequiresPostgresBackend:
-        pass
-    except Exception as e:
-        logger.warning(
-            "Could not purge pre-existing access-policy revisions for newly "
-            "registered table %s: %s -- if any are orphaned from a previous "
-            "table at this id, they may still be reachable",
-            table_id,
-            e,
-        )
 
     # Audit entry — masked params; description kept raw (it's documentation).
     audit_repo().log(

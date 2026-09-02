@@ -155,3 +155,48 @@ class TestUnregisterPurgeFailure:
         from src.repositories import table_registry_repo
 
         assert table_registry_repo().get(table_id) is not None, "registry row must survive a failed purge"
+
+
+class TestRegisterPurgeOrdering:
+    """finding A (follow-up review of PR #2023): the orphan purge in
+    `register_table` must run BEFORE the registry insert -- symmetric with
+    `unregister_table` -- so a genuine purge failure aborts the whole
+    registration instead of silently committing a row over stale, still-
+    reachable history."""
+
+    def test_register_aborts_if_purge_fails_for_a_reason_other_than_missing_backend(self, seeded_app, monkeypatch):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+
+        class _BoomRepo:
+            def delete_for_table(self, table_id):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr("app.api.admin.access_policy_revisions_repo", lambda: _BoomRepo())
+
+        r = c.post(
+            "/api/admin/register-table",
+            json={"name": "rev_register_purge_fails", "source_type": "keboola", "query_mode": "local"},
+            headers=_auth(token),
+        )
+        assert r.status_code != 201, r.text
+        assert r.status_code >= 400, r.text
+        assert r.json()["detail"]["reason"] == "access_policy_revision_purge_failed"
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("rev_register_purge_fails") is None, (
+            "registry row must not exist when the purge fails"
+        )
+
+    def test_register_succeeds_when_the_purge_raises_requires_postgres_backend(self, seeded_app):
+        """The default DuckDB test backend has no revision store at all --
+        `access_policy_revisions_repo()` itself raises `RequiresPostgresBackend`,
+        which must be swallowed rather than block registration."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+
+        r = c.post(
+            "/api/admin/register-table",
+            json={"name": "rev_register_purge_pg_only", "source_type": "keboola", "query_mode": "local"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
