@@ -233,7 +233,22 @@ _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
 #: document — see `_convert_worker_main`) INSIDE the child, before
 #: `_ConvertReply` is ever built, so the giant string never crosses the
 #: pipe at all. Configurable (``extraction.crawler.max_converted_mb``).
-_DEFAULT_MAX_CONVERTED_MB = 200
+#:
+#: The number has to sit under what the converter can actually emit, or the
+#: guard is decorative. ``convert.DEFAULT_MAX_CHARS`` caps a conversion at
+#: 5,000,000 CHARACTERS, so the largest reply that can exist is that many
+#: characters encoded as UTF-8: ~4.8 MiB of ASCII, ~14 MiB of CJK, ~19 MiB
+#: at the 4-bytes-per-character worst case. A 200 MiB threshold was therefore
+#: unreachable by construction and left the parent OOM it was written for
+#: completely unaddressed (Devin Review on #2078). 8 MiB is chosen against
+#: those numbers: an ordinary document — even a 5M-character one in a
+#: single-byte script — passes untouched, while the multi-byte documents that
+#: can actually reach double-digit megabytes are refused, which is exactly
+#: the set that multiplies across concurrent slots into the parent's memory.
+#: ``tests/test_sharepoint_convert_child.py`` pins the two ceilings together
+#: so a future change to either cannot silently make this one decorative
+#: again.
+_DEFAULT_MAX_CONVERTED_MB = 8
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS

@@ -4145,3 +4145,35 @@ class TestActivityBookkeeping:
         # Every worker entered AND exited — nothing left dangling in-flight.
         assert snap["current_path"] is None
         assert len(snap["recent"]) == 5
+
+
+def test_the_converted_size_cap_is_reachable_by_the_converter():
+    """A byte ceiling above what the converter can emit guards nothing.
+
+    `convert.DEFAULT_MAX_CHARS` bounds a conversion at 5,000,000 CHARACTERS,
+    so the largest reply that can exist is that many characters encoded as
+    UTF-8 — at most four bytes each. The shipped `max_converted_mb` was 200,
+    an order of magnitude above that worst case, so no result could ever
+    reach it and the parent OOM the cap was written for stayed unaddressed
+    (Devin Review on #2078).
+
+    This pins the two ceilings to each other: whichever one moves, the cap
+    has to stay reachable, and it has to stay above an ordinary single-byte
+    document so the common case is never refused.
+    """
+    from connectors.sharepoint.convert import DEFAULT_MAX_CHARS
+    from connectors.sharepoint.crawler import _DEFAULT_MAX_CONVERTED_MB
+
+    cap_bytes = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024
+    worst_case_bytes = DEFAULT_MAX_CHARS * 4  # UTF-8 maximum per character
+    single_byte_bytes = DEFAULT_MAX_CHARS  # the same document in ASCII
+
+    assert cap_bytes < worst_case_bytes, (
+        f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} ({cap_bytes} bytes) is above the "
+        f"largest reply the converter can produce ({worst_case_bytes} bytes at "
+        f"DEFAULT_MAX_CHARS={DEFAULT_MAX_CHARS}), so the guard can never fire"
+    )
+    assert cap_bytes > single_byte_bytes, (
+        f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} would refuse an ordinary "
+        f"single-byte document at the character cap ({single_byte_bytes} bytes)"
+    )

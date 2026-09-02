@@ -1479,7 +1479,14 @@ extraction:
     # `convert_failed` for that one file, exactly like any other
     # unconvertible document -- never a crash, never collateral damage to a
     # sibling. 0 disables the cap.
-    max_converted_mb: 200
+    #
+    # 8, not something larger, because the converter already caps a
+    # conversion at 5,000,000 CHARACTERS: the biggest reply that can exist
+    # is ~4.8 MiB of ASCII and ~19 MiB at the four-bytes-per-character
+    # worst case. A threshold above that is unreachable and guards nothing.
+    # At 8 MiB an ordinary document passes untouched and the multi-byte
+    # ones that really do reach double-digit megabytes are refused.
+    max_converted_mb: 8
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.
