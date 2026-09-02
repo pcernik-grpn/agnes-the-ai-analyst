@@ -313,16 +313,24 @@ claim per line, the LAST thing in the reply:
     ```sources
     table: hr_headcount
     metric: headcount/active
+    document: 2026_Workforce_Plan.pdf
     assumption: active employees only | origin: user | why: you asked about "the team"
     assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
     ```
 
 - `table:` — the registry id (as `agnes catalog` gives it) of every table the
   figure was computed from. `metric:` — the canonical metric id, when you
-  adapted one. Each is checked against the tools you actually ran; naming a
-  table you did not query is worse than naming none.
+  adapted one. `document:` — every document or fact-graph subject the answer
+  rests on: the filename as the fact tools give it, or the subject id you
+  passed to `agnes facts claims`. Each is checked against the tools you
+  actually ran; naming a table you did not query, or a file you did not open,
+  is worse than naming none. An answer read entirely out of documents
+  declares `document:` lines and no `table:` — that is a complete answer to
+  "where did this come from", not a gap.
 - `assumption:` — anything the number depends on that you chose rather than
-  read, one per line, always with two more segments separated by ` | `:
+  read, one per line, and never a source: a file you read is a `document:`,
+  and filing it here shows the reader your evidence among your guesses.
+  Always with two more segments separated by ` | `:
   `origin:` is ONE word from `user` (the question said or implied it),
   `definition` (a metric definition, a semantic model or a document in the
   knowledge base says so), `data` (the data forced it: a missing column or
