@@ -454,3 +454,175 @@ class TestHelperSelfReferenceExclusion:
 
         with pytest.raises(PolicyMappingEmpty):
             raise_if_policy_mapping_empty("SELECT * FROM ledger WHERE owner = $user_email")
+
+
+class TestHelperNameKeyedSyncState:
+    """Review follow-up (#1979, PR #2023): ``sync_state.table_id`` may still
+    be keyed by the mapping table's ``name`` rather than its registry ``id``
+    -- the pre-B1 convention (``src.sync_state_key``) every writer used
+    before a matching ``table_registry`` row existed at sync time. Looking
+    the mapping row up by ``id`` alone made a populated, name-keyed mapping
+    table read as "never synced" and refused every query a policy joins it
+    from. The helper must try both keys, name first (the same order
+    ``app/api/v2_sample.py::_not_synced_detail`` uses for the identical
+    reason), and take whichever row actually exists.
+    """
+
+    def _seed_mapping_row(self, conn, *, table_id: str, name: str):
+        from src.repositories.table_registry import TableRegistryRepository
+
+        registry = TableRegistryRepository(conn)
+        registry.register(id=table_id, name=name, source_type="keboola", query_mode="local")
+        registry.set_policy_mapping(table_id, True)
+
+    def _write_sync_state(self, conn, *, key: str, rows: int):
+        from src.repositories.sync_state import SyncStateRepository
+
+        state_repo = SyncStateRepository(conn)
+        state_repo.update_sync(key, rows=rows, file_size_bytes=0, hash="deadbeef")
+        return state_repo.get_table_state(key)
+
+    def test_name_keyed_row_with_rows_does_not_raise(self, e2e_env):
+        """(a) registry ``id`` differs from ``name``; ``sync_state`` is keyed
+        by the NAME with rows > 0 -- a populated legacy row must read as
+        synced, not empty."""
+        from src.access_policy import raise_if_policy_mapping_empty
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            self._seed_mapping_row(conn, table_id="mapping_a_id", name="mapping_a_name")
+            self._write_sync_state(conn, key="mapping_a_name", rows=5)
+        finally:
+            conn.close()
+
+        # No exception -- a populated name-keyed mapping table is not empty.
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_a_name WHERE email = $user_email)"
+        )
+
+    def test_name_keyed_row_with_zero_rows_raises_with_its_last_sync(self, e2e_env):
+        """(b) same shape as (a), but the name-keyed row has zero rows --
+        must still raise, and the reported ``last_sync`` must be the one
+        recorded on that name-keyed row, not ``None``."""
+        from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            self._seed_mapping_row(conn, table_id="mapping_b_id", name="mapping_b_name")
+            state = self._write_sync_state(conn, key="mapping_b_name", rows=0)
+        finally:
+            conn.close()
+
+        assert state is not None and state["last_sync"] is not None
+
+        with pytest.raises(PolicyMappingEmpty) as exc_info:
+            raise_if_policy_mapping_empty(
+                "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_b_name WHERE email = $user_email)"
+            )
+        assert exc_info.value.mapping_table == "mapping_b_name"
+        assert exc_info.value.last_sync == state["last_sync"]
+
+    def test_id_keyed_row_still_works(self, e2e_env):
+        """(c) regression: the current (B1) convention -- ``sync_state`` keyed
+        by the registry ``id`` -- must keep working exactly as before."""
+        from src.access_policy import raise_if_policy_mapping_empty
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            self._seed_mapping_row(conn, table_id="mapping_c_id", name="mapping_c_name")
+            self._write_sync_state(conn, key="mapping_c_id", rows=3)
+        finally:
+            conn.close()
+
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_c_name WHERE email = $user_email)"
+        )
+
+
+class TestQueryEndpointWithNameKeyedMappingSyncState:
+    """(a), end to end: a policy joining a populated but name-keyed mapping
+    table must succeed through ``POST /api/query`` too, not just the bare
+    helper -- the same guarantee ``mapping_workspace`` pins for the id-keyed
+    case above."""
+
+    @pytest.fixture
+    def name_keyed_mapping_workspace(self, seeded_app, mock_extract_factory, monkeypatch):
+        from app.auth.jwt import create_access_token
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+        from src.repositories.users import UserRepository
+        from tests.conftest import grant_table_via_package
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola",
+            [
+                {
+                    "name": "alerts",
+                    "data": [
+                        {"id": "1", "unit": "TeamA", "sev": "high"},
+                        {"id": "2", "unit": "TeamB", "sev": "low"},
+                    ],
+                },
+                {
+                    "name": "access_by_name",
+                    "data": [{"email": "name-keyed@example.com", "unit": "TeamA"}],
+                },
+            ],
+        )
+
+        # Sync BEFORE the mapping table is registered: `resolve_sync_state_key`
+        # (B1) finds no matching `table_registry` row for `access_by_name` yet,
+        # so this write lands keyed by NAME -- the pre-B1 legacy shape this
+        # fix reads. Registering it only afterwards, under a DIFFERENT id,
+        # reproduces "populated mapping table, but its registry id and its
+        # sync_state key disagree".
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+
+            registry.register(
+                id="tbl_alerts_nk", name="alerts", source_type="keboola", query_mode="local", server_only=True
+            )
+            registry.set_access_policy(
+                "tbl_alerts_nk",
+                sql=("SELECT * FROM alerts WHERE unit IN (SELECT unit FROM access_by_name WHERE email = $user_email)"),
+                note="mapping filter",
+                updated_by="admin",
+            )
+
+            registry.register(id="mapping_nk_id", name="access_by_name", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("mapping_nk_id", True)
+
+            users = UserRepository(conn)
+            users.create(id="u_name_keyed", email="name-keyed@example.com", name="Name Keyed")
+
+            grant_table_via_package(conn, "tbl_alerts_nk", "u_name_keyed", group_name="TeamNameKeyed")
+        finally:
+            conn.close()
+
+        return {
+            **seeded_app,
+            "name_keyed_token": create_access_token("u_name_keyed", "name-keyed@example.com"),
+        }
+
+    def test_query_through_name_keyed_mapping_table_succeeds(self, name_keyed_mapping_workspace):
+        c = name_keyed_mapping_workspace["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM alerts"},
+            headers=_auth(name_keyed_mapping_workspace["name_keyed_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 1, body
+        id_idx = body["columns"].index("id")
+        assert {row[id_idx] for row in body["rows"]} == {"1"}

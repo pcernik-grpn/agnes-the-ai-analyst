@@ -1163,7 +1163,21 @@ def raise_if_policy_mapping_empty(
         if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
     ]
     for mapping_row in mapping_rows:
-        state = sync_state_repo().get_table_state(mapping_row["id"])
+        # `sync_state.table_id` is keyed by the registry `id` once a writer
+        # has resolved it there (B1, `src.sync_state_key`), but an older row
+        # may still be keyed by the table's `name` -- the pre-B1 convention
+        # every writer used before the registry existed (see
+        # `app/api/v2_sample.py::_not_synced_detail`, which tries the same
+        # name-then-id order for the identical reason). Looking up by `id`
+        # alone made a populated-but-name-keyed mapping table read as
+        # "never synced", refusing every query a policy joins it from.
+        state = None
+        for key in dict.fromkeys((mapping_row.get("name"), mapping_row.get("id"))):
+            if not key:
+                continue
+            state = sync_state_repo().get_table_state(key)
+            if state:
+                break
         rows = state.get("rows") if state else None
         if not rows:
             raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
