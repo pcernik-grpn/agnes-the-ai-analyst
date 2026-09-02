@@ -747,21 +747,28 @@ def test_auto_title_swallows_haiku_failure(tmp_path: Path, monkeypatch):
 # --- TCRD-290: trigger on the first USER message, fall back, re-arm -----------
 
 
-async def _wait_for_live_handle(manager: ChatManager, chat_id: str) -> None:
-    for _ in range(60):
+async def _wait_for_ws_seated(manager: ChatManager, chat_id: str, ws: _FakeWS) -> None:
+    """Poll until ``attach`` has spawned the runner AND seated ``ws`` as a sink.
+
+    Waiting for the handle alone is a race: ``attach`` sets the handle before
+    it seats the sink, so a message sent in between has its ``session_renamed``
+    broadcast to zero sinks — the title is persisted but the test never sees
+    the frame (observed once on a loaded CI runner). Polling is deterministic
+    under any load; the ceiling is generous for the same reason."""
+    for _ in range(750):
         live = manager._live.get(chat_id)
-        if live is not None and live.handle is not None:
+        if live is not None and live.handle is not None and any(e.sink is ws for e in live.sinks):
             return
         await asyncio.sleep(0.02)
-    raise AssertionError("runner never came up")
+    raise AssertionError("runner never came up or the WS sink was never seated")
 
 
 async def _wait_for_frame(ws: _FakeWS, ftype: str) -> None:
-    for _ in range(60):
+    for _ in range(300):
         if any(m.get("type") == ftype for m in ws.sent):
             return
         await asyncio.sleep(0.05)
-    raise AssertionError(f"no {ftype!r} frame within 3s; frames seen: {[m.get('type') for m in ws.sent]}")
+    raise AssertionError(f"no {ftype!r} frame within 15s; frames seen: {[m.get('type') for m in ws.sent]}")
 
 
 def test_first_user_message_triggers_auto_title_before_any_reply(tmp_path: Path, monkeypatch):
@@ -786,7 +793,7 @@ def test_first_user_message_triggers_auto_title_before_any_reply(tmp_path: Path,
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
-        await _wait_for_live_handle(manager, s.id)
+        await _wait_for_ws_seated(manager, s.id, ws)
         await manager.send_user_message(s.id, question)
         await _wait_for_frame(ws, "session_renamed")
         await manager.kill(s.id, reason="test_done")
@@ -825,7 +832,7 @@ def test_user_message_trigger_does_not_double_fire_on_the_reply(tmp_path: Path, 
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
-        await _wait_for_live_handle(manager, s.id)
+        await _wait_for_ws_seated(manager, s.id, ws)
         await manager.send_user_message(s.id, "q?")
         await _wait_for_frame(ws, "session_renamed")
         handle.emit({"type": "assistant_message", "content": "a", "tokens_in": 1, "tokens_out": 1})
@@ -860,7 +867,7 @@ def test_auto_title_falls_back_to_the_message_when_model_yields_nothing(tmp_path
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
-        await _wait_for_live_handle(manager, s.id)
+        await _wait_for_ws_seated(manager, s.id, ws)
         await manager.send_user_message(s.id, question)
         await _wait_for_frame(ws, "session_renamed")
         await manager.kill(s.id, reason="test_done")
@@ -892,7 +899,7 @@ def test_scheduling_failure_neither_fails_the_send_nor_burns_the_flag(tmp_path: 
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
-        await _wait_for_live_handle(manager, s.id)
+        await _wait_for_ws_seated(manager, s.id, ws)
 
         def boom(live):
             live.auto_title_started = True  # the worst case: flag set, then failure
@@ -934,7 +941,7 @@ def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, m
         s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
-        await _wait_for_live_handle(manager, s.id)
+        await _wait_for_ws_seated(manager, s.id, ws)
         # Reply before any user row exists: the task finds nothing and re-arms.
         handle.emit({"type": "assistant_message", "content": "a0", "tokens_in": 1, "tokens_out": 1})
         await _wait_for_frame(ws, "assistant_message")
