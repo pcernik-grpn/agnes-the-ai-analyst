@@ -4,7 +4,7 @@ Commands:
   create  --name ... [--description ...] [--json]
   edit    <id> [--name ...] [--description ...] [--slug ...] [--json]
   list    [--json]
-  show    <id>       [--json]
+  show    <id>       [--limit N] [--offset N] [--q TERM] [--json]
   upload    <id> <path...>   (multipart POST per file)
   reingest  <id> <file_id>   (re-run ingestion for one file)
   rm        <id>       [--yes]
@@ -206,34 +206,75 @@ def search_collections(
 @collections_app.command("show")
 def show_collection(
     collection_id: str = typer.Argument(..., help="Collection ID (e.g. col_abc123)"),
+    limit: int = typer.Option(25, "--limit", help="Max files to show in this page (server clamps to 1-200)"),
+    offset: int = typer.Option(0, "--offset", help="Skip this many files (for pagination)"),
+    q: Optional[str] = typer.Option(None, "--q", help="Filter files by a filename/path substring (case-insensitive)"),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ):
-    """Show detail + file list for a collection."""
+    """Show detail + a page of files for a collection.
+
+    The file list is paginated (default 25) — a large collection can hold
+    far more files than fit on one page. When the footer says the list was
+    cut short, pass the suggested `--offset` for the next page. `--q`
+    filters by a filename/path substring; it does not search file
+    CONTENTS — use `agnes collections search` for that.
+    """
     try:
-        body = api_get_json(f"/api/collections/{collection_id}")
+        detail = api_get_json(f"/api/collections/{collection_id}")
     except V2ClientError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1)
 
+    # A blank `--q` means "no filter", never "match nothing" — omit it
+    # entirely rather than sending `q=""` to the server.
+    q_clean = (q or "").strip()
+    params: dict = {"limit": limit, "offset": offset}
+    if q_clean:
+        params["q"] = q_clean
+    try:
+        files_page = api_get_json(f"/api/collections/{collection_id}/files", **params)
+    except V2ClientError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+
+    files = files_page.get("files", [])
+    total = files_page.get("total", len(files))
+    page_limit = files_page.get("limit", limit)
+    page_offset = files_page.get("offset", offset)
+
     if as_json:
-        typer.echo(json_lib.dumps(body, indent=2, default=str))
+        out = dict(detail)
+        out.pop("files_total", None)
+        out.pop("files_truncated", None)
+        out["files"] = files
+        out["total"] = total
+        out["limit"] = page_limit
+        out["offset"] = page_offset
+        typer.echo(json_lib.dumps(out, indent=2, default=str))
         return
 
-    typer.echo(f"ID:          {body['id']}")
-    typer.echo(f"Slug:        {body.get('slug', '')}")
-    typer.echo(f"Name:        {body['name']}")
-    if body.get("description"):
-        typer.echo(f"Description: {body['description']}")
-    typer.echo(f"Created by:  {body.get('created_by', '')}")
-    files = body.get("files", [])
-    typer.echo(f"\nFiles ({len(files)}):")
+    typer.echo(f"ID:          {detail['id']}")
+    typer.echo(f"Slug:        {detail.get('slug', '')}")
+    typer.echo(f"Name:        {detail['name']}")
+    if detail.get("description"):
+        typer.echo(f"Description: {detail['description']}")
+    typer.echo(f"Created by:  {detail.get('created_by', '')}")
+
+    typer.echo(f"\nFiles ({total}):")
     if not files:
-        typer.echo("  (none)")
+        if q_clean:
+            typer.echo(f"  (none matched --q {q_clean!r} — try a different term, or drop --q to see all files)")
+        else:
+            typer.echo("  (none)")
         return
     typer.echo(f"  {'FILE_ID':20s}  {'STATUS':10s}  {'SIZE':8s}  FILENAME")
     for f in files:
         size = f.get("size_bytes") or 0
         typer.echo(f"  {f['file_id']:20s}  {f['processing_status']:10s}  {size:8d}  {f['filename']}")
+
+    shown_through = page_offset + len(files)
+    if shown_through < total:
+        typer.echo(f"\nShowing {len(files)} of {total} files. Use --offset {shown_through} for the next page.")
 
 
 # ---------------------------------------------------------------------------

@@ -485,20 +485,60 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def collection_get(collection_id: str) -> dict:
-        """Show one Collection's detail plus its files and per-file status.
+    async def collection_get(collection_id: str, limit: int = 25, offset: int = 0, q: str = "") -> dict:
+        """Show one Collection's detail plus a PAGE of its files with per-file status.
+
+        The file list is paginated, not exhaustive — a crawled collection can
+        hold thousands of files, far more than fits in a model's context.
+        This returns at most ``limit`` files starting at ``offset``; read
+        ``files_total`` (the true count, after any ``q`` filter) and
+        ``files_truncated`` (``files_total`` greater than the files returned)
+        before treating ``files`` as the whole collection. When
+        ``files_truncated`` is true, call again with
+        ``offset=<this call's offset + len(files)>`` (or a larger ``limit``,
+        capped at 200 server-side) to reach the rest — ``files_limit`` and
+        ``files_offset`` on the response say exactly what page you just saw.
+
+        ``q`` filters files by a case-insensitive SUBSTRING match over the
+        filename OR path — this is NOT the whole-word content search
+        ``collections_search`` performs inside file text. Use ``q`` to find a
+        file by name, use ``collections_search`` to find a passage inside one.
 
         Args:
             collection_id: Collection id from ``collections_list`` (``col_...``).
+            limit: Max files to return in this page (default 25; server clamps to 1-200).
+            offset: Files to skip before this page (default 0).
+            q: Optional filename/path substring filter. Empty string (default) means no filter.
         """
+        params: dict = {"limit": limit, "offset": offset}
+        if q:
+            params["q"] = q
         async with httpx.AsyncClient() as c:
-            r = await c.get(
+            detail_r = await c.get(
                 f"{base_url}/api/collections/{collection_id}",
                 headers=headers_fn(),
                 timeout=30,
             )
-            _raise_for_status_with_detail(r)
-            return r.json()
+            _raise_for_status_with_detail(detail_r)
+            detail = detail_r.json()
+
+            files_r = await c.get(
+                f"{base_url}/api/collections/{collection_id}/files",
+                headers=headers_fn(),
+                params=params,
+                timeout=30,
+            )
+            _raise_for_status_with_detail(files_r)
+            page = files_r.json()
+
+        files = page.get("files", [])
+        total = page.get("total", len(files))
+        detail["files"] = files
+        detail["files_total"] = total
+        detail["files_truncated"] = total > (offset + len(files))
+        detail["files_limit"] = page.get("limit", limit)
+        detail["files_offset"] = page.get("offset", offset)
+        return detail
 
     @tool(read_only=True)
     async def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict:
