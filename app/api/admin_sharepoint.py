@@ -1992,6 +1992,141 @@ async def trigger_subtree_sweep(
     return {"job_id": job["id"], "status": job["status"]}
 
 
+class FactsExtractionRunOptions(BaseModel):
+    """Optional per-run overrides for one manual facts-extraction trigger.
+    The body itself is optional — a bare ``POST`` runs over the whole
+    corpus with the configured budget, mirroring :class:`ExtractionRunOptions`'s
+    "absent means configured" contract for the crawl trigger."""
+
+    doc_ids: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Narrow the pass to these documents only (corpus_file_sources.source_doc_id) "
+            "— the 'test one document against a prompt change' path, never persisted "
+            "beyond this one run."
+        ),
+    )
+    timeout_s: Optional[int] = Field(
+        None,
+        ge=0,
+        le=86400,
+        description=(
+            "Hard ceiling for this one run, seconds (0 = unbounded). Its OWN budget — "
+            "see connectors.sharepoint.facts_extraction.run_standalone_facts_extraction's "
+            "docstring for why this is never the crawl's extraction.timeout_s."
+        ),
+    )
+
+
+def _facts_extraction_idempotency_key(connection_id: str) -> str:
+    """A STABLE per-connection idempotency key for the
+    ``sharepoint-facts-extraction`` job — mirrors :func:`_sweep_idempotency_key`'s
+    shape so a manual "run facts extraction now" and any other in-flight
+    pass for the same connection can never both be queued at once, and so
+    this job kind can never dedup against ``corpus-extraction`` or any
+    other sibling kind for the same connection (different prefix)."""
+    return f"sharepoint-facts-extraction:{connection_id}"
+
+
+def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
+    """Whether a standalone facts-extraction run can be triggered right now
+    — checked BEFORE enqueue, same reasoning as :func:`_extraction_readiness`
+    above: an admin who has not yet turned on the two facts-specific
+    switches gets ``409 facts_extraction_disabled`` immediately, naming the
+    exact fix, instead of a job that fails 30+ minutes later in a worker.
+
+    Unlike :func:`_extraction_readiness`, this does NOT re-check
+    ``sharepoint.enabled`` (the router-level gate already refuses the whole
+    surface before this ever runs) or the ``extraction`` optional-dependency
+    probe (facts extraction never touches ``markitdown``/``pypdfium2`` — it
+    reads already-converted markdown out of ``corpus_files``, not raw
+    documents).
+    """
+    from connectors.sharepoint.facts_extraction import facts_extraction_enabled, facts_surface_enabled
+
+    if not facts_extraction_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "message": (
+                "extraction.facts.enabled is off — turn it on in /admin/server-config "
+                "before running a facts-extraction pass (it is the cost gate: this stage "
+                "spends model tokens per document)."
+            ),
+        }
+    if not facts_surface_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "message": (
+                "facts.enabled is off — turn it on before running a facts-extraction pass "
+                "(writing claims into a surface nothing can read is never useful)."
+            ),
+        }
+    return True, None
+
+
+@router.post("/connections/{connection_id}/facts-extract", status_code=202)
+async def trigger_facts_extraction(
+    connection_id: str,
+    options: Optional[FactsExtractionRunOptions] = None,
+    _user: dict = Depends(require_admin),
+):
+    """Admin/ops-triggered one-off run of the ``sharepoint-facts-extraction``
+    job for this connection — build the fact graph over whatever this
+    connection's collections ALREADY hold, without running a crawl first
+    (the operator question "how do we get the fact graph populated with
+    what we already have?", which previously had no answer but "re-run the
+    whole crawl"). Enqueues ``connectors.sharepoint.facts_extraction
+    .run_standalone_facts_extraction`` (via
+    ``app/worker/kinds.py::_run_sharepoint_facts_extraction``) with
+    ``{"connection_id": connection_id}`` plus, only when set, ``doc_ids``
+    and ``timeout_s`` from an optional :class:`FactsExtractionRunOptions`
+    body — the SAME "absent means configured" mechanics as
+    :func:`trigger_extraction`'s ``ExtractionRunOptions`` above.
+
+    404 on an unknown/non-sharepoint connection BEFORE the facts readiness
+    gate below (same ordering as :func:`trigger_extraction`). Then refuses
+    cleanly — never a job that fails later in a worker — with ``409
+    facts_extraction_disabled`` when either of the stage's two switches
+    (``extraction.facts.enabled``, ``facts.enabled``) is off; see
+    :func:`_facts_extraction_readiness`.
+
+    Deduped on the STABLE per-connection idempotency key
+    (:func:`_facts_extraction_idempotency_key`), distinct from every other
+    job kind's own key for the same connection — a facts-extraction trigger
+    and a crawl trigger (or an ACL sync, or a subtree sweep) can always run
+    side by side. ``enqueue()``'s own ``"deduped"`` return value decides
+    202 vs. ``409 facts_extraction_already_running``.
+    """
+    _sharepoint_connection_or_404(connection_id)
+
+    usable, error = _facts_extraction_readiness()
+    if not usable:
+        raise HTTPException(status_code=409, detail=error)
+
+    from src.repositories import jobs_repo
+
+    payload: Dict[str, Any] = {"connection_id": connection_id}
+    if options is not None:
+        if options.doc_ids is not None:
+            payload["doc_ids"] = options.doc_ids
+        if options.timeout_s is not None:
+            payload["timeout_s"] = options.timeout_s
+
+    job = jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        payload,
+        idempotency_key=_facts_extraction_idempotency_key(connection_id),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "facts_extraction_already_running", "job_id": job["id"]},
+        )
+
+    logger.info("sharepoint connection %s: facts-extraction job %s enqueued (manual trigger)", connection_id, job["id"])
+    return {"job_id": job["id"], "status": job["status"]}
+
+
 @router.post("/extraction/run-due")
 async def run_due_extraction(
     _user: dict = Depends(require_admin),

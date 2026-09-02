@@ -158,6 +158,111 @@ def test_a_broken_diagram_keeps_its_source_on_screen():
 # ── the two defects measuring found ─────────────────────────────────────────
 
 
+def test_the_sources_row_says_each_thing_once():
+    """Three separate repetitions made the row read as noise. Each chip spelled
+    its CATEGORY as a word (five tables meant reading "table" five times); each
+    unverified chip shouted UNVERIFIED, so the common case — the model names
+    more than it queries — became the row's dominant colour and a genuinely
+    checked source had no way to look calm; and an `assumption`, which is a
+    caveat about method with nothing to open, sat in the same pill vocabulary
+    as two links.
+
+    Category is now a glyph, the verdict is summarised once for the row, and
+    assumptions have their own line. Nothing was dropped: the category word and
+    the verdict both ride the chip's accessible name."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+
+    assert "_CLAIM_ICON" in fn and "msg-source-icon" in fn, "category rides a glyph"
+    assert "msg-source-kind" not in fn, "the category word is off the chip's face"
+    assert 'chip.setAttribute("aria-label"' in fn, (
+        "what left the face must not leave the chip — the category and verdict ride the name"
+    )
+    assert "`${kindWord} ${c.ref}, unverified`" in fn
+
+    # The verdict, once for the row rather than per chip.
+    assert "const unverified = provenance.filter((c) => c.verified === false).length;" in fn
+    assert "`${unverified} unverified`" in fn
+    # Counted over ALL references, not just the visible ones — a count that
+    # changed when you expanded the row would be worse than none.
+    assert "provenance.filter" in fn and "chips.slice" in fn
+
+    # Verified is the calm state: it adds nothing to the base chip.
+    css = _read(CHAT_CSS)
+    ok = re.search(r"\.msg-source-chip\.is-ok \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert ok is None, "a verified chip wears the base chip — no fill of its own"
+
+    # Assumptions get their own ROW either way — TCRD-289's version (chips with
+    # an origin badge and a rationale) landed while this was in review and says
+    # strictly more than the prose line this branch first drew, so its row is
+    # the one kept. What matters here is unchanged: they are not filed in among
+    # the things you can open.
+    assert ".msg-sources.is-assumptions {" in css, "assumptions keep a row of their own"
+
+
+def test_the_source_chip_states_use_ink_not_line_tokens():
+    """`--ds-accent-*-line` is tuned for a border sitting on its OWN tinted
+    fill. The chip has no tint — it is plain --ds-surface-dim — so on it the
+    success line measured 2.94:1 and the warn line 1.41:1: a state marker you
+    cannot see, below even the 3:1 that WCAG 1.4.11 asks of a meaningful
+    graphic, let alone the 4.5:1 the 10px text owes.
+
+    The `-ink` pair measures 6.36:1 / 6.88:1 here and 9.68:1 / 11.2:1 in dark.
+    The rule, not the numbers, is what this guards: nothing on this row may
+    carry state in a `-line` token. (A percentage mix toward transparent was
+    the other candidate and is worse than either — the ink token flips
+    lightness between themes, so one percentage lands in two different places.)
+    """
+    css = _code_only(_read(CHAT_CSS))
+    row = css[css.index(".msg-source-chip {") : css.index(".msg-source-chip.is-none {")]
+    assert "-line)" not in row, "a --ds-accent-*-line token on the sources row — invisible on an untinted chip"
+    assert "color-mix" not in row, "a transparent mix resolves differently per theme"
+    assert "var(--ds-accent-success-ink)" in row and "var(--ds-accent-warn-ink)" in row
+
+    # The glyph inherits rather than naming a third colour, so it cannot fall
+    # out of sync with the ink beside it.
+    icon = re.search(r"\.msg-source-icon \{(.*?)\}", css, re.DOTALL)
+    assert icon and "color: inherit;" in icon.group(1)
+
+
+def test_an_answer_resting_only_on_assumptions_declares_no_sources():
+    """An assumption is not provenance, so the empty state is keyed on the
+    references — an answer resting only on assumptions has, truthfully,
+    declared no source. It still shows its assumptions: the row falls through
+    rather than returning early.
+
+    TCRD-289 landed the same conclusion independently while this branch was in
+    review, and its `provenance` split is the one kept here."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert "if (!provenance.length) {" in fn, "the empty state is keyed on references, not on claims"
+    assert "none declared" in fn
+    # No early return in that branch — the assumptions row below still runs.
+    empty = fn[fn.index("if (!provenance.length) {") :]
+    empty = empty[: empty.index("\n  }")]
+    assert "return" not in empty, "an answer with only assumptions still has assumptions to show"
+
+    rows = _render({"declared": True, "claims": [dict(_ASSUMPTION, ref="paid orders only")]})
+    assert len(rows) == 2, "the sources row and the assumptions row"
+    assert _label(rows[0]) == "Sources"
+    assert [c["text"] for c in _chips(rows[0])] == ["none declared"]
+    assert _label(rows[1]) == "Assumptions"
+    assert len(_chips(rows[1])) == 1
+
+
+def test_a_long_source_row_caps_before_it_wraps():
+    """Past the cap the rest fold behind "+N more" rather than wrapping the row
+    to a second and third line. Under it there is no control at all — the
+    common answer is untouched."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert "const _SOURCES_VISIBLE = 4;" in js
+    assert "if (chips.length <= _SOURCES_VISIBLE) {" in fn, "no control below the cap"
+    assert "_expandInPlace({" in fn, (
+        "the same grow-in-place control the tool results use — not a second copy of the list"
+    )
+
+
 def test_the_sources_label_is_not_set_in_the_muted_tone():
     """Measured at 3.93:1 against the bubble with --ds-text-muted — under WCAG
     AA at 10px. This row exists to be read."""
@@ -169,12 +274,24 @@ def test_the_sources_label_is_not_set_in_the_muted_tone():
 
 
 def test_the_unverified_flag_is_not_shrunk_below_the_chip():
-    """`font-size: 0.85em` of --text-xs measured 8.5px — the one word on the row
-    that has to be legible, set smaller than everything around it."""
+    """`font-size: 0.85em` of --text-xs measured 8.5px — the one phrase on the
+    row that has to be legible, set smaller than everything around it.
+
+    The flag used to sit INSIDE a chip, where inheriting was parity and any
+    font-size at all was the shrink. It is now the row's own summary — said
+    once instead of repeated per chip — so it has to set a size, and parity is
+    asserted directly: the same token the chips use."""
     css = _read(CHAT_CSS)
-    block = re.search(r"\.msg-source-flag \{(.*?)\}", _code_only(css), re.DOTALL)
-    assert block, ".msg-source-flag moved — re-point this guard"
-    assert "font-size" not in block.group(1)
+    flag = re.search(r"\.msg-source-flag \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert flag, ".msg-source-flag moved — re-point this guard"
+    chip = re.search(r"\.msg-source-chip \{(.*?)\}", _code_only(css), re.DOTALL)
+    assert chip, ".msg-source-chip moved — re-point this guard"
+    size = re.search(r"font-size: (var\(--[a-z-]+\));", flag.group(1))
+    assert size, "the flag must state its own size now that it is not inside a chip"
+    assert f"font-size: {size.group(1)};" in chip.group(1), "the flag is set smaller than the chips it summarises"
+    assert not re.search(r"font-size: [\d.]+em", flag.group(1)), (
+        "no relative font-size — an em multiple of the chip's --text-xs is how it got to 8.5px"
+    )
 
 
 # ── prompt contract ─────────────────────────────────────────────────────────
@@ -399,6 +516,9 @@ class El {
     this.textContent = ""; this.title = ""; this.href = ""; this.nodeType = 1;
   }
   appendChild(c) { this.children.push(c); return c; }
+  insertBefore(c, ref) { const i = this.children.indexOf(ref); this.children.splice(i < 0 ? this.children.length : i, 0, c); return c; }
+  replaceChildren(...c) { this.children = []; c.forEach((x) => this.appendChild(x)); }
+  setAttribute(k, v) { this.attrs = this.attrs || {}; this.attrs[k] = String(v); }
   querySelector() { return null; }
   querySelectorAll() { return []; }
   closest() { return null; }
@@ -409,6 +529,7 @@ class El {
   toJSON() {
     if (this.nodeType === 3) return { text: this.textContent };
     return { tag: this.tagName, cls: this.className, title: this.title, href: this.href,
+             attrs: this.attrs || {},
              text: this.text, children: this.children.map((c) => c.toJSON()) };
   }
 }
@@ -416,6 +537,17 @@ const document = {
   createElement: (t) => new El(t),
   createTextNode: (s) => { const n = new El("#text"); n.nodeType = 3; n.textContent = String(s); return n; },
 };
+// The chip's category glyph and the row's "+N more" control come from the
+// shared helpers, which live outside the slice this harness evals. Stubbed to
+// the shape the renderer uses: an icon element, and the [meta, button] pair.
+function iconEl(name) { const i = new El("svg"); i.className = "icon-" + name; return i; }
+function _expandInPlace({ paint, expandLabel }) {
+  paint(false);
+  const b = new El("button");
+  b.className = "msg-source-more";
+  b.textContent = expandLabel;
+  return [null, b];
+}
 """
 
 
@@ -441,7 +573,19 @@ process.stdout.write(JSON.stringify(bubble.children.map((c) => c.toJSON())));
 
 
 def _chips(row: dict) -> list[dict]:
-    return [c for c in row["children"] if "msg-source-chip" in c["cls"]]
+    """Every chip in a row, whether or not it sits in the list wrapper.
+
+    The provenance row nests its chips in `.msg-sources-list` so the
+    cap/"+N more" control can repaint just the chips without disturbing the
+    label or the trailing summary. The assumptions row has no cap and appends
+    its chips directly. Flattening one level covers both."""
+    out = []
+    for c in row["children"]:
+        if "msg-sources-list" in c["cls"]:
+            out.extend(k for k in c["children"] if "msg-source-chip" in k["cls"])
+        elif "msg-source-chip" in c["cls"]:
+            out.append(c)
+    return out
 
 
 def _label(row: dict) -> str:
@@ -463,7 +607,11 @@ def test_assumptions_are_drawn_on_their_own_row_under_sources():
     rows = _render({"declared": True, "claims": [{"kind": "table", "ref": "orders", "verified": True}, _ASSUMPTION]})
     assert [_label(r) for r in rows] == ["Sources", "Assumptions"]
     assert "is-assumptions" in rows[1]["cls"]
-    assert [c["text"] for c in _chips(rows[0])] == ["table orders"], "the sources row holds provenance only"
+    # The category is a glyph on this row now, with the word on `aria-label`
+    # (see the icon commit), so the chip's TEXT is the ref alone.
+    (prov,) = _chips(rows[0])
+    assert prov["text"].strip() == "orders", "the sources row holds provenance only"
+    assert prov["attrs"]["aria-label"] == "table orders, verified", "the category is still named"
     assert len(_chips(rows[1])) == 1
 
 

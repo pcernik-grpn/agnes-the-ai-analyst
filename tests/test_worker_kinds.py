@@ -91,6 +91,7 @@ class TestRegisterAllKinds:
         "corpus-extraction",
         "sharepoint-acl-sync",
         "sharepoint-subtree-sweep",
+        "sharepoint-facts-extraction",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -125,6 +126,10 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
         assert JOB_KINDS["sharepoint-acl-sync"].lane == LIGHT_LANE
         assert JOB_KINDS["sharepoint-subtree-sweep"].lane == LIGHT_LANE
+        # Same lane as corpus-extraction: an LLM-calling document-processing
+        # stage, the same cost/resource class, sharing its concurrency
+        # ceiling rather than getting its own.
+        assert JOB_KINDS["sharepoint-facts-extraction"].lane == EXTRACTION_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a
@@ -830,6 +835,103 @@ class TestCorpusExtractionHandler:
         assert not hasattr(_kinds, "_extraction_producer_argv")
         assert not hasattr(_kinds, "_extraction_producer_mode")
         assert not hasattr(_kinds, "_agnes_producer_callback_env")
+
+
+class TestSharePointFactsExtractionHandler:
+    """``sharepoint-facts-extraction`` — run one fact-extraction pass over a
+    connection's ALREADY-INDEXED corpus, without a crawl (the answer to
+    "how do we get the fact graph populated with what we already have?").
+
+    A thin delegate to
+    ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+    — mirrors ``TestCorpusExtractionHandler`` exactly: this handler owns
+    only the ``sharepoint.enabled`` gate, same posture as
+    ``corpus-extraction``. The stage's own two cost/surface gates
+    (``extraction.facts.enabled`` / ``facts.enabled``) are
+    ``run_standalone_facts_extraction``'s own job and are covered by
+    ``tests/test_facts_extraction.py``, not duplicated here.
+    """
+
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}}
+
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+    def _register(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        return JOB_KINDS["sharepoint-facts-extraction"].handler
+
+    def _stub_run(self, monkeypatch, *, report=None, boom=None):
+        calls: list = []
+
+        def _fake(connection_id, *, doc_ids=None, timeout_s=None):
+            calls.append({"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s})
+            if boom is not None:
+                raise boom
+            return report if report is not None else {"docs_extracted": 0}
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_standalone_facts_extraction", _fake)
+        return calls
+
+    def test_disabled_by_default_refuses_to_run(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="sharepoint.enabled"):
+            handler({"connection_id": "conn1"})
+        # The gate fires BEFORE the pass — never a model call, never a
+        # partial run, when the connector itself is off.
+        assert calls == []
+
+    def test_enabled_delegates_connection_id_doc_ids_and_timeout_s(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch, report={"docs_extracted": 5})
+        handler = self._register()
+
+        result = handler({"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120})
+
+        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120}]
+        assert result == {"docs_extracted": 5}
+
+    def test_doc_ids_and_timeout_s_are_optional(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None}]
+
+    def test_the_gate_from_run_standalone_facts_extraction_propagates(self, monkeypatch):
+        """`FactsExtractionDisabled` (either cost/surface switch off) is
+        this function's job, not re-checked here — proven by letting the
+        stub raise it and asserting it reaches the caller unchanged."""
+        from connectors.sharepoint.facts_extraction import FactsExtractionDisabled
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_run(monkeypatch, boom=FactsExtractionDisabled("facts.enabled is off"))
+        handler = self._register()
+
+        with pytest.raises(FactsExtractionDisabled, match="facts.enabled"):
+            handler({"connection_id": "conn1"})
+
+    def test_lease_and_retry_posture_mirror_corpus_extraction(self):
+        from app.worker.kinds import _DEFAULT_EXTRACTION_LEASE_S, register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        kind = JOB_KINDS["sharepoint-facts-extraction"]
+        assert kind.lease_seconds == _DEFAULT_EXTRACTION_LEASE_S
+        # No automatic retry — same rationale as corpus-extraction: a
+        # failed pass needs an operator, and a resumed run already picks up
+        # from the persisted per-document state.
+        assert kind.retry_in_seconds is None
 
 
 class TestDispatchJobThreadsSharePointJobId:
