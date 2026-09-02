@@ -2187,10 +2187,15 @@ async function loadAndRenderHistory(chatId) {
 function scrollToLatestMessage() {
   const el = $("chat-messages");
   if (!el) return;
+  // A fresh transcript is a fresh reading position, so it also re-arms
+  // following: whatever the previous thread's last turn left `_stickToBottom`
+  // as, this one opens at its newest message and keeps up from there.
+  resumeFollowingStream();
   el.scrollTop = el.scrollHeight;
+  noteSelfScroll(el);
   // Once more after layout settles — images, mermaid diagrams and code
   // highlighting all change the height after the first paint.
-  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; noteSelfScroll(el); });
 }
 
 /** A deep-link restore that could not be completed (#1973).
@@ -3319,30 +3324,213 @@ function enhanceCodeBlocks(root) {
 }
 
 // ---------- Smart auto-scroll --------------------------------------------
-// We only scroll the chat-messages container down on a new token / new
-// turn if the user was already near the bottom — otherwise scrolling
-// would yank them away from a paragraph they're actively reading
-// further up. `SCROLL_STICK_PX` is the slack zone counted as "near
-// bottom" (8 lines or so).
+// A turn writes continuously — a token every few milliseconds, then a tool
+// card, then a table — and every one of those appends asks to be brought into
+// view. That is right until the reader scrolls UP, at which point following is
+// the one thing they cannot out-argue: the next token puts them back at the
+// floor, and a turn is unreadable while it is being written.
+//
+// So the stream carries an explicit verdict, `_stickToBottom`, and the
+// appenders scroll only while it holds. It is deliberately NOT re-derived from
+// the scroll position on every append: the position moves under the reader as
+// content grows below them, so a distance-only rule cannot tell "they are
+// 300px up because they scrolled there" from "they are 300px up because the
+// agent just wrote 300px". Only the reader's own scrolling changes it.
+//
+//   scrolled UP, by any amount   → stop following. Any amount on purpose: one
+//                                  wheel notch is ~100px, and the old 320px
+//                                  slack zone swallowed every one of them,
+//                                  which is what made scrolling up during a
+//                                  turn feel broken.
+//   back down to the floor       → follow again.
+//
+// The load-bearing detector is the DRIFT CHECK in `maybeScrollToBottom`, not
+// the scroll listener. Scroll events are dispatched once per frame carrying
+// the position as it is THEN — so a token that arrives in the same frame as
+// the reader's wheel, and scrolls back to the floor, leaves a single event
+// reporting the floor: the reader's scroll is undone and no event ever says it
+// happened. (Measured against the kai-agent stub: a 150px scroll during a
+// streaming answer was silently reverted, every time.) Appending below the
+// viewport never moves `scrollTop`, so reading it back before we overwrite it
+// is the one observation that cannot be raced — any drift from the value we
+// last wrote is the reader.
+//
+// The `wheel` / `touchmove` handlers add nothing to that; they only make the
+// button appear on the first notch instead of on the next append, because a
+// gesture handler runs before the scroll it causes. Being an optimisation and
+// not the contract is exactly why they must not fire on a gesture that moves
+// nothing — see `gestureCanScrollTranscriptUp`.
+//
+// `SCROLL_STICK_PX` is what counts as "at the floor" on the way back down — a
+// rounding zone for fractional scroll heights and for the last line of a turn
+// that is still growing, not a place to read from.
 
 const SCROLL_STICK_PX = 120;
+/** `scrollTop` is fractional on a scaled display, so "unchanged" is a range. */
+const SCROLL_DRIFT_PX = 1;
+
+/** Does the stream follow new content? Starts true — a conversation with
+ *  nothing in it has no reading position to protect. */
+let _stickToBottom = true;
+/** The last scroll offset we saw, so the next event yields a direction. */
+let _lastScrollTop = 0;
+/** The offset this file last WROTE, and the baseline the drift check measures
+ *  against. -1 means we own no position (nothing written yet), which disables
+ *  the check rather than reading every offset as drift. */
+let _selfScrollTop = -1;
+/** Where a touch started, to tell a drag down the screen (which scrolls the
+ *  transcript up) from a tap or a drag the other way. */
+let _touchStartY = null;
 
 function isNearBottom(el) {
   if (!el) return true;
-  return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_PX;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= SCROLL_STICK_PX;
 }
 
+/** Take ownership of the container's current offset. Call after EVERY direct
+ *  `scrollTop` write on it, and whenever following resumes — the drift check
+ *  compares against this, and a stale baseline would read as the reader
+ *  moving the moment the next token landed. */
+function noteSelfScroll(el) {
+  if (!el) return;
+  _selfScrollTop = el.scrollTop;
+  _lastScrollTop = _selfScrollTop;
+}
+
+/** Drop to the floor and keep ownership of where that put us. */
+function scrollToFloor(el) {
+  el.scrollTop = el.scrollHeight;
+  noteSelfScroll(el);
+}
+
+/** Stop following. Synchronous by design: a gesture handler runs before the
+ *  scroll it causes, so an append in the same frame already sees this. */
+function stopFollowingStream() {
+  if (!_stickToBottom) return;
+  _stickToBottom = false;
+  syncJumpToLatest();
+}
+
+/** Follow again. Sending a message is an explicit "show me what comes back",
+ *  whatever the previous turn left the scroll position as; so is opening a
+ *  transcript, and so is arriving back at the floor. */
+function resumeFollowingStream(el) {
+  _stickToBottom = true;
+  noteSelfScroll(el || $("chat-messages"));
+  syncJumpToLatest();
+}
+
+/** Direction and re-arming. Covers the gestures that emit no wheel or touch
+ *  event of their own — dragging the scrollbar, a trackpad fling's inertia. */
+function onMessagesScroll() {
+  const el = $("chat-messages");
+  if (!el) return;
+  const top = el.scrollTop;
+  const ours = Math.abs(top - _selfScrollTop) <= SCROLL_DRIFT_PX;
+  if (!ours && top < _lastScrollTop - SCROLL_DRIFT_PX) {
+    stopFollowingStream();
+  } else if (isNearBottom(el)) {
+    // Standing still or heading down, and back at the floor. Following resumes
+    // without a click — arriving at the bottom IS the request to follow.
+    resumeFollowingStream(el);
+  }
+  _lastScrollTop = top;
+  syncJumpToLatest();
+}
+
+/** Follow the newest content — unless the reader has scrolled off it. */
 function maybeScrollToBottom() {
   const el = $("chat-messages");
   if (!el) return;
-  // Capture stickiness BEFORE the next paint. The caller has already
-  // appended the new node so scrollHeight has grown; we approximate
-  // "was near bottom" by comparing post-append minus the typical
-  // bubble height (~80px). Conservative: if uncertain, scroll.
-  if (el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_STICK_PX + 200) {
-    el.scrollTop = el.scrollHeight;
+  // The drift check. See the section comment: this, and not the scroll event,
+  // is what makes a scroll during a live turn survive.
+  if (_stickToBottom && _selfScrollTop >= 0 && Math.abs(el.scrollTop - _selfScrollTop) > SCROLL_DRIFT_PX) {
+    stopFollowingStream();
   }
+  if (!_stickToBottom) {
+    // Not a failure: they are above, on purpose. What staying there costs them
+    // is knowing the turn moved on, so the button says it instead.
+    syncJumpToLatest();
+    return;
+  }
+  scrollToFloor(el);
 }
+
+/** Would an UPWARD gesture on `target` actually move the transcript?
+ *
+ *  The fast path below is only allowed to pre-disarm following for a gesture
+ *  that can. Two kinds cannot, and both used to disarm it (Devin review on
+ *  #2083) — leaving a reader who is still at the floor not following, with the
+ *  recovery button correctly hidden because there is nothing above them to go
+ *  back from, so new tokens simply walked off the bottom of the screen:
+ *
+ *    - the transcript has nothing to give: already at the top, or not
+ *      overflowing at all (a short thread, the first tokens of a turn);
+ *    - a nested scroller eats the gesture. A tool console or a code block
+ *      scrolled down consumes an upward wheel entirely; the event still
+ *      bubbles here, but the transcript never moved. Chained gestures — a
+ *      nested scroller already AT its own top — do move the transcript, and
+ *      `scrollTop > 0` is what tells the two apart.
+ *
+ *  The drift check in `maybeScrollToBottom` is unaffected either way: it
+ *  measures what the container actually did, so a gesture this predicate turns
+ *  away is still caught by the next append if it did move the transcript. */
+function gestureCanScrollTranscriptUp(el, target) {
+  if (!el || el.scrollTop <= 0) return false;
+  for (let n = target instanceof Element ? target : null; n && n !== el; n = n.parentElement) {
+    if (n.scrollTop > 0 && n.scrollHeight - n.clientHeight > 1) {
+      const overflowY = getComputedStyle(n).overflowY;
+      if (overflowY === "auto" || overflowY === "scroll") return false;
+    }
+  }
+  return true;
+}
+
+/** The way back. Shown only while the reader is off the floor, because that is
+ *  the only state it can fix — a button that is always up is chrome. */
+function syncJumpToLatest() {
+  const btn = $("chat-jump-latest");
+  if (!btn) return;
+  const el = $("chat-messages");
+  const off = !!el && !_stickToBottom && !isNearBottom(el);
+  btn.hidden = !off;
+}
+
+(function wireStreamFollow() {
+  const el = $("chat-messages");
+  if (!el) return;
+  _lastScrollTop = el.scrollTop;
+  // Passive throughout: none of these call preventDefault, and saying so keeps
+  // them off the critical path of the very gestures they exist to honour.
+  el.addEventListener("scroll", onMessagesScroll, { passive: true });
+  el.addEventListener("wheel", (e) => {
+    if (e.deltaY < 0 && gestureCanScrollTranscriptUp(el, e.target)) stopFollowingStream();
+  }, { passive: true });
+  el.addEventListener("touchstart", (e) => {
+    _touchStartY = e.touches && e.touches[0] ? e.touches[0].clientY : null;
+  }, { passive: true });
+  el.addEventListener("touchmove", (e) => {
+    const y = e.touches && e.touches[0] ? e.touches[0].clientY : null;
+    // A finger travelling DOWN the screen drags the transcript down, which
+    // uncovers what is above it — that is scrolling up. 4px of slack so a tap
+    // that wobbles is not a scroll.
+    if (_touchStartY !== null && y !== null && y > _touchStartY + 4 &&
+        gestureCanScrollTranscriptUp(el, e.target)) {
+      stopFollowingStream();
+    }
+  }, { passive: true });
+  const btn = $("chat-jump-latest");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      resumeFollowingStream(el);
+      scrollToFloor(el);
+      syncJumpToLatest();
+      // The floor is where new content lands; hand focus to the composer so a
+      // reader who came back to reply does not have to reach for it.
+      $("chat-input")?.focus();
+    });
+  }
+})();
 
 // ---------- "Agnes is thinking…" placeholder -----------------------------
 // Rendered the moment the user submits, removed as soon as the first
@@ -5813,6 +6001,10 @@ async function submitUserMessage(text) {
     }
     if (ready.length) text = ChatAttachments.composeText(text, ready);
   }
+  // Asking is an explicit "show me what comes back": a reader parked halfway up
+  // the previous turn gets put back on the stream by their own submit, not left
+  // watching a transcript that has moved on without them.
+  resumeFollowingStream();
   renderMessage({ role: "user", content: text });
   lastUserText = text;
   // History stores what the user TYPED. Recalling a prompt must not re-attach
@@ -5906,7 +6098,13 @@ function _syncComposerHeightVar() {
   const msgs = $("chat-messages");
   const fromBottom = msgs ? msgs.scrollHeight - msgs.scrollTop - msgs.clientHeight : 0;
   shell.style.setProperty("--chat-composer-h", next);
-  if (msgs) msgs.scrollTop = msgs.scrollHeight - msgs.clientHeight - fromBottom;
+  if (msgs) {
+    msgs.scrollTop = msgs.scrollHeight - msgs.clientHeight - fromBottom;
+    // Ours, not the reader's — and it can move UP when the composer shrinks
+    // back. Unrecorded, growing the composer mid-turn would read as scrolling
+    // away and quietly stop the answer from following itself.
+    noteSelfScroll(msgs);
+  }
 }
 
 /** Resize the composer textarea to fit its content, capped at 220px
