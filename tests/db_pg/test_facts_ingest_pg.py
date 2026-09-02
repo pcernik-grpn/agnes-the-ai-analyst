@@ -1178,6 +1178,136 @@ def test_possible_duplicate_of_edge_needs_no_evidence_and_is_a_review_item(pg_en
 
 
 # ---------------------------------------------------------------------------
+# possible_duplicate_of — SYSTEM-proposed candidates. Extraction is
+# per-document and stateless (spec's own `entity_resolution` split: pass 1
+# never sees the rest of the graph), so a cross-document duplicate can only
+# ever be caught here, comparing a NEWLY minted alias against every OTHER
+# alias of the same type already on file -- never on the producer's own
+# initiative. `_duplicate_candidate_reason` is the pure matching rule; the
+# tests below drive it through `ingest_batch` to prove the write path.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_candidate_reason_matches_name_token_prefix():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood-farms", "norwood-farms-group") is not None
+    assert _duplicate_candidate_reason("norwood-farms-group", "norwood-farms") is not None  # symmetric
+
+
+def test_duplicate_candidate_reason_matches_near_identical_spelling():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood", "norwod") is not None  # one dropped letter
+
+
+def test_duplicate_candidate_reason_none_for_unrelated_names():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("globex-corp", "initech") is None
+
+
+def test_duplicate_candidate_reason_none_for_identical_slugs():
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("norwood-farms", "norwood-farms") is None
+
+
+def test_duplicate_candidate_reason_none_below_the_short_token_floor():
+    """A stub prefix like ``co`` trivially prefixes many unrelated names —
+    the length floor exists so the prefix rule stays a real signal, not a
+    coincidence generator."""
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("co", "co-op-farms") is None
+
+
+def test_duplicate_candidate_reason_none_when_qualifiers_diverge_after_a_shared_word():
+    """Two equally-qualified names sharing only a leading word are NOT a
+    prefix relationship (only a STRICT prefix counts) — distinguishes a
+    genuine short-form/long-form pair from two different, unrelated
+    entities whose fuller names happen to start the same way."""
+    from src.repositories.facts_pg import _duplicate_candidate_reason
+
+    assert _duplicate_candidate_reason("riverton-north-labs", "riverton-south-metrics") is None
+
+
+def test_duplicate_candidate_proposed_across_two_separate_ingest_calls(pg_env, repo):
+    """Two SEPARATE `ingest_batch` calls — two different documents, exactly
+    how a real crawl sends them — each mint one new `client` fact with NO
+    producer-authored edge between them at all. The name-token-prefix rule
+    still proposes a `possible_duplicate_of` review item on the second
+    call: the exact gap a live-graph audit found — cross-document variants
+    of one name never meet inside a single (stateless) extraction call, so
+    nothing upstream of `ingest_batch` could ever have proposed this."""
+    doc1 = _seed_ready_doc(pg_env, file_id="cf_dup1", doc_id="doc_dup1", text="Norwood Farms placed an order.")
+    first = repo.ingest_batch(nodes=[_node("client:norwood-farms", doc1, "Norwood Farms placed an order.")])
+    assert not [ri for ri in first["review_items"] if ri.get("type") == "possible_duplicate_of"]
+
+    doc2 = "doc_dup2"
+    _seed_corpus_file(file_id="cf_dup2")
+    _seed_chunk(file_id="cf_dup2", text="Norwood Farms Group renewed its contract.")
+    _seed_source_mapping(file_id="cf_dup2", source_doc_id=doc2)
+    second = repo.ingest_batch(
+        nodes=[_node("client:norwood-farms-group", doc2, "Norwood Farms Group renewed its contract.")]
+    )
+
+    dup_items = [ri for ri in second["review_items"] if ri.get("type") == "possible_duplicate_of"]
+    assert len(dup_items) == 1
+    assert dup_items[0]["auto"] is True
+    assert dup_items[0]["reason"]
+    assert {dup_items[0]["src"], dup_items[0]["dst"]} == {"client:norwood-farms", "client:norwood-farms-group"}
+
+    # Never auto-merged: both facts still exist as distinct subjects, per
+    # the ontology's own `entity_resolution` convention ("merge on exact
+    # normalized slug only... never auto-merged").
+    assert second["subjects_created"] == 1
+
+
+def test_unrelated_same_type_facts_get_no_duplicate_candidate(pg_env, repo):
+    doc1 = _seed_ready_doc(pg_env, file_id="cf_unrel1", doc_id="doc_unrel1", text="Globex Corp placed an order.")
+    repo.ingest_batch(nodes=[_node("client:globex-corp", doc1, "Globex Corp placed an order.")])
+
+    doc2 = "doc_unrel2"
+    _seed_corpus_file(file_id="cf_unrel2")
+    _seed_chunk(file_id="cf_unrel2", text="Initech renewed its contract.")
+    _seed_source_mapping(file_id="cf_unrel2", source_doc_id=doc2)
+    report = repo.ingest_batch(nodes=[_node("client:initech", doc2, "Initech renewed its contract.")])
+
+    assert not [ri for ri in report["review_items"] if ri.get("type") == "possible_duplicate_of"]
+
+
+def test_duplicate_candidate_not_reproposed_when_fact_already_existed(pg_env, repo):
+    """The scan only ever looks at facts THIS batch newly minted (spec's
+    `_resolve_alias` fires ``created=True`` exactly once per fact's
+    lifetime) — a later batch that just adds a second claim to an
+    ALREADY-existing fact (a re-crawled or revisited document) has nothing
+    new to compare, so it proposes nothing a second time. This is what
+    keeps a scheduled re-crawl from spamming the same review item on every
+    run."""
+    doc1 = _seed_ready_doc(
+        pg_env,
+        file_id="cf_dup3",
+        doc_id="doc_dup3",
+        text="Norwood Farms placed an order. Norwood Farms Group renewed.",
+    )
+    repo.ingest_batch(
+        nodes=[
+            _node("client:norwood-farms", doc1, "Norwood Farms placed an order."),
+            _node("client:norwood-farms-group", doc1, "Norwood Farms Group renewed."),
+        ]
+    )
+
+    doc2 = "doc_dup3b"
+    _seed_corpus_file(file_id="cf_dup3b")
+    _seed_chunk(file_id="cf_dup3b", text="Norwood Farms renewed again.")
+    _seed_source_mapping(file_id="cf_dup3b", source_doc_id=doc2)
+    report = repo.ingest_batch(nodes=[_node("client:norwood-farms", doc2, "Norwood Farms renewed again.")])
+
+    assert not [ri for ri in report["review_items"] if ri.get("type") == "possible_duplicate_of"]
+
+
+# ---------------------------------------------------------------------------
 # §7.3 — functionally single-valued edges (`owned_by`/`for_client` by
 # default, `facts.single_valued_edges`): >1 distinct dst with a live claim
 # becomes a `single_valued_conflict` review item.
