@@ -670,6 +670,8 @@
      chips in here. Only the label earns weight. */
   .ax-preview__band--gap .ax-preview__label { color: var(--ds-text-primary); }
   .ax-preview__more { padding: 5px 0 0; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-selfnote { align-self: center; font-size: 12.5px; color: var(--ds-text-muted); }
+  .ax-selfnote[hidden] { display: none; }
 
   .ax-chain { margin: 6px 0 0; padding: 0; list-style: none; }
   .ax-chain li {
@@ -2637,7 +2639,12 @@
         {{ ds.button('View a page as them →', variant='primary', type='submit',
                      attrs='title="Opens Agnes read-only as this person — you cannot change anything until you exit."') }}
       </form>
-
+      {# The caller's own row. `view_as_self` is a real refusal at the entry
+         route — there is no view of yourself to open, and the mode would have
+         nothing to narrow — so the button is not offered rather than offered
+         and then refused with a machine token on a full-page 400. Same rule
+         the rest of the product follows: never offer what cannot succeed. #}
+      <span class="ax-selfnote" id="ax-sim-self" hidden>That is you — pick someone else to open a page as them.</span>
     </div>
     <div id="ax-sim-out"><div class="ax-empty">Pick a person to see what they can use, and why.</div></div>
   </div>
@@ -2656,6 +2663,9 @@
   const OVERVIEW_API = "/api/admin/access-overview";
   const USERS_LIST_API = "/api/users";        // list + search + single user
   const ADMIN_USERS_API = "/api/admin/users"; // memberships + effective-access
+  // Who is looking. Used only to withhold the view-as offer on the caller's
+  // own row — the server refuses it either way (`view_as_self`).
+  const VIEWER_USER_ID = {{ viewer_user_id | tojson }};
 
   // Data packages first — the redesign's spine. Everything else keeps a
   // section but stays collapsed: breadth disclosed, never removed.
@@ -5809,6 +5819,8 @@
     const viewAsForm = el("ax-sim-viewas");
     const viewAsUid = el("ax-sim-viewas-uid");
     const viewAsReturn = el("ax-sim-viewas-return");
+    const viewAsSelf = el("ax-sim-self");
+    if (viewAsSelf) viewAsSelf.hidden = true;
     if (!uid) {
       out.innerHTML = `<div class="ax-empty">Pick a person to see what they can use, and why.</div>`;
       detailBtn.hidden = true;
@@ -5817,7 +5829,13 @@
     }
     detailBtn.hidden = false;
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
-    if (viewAsForm && viewAsUid) {
+    // The caller's own row offers no view-as: the entry route refuses it
+    // (`view_as_self`), so offering it can only ever produce an error page.
+    const isSelf = !!VIEWER_USER_ID && uid === VIEWER_USER_ID;
+    if (isSelf) {
+      if (viewAsForm) viewAsForm.hidden = true;
+      if (viewAsSelf) viewAsSelf.hidden = false;
+    } else if (viewAsForm && viewAsUid) {
       viewAsUid.value = uid;
       // Where exiting comes back to: THIS lens with THIS person, read off the
       // URL `history.replaceState` just wrote (path + search only — the server

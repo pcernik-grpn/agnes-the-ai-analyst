@@ -261,6 +261,30 @@ def is_narrowed_subject(subject_user_id: Optional[str]) -> bool:
     return subject_user_id is None or subject_user_id == target
 
 
+def local_dev_viewer_id() -> Optional[str]:
+    """The id every request authenticates as under ``LOCAL_DEV_MODE``, else ``None``.
+
+    Not a relaxation of the binding rule — the same rule applied to the
+    credential dev mode actually uses. Dev mode authenticates from
+    configuration rather than from a session cookie, so there is no
+    ``access_token`` for a ticket to be bound TO, and a check written only
+    against that cookie does not fail the ticket, it fails to evaluate at all:
+    the mode silently never engages, which is how a "View a page as them"
+    button came to set a cookie, redirect, and then render no banner and
+    therefore no way out.
+
+    Off in every other mode, and it grants nothing on its own: dev mode
+    already resolves every caller to this one account, so a ticket minted by
+    it can only ever name the identity the request already had.
+    """
+    from app.auth.dependencies import _get_local_dev_user, is_local_dev_mode
+
+    if not is_local_dev_mode():
+        return None
+    user = _get_local_dev_user()
+    return str(user["id"]) if user and user.get("id") else None
+
+
 def session_matches_viewer(session_token: Optional[str], ticket: Optional["ViewAsTicket"]) -> bool:
     """Does this request's OWN session belong to the ticket's viewer?
 
@@ -279,15 +303,54 @@ def session_matches_viewer(session_token: Optional[str], ticket: Optional["ViewA
     a ``view_as.end`` entry against a real admin who did nothing. A rule kept
     in three places is a rule that will be dropped in a fourth.
 
-    Fail-closed: no token, an unverifiable token, or no ticket → ``False``.
+    Fail-closed: an unverifiable token, or no ticket → ``False``. A MISSING
+    token is fail-closed too in every mode that issues one; under
+    ``LOCAL_DEV_MODE`` it means the request authenticates by configuration
+    instead, and the binding is checked against that identity
+    (:func:`local_dev_viewer_id`) rather than skipped.
     """
-    if ticket is None or not session_token:
+    if ticket is None:
         return False
 
-    from app.auth.jwt import verify_token
+    if session_token:
+        from app.auth.jwt import verify_token
 
-    payload = verify_token(session_token) or {}
-    return str(payload.get("sub") or "") == ticket.viewer_user_id
+        payload = verify_token(session_token) or {}
+        if str(payload.get("sub") or "") == ticket.viewer_user_id:
+            return True
+
+    # The configured-identity fallback is reached whenever the session cookie
+    # did not answer — absent, unreadable, or belonging to someone else.
+    #
+    # "Absent" alone was not enough, and the miss is worth naming: browser
+    # cookies ignore the PORT, so every local instance on 127.0.0.1 shares one
+    # jar. A developer who has opened any other Agnes on that host is carrying
+    # an `access_token` this instance cannot verify — signed by a different
+    # deployment's secret — and a check that fired only on a MISSING cookie
+    # took the token path, failed to read it, and silently declined to engage.
+    # Same outcome as the bug this fallback exists to fix: a cookie set, a
+    # redirect served, and no banner.
+    #
+    # Still a binding, and still fail-closed off dev mode: a ticket naming
+    # anyone other than the configured identity is inert, and
+    # `local_dev_viewer_id` answers None in every mode that issues real
+    # sessions — where an unverifiable token must keep failing, since there
+    # the request has no other credential to fall back ON.
+    dev_viewer = local_dev_viewer_id()
+    return dev_viewer is not None and dev_viewer == ticket.viewer_user_id
+
+
+def binding_is_possible(session_token: Optional[str]) -> bool:
+    """Could a ticket minted for this request ever engage?
+
+    Asked at ENTRY, before a cookie is set. Every consumer of a ticket binds
+    it to the caller's own credential, so minting one for a request that
+    carries no bindable credential produces a cookie that is inert for its
+    whole lifetime — and the mode's only exit control lives in the banner that
+    inert cookie never renders. Refusing up front is the difference between a
+    button that fails and a button that lies.
+    """
+    return bool(session_token) or local_dev_viewer_id() is not None
 
 
 def safe_internal_path(candidate: Optional[str], default: str) -> str:

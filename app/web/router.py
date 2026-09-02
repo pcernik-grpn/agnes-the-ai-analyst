@@ -7269,6 +7269,18 @@ async def view_as_enter(
         # automation credential.
         raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
 
+    from app.auth.view_as import binding_is_possible
+
+    if not binding_is_possible(request.cookies.get("access_token")):
+        # Every consumer binds the ticket to the caller's own credential, so a
+        # request with no bindable credential would get a cookie that is inert
+        # for its whole lifetime — and the mode's only exit control lives in
+        # the banner that inert cookie never renders. The failure mode was not
+        # "the mode does not start": it was a button that set a cookie,
+        # redirected to the Library, and left the admin looking at an ordinary
+        # page with no banner and no way back. Refuse before setting anything.
+        raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
+
     target_id = (user_id or "").strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="user_id is required")
@@ -10634,6 +10646,12 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     # POST (F2) — the same mint-and-set pair /me/profile and /auth/logout use.
     csrf_token = _get_or_mint_web_csrf(request)
     ctx["csrf_token"] = csrf_token
+    # Who is asking — so the person lens can decline to OFFER a view-as of the
+    # caller themselves. `view_as_self` is a real 400 at the entry route, and
+    # without this the page rendered the button for the caller's own row and
+    # sent them to a full-page error carrying a machine token and no way back
+    # to the lens they came from.
+    ctx["viewer_user_id"] = str(user["id"])
     response = templates.TemplateResponse(request, "admin_access.html", ctx)
     _set_web_csrf_cookie(response, request, csrf_token)
     return response
