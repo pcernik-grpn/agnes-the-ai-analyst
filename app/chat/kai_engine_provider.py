@@ -126,7 +126,7 @@ _APPROVAL_TIMEOUT_FALLBACK_SECONDS = 300
 #: in-flight turn. Bounded because the alternative to a slow stop is a
 #: slow pause on every idle session, and the orphan a missed stop leaves
 #: is recoverable at the next message (see the conflict retry).
-_TEARDOWN_STOP_BUDGET_SECONDS = 5.0
+_STOP_BUDGET_SECONDS = 5.0
 #: The engine's refusal when a chat already has a message in flight.
 _CONFLICT_STATUS = 409
 
@@ -348,11 +348,15 @@ class KaiEngineHandle:
         # crash-respawn is another, so this is the ordinary path, not an edge
         # case. Awaited rather than spawned: side tasks are cancelled just
         # above and the shared client closes just below.
-        if turn_in_flight and not self._stop_requested:
-            try:
-                await asyncio.wait_for(self._post_stop(), _TEARDOWN_STOP_BUDGET_SECONDS)
-            except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - teardown is best-effort
-                logger.warning("kai engine handle: teardown stop timed out for %s", self._chat_id)
+        # Unconditional on `turn_in_flight`, NOT gated on `_stop_requested`.
+        # A cancel posts its stop as a SIDE TASK, and the loop above cancels
+        # every side task — so a teardown arriving just after Stop kills the
+        # stop request in flight, and skipping the replacement here because
+        # "a stop was already requested" leaves the engine processing an
+        # answer nobody will read (Devin Review on #2022). Re-posting a stop
+        # the engine already honoured is a no-op; not posting one is not.
+        if turn_in_flight:
+            await self._stop_within_budget("teardown")
         self.stdout.feed_eof()
         try:
             await self._client.aclose()
@@ -468,6 +472,25 @@ class KaiEngineHandle:
                 self._spawn_side_task(self._post_approval(request_id, decision))
         # ticket_push (native egress credentials) has no engine meaning — the
         # engine mints its own per-turn tickets at /api/kai/tickets.
+
+    async def _stop_within_budget(self, why: str) -> None:
+        """Post a stop, bounded and best-effort.
+
+        Every caller is already recovering from something — a teardown, an
+        orphaned turn, a read timeout, a failed turn — so the stop must not
+        add the client's own 120s read timeout on top of whatever went wrong
+        (Devin Review on #2022). Five seconds is the same budget teardown
+        always used; the other paths simply never had one.
+
+        Failure is swallowed by design: a stop that cannot be delivered
+        leaves the engine processing an answer nobody reads, which is bad,
+        but raising here would replace it with a caller that cannot finish
+        its own recovery, which is worse.
+        """
+        try:
+            await asyncio.wait_for(self._post_stop(), _STOP_BUDGET_SECONDS)
+        except Exception:  # noqa: BLE001 - includes TimeoutError; recovery is best-effort
+            logger.warning("kai engine handle: %s stop did not complete for %s", why, self._chat_id)
 
     def _spawn_side_task(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -604,7 +627,15 @@ class KaiEngineHandle:
                             "kai engine turn for %s hit an orphaned turn; stopping it and retrying once",
                             self._chat_id,
                         )
-                        await self._post_stop()
+                        await self._stop_within_budget("orphan-clearing")
+                        # A cancel can be processed while the stop above is in
+                        # flight. Retrying then submits the very question the
+                        # user cancelled, and the engine does work nobody asked
+                        # for — so re-read the flag rather than trusting the
+                        # one checked before the await (Devin Review on #2022).
+                        if self._stop_requested:
+                            self._finish_turn(state)
+                            return
                         continue
                     if resp.status_code >= 400:
                         await resp.aread()
@@ -649,7 +680,7 @@ class KaiEngineHandle:
             # Giving up on reading the turn has to mean giving up on the turn:
             # the engine is still processing this message and would refuse the
             # next one with a 409 conflict.
-            await self._post_stop()
+            await self._stop_within_budget("read-timeout")
             self._emit_turn_failure(
                 state,
                 f"no engine activity for {int(_SSE_READ_TIMEOUT_SECONDS)}s; giving up on the turn",
@@ -657,7 +688,7 @@ class KaiEngineHandle:
             return
         except Exception as exc:  # noqa: BLE001 - a failed turn ends, the handle survives
             logger.exception("kai engine turn failed for %s", self._chat_id)
-            await self._post_stop()
+            await self._stop_within_budget("failed-turn")
             self._emit_turn_failure(state, f"engine turn failed: {exc}")
             return
         self._finish_turn(state)

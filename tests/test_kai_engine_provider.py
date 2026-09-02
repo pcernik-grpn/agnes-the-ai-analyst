@@ -1368,3 +1368,62 @@ def test_a_mutating_tool_still_raises_its_card_when_approvals_are_off():
         assert engine.approvals == [{"toolUseId": "call-m", "approved": False}]
 
     asyncio.run(_run())
+
+
+class TestStopSurvivesTeardownAndRecovery:
+    """Three ways a Stop could fail to reach the engine, all reported by Devin
+    on #2022. Source inspection: each is a control-flow property that the
+    surrounding async machinery makes expensive to drive end to end, and each
+    is stated plainly enough in the code to pin."""
+
+    @staticmethod
+    def _src() -> str:
+        return Path("app/chat/kai_engine_provider.py").read_text(encoding="utf-8")
+
+    def test_teardown_posts_a_stop_even_when_one_was_already_requested(self):
+        """A cancel posts its stop as a SIDE TASK, and `_close_resources`
+        cancels every side task. So a teardown arriving just after Stop kills
+        the stop in flight — and gating the replacement on `_stop_requested`
+        means nothing reaches the engine at all, which keeps processing an
+        answer nobody will read.
+
+        Re-posting a stop the engine already honoured is a no-op; not posting
+        one is not."""
+        src = self._src()
+        block = src.split("async def _close_resources", 1)[1].split("\n    async def ", 1)[0]
+        assert "if turn_in_flight:" in block, (
+            "teardown must post the stop on turn_in_flight alone — the cancel's "
+            "own stop is a side task this method has just cancelled"
+        )
+        assert "if turn_in_flight and not self._stop_requested" not in block
+
+    def test_every_recovery_stop_is_bounded(self):
+        """Each caller is already recovering from something — a teardown, an
+        orphaned turn, a read timeout, a failed turn. An unbounded stop adds
+        the client's own read timeout on top of whatever went wrong."""
+        src = self._src()
+        body = src.split("class ", 1)[1] if "class " in src else src
+        bare = [
+            ln for ln in body.splitlines()
+            if ln.strip() == "await self._post_stop()"
+        ]
+        assert not bare, (
+            f"every awaited stop must go through _stop_within_budget; found {bare}"
+        )
+        helper = src.split("async def _stop_within_budget", 1)[1].split("\n    def ", 1)[0]
+        assert "asyncio.wait_for" in helper and "_STOP_BUDGET_SECONDS" in helper
+
+    def test_conflict_recovery_rechecks_the_cancel_flag_after_awaiting(self):
+        """A cancel can be processed while the orphan-clearing stop is in
+        flight. Retrying then submits the very question the user cancelled, so
+        the flag has to be re-read after the await rather than trusted from
+        before it."""
+        src = self._src()
+        i = src.index('_stop_within_budget("orphan-clearing")')
+        after = src[i : i + 600]
+        assert "if self._stop_requested:" in after.split("continue", 1)[0], (
+            "conflict recovery must re-check _stop_requested before retrying"
+        )
+        assert "self._finish_turn(state)" in after.split("continue", 1)[0], (
+            "a cancelled turn ends through _finish_turn, like the pre-turn race above"
+        )
