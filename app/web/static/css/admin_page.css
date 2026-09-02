@@ -57,7 +57,14 @@
    gap to a first PARAGRAPH of content. The tab strip is a ruled band and
    reads as part of the header block, so where one follows the head the
    two close up. */
-.admin-main .page-header--plain:has(+ .admin-tabs) { padding-bottom: 14px; }
+/* Two forms of the same adjacency. `base_admin.html` pages put the strip
+   directly after the head; `base_page.html` pages now always render a
+   `.page-toolbar` between them (components.css) — an element even when the
+   page defines no toolbar, and `display`/`margin` do not remove an element
+   from the sibling chain. Without the second selector the strip detaches
+   from the header block on People, Data, Semantic and Data packages. */
+.admin-main .page-header--plain:has(+ .admin-tabs),
+.admin-main .page-header--plain:has(+ .page-toolbar + .admin-tabs) { padding-bottom: 14px; }
 
 /* ── Back to the surface ─────────────────────────────────────────────
    A detail page's first line: the way back to the list it was reached
