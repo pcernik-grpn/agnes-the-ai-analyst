@@ -167,6 +167,7 @@ from connectors.sharepoint.graph_client import (
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
 from src.repositories import (
+    connection_secrets_repo,
     corpus_file_events_repo,
     corpus_files_repo,
     file_corpora_repo,
@@ -1738,18 +1739,25 @@ async def clone_connection(
     same "same site/host settings" reason, and are inert until the clone
     has scopes/subscriptions of its own.
 
-    **The certificate/secret VALUE itself is never copied** — only its
-    reference. When the source's certificate lives in a deployment env var
+    **The certificate/secret VALUE is never decrypted or re-encrypted.**
+    When the source's certificate lives in a deployment env var
     (``config.cert_private_key_env``/``client_secret_env``, the common
     case), the clone resolves the exact same value on its own, no admin
     action required (:func:`connectors.sharepoint.settings.
     resolve_sharepoint_settings`). When it was instead uploaded to the
     source's OWN vault slot (``connection_secrets`` — one row per
-    ``connection_id``, see that module's docstring), it is NOT duplicated
-    into a second row for the clone: an admin re-uploads it to the clone
-    separately. ``404`` for an unknown/non-SharePoint connection id; ``409
-    connection_name_exists`` if ``name`` is already taken (same rule as
-    ``POST /api/admin/source-connections``).
+    ``connection_id``, see that module's docstring), this call duplicates
+    that row's ciphertext verbatim under the clone's id
+    (``ConnectionSecretsRepository.copy_secret`` — a read-and-reinsert, not a
+    decrypt: the ciphertext is not bound to a connection id, so a byte-for-
+    byte copy decrypts identically for the new id) — the clone can resolve
+    settings and crawl immediately, no re-upload. The response's
+    ``secret_copied`` reports whether a vault row existed to copy (``False``
+    is not an error — it just means the source's credential comes from an
+    env var, which every clone already resolves on its own). ``404`` for an
+    unknown/non-SharePoint connection id; ``409 connection_name_exists`` if
+    ``name`` is already taken (same rule as ``POST
+    /api/admin/source-connections``).
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -1757,9 +1765,7 @@ async def clone_connection(
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
 
-    cloned_config = {
-        k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS
-    }
+    cloned_config = {k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS}
 
     new_id = str(uuid4())
     repo.create(
@@ -1772,15 +1778,17 @@ async def clone_connection(
         created_by=user.get("id"),
     )
 
+    secret_copied = connection_secrets_repo().copy_secret(connection_id, new_id)
+
     log_safe(
         user_id=user.get("id"),
         action="sharepoint_connection.clone",
         resource=f"source_connection:{new_id}",
-        params={"source_connection_id": connection_id, "name": body.name},
+        params={"source_connection_id": connection_id, "name": body.name, "secret_copied": secret_copied},
         result="success",
     )
 
-    return {"id": new_id, "name": body.name}
+    return {"id": new_id, "name": body.name, "secret_copied": secret_copied}
 
 
 @router.get("/connections/{connection_id}/certificate")

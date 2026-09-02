@@ -545,3 +545,37 @@ class ConnectionSecretsRepository:
             [connection_id],
         ).fetchone()
         return str(row[0]) if row and row[0] is not None else None
+
+    def copy_secret(self, source_connection_id: str, target_connection_id: str) -> bool:
+        """Duplicate ``source_connection_id``'s encrypted row verbatim under
+        ``target_connection_id`` — a read-and-reinsert of ``ciphertext``,
+        NEVER a decrypt/re-encrypt round trip. Safe because ``encrypt_secret``
+        binds the ciphertext to no AAD / connection id (it is just
+        ``Fernet(key).encrypt(value)``) — the exact same token decrypts
+        identically under either connection id.
+
+        Used by SharePoint's ``POST …/clone`` (see
+        ``app/api/admin_sharepoint.py::clone_connection``) so a clone whose
+        source certificate lives in this vault, rather than a deployment env
+        var, resolves settings immediately — no admin re-upload.
+
+        Returns ``True`` iff the source had a row (and one was written under
+        ``target_connection_id``, replacing any prior row there); ``False``
+        when there is nothing to copy — callers must NOT clear an existing
+        target row in that case.
+        """
+        row = self.conn.execute(
+            "SELECT ciphertext FROM connection_secrets WHERE connection_id = ?",
+            [source_connection_id],
+        ).fetchone()
+        if row is None:
+            return False
+        self.conn.execute(
+            """INSERT INTO connection_secrets (connection_id, ciphertext, updated_at)
+               VALUES (?, ?, current_timestamp)
+               ON CONFLICT (connection_id) DO UPDATE SET
+                   ciphertext = excluded.ciphertext,
+                   updated_at = excluded.updated_at""",
+            [target_connection_id, row[0]],
+        )
+        return True

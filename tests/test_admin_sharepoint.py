@@ -3397,7 +3397,13 @@ class TestConnectionClone:
         assert "scopes" not in detail["config"]
         assert "extraction" not in detail["config"]
 
-    def test_clone_does_not_duplicate_a_vault_secret(self, seeded_app, monkeypatch):
+    def test_clone_copies_a_vault_secret_so_the_clone_resolves_without_reupload(self, seeded_app, monkeypatch):
+        """The clone's whole point is a working sibling with zero scopes —
+        when the source's certificate lives in its OWN vault slot (rather
+        than a deployment env var), a clone with no row of its own could
+        never resolve settings and every Graph call 409ed
+        ``sharepoint_cert_unresolved``. The fix copies the encrypted row
+        verbatim (never decrypts) so the clone is immediately ready."""
         from cryptography.fernet import Fernet
 
         from app.secrets_vault import _reset_ephemeral_key_for_tests
@@ -3418,13 +3424,43 @@ class TestConnectionClone:
             r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-vault-target"}, headers=_auth(token))
             assert r.status_code == 201, r.text
             new_id = r.json()["id"]
+            assert r.json()["secret_copied"] is True
 
             from src.repositories import connection_secrets_repo
 
-            assert connection_secrets_repo().has(conn_id) is True
-            assert connection_secrets_repo().has(new_id) is False
+            secrets = connection_secrets_repo()
+            assert secrets.has(conn_id) is True
+            assert secrets.has(new_id) is True
+            # Same plaintext, and — since a clone is created fresh, never
+            # decrypted/re-encrypted along the way — the exact same ciphertext.
+            assert secrets.get(new_id) == secrets.get(conn_id) == PEM
+
+            from connectors.sharepoint.settings import resolve_sharepoint_settings
+
+            cloned_row = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+            settings = resolve_sharepoint_settings({"id": new_id, "config": cloned_row["config"]})
+            assert settings.credential_source == "vault"
+            assert settings.private_key == PEM
         finally:
             _reset_ephemeral_key_for_tests()
+
+    def test_clone_reports_no_secret_copied_when_source_uses_env_var(self, seeded_app):
+        """A source whose certificate resolves from a deployment env var
+        (``config.cert_private_key_env`` / no vault row at all) has nothing
+        to copy — ``secret_copied: False`` is not an error, it just means
+        every clone already resolves that same env var on its own."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-no-vault-source")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-no-vault-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        assert r.json()["secret_copied"] is False
+
+        from src.repositories import connection_secrets_repo
+
+        assert connection_secrets_repo().has(new_id) is False
 
     def test_name_conflict_is_409(self, seeded_app):
         c = seeded_app["client"]
@@ -3451,8 +3487,9 @@ class TestConnectionClone:
         rows, _ = audit_repo().query(action="sharepoint_connection.clone", limit=10)
         assert len(rows) == 1
         params = _audit_params(rows[0])
-        assert params == {"source_connection_id": conn_id, "name": "clone-audit-target"}
+        assert params == {"source_connection_id": conn_id, "name": "clone-audit-target", "secret_copied": False}
         assert rows[0]["resource"] == f"source_connection:{new_id}"
+
 
 class TestFactsExtractionRefusalNamesTheSwitch:
     """The ``409 facts_extraction_disabled`` body names WHICH of the two

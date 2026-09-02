@@ -123,3 +123,55 @@ def test_updated_at_round_trips_and_advances_on_rotate(repo):
     second = repo.updated_at("c1")
     assert second is not None
     assert second >= first
+
+
+def _raw_ciphertext(repo, connection_id: str):
+    """Read the ``ciphertext`` column directly, bypassing ``get()`` (which
+    decrypts) — used to prove ``copy_secret`` is a verbatim byte copy, never
+    a decrypt/re-encrypt round trip (Fernet embeds a fresh IV + timestamp per
+    encrypt, so a re-encrypt of the same plaintext would never match)."""
+    if hasattr(repo, "conn"):
+        row = repo.conn.execute(
+            "SELECT ciphertext FROM connection_secrets WHERE connection_id = ?",
+            [connection_id],
+        ).fetchone()
+    else:
+        import sqlalchemy as sa
+
+        with repo._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT ciphertext FROM connection_secrets WHERE connection_id = :cid"),
+                {"cid": connection_id},
+            ).fetchone()
+    return row[0] if row else None
+
+
+def test_copy_secret_duplicates_ciphertext_verbatim(repo):
+    """SharePoint's ``POST …/clone`` (app/api/admin_sharepoint.py) relies on
+    this to hand a clone a working credential when the source's certificate
+    lives in this vault rather than a deployment env var."""
+    repo.upsert("src-conn", "cert-pem-value")
+    source_ciphertext = _raw_ciphertext(repo, "src-conn")
+    assert source_ciphertext is not None
+
+    copied = repo.copy_secret("src-conn", "clone-conn")
+    assert copied is True
+
+    assert repo.get("clone-conn") == "cert-pem-value"
+    assert _raw_ciphertext(repo, "clone-conn") == source_ciphertext
+
+
+def test_copy_secret_is_a_noop_when_source_has_no_row(repo):
+    assert repo.has("no-such-source") is False
+    copied = repo.copy_secret("no-such-source", "target-conn")
+    assert copied is False
+    assert repo.has("target-conn") is False
+
+
+def test_copy_secret_overwrites_an_existing_target_row(repo):
+    repo.upsert("src-conn-2", "source-value")
+    repo.upsert("target-conn-2", "stale-target-value")
+
+    copied = repo.copy_secret("src-conn-2", "target-conn-2")
+    assert copied is True
+    assert repo.get("target-conn-2") == "source-value"

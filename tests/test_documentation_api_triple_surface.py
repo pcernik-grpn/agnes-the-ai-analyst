@@ -1217,16 +1217,16 @@ _EXEMPT: dict[str, str] = {
         "large-site split, not an analyst query surface"
     ),
     # Connection clone — creates a new source_connections row wired to the
-    # SAME credential material as an existing one (never a copied secret
-    # value; see the endpoint's own docstring). CLI-reachable, but never
-    # MCP-exposed: the same "admin credential-provisioning writes" standing
-    # exemption (CONTRIBUTING.md) as the generic connection-create/secret
-    # routes — an agent-invokable tool that can mint a new connection
-    # inheriting an existing credential's trust is a privilege-escalation
-    # seam, not a convenience.
+    # SAME credential material as an existing one (a vault-stored secret is
+    # copied verbatim, never decrypted; see the endpoint's own docstring).
+    # CLI-reachable, but never MCP-exposed: the same "admin
+    # credential-provisioning writes" standing exemption (CONTRIBUTING.md)
+    # as the generic connection-create/secret routes — an agent-invokable
+    # tool that can mint a new connection inheriting an existing
+    # credential's trust is a privilege-escalation seam, not a convenience.
     "/api/admin/sharepoint/connections/{connection_id}/clone": (
         "clone a SharePoint connection (same tenant/client identity and "
-        "certificate/client-secret env-var reference, zero scopes) — CLI-reachable "
+        "certificate/client-secret material, zero scopes) — CLI-reachable "
         "(agnes admin sharepoint connection clone) but deliberately not MCP-exposed: "
         "the standing admin credential-provisioning exemption (CONTRIBUTING.md), same "
         "reasoning as POST /api/admin/source-connections' own credential-adjacent writes"

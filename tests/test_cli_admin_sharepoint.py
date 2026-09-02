@@ -191,17 +191,27 @@ class TestConnectionClone:
     """`agnes admin sharepoint connection clone` — CLI counterpart to
     `POST /api/admin/sharepoint/connections/{connection_id}/clone`."""
 
-    def test_happy_path(self):
-        body = {"id": "conn2", "name": "clone-target"}
+    def test_happy_path_reports_secret_copied(self):
+        body = {"id": "conn2", "name": "clone-target", "secret_copied": True}
         with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)) as mock_post:
             result = runner.invoke(
                 app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "clone-target"]
             )
         assert result.exit_code == 0, result.output
         assert "conn1 -> conn2" in result.output
+        assert "Vault secret copied" in result.output
         args, kwargs = mock_post.call_args
         assert args[0] == "/api/admin/sharepoint/connections/conn1/clone"
         assert kwargs["json"] == {"name": "clone-target"}
+
+    def test_happy_path_reports_no_secret_to_copy(self):
+        body = {"id": "conn2", "name": "clone-target", "secret_copied": False}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "clone-target"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "No vault secret to copy" in result.output
 
     def test_json_output(self):
         body = {"id": "conn2", "name": "clone-target"}
@@ -442,6 +452,7 @@ class TestRuns:
             result = runner.invoke(app, ["admin", "sharepoint", "runs", "--watch"])
         assert result.exit_code == 0, result.output
         assert mock_get.call_count == 2
+
 
 class TestExtract:
     """`agnes admin sharepoint extract` — CLI counterpart to

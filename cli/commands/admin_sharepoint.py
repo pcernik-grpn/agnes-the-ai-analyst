@@ -293,10 +293,11 @@ def connection_clone(
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Create a sibling SharePoint connection wired to the SAME credential
-    material as ``connection_id`` (tenant/client identity, certificate/
-    client-secret env-var reference — never a copied secret value), with
-    zero scopes. Pair with ``agnes admin sharepoint scope bulk-add`` to
-    populate the clone with its own slice of the split.
+    material as ``connection_id`` (tenant/client identity, and the
+    certificate/client-secret — a vault-stored one is copied verbatim,
+    never decrypted; an env-var-sourced one resolves on its own, nothing to
+    copy), with zero scopes. Pair with ``agnes admin sharepoint scope
+    bulk-add`` to populate the clone with its own slice of the split.
 
     ``409 connection_name_exists`` if ``--name`` is already taken; ``404``
     for an unknown or non-SharePoint connection id.
@@ -309,6 +310,10 @@ def connection_clone(
         typer.echo(json.dumps(body, indent=2))
         return
     typer.echo(f"Cloned {connection_id} -> {body.get('id')} ({body.get('name')})")
+    if body.get("secret_copied"):
+        typer.echo("Vault secret copied — the clone is ready to crawl.")
+    else:
+        typer.echo("No vault secret to copy (source resolves its certificate from an env var).")
 
 
 # ---------------------------------------------------------------------------

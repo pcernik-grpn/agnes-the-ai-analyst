@@ -716,7 +716,9 @@ CATALOG: dict[str, AuditEvent] = {
     "sharepoint_connection.clone": AuditEvent(
         "sharepoint_connection.clone",
         "mutation",
-        "An admin cloned a SharePoint connection into a sibling wired to the same credential material.",
+        "An admin cloned a SharePoint connection into a sibling wired to the same credential "
+        "material, including a copied vault secret when the source's certificate was uploaded "
+        "rather than sourced from a deployment env var.",
     ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
