@@ -522,3 +522,51 @@ def test_collection_get_derives_truncation_from_the_offset_the_server_used():
         "truncation must be derived from the offset the server used, not the one asked for"
     )
     assert "effective_offset" in block
+
+
+def _tool_params(path: str) -> dict:
+    """`{tool name: [parameter names]}` for every `@tool`-decorated function
+    in a module, HTTP or stdio, nested or not."""
+    import ast
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    out: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorated = any(
+            (isinstance(d, ast.Name) and d.id == "tool")
+            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "tool")
+            for d in node.decorator_list
+        )
+        if decorated:
+            out[node.name] = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
+    return out
+
+
+def test_a_shared_tool_takes_the_same_arguments_on_both_servers():
+    """Name parity is not contract parity.
+
+    Every guard above compares tool NAMES, so `collection_get` gaining
+    `limit`/`offset`/`q` on the HTTP foundation server while the stdio server
+    kept the one-argument version passed all of them — an agent on the CLI
+    server asked for a collection and got whatever the endpoint's own default
+    page happened to be, with no way to reach the rest and nothing saying so
+    (Devin Review on #2062). A tool present on both servers must accept the
+    same arguments on both.
+    """
+    http = _tool_params("app/api/mcp/foundation_tools.py")
+    stdio = _tool_params("cli/mcp/server.py")
+
+    shared = sorted(set(http) & set(stdio))
+    assert shared, "expected the two servers to share tools; the AST scan found none"
+
+    drift = {
+        name: {"http": http[name], "stdio": stdio[name]}
+        for name in shared
+        if set(http[name]) != set(stdio[name])
+    }
+    assert not drift, (
+        "these tools take different arguments on the HTTP and stdio MCP servers — "
+        f"the contract an agent reads depends on which server it reached: {drift}"
+    )
