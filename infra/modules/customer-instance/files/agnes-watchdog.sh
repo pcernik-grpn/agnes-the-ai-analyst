@@ -67,11 +67,11 @@ cd "$COMPOSE_DIR" 2>/dev/null || true
 
 # Environment label precedence: explicit ENV_LABEL > ENV_STAGE (written by
 # provisioning, e.g. the Terraform module's per-VM role) >
-# POSTHOG_ENVIRONMENT from /opt/agnes/.env (deployments that set it) >
+# AGNES_DEPLOYMENT_ENV from /opt/agnes/.env (deployments that set it) >
 # hostname only.
 STAGE="${ENV_STAGE:-}"
 if [ -z "$STAGE" ]; then
-    STAGE=$(grep -E '^POSTHOG_ENVIRONMENT=' /opt/agnes/.env 2>/dev/null | cut -d= -f2 | tr -d '"')
+    STAGE=$(grep -E '^AGNES_DEPLOYMENT_ENV=' /opt/agnes/.env 2>/dev/null | cut -d= -f2 | tr -d '"')
 fi
 case "$STAGE" in
   prod*) EMOJI=$(printf '\xf0\x9f\x94\xb4');;
