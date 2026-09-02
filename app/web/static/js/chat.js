@@ -1000,10 +1000,20 @@ function renderNextActions(bubble, actions, pending = false) {
     icon.setAttribute("aria-hidden", "true");
     icon.appendChild(iconEl("arrow-right"));
     btn.appendChild(icon);
+    // The title goes inside `.rdb-action-txt`, not straight into the button —
+    // the same nesting the landing row builds (chat_dashboard.js). It is not
+    // decoration: `.rdb-action-title` is `flex-shrink: 0` + `white-space:
+    // nowrap`, so on its own it cannot give up width, and a long follow-up
+    // overflows a narrow bubble or viewport. The wrapper is the shrinkable
+    // half — `flex: 0 1 auto; min-width: 0; overflow: hidden` — and reusing
+    // it keeps the two rows from drifting apart again (Devin Review on #2049).
+    const text = document.createElement("span");
+    text.className = "rdb-action-txt";
     const label = document.createElement("span");
     label.className = "rdb-action-title";
     label.textContent = action;
-    btn.appendChild(label);
+    text.appendChild(label);
+    btn.appendChild(text);
     // `pending` is the mid-stream draw: the trailer has closed but the turn
     // has not. Showing the row there is the point — the reader learns the
     // follow-ups exist while the tail is still arriving — but CLICKING it

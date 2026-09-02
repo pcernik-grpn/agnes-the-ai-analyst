@@ -1945,3 +1945,35 @@ def test_transcript_reserves_the_composer_s_measured_height():
     rule = rule[: rule.index("}")]
     assert "var(--chat-composer-h" in rule, "the reserved space must track the measurement"
     assert "116px" not in rule, "the constant this replaced"
+
+
+def test_a_follow_up_label_can_shrink_inside_a_narrow_bubble():
+    """A suggested-action label must sit inside `.rdb-action-txt`, not straight
+    in the button.
+
+    `.rdb-action-title` is `flex-shrink: 0` with `white-space: nowrap`
+    (chat_dashboard.css), so on its own it cannot give up width: a long
+    follow-up overflows a narrow chat bubble or viewport instead of being
+    clipped. The wrapper is the shrinkable half — `flex: 0 1 auto`,
+    `min-width: 0`, `overflow: hidden` — and the landing row already nests
+    them that way (chat_dashboard.js). Reusing the same nesting is what keeps
+    the two rows from drifting apart, which is the reason this PR moved the
+    chip onto the shared class in the first place (Devin Review on #2049).
+
+    Pins the nesting, not the CSS: the properties live in
+    chat_dashboard.css and are asserted here only as the reason the wrapper
+    is load-bearing."""
+    js = Path("app/web/static/js/chat.js").read_text(encoding="utf-8")
+    block = js.split('label.className = "rdb-action-title"', 1)[0][-600:]
+    assert 'rdb-action-txt' in block, (
+        "the follow-up title must be wrapped in .rdb-action-txt — without it "
+        "a nowrap, non-shrinking label overflows the bubble"
+    )
+    assert "text.appendChild(label)" in js and "btn.appendChild(text)" in js, (
+        "the title must go into the wrapper and the wrapper into the button"
+    )
+    css = Path("app/web/static/css/chat_dashboard.css").read_text(encoding="utf-8")
+    wrapper = css.split(".rdb-action-txt {", 1)[1].split("}", 1)[0]
+    assert "min-width: 0" in wrapper and "overflow: hidden" in wrapper, (
+        "the wrapper is only load-bearing while it carries the shrink rules"
+    )
