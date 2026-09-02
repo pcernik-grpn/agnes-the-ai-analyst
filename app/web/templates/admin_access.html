@@ -1037,6 +1037,11 @@
   /* "Required plugin" — a grant this page reports but does not own. Muted,
      because it is a statement of fact rather than a control. */
   .ax-ctl--managed { display: inline-flex; align-items: center; gap: 8px; }
+  /* The " · via Everyone" (or " · via Marketplaces") suffix on a stated
+     tier. Quieter than the tier itself: the answer to "what is it" stays the
+     first word, and "why can't I change it here" rides behind it instead of
+     living only in a tooltip. */
+  .ax-managed__src { color: var(--text-secondary, #6b7280); font-weight: 400; }
   .ax-managed {
     font-size: 12px; font-weight: 600; color: var(--ds-text-muted);
     white-space: nowrap; cursor: help;
@@ -3550,12 +3555,18 @@
       // let an admin quietly alter a company-wide grant while looking at one
       // group. Say where it comes from and send them there instead.
       // Inherited: the tier is real but it is Everyone's to set, so it is
-      // stated rather than offered. The Manage column carries the way there,
-      // which is why this does not repeat the word "Everyone".
+      // stated rather than offered.
+      //
+      // It says where it is set, in the cell. The bare word alone sat in the
+      // same column as a live control one row below and read as a setting
+      // that had stopped working — the reason it cannot be touched here was
+      // real but lived in a tooltip, which is to say nowhere. The Manage
+      // column does carry the way there; a reader should not have to join
+      // two columns to find out why the first one is inert.
       const control = grant.inherited
         ? `<span class="ax-ctl ax-ctl--managed"><span class="ax-managed"
              data-tip="Granted to Everyone, so it reaches this group's members too. Its tier is set there.">${
-               tier === "required" ? "Automatic" : "Optional"}</span></span>`
+               tier === "required" ? "Automatic" : "Optional"}<span class="ax-managed__src"> · via Everyone</span></span></span>`
         : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by });
       const manage = manageCell({
         inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref,

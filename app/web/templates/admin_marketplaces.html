@@ -215,6 +215,39 @@
      aligned — "Enabled" and "Automatic for everyone" are both switches, and
      the complaint that two on/off states wore two different widgets is
      answered rather than argued with. */
+  /* ── Who gets this plugin: ONE question, three answers ────────────────
+     Two switches (Enabled + Automatic for everyone) implied four states and
+     the system only holds three — disabling clears the automatic flag in the
+     same write, so "off AND automatic" is undrawable. The reader had to work
+     out which corner was fake, and the two switches were not even the same
+     kind of question: one is a kill switch, the other a distribution choice.
+
+     One segmented control, positions ordered by increasing reach, so the
+     phantom fourth state cannot be expressed and the axis is legible at a
+     glance. Same widget family as the Optional/Automatic pair on
+     /admin/access, which is the same axis read per group. */
+  .plugin-reach { display: inline-flex; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .plugin-reach__btn {
+    appearance: none; border: 0; background: var(--ds-surface); cursor: pointer;
+    font-size: 11px; font-weight: 600; padding: 5px 10px; white-space: nowrap;
+    color: var(--text-secondary, #6b7280);
+    border-right: 1px solid var(--ds-border);
+    transition: background 0.15s, color 0.15s;
+  }
+  .plugin-reach__btn:last-child { border-right: 0; }
+  .plugin-reach__btn:hover:not(.is-active):not([disabled]) { background: var(--ds-surface-sunken); color: var(--ds-text); }
+  .plugin-reach__btn:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: -2px; }
+  .plugin-reach__btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* The active position carries the MEANING of the state it names, so the row
+     can be read without the label: muted for Off, ordinary for By group, the
+     shared policy amber for Everyone — the same amber the AUTOMATIC pill and
+     /admin/access's Automatic tier use. */
+  .plugin-reach__btn.is-active { background: var(--ds-surface-sunken); color: var(--ds-text); }
+  .plugin-reach__btn.is-active[data-reach="all"] {
+    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+  }
+  .plugin-reach__btn.is-active[data-reach="off"] { color: var(--text-secondary, #6b7280); }
+
   .plugin-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .plugin-system-control { display: inline-flex; align-items: center; gap: 6px; }
   /* Small, always-visible help affordance — a bare `title` on the button
@@ -498,7 +531,12 @@
      modal handles both directions. -->
 <div class="modal-backdrop" id="system-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="system-confirm-title">
   <div class="modal-card" style="max-width: 520px;">
-    <h3 id="system-confirm-title">Mark as system plugin?</h3>
+    {# Placeholder only — every opener sets this heading (and the OK button's
+       label and variant) before the modal is shown. It carried "Mark as system
+       plugin?" long after that control was retired: dead default copy in the
+       markup outlives the flow it was written for, and flashes if the fill
+       ever runs late. #}
+    <h3 id="system-confirm-title">Change who gets this plugin?</h3>
     <p class="sub" id="system-confirm-plugin" style="margin: 0 0 14px; font-size: 13px; color: var(--text-primary, #111827); font-weight: 500;"></p>
     <div id="system-confirm-body" style="font-size: 13px; line-height: 1.55; color: var(--text-secondary, #374151);"></div>
     <div class="modal-actions">
@@ -837,6 +875,12 @@ async function openDetails(id, name) {
       const depPill = p.deprecated === true
         ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
         : "";
+      // ONE state along one axis, derived from the two flags that hold it.
+      // The pair is never contradictory in storage — disabling clears the
+      // automatic flag — so three positions cover it exactly.
+      const reach = isDisabled ? "off" : (p.is_system ? "all" : "group");
+      const reachHelpText =
+        "Who gets this plugin. Off: nobody, hidden everywhere even from groups that were granted it. By group: only the groups granted it on Access, and they choose whether to install it. Everyone: every user automatically, with no way to remove it. Off is also set by the nightly sync when the marketplace marks a plugin deprecated.";
       // #1956 item 14: "system" is gone from the UI. It was never a third
       // concept — /admin/access has said Optional / Automatic about a grant
       // since v49, and marking a plugin system meant exactly "Automatic, for
@@ -844,7 +888,7 @@ async function openDetails(id, name) {
       const autoTitle = isDisabled
         ? "Automatic for everyone means every user gets this plugin without asking. The plugin is disabled, so it cannot be set — re-enable it first."
         : (p.is_system
-          ? "Every user gets this plugin without asking. Switch off to make it Optional again — grants you set by hand on Access are untouched either way."
+          ? "Every user gets this plugin without asking. Move it to By group to reach only granted groups again — grants you set by hand on Access are untouched either way."
           : "Switch on to give every user this plugin without asking. It writes nothing per group or per user, so switching off later reverses it exactly.");
       // No literal double quotes — esc() round-trips through textContent /
       // innerHTML, which escapes &/</> but not ", so one would break out of
@@ -861,56 +905,137 @@ async function openDetails(id, name) {
           <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
           <span class="spacer"></span>
           <span class="plugin-controls">
-            <label class="plugin-enabled-toggle" title="${esc(isDisabled
-                ? "Hidden from every served surface for all users. Toggle on to make it available again."
-                : "Available to users with a grant. Toggle off to admin-disable it instance-wide — hides it from every served surface for all users.")}">
-              <span class="toggle-label">Enabled</span>
-              <span class="toggle">
-                <input type="checkbox"
-                       data-action="toggle-disabled"
-                       data-marketplace="${esc(id)}"
-                       data-plugin="${esc(p.name)}"
-                       data-admin-disabled="${isDisabled ? "1" : "0"}"
-                       ${isDisabled ? "" : "checked"}>
-                <span class="toggle-slider"></span>
-              </span>
-            </label>
-            <span class="plugin-system-control">
-              <label class="plugin-enabled-toggle plugin-auto-toggle" title="${esc(autoTitle)}">
-                <span class="toggle-label">Automatic for everyone</span>
-                <span class="toggle">
-                  <input type="checkbox"
-                         data-action="toggle-system"
-                         data-marketplace="${esc(id)}"
-                         data-plugin="${esc(p.name)}"
-                         data-is-system="${p.is_system ? "1" : "0"}"
-                         ${isDisabled ? "disabled" : ""}
-                         ${p.is_system ? "checked" : ""}>
-                  <span class="toggle-slider"></span>
-                </span>
-              </label>
-              <span class="plugin-help-icon" tabindex="0" role="img"
-                    aria-label="What does Automatic for everyone do?"
-                    title="${esc(autoHelpText)}">${autoHelpIcon}</span>
+            <span class="plugin-reach" role="group" aria-label="Who gets this plugin">
+              <button type="button" class="plugin-reach__btn ${reach === "off" ? "is-active" : ""}"
+                      data-action="set-reach" data-reach="off"
+                      data-marketplace="${esc(id)}" data-plugin="${esc(p.name)}"
+                      data-current="${reach}"
+                      aria-pressed="${reach === "off"}"
+                      title="Nobody. Hidden everywhere, even from groups that were granted it.">Off</button>
+              <button type="button" class="plugin-reach__btn ${reach === "group" ? "is-active" : ""}"
+                      data-action="set-reach" data-reach="group"
+                      data-marketplace="${esc(id)}" data-plugin="${esc(p.name)}"
+                      data-current="${reach}"
+                      aria-pressed="${reach === "group"}"
+                      title="Only the groups granted it on Access. They choose whether to install it.">By group</button>
+              <button type="button" class="plugin-reach__btn ${reach === "all" ? "is-active" : ""}"
+                      data-action="set-reach" data-reach="all"
+                      data-marketplace="${esc(id)}" data-plugin="${esc(p.name)}"
+                      data-current="${reach}"
+                      aria-pressed="${reach === "all"}"
+                      title="Every user, automatically, with no way to remove it.">Everyone</button>
             </span>
+            <span class="plugin-help-icon" tabindex="0" role="img"
+                  aria-label="What do Off, By group and Everyone mean?"
+                  title="${esc(reachHelpText)}">${autoHelpIcon}</span>
           </span>
         </div>${desc}${metaHtml}
       </div>`;
     }).join("");
-    // `click` with preventDefault, NOT `change`: the switch must not move
-    // until the server has agreed. A confirm modal can be dismissed three
-    // ways (Cancel, backdrop, Escape) and only one of them runs our code, so
-    // a switch that flipped optimistically would be left lying by the other
-    // two. preventDefault holds it still; the re-fetch after a successful
-    // call is what moves it. Still keyboard-operable — Space on a checkbox
-    // dispatches a click.
-    body.querySelectorAll('[data-action="toggle-system"]').forEach(btn =>
-      btn.addEventListener("click", (ev) => { ev.preventDefault(); toggleSystem(btn, id, name); }));
-    body.querySelectorAll('[data-action="toggle-disabled"]').forEach(el =>
-      el.addEventListener("change", () => toggleDisabled(el, id, name)));
+    // Buttons, so nothing moves until the server agrees: a confirm modal can
+    // be dismissed three ways (Cancel, backdrop, Escape) and only one runs our
+    // code, so an optimistically-moved switch would be left lying by the other
+    // two. The re-fetch after a successful call is what repaints the control.
+    body.querySelectorAll('[data-action="set-reach"]').forEach(btn =>
+      btn.addEventListener("click", () => setReach(btn, id, name)));
   } catch (e) {
     body.innerHTML = `<div class="empty" style="color:var(--ds-accent-danger-ink);">Failed to load plugins: ${esc(e.message)}</div>`;
   }
+}
+
+/* One entry point for the three positions. Each transition is expressed as
+   the calls it needs, so the control stays declarative ("put it here") while
+   the endpoints stay exactly what they were — no new API for a UI change.
+
+   Off and Everyone keep their confirms: one hides a plugin from everybody
+   (and can retire its grants), the other hands it to every user. By group is
+   the resting state and its confirms are the light ones — coming back from
+   Off, or standing down from Everyone. */
+function setReach(btn, marketplaceId, marketplaceName) {
+  const target = btn.dataset.reach;
+  const current = btn.dataset.current;
+  if (target === current) return;   // already there; nothing to confirm
+  const pluginName = btn.dataset.plugin;
+  // The two confirm flows were written against the old switches and read
+  // their state off the element. Hand them a stand-in carrying the same
+  // dataset, so the transitions reuse the existing, already-reviewed copy and
+  // network paths instead of a parallel set that could drift from them.
+  const shim = {
+    dataset: {
+      plugin: pluginName,
+      adminDisabled: current === "off" ? "1" : "0",
+      isSystem: current === "all" ? "1" : "0",
+    },
+    set disabled(v) { setReachBusy(btn, v); },
+    get disabled() { return false; },
+    set checked(_v) {},
+    get checked() { return false; },
+  };
+
+  if (target === "off") {
+    // Reuses the existing disable confirm — including its "also revoke all
+    // group grants" retirement option, which has no equivalent elsewhere.
+    return toggleDisabled(shim, marketplaceId, marketplaceName);
+  }
+  if (target === "all") {
+    if (current === "off") {
+      // Two steps: a disabled plugin cannot be made Automatic (the endpoint
+      // refuses with 409), so it is enabled first and then handed to everyone.
+      return confirmReachFromOff(btn, marketplaceId, marketplaceName, "all");
+    }
+    return toggleSystem(shim, marketplaceId, marketplaceName);
+  }
+  // target === "group"
+  if (current === "off") {
+    return toggleDisabled(shim, marketplaceId, marketplaceName);   // enable path
+  }
+  return toggleSystem(shim, marketplaceId, marketplaceName);       // stand down from Everyone
+}
+
+function setReachBusy(btn, busy) {
+  const group = btn.closest(".plugin-reach");
+  if (!group) return;
+  group.querySelectorAll(".plugin-reach__btn").forEach(b => { b.disabled = !!busy; });
+}
+
+/* Off → Everyone. The only transition that is two calls, so it gets its own
+   confirm rather than chaining two modals at the admin. */
+function confirmReachFromOff(btn, marketplaceId, marketplaceName, target) {
+  const pluginName = btn.dataset.plugin;
+  const titleEl = document.getElementById("system-confirm-title");
+  const pluginEl = document.getElementById("system-confirm-plugin");
+  const bodyEl = document.getElementById("system-confirm-body");
+  const okBtn = document.getElementById("system-confirm-ok-btn");
+  titleEl.textContent = "Turn on and give to everyone?";
+  pluginEl.textContent = pluginName;
+  bodyEl.innerHTML = `
+    <p style="margin: 0 0 10px;">This plugin is currently <strong>Off</strong>.
+      It will be turned back on and handed to <strong>every user</strong>.</p>
+    <ul style="margin: 0; padding-left: 20px;">
+      <li>It appears in every user's stack as <strong>Automatic</strong>, and they cannot remove it.</li>
+      <li>If the marketplace marks this plugin deprecated, the nightly sync will turn it Off again.</li>
+    </ul>`;
+  okBtn.textContent = "Turn on for everyone";
+  okBtn.classList.remove("btn-danger");
+  okBtn.classList.add("btn-primary");
+  okBtn.onclick = async () => {
+    okBtn.onclick = null;
+    closeModal("system-confirm-modal");
+    setReachBusy(btn, true);
+    try {
+      const base = `${API}/${encodeURIComponent(marketplaceId)}/plugins/${encodeURIComponent(pluginName)}`;
+      let r = await fetch(`${base}/enable`, { method: "POST", credentials: "include" });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.status);
+      r = await fetch(`${base}/system`, { method: "POST", credentials: "include" });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.status);
+      toast(`${pluginName} is now on for everyone`, "success");
+      openDetails(marketplaceId, marketplaceName);
+    } catch (e) {
+      toast(`Could not turn on: ${e.message}`, "error");
+      setReachBusy(btn, false);
+    }
+  };
+  openModal("system-confirm-modal");
 }
 
 function toggleSystem(btn, marketplaceId, marketplaceName) {
@@ -930,16 +1055,17 @@ function toggleSystem(btn, marketplaceId, marketplaceName) {
     // never fanned out into rows, so there is nothing left behind and
     // nothing of the admin's own is touched. Say that, and get out of
     // the way.
-    titleEl.textContent = "Make this plugin Optional?";
+    titleEl.textContent = "Limit this plugin to chosen groups?";
     pluginEl.textContent = pluginName;
     bodyEl.innerHTML = `
       <p style="margin: 0 0 10px;">Users stop getting this plugin automatically.
-        They can still add it themselves if a group of theirs is granted it.</p>
+        It goes back to reaching only the groups granted it on Access, who
+        choose whether to install it.</p>
       <ul style="margin: 0; padding-left: 20px;">
         <li>Nothing was written per group or per user, so nothing is left behind.</li>
         <li>Grants you set by hand on <a href="/admin/access" style="color: var(--ds-primary, #6366f1);">Access</a> are untouched.</li>
       </ul>`;
-    okBtn.textContent = "Make Optional";
+    okBtn.textContent = "Limit to groups";
     okBtn.classList.remove("btn-danger");
     okBtn.classList.add("btn-primary");
   } else {
@@ -996,9 +1122,9 @@ async function performToggleSystem(btn, marketplaceId, marketplaceName, isSystem
     }
     if (!isSystem) {
       // No counts to report: the change writes one flag, not N grants.
-      toast(`${pluginName} is now Automatic for everyone`, "success");
+      toast(`${pluginName} is now on for everyone`, "success");
     } else {
-      toast(`${pluginName} is now Optional`, "success");
+      toast(`${pluginName} is now By group`, "success");
     }
     // Reload the modal so the pill + button label refresh from a fresh fetch.
     openDetails(marketplaceId, marketplaceName);

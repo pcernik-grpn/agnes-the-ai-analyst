@@ -61,13 +61,17 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
     ),
     "marketplace_required": GrantSource(
         key="marketplace_required",
-        label="Required plugin",
+        # The same words the switch on /admin/marketplaces wears. An admin who
+        # met "Automatic" on this page and "system" on that one was learning
+        # two names for one idea, which is the defect (#1956 items 13 + 14);
+        # a third name here would have re-introduced it in the fix.
+        label="Automatic for everyone",
         surface="Marketplaces",
         href="/admin/marketplaces",
         revocable=False,
         reason=(
-            "This plugin is marked Required, which grants it to every group. "
-            "Turn Required off on Marketplaces to revoke it."
+            "Every user gets this plugin without asking. It is set by one "
+            "switch on Marketplaces, not by a grant here."
         ),
     ),
     "marketplace_sync": GrantSource(

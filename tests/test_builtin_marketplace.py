@@ -501,44 +501,54 @@ def test_next_nightly_sync_rolls_forward_on_the_boundary():
     assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
 
 
-def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
-    """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
-    checked meant admin_disabled=true, so switching it ON looked like it
-    should turn something *on* while it actually hid the plugin. #1913's
-    reporter mistook a checked (= hidden) toggle for "still active". The
-    control now presents as "Enabled": checked means the plugin is available
-    to users (admin_disabled=false); the underlying admin_disabled write is
-    unchanged, only the rendered semantics flip."""
+def test_plugin_reach_is_one_control_with_three_positions():
+    """#1956 items 13 + 14. Two switches (Enabled + the system control) drew
+    FOUR combinations for three real states: disabling clears the automatic
+    flag in the same write, so "off and automatic" was never expressible and
+    the reader had to work out which corner was fake. They were also not the
+    same kind of question — one is a kill switch, the other a distribution
+    choice — while being rendered as two identical widgets side by side.
+
+    One control, three positions, ordered by increasing reach. The state is
+    DERIVED from the two stored flags in a single expression, which is what
+    makes the phantom fourth state undrawable rather than merely discouraged.
+    """
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    assert "plugin-enabled-toggle" in template, "toggle wrapper class must be renamed off the inverted 'disable' name"
-    assert ">Enabled<" in template
-    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain anywhere in the markup"
-    assert '${isDisabled ? "" : "checked"}' in template, (
-        "checkbox must be checked when isDisabled is false (Enabled == ON)"
+
+    assert "plugin-reach" in template
+    for position in ('data-reach="off"', 'data-reach="group"', 'data-reach="all"'):
+        assert position in template, f"missing position: {position}"
+    assert ">Off<" in template and ">By group<" in template and ">Everyone<" in template
+
+    # ONE derivation, not two independent controls.
+    assert 'const reach = isDisabled ? "off" : (p.is_system ? "all" : "group");' in template, (
+        "the three positions must be derived from the two flags in one expression — "
+        "two independent bindings are what allowed the impossible fourth state"
     )
-    assert '${isDisabled ? "checked" : ""}' not in template, "the old inverted checked-binding must be gone"
 
-
-def test_both_plugin_states_are_the_same_widget():
-    """#1956 item 14c, answered rather than argued with. The first pass put
-    the Enabled toggle and the system-mark BUTTON in a shared wrapper so they
-    at least aligned; the reporter's actual complaint was that two on/off
-    states wore two different widgets. They are now both switches — the
-    Automatic control reuses `.plugin-enabled-toggle`, so it cannot drift
-    from its neighbour the way a separately-styled control did."""
-    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    assert "plugin-controls" in template
-    # Both controls are checkbox switches inside the shared toggle class.
-    assert 'data-action="toggle-disabled"' in template
-    assert 'data-action="toggle-system"' in template
-    assert "plugin-auto-toggle" in template
-    for action in ("toggle-disabled", "toggle-system"):
-        block = template.split(f'data-action="{action}"')[0]
-        assert block.rstrip().endswith('type="checkbox"'), (
-            f"{action} must be a checkbox switch, not a bespoke control"
-        )
-    # The bespoke button styling is gone with the button.
+    # The retired widgets and their inverted caption are gone.
+    assert 'data-action="toggle-disabled"' not in template
+    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain"
     assert ".plugin-system-btn {" not in template
+
+
+def test_no_user_facing_control_says_system():
+    """The word was the defect: /admin/access has said Optional / Automatic
+    about a grant since v49, and `is_system` is that same Automatic tier with
+    its scope fixed to everyone. Two names for one idea is what sent an admin
+    looking for a second concept that does not exist. The column keeps its
+    name; the UI does not."""
+    import re
+
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    # Comments are stripped first: this asserts on what a READER can see, and
+    # the history of a retired control is exactly the thing worth keeping in
+    # the source. A guard that cannot tell copy from commentary would push the
+    # next author to delete the explanation instead of the string.
+    visible = re.sub(r"<!--.*?-->|\{#.*?#\}|/\*.*?\*/", "", template, flags=re.S)
+    visible = re.sub(r"^\s*//.*$", "", visible, flags=re.M)
+    for banned in ("Mark as system", "Unmark system", ">SYSTEM<"):
+        assert banned not in visible, f"user-facing copy still says: {banned}"
 
 
 def test_plugin_system_control_carries_a_discoverable_explanation():
