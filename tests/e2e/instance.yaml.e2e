@@ -38,7 +38,7 @@ chat:
   per_session_bq_scan_bytes: 21474836480
   daily_anthropic_spend_usd: 20.0
   max_session_seconds: 14400
-  max_session_tokens: 200000
+  max_session_tokens: 2000000
   rate_messages_per_hour: 100
   tool_calls_per_turn_budget: 50
   marketplace_sha_debounce_seconds: 300
