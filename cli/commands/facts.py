@@ -140,13 +140,17 @@ def search_facts(
 def facts_type_map(
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
-    """Show every node type in the graph with a live count of what YOU can see.
+    """Show every node type AND every edge (relationship) type in the graph,
+    each with a live count of what YOU can see.
 
-    Each row is a way in: pass its TYPE to `agnes facts search` to list the
-    subjects behind the number. Counts are gated exactly as `search` is, so
-    a type's number is what you could reach and never a total that includes
-    evidence you cannot read. A type you have no visible subjects for is
-    omitted entirely rather than shown as 0.
+    Each node-type row is a way in: pass its TYPE to `agnes facts search` to
+    list the subjects behind the number. Each edge-type row is a valid
+    `--edge-types` value for `agnes facts neighbors` — check here BEFORE
+    traversing a well-connected subject, since omitting `--edge-types`
+    returns every relationship type it has. Counts are gated exactly as
+    `search`/`neighbors` are, so a number is what you could reach and never
+    a total that includes evidence you cannot read. A type you have no
+    visible subjects/edges for is omitted entirely rather than shown as 0.
     """
     resp = api_get("/api/facts/type-map")
     if resp.status_code != 200:
@@ -160,20 +164,29 @@ def facts_type_map(
         return
 
     types = data.get("types", [])
-    if not types:
-        typer.echo("No node types are visible to you.")
+    edge_types = data.get("edge_types", [])
+    if not types and not edge_types:
+        typer.echo("No node or edge types are visible to you.")
         typer.echo(
             "Either nothing has been extracted into the graph yet, or none of its evidence "
             "is in a collection you can read — ask an admin about collection grants."
         )
         return
 
-    width = max(len(t["type"]) for t in types)
-    typer.echo(f"{'TYPE':{width}s}  COUNT")
-    for t in types:
-        typer.echo(f"{t['type']:{width}s}  {t['count']}")
-    typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
-    typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+    if types:
+        width = max(len(t["type"]) for t in types)
+        typer.echo(f"{'TYPE':{width}s}  COUNT")
+        for t in types:
+            typer.echo(f"{t['type']:{width}s}  {t['count']}")
+        typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
+        typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+
+    if edge_types:
+        ewidth = max(len(t["type"]) for t in edge_types)
+        typer.echo(f"\n{'EDGE TYPE':{ewidth}s}  COUNT")
+        for t in edge_types:
+            typer.echo(f"{t['type']:{ewidth}s}  {t['count']}")
+        typer.echo("Run `agnes facts neighbors <ID> --edge-types <TYPE>` to traverse just that relationship.", err=True)
 
 
 @facts_app.command("facets")
@@ -224,11 +237,18 @@ def facts_facets(
 @facts_app.command("neighbors")
 def facts_neighbors(
     subject_id: str = typer.Argument(..., help="Fact id to traverse from (from `agnes facts search`)"),
-    edge_types: str = typer.Option("", "--edge-types", help="Comma-separated edge type filter (default: all)"),
+    edge_types: str = typer.Option(
+        "", "--edge-types", help="Comma-separated edge type filter — see `agnes facts type-map` (default: all)"
+    ),
     depth: int = typer.Option(1, "--depth", min=1, max=2, help="Traversal depth, 1 (default) or 2"),
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
     """Bounded graph traversal from one subject (depth <= 2).
+
+    Pass --edge-types when you know it — a well-connected subject can carry
+    many relationship types, and omitting --edge-types returns ALL of them.
+    Run `agnes facts type-map` first for a cheap list of valid edge type
+    names with a count each.
 
     Re-checks visibility at EVERY hop: an edge into a subject whose claims
     you cannot read is dropped silently, never revealed as "there but
