@@ -1726,6 +1726,11 @@ class ChatManager:
             live.current_pump = pump_task
             live.current_wait = wait_task
             self._repo.set_sandbox_paused_at(live.chat_id, None)
+            # The pause cancelled every task in live.tasks — a title task still
+            # awaiting the model included, which re-armed the flag on its way
+            # out (TCRD-290). Retry now: nothing else would, since a finished
+            # turn is not replayed.
+            self._retry_auto_title_if_untitled(live)
 
     async def _destroy_old_sandbox(self, session: "ChatSession") -> None:
         """Best-effort teardown of a session's paused sandbox before its
@@ -2631,7 +2636,7 @@ class ChatManager:
                 # rapid-fire assistant frames during crash-respawn replay
                 # don't both fire the call.
                 if not live.auto_title_started:
-                    self._maybe_start_auto_title(live)
+                    self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
@@ -4209,6 +4214,19 @@ class ChatManager:
         live.auto_title_started = True
         live.tasks.append(task)
 
+    def _retry_auto_title_if_untitled(self, live: LiveSession) -> None:
+        """Guarded ``_maybe_start_auto_title``: a scheduling failure (repo
+        hiccup, loop shutting down) is logged, never raised into the caller
+        — the WS pump and the resume path must not die for a cosmetic task —
+        and leaves the session re-armed for the next trigger."""
+        if live.auto_title_started:
+            return
+        try:
+            self._maybe_start_auto_title(live)
+        except Exception:
+            live.auto_title_started = False
+            logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
+
     async def announce_title(self, chat_id: str) -> bool:
         """Push the session's PERSISTED title as a ``session_renamed`` frame to
         every sink of its live session hosted in THIS process. Returns
@@ -4273,10 +4291,15 @@ class ChatManager:
                     ),
                 )
             except asyncio.CancelledError:
-                # Teardown (``kill`` cancels ``live.tasks``): stop here, never
-                # fall through to the fallback + persist below. CancelledError
-                # is a BaseException so ``except Exception`` would not catch
-                # it anyway — this makes the intent explicit.
+                # A pause or a kill cancels every task in ``live.tasks``, this
+                # one included. Stop here — never fall through to the fallback
+                # + persist below — but leave the session re-armed: a paused
+                # session is resumed with the same LiveSession, and
+                # ``_resume_live`` retries an untitled one right away instead
+                # of waiting for a message the user may never send.
+                # CancelledError is a BaseException so ``except Exception``
+                # would not catch it anyway — this makes the intent explicit.
+                live.auto_title_started = False
                 raise
             except Exception:
                 logger.exception(
@@ -4310,6 +4333,7 @@ class ChatManager:
                     live.chat_id,
                 )
         except asyncio.CancelledError:
+            live.auto_title_started = False
             raise
         except Exception:
             logger.exception("auto-title task crashed for %s", live.chat_id)

@@ -1084,6 +1084,94 @@ def test_overlapping_renames_are_announced_in_persistence_order(tmp_path: Path, 
     assert titles == ["First name", "Second name"], titles
 
 
+def test_backstop_scheduling_failure_does_not_break_the_pump(tmp_path: Path, monkeypatch):
+    """The assistant_message backstop schedules the title task from inside the
+    WS pump. A failure there must be logged and re-arm the session, never
+    propagate and take the live session down with it."""
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_ws_seated(manager, s.id, ws)
+
+        def boom(live):
+            live.auto_title_started = True
+            raise RuntimeError("cannot schedule")
+
+        monkeypatch.setattr(manager, "_maybe_start_auto_title", boom)
+        manager._repo.append_message(session_id=s.id, role="user", content="q")
+        handle.emit({"type": "assistant_message", "content": "a", "tokens_in": 1, "tokens_out": 1})
+        await _wait_for_frame(ws, "assistant_message")
+        # The pump is still alive: a later frame still reaches the sink.
+        handle.emit({"type": "token", "text": "still here"})
+        await _wait_for_frame(ws, "token")
+        flag = manager._live[s.id].auto_title_started
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return flag
+
+    assert asyncio.run(_run()) is False
+
+
+def test_cancelled_title_task_re_arms_and_resume_retries(tmp_path: Path, monkeypatch):
+    """A pause cancels every task in ``live.tasks`` — a title task still
+    awaiting the model included. The cancellation must re-arm the flag, and
+    the resume-side retry must then title the session without waiting for
+    another message."""
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def gen(_msg: str, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await release.wait()  # first attempt: parked, then cancelled
+        return "Titled after resume"
+
+    monkeypatch.setattr("app.chat.auto_title.generate_title", gen)
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_ws_seated(manager, s.id, ws)
+        live = manager._live[s.id]
+        await manager.send_user_message(s.id, "q?")
+        await asyncio.sleep(0.1)
+        assert live.auto_title_started is True
+        title_tasks = [t for t in live.tasks if t not in (live.current_pump, live.current_wait)]
+        assert len(title_tasks) == 1
+        # What _pause_live does to every task in live.tasks:
+        title_tasks[0].cancel()
+        await asyncio.gather(*title_tasks, return_exceptions=True)
+        flag_after_cancel = live.auto_title_started
+        # What _resume_live does once the runner is back:
+        manager._retry_auto_title_if_untitled(live)
+        await _wait_for_frame(ws, "session_renamed")
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return flag_after_cancel, manager._repo.get_session(s.id).title
+
+    flag_after_cancel, title = asyncio.run(_run())
+    assert flag_after_cancel is False
+    assert title == "Titled after resume"
+    assert calls["n"] == 2
+
+
 def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, monkeypatch):
     """An assistant_message with no persisted user row must not burn the
     per-session flag: the next trigger has to get another go, or the
