@@ -215,6 +215,35 @@ _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: 0 disables the cap. Not enforceable on every platform (notably macOS,
 #: where this repo's tests run) — see ``_install_memory_limit``.
 _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
+#: How long a single item's CONVERSION may run before its worker is killed
+#: and the file counted an ordinary, attributable ``convert_failed`` — the
+#: per-item TIME bound. Nothing previously bounded how long one document
+#: could occupy a worker slot: the run-level deadline (``extraction.
+#: timeout_s``) is only checked BETWEEN items, and a cooperative stop
+#: request is polled at those same quiescent points, so a single item stuck
+#: inside native conversion code made both unreachable. Observed on a live
+#: deployment: one file occupied a slot for over nine minutes — 9m16s of
+#: CPU and 5.8 GB RSS — with no bound at all; the run's deadline never
+#: fired, an operator's stop request went unanswered for 20+ minutes, and
+#: the kernel's OOM killer eventually ended the run, taking ~140 unrelated
+#: in-flight files down with it.
+#:
+#: This bound lives at the CONVERSION-SUBPROCESS boundary
+#: (:meth:`_ConvertProcessPool.convert`), not around the worker THREAD that
+#: calls :func:`_prepare_document` (hash -> convert -> anonymize): a Python
+#: thread cannot be forcibly cancelled, so a naive ``asyncio`` timeout
+#: around that thread would abandon the runaway call while it keeps running
+#: and keeps occupying one of this run's fixed ``ThreadPoolExecutor``
+#: slots — over a large crawl, repeated timeouts would eventually exhaust
+#: every slot and recreate the exact stall this bound exists to prevent,
+#: just delayed. The conversion child is the one span of an item's pipeline
+#: that already crosses an OS process boundary, so it is the one span that
+#: can be forcibly reclaimed (SIGKILL) without leaking anything — the same
+#: reasoning that motivated isolating conversion in its own process to
+#: begin with, extended from crash isolation to hang isolation.
+#: Configurable (``extraction.crawler.item_timeout_s``); 0 disables it (the
+#: pre-bound behaviour exactly).
+_DEFAULT_ITEM_TIMEOUT_S = 300
 #: Ceiling on the CONVERTED MARKDOWN a child is allowed to send back across
 #: the pipe, in MiB (0 disables). A THIRD, separate live-deployment finding
 #: from the two above: recycling and `RLIMIT_AS` both hold the CHILD's own
@@ -249,35 +278,6 @@ _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
 #: so a future change to either cannot silently make this one decorative
 #: again.
 _DEFAULT_MAX_CONVERTED_MB = 8
-#: How long a single item's CONVERSION may run before its worker is killed
-#: and the file counted an ordinary, attributable ``convert_failed`` — the
-#: per-item TIME bound. Nothing previously bounded how long one document
-#: could occupy a worker slot: the run-level deadline (``extraction.
-#: timeout_s``) is only checked BETWEEN items, and a cooperative stop
-#: request is polled at those same quiescent points, so a single item stuck
-#: inside native conversion code made both unreachable. Observed on a live
-#: deployment: one file occupied a slot for over nine minutes — 9m16s of
-#: CPU and 5.8 GB RSS — with no bound at all; the run's deadline never
-#: fired, an operator's stop request went unanswered for 20+ minutes, and
-#: the kernel's OOM killer eventually ended the run, taking ~140 unrelated
-#: in-flight files down with it.
-#:
-#: This bound lives at the CONVERSION-SUBPROCESS boundary
-#: (:meth:`_ConvertProcessPool.convert`), not around the worker THREAD that
-#: calls :func:`_prepare_document` (hash -> convert -> anonymize): a Python
-#: thread cannot be forcibly cancelled, so a naive ``asyncio`` timeout
-#: around that thread would abandon the runaway call while it keeps running
-#: and keeps occupying one of this run's fixed ``ThreadPoolExecutor``
-#: slots — over a large crawl, repeated timeouts would eventually exhaust
-#: every slot and recreate the exact stall this bound exists to prevent,
-#: just delayed. The conversion child is the one span of an item's pipeline
-#: that already crosses an OS process boundary, so it is the one span that
-#: can be forcibly reclaimed (SIGKILL) without leaking anything — the same
-#: reasoning that motivated isolating conversion in its own process to
-#: begin with, extended from crash isolation to hang isolation.
-#: Configurable (``extraction.crawler.item_timeout_s``); 0 disables it (the
-#: pre-bound behaviour exactly).
-_DEFAULT_ITEM_TIMEOUT_S = 300
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS
@@ -1090,6 +1090,11 @@ class CrawlStats:
     #: part of :meth:`report`'s contract (that stays unchanged); read only by
     #: :meth:`activity_snapshot`.
     recent: List[Dict[str, Any]] = field(default_factory=list, repr=False, compare=False)
+    #: How many successfully-ingested files (``new + changed``) had already
+    #: crossed a ``extraction.facts.stream_every`` threshold the last time
+    #: :meth:`facts_stream_due` fired — bookkeeping for that knob only, not
+    #: part of :meth:`report`'s contract.
+    _facts_stream_last_enqueued: int = field(default=0, repr=False, compare=False)
     #: Guards every counter above. Not compared, not printed — it is machinery.
     _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -1116,6 +1121,30 @@ class CrawlStats:
         with self._lock:
             self.in_flight -= 1
             self.item_seconds += max(0.0, seconds)
+
+    def facts_stream_due(self, stream_every: int) -> bool:
+        """True at most once per ``stream_every`` newly-ingested files —
+        ``new + changed`` crossing another multiple since the last time this
+        returned ``True``. ``stream_every <= 0`` (the knob off) always
+        returns ``False``.
+
+        The check and the bookkeeping update happen under the same lock as
+        every other counter, so two callers racing the same crossing can
+        never both see ``True`` for it — in practice this is only ever
+        called from one coroutine at a time (drives and pages both run
+        strictly sequentially within a run, see :func:`_crawl_drive`'s
+        docstring), but the lock costs nothing and keeps this field on the
+        same discipline as its neighbours rather than being the one
+        exception.
+        """
+        if stream_every <= 0:
+            return False
+        with self._lock:
+            ingested = int(self.new + self.changed)
+            if ingested - self._facts_stream_last_enqueued >= stream_every:
+                self._facts_stream_last_enqueued = ingested
+                return True
+            return False
 
     def throttle_snapshot(self) -> Tuple[int, float]:
         """``(http_429, throttle_wait_s)`` read atomically together.
@@ -2418,19 +2447,19 @@ class _ConvertProcessPool:
         recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
         recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
         memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
-        max_output_bytes: int = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024,
         timeout_s: float = 0.0,
+        max_output_bytes: int = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024,
     ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
         self._size = max(1, int(size))
         self._recycle_after_docs = max(0, int(recycle_after_docs))
         self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
         self._memory_limit_bytes = max(0, int(memory_limit_bytes))
-        self._max_output_bytes = max(0, int(max_output_bytes))
         #: Per-item CONVERSION bound — see :data:`_DEFAULT_ITEM_TIMEOUT_S`.
         #: 0 disables it (block on ``conn.recv()`` exactly as before this
         #: existed).
         self._timeout_s = max(0.0, float(timeout_s))
+        self._max_output_bytes = max(0, int(max_output_bytes))
         self._procs: List[Optional[Any]] = [None] * self._size
         self._conns: List[Optional[Connection]] = [None] * self._size
         self._doc_counts: List[int] = [0] * self._size
@@ -3726,6 +3755,10 @@ async def _crawl_drive(
             convert_pool=convert_pool,
             recorder=recorder,
         )
+        # `extraction.facts.stream_every` — a no-op page boundary check
+        # when the knob is off (0, the default). See
+        # `_maybe_stream_facts_extraction`'s docstring.
+        _maybe_stream_facts_extraction(connection_id, stats)
         if convert_pool is not None:
             # Safe HERE: `_process_page` has already joined this page's own
             # thread pool (if it made one) before returning, so no other
@@ -3829,19 +3862,6 @@ def _convert_child_memory_limit_bytes() -> int:
     return mb * 1024 * 1024
 
 
-def _max_converted_output_bytes() -> int:
-    """``extraction.crawler.max_converted_mb``, resolved to bytes — see
-    :data:`_DEFAULT_MAX_CONVERTED_MB`. 0 disables the cap."""
-    from app.instance_config import get_value
-
-    raw = get_value("extraction", "crawler", "max_converted_mb", default=_DEFAULT_MAX_CONVERTED_MB)
-    try:
-        mb = max(0, int(raw))
-    except (TypeError, ValueError):
-        mb = _DEFAULT_MAX_CONVERTED_MB
-    return mb * 1024 * 1024
-
-
 def _item_timeout_seconds() -> int:
     """``extraction.crawler.item_timeout_s`` — see
     :data:`_DEFAULT_ITEM_TIMEOUT_S`. 0 (or negative, or unparseable)
@@ -3853,6 +3873,19 @@ def _item_timeout_seconds() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return _DEFAULT_ITEM_TIMEOUT_S
+
+
+def _max_converted_output_bytes() -> int:
+    """``extraction.crawler.max_converted_mb``, resolved to bytes — see
+    :data:`_DEFAULT_MAX_CONVERTED_MB`. 0 disables the cap."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "max_converted_mb", default=_DEFAULT_MAX_CONVERTED_MB)
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_MAX_CONVERTED_MB
+    return mb * 1024 * 1024
 
 
 def _crawl_concurrency() -> int:
@@ -4012,6 +4045,142 @@ def _ocr_run_usage(scan_ocr_module: Any) -> Dict[str, Any]:
     return {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
 
 
+def _facts_stream_every() -> int:
+    """``extraction.facts.stream_every`` — enqueue a standalone
+    ``sharepoint-facts-extraction`` job for this connection after every N
+    successfully ingested files during a live crawl, so the fact graph
+    fills in WHILE a long crawl is still running rather than waiting for
+    the chained tail pass below. 0 (the default) disables this entirely —
+    the crawl's behaviour is then exactly what it was before this knob
+    existed: only the chained tail pass runs, after the crawl finishes.
+    Negative or unparseable values are treated as 0.
+
+    Needs the worker's EXTRACTION lane (``app/worker/runtime.py::
+    _extraction_concurrency`` / ``extraction.concurrency``) sized to at
+    least 2 for a streamed pass to actually OVERLAP the crawl still
+    running — at the default of 1, the lane has a single slot, so the
+    standalone job just queues behind (or ahead of) the crawl and runs
+    after it, same wall-clock ordering the chained pass would have given.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "stream_every", default=0)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+#: The job kind both the manual "run facts extraction now" trigger
+#: (``app/api/admin_sharepoint.py::trigger_facts_extraction``) and this
+#: module's streamed passes enqueue — one constant so a rename of either
+#: side cannot drift them apart.
+_FACTS_EXTRACTION_JOB_KIND = "sharepoint-facts-extraction"
+
+
+def _enqueue_streamed_facts_pass(connection_id: str) -> None:
+    """Enqueue one standalone ``sharepoint-facts-extraction`` job for this
+    connection — the SAME job kind, enqueue call and idempotency key
+    ``POST …/connections/{id}/facts-extract`` uses
+    (``app.api.admin_sharepoint._facts_extraction_idempotency_key``), so a
+    pass this streams and a manual trigger (or another streamed pass
+    already queued/running) can never both be in flight for the same
+    connection at once — ``enqueue()``'s own idempotency dedup collapses
+    onto whichever is already there.
+
+    That collapse is the DESIRED behaviour for a fast crawl crossing
+    several ``stream_every`` thresholds before a prior pass finishes — it
+    is what keeps this from piling up one job per threshold — so it is
+    logged at debug, never a warning. Also skips (debug) when the two
+    facts-extraction switches (``extraction.facts.enabled``,
+    ``facts.enabled``) are not both on — the same gate the manual trigger
+    checks BEFORE enqueueing (``_facts_extraction_readiness``), so this
+    never hands the worker a job that can only fail once claimed. Never
+    raises: called from deep inside the crawl's own page loop, and a
+    hiccup scheduling a bonus pass must not fail a crawl that is still
+    ingesting real documents.
+    """
+    from app.api.admin_sharepoint import _facts_extraction_idempotency_key, _facts_extraction_readiness
+    from src.repositories import jobs_repo
+
+    try:
+        usable, _error = _facts_extraction_readiness()
+        if not usable:
+            logger.debug(
+                "sharepoint crawl: connection %s — extraction.facts.stream_every is set but facts extraction "
+                "is not usable yet — not enqueueing a streamed pass",
+                connection_id,
+            )
+            return
+        job = jobs_repo().enqueue(
+            _FACTS_EXTRACTION_JOB_KIND,
+            {"connection_id": connection_id},
+            idempotency_key=_facts_extraction_idempotency_key(connection_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — a bonus pass must never fail the crawl
+        logger.debug(
+            "sharepoint crawl: connection %s — could not enqueue a streamed facts pass: %s", connection_id, exc
+        )
+        return
+    if job.get("deduped"):
+        logger.debug(
+            "sharepoint crawl: connection %s — streamed facts pass already queued/running (job %s), not piling up",
+            connection_id,
+            job.get("id"),
+        )
+    else:
+        logger.info(
+            "sharepoint crawl: connection %s — streamed facts-extraction job %s enqueued "
+            "(extraction.facts.stream_every)",
+            connection_id,
+            job.get("id"),
+        )
+
+
+def _maybe_stream_facts_extraction(connection_id: str, stats: "CrawlStats", *, final: bool = False) -> None:
+    """The crawl-side half of ``extraction.facts.stream_every``: called at
+    every page boundary (``final=False``) and once more after this run's
+    enumeration finishes (``final=True``, the tail flush — a remainder of
+    ingested files smaller than the next full threshold must not wait for
+    the chained pass below). A no-op whenever the knob is off (0, the
+    default) — the crawl's behaviour is then unchanged from before this
+    knob existed.
+    """
+    stream_every = _facts_stream_every()
+    if stream_every <= 0:
+        return
+    if final or stats.facts_stream_due(stream_every):
+        _enqueue_streamed_facts_pass(connection_id)
+
+
+def _standalone_facts_pass_in_flight(connection_id: str) -> bool:
+    """Whether a standalone ``sharepoint-facts-extraction`` job for this
+    connection is currently ``queued`` or ``running`` — checked at the
+    crawl's own CHAINED tail pass (:func:`maybe_run_facts_extraction`) so
+    the two can never interleave on the same per-connection facts state
+    (``connectors.sharepoint.facts_extraction``'s ``state_path``/
+    ``load_state``/``save_state`` — both a streamed/manual standalone pass
+    and the chained pass read-modify-write the SAME per-document
+    "already up to date" ledger).
+
+    No repository method exists for "jobs of this kind whose payload names
+    this connection" (adding one would touch the frozen ``jobs``
+    DuckDB↔Postgres pair for a query only this one caller needs — see
+    CONTRIBUTING.md's dual-backend discipline), so this filters
+    ``jobs_repo().list(kind=..., status=...)`` in Python instead — cheap,
+    since one instance's total row count for this job kind is small.
+    """
+    from src.repositories import jobs_repo
+
+    repo = jobs_repo()
+    for status in ("queued", "running"):
+        for job in repo.list(kind=_FACTS_EXTRACTION_JOB_KIND, status=status, limit=200):
+            payload = job.get("payload_json") or {}
+            if isinstance(payload, dict) and str(payload.get("connection_id")) == str(connection_id):
+                return True
+    return False
+
+
 def maybe_run_facts_extraction(
     connection: Dict[str, Any],
     *,
@@ -4041,7 +4210,23 @@ def maybe_run_facts_extraction(
     with no crawl run to attach to, e.g. a standalone facts trigger) simply
     runs the pass without a liveness checkpoint of its own — never an
     error, since a caller with no run row has nowhere to write one.
+
+    Returns ``None`` (WITHOUT even checking the enabled switches) when a
+    standalone ``sharepoint-facts-extraction`` job for this connection — a
+    streamed pass (``extraction.facts.stream_every``) or a manual trigger
+    — is already queued or running: see
+    :func:`_standalone_facts_pass_in_flight`. The two passes share the
+    same per-document ledger and must never run concurrently for one
+    connection.
     """
+    connection_id = str(connection.get("id"))
+    if _standalone_facts_pass_in_flight(connection_id):
+        logger.info(
+            "sharepoint crawl: connection %s — standalone pass in flight — skipping chained pass",
+            connection_id,
+        )
+        return None
+
     from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
 
     on_progress = None
@@ -4142,8 +4327,8 @@ async def _run_crawl_async(
         recycle_after_docs=_convert_recycle_after_docs(),
         recycle_rss_bytes=_convert_recycle_rss_bytes(),
         memory_limit_bytes=_convert_child_memory_limit_bytes(),
-        max_output_bytes=_max_converted_output_bytes(),
         timeout_s=_item_timeout_seconds(),
+        max_output_bytes=_max_converted_output_bytes(),
     )
     convert_pool.start()
     auth = GraphAuth(
@@ -4228,6 +4413,14 @@ async def _run_crawl_async(
             # processes before the (potentially long) facts stage below runs,
             # rather than leaving them idle for its whole duration.
             convert_pool.shutdown()
+
+        # `extraction.facts.stream_every`'s tail flush — once more, right as
+        # enumeration finishes, so a remainder of ingested files smaller than
+        # the next full threshold is not left to wait for the chained pass
+        # below (which may run much later, or be skipped entirely by it —
+        # see `_standalone_facts_pass_in_flight`). A no-op when the knob is
+        # off.
+        _maybe_stream_facts_extraction(connection_id, stats, final=True)
 
         # ---- the LLM stage (owner decision 2026-09-01) -------------------
         # Chained HERE, not in the worker handler, for three reasons: it

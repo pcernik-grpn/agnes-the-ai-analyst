@@ -2589,76 +2589,6 @@ def test_http_deleting_a_file_via_collections_api_sweeps_orphaned_subjects(tmp_p
     assert after.json()["subjects"] == []
 
 
-def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo):
-    """`_propose_duplicate_candidates` writes claimless `possible_duplicate_of`
-    edges, and `ingest_batch` finishes by calling `sweep_orphans()`, which
-    deleted every claimless edge — so each candidate was created and destroyed
-    inside the same call and the review queue never received one (Devin Review
-    on #2075).
-
-    End-to-end rather than on the SQL: ingest two documents whose entities
-    differ only the way the matching rule is meant to catch, then read the
-    collection's review items back through the surface a human actually sees.
-    """
-    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupa", doc_id="doc_dupa")
-    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
-
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb"
-    )
-    report = repo.ingest_batch(
-        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
-    )
-
-    assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"]), report["review_items"]
-
-    import sqlalchemy as sa
-
-    with repo._engine.connect() as conn:
-        surviving = conn.execute(
-            sa.text("SELECT count(*) FROM edges WHERE type = 'possible_duplicate_of'")
-        ).scalar_one()
-    assert surviving == 1, (
-        "the candidate must outlive the ingest that proposed it — a claimless "
-        "proposal is not an orphan"
-    )
-
-
-def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
-    """The other half of the same exception. A proposal carries no evidence,
-    so it must not count as the incident edge that anchors a fact through the
-    orphan sweep — otherwise a candidate between two facts whose claims are
-    all gone would keep both in the graph forever.
-
-    Note this one passes against the PRE-fix code too, and honestly so: there
-    the candidate was swept and could not anchor anything. It is a boundary
-    guard on the exception introduced beside it, not a regression test for the
-    reported bug — verified by removing the `e.type <> 'possible_duplicate_of'`
-    clause from the FACT sweep, which leaves two unevidenced facts standing."""
-    import sqlalchemy as sa
-
-    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupc", doc_id="doc_dupc")
-    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd"
-    )
-    repo.ingest_batch(
-        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
-    )
-
-    # Every claim gone — both facts are now unevidenced, and the only thing
-    # touching them is the proposal.
-    with repo._engine.begin() as conn:
-        conn.execute(sa.text("DELETE FROM claims"))
-    repo.sweep_orphans()
-
-    with repo._engine.connect() as conn:
-        facts_left = conn.execute(sa.text("SELECT count(*) FROM facts")).scalar_one()
-        edges_left = conn.execute(sa.text("SELECT count(*) FROM edges")).scalar_one()
-    assert facts_left == 0, "a proposal must not anchor a fact no document evidences"
-    assert edges_left == 0, "the proposal dies with its endpoints (ON DELETE CASCADE)"
-
-
 def test_moving_a_file_repoints_its_claims_at_the_new_collection(pg_env, repo):
     """`claims.corpus_id` is denormalized from `corpus_files` and is the
     column fact visibility is filtered on. Moving a file updated the file row
@@ -2756,3 +2686,73 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
         f"the document must be rebuilt once per file per batch, not once per quote; "
         f"joined {_CountingSeparator.calls} times for 5 boundary-crossing quotes"
     )
+
+
+def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo):
+    """`_propose_duplicate_candidates` writes claimless `possible_duplicate_of`
+    edges, and `ingest_batch` finishes by calling `sweep_orphans()`, which
+    deleted every claimless edge — so each candidate was created and destroyed
+    inside the same call and the review queue never received one (Devin Review
+    on #2075).
+
+    End-to-end rather than on the SQL: ingest two documents whose entities
+    differ only the way the matching rule is meant to catch, then read the
+    collection's review items back through the surface a human actually sees.
+    """
+    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupa", doc_id="doc_dupa")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
+
+    doc_b = _seed_second_doc(
+        text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb"
+    )
+    report = repo.ingest_batch(
+        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
+    )
+
+    assert any(ri["type"] == "possible_duplicate_of" for ri in report["review_items"]), report["review_items"]
+
+    import sqlalchemy as sa
+
+    with repo._engine.connect() as conn:
+        surviving = conn.execute(
+            sa.text("SELECT count(*) FROM edges WHERE type = 'possible_duplicate_of'")
+        ).scalar_one()
+    assert surviving == 1, (
+        "the candidate must outlive the ingest that proposed it — a claimless "
+        "proposal is not an orphan"
+    )
+
+
+def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
+    """The other half of the same exception. A proposal carries no evidence,
+    so it must not count as the incident edge that anchors a fact through the
+    orphan sweep — otherwise a candidate between two facts whose claims are
+    all gone would keep both in the graph forever.
+
+    Note this one passes against the PRE-fix code too, and honestly so: there
+    the candidate was swept and could not anchor anything. It is a boundary
+    guard on the exception introduced beside it, not a regression test for the
+    reported bug — verified by removing the `e.type <> 'possible_duplicate_of'`
+    clause from the FACT sweep, which leaves two unevidenced facts standing."""
+    import sqlalchemy as sa
+
+    doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupc", doc_id="doc_dupc")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
+    doc_b = _seed_second_doc(
+        text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd"
+    )
+    repo.ingest_batch(
+        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
+    )
+
+    # Every claim gone — both facts are now unevidenced, and the only thing
+    # touching them is the proposal.
+    with repo._engine.begin() as conn:
+        conn.execute(sa.text("DELETE FROM claims"))
+    repo.sweep_orphans()
+
+    with repo._engine.connect() as conn:
+        facts_left = conn.execute(sa.text("SELECT count(*) FROM facts")).scalar_one()
+        edges_left = conn.execute(sa.text("SELECT count(*) FROM edges")).scalar_one()
+    assert facts_left == 0, "a proposal must not anchor a fact no document evidences"
+    assert edges_left == 0, "the proposal dies with its endpoints (ON DELETE CASCADE)"

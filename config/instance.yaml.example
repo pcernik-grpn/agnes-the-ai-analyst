@@ -1465,6 +1465,19 @@ extraction:
     # the ceiling a single heavy document can still reach. 0 disables the
     # cap; not enforceable on every platform (notably macOS).
     convert_child_memory_limit_mb: 1536
+    # How long (seconds) a single item's CONVERSION may run before its
+    # worker is killed and the file counted an ordinary, attributable
+    # `convert_failed` -- the per-item TIME bound. Without it, nothing
+    # bounds how long one document can occupy a worker slot: the run's own
+    # `timeout_s` above is only checked BETWEEN items, and a cooperative
+    # stop request is polled at those same points, so a single stuck item
+    # makes both unreachable -- observed on a live deployment as one file
+    # occupying a slot for over nine minutes before the container's own
+    # memory limit, not this setting, ended the run. 300s (5 minutes) is
+    # generous enough for a legitimately large document on a loaded host
+    # while still keeping the worst case per file small against a corpus of
+    # thousands. 0 disables the bound (the pre-fix behaviour).
+    item_timeout_s: 300
     # Ceiling on the CONVERTED MARKDOWN a conversion worker is allowed to
     # send back to the crawl's main process, in MiB. A THIRD, separate
     # guard from the two above: recycling and the RLIMIT_AS cap both hold
@@ -1487,19 +1500,6 @@ extraction:
     # At 8 MiB an ordinary document passes untouched and the multi-byte
     # ones that really do reach double-digit megabytes are refused.
     max_converted_mb: 8
-    # How long (seconds) a single item's CONVERSION may run before its
-    # worker is killed and the file counted an ordinary, attributable
-    # `convert_failed` -- the per-item TIME bound. Without it, nothing
-    # bounds how long one document can occupy a worker slot: the run's own
-    # `timeout_s` above is only checked BETWEEN items, and a cooperative
-    # stop request is polled at those same points, so a single stuck item
-    # makes both unreachable -- observed on a live deployment as one file
-    # occupying a slot for over nine minutes before the container's own
-    # memory limit, not this setting, ended the run. 300s (5 minutes) is
-    # generous enough for a legitimately large document on a loaded host
-    # while still keeping the worst case per file small against a corpus of
-    # thousands. 0 disables the bound (the pre-fix behaviour).
-    item_timeout_s: 300
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.
@@ -1543,6 +1543,19 @@ extraction:
     # crawl for time, so it gets a budget of its own. 0 disables the bound
     # (unbounded), same convention as `extraction.timeout_s`.
     run_timeout_s: 3600
+    # Let fact extraction run WHILE a crawl is still going, without an
+    # external script: after every N successfully ingested files (and once
+    # more when enumeration finishes), the built-in crawler enqueues a
+    # standalone `sharepoint-facts-extraction` job for the connection — the
+    # SAME job kind and idempotency key `POST …/connections/{id}/facts-
+    # extract` uses, so a fast crawl crossing several thresholds before a
+    # prior pass finishes collapses onto one queued job rather than piling
+    # up. 0 (the default) disables this — only the chained tail pass runs,
+    # after the crawl finishes, exactly as before this knob existed. Needs
+    # the worker's EXTRACTION lane (`extraction.concurrency` above) sized
+    # to at least 2 for a streamed pass to actually OVERLAP the crawl still
+    # running; at the default of 1 it simply queues behind it.
+    stream_every: 0
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails
