@@ -1139,9 +1139,18 @@ chat:
   idle_ttl_seconds: 1800              # 30 min
   per_tool_call_seconds: 90
   per_session_bq_scan_bytes: 21474836480   # 20 GiB
+  # Per-sender daily spend estimate (USD; a message with no recorded model is
+  # priced at the most expensive general-purpose tier). 0 disables.
   daily_anthropic_spend_usd: 20.0
   max_session_seconds: 14400
-  max_session_tokens: 200000
+  # Tokens billed over ONE conversation's whole life (input + output + cache
+  # writes, summed over every turn) — NOT its context window, which the
+  # engine compacts on its own. An agentic turn re-sends the context on every
+  # tool call, so a busy conversation bills several hundred thousand tokens
+  # per turn and a value near the model's context size trips mid-conversation.
+  # A runaway-conversation guard, not the cost control (that is
+  # daily_anthropic_spend_usd). 0 disables.
+  max_session_tokens: 2000000
   rate_messages_per_hour: 100
   tool_calls_per_turn_budget: 50
   # How long the in-runner approval gate waits for the user to answer an
@@ -1529,6 +1538,55 @@ extraction:
     # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
     # the recall is worth that per-corpus bill.
     detector: "regex"
+    # OPTIONAL: point the `llm` tier at a SELF-HOSTED endpoint instead of the
+    # instance's cloud model credentials. Leave `base_url` empty (the
+    # default) and nothing here applies — the tier uses ANTHROPIC_API_KEY /
+    # LLM_API_KEY / Vertex ADC exactly as before.
+    #
+    # The endpoint must speak the Anthropic Messages shape
+    # (`POST {base_url}/v1/messages`); LiteLLM, vLLM's Anthropic route and
+    # similar proxies all expose it in front of a local model. That surface
+    # rather than OpenAI chat-completions because this tier needs per-call
+    # token `usage` and a cacheable system-prompt breakpoint.
+    #
+    # TWO GATES, both server-side and neither optional, because this whole
+    # section is admin-writable and this endpoint receives document text
+    # BEFORE anonymization — names, emails, account numbers:
+    #
+    #   1. The host of `base_url` must be listed in
+    #      AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST (comma-separated
+    #      host or host:port) in the server's environment. DEFAULT-CLOSED:
+    #      unset allows nothing, so an edited `base_url` cannot quietly
+    #      redirect documents off-network.
+    #   2. `api_key_env` may only name a variable under the
+    #      AGNES_ANONYMIZATION_LLM_ prefix. It is checked BEFORE the value is
+    #      read, so config cannot point it at the vault key, the anonymization
+    #      HMAC key, or a connector certificate and have that sent as a bearer
+    #      token — those are outside the namespace by construction.
+    #
+    # A misconfiguration here FAILS the anonymize pass; it never falls back
+    # to the cloud path. Falling back would either start billing a model the
+    # operator did not choose or ship documents somewhere they did not intend.
+    llm:
+      base_url: ""              # e.g. "https://llm.internal:8443"
+      # The id the endpoint serves, used VERBATIM — no tier resolution, so
+      # non-Claude ids are fine and required (e.g. "qwen3.5-9b").
+      model: ""
+      # Omit or leave empty for the default name
+      # (AGNES_ANONYMIZATION_LLM_API_KEY); any other AGNES_ANONYMIZATION_LLM_*
+      # name works too, for a deployment running more than one endpoint. An
+      # endpoint that wants no auth is fine — the variable simply stays unset.
+      api_key_env: ""
+      # Per-call output ceiling; 0 or unset uses the built-in 4096.
+      #
+      # Size this to the DEPLOYED MODEL, not to the expected answer. A model
+      # with a reasoning channel spends this same budget thinking before it
+      # answers and can exhaust it mid-thought, which arrives here as an
+      # empty reply and fails the document closed. A 20B reasoning model
+      # measured on real documents needed >16384 and still failed under
+      # concurrency; a model with no reasoning channel answered the same
+      # documents in ~200 tokens.
+      max_output_tokens: 0
     # Deterministic identifier tiers — the shapes a *name* detector cannot
     # find, because they are not names: they are decided from characters
     # alone. Each runs before entity substitution and each is individually
