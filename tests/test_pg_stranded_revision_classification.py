@@ -112,3 +112,28 @@ def test_unparsable_prefix_keeps_ahead_wording_with_a_stranded_hint(monkeypatch)
     assert "STRANDED" not in msg
     assert "#2086" in msg, "unparsable case must still mention the stranded possibility"
     assert "ffffffffffff" in msg
+
+
+def test_assert_never_mutates_schema_on_a_repairable_stranded_id(monkeypatch):
+    """``assert_pg_at_head()`` is the check-only path — even when the
+    stranded id has a registered repair, it must only name the repair, not
+    apply it (``ensure_pg_at_head()`` owns applying it)."""
+    import src.db_pg as db_pg
+
+    assert "0077_facts_ingest_runs" in db_pg.RENUMBERED_REVISION_REPAIRS, (
+        "this test documents the behavior for a REGISTERED repair; if the "
+        "fixture id below stops being registered, point it at whichever "
+        "key currently is"
+    )
+    _patch_revisions(monkeypatch, "0077_facts_ingest_runs", "0095_memory_detection_runs", True)
+    calls = []
+    monkeypatch.setattr(
+        db_pg,
+        "_apply_renumbered_revision_repair",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    with pytest.raises(RuntimeError):
+        db_pg.assert_pg_at_head()
+
+    assert calls == [], "assert_pg_at_head() must never apply a repair itself"

@@ -18,6 +18,7 @@ alembic.ini                              ; Alembic config, no DB URL
 migrations/                              ; revision chain
   env.py                                 ; reads DATABASE_URL / AGNES_DB_URL (legacy alias)
   script.py.mako
+  shipped_revision_ids.txt               ; append-only ratchet — every id ever shipped (issue #2086)
   versions/
     0001_baseline.py                     ; empty anchor
     0002_audit_log.py
@@ -183,6 +184,101 @@ DATABASE_URL=... alembic upgrade head --sql > /tmp/up.sql
 DATABASE_URL=... alembic revision --autogenerate -m "your message"
 # (then hand-review the file in migrations/versions/)
 ```
+
+## A database stranded by a renumbered revision
+
+Revision ids are immutable once shipped — see
+`migrations/shipped_revision_ids.txt`, the append-only manifest
+`tests/test_alembic_revision_ratchet.py` checks on every PR. This section is
+what to do when that discipline was violated before the ratchet existed
+(issue #2086: `facts_ingest_runs` shipped as `0077_facts_ingest_runs`, then
+got renumbered to `0078_facts_ingest_runs` when `0077_ontology_drafts` was
+inserted ahead of it).
+
+**What the state is.** A database that had already applied the OLD id is
+stamped in `alembic_version` at a string no image's `migrations/versions/`
+contains any more — not the current one, not any past or future one, because
+the id itself stopped existing the moment it was renamed. `assert_pg_at_head`
+cannot tell this apart from a plain app rollback by the stamped string alone,
+so it disambiguates using this repo's strict `NNNN_name` numbering: an
+unknown id whose leading 4-digit prefix is <= the shipped head's prefix
+cannot have come from a newer image (a newer image's head number only goes
+up), so it must be a **STRANDED** database rather than one that is merely
+**AHEAD** — a distinct `RuntimeError` names the id and says so, instead of
+telling the operator to "roll the image forward" (impossible: no image knows
+that id) or restore a backup (usually unnecessary: the database's data is
+fine, only its migration bookkeeping is confused).
+
+**Why stamping forward without applying the skipped revision is unsafe.** The
+stranded id is missing exactly the migration(s) that were inserted ahead of
+it when it got renumbered — in the #2086 case, the `ontology_drafts` table.
+Simply `UPDATE alembic_version SET version_num = '<the new id>'` would tell
+Alembic "you are here" for a database that is NOT actually there: every
+later migration that assumes `ontology_drafts` exists (a `add_column` on it,
+a foreign key into it, …) now runs against a schema silently missing it, and
+future `alembic upgrade head` runs never revisit the gap because, as far as
+Alembic is concerned, that step is already behind it.
+
+**The automatic repair.** `src/db_pg.py`'s `RENUMBERED_REVISION_REPAIRS` maps
+a stranded id to the revision(s) that were inserted ahead of it and the id
+that now occupies its old position in the chain. `ensure_pg_at_head()` (the
+self-migrating startup path — see "Adding a PG-only feature" below for how
+that path fits together) checks the DB's stamped revision against this map
+before its normal behind-head upgrade: on a match it applies the listed
+revision(s)' DDL directly, then atomically re-stamps `alembic_version` to the
+map's target id (guarded by `WHERE version_num = <the stranded id>` plus a
+rowcount check), then falls through to the ordinary upgrade-to-head — so one
+boot cycle both repairs the gap and catches the database up to the image's
+real head. The repair tolerates a half-applied prior attempt (a crash
+between applying the DDL and re-stamping, or an operator having applied the
+same DDL by hand already): each listed revision runs its own DDL inside a
+savepoint, and a duplicate-object error is treated as "already done" rather
+than crashing the boot loop. `assert_pg_at_head()` — the check-only path used
+where `ensure_pg_at_head()` doesn't run — never applies this repair itself;
+it only names it.
+
+**Generic manual recipe**, for a stranding this map does not (yet) cover, or
+for an operator who wants to apply the fix by hand instead of relying on the
+next boot's auto-repair:
+
+```bash
+# 1. Identify the gap: which revision(s) exist in the CURRENT chain between
+#    the stranded id's old position and where it was renumbered to. Read the
+#    migration file(s)' upgrade() bodies — do not guess; a botched CREATE TABLE
+#    against a database whose real state you're unsure of is the failure mode
+#    this whole section exists to avoid.
+
+# 2. Apply exactly that DDL by hand (adapt column/table names — this is
+#    illustrative, not literal SQL to paste):
+psql "$DATABASE_URL" -c '
+    CREATE TABLE <the_skipped_table> (
+        id VARCHAR PRIMARY KEY,
+        ...
+    );
+    CREATE INDEX <the_skipped_index> ON <the_skipped_table> (...);
+'
+
+# 3. Re-stamp alembic_version — guarded by WHERE + a rowcount check so an
+#    unexpected concurrent change is caught rather than silently overwritten:
+psql "$DATABASE_URL" -c "
+    UPDATE alembic_version
+       SET version_num = '<the id that now occupies the old position>'
+     WHERE version_num = '<the stranded id>';
+"
+# Confirm exactly one row changed ("UPDATE 1") before continuing.
+
+# 4. Restart the app. ensure_pg_at_head() (or a manual `alembic upgrade
+#    head`) picks up from the freshly-stamped id and migrates the rest of
+#    the way normally — the stranded id no longer matches any
+#    RENUMBERED_REVISION_REPAIRS key, so this is now an ordinary
+#    behind-head upgrade.
+```
+
+Whichever path is used, **never renumber a revision id to "fix" this** — that
+only moves the strand to whichever id gets reused. Register the repair in
+`RENUMBERED_REVISION_REPAIRS` once identified, so the next database (or the
+next operator) that hits the same stranded id self-heals on its next boot
+instead of needing this recipe again.
 
 ## Adding a PG-only feature (post-A3)
 
