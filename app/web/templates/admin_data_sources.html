@@ -2400,6 +2400,46 @@ function _sharepointIdentityLine(config) {
   return bits.join(" · ");
 }
 
+/* Per-connection facts-extraction policy override (retry_mode / transport) —
+   `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Its own
+   render helper, its own save function (`saveSpFactsPolicy` below), so this
+   control never entangles with the run-options row or the "Extract facts
+   now" button it sits next to. The two selects read the CONNECTION-level
+   override straight off `row.config.extraction.facts` — the same rows
+   payload `loadConnections()` already fetched, no extra round trip — and an
+   empty selection ("Instance default") means "no override", exactly what
+   the PATCH body's `null` clears. The resolved value and its source
+   ("connection"/"instance") are shown only after Save, from the endpoint's
+   own response — there is no resolver on this side to guess it beforehand. */
+function _extRenderFactsPolicy(row) {
+  const facts = ((row.config || {}).extraction || {}).facts || {};
+  const retryMode = typeof facts.retry_mode === "string" ? facts.retry_mode : "";
+  const transport = typeof facts.transport === "string" ? facts.transport : "";
+  const opt = (current, value, label) =>
+    `<option value="${_esc(value)}"${current === value ? " selected" : ""}>${_esc(label)}</option>`;
+  const label = _esc(row.name || row.id || "");
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy and API transport (cost levers). Leave both on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
+    <span class="ds-src__fact-v">
+      <select id="ds-sp-factspolicy-retry-${row.id}" class="ds-dropdown-native" aria-label="Facts retry mode for ${label}">
+        ${opt(retryMode, "", "Instance default")}
+        ${opt(retryMode, "off", "Off")}
+        ${opt(retryMode, "on_gate_fail", "On gate fail")}
+        ${opt(retryMode, "always", "Always")}
+      </select>
+      <select id="ds-sp-factspolicy-transport-${row.id}" class="ds-dropdown-native" aria-label="Facts transport for ${label}">
+        ${opt(transport, "", "Instance default")}
+        ${opt(transport, "sync", "Sync")}
+        ${opt(transport, "batch", "Batch")}
+      </select>
+      <span class="field-hint" id="ds-sp-factspolicy-status-${row.id}"></span>
+    </span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="saveSpFactsPolicy('${row.id}')">Save</button></span>
+  </div>`;
+}
+
 /* File-source card body (spec §13.2 "Source card"): schedule (static text —
    the crawl runs externally), certificate (origin + set-date, NEVER the
    value), identity matching (fail-closed grant coverage), and error badges
@@ -2633,6 +2673,7 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-v">${factsParts.join(" · ")}</span>
     <span class="ds-src__fact-a"><button type="button" id="ext-facts-btn-${row.id}" class="btn btn-secondary" data-facts-ready="${factsReady ? "1" : "0"}" ${factsReady ? "" : "disabled"} title="${_esc(factsUnreadyText)}" onclick="runSpFactsExtraction('${row.id}')">Extract facts now</button></span>
   </div>
+  ${_extRenderFactsPolicy(row)}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
@@ -3345,6 +3386,61 @@ async function runSpFactsExtraction(id) {
   } catch (e) {
     resultEl.className = "ds-conn-test-result show fail";
     resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
+   `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Both
+   selects are always sent — the empty "Instance default" option maps to
+   `null`, which the endpoint reads as "clear the override", the same
+   least-surprise reading the endpoint's own docstring describes. The
+   response carries the RESOLVED value and its source ("connection" once an
+   override is set, "instance" once cleared) — shown here rather than
+   guessed, since this page has no copy of the instance-level default to
+   resolve against itself. */
+async function saveSpFactsPolicy(id) {
+  const retrySel = document.getElementById(`ds-sp-factspolicy-retry-${id}`);
+  const transportSel = document.getElementById(`ds-sp-factspolicy-transport-${id}`);
+  const statusEl = document.getElementById(`ds-sp-factspolicy-status-${id}`);
+  if (!retrySel || !transportSel) return;
+  const body = {
+    retry_mode: retrySel.value || null,
+    transport: transportSel.value || null,
+  };
+  if (statusEl) statusEl.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/facts-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const rm = respBody.retry_mode || {};
+      const tr = respBody.transport || {};
+      if (statusEl) statusEl.textContent = `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source})`;
+      showToast("Facts policy saved.", true);
+      // Keep the in-memory row current — a later `renderConnList()` (e.g.
+      // after `loadConnections()`) must redraw the just-saved override, not
+      // the value the page loaded with.
+      const conn = _connections.find((c) => c.id === id);
+      if (conn) {
+        conn.config = conn.config || {};
+        conn.config.extraction = conn.config.extraction || {};
+        const facts = { ...(conn.config.extraction.facts || {}) };
+        if (body.retry_mode === null) delete facts.retry_mode; else facts.retry_mode = body.retry_mode;
+        if (body.transport === null) delete facts.transport; else facts.transport = body.transport;
+        conn.config.extraction.facts = facts;
+      }
+    } else {
+      if (statusEl) statusEl.textContent = "";
+      showToast(detailMessage(respBody, "failed to save the facts policy"), false);
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast("Request failed", false);
   }
 }
 

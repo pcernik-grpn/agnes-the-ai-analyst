@@ -1668,7 +1668,9 @@ Works on both app-state backends, same as `…/extraction/stop`. Audited as
 `extraction.facts_retry_mode_set` — the handler writes its own row (more than
 the fallback middleware could say: the requested value, the resolved value
 and its source). CLI: `agnes admin sharepoint facts-config <connection_id>
---retry-mode <mode>` / `--clear`.
+--retry-mode <mode>` / `--clear`. The same two overrides (retry mode and
+transport) are also settable from the SharePoint source card on
+`/admin/data-sources`, for an admin with no server or CLI access.
 
 The four `GET`/stop routes above are admin-only display primitives with no
 analyst CLI/MCP analogue. The fleet endpoint and `facts-config` are both
