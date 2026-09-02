@@ -2044,6 +2044,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         html = result["html"]
         assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
         assert "Re-process everything (ignore the delta cursor)" in html
         assert "all 12 documents" in html
         assert "not just what changed" in html
@@ -2054,6 +2055,7 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
         assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
         assert "every document" in html
 
     def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):

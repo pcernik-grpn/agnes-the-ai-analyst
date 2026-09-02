@@ -2625,6 +2625,11 @@ function _sharepointFactsHtml(row) {
       Re-process everything (ignore the delta cursor)
     </label>
     <span class="field-hint" style="flex-basis:100%;">${_esc(forceReprocessHelp)}</span>
+    <label class="field-hint" for="ds-sp-runopts-resync-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-resync-${row.id}">
+      Re-enumerate from scratch (drop the change cursor, keep already-ingested files)
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">Use after widening a crawl filter or when the change cursor ran past files it never ingested: every folder is listed again, but a file whose content is unchanged is not re-downloaded.</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
@@ -3261,10 +3266,13 @@ async function runSpExtraction(id) {
   }
   const forceEl = document.getElementById(`ds-sp-runopts-force-${id}`);
   const forceReprocess = !!(forceEl && forceEl.checked);
+  const resyncEl = document.getElementById(`ds-sp-runopts-resync-${id}`);
+  const resync = !!(resyncEl && resyncEl.checked);
   const overrides = {};
   if (conc !== null) overrides.concurrency = conc;
   if (timeout !== null) overrides.timeout_s = timeout;
   if (forceReprocess) overrides.force_reprocess = true;
+  if (resync) overrides.resync = true;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
