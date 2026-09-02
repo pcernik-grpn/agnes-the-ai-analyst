@@ -91,7 +91,31 @@
      or _path.startswith('/admin/data-packages'))
    ) or _path.startswith('/admin/linked-apps') %}
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
-<nav class="rail{% if _admin_page %} rail-icon-mode{% endif %}" aria-label="Primary"
+{# Does this page render the ADMIN SECONDARY NAV (`_admin_nav.html`, via
+   base_admin.html / base_admin_page.html)? If it does, the collapsed rail must
+   not PEEK OPEN ON HOVER: the peek is a 240px overlay and that column is 200px
+   wide starting at the rail's own edge, so a stray pointer pass erased the
+   navigation the caller was actually using (#1956 item 6). `.rail-no-hover-peek`
+   turns the hover half of the peek off; the keyboard `:focus-within` half
+   stays, because that is deliberate and it is the only way a caller tabbing
+   through the strip reads the labels. Hovering a single row still names it —
+   the label unfurls beside the icon as a chip instead of the whole column
+   opening (rail.css).
+
+   `_admin_page` is the same test, which is why it is reused rather than
+   restated: every /admin/* page renders that column EXCEPT the three Library
+   builders, and those are exactly what `_admin_page` already excludes (all
+   three extend `base_index.html`).
+
+   A PATH is only a guess at what a template will render, though — an /admin
+   route whose feature flag is off answers with the plain error page, which has
+   no second column. So the class is rendered here for FIRST PAINT (a hover
+   cannot be waiting on JS to know whether it may peek) and reconciled against
+   the DOM by js/rail_toggle.js the moment the document is parsed: `.admin-nav`
+   present adds it, absent removes it. Same division of labour as
+   `.rail-icon-mode` directly above — the server supplies the value that has to
+   be right before paint, and script owns the truth. #}
+<nav class="rail{% if _admin_page %} rail-icon-mode rail-no-hover-peek{% endif %}" aria-label="Primary"
      data-rail-context="{{ 'admin' if _admin_page else 'app' }}">
     <script>
       (function () {
