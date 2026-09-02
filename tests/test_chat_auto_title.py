@@ -975,7 +975,39 @@ def test_manual_rename_during_title_generation_is_not_overwritten(tmp_path: Path
     manager, chat_id, ws = asyncio.run(_run())
     persisted = manager._repo.get_session(chat_id)
     assert persisted is not None and persisted.title == "My own name"
-    assert not [m for m in ws.sent if m.get("type") == "session_renamed"], ws.sent
+    # The losing task announces the USER's title to the session's sinks (a
+    # co-driver's sidebar), never the model's.
+    renamed = [m for m in ws.sent if m.get("type") == "session_renamed"]
+    assert [m["title"] for m in renamed] == ["My own name"], ws.sent
+
+
+def test_announce_title_reaches_local_sinks_only(tmp_path: Path):
+    """The rename endpoint's broadcast: every sink of a live session hosted
+    here gets ``session_renamed``; a session not live in this process is a
+    no-op that reports ``False``."""
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_ws_seated(manager, s.id, ws)
+        hit = await manager.announce_title(s.id, "Renamed by hand")
+        miss = await manager.announce_title("chat_not_live_here", "x")
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return hit, miss, ws
+
+    hit, miss, ws = asyncio.run(_run())
+    assert hit is True and miss is False
+    renamed = [m for m in ws.sent if m.get("type") == "session_renamed"]
+    assert len(renamed) == 1 and renamed[0]["title"] == "Renamed by hand"
 
 
 def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, monkeypatch):

@@ -4206,6 +4206,23 @@ class ChatManager:
         live.auto_title_started = True
         live.tasks.append(task)
 
+    async def announce_title(self, chat_id: str, title: str) -> bool:
+        """Push a ``session_renamed`` frame for ``chat_id`` to every sink of
+        its live session hosted in THIS process. Returns ``False`` (and does
+        nothing) when the session is not live here — after a rename the
+        initiating browser updates itself from the HTTP response, so this is
+        what keeps a co-driver's or a second tab's sidebar current.
+
+        Local-only by design: in a role-split deployment the sinks live on the
+        owning gateway, and an api-role process has no LiveSession to reach.
+        Best-effort — a dropped socket is handled inside ``_broadcast``.
+        """
+        live = self._live.get(chat_id)
+        if live is None:
+            return False
+        await self._broadcast(live, {"type": "session_renamed", "chat_id": chat_id, "title": title})
+        return True
+
     async def _run_auto_title(self, live: LiveSession) -> None:
         """Task body: fetch the first user message, ask the model for a
         title — falling back to a cut of the message itself when the model
@@ -4261,11 +4278,17 @@ class ChatManager:
             if not title:
                 return
             # Conditional write: the user may have renamed the chat while we
-            # were awaiting the model, and their name wins. No broadcast
-            # then either — the rename endpoint already announced theirs.
+            # were awaiting the model, and their name wins. Announce THEIR
+            # title to this session's sinks rather than the model's — the
+            # rename endpoint reaches only sinks hosted in its own process, so
+            # on the owning gateway this is what a co-driver's sidebar sees.
             if not self._repo.set_title_if_unset(live.chat_id, title):
                 logger.debug("auto-title: %s was titled meanwhile (user rename); keeping it", live.chat_id)
-                return
+                current = self._repo.get_session(live.chat_id)
+                if current is not None and current.title:
+                    title = current.title
+                else:
+                    return
             # Push the new title to the live WS so the sidebar +
             # thread header update without a refresh. _broadcast may
             # raise if the socket has dropped — swallow it; the

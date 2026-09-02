@@ -361,6 +361,16 @@ async def rename_session(
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
     repo.set_title(chat_id, title)
+    # Tell every sink of the live session about the new name — the caller's
+    # own tab updates from this response, a co-driver's or a second tab's
+    # sidebar does not. Local-process only (see ChatManager.announce_title)
+    # and never a reason to fail the rename itself.
+    mgr = getattr(request.app.state, "chat_manager", None)
+    if mgr is not None:
+        try:
+            await mgr.announce_title(chat_id, title)
+        except Exception:
+            logger.debug("rename: session_renamed broadcast failed for %s (non-fatal)", chat_id, exc_info=True)
     return {"id": chat_id, "title": title}
 
 
