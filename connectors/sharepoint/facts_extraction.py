@@ -73,6 +73,7 @@ import re
 import secrets
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -124,6 +125,20 @@ DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
 
+#: Wall-clock budget for a STANDALONE run (``run_standalone_facts_extraction``
+#: — the ``sharepoint-facts-extraction`` job kind / ``POST …/facts-extract``
+#: / ``agnes admin sharepoint facts-extract``), in seconds. Deliberately its
+#: OWN knob, never the crawl's ``extraction.timeout_s``: a crawl-chained pass
+#: (``maybe_run_after_crawl``) shares the crawl's budget by construction — a
+#: long crawl can leave it little or nothing (observed: a 900s crawl left the
+#: chained pass an already-EXPIRED deadline, and it stopped after 3
+#: documents) — but an operator asking "build the graph over what we already
+#: have" is not fighting a crawl for time at all, and should not have their
+#: run silently capped by an unrelated budget. Configurable
+#: (``extraction.facts.run_timeout_s``); 0 disables it (unbounded), same
+#: convention as the crawl's own ``timeout_s``.
+DEFAULT_STANDALONE_TIMEOUT_S = 3600
+
 
 class FactsExtractionUnavailable(RuntimeError):
     """The model did not answer, so this pass cannot be trusted.
@@ -155,16 +170,46 @@ def facts_extraction_enabled() -> bool:
     )
 
 
-def _facts_surface_enabled() -> bool:
+def facts_surface_enabled() -> bool:
     """``facts.enabled`` — the feature flag guarding the fact graph itself.
 
     Checked separately from the cost switch above: writing claims into an
     instance whose whole ``/api/facts*`` surface answers 404 would spend
-    money producing data nobody can read.
+    money producing data nobody can read. Public (not ``_``-prefixed): both
+    ``maybe_run_after_crawl`` (this module) and
+    :func:`run_standalone_facts_extraction` below gate on it, and
+    ``app.api.admin_sharepoint``'s standalone-trigger readiness check reads
+    it too, before a job is even enqueued.
     """
     from app.instance_config import feature_enabled
 
     return bool(feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False))
+
+
+def _standalone_timeout_seconds() -> float:
+    """``extraction.facts.run_timeout_s`` — see
+    :data:`DEFAULT_STANDALONE_TIMEOUT_S`. 0 (or negative, or unparseable)
+    disables the bound (unbounded)."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "run_timeout_s", default=DEFAULT_STANDALONE_TIMEOUT_S)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_STANDALONE_TIMEOUT_S)
+
+
+class FactsExtractionDisabled(RuntimeError):
+    """Raised by :func:`run_standalone_facts_extraction` when either of the
+    two gates ``maybe_run_after_crawl`` already enforces for the
+    crawl-chained pass (``extraction.facts.enabled``, ``facts.enabled``) is
+    off. Loud, unlike the crawl seam's silent ``None``: a standalone
+    trigger only ever runs because an admin (or a script calling
+    ``agnes admin sharepoint facts-extract``) explicitly asked for it, so a
+    silent no-op would look like a hang, not a refusal — the same reasoning
+    ``_run_corpus_extraction``'s own ``sharepoint.enabled`` guard already
+    applies to the crawl job kind.
+    """
 
 
 def resolve_concurrency() -> Tuple[int, str]:
@@ -500,17 +545,26 @@ def quote_is_verbatim(quote: str, *, chunk_texts: Sequence[str], filename: Optio
     """The server-side gate, evaluated here BEFORE the claim is shipped.
 
     Both halves come straight from :mod:`src.repositories.facts_pg` — the
-    meaningfulness floor and the whole-unit identity candidates — imported
-    rather than re-implemented, so this pre-check can never be more
-    permissive than the gate that will actually judge it. The substring
-    test is per CHUNK, never against the concatenation, exactly as the gate
-    does it (spec §8: "a quote cannot cross a boundary").
+    meaningfulness floor, the whole-unit identity candidates, and the
+    chunk-join separator — imported rather than re-implemented, so this
+    pre-check can never disagree with the gate that will actually judge it.
+    The substring test tries each CHUNK first (the common, cheap case), then
+    falls back to the document's FULL joined text — exactly what the model
+    was shown (`_document_text` below) — so a quote that genuinely spans an
+    internal chunk boundary the model itself never saw as a boundary still
+    counts as verbatim (cost-levers spec 2026-09-02 §2.1(b)/§2.2; was
+    previously "the substring test is per chunk, never against the
+    concatenation" — spec §8's original, narrower statement). Still
+    byte-exact either way: this widens WHERE the gate looks, never WHAT
+    counts as a match.
     """
-    from src.repositories.facts_pg import _identity_candidates, _is_meaningful_quote
+    from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR, _identity_candidates, _is_meaningful_quote
 
     if not quote or not _is_meaningful_quote(quote):
         return False
     if any(quote in text for text in chunk_texts):
+        return True
+    if quote in CHUNK_JOIN_SEPARATOR.join(chunk_texts):
         return True
     return quote in _identity_candidates(filename, path)
 
@@ -556,6 +610,148 @@ def _fact_key(fact: dict) -> str:
         return json.dumps(fact, sort_keys=True, ensure_ascii=False)
     except (TypeError, ValueError):
         return repr(fact)
+
+
+# --------------------------------------------------------------------------
+# Deterministic quote repair — cost-levers spec 2026-09-02 §2.1(a)/§2.2.
+#
+# Before spending a second full-document model call on the corrective
+# retry, try to REPAIR a failing quote at zero token cost: a PDF/DOCX
+# conversion routinely introduces byte-level artifacts (a curly apostrophe,
+# an NFC/NFD form, a non-breaking space, a soft hyphen, a doubled space)
+# that make the model's honest reproduction of a passage fail a byte-exact
+# substring test. This does NOT weaken the gate — `quote_is_verbatim` above
+# stays byte-exact — it locates where in the document's REAL, stored text
+# a quote's normalized form appears, and substitutes those REAL bytes for
+# the model's own (possibly slightly-off) rendering. A quote with no
+# unique match is left untouched and falls through to the existing
+# corrective retry exactly as before.
+# --------------------------------------------------------------------------
+
+
+def _build_confusable_classes() -> Dict[str, str]:
+    """Groups of punctuation a document-conversion pipeline and a model's
+    own reproduction of it routinely disagree on. Each group folds to a
+    single regex character class, so either side's spelling matches the
+    other's. Whitespace (incl. non-breaking space, which Python's ``\\s``
+    already treats as whitespace) is handled separately, per RUN, not here."""
+    groups = (
+        "'‘’`´",  # apostrophe variants
+        '"“”„',  # double-quote variants
+        "-‐‑‒–—−",  # hyphen/dash variants
+    )
+    mapping: Dict[str, str] = {}
+    for group in groups:
+        char_class = "[" + "".join(re.escape(c) for c in group) + "]"
+        for char in group:
+            mapping[char] = char_class
+    return mapping
+
+
+_CONFUSABLE_CLASSES = _build_confusable_classes()
+
+#: Invisible line-break hint a PDF's hyphenation may or may not have left in
+#: the extracted text at a given point — the model, reading the RENDERED
+#: word, never saw it either way. Matched as optional between every literal
+#: character below, never inside a whitespace run.
+_SOFT_HYPHEN = "­"
+
+
+def _char_pattern(ch: str) -> str:
+    char_class = _CONFUSABLE_CLASSES.get(ch)
+    if char_class:
+        return char_class
+    # NFC composes the QUOTE up front (see `_quote_search_pattern`), so any
+    # remaining decomposed form here belongs to the HAYSTACK: match either
+    # the composed character or its canonical decomposition, so an NFD-
+    # stored chunk (base + combining mark) still matches an NFC quote.
+    decomposed = unicodedata.normalize("NFD", ch)
+    if decomposed != ch:
+        return "(?:" + re.escape(ch) + "|" + re.escape(decomposed) + ")"
+    return re.escape(ch)
+
+
+def _quote_search_pattern(quote: str) -> "re.Pattern[str] | None":
+    """A regex that finds ``quote`` as it would look once the handful of
+    conversion artifacts above are accounted for — never a fuzzy/approximate
+    match. Every match this pattern finds is REAL, already-present text in
+    whatever it is run against; nothing here invents characters."""
+    normalized = unicodedata.normalize("NFC", quote)
+    if not normalized:
+        return None
+    parts: List[str] = []
+    in_space_run = False
+    for ch in normalized:
+        if ch.isspace():
+            if not in_space_run:
+                parts.append(r"\s+")
+                in_space_run = True
+            continue
+        in_space_run = False
+        parts.append(_char_pattern(ch))
+    if not parts:
+        return None
+    pattern = (re.escape(_SOFT_HYPHEN) + "?").join(parts)
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
+def snap_quote_to_source(quote: str, *, document_text: str) -> Optional[str]:
+    """Repair ONE failing verbatim quote deterministically, at zero model
+    cost. ``document_text`` is the SAME joined text `quote_is_verbatim`
+    checks against (chunks in order, `CHUNK_JOIN_SEPARATOR`-joined) — a
+    single haystack search covers both a normalization mismatch within one
+    chunk and one that also happens to cross a chunk boundary.
+
+    Returns the exact substring of ``document_text`` a unique normalized
+    match produced, or ``None`` if there is no match or more than one
+    DISTINCT matching span — an ambiguous quote is left for the corrective
+    retry, never guessed at.
+    """
+    from src.repositories.facts_pg import _is_meaningful_quote
+
+    if not quote or not _is_meaningful_quote(quote):
+        return None
+    pattern = _quote_search_pattern(quote)
+    if pattern is None:
+        return None
+    found: set = set()
+    for match in pattern.finditer(document_text):
+        found.add(match.group(0))
+        if len(found) > 1:
+            return None
+    if len(found) != 1:
+        return None
+    return next(iter(found))
+
+
+def repair_verbatim_failures(
+    failures: Sequence[Tuple[dict, str]],
+    *,
+    document_text: str,
+) -> int:
+    """Apply :func:`snap_quote_to_source` to every failing quote IN PLACE
+    (mutating the ``evidence`` entry the failure came from) and return how
+    many were repaired. The caller re-runs :func:`verbatim_failures`
+    afterward — a fact can carry more than one evidence entry, and this
+    only ever sees the FIRST bad one per fact (`verbatim_failures`' own
+    contract), so a second, still-bad quote on an otherwise-repaired fact
+    must be re-discovered, not assumed away."""
+    repaired = 0
+    for fact, bad_quote in failures:
+        evidence = fact.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for entry in evidence:
+            if isinstance(entry, dict) and entry.get("quote") == bad_quote:
+                fixed = snap_quote_to_source(bad_quote, document_text=document_text)
+                if fixed is not None:
+                    entry["quote"] = fixed
+                    repaired += 1
+                break
+    return repaired
 
 
 # --------------------------------------------------------------------------
@@ -809,11 +1005,12 @@ def _document_text(file_id: str) -> Tuple[List[str], str]:
     produce quotes the gate then rejects for whitespace it never saw.
     """
     from src.repositories import corpus_chunks_repo
+    from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
 
     chunks = [
         (c.get("text") or "") for c in corpus_chunks_repo().list_for_file(file_id) if (c.get("text") or "").strip()
     ]
-    return chunks, "\n\n".join(chunks)
+    return chunks, CHUNK_JOIN_SEPARATOR.join(chunks)
 
 
 # --------------------------------------------------------------------------
@@ -842,6 +1039,7 @@ class _Report:
         self.docs_truncated = 0
         self.facts_failed = 0
         self.facts_quotes_dropped = 0
+        self.facts_quotes_repaired = 0
         self.facts_retries = 0
         self.parse_errors = 0
         self.nodes_emitted = 0
@@ -896,6 +1094,7 @@ class _Report:
             "docs_truncated": self.docs_truncated,
             "facts_failed": self.facts_failed,
             "facts_quotes_dropped": self.facts_quotes_dropped,
+            "facts_quotes_repaired": self.facts_quotes_repaired,
             "facts_retries": self.facts_retries,
             "parse_errors": self.parse_errors,
             "nodes_emitted": self.nodes_emitted,
@@ -1109,6 +1308,7 @@ class _DocResult:
         edges: List[dict],
         dropped: int,
         retried: bool,
+        repaired: int,
         parse_errors: int,
         seconds: float,
     ) -> None:
@@ -1117,13 +1317,14 @@ class _DocResult:
         self.edges = edges
         self.dropped = dropped
         self.retried = retried
+        self.repaired = repaired
         self.parse_errors = parse_errors
         self.seconds = seconds
 
 
 def extract_one(extractor: Any, work: _Work) -> _DocResult:
-    """The whole per-document LLM half: call, verbatim-check, ONE corrective
-    retry, drop-and-count.
+    """The whole per-document LLM half: call, verbatim-check, deterministic
+    repair, ONE corrective retry, drop-and-count.
 
     Pure with respect to this process's shared state — it reads nothing but
     its ``work`` and returns a result — which is exactly why it can run in
@@ -1138,6 +1339,19 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
 
     kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
     failures = verbatim_failures([*nodes, *edges], **kwargs)
+    repaired = 0
+    if failures:
+        from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
+
+        # Zero-token repair BEFORE the corrective retry (cost-levers spec
+        # §2.2): most first-attempt failures are a byte-level artifact, not
+        # a fabrication, and the retry cannot tell the difference either —
+        # it just pays for a second full-document call to find out. Joined
+        # text, not per-chunk, so a repair can also rescue a quote that
+        # crosses a chunk boundary (§2.1(b)), same as `quote_is_verbatim`.
+        repaired = repair_verbatim_failures(failures, document_text=CHUNK_JOIN_SEPARATOR.join(work.chunk_texts))
+        if repaired:
+            failures = verbatim_failures([*nodes, *edges], **kwargs)
     retried = False
     dropped = 0
     if failures:
@@ -1177,6 +1391,7 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
         edges=edges,
         dropped=dropped,
         retried=retried,
+        repaired=repaired,
         parse_errors=parse_errors,
         seconds=round(time.time() - started, 1),
     )
@@ -1205,6 +1420,7 @@ def run_facts_extraction(
     extractor: Any | None = None,
     max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
     concurrency: Optional[int] = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -1228,6 +1444,21 @@ def run_facts_extraction(
     composition included, and a run at 8 differs only in wall clock.
     ``concurrency`` overrides the configured value (the test seam for
     that).
+
+    ``on_progress`` is the liveness seam (owner-frustration fix,
+    2026-09-02: a healthy multi-hour pass over this phase alone read as
+    ``stalled`` because nothing here ever checkpointed). Called with
+    ``{"docs_done", "docs_total", "current_path"}`` once before the first
+    submission (so a caller wired to a run recorder can flip its phase to
+    "facts" immediately, before any document finishes) and again after
+    every document this pass drains — successful or failed, since a
+    document that errored is still one fewer left. ``docs_total`` is the
+    number of documents SUBMITTED so far, not the corpus size: like the
+    crawl's own ``files_seen``, it grows as the walk discovers more
+    candidates and is only final once the walk is exhausted — never
+    invented ahead of that. Exceptions from the callback are swallowed:
+    this is observability, never load-bearing, the same posture every
+    other progress signal in this pipeline takes.
 
     Returns the pass report (see :meth:`_Report.render`).
     """
@@ -1398,6 +1629,7 @@ def run_facts_extraction(
         report.parse_errors += result.parse_errors
         report.facts_retries += 1 if result.retried else 0
         report.facts_quotes_dropped += result.dropped
+        report.facts_quotes_repaired += result.repaired
         claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
         shipper.add(
             document={
@@ -1438,6 +1670,27 @@ def run_facts_extraction(
     # batches in the same order regardless of which worker finished first.
     inflight: "deque[Tuple[Future, _Work]]" = deque()
     hard_stop: Optional[BaseException] = None
+    #: Documents that left the queue because the MODEL was unavailable, not
+    #: because they failed on their own content. Kept apart from
+    #: `report.facts_failed`, which is a reported metric meaning "this
+    #: document's own extraction failed" — an unavailable model says nothing
+    #: about the document. But the progress count below is "no longer in
+    #: flight", and without this it stayed one short for the whole drain,
+    #: contradicting the comment that drives it (Devin Review on #2059).
+    docs_unavailable = 0
+    #: Documents SUBMITTED so far — the honest, growing denominator
+    #: `_report_progress` reports as `docs_total` (see the docstring above:
+    #: same "not final until the walk is exhausted" contract `files_seen`
+    #: already has on the crawl side).
+    docs_planned = 0
+
+    def _report_progress(*, docs_done: int, current_path: Optional[str] = None) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress({"docs_done": docs_done, "docs_total": docs_planned, "current_path": current_path})
+        except Exception as exc:  # noqa: BLE001 — progress reporting is observability, never load-bearing
+            logger.debug("facts extraction: progress callback failed (%s) — continuing", type(exc).__name__)
 
     def _drain_one() -> None:
         """Consume the oldest in-flight document.
@@ -1448,11 +1701,12 @@ def run_facts_extraction(
         instead of raised here, so the remaining in-flight calls (already
         paid for) still get drained before the pass stops.
         """
-        nonlocal hard_stop
+        nonlocal hard_stop, docs_unavailable
         future, work = inflight.popleft()
         try:
             _accept(future.result())
         except FactsExtractionUnavailable as exc:
+            docs_unavailable += 1
             if hard_stop is None:
                 hard_stop = exc
         except Exception as exc:  # noqa: BLE001 — one document, not the pass
@@ -1463,9 +1717,23 @@ def run_facts_extraction(
                 type(exc).__name__,
                 exc,
             )
+        # Reported for BOTH branches above (and the hard-stop one): a
+        # document that errored, or the one whose failure just set
+        # `hard_stop`, is still one fewer left in flight — the checkpoint
+        # this drives must move even on a run that is about to fail.
+        _report_progress(
+            docs_done=report.docs_extracted + report.facts_failed + docs_unavailable,
+            current_path=work.path or work.filename,
+        )
 
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agnes-facts")
     try:
+        # Fired once, before the first submission, with `docs_total=0`: the
+        # honest "we don't know yet" value — but it is what lets a caller
+        # wired to a run recorder flip the row's `phase` to "facts"
+        # immediately, rather than only once the (possibly slow) first
+        # document finishes.
+        _report_progress(docs_done=0)
         for work in _plan():
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
@@ -1476,6 +1744,7 @@ def run_facts_extraction(
                 break
             if hard_stop is not None:
                 break
+            docs_planned += 1
             inflight.append((executor.submit(extract_one, extractor, work), work))
             while len(inflight) >= workers:
                 _drain_one()
@@ -1527,20 +1796,88 @@ def run_facts_extraction(
     return rendered
 
 
-def maybe_run_after_crawl(connection: Dict[str, Any], *, deadline: Any | None = None) -> Optional[Dict[str, Any]]:
+def maybe_run_after_crawl(
+    connection: Dict[str, Any],
+    *,
+    deadline: Any | None = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Optional[Dict[str, Any]]:
     """The crawl's chaining seam — returns ``None`` when this pass is off.
 
     Two switches, both of which must be on: ``extraction.facts.enabled``
     (the cost gate for this stage) and ``facts.enabled`` (the fact graph
     itself — writing claims into an instance whose ``/api/facts*`` surface
     answers 404 would spend money producing data nobody can read).
+
+    ``on_progress`` is passed straight through to :func:`run_facts_extraction`
+    — see its docstring for the liveness contract.
     """
     if not facts_extraction_enabled():
         return None
-    if not _facts_surface_enabled():
+    if not facts_surface_enabled():
         logger.info(
             "facts extraction: extraction.facts.enabled is on but facts.enabled is off — "
             "skipping the pass rather than writing claims no surface can serve"
         )
         return None
-    return run_facts_extraction(str(connection["id"]), deadline=deadline)
+    return run_facts_extraction(str(connection["id"]), deadline=deadline, on_progress=on_progress)
+
+def run_standalone_facts_extraction(
+    connection_id: str,
+    *,
+    doc_ids: Optional[Sequence[str]] = None,
+    timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Run one fact-extraction pass OUTSIDE a crawl, over whatever this
+    connection's collections already hold — the operator's OWN trigger
+    (the ``sharepoint-facts-extraction`` job kind, ``POST
+    …/connections/{id}/facts-extract``, ``agnes admin sharepoint
+    facts-extract``), never the crawl's tail call.
+
+    Two things this buys that :func:`maybe_run_after_crawl` cannot:
+
+    1. **No crawl required.** ``run_facts_extraction``'s own ``_plan()``
+       walks whatever is already ``processing_status='indexed'`` in the
+       connection's collections — a corpus already sitting in
+       ``corpus_files`` from a PAST crawl is exactly what it reads, so
+       "build the graph over what we already have" needs nothing new from
+       the crawler. Before this existed, the only way to (re)build the
+       graph was to re-run an entire crawl just to reach the pass chained
+       onto its tail.
+    2. **Its OWN wall-clock budget** — ``timeout_s`` (falling back to
+       ``extraction.facts.run_timeout_s``, :data:`DEFAULT_STANDALONE_TIMEOUT_S`
+       when not given), never the crawl's ``extraction.timeout_s``. A crawl
+       that runs long can leave a CHAINED pass no time at all — observed on
+       a live deployment: a 900s crawl left ``maybe_run_after_crawl``'s pass
+       an already-expired deadline, and it stopped after 3 documents. A
+       standalone run is not fighting a crawl for time, so it gets a budget
+       of its own.
+
+    Same two gates as :func:`maybe_run_after_crawl` (``facts_extraction_
+    enabled()``, :func:`facts_surface_enabled`) — both must be on — but LOUD
+    (raises :class:`FactsExtractionDisabled`) rather than returning ``None``:
+    this only ever runs because something explicitly asked for it, so a
+    silent no-op would look like a hang, not a refusal.
+
+    ``deadline`` reuses ``connectors.sharepoint.crawler._Deadline`` — the
+    exact type :func:`run_facts_extraction` already accepts from the crawl
+    seam (duck-typed on ``.expired()``, see ``_deadline_expired`` above) —
+    rather than inventing a second implementation of the same wall-clock
+    bound.
+    """
+    if not facts_extraction_enabled():
+        raise FactsExtractionDisabled(
+            "extraction.facts.enabled is off — turn it on before running a standalone facts-extraction pass "
+            "(it is the cost gate: this stage spends model tokens per document)"
+        )
+    if not facts_surface_enabled():
+        raise FactsExtractionDisabled(
+            "facts.enabled is off — turn it on before running a standalone facts-extraction pass "
+            "(writing claims into a surface nothing can read is never useful)"
+        )
+
+    from connectors.sharepoint.crawler import _Deadline
+
+    resolved_timeout = _standalone_timeout_seconds() if timeout_s is None else timeout_s
+    deadline = _Deadline(resolved_timeout)
+    return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)
