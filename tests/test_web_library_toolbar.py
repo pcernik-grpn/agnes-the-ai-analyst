@@ -9,6 +9,8 @@ classification.
 """
 
 from __future__ import annotations
+
+import pathlib
 import pytest
 
 import io
@@ -516,3 +518,117 @@ def test_chip_label_keeps_a_name_that_ends_in_a_number(seeded_app):
     js = seeded_app["client"].get("/static/js/filter_toolbar.js").text
     assert "var span = opt.querySelector('.fbar-menu__opt-text');" in js
     assert "if (!span) txt = txt.replace(/\\s+\\d+\\s*$/, '');" in js
+
+
+# ---------------------------------------------------------------------------
+# The filter menu's own height. Entity facets took the Library from five
+# categories to nine (eleven on a fully-granted instance), which is what broke
+# the assumption the CSS opt-out below was written on.
+# ---------------------------------------------------------------------------
+
+_TOOLBAR_CSS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/css/filter_toolbar.css"
+_TOOLBAR_JS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/js/filter_toolbar.js"
+
+
+def test_a_category_menu_is_not_exempt_from_the_height_cap():
+    """`.fbar-menu--cats` used to set `overflow: visible; max-height: none`,
+    because a popover positioned `absolute` inside it was clipped. The popover
+    has been `position: fixed` since collision detection moved into the JS, so
+    the exemption bought nothing and cost the menu its scrolling — with nine
+    categories, Clear/Done sat below the fold of a 720px window."""
+    css = _TOOLBAR_CSS.read_text(encoding="utf-8")
+    assert ".fbar-menu--cats { overflow: visible; max-height: none; }" not in css
+    # The BASE rule, anchored at the start of a line: the single-category form
+    # deliberately re-positions its own popover `static` (it is the menu, not a
+    # popover beside one), and a loose substring search finds that one first.
+    base = [ln for ln in css.splitlines() if ln.startswith(".fbar-cat__pop {")]
+    assert base, "the base popover rule must exist"
+    body = css.split(base[0], 1)[1].split("}")[0]
+    assert "position: fixed" in base[0] + body, (
+        "the default popover must stay `fixed` — it is what lets the menu scroll without clipping it"
+    )
+
+
+def test_the_clamp_does_not_fight_the_menus_own_scrolling():
+    """The clamp must not clear `max-height` to re-measure: dropping the cap
+    momentarily removes the overflow, which resets `scrollTop` to 0 — and the
+    re-clamp runs on a capture-phase window `scroll` listener, so it fires on
+    the MENU's own scrolling. The menu snapped back to the top on every wheel
+    tick and read as unscrollable. The stylesheet's cap is cached instead, and
+    a scroll originating inside the menu skips the clamp entirely."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    body = js.split("function clampMenuHeight()")[1].split("\n    }")[0]
+    assert "style.maxHeight = ''" not in body.split("var top")[0], (
+        "clearing the inline cap before measuring is what reset scrollTop"
+    )
+    assert "cssMenuMaxHeight" in body, "the stylesheet's cap must be cached, not re-read"
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
+    assert "menuEl.contains(e.target)" in replacer, "a scroll from inside the menu must not trigger a re-clamp"
+
+
+def test_an_open_submenu_is_re_placed_when_the_menu_itself_scrolls():
+    """The popover is `position: fixed`, so it does not follow the row it points
+    at — it has to be re-placed. A `scroll` event on an element does not bubble,
+    and leaning on it reaching a window capture listener left the popover
+    stranded beside a row that had scrolled away. A listener bound directly to
+    the menu cannot be missed."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "on(menuEl, 'scroll'" in js, "the menu needs its own scroll listener"
+    handler = js.split("on(menuEl, 'scroll'")[1][:300]
+    assert "placeSubmenu(open)" in handler
+    assert "clampMenuHeight" not in handler, (
+        "the menu's own scrolling must not re-clamp its height — that is what reset scrollTop"
+    )
+
+
+def test_the_menu_is_clamped_to_the_room_below_its_trigger():
+    """A CSS `max-height` is a limit on height and says nothing about where the
+    menu starts, so a toolbar partway down the page can still push the footer
+    off-screen. The clamp measures live rects, like every other coordinate in
+    this component, and must run when the menu opens and whenever the anchor
+    moves."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "function clampMenuHeight()" in js
+    assert "innerHeight" in js.split("function clampMenuHeight()")[1][:600]
+    # The whole function body, not a fixed slice: the single-category cleanup
+    # now sits between the signature and the clamp call.
+    opener = js.split("function openMenu(open)")[1].split("\n    }")[0]
+    assert "clampMenuHeight()" in opener, "the clamp must run on open"
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
+    assert "clampMenuHeight()" in replacer, "…and again when the page moves or resizes under it"
+
+
+# ---------------------------------------------------------------------------
+# Page structure. Four chrome tiers stood between the lede and the first row —
+# Definitions panel, toolbar, tabs, type map — and a reader could not tell
+# which was the page's real structure. These pin the decisions that fixed it.
+# ---------------------------------------------------------------------------
+
+_LIBRARY_HTML = pathlib.Path(__file__).resolve().parents[1] / "app/web/templates/library.html"
+
+
+def test_a_chip_opens_only_its_own_filter():
+    """The Filter button means "narrow this list" and the whole vocabulary
+    belongs on screen. A chip means "change THIS one" — answering that with
+    eleven categories makes the reader find their way back to the filter they
+    were already pointing at."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    css = _TOOLBAR_CSS.read_text(encoding="utf-8")
+    assert "openCategory(f.key, true)" in js, "a chip asks for the single-category form"
+    assert "fbar-menu--single" in js and "fbar-menu--single" in css
+    # Closing must drop it, or the next press of Filter answers with one category.
+    closer = js.split("function openMenu(open)")[1].split("\n    }")[0]
+    assert "remove('fbar-menu--single')" in closer
+    # In single mode the siblings and the footer are gone.
+    rule = [ln for ln in css.splitlines() if ln.startswith(".fbar-menu--single .fbar-cat:not(.is-single)")]
+    assert rule or ".fbar-cat:not(.is-single) { display: none; }" in css
+
+
+def test_the_library_does_not_restyle_the_shared_chip():
+    """One chip design across the platform. This page used to quieten the
+    component — transparent fill, muted text, its own height — which made the
+    Library's chips a different control from the ones on /admin/access, and
+    killed the component's own hover into the bargain (same specificity, later
+    in the document)."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert ".library-page .fbar-chip" not in html

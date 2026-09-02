@@ -322,7 +322,7 @@
       // stopPropagation: the document-level "click outside closes the menu"
       // listener would otherwise fire on this same event and shut the popover
       // being opened (the chip row sits outside the menu).
-      edit.addEventListener('click', function (e) { e.stopPropagation(); openCategory(f.key); });
+      edit.addEventListener('click', function (e) { e.stopPropagation(); openCategory(f.key, true); });
       var x = document.createElement('button');
       x.type = 'button';
       x.className = 'fbar-chip__x';
@@ -501,23 +501,61 @@
     // `position: fixed` does not follow the anchor, so re-place the open submenu
     // when the page moves or resizes under it. Capture phase, to catch scrolling
     // inside an ancestor as well as the window.
-    function replaceOpenSubmenu() {
+    function replaceOpenSubmenu(e) {
       if (!menuEl) return;
+      // The menu's room below the trigger changes with the same events, so
+      // re-clamp before re-placing — otherwise a resize leaves the menu the
+      // height the OLD viewport allowed. Scrolling INSIDE the menu is the one
+      // case to skip: it cannot move a menu anchored to its trigger, and
+      // re-clamping on it is how the menu's own scrolling fought the reader.
+      if (!(e && e.target && e.target.nodeType === 1 && menuEl.contains(e.target))) {
+        clampMenuHeight();
+      }
       var open = qs('.fbar-cat.is-open', menuEl);
       if (open) placeSubmenu(open);
     }
-    on(global, 'resize', replaceOpenSubmenu);
+    // A resize changes what the stylesheet's `vh` cap resolves to, so drop the
+    // cached value before re-clamping.
+    on(global, 'resize', function (e) { cssMenuMaxHeight = null; replaceOpenSubmenu(e); });
     on(global, 'scroll', replaceOpenSubmenu, true);
+    //: The menu's OWN scrolling, on a listener bound directly to it. The window
+    //: capture listener above is meant to cover this — but a `scroll` event does
+    //: not bubble, and relying on it reaching an ancestor is what left a
+    //: `position: fixed` popover stranded beside the row it no longer points at
+    //: once the menu grew tall enough to scroll. A direct listener cannot be
+    //: missed. Re-places only: the menu's height is unaffected by its own
+    //: scrolling (see `replaceOpenSubmenu`).
+    if (menuEl) {
+      on(menuEl, 'scroll', function () {
+        var open = qs('.fbar-cat.is-open', menuEl);
+        if (open) placeSubmenu(open);
+      });
+    }
 
     // Open the Filter menu with ONE category's options showing — what a chip
     // click does, so a filter is edited where it was applied. A TOGGLE facet has
     // no category row and no submenu: it sits in the menu itself, so opening the
     // menu and focusing its checkbox is the whole affordance.
-    function openCategory(key) {
+    //: Opening the menu from a CHIP is a different request from opening it from
+    //: the Filter button. The button means "narrow this list" and the whole
+    //: vocabulary belongs on screen; a chip means "change THIS one", and
+    //: answering that with eleven categories makes the reader find their way
+    //: back to the filter they were already pointing at. `only` therefore
+    //: renders the menu with just that category — its siblings, the toggles
+    //: above them and the footer are all hidden by `.fbar-menu--single`.
+    function openCategory(key, only) {
       if (!menuEl) return;
       openMenu(true);
+      menuEl.classList.toggle('fbar-menu--single', !!only);
+      if (only) menuEl.setAttribute('data-single-cat', key); else menuEl.removeAttribute('data-single-cat');
       var cat = qs('.fbar-cat[data-cat="' + key + '"]', menuEl);
-      qsa('.fbar-cat', menuEl).forEach(function (c) { setCatOpen(c, c === cat); });
+      qsa('.fbar-cat', menuEl).forEach(function (c) {
+        // In single mode the one category is not a collapsed row to expand —
+        // it IS the menu, so its options show in place rather than in a
+        // popover beside a list that is not there.
+        c.classList.toggle('is-single', !!only && c === cat);
+        setCatOpen(c, c === cat);
+      });
       // A long category opens with the caret in its search field: the reader came
       // here to change a selection they can name, and on that list finding the
       // value is the work. Short ones focus the first option, as before.
@@ -859,10 +897,55 @@
     }
 
     // ── menu open/close ──
+    //: The menu is capped by CSS at a share of the viewport (`max-height: 60vh`),
+    //: which is a limit on its HEIGHT and says nothing about where it starts. A
+    //: toolbar sits partway down the page, so a menu that is comfortably under
+    //: 60vh can still end below the fold — which is what happened when the
+    //: Library's filter menu grew entity facets: nine categories, and Clear/Done
+    //: off the bottom of the window. Clamp to the room actually below the
+    //: trigger, measured from live rects like every other coordinate in this
+    //: component, and let the CSS cap stand when it is the smaller of the two.
+    //: Only ever REDUCES the height, so a short menu is untouched.
+    var MENU_EDGE = 8;    //: keep this clear of the viewport's bottom edge
+    var MENU_FLOOR = 160; //: never clamp below this — a scrollable stub beats none
+    //: The stylesheet's own cap, read ONCE while no inline height is set. It has
+    //: to be cached rather than re-read: clearing the inline value to re-measure
+    //: momentarily removes the overflow, which drops the menu's `scrollTop` to
+    //: 0 — and because the re-clamp runs on a capture-phase window `scroll`
+    //: listener, that fires on the MENU's own scrolling too. The menu snapped
+    //: back to the top on every wheel tick, i.e. read as "it won't scroll".
+    var cssMenuMaxHeight = null;
+
+    function clampMenuHeight() {
+      if (!menuEl || menuEl.hidden) return;
+      if (cssMenuMaxHeight === null) {
+        var declared = parseFloat(global.getComputedStyle(menuEl).maxHeight);
+        cssMenuMaxHeight = isFinite(declared) ? declared : Infinity;
+      }
+      // The menu is anchored under its trigger, so its top does not depend on
+      // its own height — nothing needs clearing to measure it.
+      var top = menuEl.getBoundingClientRect().top;
+      var room = Math.round(global.innerHeight - top - MENU_EDGE);
+      if (room < cssMenuMaxHeight) {
+        menuEl.style.maxHeight = Math.max(MENU_FLOOR, room) + 'px';
+      } else {
+        menuEl.style.maxHeight = '';
+      }
+    }
+
     function openMenu(open) {
       if (!menuEl || !filterBtn) return;
       menuEl.hidden = !open;
+      // Closing always drops single mode: the next opener decides the form, and
+      // a menu that stayed narrowed would answer the Filter button with one
+      // category (see openCategory).
+      if (!open) {
+        menuEl.classList.remove('fbar-menu--single');
+        menuEl.removeAttribute('data-single-cat');
+        qsa('.fbar-cat', menuEl).forEach(function (c) { c.classList.remove('is-single'); });
+      }
       filterBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) clampMenuHeight(); else menuEl.style.maxHeight = '';
     }
 
     // ── wiring ──

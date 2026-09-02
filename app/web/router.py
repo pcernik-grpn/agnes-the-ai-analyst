@@ -2390,28 +2390,55 @@ def _library_type_map(user: dict) -> list[dict]:
     return [{"type": t, "count": n} for t, n in counts.items()]
 
 
-def _library_type_map(user: dict) -> list[dict]:
-    """Node types with caller-scoped counts for the Knowledge tab's head.
+#: The four entity types the Library's filter menu slices rows by, each
+#: mapped to the ``data-`` attribute its facet reads and the label the menu
+#: shows. The fact types come from ``app.api.facts.DEFAULT_FACET_TYPES``
+#: rather than being restated here, so the page and the API can never offer
+#: different vocabularies for the same question.
+#:
+#: This is what "filter by tags" should have meant on this page: the
+#: vocabulary the extraction pass already produces, instead of a `Tags`
+#: category that has been empty for every row since it shipped, because
+#: ``file_corpora`` has no tags column and nobody maintains hand-entered
+#: tags anyway (TCRD-250 piece 4).
+_ENTITY_FACET_LABELS = {
+    "client": ("client", "Client"),
+    "industry": ("industry", "Industry"),
+    "service_offering": ("offering", "Offering"),
+    "doc_type": ("doctype", "Document type"),
+}
 
-    Fails soft on every axis, because this is a decoration on a page that
-    must render without it: the `facts` feature can be off, the app-state
-    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
-    and the graph can simply be empty. Any of those renders the Library
-    exactly as it does today, with no type map — never a 500 on the
-    caller's main inventory page.
+
+def _entity_facet_token(value: str) -> str:
+    """A graph label, made safe to carry in a multi-valued row attribute.
+
+    ``|`` is the filter engine's separator for a `multi` facet
+    (``data-client="a|b"``, see ``filter_toolbar.js``'s ``facetMatch``). A
+    label containing one would split into two junk values on the row while
+    the menu offered the label whole — a filter that matches nothing, on
+    data nobody controls, failing silently. Replacing it keeps the value
+    filterable and costs one character of fidelity; the menu reads the same
+    token, so the two can never disagree.
     """
-    try:
-        from app.instance_config import feature_enabled
+    return value.replace("|", " ")
 
-        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
-            return []
-        from src.repositories import facts_repo
 
-        counts = facts_repo().count_visible_facts_by_type(user)
-    except Exception:
-        logger.debug("library: type map unavailable", exc_info=True)
-        return []
-    return [{"type": t, "count": n} for t, n in counts.items()]
+def _entity_facet_spec() -> list[tuple[str, str, str]]:
+    """``(fact_type, facet_key, label)`` for each entity facet, in menu order.
+
+    Reads the API's own default facet list so a type added there reaches the
+    Library too; a type with no label mapped here is skipped rather than
+    rendered under its raw key, which is the honest failure — a menu heading
+    reading ``service_offering`` is worse than one fewer heading.
+    """
+    from app.api.facts import DEFAULT_FACET_TYPES
+
+    out: list[tuple[str, str, str]] = []
+    for fact_type in DEFAULT_FACET_TYPES:
+        mapped = _ENTITY_FACET_LABELS.get(fact_type)
+        if mapped:
+            out.append((fact_type, mapped[0], mapped[1]))
+    return out
 
 
 def _has_connected_tools(user) -> bool:
@@ -2628,6 +2655,21 @@ async def library_page(
             _file_counts = cf_repo.count_by_corpus()
         except Exception as e:
             logger.warning("/library: file counts failed: %s", e)
+    # What each collection is ABOUT — the values its entity facets slice on.
+    # One batch call beside the counts above, for the same reason: the
+    # caller's readable set is the expensive half and it resolves once.
+    _entity_facets = _entity_facet_spec()
+    _entity_values: dict = {}
+    if facts_repo_ is not None and _entity_facets:
+        try:
+            _entity_values = facts_repo_.facet_values_for_collections(
+                user, _visible_ids, types=[t for t, _k, _lbl in _entity_facets]
+            )
+        except Exception as e:
+            # Fails soft exactly as the type map does: the facets are a
+            # refinement on a page whose job is the inventory, so a graph
+            # that cannot answer costs the menu four categories, not the page.
+            logger.warning("/library: entity facets failed: %s", e)
     try:
         for col in _all_cols:
             owned = col.get("created_by") == uid
@@ -2714,6 +2756,16 @@ async def library_page(
                 extra_search=fname or "",
                 owner_key="me" if owned else (col.get("created_by") or ""),
             )
+            # What this collection is ABOUT, from the fact graph — the values
+            # its entity facets slice on. Empty lists, not absent keys:
+            # `_present_multi` and the row template both iterate these
+            # unconditionally, and a collection the graph says nothing about
+            # is the common case. Set on `row` (what reaches `items`), never on
+            # the intermediate card `c` — `_library_row_base` builds a fresh
+            # dict, so a key left on `c` is silently dropped.
+            _ent = _entity_values.get(col["id"]) or {}
+            for _ftype, _fkey, _flabel in _entity_facets:
+                row[f"entity_{_fkey}"] = [_entity_facet_token(v) for v in (_ent.get(_ftype) or [])]
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
@@ -3819,6 +3871,20 @@ async def library_page(
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
     library_tags = sorted(((k, k, n) for k, n in tag_counts.items()), key=lambda x: x[1].lower())
 
+    #: Entity facets — Client / Industry / Offering / Document type, tallied
+    #: off the ROWS rather than fetched as a second list, so an option can
+    #: never offer a value no row carries and its count is what clicking it
+    #: leaves on screen. Same reason `library_tags` is built this way.
+    #:
+    #: Not subject to the "<2 values is dead weight" rule below, which is
+    #: about facets EVERY row carries: a lone client still splits the page
+    #: into "about them" and "everything else", because a skill or a data
+    #: package carries no client at all.
+    library_entity_cats = [
+        (facet_key, label, _present_multi(f"entity_{facet_key}")) for _fact_type, facet_key, label in _entity_facets
+    ]
+    library_entity_cats = [(k, lbl, opts) for k, lbl, opts in library_entity_cats if opts]
+
     # A single-valued facet is dead weight (every row matches), so drop it.
     if len(library_requirements) < 2:
         library_requirements = []
@@ -4131,6 +4197,7 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        library_entity_cats=library_entity_cats,
         #: The kind. Left out for a long time because "the list is already
         #: GROUPED by type into these very sections" — true of one flat list of
         #: eight kinds, but a tab now holds several and grouping is not
@@ -4187,9 +4254,6 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
-        # TCRD-250: node types with live, caller-scoped counts at the head
-        # of the Knowledge tab. Empty list = render nothing, see helper.
-        library_type_map=_library_type_map(user),
         # Has this reader already taken Agnes to their tools? The foot banner
         # asked everyone forever, including the people who had finished
         # (#1956 item 2). Two signals, because either one alone misses a real
@@ -10052,6 +10116,14 @@ async def admin_ontology_page(
     ctx = _build_context(request, user=user)
     ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
     ctx["pg_backend"] = use_pg()
+    #: What the extraction pass actually produced, on the page of the person who
+    #: configured it. It used to head the Library, where it answered a question
+    #: no analyst was asking — a reader there wants their documents, and the
+    #: node-type counts describe what was pulled OUT of documents. Here it is
+    #: the answer to "did the crawl work, and what did it find", next to the
+    #: controls that would fix a bad number. Static chips: this page has no
+    #: filter for them to drive.
+    ctx["library_type_map"] = _library_type_map(user)
     return templates.TemplateResponse(request, "ontology_builder.html", ctx)
 
 

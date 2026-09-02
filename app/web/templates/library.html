@@ -176,6 +176,16 @@
                 data-copy-undo="{{ c.stack_undo or 'Remove' }}"
                 data-copy-pill="{{ c.stack_pill or 'Agents can use this' }}"
                 data-tag="{{ c.tags | join('|') }}"
+                {# What this row is ABOUT, from the fact graph: one attribute per
+                   entity facet the menu is offering (client, industry, offering,
+                   document type). Rendered from the same server-side list the
+                   menu and the JS facet definitions read, so a row can never
+                   carry a value the menu cannot offer or vice versa. Absent
+                   entirely when the graph is off, empty, or unreachable — the
+                   facet is not offered either, so nothing dangles. #}
+                {%- for facet_key, _cat_label, _options in (library_entity_cats or []) %}
+                data-{{ facet_key }}="{{ (c['entity_' ~ facet_key] or []) | join('|') }}"
+                {%- endfor %}
                 {# Cumulative recency buckets as a SET, so "Last 30 days" matches
                    everything inside 30 days rather than a 23-day slice (see
                    `age_buckets` in the router). Empty when we do not know when
@@ -590,7 +600,6 @@
 {% block body_attrs %}class="library-page"{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="{{ static_url('css/type_map.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
@@ -652,13 +661,23 @@
      splitting them put the number under the page title and the chips two bands
      lower. */
   .lib-browse { margin: 0 0 10px; }
+  /* Two rows, not one: the count is a fact about the list, the chips are the
+     conditions that produced it, and reading them as one line made the chips
+     look like part of the number. They stay in ONE block, one row under the
+     other — which is what keeps the earlier failure this comment records (the
+     number under the page title, the chips two bands lower) from returning.
+     A hidden chip row is , so it contributes no gap and an
+     unfiltered page looks exactly as it did. */
   .lib-browse__state {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
     min-height: 22px; margin-top: 10px;
+  }
+  .lib-browse__count {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-height: 22px;
   }
   .lib-browse__state .lib-count { font-size: 12.5px; color: var(--ds-text-muted); }
   .lib-browse__state #lib-chips { margin: 0; }
-  /* A chip sits on the same baseline as the count beside it. */
+  /* A chip sits on the same baseline as the count above it. */
   .library-page .lib-browse__state .fbar-chip { height: 22px; }
   /* The strip closes the header, full width, so it reads as the divider
      between the page and its list rather than as another control. Everything
@@ -746,14 +765,12 @@
     }
   .library-page .lib-new__btn { height: 32px; font-size: 13px; }
 
-  /* Chips: the detail behind the Filter badge, so they read as a caption on the
-     list rather than as a second toolbar. */
-  .library-page .fbar-chip {
-    height: 24px; padding: 0 4px 0 9px; font-size: 12px; font-weight: 500;
-    background: transparent; border-color: var(--ds-border);
-    color: var(--ds-text-secondary);
-  }
-  .library-page .fbar-chip b, .library-page .fbar-chip strong { color: var(--ds-text-primary); font-weight: 600; }
+  /* No page-local chip treatment, deliberately. This page used to quieten the
+     component — transparent fill, muted text, its own height — which made the
+     Library's chips a different control from the ones on /admin/access, and
+     killed the component's own :hover into the bargain: same specificity,
+     later in the document. One chip design, defined once, in
+     filter_toolbar.css. */
 
   /* ══ Row metadata, one step quieter than the name ═════════════════════
      The name is the thing being scanned; owner, sharing and the action are how
@@ -2035,15 +2052,14 @@
 {% endblock %}
 
 {% block page_surface %}
-{# Type map — the head of the Knowledge tab (TCRD-250). Self-contained
-   macro + its own CSS; renders nothing when the graph is empty or the
-   facts feature is off, so the Library is unchanged without it. #}
-{% from "macros/_type_map.html" import type_map %}
-{% if library_type_map %}
-<div id="lib-typemap" hidden>
-  {{ type_map(library_type_map, library_type_map | sum(attribute="count"), base_url="/library") }}
-</div>
-{% endif %}
+{# The type map ("What the graph knows") is NOT here. It headed the Knowledge
+   tab, where it answered a question no analyst was asking: a reader on this
+   page wants their documents, and node-type counts describe what was pulled
+   OUT of documents. It now heads /admin/ontology — beside the controls that
+   would fix a bad number, on the page of the person who configured the pass
+   that produced it. The vocabulary it described reaches this page as the
+   Client / Industry / Offering / Document type facets instead, where it is
+   something you can act on. #}
 <section class="lib-section">
   {# ── Toolbar — a FLOATING DOCK pinned to the bottom of the viewport rather
        than a strip between the header and the list. The Library is a scrolling
@@ -2150,7 +2166,7 @@
          menu is not built at all rather than built empty. It comes back on its
          own — these are page-load facts, and the next render with two of
          anything in it has a live control again. #}
-      {% set _cats = [
+      {% set _cats = (library_entity_cats or []) + [
          ('tag', 'Tags', library_tags),
          ('age', 'Added', library_ages),
          ('ownership', 'Yours or shared', library_ownerships),
@@ -2413,8 +2429,10 @@
     </div>
       </div>
     <div class="lib-browse__state">
-            <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
-            {{ library_more_coming() }}
+      <div class="lib-browse__count">
+        <span class="lib-count" id="lib-item-count">{{ library_items|length }} item{{ '' if library_items|length == 1 else 's' }}</span>
+        {{ library_more_coming() }}
+      </div>
       {# Applied filters, stated above the list they narrow. NOT `--center`: that
          modifier belonged to the dock's card, where the row was centred over a
          centred bar; over a left-aligned list it left the chips floating in the
@@ -3371,6 +3389,13 @@
     // in the menu (value="available"), a chip that states the condition.
     { key: 'availability', attr: 'data-stack', label: 'Not added yet', toggle: true },
     { key: 'requirement', attr: 'data-requirement', label: 'Access' },
+    // Entity facets from the fact graph — `multi` because a collection is
+    // about as many clients as its documents name. Emitted from the SAME
+    // server list that renders the menu and the row attributes; an entry
+    // here whose category did not render would filter every row out.
+{%- for facet_key, cat_label, _options in (library_entity_cats or []) %}
+    { key: {{ facet_key | tojson }}, attr: {{ ('data-' ~ facet_key) | tojson }}, label: {{ cat_label | tojson }}, multi: true },
+{%- endfor %}
     { key: 'tag', attr: 'data-tag', label: 'Tag', multi: true },
     // `multi` because the recency buckets are cumulative sets on the row.
     { key: 'age', attr: 'data-age', label: 'Added', multi: true },
@@ -3422,7 +3447,7 @@
         buttons: '.fbar-view__btn', tableWrap: '.lib-tablewrap',
         grid: '.fbar-grid', storageKey: 'lib-view', card: buildCard,
       },
-      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); syncTypeMap(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
+      onApply: () => { syncChildren(); markGroupEnd(); refreshItemCount(); refreshTabCounts(); refreshOptionCounts(); refreshStackCount(); syncDefinitionsHit(); syncEmptyState(); },
     });
 
     // The engine's segment value starts at the `all` wildcard, which is not a
@@ -3650,12 +3675,6 @@
   //: cross-cutting refresh rather than inventing a second mechanism.
   //: Starts `hidden` in the markup so it never flashes on Capabilities
   //: before the engine's first apply().
-  function syncTypeMap() {
-    const el = document.getElementById('lib-typemap');
-    if (!el) return;
-    const seg = document.querySelector('#lib-tabs .fbar-seg__btn.is-active');
-    el.hidden = !seg || seg.getAttribute('data-own') !== 'knowledge';
-  }
   function refreshTabCounts() {
     const base = libRowsMatching(null, true);
     document.querySelectorAll('#lib-tabs [data-seg-count]').forEach(badge => {
