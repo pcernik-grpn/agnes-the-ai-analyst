@@ -2394,6 +2394,57 @@ def _install_memory_limit(limit_bytes: int) -> None:
         pass
 
 
+#: Signals a conversion child must answer with the DEFAULT action (die), not
+#: with whatever Python-level handler it inherited across ``fork`` from the
+#: process that forked it. Live-deployment finding (2026-09, a 64-vCPU
+#: extraction worker running 7 crawls): the worker runs under uvicorn, which
+#: installs a Python handler for SIGTERM/SIGINT that merely flags the server
+#: loop to exit — a no-op in a forked child that never runs that loop. Every
+#: child inherited it, so :meth:`_ConvertProcessPool._close_slot`'s
+#: ``terminate()`` (SIGTERM) on a recycled or crashed slot was IGNORED, and
+#: the ``join(timeout=5)`` after it simply expired. The retiree then sat in
+#: ``conn.recv()`` forever: its pipe's parent end was closed by the parent,
+#: but every SIBLING forked after it still held an inherited copy of that
+#: fd, so no EOF ever arrived. Each recycle leaked one ~0.8 GB process; the
+#: worker grew ~10 GB/min and was OOM-killed (200 GB) within the hour.
+_CHILD_DEFAULT_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def _reset_inherited_signal_handlers() -> None:
+    """Restore the DEFAULT disposition of :data:`_CHILD_DEFAULT_SIGNALS` in
+    THIS (child) process — call once, right after fork, before anything
+    else. See :data:`_CHILD_DEFAULT_SIGNALS` for the live finding this
+    answers. Best-effort: a platform or thread that cannot set a handler
+    (``ValueError`` outside the main thread, ``OSError``) still converts —
+    :meth:`_ConvertProcessPool._close_slot`'s SIGKILL escalation is the
+    guarantee, this is what makes the polite path work at all."""
+    for sig in _CHILD_DEFAULT_SIGNALS:
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+
+
+def _retire_process(proc: Any, *, grace_s: float = 5.0) -> None:
+    """Stop ``proc`` and REAP it, whatever it thinks about SIGTERM.
+
+    ``terminate()`` (SIGTERM) first, so a cooperative child can exit
+    cleanly; if it is still alive after ``grace_s`` — a child that
+    inherited a signal handler across fork (see
+    :data:`_CHILD_DEFAULT_SIGNALS`), or one wedged in native code — escalate
+    to ``kill()`` (SIGKILL, which nothing in user space can ignore) and
+    join again. Never returns with a live process it was asked to retire,
+    and never leaves a zombie: both joins reap.
+    """
+    if proc is None or not proc.is_alive():
+        return
+    proc.terminate()
+    proc.join(timeout=grace_s)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=grace_s)
+
+
 def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_output_bytes: int = 0) -> None:
     """Entry point for a dedicated conversion child process — runs ONLY
     inside a forked child, never called directly.
@@ -2422,6 +2473,7 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
     ``markdown`` ever touching a :class:`_ConvertOutcome`, so it never
     crosses ``conn.send`` at all.
     """
+    _reset_inherited_signal_handlers()
     _install_memory_limit(memory_limit_bytes)
     while True:
         try:
@@ -2789,9 +2841,7 @@ class _ConvertProcessPool:
                 conn.close()
             except OSError:
                 pass
-        if proc is not None and proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
+        _retire_process(proc)
         self._procs[slot] = None
         self._conns[slot] = None
 
@@ -2803,9 +2853,7 @@ class _ConvertProcessPool:
                 conn.close()
             except OSError:
                 pass
-        if proc is not None and proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
+        _retire_process(proc)
         self._spare_procs[slot] = None
         self._spare_conns[slot] = None
 
