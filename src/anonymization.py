@@ -1112,7 +1112,7 @@ class RegexDetector:
             covered.append(span)
 
         person_spans: list[tuple[int, int]] = []
-        for entity, span in self._persons(text, words, covered):
+        for entity, span, _honorific in self._persons(text, words, covered):
             entities.append(entity)
             person_spans.append(span)
 
@@ -1150,8 +1150,8 @@ class RegexDetector:
         text: str,
         words: list[_Word],
         covered: list[tuple[int, int]],
-    ) -> list[tuple[Entity, tuple[int, int]]]:
-        found: list[tuple[Entity, tuple[int, int]]] = []
+    ) -> list[tuple[Entity, tuple[int, int], bool]]:
+        found: list[tuple[Entity, tuple[int, int], bool]] = []
         index = 0
         while index < len(words):
             word = words[index]
@@ -1172,8 +1172,36 @@ class RegexDetector:
             trimmed, honorific = self._trim_run(text, run)
             if trimmed and (honorific or len(trimmed) >= 2):
                 start, end = trimmed[0].start, trimmed[-1].end
-                found.append((Entity(text=text[start:end], kind=PERSON), (start, end)))
+                found.append((Entity(text=text[start:end], kind=PERSON), (start, end), honorific))
             index = cursor
+        return found
+
+    # -- the high-precision subset -----------------------------------------
+
+    def high_confidence(self, text: str) -> list[Entity]:
+        """The subset of :meth:`__call__` whose hits carry an explicit signal.
+
+        Pass 1 companies (a legal-form marker — "the marker is what carries
+        the confidence") and pass 2 persons introduced by an honorific. NOT
+        the bare two-capitalized-token runs, and not their pass 3 inflections.
+
+        This exists because "the regex tier found something" is a useless
+        corroborator on Markdown: pass 2 fires on any two adjacent capitalized
+        tokens, so every Title-Cased heading is a `person` hit and a release
+        note with no names in it produces several. Over-detection is harmless
+        where this class is USED — an over-redacted heading costs nothing —
+        but it is fatal to any caller reasoning from "regex found a name,
+        therefore there is a name here". Such a caller wants this method.
+        """
+        words = _words(text)
+        found: list[Entity] = []
+        covered: list[tuple[int, int]] = []
+        for entity, span in self._companies(text, words):
+            found.append(entity)
+            covered.append(span)
+        for entity, _span, honorific in self._persons(text, words, covered):
+            if honorific:
+                found.append(entity)
         return found
 
     def _trim_run(self, text: str, run: list[_Word]) -> tuple[list[_Word], bool]:
