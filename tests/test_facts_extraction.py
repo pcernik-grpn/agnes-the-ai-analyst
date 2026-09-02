@@ -543,6 +543,105 @@ def test_the_retry_keeps_the_facts_that_already_passed():
 
 
 # ---------------------------------------------------------------------------
+# Batch-transport gate helpers — the SAME verbatim-gate / one-retry contract
+# as extract_one, generalized to a reply that may have arrived asynchronously
+# (a collected Batches-API result) rather than from a live call.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_kept_removes_facts_matching_a_failure_by_key():
+    text = "The Northwind rollout began in March."
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:x")
+    kept_nodes, kept_edges = fe._filter_kept([ok, bad], [], [(bad, "never appeared")])
+    assert kept_nodes == [ok]
+    assert kept_edges == []
+
+
+def test_finalize_gate_with_no_failures_is_a_no_op():
+    w = _work()
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w, nodes=[ok], edges=[], failures=[], retry_reply=None, parse_errors=0
+    )
+    assert nodes == [ok]
+    assert dropped == 0
+    assert retried is False
+    assert parse_errors == 0
+
+
+def test_finalize_gate_drops_and_counts_when_no_retry_is_available():
+    w = _work()
+    bad = _node("never appeared", node_id="client:x")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w, nodes=[bad], edges=[], failures=[(bad, "never appeared")], retry_reply=None, parse_errors=0
+    )
+    assert nodes == []
+    assert dropped == 1
+    assert retried is False
+
+
+def test_finalize_gate_merges_a_recovering_retry_reply():
+    text = "The Northwind rollout began in March for Contoso."
+    w = _work(text)
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:contoso")
+    fixed = _node("for Contoso", node_id="client:contoso")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w,
+        nodes=[ok, bad],
+        edges=[],
+        failures=[(bad, "never appeared")],
+        retry_reply=_stream(fixed),
+        parse_errors=0,
+    )
+    assert sorted(n["id"] for n in nodes) == ["client:contoso", "engagement:northwind-rollout"]
+    assert dropped == 0
+    assert retried is True
+
+
+def test_finalize_gate_drops_whatever_the_retry_still_cannot_fix():
+    text = "The Northwind rollout began in March."
+    w = _work(text)
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:x")
+    still_bad = _node("still never appeared", node_id="client:x")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w,
+        nodes=[ok, bad],
+        edges=[],
+        failures=[(bad, "never appeared")],
+        retry_reply=_stream(still_bad),
+        parse_errors=0,
+    )
+    assert [n["id"] for n in nodes] == ["engagement:northwind-rollout"]
+    assert dropped == 1
+    assert retried is True
+
+
+def test_merge_retry_reply_recovers_and_drops_by_the_same_rule_as_extract_one():
+    text = "The Northwind rollout began in March for Contoso."
+    w = _work(text)
+    kept = [_node("rollout began in March", node_id="engagement:northwind-rollout")]
+    fixed = _node("for Contoso", node_id="client:contoso")
+    nodes, edges, dropped, parse_errors = fe._merge_retry_reply(
+        work=w, kept_nodes=kept, kept_edges=[], failed_count=1, retry_reply_text=_stream(fixed), parse_errors=0
+    )
+    assert sorted(n["id"] for n in nodes) == ["client:contoso", "engagement:northwind-rollout"]
+    assert dropped == 0
+
+
+def test_merge_retry_reply_counts_a_parse_error_from_the_retry_stream():
+    w = _work()
+    kept = [_node("rollout began in March")]
+    nodes, edges, dropped, parse_errors = fe._merge_retry_reply(
+        work=w, kept_nodes=kept, kept_edges=[], failed_count=1, retry_reply_text="NODES\n{not json\n", parse_errors=0
+    )
+    assert parse_errors == 1
+    assert dropped == 1  # the one failure the retry never addressed
+
+
+# ---------------------------------------------------------------------------
 # Failure posture
 # ---------------------------------------------------------------------------
 

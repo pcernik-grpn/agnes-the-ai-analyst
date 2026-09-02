@@ -1728,6 +1728,106 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
     )
 
 
+# --------------------------------------------------------------------------
+# Batch-transport gate helpers — the SAME verbatim-gate / one-corrective-
+# retry contract `extract_one` applies to a LIVE reply, generalized to a
+# reply that may arrive asynchronously (an already-collected Batches API
+# result) instead. Deliberately NOT shared code with `extract_one` itself —
+# that function's own call site stays untouched, so the synchronous
+# transport's tested behaviour carries zero risk from this addition; these
+# three functions duplicate its filtering/merging RULES, verified against
+# the same fixtures `extract_one`'s own tests use.
+# --------------------------------------------------------------------------
+
+
+def _filter_kept(
+    nodes: List[dict], edges: List[dict], failures: Sequence[Tuple[dict, str]]
+) -> Tuple[List[dict], List[dict]]:
+    """``(nodes, edges)`` with every fact named in ``failures`` removed —
+    the same by-key filter `extract_one`'s own retry branch applies before
+    merging in what the retry recovers."""
+    failed_keys = {_fact_key(fact) for fact, _ in failures}
+    return (
+        [n for n in nodes if _fact_key(n) not in failed_keys],
+        [e for e in edges if _fact_key(e) not in failed_keys],
+    )
+
+
+def _merge_retry_reply(
+    *,
+    work: "_Work",
+    kept_nodes: List[dict],
+    kept_edges: List[dict],
+    failed_count: int,
+    retry_reply_text: str,
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, int]:
+    """Merge a corrective-retry's reply into the facts that already passed
+    the gate (``kept_nodes``/``kept_edges`` — the ORIGINAL reply already
+    filtered of its failures via :func:`_filter_kept`). ``failed_count`` is
+    how many facts the retry needed to recover — the same denominator
+    `extract_one` counts against. Returns ``(nodes, edges, dropped,
+    parse_errors)``, applying the SAME final safety net `extract_one` does:
+    whatever is STILL not verbatim after the merge is dropped and counted,
+    never shipped for the server to reject.
+    """
+    retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply_text)
+    parse_errors += retry_parse_errors
+    kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+    nodes = list(kept_nodes)
+    edges = list(kept_edges)
+    recovered = 0
+    for fact in [*retry_nodes, *retry_edges]:
+        if verbatim_failures([fact], **kwargs):
+            continue
+        (edges if "src" in fact and "dst" in fact else nodes).append(fact)
+        recovered += 1
+    dropped = max(0, failed_count - recovered)
+
+    still_bad = verbatim_failures([*nodes, *edges], **kwargs)
+    dropped_keys = {_fact_key(fact) for fact, _ in still_bad}
+    nodes = [n for n in nodes if _fact_key(n) not in dropped_keys]
+    edges = [e for e in edges if _fact_key(e) not in dropped_keys]
+    dropped += len(still_bad)
+    return nodes, edges, dropped, parse_errors
+
+
+def _finalize_gate(
+    *,
+    work: "_Work",
+    nodes: List[dict],
+    edges: List[dict],
+    failures: Sequence[Tuple[dict, str]],
+    retry_reply: Optional[str],
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, bool, int]:
+    """Resolve a document's verbatim-gate failures given a retry reply that
+    may have arrived from EITHER transport (a live sync call, or an
+    already-collected batch result) — or none at all, when the pass ran
+    out of budget for one. Returns ``(nodes, edges, dropped, retried,
+    parse_errors)``, matching :class:`_DocResult`'s own fields.
+    """
+    if not failures:
+        return nodes, edges, 0, False, parse_errors
+    kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+    if retry_reply is None:
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        still_bad = verbatim_failures([*kept_nodes, *kept_edges], **kwargs)
+        dropped_keys = {_fact_key(f) for f, _ in still_bad}
+        kept_nodes = [n for n in kept_nodes if _fact_key(n) not in dropped_keys]
+        kept_edges = [e for e in kept_edges if _fact_key(e) not in dropped_keys]
+        return kept_nodes, kept_edges, len(failures) + len(still_bad), False, parse_errors
+    final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+        work=work,
+        kept_nodes=kept_nodes,
+        kept_edges=kept_edges,
+        failed_count=len(failures),
+        retry_reply_text=retry_reply,
+        parse_errors=parse_errors,
+    )
+    return final_nodes, final_edges, dropped, True, parse_errors2
+
+
 def _ingest_identity() -> Any:
     """The identity claims from this pass are attributed to.
 
