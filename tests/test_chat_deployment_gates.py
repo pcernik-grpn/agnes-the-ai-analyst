@@ -12,7 +12,7 @@ Two gates verified here:
 
 The multi-worker test uses a minimal app whose lifespan replicates only
 the UVICORN_WORKERS branch of app/main.py's CHAT-INIT block — avoiding
-the full app.main lifespan (DuckDB, BQ config, PostHog, …) while still
+the full app.main lifespan (DuckDB, BQ config, …) while still
 exercising the exact code path under test, via
 ``app.main._chat_coordination_backend`` so a monkeypatch of that one
 function drives the mirrored branch exactly like the real lifespan would.

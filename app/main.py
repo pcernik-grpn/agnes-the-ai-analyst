@@ -1643,23 +1643,6 @@ async def lifespan(app):
         except Exception:
             pass  # never block startup on a logging convenience
 
-    # Construct the PostHog client up front so its background flush thread
-    # starts before the first request — and so a missing/invalid key fails
-    # loud at boot rather than on first capture. No-op when disabled.
-    try:
-        from src.observability import get_posthog
-
-        pc = get_posthog()
-        if pc.enabled:
-            logger.info(
-                "PostHog observability enabled (host=%s, identify=%s, replay=%s)",
-                pc.host,
-                pc.identify_mode,
-                pc.replay_enabled,
-            )
-    except Exception:
-        logger.exception("PostHog init at startup failed")
-
     # --- CHAT-INIT -----------------------------------------------------------
     # Always create chat_repo + chat_config regardless of chat.enabled so that
     # the admin_chat and chat API routers (which use app.state.chat_repo) work
@@ -2156,12 +2139,6 @@ async def lifespan(app):
                 _env_overlay_unsubscribe()
             except Exception:
                 logger.exception("env-overlay-changed unsubscribe failed (non-fatal)")
-        try:
-            from src.observability import get_posthog
-
-            get_posthog().shutdown()
-        except Exception:
-            logger.exception("PostHog shutdown failed")
         # Flush any buffered llm_usage rows (broker Task 8 — batched ledger
         # writes) BEFORE the system DB closes, so a graceful shutdown doesn't
         # drop the tail of usage the accumulator hadn't hit a size/age
@@ -2473,18 +2450,6 @@ def create_app() -> FastAPI:
             logger.warning(
                 "DEBUG=1 but fastapi-debug-toolbar not installed; toolbar disabled",
             )
-
-    # PostHog HTML snippet injection — must run INSIDE the GZip layer so it
-    # sees uncompressed HTML before compression. Starlette runs middleware
-    # in reverse-registration order on the response, so registering this
-    # before _SelectiveGZipMiddleware places it deeper in the stack and
-    # therefore earlier in the response chain. Many of this app's templates
-    # are standalone (their own <!DOCTYPE>) and never extend base.html, so
-    # a per-template include would miss them; the middleware covers
-    # everything in one place. No-op when POSTHOG_API_KEY is unset.
-    from app.middleware.posthog_inject import PosthogInjectionMiddleware
-
-    app.add_middleware(PosthogInjectionMiddleware)
 
     # Compress JSON / HTML responses on the wire. Parquet downloads are
     # excluded — they're already columnar-compressed and re-gzipping them
@@ -3488,26 +3453,6 @@ def create_app() -> FastAPI:
         import traceback as _tb
 
         logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-
-        # Best-effort: forward the exception to PostHog before rendering the
-        # error page. Disabled state is a cheap no-op. Wrapped because a
-        # tracing failure must never replace the user-visible 500 with a
-        # second exception.
-        try:
-            from src.observability import get_posthog
-            from app.logging_config import request_id_var as _rid_var
-
-            get_posthog().capture_exception(
-                exc,
-                request=request,
-                properties={
-                    "request_id": _rid_var.get(),
-                    "path": request.url.path,
-                    "method": request.method,
-                },
-            )
-        except Exception:
-            logger.exception("PostHog capture_exception failed in 500 handler")
 
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
         debug_on = _os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")

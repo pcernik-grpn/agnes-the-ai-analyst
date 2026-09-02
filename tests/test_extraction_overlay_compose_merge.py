@@ -160,11 +160,11 @@ def test_gcp_logging_overlay_reaches_the_activated_worker(project: Path):
     chain = BASE_CHAIN + ["docker-compose.gcp-logging.yml", "docker-compose.extraction.yml"]
     services = _compose_config(project, chain)["services"]
 
-    assert services["extraction-worker"].get("logging") == {"driver": "gcplogs"}, (
+    assert (services["extraction-worker"].get("logging") or {}).get("driver") == "fluentd", (
         "the extraction worker must ship to Cloud Logging on a VM with the "
         "overlay armed — this is the service that runs the connector crawls"
     )
-    assert services["app"]["logging"] == {"driver": "gcplogs"}
+    assert services["app"]["logging"]["driver"] == "fluentd"
 
     # redis comes from the extraction overlay alone, so the log-driver overlay
     # must NOT name it (doing so breaks every instance without that overlay);
@@ -179,7 +179,7 @@ def test_gcp_logging_overlay_loads_without_the_conditional_overlays(project: Pat
     named here but defined only in a conditional overlay would make compose
     reject the whole stack on every instance that lacks it."""
     services = _compose_config(project, BASE_CHAIN + ["docker-compose.gcp-logging.yml"])["services"]
-    assert services["app"]["logging"] == {"driver": "gcplogs"}
+    assert services["app"]["logging"]["driver"] == "fluentd"
     # Still profile-gated without the extraction overlay — the logging entry
     # does not accidentally activate anything.
     assert "extraction-worker" not in services

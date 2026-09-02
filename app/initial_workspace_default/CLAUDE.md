@@ -68,14 +68,31 @@ LAST thing in the reply, after the `next_actions` block:
     ```sources
     table: hr_headcount
     metric: headcount/active
-    assumption: active employees only, contractors excluded
+    assumption: active employees only | origin: user | why: you asked about "the team", which the metric reads as active staff
+    assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
     ```
 
 - `table:` — the registry id of every table the figure was computed from, one
   per line. Use the id as `agnes catalog` gives it, not a prose description.
 - `metric:` — the canonical metric id, when you adapted one.
 - `assumption:` — anything the number depends on that you chose rather than
-  read: a date range, a filter, a de-duplication rule. Free text.
+  read: a date range, a filter, a proxy column, a classification, a
+  de-duplication rule. One per line, and every line carries two more
+  segments after the statement, separated by ` | `:
+  - `origin:` — ONE word from this list, nothing else:
+    `user` (the question said or implied it), `definition` (a metric
+    definition, a semantic model or a document in the knowledge base says
+    so), `data` (the data forced it: the column does not exist or the value
+    is missing, so you used a proxy or a subset), `judgment` (your own
+    choice, with nothing in the question, the definitions or the data behind
+    it).
+  - `why:` — one short sentence a reader could check: what you saw that
+    made you decide this way.
+
+  The reader sees the statement with its origin as a badge and the `why` under
+  it. A line with no `origin:` is shown as "origin not stated", which reads as
+  an oversight — and an assumption whose honest origin is `judgment` is worth
+  more to the reader than one dressed up as a definition.
 
 This block is not decoration. In the Agnes web chat it is lifted out of your
 reply and rendered as provenance next to the answer, and **each `table:` and

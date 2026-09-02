@@ -586,6 +586,46 @@ function stripSourcesFence(markdown) {
 
 const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
 
+/** Where an assumption came from, as the reader sees it.
+ *
+ *  The report behind this (TCRD-289) was a row of six `assumes …` chips:
+ *  "it's not clear enough where they originated and it's not easy to
+ *  understand why those assumptions were made". The statement alone cannot
+ *  answer either — "signed date proxied by close date" reads the same whether
+ *  the question asked for it, a definition says so, the CRM has no better
+ *  column, or the model guessed. So every `assumption:` line now carries an
+ *  `origin:` from the server's closed vocabulary (`ASSUMPTION_ORIGINS` in
+ *  app/chat/sources.py — the server normalizes, this map only labels) and a
+ *  one-sentence `why:`; the chip shows the origin as a badge in front of the
+ *  statement and the rationale on a second line.
+ *
+ *  Keys are the wire vocabulary; `tests/test_chat_sources_ui.py` pins them to
+ *  the server's so the two cannot drift. Copy is the product's voice, not the
+ *  model's: a badge is a category, and the model's own phrasing of where it
+ *  got something is exactly what the badge exists to replace. */
+const _ASSUMPTION_ORIGIN = {
+  user: { label: "from your question", title: "Your question said or implied this." },
+  definition: {
+    label: "from a definition",
+    title: "A metric definition, semantic model, glossary term or knowledge-base document says so.",
+  },
+  data: {
+    label: "data gap",
+    title: "The data does not carry what the question needs, so a proxy or a subset stood in.",
+  },
+  judgment: {
+    label: "own judgment",
+    title: "The answer's own choice — nothing in the question, the definitions or the data settles it.",
+  },
+};
+/** The absence, made visible the same way "none declared" is: a line with no
+ *  `origin:` (or one outside the vocabulary — the server hands those over as
+ *  null rather than guessing) gets a dashed badge, not a blank. */
+const _ASSUMPTION_ORIGIN_UNSTATED = {
+  label: "origin not stated",
+  title: "The answer did not say where this assumption came from.",
+};
+
 /** Where a claim's chip goes when you click it.
  *
  *  Checking a number means opening the thing it came from, so the chip that
@@ -633,6 +673,41 @@ function _bubbleHasFigure(bubble) {
   return false;
 }
 
+/** One `assumes …` chip: the kind label, the origin badge, the statement,
+ *  and — when the answer gave one — the rationale on its own line. Never a
+ *  link: an assumption names nothing to open (see _claimHref). */
+function _renderAssumptionChip(c) {
+  const known = c.origin && Object.prototype.hasOwnProperty.call(_ASSUMPTION_ORIGIN, c.origin);
+  const origin = known ? c.origin : "unstated";
+  const copy = known ? _ASSUMPTION_ORIGIN[c.origin] : _ASSUMPTION_ORIGIN_UNSTATED;
+  const chip = document.createElement("span");
+  chip.className = `msg-source-chip is-neutral is-assumption is-origin-${origin}`;
+  const kind = document.createElement("span");
+  kind.className = "msg-source-kind";
+  kind.textContent = _CLAIM_LABEL.assumption;
+  chip.appendChild(kind);
+  const badge = document.createElement("span");
+  badge.className = `msg-source-origin is-origin-${origin}`;
+  badge.textContent = copy.label;
+  badge.title = copy.title;
+  chip.appendChild(badge);
+  const text = document.createElement("span");
+  text.className = "msg-source-text";
+  text.textContent = c.ref || "";
+  chip.appendChild(text);
+  if (c.why) {
+    const why = document.createElement("span");
+    why.className = "msg-source-why";
+    const whyLabel = document.createElement("span");
+    whyLabel.className = "msg-source-why-label";
+    whyLabel.textContent = "why";
+    why.appendChild(whyLabel);
+    why.appendChild(document.createTextNode(c.why));
+    chip.appendChild(why);
+  }
+  return chip;
+}
+
 function renderSourcesChips(bubble, verdict) {
   if (!verdict) return;
   const claims = verdict.claims || [];
@@ -648,6 +723,15 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
+  // Two rows, not one. A `table:` is something the answer READ; an
+  // `assumption:` is something it DECIDED. Filed together under one SOURCES
+  // label, six `assumes …` chips read as neither (TCRD-289) — and the
+  // "none declared" signal below is about provenance, so it is judged on
+  // the tables and metrics alone: an answer that named only assumptions
+  // has, truthfully, declared no source.
+  const provenance = claims.filter((c) => c.kind !== "assumption");
+  const assumptions = claims.filter((c) => c.kind === "assumption");
+
   const wrap = document.createElement("div");
   wrap.className = "msg-sources";
 
@@ -656,16 +740,14 @@ function renderSourcesChips(bubble, verdict) {
   label.textContent = "Sources";
   wrap.appendChild(label);
 
-  if (!claims.length) {
+  if (!provenance.length) {
     const none = document.createElement("span");
     none.className = "msg-source-chip is-none";
     none.textContent = "none declared";
     wrap.appendChild(none);
-    bubble.appendChild(wrap);
-    return;
   }
 
-  for (const c of claims) {
+  for (const c of provenance) {
     // A table or metric claim is a link to the thing it names; an assumption
     // has nothing to open and stays a <span> (see _claimHref).
     const href = _claimHref(c);
@@ -694,6 +776,16 @@ function renderSourcesChips(bubble, verdict) {
     wrap.appendChild(chip);
   }
   bubble.appendChild(wrap);
+
+  if (!assumptions.length) return;
+  const arow = document.createElement("div");
+  arow.className = "msg-sources is-assumptions";
+  const alabel = document.createElement("span");
+  alabel.className = "msg-sources-label";
+  alabel.textContent = "Assumptions";
+  arow.appendChild(alabel);
+  for (const c of assumptions) arow.appendChild(_renderAssumptionChip(c));
+  bubble.appendChild(arow);
 }
 
 // ---------- Next-actions block ---------------------------------------------
@@ -3223,10 +3315,65 @@ function _streamingSafeText(text) {
     }
     i = f + 3;
   }
-  if (openAt === -1) return t; // every fence is closed
-  if (openLang === null) return t.slice(0, openAt); // language id still streaming
+  if (openAt === -1) return _withholdOpenTableHead(t); // every fence is closed
+  if (openLang === null) return _withholdOpenTableHead(t.slice(0, openAt)); // language id still streaming
   if (openLang && ("sources".startsWith(openLang) || "next_actions".startsWith(openLang))) {
-    return t.slice(0, openAt);
+    return _withholdOpenTableHead(t.slice(0, openAt));
+  }
+  // An open code fence with a language and a body: the trailing lines are
+  // CODE, so a pipe there is not a table head — nothing to withhold.
+  return t;
+}
+
+/** A line that can only be a GFM table row: it opens with a pipe. GFM also
+ *  accepts a header without a leading pipe, and a table nested in a
+ *  blockquote or list item (`> | a |`, `- | a |`); models rarely write either,
+ *  and a false negative here costs a brief raw-pipes flash, nothing more. */
+const _TABLE_ROW_RE = /^ {0,3}\|/;
+/** The other direction — prose that happens to open with a pipe — would be
+ *  hidden until its newline. A header row's FIRST cell is never this long, so
+ *  a lone pipe line that has run this far without a second pipe is released
+ *  as prose; the worst case is that many characters withheld, not a line. */
+const _TABLE_HEAD_FIRST_CELL_MAX = 80;
+/** A delimiter row that may still be streaming: pipes, dashes, colons and
+ *  spaces only — `|`, `|-`, `|---|:--`, and the empty string right after the
+ *  header's newline all match; a data row (`| Acme |`) does not. */
+const _TABLE_DELIMITER_PARTIAL_RE = /^ {0,3}\|?[ :|-]*$/;
+
+/** Hold back a table head that marked cannot render as a table yet
+ *  (TCRD-288). A GFM table exists only once its delimiter row carries one
+ *  cell per header cell; until then marked emits the header line — and then
+ *  the growing delimiter row — as a paragraph of raw `| Client | Sponsor |`
+ *  pipes, which is what the reader saw for every table while it streamed.
+ *  Two shapes are withheld, both at the very end of the text:
+ *
+ *    - a lone pipe line with no table row above it — a header waiting for
+ *      its delimiter;
+ *    - that header plus a second line that is still a delimiter in progress.
+ *
+ *  The newline that ends the delimiter row releases both: from there marked
+ *  renders a table, and every later token lands in a cell. A data row is
+ *  never withheld (it has table rows above it), so a table already on screen
+ *  keeps growing row by row. */
+function _withholdOpenTableHead(text) {
+  const t = text || "";
+  const lastNl = t.lastIndexOf("\n");
+  const last = t.slice(lastNl + 1);
+  const prevNl = lastNl === -1 ? -1 : t.lastIndexOf("\n", lastNl - 1);
+  const prev = lastNl === -1 ? null : t.slice(prevNl + 1, lastNl);
+  const prevIsRow = prev !== null && _TABLE_ROW_RE.test(prev);
+  if (_TABLE_ROW_RE.test(last) && !prevIsRow) {
+    const firstPipe = last.indexOf("|");
+    const secondPipe = last.indexOf("|", firstPipe + 1);
+    if (secondPipe === -1 && last.length > _TABLE_HEAD_FIRST_CELL_MAX) return t; // prose, not a head
+    return t.slice(0, lastNl + 1); // header candidate, no delimiter yet
+  }
+  if (prevIsRow && _TABLE_DELIMITER_PARTIAL_RE.test(last)) {
+    const prev2Nl = prevNl === -1 ? -1 : t.lastIndexOf("\n", prevNl - 1);
+    const prev2 = prevNl === -1 ? null : t.slice(prev2Nl + 1, prevNl);
+    if (prev2 === null || !_TABLE_ROW_RE.test(prev2)) {
+      return t.slice(0, prevNl + 1); // header + delimiter still streaming
+    }
   }
   return t;
 }
@@ -3255,6 +3402,17 @@ function _renderStreamingMarkdown() {
   }
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(visible);
+    // Tables are part of the answer's SHAPE, not a finishing touch: marked's
+    // bare <table> has no border, no padding and a centered bold header, so
+    // until finalize a streamed table looked like a different widget from
+    // the one the turn ends with (TCRD-288). The pass is cheap — a wrap, a
+    // class, a click handler per header cell — and idempotent, so running
+    // it on every repaint costs nothing the reader can measure; the heavy
+    // passes (highlight.js, mermaid) still wait for the final content. The
+    // repaint replaces the DOM, so a sort or a horizontal scroll made while
+    // the table is still growing lasts until the next tick — the table
+    // settles at finalize, which is when those are worth doing anyway.
+    enhanceTables(currentAssistantBody);
   } catch (_e) {
     currentAssistantBody.textContent = visible;
   }
@@ -3299,6 +3457,10 @@ function _flushStreamingTail() {
   if (!currentAssistantBody) return;
   try {
     currentAssistantBody.innerHTML = renderAnswerMarkdown(currentAssistantText);
+    // Same light table pass as the live painter: this repaint replaces the
+    // DOM, and a cancelled/error frame that is the turn's last word must not
+    // leave the table LESS finished than it was a tick earlier.
+    enhanceTables(currentAssistantBody);
   } catch (_e) {
     currentAssistantBody.textContent = currentAssistantText;
   }

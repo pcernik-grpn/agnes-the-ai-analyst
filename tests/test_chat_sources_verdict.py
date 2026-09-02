@@ -119,12 +119,15 @@ def test_tool_call_shapes_do_not_break_verification(calls):
 
 
 def test_verdict_serializes_for_the_wire():
+    """A table/metric claim keeps the three-key shape it always had; the two
+    TCRD-289 keys ride on assumptions only, present even when unset so the
+    client reads one shape."""
     v = verdict(_answer("table: mrr\nassumption: x"), TOOL_CALLS)
     assert v.to_dict() == {
         "declared": True,
         "claims": [
             {"kind": "table", "ref": "mrr", "verified": True},
-            {"kind": "assumption", "ref": "x", "verified": None},
+            {"kind": "assumption", "ref": "x", "verified": None, "origin": None, "why": None},
         ],
     }
 
@@ -318,3 +321,140 @@ class TestTheBlockLocatorIsLinear:
         out = strip_block(two)
         assert "```sources" not in out
         assert "a" in out and "b" in out
+
+
+class TestAnAssumptionSaysWhereItCameFromAndWhy:
+    """TCRD-289: six `assumes …` chips under an answer, and the reader could
+    not tell where any of them originated or why it was made.
+
+    The statement alone cannot carry that — "signed date proxied by close
+    date" reads the same whether the user asked for it, a definition says so,
+    the CRM has no better column, or the model guessed. So the line grew two
+    keyed segments, `| origin: … | why: …`, and this is the parse: the origin
+    is a CLOSED vocabulary the badge copy is keyed on, the why is one
+    sentence, and a line with neither is still an assumption — shown as
+    "origin not stated", the block's own visible-absence rule applied to
+    itself.
+    """
+
+    def test_a_structured_line_splits_into_statement_origin_and_why(self):
+        (c,) = parse_claims('assumption: active employees only | origin: user | why: you asked about "the team"')
+        assert (c.kind, c.ref) == ("assumption", "active employees only")
+        assert c.origin == "user"
+        assert c.why == 'you asked about "the team"'
+
+    def test_a_legacy_line_is_still_an_assumption_with_nothing_stated(self):
+        """History written before this change, and a model that ignores the
+        two segments, must not lose the assumption — only its badge."""
+        (c,) = parse_claims("assumption: excludes contractors")
+        assert c.ref == "excludes contractors"
+        assert c.origin is None and c.why is None
+
+    def test_the_segments_may_come_in_either_order(self):
+        (c,) = parse_claims("assumption: proxied by close date | why: no SOW date in the CRM | origin: data")
+        assert (c.origin, c.why) == ("data", "no SOW date in the CRM")
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("user", "user"),
+            ("User", "user"),
+            ("question", "user"),
+            ("definition", "definition"),
+            ("semantic model", "definition"),
+            ("glossary", "definition"),
+            ("data", "data"),
+            ("missing data", "data"),
+            ("judgment", "judgment"),
+            ("judgement", "judgment"),
+            ("my own", "judgment"),
+            ("`data`", "data"),
+        ],
+    )
+    def test_the_origin_is_normalized_to_the_closed_vocabulary(self, raw, expected):
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        (c,) = parse_claims(f"assumption: s | origin: {raw}")
+        assert c.origin == expected
+        assert c.origin in ASSUMPTION_ORIGINS
+
+    @pytest.mark.parametrize("raw", ["Salesforce", "the CRM", "", "n/a"])
+    def test_an_origin_outside_the_vocabulary_is_not_stated_rather_than_guessed(self, raw):
+        """The badge is a category with fixed copy. A model's free-text origin
+        goes nowhere near it — the reader is told the origin was not stated,
+        which is true of that line in the only sense the badge can express."""
+        (c,) = parse_claims(f"assumption: s | origin: {raw} | why: w")
+        assert c.origin is None
+        assert c.why == "w", "an off-vocabulary origin must not cost the reader the rationale"
+
+    def test_a_pipe_inside_the_statement_stays_in_the_statement(self):
+        """`|` is the segment separator, but only in front of a recognized key.
+        A pipe in prose — `A | B` naming two things — continues whatever it
+        was inside, never becomes a phantom segment and is never dropped."""
+        line = "assumption: shipping | billing country both count | origin: judgment | why: either | both mark CZ"
+        (c,) = parse_claims(line)
+        assert c.ref == "shipping | billing country both count"
+        assert c.origin == "judgment"
+        assert c.why == "either | both mark CZ"
+
+    def test_an_empty_why_is_no_rationale(self):
+        (c,) = parse_claims("assumption: s | origin: data | why:")
+        assert c.why is None
+
+    def test_duplicates_are_judged_on_the_statement(self):
+        """The same assumption written twice with two rationales is one
+        assumption; the reader gets the first."""
+        claims = parse_claims("assumption: s | origin: user | why: a\nassumption: s | origin: data | why: b")
+        assert len(claims) == 1
+        assert (claims[0].origin, claims[0].why) == ("user", "a")
+
+    def test_origin_and_why_survive_verification_and_reach_the_wire(self):
+        v = verdict(_answer("table: mrr\nassumption: s | origin: judgment | why: w"), TOOL_CALLS)
+        d = v.to_dict()
+        assert d["claims"][1] == {"kind": "assumption", "ref": "s", "verified": None, "origin": "judgment", "why": "w"}
+        assert set(d["claims"][0]) == {"kind", "ref", "verified"}, "table claims keep their wire shape"
+
+    def test_table_and_metric_lines_are_not_split(self):
+        """The segment grammar is the assumption line's alone — a `|` on a
+        table line is part of the (odd) ref and is compared as written."""
+        (c,) = parse_claims("table: a | origin: user")
+        assert c.ref == "a | origin: user"
+        assert c.origin is None
+
+    def test_the_prompt_teaches_exactly_the_vocabulary_the_parser_accepts(self):
+        """The parser's closed vocabulary and the prompt's list of allowed
+        words are the same contract written twice. Pinned so one cannot gain
+        a value the other never heard of."""
+        import pathlib
+        import re
+
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        md = (root / "app" / "initial_workspace_default" / "CLAUDE.md").read_text(encoding="utf-8")
+        section = md[md.index("## Say where every number came from") :]
+        section = section[: section.index("\n## ", 1)]
+        assert "`origin:`" in section and "`why:`" in section
+        for word in ASSUMPTION_ORIGINS:
+            assert f"`{word}`" in section, f"the prompt does not offer {word!r}"
+        # The example the model imitates most is the fenced one — it must show
+        # the segments, not the bare legacy line.
+        fence = re.search(r"```sources\n(.*?)```", section, re.DOTALL)
+        assert fence and "| origin:" in fence.group(1) and "| why:" in fence.group(1)
+        assert "origin not stated" in section, "the model is told what an omitted origin looks like to the reader"
+
+    def test_the_persona_rail_teaches_the_same_vocabulary(self):
+        """A persona-backed named agent replaces the workspace template with
+        `build_profile`'s rails (Devin Review on #2047), so the contract has a
+        third carrier. Same pin: every origin the parser accepts is offered
+        there, and the example shows the segments."""
+        import re
+
+        from app.chat.agent_profile import PROVENANCE_RAILS
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        for word in ASSUMPTION_ORIGINS:
+            assert f"`{word}`" in PROVENANCE_RAILS, f"the persona rail does not offer {word!r}"
+        fence = re.search(r"```sources\n(.*?)```", PROVENANCE_RAILS, re.DOTALL)
+        assert fence and "| origin:" in fence.group(1) and "| why:" in fence.group(1)
+        assert "origin not stated" in PROVENANCE_RAILS

@@ -23,6 +23,10 @@
          so cloned markup (the Library's grid cards are built from its table rows)
          needs no re-wiring. Styling: `.ds-tip` in components.css. -->
     <script src="{{ static_url('js/components/tooltip.js') }}" defer></script>
+    {# Dismissal for any `connect_banner(dismiss_key=…)` on the page. Loaded
+       app-wide because the macro is, and it binds nothing when no card on the
+       page carries a key. #}
+    <script src="{{ static_url('js/connect_banner.js') }}" defer></script>
     <!-- window.confirmModal / alertModal / promptModal — design-system
          replacements for native confirm()/alert()/prompt() (#497 §1).
          Defined here alongside the other end-of-<body> app globals (e.g.
