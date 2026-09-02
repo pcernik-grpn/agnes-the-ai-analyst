@@ -828,6 +828,12 @@ class FactsConfigPatch(BaseModel):
     #: alone — so a caller setting only `retry_mode` cannot silently move a
     #: connection off the Batches API.
     transport: Optional[str] = None
+    #: `provider` follows `transport`'s own PRESENT-in-body convention (never
+    #: `retry_mode`'s always-touched one), for the same reason: a caller
+    #: setting only `retry_mode` must not silently move a connection off (or
+    #: onto) Vertex. `"inherit"`/`"anthropic"`/`"vertex"` sets the override,
+    #: an explicit `null` clears it, omitting it leaves it alone.
+    provider: Optional[str] = None
 
 
 @router.patch("/connections/{connection_id}/extraction/facts-config")
@@ -854,13 +860,27 @@ async def patch_extraction_facts_config(
     plain ``422`` rather than silently ignored — a caller setting a value
     expects it to take effect.
 
+    ``provider`` is a sibling override (``config.extraction.facts.provider``):
+    ``"inherit"`` (the default) follows this instance's ``ai.provider``,
+    ``"anthropic"``/``"vertex"`` pin this stage regardless of it — see
+    :func:`connectors.sharepoint.facts_extraction.resolve_effective_provider`.
+    The Anthropic Batches API has no Vertex equivalent, so a connection
+    resolved to ``provider: vertex`` always runs the ``sync`` transport
+    regardless of its own ``transport`` setting (one warning log line, never
+    an error) — the response's ``provider.effective`` field is what a pass
+    actually builds a client from, which can differ from ``provider.value``
+    when the latter is ``"inherit"``.
+
     Works on BOTH app-state backends, like the Stop control above: this
     touches only ``source_connections``, never a PG-only table.
     """
     connection = _sharepoint_connection_or_404(connection_id)
     from connectors.sharepoint.facts_extraction import (
+        _VALID_PROVIDERS,
         _VALID_RETRY_MODES,
         _VALID_TRANSPORTS,
+        resolve_effective_provider,
+        resolve_provider,
         resolve_retry_mode,
         resolve_transport,
     )
@@ -875,6 +895,12 @@ async def patch_extraction_facts_config(
         raise HTTPException(
             status_code=422,
             detail=f"transport must be one of {sorted(_VALID_TRANSPORTS)} or null (to clear the override)",
+        )
+    provider_given = "provider" in body.model_fields_set
+    if provider_given and body.provider is not None and body.provider not in _VALID_PROVIDERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"provider must be one of {sorted(_VALID_PROVIDERS)} or null (to clear the override)",
         )
 
     from src.repositories import source_connections_repo
@@ -891,6 +917,11 @@ async def patch_extraction_facts_config(
             facts_cfg.pop("transport", None)
         else:
             facts_cfg["transport"] = body.transport
+    if provider_given:
+        if body.provider is None:
+            facts_cfg.pop("provider", None)
+        else:
+            facts_cfg["provider"] = body.provider
     if facts_cfg:
         extraction["facts"] = facts_cfg
     else:
@@ -899,6 +930,8 @@ async def patch_extraction_facts_config(
 
     mode, source = resolve_retry_mode(updated)
     transport_value, transport_source = resolve_transport(updated)
+    provider_value, provider_source = resolve_provider(updated)
+    effective_provider, effective_provider_source = resolve_effective_provider(updated)
 
     # More than the fallback middleware can say (it sees only path params
     # and the response status, never the body) — the VALUE an admin set or
@@ -915,6 +948,10 @@ async def patch_extraction_facts_config(
             "transport": body.transport if transport_given else "(untouched)",
             "transport_resolved": transport_value,
             "transport_source": transport_source,
+            "provider": body.provider if provider_given else "(untouched)",
+            "provider_resolved": provider_value,
+            "provider_source": provider_source,
+            "provider_effective": effective_provider,
         },
     )
 
@@ -922,6 +959,12 @@ async def patch_extraction_facts_config(
         "connection_id": connection_id,
         "retry_mode": {"value": mode, "source": source},
         "transport": {"value": transport_value, "source": transport_source},
+        "provider": {
+            "value": provider_value,
+            "source": provider_source,
+            "effective": effective_provider,
+            "effective_source": effective_provider_source,
+        },
     }
 
 
@@ -1326,7 +1369,56 @@ def _deterministic_tier_rows() -> List[Dict[str, Any]]:
     return [*rows, row]
 
 
-def _extraction_config_rows() -> List[Dict[str, Any]]:
+def _facts_provider_row(connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The facts-extraction provider row — the RESOLVED value
+    (``connectors.sharepoint.facts_extraction.resolve_effective_provider``),
+    not just the raw ``extraction.facts.provider`` setting: ``"inherit"``
+    (the default) resolves through this instance's ``ai.provider``, and an
+    operator debugging "why did this connection's last pass spend against
+    Anthropic instead of Vertex" needs the resolved answer, the same
+    "pre-resolved ``value=``" pattern :func:`_ner_model_row` already uses for
+    its own two-path resolution.
+    """
+    from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+    provider, source = resolve_effective_provider(connection)
+    return _config_row(
+        "Facts provider",
+        ("extraction", "facts", "provider"),
+        default="inherit",
+        value=provider,
+        note=(
+            f"resolved via {source} — 'inherit' (the default) follows this instance's ai.provider; "
+            "'anthropic'/'vertex' pin this stage regardless of it. A connection can override it on "
+            "its source card."
+        ),
+    )
+
+
+def _facts_transport_row(connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The facts-extraction transport row — the RESOLVED value
+    (``connectors.sharepoint.facts_extraction.resolve_transport``). Does NOT
+    account for the provider-vertex-forces-sync fallback a live PASS applies
+    (that is a per-run outcome, reported on the run itself, not a static
+    setting this row describes) — see the run report's own ``transport``
+    field for what a given pass actually used.
+    """
+    from connectors.sharepoint.facts_extraction import resolve_transport
+
+    transport, source = resolve_transport(connection)
+    return _config_row(
+        "Facts transport",
+        ("extraction", "facts", "transport"),
+        default="sync",
+        value=transport,
+        note=(
+            f"resolved via {source} — the Anthropic Batches API has no Vertex equivalent, so a pass "
+            "resolved to provider: vertex always runs sync regardless of this setting"
+        ),
+    )
+
+
+def _extraction_config_rows(connection: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """The effective ``extraction`` block, one row per leaf (design §6.2).
 
     ``extraction.producer.*`` is deliberately absent: the built-in pipeline
@@ -1366,6 +1458,8 @@ def _extraction_config_rows() -> List[Dict[str, Any]]:
         ),
         _detector_row(),
         _ner_model_row(),
+        _facts_provider_row(connection),
+        _facts_transport_row(connection),
         _config_row(
             "Anonymization key",
             ("extraction", "anonymization", "hmac_key_env"),
@@ -1439,7 +1533,7 @@ async def extraction_config(
 
     return {
         "connection_id": connection_id,
-        "effective": _extraction_config_rows(),
+        "effective": _extraction_config_rows(connection),
         "scopes": scopes,
         "section_editable": section_editable,
         "section_lock_reason": None

@@ -1614,8 +1614,12 @@ environment overrides. The whole `extraction` section stays out of
 section name and then deep-merges, so one editable key would make the section
 that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
-`sharepoint_connection.extraction_config_read`. The response also carries
-`min_modified: {value, source}` — the SAME resolved shape `…/extraction/
+`sharepoint_connection.extraction_config_read`. Two rows — "Facts provider"
+and "Facts transport" — show the CONNECTION-RESOLVED value
+(`resolve_effective_provider`/`resolve_transport`), not just the instance-wide
+setting: an operator debugging why a pass spent against one provider instead
+of another needs the resolved answer for THIS connection. The response also
+carries `min_modified: {value, source}` — the SAME resolved shape `…/extraction/
 crawl-config`'s own PATCH response returns. The card's own Crawl filter
 control (a date input plus Save/Clear, next to "Facts policy") reads this
 straight off the connection row it already has rather than calling this
@@ -1662,25 +1666,45 @@ counters, read off the SAME run row (crawl and facts are literally one row;
 `agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
 refreshes every 10s).
 
-`PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears a
-per-connection override for the corrective-retry policy —
-`config.extraction.facts.retry_mode`, a sibling of `config.extraction.
-stop_requested_at` above on the same JSON column. A single high-value
-connection can keep the retry ON (a dropped quote there is a lost citation on
-stage) while a long-tail connection runs with it OFF, without an
-`instance.yaml` edit that would flip every connection at once. Body:
-`{"retry_mode": "off" | "on_gate_fail" | "always" | null}` — `null` (or the
-field omitted) clears the override and falls back to the instance-level
-`extraction.facts.retry_mode`. Returns `{connection_id, retry_mode: {value,
-source}}`, `source` being `"connection"` or `"instance"`. `422` for a value
-outside the three above; `404` for an unknown or non-SharePoint connection.
-Works on both app-state backends, same as `…/extraction/stop`. Audited as
+`PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears
+per-connection overrides for the corrective-retry policy, transport and LLM
+provider — `config.extraction.facts.{retry_mode,transport,provider}`, siblings
+of `config.extraction.stop_requested_at` above on the same JSON column. A
+single high-value connection can keep the retry ON (a dropped quote there is
+a lost citation on stage) while a long-tail connection runs with it OFF,
+without an `instance.yaml` edit that would flip every connection at once;
+`provider` is the same lever for the incident it was added for — a connection
+whose Anthropic key hit its workspace usage cap can be pinned to `vertex`
+without waiting for the instance-wide `ai.provider` to change. Body:
+`{"retry_mode": "off" | "on_gate_fail" | "always" | null, "transport": "sync"
+| "batch" | null, "provider": "inherit" | "anthropic" | "vertex" | null}`.
+`retry_mode` is always touched (omitted behaves like `null`); `transport` and
+`provider` are touched ONLY when present in the body — so a retry-mode-only
+call can never silently move a connection off the Batches API or off (or
+onto) Vertex. `null` (or the field omitted, for `transport`/`provider`) clears
+the override and falls back to the instance-level default. Returns
+`{connection_id, retry_mode: {value, source}, transport: {value, source},
+provider: {value, source, effective, effective_source}}` — `source` is
+`"connection"` or `"instance"`; `provider.value` can be `"inherit"` itself
+(the RAW setting), while `provider.effective` is ALWAYS a concrete
+`"anthropic"`/`"vertex"` (the provider a pass actually builds a client from —
+see `connectors.sharepoint.facts_extraction.resolve_effective_provider`), with
+`effective_source` carrying an `:inherit` suffix when it resolved through
+`ai.provider` rather than an explicit setting. `422` for a value outside the
+three enums above; `404` for an unknown or non-SharePoint connection. Works on
+both app-state backends, same as `…/extraction/stop`. Audited as
 `extraction.facts_retry_mode_set` — the handler writes its own row (more than
-the fallback middleware could say: the requested value, the resolved value
-and its source). CLI: `agnes admin sharepoint facts-config <connection_id>
---retry-mode <mode>` / `--clear`. The same two overrides (retry mode and
-transport) are also settable from the SharePoint source card on
-`/admin/data-sources`, for an admin with no server or CLI access.
+the fallback middleware could say: the requested values, their resolved
+values and sources). CLI: `agnes admin sharepoint facts-config <connection_id>
+--retry-mode <mode>` / `--clear` / `--transport <sync|batch>` /
+`--clear-transport` / `--provider <inherit|anthropic|vertex>` /
+`--clear-provider`. The Anthropic Batches API has no Vertex equivalent: a
+pass resolved to `provider: vertex` always runs the `sync` transport
+regardless of its own `transport` setting — one warning log line, never an
+error — and the run report (`…/extraction/runs/{run_id}`) names the ACTUAL
+`provider`/`transport` a pass used, which can differ from what was
+configured. All three overrides are also settable from the SharePoint source
+card on `/admin/data-sources`, for an admin with no server or CLI access.
 
 `PATCH …/extraction/crawl-config` sets or clears a per-connection age filter
 for the crawl — `config.extraction.crawl.min_modified`, another sibling on

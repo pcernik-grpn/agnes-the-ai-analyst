@@ -16,6 +16,7 @@ schema itself).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -840,6 +841,8 @@ def test_a_cached_retry_response_is_served_without_a_second_call():
     assert result.retried is True
     assert result.cache_hits == 2
     assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
+
+
 # Batch-transport gate helpers — the SAME verbatim-gate / one-retry contract
 # as extract_one, generalized to a reply that may have arrived asynchronously
 # (a collected Batches-API result) rather than from a live call.
@@ -1865,3 +1868,258 @@ def test_an_invalid_connection_transport_falls_back_to_instance(monkeypatch):
     _config(monkeypatch, {})
     conn = {"id": "c1", "config": {"extraction": {"facts": {"transport": "carrier-pigeon"}}}}
     assert resolve_transport(conn) == ("sync", "instance")
+
+
+# ---------------------------------------------------------------------------
+# Provider knob (`extraction.facts.provider`) — the Vertex-incident fix. A
+# live instance whose chat already runs through Google Vertex AI
+# (`ai.provider: vertex`) kept building an Anthropic client for facts
+# extraction and hit its Anthropic workspace's monthly usage cap while the
+# Vertex project had headroom. `inherit` (default) follows `ai.provider`;
+# `anthropic`/`vertex` pin this stage regardless of it — same per-connection
+# override shape as `transport`/`retry_mode` above.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_setting_defaults_to_inherit(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._provider_setting() == "inherit"
+
+
+def test_provider_setting_reads_the_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "provider"): "vertex"})
+    assert fe._provider_setting() == "vertex"
+
+
+def test_an_invalid_provider_setting_falls_back_to_inherit(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "provider"): "openai"})
+    assert fe._provider_setting() == "inherit"
+
+
+def test_resolve_provider_with_no_connection_falls_back_to_instance(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_provider
+
+    _config(monkeypatch, {("extraction", "facts", "provider"): "vertex"})
+    assert resolve_provider(None) == ("vertex", "instance")
+    assert resolve_provider({"id": "c1", "config": {}}) == ("vertex", "instance")
+
+
+def test_a_connection_provider_override_beats_the_instance_setting(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_provider
+
+    _config(monkeypatch, {("extraction", "facts", "provider"): "vertex"})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"provider": "anthropic"}}}}
+    assert resolve_provider(conn) == ("anthropic", "connection")
+
+
+def test_an_invalid_connection_provider_falls_back_to_instance(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_provider
+
+    _config(monkeypatch, {})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"provider": "openai"}}}}
+    assert resolve_provider(conn) == ("inherit", "instance")
+
+
+class TestResolveEffectiveProvider:
+    """`resolve_effective_provider` — ALWAYS a concrete anthropic/vertex,
+    never `inherit` itself."""
+
+    def test_an_explicit_anthropic_setting_is_returned_verbatim(self, monkeypatch):
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        _config(monkeypatch, {("extraction", "facts", "provider"): "anthropic"})
+        assert resolve_effective_provider(None) == ("anthropic", "instance")
+
+    def test_an_explicit_vertex_setting_is_returned_verbatim_even_without_vertex_configured(self, monkeypatch):
+        """An explicit override is a deliberate operator choice — this
+        function does not second-guess it by falling back to anthropic just
+        because `ai.provider` isn't vertex. Whether the client can actually
+        be BUILT is `_build_facts_client`'s job, tested separately."""
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        _config(monkeypatch, {("extraction", "facts", "provider"): "vertex"})
+        assert resolve_effective_provider(None) == ("vertex", "instance")
+
+    def test_inherit_follows_ai_provider_vertex(self, monkeypatch):
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+        _config(monkeypatch, {})
+        assert resolve_effective_provider(None) == ("vertex", "instance:inherit")
+
+    def test_inherit_follows_ai_provider_anthropic(self, monkeypatch):
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        _config(monkeypatch, {})
+        assert resolve_effective_provider(None) == ("anthropic", "instance:inherit")
+
+    def test_a_connection_override_still_wins_over_ai_provider(self, monkeypatch):
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        # ai.provider says vertex, but this ONE connection is pinned to
+        # anthropic — e.g. it still has budget on a different key.
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+        conn = {"id": "c1", "config": {"extraction": {"facts": {"provider": "anthropic"}}}}
+        assert resolve_effective_provider(conn) == ("anthropic", "connection")
+
+
+class TestVertexModelId:
+    """`_vertex_model_id` — the facts stage's own zero-config default
+    (`claude-haiku-4-5`, undated) must map to a VALID Vertex snapshot, not
+    pass through `to_vertex_model_id` unchanged (Vertex requires a dated
+    snapshot; an undated alias 404s there)."""
+
+    def test_the_zero_config_default_maps_to_a_dated_vertex_snapshot(self):
+        assert fe._vertex_model_id("claude-haiku-4-5") == "claude-haiku-4-5@20251001"
+
+    def test_an_already_dated_model_is_translated_normally(self):
+        assert fe._vertex_model_id("claude-sonnet-4-6-20260101") == "claude-sonnet-4-6@20260101"
+
+    def test_an_already_vertex_spelled_model_passes_through(self):
+        assert fe._vertex_model_id("claude-haiku-4-5@20251001") == "claude-haiku-4-5@20251001"
+
+
+class TestBuildFactsClient:
+    """`_build_facts_client` — the ONE factory function client construction
+    routes through, per the resolved (never `inherit`) provider."""
+
+    def test_anthropic_provider_delegates_to_the_shared_ladder(self, monkeypatch):
+        calls = []
+        sentinel_client = object()
+
+        def fake_build_client(model, timeout_s):
+            calls.append((model, timeout_s))
+            return sentinel_client, "resolved-model"
+
+        monkeypatch.setattr("src.anonymization_ner.build_client", fake_build_client)
+        client, model = fe._build_facts_client("anthropic", "claude-haiku-4-5", 30.0)
+        assert client is sentinel_client
+        assert model == "resolved-model"
+        assert calls == [("claude-haiku-4-5", 30.0)]
+
+    def test_a_shared_ladder_failure_becomes_facts_extraction_unavailable(self, monkeypatch):
+        from src.anonymization_ner import DetectionUnavailable
+
+        def boom(model, timeout_s):
+            raise DetectionUnavailable("no credential")
+
+        monkeypatch.setattr("src.anonymization_ner.build_client", boom)
+        with pytest.raises(FactsExtractionUnavailable):
+            fe._build_facts_client("anthropic", "claude-haiku-4-5", 30.0)
+
+    def test_vertex_provider_builds_an_anthropic_vertex_client_directly(self, monkeypatch):
+        sentinel_client = object()
+        captured = {}
+
+        def fake_create_vertex_client(*, project_id, region, timeout=None):
+            captured.update(project_id=project_id, region=region, timeout=timeout)
+            return sentinel_client
+
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", fake_create_vertex_client)
+
+        client, model = fe._build_facts_client("vertex", "claude-haiku-4-5", 45.0)
+
+        assert client is sentinel_client
+        assert captured == {"project_id": "my-project", "region": "us-central1", "timeout": 45.0}
+        assert model == "claude-haiku-4-5@20251001"
+
+    def test_a_static_anthropic_key_in_the_environment_never_overrides_an_explicit_vertex_provider(self, monkeypatch):
+        """The incident this knob exists to fix: a live instance with
+        ai.provider: vertex still had ANTHROPIC_API_KEY set in its
+        environment (left over, or used by something unrelated), and every
+        facts-extraction pass kept building an Anthropic client anyway —
+        `src.anonymization_ner.build_client`'s own "static key wins" ladder.
+        Once the caller has resolved provider="vertex", that ladder must
+        never even be consulted."""
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-workspace-cap-hit")
+
+        def build_client_must_not_be_called(model, timeout_s):
+            raise AssertionError("build_client (the Anthropic-key ladder) must not run for provider=vertex")
+
+        monkeypatch.setattr("src.anonymization_ner.build_client", build_client_must_not_be_called)
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", lambda **kwargs: object())
+
+        client, model = fe._build_facts_client("vertex", "claude-haiku-4-5", 30.0)
+        assert client is not None
+        assert model == "claude-haiku-4-5@20251001"
+
+    def test_vertex_not_configured_raises_facts_extraction_unavailable_naming_the_setting(self, monkeypatch):
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        with pytest.raises(FactsExtractionUnavailable) as excinfo:
+            fe._build_facts_client("vertex", "claude-haiku-4-5", 30.0)
+        message = str(excinfo.value).lower()
+        assert "vertex" in message
+        assert "ai.vertex.project_id" in message
+
+
+class TestExtractorUsesResolvedProvider:
+    def test_defaults_to_anthropic_when_not_given(self):
+        extractor = _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5")
+        assert extractor.provider == "anthropic"
+
+    def test_ensure_client_routes_through_the_resolved_provider(self, monkeypatch):
+        sentinel_client = object()
+        captured = []
+
+        def fake_build_facts_client(provider, model, timeout_s):
+            captured.append((provider, model, timeout_s))
+            return sentinel_client, "vertex-model-id"
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction._build_facts_client", fake_build_facts_client)
+        extractor = _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5", provider="vertex")
+        client, model = extractor._ensure_client()
+        assert client is sentinel_client
+        assert model == "vertex-model-id"
+        assert captured == [("vertex", "claude-haiku-4-5", extractor.timeout_s)]
+
+
+class TestResolveRunTransport:
+    """`_resolve_run_transport` — the Anthropic Batches API has no Vertex
+    equivalent, so a pass resolved to provider=vertex always runs sync,
+    regardless of the configured/overridden transport — ONE warning naming
+    why, never an error, never a silent switch with no trace."""
+
+    def test_vertex_provider_downgrades_batch_to_sync_with_one_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            mode = fe._resolve_run_transport(
+                connection_id="conn1", transport="batch", connection=None, effective_provider="vertex"
+            )
+        assert mode == "sync"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage().lower()
+        assert "vertex" in message
+        assert "batch" in message
+
+    def test_anthropic_provider_leaves_batch_alone(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            mode = fe._resolve_run_transport(
+                connection_id="conn1", transport="batch", connection=None, effective_provider="anthropic"
+            )
+        assert mode == "batch"
+        assert not caplog.records
+
+    def test_vertex_provider_with_sync_transport_is_unaffected(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            mode = fe._resolve_run_transport(
+                connection_id="conn1", transport="sync", connection=None, effective_provider="vertex"
+            )
+        assert mode == "sync"
+        assert not caplog.records
+
+    def test_falls_back_to_resolve_transport_when_no_explicit_transport(self, monkeypatch, caplog):
+        _config(monkeypatch, {("extraction", "facts", "transport"): "batch"})
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            mode = fe._resolve_run_transport(
+                connection_id="conn1", transport=None, connection=None, effective_provider="vertex"
+            )
+        assert mode == "sync"

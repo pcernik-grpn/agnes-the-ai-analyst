@@ -657,7 +657,11 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 raise HTTPException(
                     status_code=422, detail=f"extraction.facts.{key} must be between {lo} and {hi} (got {value})"
                 )
-        for key, allowed in (("transport", ("sync", "batch")), ("retry_mode", ("off", "on_gate_fail", "always"))):
+        for key, allowed in (
+            ("transport", ("sync", "batch")),
+            ("retry_mode", ("off", "on_gate_fail", "always")),
+            ("provider", ("inherit", "anthropic", "vertex")),
+        ):
             value = facts.get(key)
             if value is not None and value not in allowed:
                 raise HTTPException(
@@ -1343,6 +1347,21 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "deterministic repair), 'off' (never retry — cheapest, lowest recall), "
                         "'always' (retry whenever the first pass had any failure). A connection "
                         "can override it on its source card."
+                    ),
+                },
+                "provider": {
+                    "kind": "string",
+                    "default": "inherit",
+                    "hint": (
+                        "Instance default for which LLM provider carries this stage's calls: "
+                        "'inherit' (default) follows this instance's ai.provider (vertex when "
+                        "chat/LLM traffic already runs through Google Vertex AI, anthropic "
+                        "otherwise); 'anthropic'/'vertex' pin this stage regardless of ai.provider "
+                        "— e.g. keep facts extraction on a still-working Anthropic key while chat "
+                        "has moved to Vertex, or the reverse. The Anthropic Batches API has no "
+                        "Vertex equivalent: a vertex-resolved provider always runs the sync "
+                        "transport, regardless of extraction.facts.transport. A connection can "
+                        "override it on its source card."
                     ),
                 },
             },

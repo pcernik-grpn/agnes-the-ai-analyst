@@ -1449,8 +1449,8 @@ console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }
 
 
 # --------------------------------------------------------------------------
-# Facts policy control (retry_mode / transport) — the admin-UI control for
-# `PATCH .../extraction/facts-config`
+# Facts policy control (retry_mode / transport / provider) — the admin-UI
+# control for `PATCH .../extraction/facts-config`
 # (`app/api/admin_extraction.py::patch_extraction_facts_config`), so an admin
 # without server or CLI access can set a per-connection override. Own render
 # helper (`_extRenderFactsPolicy`) and own save function (`saveSpFactsPolicy`)
@@ -1480,43 +1480,48 @@ def _run_facts_policy_js(body: str) -> dict:
 
 
 class TestFactsPolicyControlRendering:
-    def test_renders_both_selects_with_the_connection_override_preselected(self):
+    def test_renders_all_three_selects_with_the_connection_override_preselected(self):
         row = {
             "id": "sp1",
             "name": "Finance SharePoint",
-            "config": {"extraction": {"facts": {"retry_mode": "always", "transport": "batch"}}},
+            "config": {"extraction": {"facts": {"retry_mode": "always", "transport": "batch", "provider": "vertex"}}},
         }
         out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
         html = out["html"]
         assert 'id="ds-sp-factspolicy-retry-sp1"' in html
         assert 'id="ds-sp-factspolicy-transport-sp1"' in html
+        assert 'id="ds-sp-factspolicy-provider-sp1"' in html
         assert '<option value="always" selected>' in html
         assert '<option value="batch" selected>' in html
+        assert '<option value="vertex" selected>' in html
         assert "saveSpFactsPolicy('sp1')" in html
 
     def test_no_override_leaves_instance_default_selected(self):
         row = {"id": "sp2", "name": "Ops SharePoint", "config": {}}
         out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
         html = out["html"]
-        # Both selects default to the empty "Instance default" option — twice,
+        # All three selects default to the empty "Instance default" option —
         # once per select — never a value that reads as a chosen policy.
-        assert html.count('<option value="" selected>Instance default</option>') == 2
+        assert html.count('<option value="" selected>Instance default</option>') == 3
         assert '<option value="off"' in html
         assert '<option value="on_gate_fail"' in html
         assert '<option value="sync"' in html
+        assert '<option value="inherit"' in html
+        assert '<option value="anthropic"' in html
 
-    def test_offers_exactly_the_three_retry_modes_and_two_transports(self):
+    def test_offers_exactly_the_three_retry_modes_two_transports_and_three_providers(self):
         """Pinned against the API's own vocabulary
         (`connectors.sharepoint.facts_extraction._VALID_RETRY_MODES` /
-        `_VALID_TRANSPORTS`) — a fourth option here would be a value the
-        server refuses with 422."""
+        `_VALID_TRANSPORTS` / `_VALID_PROVIDERS`) — a fourth option here
+        would be a value the server refuses with 422."""
         row = {"id": "sp3", "config": {}}
         html = _run_facts_policy_js(
             f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));"
         )["html"]
         # "Instance default" + off/on_gate_fail/always (retry) = 4, plus
-        # "Instance default" + sync/batch (transport) = 3.
-        assert html.count("<option") == 4 + 3
+        # "Instance default" + sync/batch (transport) = 3, plus
+        # "Instance default" + inherit/anthropic/vertex (provider) = 4.
+        assert html.count("<option") == 4 + 3 + 4
 
     def test_an_untrusted_name_is_escaped_not_injected(self):
         row = {"id": "sp4", "name": "<img src=x onerror=alert(1)>", "config": {}}
@@ -1533,7 +1538,16 @@ class TestFactsPolicySave:
     the response's resolved `{value, source}` pair must land in the status
     line, never the raw request echoed back."""
 
-    def _run(self, *, retry_value, transport_value, response_status=200, response_body=None, prior_config=None):
+    def _run(
+        self,
+        *,
+        retry_value,
+        transport_value,
+        provider_value="",
+        response_status=200,
+        response_body=None,
+        prior_config=None,
+    ):
         tpl = TEMPLATE.read_text(encoding="utf-8")
         fn = _extract_block(tpl, "async function saveSpFactsPolicy(id) {")
         response_body = response_body if response_body is not None else {}
@@ -1541,6 +1555,7 @@ class TestFactsPolicySave:
 const _elements = {{
   "ds-sp-factspolicy-retry-sp1": {{ value: {json.dumps(retry_value)} }},
   "ds-sp-factspolicy-transport-sp1": {{ value: {json.dumps(transport_value)} }},
+  "ds-sp-factspolicy-provider-sp1": {{ value: {json.dumps(provider_value)} }},
   "ds-sp-factspolicy-status-sp1": {{ textContent: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] || null }};
@@ -1583,13 +1598,13 @@ async function fetch(url, opts) {{
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return json.loads(proc.stdout)
 
-    def test_an_empty_selection_sends_null_for_both_fields(self):
-        out = self._run(retry_value="", transport_value="")
-        assert out["requests"][0]["body"] == {"retry_mode": None, "transport": None}
+    def test_an_empty_selection_sends_null_for_all_three_fields(self):
+        out = self._run(retry_value="", transport_value="", provider_value="")
+        assert out["requests"][0]["body"] == {"retry_mode": None, "transport": None, "provider": None}
 
     def test_a_chosen_value_is_sent_verbatim(self):
-        out = self._run(retry_value="always", transport_value="batch")
-        assert out["requests"][0]["body"] == {"retry_mode": "always", "transport": "batch"}
+        out = self._run(retry_value="always", transport_value="batch", provider_value="vertex")
+        assert out["requests"][0]["body"] == {"retry_mode": "always", "transport": "batch", "provider": "vertex"}
 
     def test_it_patches_the_facts_config_endpoint(self):
         out = self._run(retry_value="off", transport_value="sync")
@@ -1600,15 +1615,18 @@ async function fetch(url, opts) {{
         out = self._run(
             retry_value="always",
             transport_value="",
+            provider_value="vertex",
             response_body={
                 "retry_mode": {"value": "always", "source": "connection"},
                 "transport": {"value": "sync", "source": "instance"},
+                "provider": {"value": "vertex", "source": "connection", "effective": "vertex"},
             },
         )
         assert "always" in out["status"]
         assert "connection" in out["status"]
         assert "sync" in out["status"]
         assert "instance" in out["status"]
+        assert "vertex" in out["status"]
 
     def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
         out = self._run(
@@ -1625,14 +1643,17 @@ async function fetch(url, opts) {{
         out = self._run(
             retry_value="always",
             transport_value="",
-            prior_config={"extraction": {"facts": {"retry_mode": "off", "transport": "batch"}}},
+            provider_value="",
+            prior_config={"extraction": {"facts": {"retry_mode": "off", "transport": "batch", "provider": "vertex"}}},
             response_body={
                 "retry_mode": {"value": "always", "source": "connection"},
                 "transport": {"value": "sync", "source": "instance"},
+                "provider": {"value": "inherit", "source": "instance", "effective": "anthropic"},
             },
         )
         facts = out["conn"]["config"]["extraction"]["facts"]
         assert facts["retry_mode"] == "always"
-        # transport was cleared (sent null) — the override is removed, not
-        # left at its stale prior value.
+        # transport AND provider were cleared (sent null) — both overrides
+        # are removed, not left at their stale prior values.
         assert "transport" not in facts
+        assert "provider" not in facts
