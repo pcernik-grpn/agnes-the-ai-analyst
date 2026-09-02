@@ -15137,6 +15137,56 @@
         ]
       }
     },
+    "/admin/extraction": {
+      "get": {
+        "description": "The SharePoint extraction fleet dashboard (2026-09-02): one screen for\nan operator running several connections' crawl + facts passes at once \u2014\nis it on pace, is anything stuck, what is it costing.\n\nOff-nav (see ``ADMIN_NAV_OFFNAV`` in ``app/web/admin_nav.py``), reached\nfrom a source card's extraction status on ``/admin/data-sources`` \u2014 the\nsame posture ``/admin/sync`` and ``/admin/semantic-layer`` already take.\nShell-only: the table is fetched client-side from\n``GET /api/admin/sharepoint/extraction/runs`` (PG-only \u2014 a DuckDB-backed\ninstance gets the typed ``501`` explained inline rather than a page that\nsilently renders empty, the same posture ``/admin/semantic-layer`` takes\nfor its own PG-only report).",
+        "operationId": "admin_extraction_fleet_page_admin_extraction_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Extraction Fleet Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/admin/grants": {
       "get": {
         "description": "Backward-compat redirect for the page's oldest URL.\n\nCarries ``?group=`` through, which the Access page reads to preselect a\ngroup. Keeps the admin gate the destination has, so a non-admin gets 403\nhere rather than a 308 naming an internal URL.",
@@ -33667,6 +33717,84 @@
           }
         },
         "summary": "Run Due Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/extraction/runs": {
+      "get": {
+        "description": "One row per SharePoint connection \u2014 the fleet dashboard for an\noperator running several crawls at once: is it on pace, is anything\nstuck, what is it costing.\n\nDefault scope (and ``?active=1``) is connections with a run CURRENTLY\n``running`` \u2014 an idle connection has nothing to say about \"on pace\" and\nits absence here is the honest answer, not an omission. ``?all=1``\nbroadens to every SharePoint connection, each with its own latest run\n(``null`` if it has never run) \u2014 ``all`` wins if both are passed.\n\nEach row's ``run`` reuses :func:`_run_out` \u2014 the SAME projection the\nper-connection status/history endpoints render, so a fleet row and a\nsource card can never disagree about one run \u2014 plus two fleet-only\nadditions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck`` (a\ncheckpoint older than :data:`_FLEET_STUCK_AFTER_S` on a row whose STORED\nstatus is still ``running`` \u2014 deliberately not gated on the derived\n``outcome`` word, so a run already reclassified ``stalled`` or\njob-``failed`` still trips it). ``facts`` is the facts stage's own\nnumbers, read off the same row (:func:`_fleet_facts`).\n\nPG-only, same as every other route in this module: ``extraction_runs``\nis a post-A3 table, so a DuckDB-backed instance gets the typed ``501``\nfrom ``extraction_runs_repo()`` via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.",
+        "operationId": "fleet_extraction_runs_api_admin_sharepoint_extraction_runs_get",
+        "parameters": [
+          {
+            "description": "Only connections with a currently running run (the default scope)",
+            "in": "query",
+            "name": "active",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Only connections with a currently running run (the default scope)",
+              "title": "Active",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Every SharePoint connection, running or not \u2014 wins over `active`",
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Every SharePoint connection, running or not \u2014 wins over `active`",
+              "title": "All",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fleet Extraction Runs",
         "tags": [
           "admin"
         ]
