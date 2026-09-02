@@ -69,6 +69,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional
 
+from urllib.parse import quote
+
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from app.auth.jwt import get_signing_secret
@@ -105,6 +107,18 @@ class ViewAsTicket:
     target_user_id: str
     target_email: str
 
+    #: Where the admin was standing when they entered — the page exit sends
+    #: them back to. It lives in the TICKET rather than in the banner's exit
+    #: form because the banner only ever knows the page it is rendering on:
+    #: an admin who entered from the Access page and then clicked through to
+    #: `/library` and `/agents` would otherwise be dropped wherever they
+    #: happened to stop, as their own admin self, with the person they were
+    #: investigating forgotten. Signed, so it cannot be re-pointed mid-mode,
+    #: and re-validated on read. Empty means "not recorded" — an older
+    #: ticket minted before this field existed, or an entry point that did
+    #: not name one; :func:`return_path` derives a destination either way.
+    return_to: str = ""
+
 
 # Request-scoped active ticket. Default None, so every non-request context
 # (scheduler, worker, CLI, a direct function call in a test) behaves exactly
@@ -116,14 +130,27 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt=_SALT)
 
 
-def sign_ticket(*, viewer_user_id: str, viewer_email: str, target_user_id: str, target_email: str) -> str:
-    """Sign a ticket into the opaque string that rides :data:`VIEW_AS_COOKIE`."""
+def sign_ticket(
+    *,
+    viewer_user_id: str,
+    viewer_email: str,
+    target_user_id: str,
+    target_email: str,
+    return_to: str = "",
+) -> str:
+    """Sign a ticket into the opaque string that rides :data:`VIEW_AS_COOKIE`.
+
+    ``return_to`` is sanitized here as well as on read: it arrives from a form
+    field, and a rejected value must degrade to "not recorded" rather than
+    ride along inside a signed blob where the next reader would trust it.
+    """
     return _serializer().dumps(
         {
             "viewer_user_id": viewer_user_id,
             "viewer_email": viewer_email,
             "target_user_id": target_user_id,
             "target_email": target_email,
+            "return_to": safe_internal_path(return_to, ""),
         }
     )
 
@@ -158,6 +185,12 @@ def verify_ticket(raw: Optional[str]) -> Optional[ViewAsTicket]:
         viewer_email=data["viewer_email"],
         target_user_id=data["target_user_id"],
         target_email=data["target_email"],
+        # Optional on purpose: a ticket minted before this field existed is
+        # still a valid ticket, and adding it to `_REQUIRED_KEYS` would log
+        # every mid-session admin out of the mode on deploy. Re-validated
+        # rather than trusted-because-signed — the signature proves Agnes
+        # wrote it, not that what Agnes wrote was a safe redirect target.
+        return_to=safe_internal_path(data.get("return_to"), ""),
     )
 
 
@@ -273,3 +306,29 @@ def safe_internal_path(candidate: Optional[str], default: str) -> str:
     if "\\" in candidate:
         return default
     return candidate
+
+
+#: Where exit lands when the ticket recorded no origin of its own. Not simply
+#: ``/admin/access``: the person under investigation is the whole reason the
+#: admin left that page, and the Simulate lens restores its selection from
+#: ``?lens=simulate&user=`` — so the fallback rebuilds the deep link out of
+#: the ticket rather than dropping the admin on an empty picker.
+_DEFAULT_RETURN = "/admin/access?lens=simulate&user={target_user_id}"
+
+
+def return_path(ticket: Optional[ViewAsTicket]) -> str:
+    """The page exit should land on for ``ticket``.
+
+    The ticket is the only input, deliberately. The exit route mounts no auth
+    dependency (``get_current_user`` resolves to the TARGET while the mode is
+    on, so ``require_admin`` would 403 the very person trying to leave), which
+    makes a form-supplied destination the one attacker-influenced value on an
+    endpoint that has no other. Reading it from the signed ticket instead
+    means the admin can only ever be returned to the page they actually
+    entered from, and there is no redirect parameter left to aim.
+    """
+    if ticket is None:
+        return "/admin/access"
+    if ticket.return_to:
+        return safe_internal_path(ticket.return_to, "/admin/access")
+    return _DEFAULT_RETURN.format(target_user_id=quote(ticket.target_user_id, safe=""))

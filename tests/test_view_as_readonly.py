@@ -93,22 +93,34 @@ def _mint_csrf(client) -> str:
     return token
 
 
-def _enter(client, target_id: str = ANALYST, *, next_path: str = "/me/profile", csrf: str | None = None):
+def _enter(
+    client,
+    target_id: str = ANALYST,
+    *,
+    next_path: str = "/me/profile",
+    return_to: str | None = None,
+    csrf: str | None = None,
+):
     if csrf is None:
         csrf = _mint_csrf(client)
-    return client.post(
-        "/admin/view-as",
-        data={"user_id": target_id, "csrf_token": csrf, "next": next_path},
-        follow_redirects=False,
-    )
+    data = {"user_id": target_id, "csrf_token": csrf, "next": next_path}
+    if return_to is not None:
+        data["return_to"] = return_to
+    return client.post("/admin/view-as", data=data, follow_redirects=False)
 
 
 def _exit(client, csrf: str | None = None):
+    """Exit posts the CSRF token and NOTHING else.
+
+    No destination field on purpose — the route has no auth dependency, so a
+    form-supplied redirect target would be its one attacker-influenced value;
+    where to land comes from the signed ticket instead.
+    """
     if csrf is None:
         csrf = client.cookies.get("web_csrf")
     return client.post(
         "/admin/view-as/exit",
-        data={"csrf_token": csrf or "", "next": "/me/profile"},
+        data={"csrf_token": csrf or ""},
         follow_redirects=False,
     )
 
@@ -566,9 +578,59 @@ def test_exiting_restores_the_admins_own_identity(va):
     assert "view-as-banner" not in client.get("/me/profile").text
 
 
-def test_exit_redirects_only_to_an_internal_path(va):
+def test_exit_returns_to_the_page_the_mode_was_entered_from(va):
+    """The errand, finished — not abandoned wherever the browse stopped.
+
+    The admin left the Access page to answer a question about one person. The
+    banner's exit form used to post the CURRENT page back as `next`, so leaving
+    from `/library` landed them on `/library` as themselves, with the person
+    they were investigating forgotten and the lens closed. The origin rides the
+    signed ticket now, so it survives however far the browse wandered.
+    """
     client = va["client"]
-    assert _enter(client).status_code == 303
+    origin = f"/admin/access?lens=simulate&user={ANALYST}"
+    assert _enter(client, next_path="/library", return_to=origin).status_code == 303
+
+    # Wander: several pages deep, nowhere near where the mode was entered.
+    for path in ("/library", "/me/profile", "/catalog"):
+        client.get(path)
+
+    r = _exit(client)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == origin
+
+
+def test_exit_falls_back_to_the_person_deep_link_when_no_origin_was_recorded(va):
+    """A ticket minted before `return_to` existed is still a valid ticket.
+
+    `_REQUIRED_KEYS` deliberately does not list it, so a deploy does not evict
+    every admin mid-session. The fallback is derived from the ticket rather
+    than being a bare `/admin/access`, because the picker would otherwise come
+    back empty and the admin would have to find their person again.
+    """
+    client = va["client"]
+    assert _enter(client, return_to=None).status_code == 303
+
+    r = _exit(client)
+
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert location.startswith("/admin/access?")
+    assert "lens=simulate" in location
+    assert f"user={ANALYST}" in location
+
+
+def test_exit_takes_no_destination_from_the_caller(va):
+    """The route mounts no auth dependency, so it accepts no redirect target.
+
+    A `next` field here would be the one attacker-influenced value on an
+    endpoint that has no auth gate to lean on. Posting one must change nothing:
+    the ticket's own origin still wins.
+    """
+    client = va["client"]
+    origin = f"/admin/access?lens=simulate&user={ANALYST}"
+    assert _enter(client, return_to=origin).status_code == 303
     csrf = client.cookies.get("web_csrf")
 
     r = client.post(
@@ -578,7 +640,42 @@ def test_exit_redirects_only_to_an_internal_path(va):
     )
 
     assert r.status_code == 303
-    assert r.headers["location"].startswith("/")
+    assert r.headers["location"] == origin
+
+
+def test_the_banner_exit_form_carries_no_destination(va):
+    """Pins the shape, not just today's behavior.
+
+    The bug was reintroducible by one hidden input: a banner that posts its own
+    page back is a banner that can only ever return the admin to where they
+    already are. If a future edit adds a destination field, this fails.
+    """
+    client = va["client"]
+    assert _enter(client, next_path="/library").status_code == 303
+
+    r = client.get("/library")
+    assert r.status_code == 200
+    banner = r.text.split('action="/admin/view-as/exit"', 1)[1].split("</form>", 1)[0]
+    assert 'name="csrf_token"' in banner
+    assert 'name="next"' not in banner
+    assert 'name="return_to"' not in banner
+
+
+def test_a_hostile_origin_at_entry_is_refused_not_signed(va):
+    """`return_to` arrives from a form field, so it is sanitized on the way IN.
+
+    A rejected value must degrade to "not recorded" rather than ride along
+    inside a signed blob, where the next reader would trust it for having a
+    valid signature.
+    """
+    client = va["client"]
+    for hostile in ("https://evil.example.com/", "//evil.example.com/", "/\\evil.example.com"):
+        assert _enter(client, return_to=hostile).status_code == 303
+        r = _exit(client)
+        assert r.status_code == 303
+        location = r.headers["location"]
+        assert location.startswith("/admin/access?"), (hostile, location)
+        assert "evil.example.com" not in location, (hostile, location)
 
 
 def test_enter_redirects_only_to_an_internal_path(va):
