@@ -36,13 +36,26 @@ compute_agent_intersection`) and **co-session** grant intersection
 both read `app.auth.access._allowed_ids_for_user(owner_id, 'table')`, a raw
 `resource_grants` lookup that never expands through a Data Package.
 
-Practical consequence: to let a scoped agent (or a co-drive session) reach a
-table, an admin must grant that table to the owner's group **in addition
-to** — never instead of — putting it in a Data Package the owner has access
-to. Granting only the package leaves the agent's/session's effective table
-set empty for that table, regardless of the owner's own query access to it
-via `agnes query`/`agnes pull`. If nobody in the instance uses agent scoping
-or co-sessions, a `TABLE` grant has no live effect at all.
+**Corrected 2026-09-02.** This section used to say a scoped agent could
+reach a table ONLY via a direct `TABLE` grant, so an admin had to grant the
+table "in addition to — never instead of" the package. That stopped being
+true with the one-agent-model change (`docs/superpowers/plans/
+2026-08-26-one-agent-model.md`), and the claim outlived it.
+
+What is true: the data axis resolves to `raw TABLE grants ∪ tables in the
+identity's data packages` (`src/agent_scope_intersection.py`
+`_axis_allowed_ids`, the `base | _package_table_ids(pkgs)` branch). A
+declared `data_package` scope row stands for its member tables and is
+expanded LIVE per request, so a package edit reaches every agent scoped to
+it without a re-save. The `/agents` builder only ever declares packages,
+memory domains and collections — never bare table ids.
+
+Practical consequence, restated: putting a table in a Data Package the
+owner holds is normally sufficient for a scoped agent to reach it. A direct
+`TABLE` grant is only needed to ADD a table beyond the owner's packages —
+and since analyst visibility is package-mediated too, such a grant reaches
+nobody except through this one union. If nobody in the instance uses agent
+scoping or co-sessions, a `TABLE` grant has no live effect at all.
 
 ### Internal usage tables: the `agnes-usage` package
 
