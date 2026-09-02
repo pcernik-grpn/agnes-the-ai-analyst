@@ -112,10 +112,15 @@ indexed — after turning `extraction.facts.enabled` on for the first time
 over an existing connection, or after a prompt/ontology change — trigger it
 on its own, with its own wall-clock budget
 (`extraction.facts.run_timeout_s`, independent of the crawl's own
-`extraction.timeout_s`): `POST /api/admin/sharepoint/connections/{id}
-/facts-extract` or `agnes admin sharepoint facts-extract <connection_id>`
-(`--doc-id` narrows it to one document, e.g. to test a prompt change
-cheaply; `--timeout-s` overrides the budget for that one run).
+`extraction.timeout_s`): source card → **Extract facts now** (next to
+**Run extraction now**; disabled, with the reason, while either switch is
+off), `POST /api/admin/sharepoint/connections/{id}/facts-extract`, or
+`agnes admin sharepoint facts-extract <connection_id>` (`--doc-id` narrows
+it to one document, e.g. to test a prompt change cheaply; `--timeout-s`
+overrides the budget for that one run). The pass is incremental — indexed
+documents without up-to-date facts — so it is safe to repeat, and it runs
+alongside a crawl; while one is queued or running the card's Run row says
+so and the button is locked.
 
 ## Troubleshooting quick table
 

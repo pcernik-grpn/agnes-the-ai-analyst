@@ -514,3 +514,59 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["facts_progress"] is None
+
+
+class TestFactsJobInFlight:
+    """The standalone facts pass (``sharepoint-facts-extraction``) writes no
+    ``extraction_runs`` row — it is a JOB, not a crawl run — so the card's
+    status poll reads it off the job queue instead: ``_facts_job_in_flight``
+    is the one lookup ``GET …/extraction/status`` uses to say "a facts pass
+    is queued/running for this connection". Backend-agnostic (the jobs
+    table exists on both), so it is pinned here on DuckDB even though the
+    status route itself is Postgres-only."""
+
+    KIND = "sharepoint-facts-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": connection_id},
+            idempotency_key=f"sharepoint-facts-extraction:{connection_id}",
+        )
+
+    def test_nothing_in_flight_is_none(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        assert _facts_job_in_flight("sp-none") is None
+
+    def test_a_queued_pass_is_reported_with_its_id_and_status(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        job = self._enqueue("sp-queued")
+        found = _facts_job_in_flight("sp-queued")
+        assert found is not None
+        assert found["id"] == job["id"]
+        assert found["status"] == "queued"
+        assert found["created_at"]
+
+    def test_another_connections_pass_is_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        self._enqueue("sp-other")
+        assert _facts_job_in_flight("sp-mine") is None
+
+    def test_a_running_pass_is_reported_running_and_a_finished_one_is_gone(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+        from src.repositories import jobs_repo
+
+        job = self._enqueue("sp-running")
+        claimed = jobs_repo().claim_next(kinds=[self.KIND], worker_id="w1", lease_seconds=60)
+        assert claimed and claimed["id"] == job["id"]
+        found = _facts_job_in_flight("sp-running")
+        assert found is not None and found["status"] == "running"
+
+        assert jobs_repo().complete(job["id"], "w1", claimed["lease_token"], result={"docs_extracted": 0})
+        assert _facts_job_in_flight("sp-running") is None

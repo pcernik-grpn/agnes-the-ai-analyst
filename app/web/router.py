@@ -4054,9 +4054,7 @@ async def library_page(
                 # 170px column while offering something true of every row in
                 # the band equally.
                 "band_link": (
-                    {"href": "/agents?from_template=1", "label": "Start from a template"}
-                    if key == "agent"
-                    else None
+                    {"href": "/agents?from_template=1", "label": "Start from a template"} if key == "agent" else None
                 ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
@@ -9835,6 +9833,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # the block below never runs.
         "extraction_ready": False,
         "extraction_unready_reason": None,
+        # The "Extract facts now" gate — the standalone
+        # `sharepoint-facts-extraction` pass. Same posture as the two keys
+        # above: computed here so the card disables the button with the
+        # reason instead of letting the click land a 409 the server already
+        # knows about, and closed (not ready, no switch named) if the block
+        # below never runs.
+        "facts_extraction_ready": False,
+        "facts_extraction_unready_switch": None,
     }
     try:
         from app.instance_config import feature_enabled, get_value
@@ -9861,6 +9867,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         usable, error = _extraction_readiness()
         in_agnes_schedule["extraction_ready"] = usable
         in_agnes_schedule["extraction_unready_reason"] = None if usable else (error or {}).get("error")
+
+        # The facts pass honours the connector switch first (router-level:
+        # the whole `/api/admin/sharepoint/*` surface answers `409
+        # feature_disabled` without it) and then its own two switches —
+        # `_facts_extraction_readiness`, the SAME check the trigger runs
+        # before enqueueing, whose refusal names the key that is off. It
+        # deliberately does NOT need the `extraction` dependency extra
+        # (`extraction_dependencies_missing` above): the pass reads
+        # already-converted markdown, never raw documents.
+        from app.api.admin_sharepoint import _facts_extraction_readiness
+
+        if not in_agnes_schedule["enabled"]:
+            facts_usable, facts_switch = False, "sharepoint.enabled"
+        else:
+            facts_usable, facts_error = _facts_extraction_readiness()
+            facts_switch = None if facts_usable else (facts_error or {}).get("switch")
+        in_agnes_schedule["facts_extraction_ready"] = facts_usable
+        in_agnes_schedule["facts_extraction_unready_switch"] = facts_switch
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 
