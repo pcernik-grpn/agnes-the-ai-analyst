@@ -245,6 +245,82 @@ def test_the_advanced_editor_refuses_sql_with_the_server_s_own_words(sql):
     assert "not SQL" in message
 
 
+def _advanced_editor_error(raw: str) -> str:
+    """Run the shipped raw-editor branch and return the message it throws."""
+    script = (
+        _load_register_js()
+        + _edit_helpers_slice()
+        + "\ntry { _editKbFilterSourceQuery(true, %s, '[]'); process.stdout.write('\"no-throw\"'); }\n"
+        % json.dumps(raw)
+        + "catch (e) { process.stdout.write(JSON.stringify(e.message)); }\n"
+    )
+    return json.loads(_node_run(script))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"where_filter": [{"column": "a", "operator": "eq", "values": ["1"]}]}',
+        '{"whereFilters": [{"column": "a", "operator": "eq", "values": ["1"]}]}',
+        '{"columns": ["id"], "changedSince": "-7 days"}',
+    ],
+)
+def test_the_advanced_editor_refuses_an_unknown_filter_key(raw):
+    """The raw editor took ANY JSON object, and `ExportFilter.from_dict`
+    dropped what it didn't know — so a misspelled row filter saved fine and
+    the next sync exported the FULL table (#1979). It is refused here too,
+    before the request leaves the browser."""
+    message = _advanced_editor_error(raw)
+    assert message != "no-throw", "an unknown key must not be saveable"
+    assert "unknown key" in message
+    assert "full table" in message
+
+
+def test_the_advanced_editor_still_takes_every_accepted_key():
+    """Including the `fileType` wire-name alias `ExportFilter.from_dict`
+    accepts — the client must not be stricter than the server."""
+    for raw in (
+        '{"where_filters": [{"column": "a", "operator": "eq", "values": ["1"]}]}',
+        '{"fileType": "parquet"}',
+        '{"columns": ["id"], "changed_since": "-2 days", "changed_until": "-1 days", "limit": 10, "file_type": "csv"}',
+    ):
+        produced = _run_edit_helper("_editKbFilterSourceQuery(true, %s, '[]')" % json.dumps(raw))
+        assert json.loads(produced) == json.loads(raw)
+
+
+def test_the_accepted_key_list_is_the_same_on_both_sides():
+    """The browser must not drift from the parser: one list of accepted keys,
+    mirrored in `register_table_form.js` and asserted against the Python
+    definition here (a key added to the spec has to land in both)."""
+    from connectors.keboola.storage_api import EXPORT_FILTER_DOC_KEYS, EXPORT_FILTER_KEYS
+
+    assert _run_edit_helper("window.RegisterTableForm.KEBOOLA_FILTER_DOC_KEYS") == list(EXPORT_FILTER_DOC_KEYS)
+    assert set(_run_edit_helper("window.RegisterTableForm.KEBOOLA_FILTER_KEYS")) == set(EXPORT_FILTER_KEYS)
+
+
+def test_the_unknown_key_rejection_matches_the_server_s_wording(seeded_app):
+    """One wording, two places: the string the JS refuses with is the one the
+    API answers with, so an operator can search for it once."""
+    c = seeded_app["client"]
+    auth = _auth(seeded_app["admin_token"])
+    r = c.post(
+        "/api/admin/register-table",
+        headers=auth,
+        json={
+            "name": "orders_kb_unknown_key",
+            "source_type": "keboola",
+            "query_mode": "materialized",
+            "bucket": "in.c-sales",
+            "source_table": "orders",
+            "source_query": '{"where_filter": []}',
+        },
+    )
+    assert r.status_code == 422, r.text
+    server_message = " ".join(str(r.json()["detail"]).split())
+    js_message = " ".join(_advanced_editor_error('{"where_filter": []}').split())
+    assert js_message in server_message
+
+
 def test_the_client_side_rejection_is_the_server_s_message_verbatim(seeded_app):
     """Not a paraphrase: the string the JS refuses with is the same one the
     API answers with, so an operator who sees it can search for it once."""

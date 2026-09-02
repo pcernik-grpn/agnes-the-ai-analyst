@@ -4783,6 +4783,13 @@
             if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
                 throw new Error('Storage API filter must be a JSON object, e.g. {"where_filters": [ ... ]}.');
             }
+            // A key the exporter does not read is refused, never ignored: the
+            // server used to drop it and export the WHOLE table (#1979). Same
+            // key list and same wording as the API answers with.
+            var unknown = window.RegisterTableForm.keboolaFilterUnknownKeys(parsed);
+            if (unknown.length) {
+                throw new Error(window.RegisterTableForm.KEBOOLA_FILTER_UNKNOWN_KEYS_MESSAGE(unknown));
+            }
             return raw;
         }
         var rows = [];

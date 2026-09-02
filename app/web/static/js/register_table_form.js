@@ -59,6 +59,31 @@
   // /admin/tables Edit modal validates its "Advanced: raw filter (JSON)"
   // editor client-side with this exact wording, so an operator who hits it
   // in the UI can search for the same string in the API's response (#1979).
+  // The keys a Keboola filter spec may carry — ONE list, mirroring
+  // connectors/keboola/storage_api.py's EXPORT_FILTER_DOC_KEYS. The server
+  // used to DROP a key it didn't recognise, so a misspelled row filter
+  // (`where_filter`, `whereFilters`, …) saved fine and the next sync
+  // exported the FULL table (#1979); both modals now refuse it in the
+  // browser with the server's own wording.
+  var KEBOOLA_FILTER_DOC_KEYS = [
+    'where_filters', 'columns', 'changed_since', 'changed_until', 'limit', 'file_type',
+  ];
+  // `fileType` is the Storage API wire name — accepted by the parser as an
+  // alias, deliberately not advertised as a spec key.
+  var KEBOOLA_FILTER_KEYS = KEBOOLA_FILTER_DOC_KEYS.concat(['fileType']);
+
+  function keboolaFilterUnknownKeys(spec) {
+    return Object.keys(spec || {}).filter(function (k) {
+      return KEBOOLA_FILTER_KEYS.indexOf(k) === -1;
+    });
+  }
+
+  function KEBOOLA_FILTER_UNKNOWN_KEYS_MESSAGE(keys) {
+    return 'Storage API filter has unknown key(s) ' + keys.slice().sort().join(', ')
+      + '; accepted keys are ' + KEBOOLA_FILTER_DOC_KEYS.join(', ')
+      + '. A misspelled key would silently export the full table.';
+  }
+
   var KEBOOLA_FILTER_NOT_SQL_MESSAGE =
     'Keboola materialized source_query must be a JSON filter spec '
     + '(columns/whereFilters/changedSince), not SQL. Use null for full-table '
@@ -1033,6 +1058,10 @@
   window.RegisterTableForm = {
     CONNECTORS: CONNECTORS,
     KEBOOLA_FILTER_NOT_SQL_MESSAGE: KEBOOLA_FILTER_NOT_SQL_MESSAGE,
+    KEBOOLA_FILTER_DOC_KEYS: KEBOOLA_FILTER_DOC_KEYS,
+    KEBOOLA_FILTER_KEYS: KEBOOLA_FILTER_KEYS,
+    KEBOOLA_FILTER_UNKNOWN_KEYS_MESSAGE: KEBOOLA_FILTER_UNKNOWN_KEYS_MESSAGE,
+    keboolaFilterUnknownKeys: keboolaFilterUnknownKeys,
     modeOutcome: modeOutcome,
     renderModeCards: renderModeCards,
     open: open,

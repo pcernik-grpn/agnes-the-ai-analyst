@@ -3708,6 +3708,45 @@ _BACKTICK_REJECTION_MESSAGE = (
 )
 
 
+# A Keboola materialized row exports through the Storage API, whose filter is
+# a JSON spec (`connectors.keboola.storage_api.ExportFilter`) — never SQL.
+# ONE validator for it, called from the RegisterTableRequest model validator
+# (POST /register-table) AND the merged-record path in `update_table` (PUT),
+# so the two routes cannot disagree about what a filter spec is.
+_KEBOOLA_FILTER_NOT_SQL_MESSAGE = (
+    "Keboola materialized source_query must be a JSON filter spec "
+    "(columns/whereFilters/changedSince), not SQL. "
+    "Use null for full-table export, or set query_mode='local' "
+    "for DuckDB-based Keboola pulls."
+)
+
+
+def _validate_keboola_filter_spec(sq: str) -> None:
+    """Raise ValueError unless ``sq`` is a filter spec the exporter honors.
+
+    Three refusals, in order: SQL (the Storage API takes no SQL), invalid
+    JSON, and — since #1979 — a spec carrying a key nobody reads.
+    `ExportFilter.from_dict` used to drop unknown keys, so a misspelled row
+    filter (`where_filter`, `whereFilters`, …) was accepted here and the next
+    sync exported and distributed the FULL table. The parser is the same one
+    the sync runs, so registration cannot accept what sync will refuse.
+    """
+    if sq.upper().startswith(("SELECT", "WITH")):
+        raise ValueError(_KEBOOLA_FILTER_NOT_SQL_MESSAGE)
+    try:
+        parsed = json.loads(sq)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Keboola materialized source_query must be valid JSON: {e}") from e
+    # Imported locally: `app.api.admin` must not pull a connector module in at
+    # import time.
+    from connectors.keboola.storage_api import ExportFilter
+
+    try:
+        ExportFilter.from_dict(parsed)
+    except ValueError as e:
+        raise ValueError(str(e)) from e
+
+
 class RegisterTableRequest(BaseModel):
     name: str
     folder: Optional[str] = None
@@ -3884,17 +3923,7 @@ class RegisterTableRequest(BaseModel):
         # The extractor uses the Storage API with structured filters (columns,
         # whereFilters, changedSince) — DuckDB SQL belongs on BigQuery rows.
         if self.query_mode == "materialized" and self.source_type == "keboola" and sq:
-            if sq.upper().startswith(("SELECT", "WITH")):
-                raise ValueError(
-                    "Keboola materialized source_query must be a JSON filter spec "
-                    "(columns/whereFilters/changedSince), not SQL. "
-                    "Use null for full-table export, or set query_mode='local' "
-                    "for DuckDB-based Keboola pulls."
-                )
-            try:
-                json.loads(sq)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Keboola materialized source_query must be valid JSON: {e}") from e
+            _validate_keboola_filter_spec(sq)
         # Normalise: stash the trimmed-or-None form so the persisted column
         # never carries surrounding whitespace or empty-string sentinels.
         self.source_query = sq
@@ -6721,24 +6750,15 @@ async def update_table(
                 # is a non-empty string here.
                 if merged.get("source_type") == "keboola":
                     _sq = str(merged.get("source_query", "") or "").strip()
-                    if _sq.upper().startswith(("SELECT", "WITH")):
-                        raise HTTPException(
-                            status_code=422,
-                            detail=(
-                                "Keboola materialized source_query must be a JSON "
-                                "filter spec (columns/whereFilters/changedSince), "
-                                "not SQL. Use null for full-table export, or set "
-                                "query_mode='local' for DuckDB-based Keboola pulls."
-                            ),
-                        )
                     if _sq:
+                        # Same validator the register route runs — SQL, invalid
+                        # JSON, and (since #1979) any unknown key are refused
+                        # identically on both paths. The Edit modal's advanced
+                        # JSON editor lands here.
                         try:
-                            json.loads(_sq)
-                        except json.JSONDecodeError as _e:
-                            raise HTTPException(
-                                status_code=422,
-                                detail=f"Keboola materialized source_query must be valid JSON: {_e}",
-                            ) from _e
+                            _validate_keboola_filter_spec(_sq)
+                        except ValueError as _e:
+                            raise HTTPException(status_code=422, detail=str(_e)) from _e
 
             if merged.get("source_type") == "databricks":
                 # Reuse the register-time contract on updates too: the synthetic

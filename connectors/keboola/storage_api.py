@@ -469,6 +469,88 @@ def _write_empty_parquet_export(dest_path: Path, columns: List[str]) -> None:
         pq.write_table(schema.empty_table(), tmp)
 
 
+# ── the filter spec vocabulary, in one place (#1979) ────────────────────────
+#
+# `from_dict` used to tolerate unknown keys, so a misspelled row filter
+# (`where_filter`, `whereFilters`, `changedSince`, …) parsed into a DEFAULT
+# ExportFilter — "export the whole table". The admin saw a saved filter and
+# every sync distributed every row. These sets are what the parser, the
+# register/update validator (`app/api/admin.py`) and the /admin/tables
+# advanced JSON editor all refuse against, so the operator meets ONE
+# vocabulary and ONE wording wherever the typo is made.
+EXPORT_FILTER_DOC_KEYS = (
+    "where_filters",
+    "columns",
+    "changed_since",
+    "changed_until",
+    "limit",
+    "file_type",
+)
+# `fileType` is a deliberate alias (the Storage API wire name) — accepted,
+# but not advertised as a spec key.
+EXPORT_FILTER_KEYS = frozenset(EXPORT_FILTER_DOC_KEYS) | {"fileType"}
+WHERE_FILTER_ENTRY_KEYS = ("column", "operator", "values")
+
+
+def unknown_filter_keys_message(
+    unknown,
+    accepted=EXPORT_FILTER_DOC_KEYS,
+    subject: str = "Storage API filter",
+) -> str:
+    """The ONE wording for "this filter spec has a key nobody honors".
+
+    Shared by `ExportFilter.from_dict`, the `RegisterTableRequest`
+    validator and the advanced JSON editor in `admin_tables.html`, so an
+    operator who hits it in the UI can search for the same string in the
+    API's response.
+    """
+    return (
+        f"{subject} has unknown key(s) {', '.join(sorted(unknown))}; accepted keys are "
+        f"{', '.join(accepted)}. A misspelled key would silently export the full table."
+    )
+
+
+def _validated_where_filters(raw) -> List[dict]:
+    """Normalize a `where_filters` list, refusing anything unhonored.
+
+    An entry's keys are `{column, operator, values}` and nothing else — a
+    misspelled one (`colum`) would otherwise be dropped and the filter would
+    widen rather than narrow. `operator` stays optional and materializes as
+    `eq`, matching `connectors/keboola/where_filters.py:parse_filters`, so a
+    spec that worked before this guard still works.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"where_filters must be a list, got {type(raw).__name__}")
+    out: List[dict] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"where_filters[{i}] must be a dict, got {type(entry).__name__}")
+        unknown = set(entry) - set(WHERE_FILTER_ENTRY_KEYS)
+        if unknown:
+            raise ValueError(
+                unknown_filter_keys_message(
+                    unknown,
+                    accepted=WHERE_FILTER_ENTRY_KEYS,
+                    subject=f"Storage API filter where_filters[{i}]",
+                )
+            )
+        missing = [k for k in ("column", "values") if k not in entry]
+        if missing:
+            raise ValueError(f"where_filters[{i}] missing fields: {missing}")
+        if not isinstance(entry["values"], list):
+            raise ValueError(f"where_filters[{i}].values must be a list")
+        out.append(
+            {
+                "column": entry["column"],
+                "operator": entry.get("operator", "eq"),
+                "values": list(entry["values"]),
+            }
+        )
+    return out
+
+
 @dataclass
 class ExportFilter:
     """Structured Keboola Storage API filter spec.
@@ -505,19 +587,33 @@ class ExportFilter:
 
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> "ExportFilter":
-        """Parse from `table_registry.source_query` JSON. Tolerates None /
-        empty / unknown keys (registry stores admin input that may be sparse)."""
+        """Parse from `table_registry.source_query` JSON.
+
+        Tolerates None / empty / sparse input (the registry stores admin
+        input that may set nothing at all — that is a full-table export).
+        It does NOT tolerate an unknown key: dropping one silently turned a
+        misspelled row filter into "export the whole table" (#1979), so any
+        key outside `EXPORT_FILTER_KEYS` — and any key outside
+        `WHERE_FILTER_ENTRY_KEYS` inside a `where_filters` entry — raises
+        `ValueError` here, at parse time, before an export is prepared.
+        """
         if not data:
             return cls()
         if not isinstance(data, dict):
             raise ValueError(f"ExportFilter.from_dict expects a dict, got {type(data).__name__}")
+        unknown = set(data) - EXPORT_FILTER_KEYS
+        if unknown:
+            raise ValueError(unknown_filter_keys_message(unknown))
+        columns = data.get("columns") or []
+        if not isinstance(columns, list):
+            raise ValueError(f"columns must be a list, got {type(columns).__name__}")
         # Accept both `file_type` (preferred, matches the rest of the
         # snake_case API) and `fileType` (matches Storage API wire name)
         # so an admin who copies an example from Apiary docs doesn't trip.
         ft = data.get("file_type") or data.get("fileType") or FILE_TYPE_CSV
         return cls(
-            where_filters=list(data.get("where_filters") or []),
-            columns=list(data.get("columns") or []),
+            where_filters=_validated_where_filters(data.get("where_filters")),
+            columns=list(columns),
             changed_since=data.get("changed_since"),
             changed_until=data.get("changed_until"),
             limit=data.get("limit"),
