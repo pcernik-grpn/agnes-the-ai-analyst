@@ -1086,3 +1086,458 @@ def test_on_progress_is_never_called_when_the_stage_refuses_to_run(pg_env):
     with pytest.raises(FactsExtractionUnavailable, match="no ontology"):
         _run(StubExtractor([_stream()]), on_progress=lambda update: updates.append(dict(update)))
     assert updates == []
+
+
+# ---------------------------------------------------------------------------
+# Batch transport (extraction.facts.transport: batch) — the SAME ingest
+# chokepoint and gate contract as the sync tests above, driven through the
+# Batches API instead. No network: `FakeBatchesAPI` stands in for
+# `client.messages.batches`.
+# ---------------------------------------------------------------------------
+
+
+def _fake_message(text: str, *, usage: dict) -> object:
+    block = type("_FBlock", (), {"type": "text", "text": text})()
+    usage_obj = type(
+        "_FUsage",
+        (),
+        {
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+        },
+    )()
+    return type("_FMessage", (), {"content": [block], "usage": usage_obj})()
+
+
+def _fake_batch_result(
+    custom_id: str, *, kind: str, message: object | None = None, error_type: str | None = None
+) -> object:
+    error = None
+    if error_type is not None:
+        error = type("_FError", (), {"type": error_type, "message": error_type})()
+    result = type("_FResult", (), {"type": kind, "message": message, "error": error})()
+    return type("_FItem", (), {"custom_id": custom_id, "result": result})()
+
+
+class FakeBatchesAPI:
+    """No-network double for ``client.messages.batches``.
+
+    ``outcomes`` maps ``custom_id -> ("succeeded", reply_text) |
+    ("errored", error_type) | ("canceled", None) | ("expired", None)`` — OR
+    a LIST of such tuples, consumed in order across repeated ``create()``
+    calls for the same custom_id (the seam a corrective-retry-batch test
+    uses: the FIRST batch gets entry 0, the follow-up retry batch entry 1).
+    A batch is ``ended`` immediately after ``create()`` unless ``hold()``
+    is called for its id right after — the seam the resumability/deadline
+    tests use to keep a batch ``in_progress`` until ``release()``.
+    """
+
+    def __init__(self, outcomes: dict | None = None, *, usage: dict | None = None) -> None:
+        self.outcomes = outcomes or {}
+        self.usage = usage or {"input_tokens": 1000, "output_tokens": 100}
+        self.created: list[list] = []
+        self.retrieved: list[str] = []
+        self._next_id = 0
+        self._held: set[str] = set()
+        self._results: dict[str, list] = {}
+        self._attempt: dict[str, int] = {}
+
+    def create(self, *, requests):
+        self._next_id += 1
+        batch_id = f"batch_{self._next_id}"
+        self.created.append(list(requests))
+        results = []
+        for req in requests:
+            custom_id = req["custom_id"]
+            spec = self.outcomes.get(custom_id, ("succeeded", "NODES\nEDGES\n"))
+            if isinstance(spec, list):
+                idx = min(self._attempt.get(custom_id, 0), len(spec) - 1)
+                self._attempt[custom_id] = self._attempt.get(custom_id, 0) + 1
+                kind, payload = spec[idx]
+            else:
+                kind, payload = spec
+            if kind == "succeeded":
+                results.append(
+                    _fake_batch_result(custom_id, kind="succeeded", message=_fake_message(payload, usage=self.usage))
+                )
+            elif kind == "errored":
+                results.append(_fake_batch_result(custom_id, kind="errored", error_type=payload or "overloaded_error"))
+            else:
+                results.append(_fake_batch_result(custom_id, kind=kind))
+        self._results[batch_id] = results
+        return type("_FBatch", (), {"id": batch_id})()
+
+    def hold(self, batch_id: str) -> None:
+        self._held.add(batch_id)
+
+    def release(self, batch_id: str) -> None:
+        self._held.discard(batch_id)
+
+    def retrieve(self, batch_id: str):
+        self.retrieved.append(batch_id)
+        status = "in_progress" if batch_id in self._held else "ended"
+        return type("_FBatch", (), {"id": batch_id, "processing_status": status})()
+
+    def results(self, batch_id: str):
+        # Reversed on purpose — the SDK's own contract is "any order", and
+        # this proves the collector never assumes submission order.
+        return iter(list(reversed(self._results.get(batch_id, []))))
+
+
+class FakeBatchClient:
+    def __init__(self, api: FakeBatchesAPI) -> None:
+        self.messages = type("_FMessages", (), {"batches": api})()
+
+
+def _run_batch(batch_client, **kwargs):
+    from connectors.sharepoint.facts_extraction import run_facts_extraction
+
+    return run_facts_extraction(CONNECTION_ID, transport="batch", batch_client=batch_client, **kwargs)
+
+
+def test_batch_pass_writes_claims_through_the_real_ingest_chokepoint(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+    _seed_document(file_id="cf_2", doc_id="doc2", text="Contoso Ltd signed in April.")
+
+    node1 = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    node2 = {
+        "id": "client:contoso-ltd",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc2", "quote": "Contoso Ltd signed"}],
+    }
+    api = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node1)), "cf_2": ("succeeded", _stream(node2))})
+    report = _run_batch(FakeBatchClient(api))
+
+    assert report["docs_extracted"] == 2
+    assert report["docs_via_batch"] == 2
+    assert report["docs_via_sync"] == 0
+    assert report["claims_written"] == 2
+    assert report["ingest_failures"] == []
+    assert len(api.created) == 1, "both documents fit in one batch"
+
+    from src.repositories import facts_repo
+
+    found = facts_repo().search({"id": "admin1"}, type="engagement", filters={}, q=None, limit=10)
+    assert found["subjects"], "the batch pass's facts must be readable back through the real search path"
+
+
+def test_batch_gate_failure_defers_to_a_follow_up_retry_batch_by_default(pg_env):
+    """``extraction.facts.retry_transport`` defaults to ``batch`` — a
+    verbatim-gate failure must submit ONE follow-up batch (never a live
+    sync call) and recover through the SAME merge rule `extract_one`'s own
+    retry branch applies."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March for Contoso.")
+
+    bad = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "This sentence was never in the document."}],
+    }
+    fixed = {
+        "id": "client:contoso",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "for Contoso"}],
+    }
+    api = FakeBatchesAPI({"cf_1": [("succeeded", _stream(bad)), ("succeeded", _stream(fixed))]})
+    report = _run_batch(FakeBatchClient(api))
+
+    assert len(api.created) == 2, "the gate failure must submit a follow-up retry batch"
+    assert report["docs_extracted"] == 1
+    assert report["claims_written"] == 1
+    assert report["facts_retries"] == 1
+    assert report["facts_quotes_dropped"] == 0
+    assert report["docs_via_batch"] == 1
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    assert state["docs"]["cf_1"]["status"] == "done"
+
+
+def test_batch_retry_batch_that_still_fails_is_dropped_and_counted(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    bad = {
+        "id": "client:x",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "never appeared"}],
+    }
+    still_bad = {
+        "id": "client:x",
+        "type": "client",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "still never appeared"}],
+    }
+    api = FakeBatchesAPI({"cf_1": [("succeeded", _stream(bad)), ("succeeded", _stream(still_bad))]})
+    report = _run_batch(FakeBatchClient(api))
+
+    assert len(api.created) == 2
+    assert report["docs_extracted"] == 1, "the document is still processed — zero facts, not zero documents"
+    assert report["claims_written"] == 0
+    assert report["facts_quotes_dropped"] == 1
+    assert report["facts_retries"] == 1
+
+
+def test_batch_submission_records_batch_submitted_state_before_collection(pg_env):
+    """The per-doc state entry a submission writes — checked mid-flight,
+    before this pass's own collection step runs, by holding the batch
+    `in_progress` for a moment via a second, isolated pass."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    api = FakeBatchesAPI({"cf_1": ("succeeded", _stream())})
+
+    # Auto-hold every batch this test submits `in_progress` (the id is only
+    # known after `create()`, so it can't be `hold()`ed ahead of time), and
+    # expire the deadline on the SECOND check (Phase 1's submission gate
+    # passes; Phase 2's first poll of the held batch sees it expired) — the
+    # pass stops right after submission, before collection ever runs.
+    real_create = api.create
+
+    def create_and_hold(*, requests):
+        batch = real_create(requests=requests)
+        api.hold(batch.id)
+        return batch
+
+    api.create = create_and_hold  # type: ignore[method-assign]
+
+    class ExpireAfterOne:
+        def __init__(self) -> None:
+            self.checks = 0
+
+        def expired(self) -> bool:
+            self.checks += 1
+            return self.checks > 1
+
+    report = _run_batch(FakeBatchClient(api), deadline=ExpireAfterOne())
+    assert report["interrupted"] is True
+    assert report["docs_extracted"] == 0
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    entry = state["docs"]["cf_1"]
+    assert entry["status"] == "batch-submitted"
+    assert entry["batch_id"] == "batch_1"
+    assert entry["custom_id"] == "cf_1"
+    assert entry["phase"] == "initial"
+    assert "submitted_at" in entry
+
+
+def test_batch_transient_error_requeues_and_a_later_pass_recovers(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    api = FakeBatchesAPI({"cf_1": ("errored", "overloaded_error")})
+    first = _run_batch(FakeBatchClient(api))
+    assert first["docs_extracted"] == 0
+    assert first["facts_failed"] == 0, "a transient error is requeued, not counted as a permanent failure"
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    assert "cf_1" not in state["docs"], "cleared back to plain pending so the next pass replans it"
+    assert state["batch_attempts"]["cf_1"] == 1
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    api2 = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node))})
+    second = _run_batch(FakeBatchClient(api2))
+    assert second["docs_extracted"] == 1
+    assert second["claims_written"] == 1
+
+
+def test_batch_invalid_request_fails_without_consuming_an_attempt(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    api = FakeBatchesAPI({"cf_1": ("errored", "invalid_request_error")})
+    report = _run_batch(FakeBatchClient(api))
+    assert report["facts_failed"] == 1
+    assert report["docs_extracted"] == 0
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    assert state["docs"]["cf_1"]["status"] == "failed"
+    assert "invalid_request" in state["docs"]["cf_1"]["reason"]
+    assert "cf_1" not in state.get("batch_attempts", {}), "a permanent failure never consumes a retry attempt"
+
+
+def test_batch_deadline_mid_poll_leaves_state_resumable(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    api = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node))})
+
+    class CountingDeadline:
+        """Not expired for the FIRST check (Phase 1's submission gate);
+        expired every check after — the FIRST poll of the freshly-submitted
+        batch (which `FakeBatchesAPI` reports as `in_progress` while held)
+        sees it, so the pass stops without ever sleeping."""
+
+        def __init__(self) -> None:
+            self.checks = 0
+
+        def expired(self) -> bool:
+            self.checks += 1
+            return self.checks > 1
+
+    # The batch id is only known after `create()`; submit once un-held to
+    # learn it, then re-run against a client that holds it — instead,
+    # simplest: hold ALL future batches by patching create to hold
+    # immediately.
+    real_create = api.create
+
+    def create_and_hold(*, requests):
+        batch = real_create(requests=requests)
+        api.hold(batch.id)
+        return batch
+
+    api.create = create_and_hold  # type: ignore[method-assign]
+
+    report = _run_batch(FakeBatchClient(api), deadline=CountingDeadline())
+    assert report["interrupted"] is True
+    assert report["interrupted_reason"] == "timeout"
+    assert report["docs_extracted"] == 0
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    state = load_state(CONNECTION_ID)
+    entry = state["docs"]["cf_1"]
+    assert entry["status"] == "batch-submitted"
+    batch_id = entry["batch_id"]
+
+    # The batch finishes on Anthropic's side while we were between passes.
+    api.release(batch_id)
+
+    second = _run_batch(FakeBatchClient(api))
+    assert second["docs_extracted"] == 1
+    assert second["claims_written"] == 1
+    assert len(api.created) == 1, "the second pass resumed the SAME batch — it never resubmitted"
+
+    state2 = load_state(CONNECTION_ID)
+    assert state2["docs"]["cf_1"]["status"] == "done"
+
+
+def test_batch_resume_treats_a_29_day_old_entry_as_expired_without_a_network_call(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    from datetime import datetime, timedelta, timezone
+
+    from connectors.sharepoint.facts_extraction import BATCH_RESULT_RETENTION_DAYS, load_state, save_state
+
+    stale_at = (datetime.now(timezone.utc) - timedelta(days=BATCH_RESULT_RETENTION_DAYS + 1)).isoformat(
+        timespec="seconds"
+    )
+    state = load_state(CONNECTION_ID)
+    state["docs"]["cf_1"] = {
+        "status": "batch-submitted",
+        "batch_id": "batch_ancient",
+        "custom_id": "cf_1",
+        "submitted_at": stale_at,
+        "phase": "initial",
+    }
+    save_state(CONNECTION_ID, state)
+
+    api = FakeBatchesAPI({})
+    first = _run_batch(FakeBatchClient(api))
+    assert first["docs_extracted"] == 0
+    assert api.created == [], "the stale entry never becomes a Phase 1 submission this pass"
+    assert "batch_ancient" not in api.retrieved, "expired-by-age is checked BEFORE any network call"
+
+    state_after = load_state(CONNECTION_ID)
+    assert "cf_1" not in state_after["docs"], "requeued back to plain pending for the NEXT pass to resubmit"
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    api2 = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node))})
+    second = _run_batch(FakeBatchClient(api2))
+    assert second["docs_extracted"] == 1
+
+
+def test_batch_cost_uses_the_batch_price_multiplier(pg_env):
+    from src.llm_pricing import cost_usd
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    api = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node))}, usage={"input_tokens": 2000, "output_tokens": 300})
+    report = _run_batch(FakeBatchClient(api))
+
+    expected = cost_usd(model=report["model"], input_tokens=2000, output_tokens=300, batch=True)
+    assert report["facts_usage"]["estimated_cost_usd"] == round(expected, 4)
+    assert report["facts_usage"]["input_tokens"] == 2000
+    assert report["facts_usage"]["output_tokens"] == 300
+
+
+def test_batch_default_transport_is_still_sync(pg_env):
+    """No behavior change for a caller that never opts in —
+    extraction.facts.transport defaults to sync."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    report = _run(StubExtractor([_stream(node)]))
+    assert report["docs_via_batch"] == 0
+    assert report["docs_via_sync"] == 1

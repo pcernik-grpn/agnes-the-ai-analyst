@@ -19,9 +19,11 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import connectors.sharepoint.facts_extraction as fe
 from connectors.sharepoint.facts_extraction import (
     DEFAULT_CONCURRENCY,
     DEFAULT_RETRY_MODE,
@@ -838,6 +840,307 @@ def test_a_cached_retry_response_is_served_without_a_second_call():
     assert result.retried is True
     assert result.cache_hits == 2
     assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
+# Batch-transport gate helpers — the SAME verbatim-gate / one-retry contract
+# as extract_one, generalized to a reply that may have arrived asynchronously
+# (a collected Batches-API result) rather than from a live call.
+# ---------------------------------------------------------------------------
+
+
+def test_filter_kept_removes_facts_matching_a_failure_by_key():
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:x")
+    kept_nodes, kept_edges = fe._filter_kept([ok, bad], [], [(bad, "never appeared")])
+    assert kept_nodes == [ok]
+    assert kept_edges == []
+
+
+def test_finalize_gate_with_no_failures_is_a_no_op():
+    w = _work()
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w, nodes=[ok], edges=[], failures=[], retry_reply=None, parse_errors=0
+    )
+    assert nodes == [ok]
+    assert dropped == 0
+    assert retried is False
+    assert parse_errors == 0
+
+
+def test_finalize_gate_drops_and_counts_when_no_retry_is_available():
+    w = _work()
+    bad = _node("never appeared", node_id="client:x")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w, nodes=[bad], edges=[], failures=[(bad, "never appeared")], retry_reply=None, parse_errors=0
+    )
+    assert nodes == []
+    assert dropped == 1
+    assert retried is False
+
+
+def test_finalize_gate_merges_a_recovering_retry_reply():
+    text = "The Northwind rollout began in March for Contoso."
+    w = _work(text)
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:contoso")
+    fixed = _node("for Contoso", node_id="client:contoso")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w,
+        nodes=[ok, bad],
+        edges=[],
+        failures=[(bad, "never appeared")],
+        retry_reply=_stream(fixed),
+        parse_errors=0,
+    )
+    assert sorted(n["id"] for n in nodes) == ["client:contoso", "engagement:northwind-rollout"]
+    assert dropped == 0
+    assert retried is True
+
+
+def test_finalize_gate_drops_whatever_the_retry_still_cannot_fix():
+    text = "The Northwind rollout began in March."
+    w = _work(text)
+    ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
+    bad = _node("never appeared", node_id="client:x")
+    still_bad = _node("still never appeared", node_id="client:x")
+    nodes, edges, dropped, retried, parse_errors = fe._finalize_gate(
+        work=w,
+        nodes=[ok, bad],
+        edges=[],
+        failures=[(bad, "never appeared")],
+        retry_reply=_stream(still_bad),
+        parse_errors=0,
+    )
+    assert [n["id"] for n in nodes] == ["engagement:northwind-rollout"]
+    assert dropped == 1
+    assert retried is True
+
+
+def test_merge_retry_reply_recovers_and_drops_by_the_same_rule_as_extract_one():
+    text = "The Northwind rollout began in March for Contoso."
+    w = _work(text)
+    kept = [_node("rollout began in March", node_id="engagement:northwind-rollout")]
+    fixed = _node("for Contoso", node_id="client:contoso")
+    nodes, edges, dropped, parse_errors = fe._merge_retry_reply(
+        work=w, kept_nodes=kept, kept_edges=[], failed_count=1, retry_reply_text=_stream(fixed), parse_errors=0
+    )
+    assert sorted(n["id"] for n in nodes) == ["client:contoso", "engagement:northwind-rollout"]
+    assert dropped == 0
+
+
+def test_merge_retry_reply_counts_a_parse_error_from_the_retry_stream():
+    w = _work()
+    kept = [_node("rollout began in March")]
+    nodes, edges, dropped, parse_errors = fe._merge_retry_reply(
+        work=w, kept_nodes=kept, kept_edges=[], failed_count=1, retry_reply_text="NODES\n{not json\n", parse_errors=0
+    )
+    assert parse_errors == 1
+    assert dropped == 1  # the one failure the retry never addressed
+
+
+# ---------------------------------------------------------------------------
+# Batches-API submission machinery
+# ---------------------------------------------------------------------------
+
+
+class FakeBatch:
+    def __init__(self, batch_id: str, *, processing_status: str = "in_progress") -> None:
+        self.id = batch_id
+        self.processing_status = processing_status
+
+
+def _fake_result(custom_id: str, *, kind: str, message: Any = None, error_type: str | None = None) -> Any:
+    """One custom_id's result row — ``kind`` in
+    succeeded/errored/canceled/expired, matching the SDK's own union."""
+    error = None
+    if error_type is not None:
+        error = type("_E", (), {"type": error_type, "message": error_type})()
+    result_obj = type("_Result", (), {"type": kind, "message": message, "error": error})()
+    return type("_Item", (), {"custom_id": custom_id, "result": result_obj})()
+
+
+class FakeBatchesEndpoint:
+    """No-network stand-in for ``client.messages.batches``."""
+
+    def __init__(self) -> None:
+        self.created: list[list] = []
+        self.retrieved: list[str] = []
+        self._status: dict[str, str] = {}
+        self._results: dict[str, list] = {}
+        self._next_id = 0
+
+    def create(self, *, requests):
+        self._next_id += 1
+        batch_id = f"batch_{self._next_id}"
+        self.created.append(list(requests))
+        self._status[batch_id] = "in_progress"
+        return FakeBatch(batch_id)
+
+    def retrieve(self, batch_id):
+        self.retrieved.append(batch_id)
+        return FakeBatch(batch_id, processing_status=self._status.get(batch_id, "in_progress"))
+
+    def results(self, batch_id):
+        return iter(self._results.get(batch_id, []))
+
+    def set_ended(self, batch_id: str, results: list) -> None:
+        self._status[batch_id] = "ended"
+        self._results[batch_id] = results
+
+
+def test_estimate_request_bytes_grows_with_the_document():
+    small = fe._estimate_request_bytes(system_prompt="sys", user_message="short", max_output_tokens=100)
+    large = fe._estimate_request_bytes(system_prompt="sys", user_message="x" * 10_000, max_output_tokens=100)
+    assert large > small
+
+
+def test_group_pending_into_batches_respects_the_request_count_cap():
+    works = [_work(file_id=f"cf_{i}") for i in range(5)]
+    groups = fe._group_pending_into_batches(works, system_prompt="sys", batch_size=2, max_output_tokens=100)
+    assert [len(g) for g in groups] == [2, 2, 1]
+
+
+def test_group_pending_into_batches_respects_the_byte_cap(monkeypatch):
+    works = [_work(file_id=f"cf_{i}") for i in range(3)]
+    # Force a byte estimate large enough that only 2 fit per group even
+    # though `batch_size` alone would allow all 3.
+    monkeypatch.setattr(fe, "MAX_BATCH_API_BYTES", 100)
+    monkeypatch.setattr(fe, "_estimate_request_bytes", lambda **kwargs: 40)
+    groups = fe._group_pending_into_batches(works, system_prompt="sys", batch_size=10, max_output_tokens=100)
+    assert [len(g) for g in groups] == [2, 1]
+
+
+def test_group_pending_into_batches_of_empty_input_is_empty():
+    assert fe._group_pending_into_batches([], system_prompt="sys", batch_size=10, max_output_tokens=100) == []
+
+
+def test_batch_is_expired_by_age_false_for_recent_and_missing():
+    assert fe._batch_is_expired_by_age(None) is False
+    assert fe._batch_is_expired_by_age(fe._now_iso()) is False
+
+
+def test_batch_is_expired_by_age_true_past_the_retention_window():
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=fe.BATCH_RESULT_RETENTION_DAYS + 1)).isoformat(
+        timespec="seconds"
+    )
+    assert fe._batch_is_expired_by_age(stale) is True
+
+
+def test_batch_is_expired_by_age_tolerates_garbage():
+    assert fe._batch_is_expired_by_age("not-a-timestamp") is False
+
+
+def test_ensure_batch_client_returns_the_injected_client_unchanged():
+    sentinel = object()
+    client, model = fe._ensure_batch_client("claude-haiku-4-5", client=sentinel)
+    assert client is sentinel
+    assert model == "claude-haiku-4-5"
+
+
+def test_submit_batch_sends_one_request_per_work_item():
+    endpoint = FakeBatchesEndpoint()
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    works = [_work(file_id="cf_1"), _work(file_id="cf_2")]
+    batch_id = fe._submit_batch(
+        client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        works=works,
+        messages_by_file={w.file_id: w.user_message for w in works},
+        max_output_tokens=100,
+    )
+    assert batch_id == "batch_1"
+    assert len(endpoint.created[0]) == 2
+    assert {r["custom_id"] for r in endpoint.created[0]} == {"cf_1", "cf_2"}
+
+
+def test_poll_batch_until_ended_stops_as_soon_as_ended():
+    endpoint = FakeBatchesEndpoint()
+    endpoint.set_ended("batch_1", [])
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    sleeps: list[float] = []
+    batch = fe._poll_batch_until_ended(client, "batch_1", poll_s=5, deadline=None, sleep=sleeps.append)
+    assert batch is not None
+    assert batch.processing_status == "ended"
+    assert sleeps == []
+
+
+def test_poll_batch_until_ended_returns_none_when_the_deadline_expires():
+    endpoint = FakeBatchesEndpoint()  # never ends
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+
+    class _ExpiredDeadline:
+        def expired(self):
+            return True
+
+    sleeps: list[float] = []
+    batch = fe._poll_batch_until_ended(client, "batch_1", poll_s=5, deadline=_ExpiredDeadline(), sleep=sleeps.append)
+    assert batch is None
+
+
+def test_collect_batch_results_keys_by_custom_id_in_any_order():
+    endpoint = FakeBatchesEndpoint()
+    endpoint.set_ended(
+        "batch_1",
+        [_fake_result("cf_2", kind="succeeded"), _fake_result("cf_1", kind="succeeded")],
+    )
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    results = fe._collect_batch_results(client, "batch_1")
+    assert set(results.keys()) == {"cf_1", "cf_2"}
+
+
+# ---------------------------------------------------------------------------
+# Cross-pass requeue — bounded attempts, same shape as the crawler's own
+# per-item retry counter.
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_clears_the_state_entry_so_the_next_pass_replans_it():
+    docs_state = {"cf_1": {"status": "batch-submitted", "batch_id": "b1"}}
+    batch_attempts: dict = {}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1",
+        reason="errored: overloaded_error",
+        permanent=False,
+        docs_state=docs_state,
+        batch_attempts=batch_attempts,
+        report=report,
+    )
+    assert "cf_1" not in docs_state
+    assert batch_attempts["cf_1"] == 1
+    assert report.facts_failed == 0
+
+
+def test_requeue_gives_up_after_the_attempt_ceiling():
+    docs_state: dict = {}
+    batch_attempts = {"cf_1": fe.MAX_BATCH_REQUEUE_ATTEMPTS - 1}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1", reason="expired", permanent=False, docs_state=docs_state, batch_attempts=batch_attempts, report=report
+    )
+    assert docs_state["cf_1"]["status"] == "failed"
+    assert "cf_1" not in batch_attempts
+    assert report.facts_failed == 1
+
+
+def test_requeue_permanent_fails_immediately_without_consuming_an_attempt():
+    docs_state: dict = {}
+    batch_attempts: dict = {}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1",
+        reason="invalid_request: bad model",
+        permanent=True,
+        docs_state=docs_state,
+        batch_attempts=batch_attempts,
+        report=report,
+    )
+    assert docs_state["cf_1"]["status"] == "failed"
+    assert docs_state["cf_1"]["reason"] == "invalid_request: bad model"
+    assert "cf_1" not in batch_attempts
+    assert report.facts_failed == 1
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +1256,76 @@ def test_concurrency_is_clamped_and_says_so(monkeypatch, configured, expected):
 def test_an_unparseable_concurrency_falls_back_and_is_named(monkeypatch):
     _config(monkeypatch, {("extraction", "facts", "concurrency"): "lots"})
     assert resolve_concurrency() == (DEFAULT_CONCURRENCY, "invalid")
+
+
+# ---------------------------------------------------------------------------
+# Batch-transport config
+# ---------------------------------------------------------------------------
+
+
+def test_transport_defaults_to_sync(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._transport_mode() == "sync"
+
+
+def test_transport_reads_batch(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "transport"): "batch"})
+    assert fe._transport_mode() == "batch"
+
+
+def test_transport_falls_back_to_sync_on_garbage(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "transport"): "carrier-pigeon"})
+    assert fe._transport_mode() == "sync"
+
+
+def test_retry_transport_defaults_to_batch(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._retry_transport_mode() == "batch"
+
+
+def test_retry_transport_reads_sync(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_transport"): "sync"})
+    assert fe._retry_transport_mode() == "sync"
+
+
+def test_batch_size_defaults(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._batch_size() == fe.DEFAULT_BATCH_SIZE
+
+
+def test_batch_size_reads_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 42})
+    assert fe._batch_size() == 42
+
+
+def test_batch_size_is_hard_capped_at_the_api_ceiling(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 999_999})
+    assert fe._batch_size() == fe.MAX_BATCH_API_REQUESTS
+
+
+def test_batch_size_clamps_a_non_positive_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 0})
+    assert fe._batch_size() == 1
+
+
+def test_batch_size_falls_back_on_garbage(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): "lots"})
+    assert fe._batch_size() == fe.DEFAULT_BATCH_SIZE
+
+
+def test_batch_poll_s_defaults(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._batch_poll_s() == fe.DEFAULT_BATCH_POLL_S
+
+
+def test_batch_poll_s_reads_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_poll_s"): 5})
+    assert fe._batch_poll_s() == 5.0
+
+
+def test_batch_poll_s_floors_at_one_second(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_poll_s"): 0})
+    assert fe._batch_poll_s() == 1.0
 
 
 def test_the_pool_actually_overlaps_calls():
@@ -1339,6 +1712,46 @@ def test_standalone_timeout_seconds_defaults_and_reads_config(monkeypatch):
 
 def test_fact_key_is_stable_regardless_of_key_order():
     assert _fact_key({"a": 1, "b": 2}) == _fact_key({"b": 2, "a": 1})
+
+
+# ---------------------------------------------------------------------------
+# Report — via_batch/via_sync split, batch-priced cost
+# ---------------------------------------------------------------------------
+
+
+def test_report_counts_default_to_zero_and_render_is_backward_compatible():
+    report = fe._Report()
+    rendered = report.render(model="claude-haiku-4-5", prompt_origin="builtin", ontology={}, usage=fe._empty_usage())
+    assert rendered["docs_via_batch"] == 0
+    assert rendered["docs_via_sync"] == 0
+    assert rendered["facts_usage"]["estimated_cost_usd"] == 0.0
+
+
+def test_report_prices_batch_usage_at_the_batch_multiplier():
+    report = fe._Report()
+    usage = fe._empty_usage()
+    usage["input_tokens"] = 2_000_000
+    batch_usage = fe._empty_usage()
+    batch_usage["input_tokens"] = 1_000_000
+    rendered = report.render(
+        model="claude-sonnet-5", prompt_origin="builtin", ontology={}, usage=usage, batch_usage=batch_usage
+    )
+    # 1M tokens sync-priced ($3) + 1M tokens batch-priced at half ($1.5)
+    assert rendered["facts_usage"]["estimated_cost_usd"] == 4.5
+
+
+def test_ontology_report_shares_the_shape_used_by_the_pass():
+    models = [
+        {
+            "slug": "corpus-ontology",
+            "model": {
+                "datasets": [{"name": "engagement", "source": "ontology_node_type:engagement"}],
+                "relationships": [{"name": "for_client"}],
+            },
+        }
+    ]
+    out = fe._ontology_report(models)
+    assert out == {"models": ["corpus-ontology"], "node_types": 1, "edge_types": 1}
 
 
 class TestDeadlineExpiryIsCalledNotTruthinessTested:

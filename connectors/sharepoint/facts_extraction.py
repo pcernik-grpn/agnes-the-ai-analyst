@@ -62,6 +62,20 @@ Failure posture, in the two flavours this module keeps strictly apart:
 Cost: this is the expensive stage, so it is off by default
 (``extraction.facts.enabled``) and reports what it spent
 (``facts_usage``, into the run report and ``extraction_runs.usage``).
+
+Two transports share everything above except step 3's actual model call.
+``extraction.facts.transport: sync`` (default) is the flow just described.
+``transport: batch`` submits pending documents through the Anthropic
+Batches API instead — no per-minute rate ceiling and half the price, at
+the cost of latency (usually under an hour, up to 24h per batch): the
+right trade for a bulk pass over hundreds of thousands of documents, the
+wrong one for "extract this one document now". A batch-mode pass
+(:func:`_run_batch_pass`) is resumable — a batch still in flight when the
+run's deadline expires stays recorded in the per-document state file, and
+the next pass collects it before submitting anything new — and folds every
+result through the SAME gate, corrective-retry-recovery and ingest-shipping
+contract the sync transport uses, so a document's final shape never
+reveals which transport produced it.
 """
 
 from __future__ import annotations
@@ -113,6 +127,54 @@ DEFAULT_BATCH_CLAIMS = 1_000
 DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
+
+#: ``extraction.facts.transport``. The synchronous Messages API is bound by
+#: the model account's tokens-per-minute limit — measured on a live
+#: instance at ~13k input + ~4.3k output tokens/document, 285 documents/min
+#: needs ~1.2M output tokens/min, well above what most accounts allow. The
+#: Batches API has no per-minute ceiling and is half the price; the cost is
+#: latency (usually under an hour, up to 24h per batch) rather than rate
+#: limiting, which is the right trade for a bulk pass over an existing
+#: corpus and the wrong one for "extract this one document now".
+DEFAULT_TRANSPORT = "sync"
+
+#: ``extraction.facts.batch_size`` — documents per Batches-API submission.
+#: Hard-capped at the API's own per-batch REQUEST ceiling
+#: (:data:`MAX_BATCH_API_REQUESTS`); the payload-BYTE ceiling
+#: (:data:`MAX_BATCH_API_BYTES`) is enforced separately, per group, since a
+#: batch of the configured size can still be too large in bytes for a
+#: corpus of unusually long documents.
+DEFAULT_BATCH_SIZE = 500
+MAX_BATCH_API_REQUESTS = 100_000
+MAX_BATCH_API_BYTES = 256 * 1024 * 1024
+
+#: ``extraction.facts.batch_poll_s`` — how often an in-flight batch's
+#: ``processing_status`` is re-checked while the run's deadline allows it.
+DEFAULT_BATCH_POLL_S = 60.0
+
+#: Anthropic serves a batch's results for this many days after it ends. A
+#: ``batch-submitted`` state entry older than this is treated as expired
+#: WITHOUT a network call — a reference surviving this long in our own
+#: state file (a long-idle instance, a big gap between standalone passes)
+#: can never be collected either way.
+BATCH_RESULT_RETENTION_DAYS = 29
+
+#: ``extraction.facts.retry_transport`` — which transport carries the ONE
+#: corrective verbatim retry when the initial completion came from a
+#: batch. ``batch`` (the default) keeps the retry off the model account's
+#: per-minute budget, at the cost of a second batch round-trip;
+#: ``sync`` trades that latency for an immediate per-document retry.
+DEFAULT_RETRY_TRANSPORT = "batch"
+
+#: Cross-pass requeue ceiling for one document's batch attempt — the same
+#: "attempts accumulate across runs, given up after N" shape
+#: ``connectors.sharepoint.crawler._note_retry`` already applies to a
+#: failed download (there: :data:`connectors.sharepoint.crawler.
+#: _MAX_ITEM_RETRY_ATTEMPTS`). Applies to a transient batch outcome
+#: (errored-but-not-``invalid_request``, canceled, expired, or a missing
+#: result row) — an ``invalid_request`` error is never retried at all, it
+#: fails immediately.
+MAX_BATCH_REQUEUE_ATTEMPTS = 3
 
 #: Wall-clock budget for a STANDALONE run (``run_standalone_facts_extraction``
 #: — the ``sharepoint-facts-extraction`` job kind / ``POST …/facts-extract``
@@ -240,6 +302,84 @@ def resolve_concurrency() -> Tuple[int, str]:
         )
         return clamped, "clamped"
     return clamped, "config"
+
+
+def _transport_mode() -> str:
+    """``extraction.facts.transport``: ``sync`` (default) or ``batch``.
+
+    An unrecognized value falls back to ``sync`` rather than raising — the
+    same "loudly named, quietly corrected" posture :func:`resolve_
+    concurrency` takes for an out-of-range value, since a typo in an
+    optional cost-shape knob must never turn into a run that refuses to
+    start.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "transport", default=DEFAULT_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_TRANSPORT,
+        )
+    return DEFAULT_TRANSPORT
+
+
+def _retry_transport_mode() -> str:
+    """``extraction.facts.retry_transport``: ``batch`` (default) or
+    ``sync``. Only consulted by the batch transport — the sync transport's
+    corrective retry is always sync, it has no other client to use."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "retry_transport", default=DEFAULT_RETRY_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.retry_transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_RETRY_TRANSPORT,
+        )
+    return DEFAULT_RETRY_TRANSPORT
+
+
+def _batch_size() -> int:
+    """``extraction.facts.batch_size``, default :data:`DEFAULT_BATCH_SIZE`,
+    hard-clamped to ``[1, MAX_BATCH_API_REQUESTS]`` — the Batches API's own
+    per-batch request ceiling, never just a suggestion."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_size", default=DEFAULT_BATCH_SIZE)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_size=%r is not an integer — using %d",
+            raw,
+            DEFAULT_BATCH_SIZE,
+        )
+        return DEFAULT_BATCH_SIZE
+    return max(1, min(MAX_BATCH_API_REQUESTS, value))
+
+
+def _batch_poll_s() -> float:
+    """``extraction.facts.batch_poll_s``, default :data:`DEFAULT_BATCH_POLL_S`."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_poll_s", default=DEFAULT_BATCH_POLL_S)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_poll_s=%r is not a number — using %.0f",
+            raw,
+            DEFAULT_BATCH_POLL_S,
+        )
+        return DEFAULT_BATCH_POLL_S
 
 
 def _model() -> str:
@@ -1243,25 +1383,56 @@ class _Report:
         self.ingest_failures: List[Dict[str, Any]] = []
         self.interrupted = False
         self.interrupted_reason: Optional[str] = None
+        #: How many documents' FINAL completion came from each transport —
+        #: "final" because a batch-mode document whose corrective retry
+        #: fell back to sync (``retry_transport: sync``) still counts as
+        #: ``docs_via_batch``, its INITIAL (and dominant-cost) completion.
+        #: Sync-mode passes leave `docs_via_batch` at 0.
+        self.docs_via_batch = 0
+        self.docs_via_sync = 0
 
     def render(
-        self, *, model: str, prompt_origin: str, ontology: Dict[str, Any], usage: Dict[str, Any]
+        self,
+        *,
+        model: str,
+        prompt_origin: str,
+        ontology: Dict[str, Any],
+        usage: Dict[str, Any],
+        batch_usage: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """``batch_usage`` is the SUBSET of ``usage`` that came from the
+        Batches API (a batch-mode pass whose corrective retry fell back to
+        ``retry_transport: sync`` mixes both within one run) — priced at
+        :data:`src.llm_pricing.BATCH_PRICE_MULTIPLIER`, the remainder at
+        the synchronous rate, and summed. ``None`` (every sync-mode call
+        site) prices the whole of ``usage`` at the synchronous rate, exactly
+        as before this parameter existed.
+        """
         from src.llm_pricing import cost_usd
 
         elapsed = max(time.monotonic() - self.started, 1e-6)
         priced = dict(usage)
         priced["model"] = model
-        priced["estimated_cost_usd"] = round(
-            cost_usd(
-                model=model,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-            ),
-            4,
+        batch_usage = batch_usage or {}
+        sync_portion = {
+            field: int(usage.get(field, 0)) - int(batch_usage.get(field, 0))
+            for field in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        }
+        cost = cost_usd(
+            model=model,
+            input_tokens=sync_portion["input_tokens"],
+            output_tokens=sync_portion["output_tokens"],
+            cache_read_tokens=sync_portion["cache_read_input_tokens"],
+            cache_creation_tokens=sync_portion["cache_creation_input_tokens"],
+        ) + cost_usd(
+            model=model,
+            input_tokens=batch_usage.get("input_tokens", 0),
+            output_tokens=batch_usage.get("output_tokens", 0),
+            cache_read_tokens=batch_usage.get("cache_read_input_tokens", 0),
+            cache_creation_tokens=batch_usage.get("cache_creation_input_tokens", 0),
+            batch=True,
         )
+        priced["estimated_cost_usd"] = round(cost, 4)
         return {
             "started_at": self.started_at,
             "finished_at": _now_iso(),
@@ -1297,6 +1468,8 @@ class _Report:
             "claims_rejected": self.claims_rejected,
             "ingest_batches": self.ingest_batches,
             "ingest_failures": self.ingest_failures,
+            "docs_via_batch": self.docs_via_batch,
+            "docs_via_sync": self.docs_via_sync,
             "facts_usage": priced,
         }
 
@@ -1444,6 +1617,76 @@ class _IngestRefused(RuntimeError):
         super().__init__(f"ingest refused: {self.status_code} {self.detail}")
 
 
+def _ontology_report(ontology_models: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The report's ``ontology`` block — shared by both transports so they
+    can never describe the same ontology differently."""
+    return {
+        "models": [m.get("slug") for m in ontology_models],
+        "node_types": sum(
+            1
+            for m in ontology_models
+            for d in (m["model"].get("datasets") or [])
+            if str((d or {}).get("source") or "").startswith("ontology_node_type:")
+        ),
+        "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
+    }
+
+
+def _fold_accepted_result(
+    *,
+    report: "_Report",
+    shipper: "_BatchShipper",
+    docs_state: Dict[str, Any],
+    result: "_DocResult",
+    model: str,
+    fingerprint: str,
+) -> None:
+    """Fold one finished document into the report, the batch shipper and
+    the per-document state — the SAME "done" shape and the SAME counters
+    regardless of which transport produced ``result``, so a document's
+    final state can never reveal which one ran. Shared by
+    :func:`run_facts_extraction`'s sync loop and :func:`_run_batch_pass`.
+    """
+    from connectors.sharepoint.facts_prompt import PROMPT_VERSION
+
+    work = result.work
+    report.parse_errors += result.parse_errors
+    report.facts_retries += 1 if result.retried else 0
+    report.facts_quotes_dropped += result.dropped
+    report.facts_quotes_repaired += result.repaired
+    report.facts_cache_hits += result.cache_hits
+    claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
+    shipper.add(
+        document={
+            "doc_id": work.doc_id,
+            "corpus_id": work.collection_id,
+            "stable_id": work.mapping.get("source_stable_id"),
+            "path": work.path,
+            "name": work.filename,
+            "sha256": work.mapping.get("source_sha256") or work.sha256,
+        },
+        nodes=result.nodes,
+        edges=result.edges,
+        claim_count=claim_count,
+    )
+    report.docs_extracted += 1
+    report.nodes_emitted += len(result.nodes)
+    report.edges_emitted += len(result.edges)
+    docs_state[work.file_id] = {
+        "status": "done",
+        "doc_id": work.doc_id,
+        "extracted_sha": work.sha256,
+        "model": model,
+        "prompt_fingerprint": fingerprint,
+        "prompt_version": PROMPT_VERSION,
+        "nodes": len(result.nodes),
+        "edges": len(result.edges),
+        "dropped": result.dropped,
+        "seconds": result.seconds,
+        "at": _now_iso(),
+    }
+
+
 class _Work:
     """One document's inputs, resolved on the main thread before it is
     handed to a worker.
@@ -1516,6 +1759,109 @@ class _DocResult:
         self.parse_errors = parse_errors
         self.seconds = seconds
         self.cache_hits = cache_hits
+
+
+def _plan_documents(
+    *,
+    connection: Dict[str, Any],
+    docs_state: Dict[str, Any],
+    report: "_Report",
+    files_repo: Any,
+    sources_repo: Any,
+    wanted_doc_ids: Optional[set],
+    model: str,
+    fingerprint: str,
+    max_doc_chars: int,
+) -> Any:
+    """Yield the documents that actually need a model call — the SAME walk
+    for BOTH transports (:func:`run_facts_extraction`'s sync loop and
+    :func:`_run_batch_pass`), taking every input as an explicit parameter
+    rather than closing over one function's locals, so a document's
+    eligibility can never drift between them. Module-level rather than a
+    per-call nested closure for exactly that reason.
+
+    Every cheap decision — not a source document, tabular, not indexed,
+    unchanged, no text, still mid-flight in an unfinished batch — is made
+    HERE, on the caller's thread, before anything is submitted: those
+    documents cost nothing and must not occupy a worker slot (or a batch
+    request) to find that out.
+    """
+    for collection_id in collection_ids_for(connection):
+        for file_row in files_repo.list_for_corpus(collection_id):
+            file_id = str(file_row["id"])
+            mapping = sources_repo.get(file_id) or {}
+            doc_id = mapping.get("source_doc_id")
+            if not doc_id:
+                # Not a source-anchored document (a hand upload); it has
+                # no producer doc_id to cite, so ingest could not resolve
+                # its evidence anyway.
+                continue
+            doc_id = str(doc_id)
+            if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
+                continue
+
+            entry = docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") == "batch-submitted":
+                # Still mid-flight in a batch this pass's resume step
+                # either just collected (rewriting `entry`) or is still
+                # polling — either way it must not be submitted again.
+                continue
+
+            report.docs_seen += 1
+            # `path`/`filename` here are exactly what `corpus_files`
+            # stores — for an anonymize-marked collection that is the
+            # ANONYMIZED value (``connectors.sharepoint.crawler
+            # ._anonymize_identity`` writes it there at ingest time, the
+            # same as the document body), never the real SharePoint name
+            # or folder. This module deliberately has no anonymize gate
+            # of its own: there is no raw text left to gate by the time
+            # it gets here, so `build_user_message` and
+            # `quote_is_verbatim` below can only ever see/cite the
+            # already-redacted identity, same as the chunk text.
+            path = file_row.get("path")
+            filename = file_row.get("filename")
+            if _is_tabular(path, filename):
+                report.docs_skipped_tabular += 1
+                docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
+                continue
+            if file_row.get("processing_status") != "indexed":
+                # The gate defers a claim on a non-indexed document, so
+                # extracting it now would spend a call on claims the
+                # ingest cannot accept yet.
+                report.docs_skipped_not_indexed += 1
+                continue
+
+            sha256 = str(file_row.get("sha256") or "")
+            if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
+                report.docs_unchanged += 1
+                continue
+
+            chunk_texts, text = _document_text(file_id)
+            if not text.strip():
+                report.docs_skipped_no_text += 1
+                docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
+                continue
+            if len(text) > max_doc_chars:
+                text = text[:max_doc_chars]
+                report.docs_truncated += 1
+
+            metadata = {
+                "doc_id": doc_id,
+                "name": filename,
+                "path": path,
+                "collection_id": collection_id,
+            }
+            yield _Work(
+                file_id=file_id,
+                doc_id=doc_id,
+                collection_id=collection_id,
+                filename=filename,
+                path=path,
+                sha256=sha256,
+                mapping=mapping,
+                chunk_texts=chunk_texts,
+                user_message=build_user_message(metadata, text),
+            )
 
 
 def extract_one(
@@ -1635,6 +1981,392 @@ def extract_one(
     )
 
 
+# --------------------------------------------------------------------------
+# Batch-transport gate helpers — the SAME verbatim-gate / one-corrective-
+# retry contract `extract_one` applies to a LIVE reply, generalized to a
+# reply that may arrive asynchronously (an already-collected Batches API
+# result) instead. Deliberately NOT shared code with `extract_one` itself —
+# that function's own call site stays untouched, so the synchronous
+# transport's tested behaviour carries zero risk from this addition; these
+# three functions duplicate its filtering/merging RULES, verified against
+# the same fixtures `extract_one`'s own tests use.
+# --------------------------------------------------------------------------
+
+
+def _filter_kept(
+    nodes: List[dict], edges: List[dict], failures: Sequence[Tuple[dict, str]]
+) -> Tuple[List[dict], List[dict]]:
+    """``(nodes, edges)`` with every fact named in ``failures`` removed —
+    the same by-key filter `extract_one`'s own retry branch applies before
+    merging in what the retry recovers."""
+    failed_keys = {_fact_key(fact) for fact, _ in failures}
+    return (
+        [n for n in nodes if _fact_key(n) not in failed_keys],
+        [e for e in edges if _fact_key(e) not in failed_keys],
+    )
+
+
+def _merge_retry_reply(
+    *,
+    work: "_Work",
+    kept_nodes: List[dict],
+    kept_edges: List[dict],
+    failed_count: int,
+    retry_reply_text: str,
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, int]:
+    """Merge a corrective-retry's reply into the facts that already passed
+    the gate (``kept_nodes``/``kept_edges`` — the ORIGINAL reply already
+    filtered of its failures via :func:`_filter_kept`). ``failed_count`` is
+    how many facts the retry needed to recover — the same denominator
+    `extract_one` counts against. Returns ``(nodes, edges, dropped,
+    parse_errors)``, applying the SAME final safety net `extract_one` does:
+    whatever is STILL not verbatim after the merge is dropped and counted,
+    never shipped for the server to reject.
+    """
+    retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply_text)
+    parse_errors += retry_parse_errors
+    kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+    nodes = list(kept_nodes)
+    edges = list(kept_edges)
+    recovered = 0
+    for fact in [*retry_nodes, *retry_edges]:
+        if verbatim_failures([fact], **kwargs):
+            continue
+        (edges if "src" in fact and "dst" in fact else nodes).append(fact)
+        recovered += 1
+    dropped = max(0, failed_count - recovered)
+
+    still_bad = verbatim_failures([*nodes, *edges], **kwargs)
+    dropped_keys = {_fact_key(fact) for fact, _ in still_bad}
+    nodes = [n for n in nodes if _fact_key(n) not in dropped_keys]
+    edges = [e for e in edges if _fact_key(e) not in dropped_keys]
+    dropped += len(still_bad)
+    return nodes, edges, dropped, parse_errors
+
+
+def _finalize_gate(
+    *,
+    work: "_Work",
+    nodes: List[dict],
+    edges: List[dict],
+    failures: Sequence[Tuple[dict, str]],
+    retry_reply: Optional[str],
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, bool, int]:
+    """Resolve a document's verbatim-gate failures given a retry reply that
+    may have arrived from EITHER transport (a live sync call, or an
+    already-collected batch result) — or none at all, when the pass ran
+    out of budget for one. Returns ``(nodes, edges, dropped, retried,
+    parse_errors)``, matching :class:`_DocResult`'s own fields.
+    """
+    if not failures:
+        return nodes, edges, 0, False, parse_errors
+    kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+    if retry_reply is None:
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        still_bad = verbatim_failures([*kept_nodes, *kept_edges], **kwargs)
+        dropped_keys = {_fact_key(f) for f, _ in still_bad}
+        kept_nodes = [n for n in kept_nodes if _fact_key(n) not in dropped_keys]
+        kept_edges = [e for e in kept_edges if _fact_key(e) not in dropped_keys]
+        return kept_nodes, kept_edges, len(failures) + len(still_bad), False, parse_errors
+    final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+        work=work,
+        kept_nodes=kept_nodes,
+        kept_edges=kept_edges,
+        failed_count=len(failures),
+        retry_reply_text=retry_reply,
+        parse_errors=parse_errors,
+    )
+    return final_nodes, final_edges, dropped, True, parse_errors2
+
+
+# --------------------------------------------------------------------------
+# Batches API client machinery — submit / poll / collect. No retry/backoff
+# of its own: a submit or retrieve failure means the model account is
+# unreachable, exactly the condition :class:`FactsExtractionUnavailable`
+# already names for the sync transport, so callers translate it the same
+# way rather than growing a second failure taxonomy.
+# --------------------------------------------------------------------------
+
+
+def _ensure_batch_client(
+    model: str, *, client: Any | None = None, timeout_s: float = DEFAULT_TIMEOUT_S
+) -> Tuple[Any, str]:
+    """Resolve a real Anthropic client + its resolved model id — the SAME
+    credential ladder :meth:`_Extractor._ensure_client` uses
+    (``build_client``), reused rather than duplicated so a batch-mode pass
+    can never disagree with a sync-mode one about which key/endpoint/model
+    resolution applies. The Anthropic client this returns is the ordinary
+    Messages client — ``client.messages.batches.*`` is the same object's
+    Batches API surface, not a second client. ``client`` is the test seam
+    (and doubles as the corrective retry's client when
+    ``extraction.facts.retry_transport: sync``).
+    """
+    if client is not None:
+        return client, model
+    from src.anonymization_ner import DetectionUnavailable, build_client
+
+    try:
+        return build_client(model, timeout_s)
+    except DetectionUnavailable as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
+
+
+def _estimate_request_bytes(*, system_prompt: str, user_message: str, max_output_tokens: int) -> int:
+    """A conservative OVER-estimate of one request's on-wire JSON size — a
+    guard rail against the Batches API's 256 MB per-batch cap
+    (:data:`MAX_BATCH_API_BYTES`), not a byte-exact accounting. Mirrors the
+    exact field shape :func:`_submit_batch` sends, padded with placeholder
+    ids/model strings so the estimate never UNDER-counts what the real
+    request will carry.
+    """
+    payload = {
+        "custom_id": "x" * 64,
+        "params": {
+            "model": "x" * 40,
+            "max_tokens": max_output_tokens,
+            "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": user_message}],
+        },
+    }
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _group_pending_into_batches(
+    works: Sequence["_Work"], *, system_prompt: str, batch_size: int, max_output_tokens: int
+) -> List[List["_Work"]]:
+    """Group planned documents into Batches-API-sized groups — at most
+    ``batch_size`` requests (already clamped to the API's own 100,000-
+    request ceiling by :func:`_batch_size`) and never over the API's
+    256 MB per-batch payload cap (:data:`MAX_BATCH_API_BYTES`), estimated
+    per request via :func:`_estimate_request_bytes`. A single oversized
+    document lands alone in its own group rather than blocking the ones
+    beside it — the API itself is the final judge of a truly-too-large
+    request.
+    """
+    groups: List[List["_Work"]] = []
+    current: List["_Work"] = []
+    current_bytes = 0
+    for work in works:
+        nbytes = _estimate_request_bytes(
+            system_prompt=system_prompt, user_message=work.user_message, max_output_tokens=max_output_tokens
+        )
+        if current and (len(current) >= batch_size or current_bytes + nbytes > MAX_BATCH_API_BYTES):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(work)
+        current_bytes += nbytes
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _submit_batch(
+    client: Any,
+    *,
+    model: str,
+    system_prompt: str,
+    works: Sequence["_Work"],
+    messages_by_file: Dict[str, str],
+    max_output_tokens: int,
+) -> str:
+    """Submit ONE Batches-API call for ``works`` and return the new batch's
+    id. ``messages_by_file`` lets a corrective-retry batch send the RETRY
+    prompt (not the document's original ``user_message``) for the same
+    work items — the initial submission passes ``{w.file_id: w.user_message
+    for w in works}``.
+    """
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    requests = [
+        Request(
+            custom_id=work.file_id,
+            params=MessageCreateParamsNonStreaming(
+                model=model,
+                max_tokens=max_output_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": messages_by_file[work.file_id]}],
+            ),
+        )
+        for work in works
+    ]
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except FactsExtractionUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable, not one document's failure
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch submission failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return batch.id
+
+
+def _poll_batch_until_ended(
+    client: Any, batch_id: str, *, poll_s: float, deadline: Any, sleep: Callable[[float], None] = time.sleep
+) -> Optional[Any]:
+    """Poll ``batch_id`` until its ``processing_status`` is ``"ended"``, or
+    the run's deadline elapses first — in which case this returns ``None``
+    and the caller leaves the batch's documents ``batch-submitted`` in
+    state for the next pass to resume. Checks status BEFORE sleeping, so an
+    already-ended batch (the common case on resume) returns immediately
+    with zero wait.
+    """
+    while True:
+        try:
+            batch = client.messages.batches.retrieve(batch_id)
+        except FactsExtractionUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+            raise FactsExtractionUnavailable(
+                f"facts extraction: batch status check failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if getattr(batch, "processing_status", None) == "ended":
+            return batch
+        if _deadline_expired(deadline):
+            return None
+        sleep(poll_s)
+
+
+def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
+    """``{custom_id: result}`` for an ENDED batch. The SDK's own iterator
+    arrives in ANY order (Anthropic's own contract), so callers key off
+    ``custom_id`` rather than position — never assume request N's result
+    is the Nth item returned.
+    """
+    try:
+        return {item.custom_id: item.result for item in client.messages.batches.results(batch_id)}
+    except FactsExtractionUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch result collection failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _batch_is_expired_by_age(submitted_at: Optional[str]) -> bool:
+    """Whether a ``batch-submitted`` state entry is older than Anthropic's
+    own :data:`BATCH_RESULT_RETENTION_DAYS`-day results-retention window —
+    checked BEFORE any network call, so a stale reference from a long-idle
+    instance is treated as expired without wasting a ``retrieve()`` call on
+    a batch the API has already forgotten. Tolerates a missing or
+    unparseable timestamp as "not expired" — the safer default when the
+    state file itself cannot say otherwise.
+    """
+    if not submitted_at:
+        return False
+    try:
+        submitted = datetime.fromisoformat(str(submitted_at))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - submitted).total_seconds()
+    return age_s > BATCH_RESULT_RETENTION_DAYS * 86400
+
+
+def _load_work_for_file(
+    file_id: str, *, files_repo: Any, sources_repo: Any, max_doc_chars: int
+) -> Optional[Tuple["_Work", bool]]:
+    """Re-derive one document's ``_Work`` FRESH from the database at
+    collection time, rather than caching what :func:`_plan_documents` built
+    at submission time — a batch's result may be collected in a LATER pass
+    (a different process invocation entirely), so nothing about the
+    document can be assumed to have survived in memory. Returns ``(work,
+    was_truncated)``, or ``None`` when the document itself is gone (deleted
+    between submission and collection — rare, but a batch's ~hour-to-24h
+    round trip makes it possible).
+    """
+    file_row = files_repo.get(file_id)
+    if not file_row:
+        return None
+    mapping = sources_repo.get(file_id) or {}
+    doc_id = mapping.get("source_doc_id")
+    if not doc_id:
+        return None
+    doc_id = str(doc_id)
+    collection_id = str(file_row.get("corpus_id") or "")
+    path = file_row.get("path")
+    filename = file_row.get("filename")
+    sha256 = str(file_row.get("sha256") or "")
+    chunk_texts, text = _document_text(file_id)
+    truncated = False
+    if len(text) > max_doc_chars:
+        text = text[:max_doc_chars]
+        truncated = True
+    metadata = {"doc_id": doc_id, "name": filename, "path": path, "collection_id": collection_id}
+    work = _Work(
+        file_id=file_id,
+        doc_id=doc_id,
+        collection_id=collection_id,
+        filename=filename,
+        path=path,
+        sha256=sha256,
+        mapping=mapping,
+        chunk_texts=chunk_texts,
+        user_message=build_user_message(metadata, text),
+    )
+    return work, truncated
+
+
+def _requeue_or_fail(
+    file_id: str,
+    *,
+    reason: str,
+    permanent: bool,
+    docs_state: Dict[str, Any],
+    batch_attempts: Dict[str, int],
+    report: "_Report",
+) -> None:
+    """One document's batch attempt did not produce a usable reply.
+
+    ``permanent`` (an ``invalid_request`` error) fails it outright — no
+    resubmission fixes a request the API itself rejected as malformed.
+    Everything else (errored/canceled/expired/a missing result row) is
+    transient and gets bounded resubmission — the same "attempts accumulate
+    across runs, reset only by success" shape
+    ``connectors.sharepoint.crawler._note_retry`` already applies to a
+    failed download, applied here to :data:`MAX_BATCH_REQUEUE_ATTEMPTS`.
+    The attempt counter lives in ``batch_attempts`` (kept apart from
+    ``docs_state``, which is CLEARED on a transient requeue so
+    :func:`_plan_documents` re-derives and resubmits the document next
+    pass) and is only dropped on success or permanent failure.
+    """
+    if permanent:
+        docs_state[file_id] = {"status": "failed", "reason": reason, "at": _now_iso()}
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        logger.warning("facts extraction: document %s permanently failed (%s) — not retried", file_id, reason)
+        return
+    attempts = int(batch_attempts.get(file_id, 0)) + 1
+    batch_attempts[file_id] = attempts
+    docs_state.pop(file_id, None)
+    if attempts >= MAX_BATCH_REQUEUE_ATTEMPTS:
+        docs_state[file_id] = {
+            "status": "failed",
+            "reason": f"{reason} (gave up after {attempts} batch attempts)",
+            "at": _now_iso(),
+        }
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        logger.warning(
+            "facts extraction: giving up on document %s after %d failed batch attempts (%s)",
+            file_id,
+            attempts,
+            reason,
+        )
+    else:
+        logger.info(
+            "facts extraction: document %s requeued for batch retry (%s, attempt %d/%d)",
+            file_id,
+            reason,
+            attempts,
+            MAX_BATCH_REQUEUE_ATTEMPTS,
+        )
+
+
 def _ingest_identity() -> Any:
     """The identity claims from this pass are attributed to.
 
@@ -1660,6 +2392,8 @@ def run_facts_extraction(
     concurrency: Optional[int] = None,
     retry_mode: Optional[str] = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    transport: Optional[str] = None,
+    batch_client: Any | None = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -1702,6 +2436,15 @@ def run_facts_extraction(
     this is observability, never load-bearing, the same posture every
     other progress signal in this pipeline takes.
 
+    ``transport`` overrides ``extraction.facts.transport`` (the test seam;
+    ``None`` reads config, same convention as ``concurrency`` above). When
+    resolved to ``"batch"`` this function dispatches everything below to
+    :func:`_run_batch_pass` — the sync loop's own connection/ontology/
+    prompt resolution above this point is shared by both, but nothing
+    past the dispatch runs for a batch-mode pass. ``batch_client`` is that
+    transport's own test seam (an object exposing ``.messages.batches.
+    create/retrieve/results``), unused for a sync pass.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -1721,13 +2464,38 @@ def run_facts_extraction(
         )
     ontology_text = render_ontology(ontology_models)
 
-    from connectors.sharepoint.facts_prompt import PROMPT_VERSION, prompt_fingerprint, resolve_extraction_prompt
+    from connectors.sharepoint.facts_prompt import prompt_fingerprint, resolve_extraction_prompt
 
     prompt_text, prompt_origin = resolve_extraction_prompt()
     system_prompt = build_system_prompt(prompt_text, ontology_text)
     fingerprint = prompt_fingerprint(system_prompt)
 
     model = _model()
+
+    # Transport dispatch — the ONE branch point between the two transports.
+    # Everything above this line (connection, ontology, prompt, model) is
+    # shared; nothing below it runs for a batch-mode pass.
+    mode = transport if transport is not None else _transport_mode()
+    if mode == "batch":
+        # Same precedence as the sync loop below: an explicit `retry_mode`
+        # (the test seam) wins, else the connection's override, else the
+        # instance default — so a per-connection `off` holds on BOTH transports.
+        return _run_batch_pass(
+            connection_id,
+            connection=connection,
+            model=model,
+            system_prompt=system_prompt,
+            fingerprint=fingerprint,
+            prompt_origin=prompt_origin,
+            ontology_models=ontology_models,
+            doc_ids=doc_ids,
+            deadline=deadline,
+            max_doc_chars=max_doc_chars,
+            batch_client=batch_client,
+            on_progress=on_progress,
+            retry_mode=retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0],
+        )
+
     if extractor is None:
         extractor = _Extractor(system_prompt=system_prompt, model=model)
     else:
@@ -1790,125 +2558,17 @@ def run_facts_extraction(
             shipped_usage.update({k: int(v) for k, v in snapshot.items() if isinstance(v, (int, float))})
             save_state(connection_id, state)
 
-    def _plan() -> Any:
-        """Yield the documents that actually need a model call.
-
-        Every cheap decision — not a source document, tabular, not
-        indexed, unchanged, no text — is made HERE, on the main thread,
-        before anything is submitted: those documents cost nothing and
-        must not occupy a worker slot to find that out.
-        """
-        for collection_id in collection_ids_for(connection):
-            for file_row in files_repo.list_for_corpus(collection_id):
-                file_id = str(file_row["id"])
-                mapping = sources_repo.get(file_id) or {}
-                doc_id = mapping.get("source_doc_id")
-                if not doc_id:
-                    # Not a source-anchored document (a hand upload); it has
-                    # no producer doc_id to cite, so ingest could not resolve
-                    # its evidence anyway.
-                    continue
-                doc_id = str(doc_id)
-                if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
-                    continue
-
-                report.docs_seen += 1
-                # `path`/`filename` here are exactly what `corpus_files`
-                # stores — for an anonymize-marked collection that is the
-                # ANONYMIZED value (``connectors.sharepoint.crawler
-                # ._anonymize_identity`` writes it there at ingest time, the
-                # same as the document body), never the real SharePoint name
-                # or folder. This module deliberately has no anonymize gate
-                # of its own: there is no raw text left to gate by the time
-                # it gets here, so `build_user_message` and
-                # `quote_is_verbatim` below can only ever see/cite the
-                # already-redacted identity, same as the chunk text.
-                path = file_row.get("path")
-                filename = file_row.get("filename")
-                if _is_tabular(path, filename):
-                    report.docs_skipped_tabular += 1
-                    docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
-                    continue
-                if file_row.get("processing_status") != "indexed":
-                    # The gate defers a claim on a non-indexed document, so
-                    # extracting it now would spend a call on claims the
-                    # ingest cannot accept yet.
-                    report.docs_skipped_not_indexed += 1
-                    continue
-
-                sha256 = str(file_row.get("sha256") or "")
-                if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
-                    report.docs_unchanged += 1
-                    continue
-
-                chunk_texts, text = _document_text(file_id)
-                if not text.strip():
-                    report.docs_skipped_no_text += 1
-                    docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
-                    continue
-                if len(text) > max_doc_chars:
-                    text = text[:max_doc_chars]
-                    report.docs_truncated += 1
-
-                metadata = {
-                    "doc_id": doc_id,
-                    "name": filename,
-                    "path": path,
-                    "collection_id": collection_id,
-                }
-                yield _Work(
-                    file_id=file_id,
-                    doc_id=doc_id,
-                    collection_id=collection_id,
-                    filename=filename,
-                    path=path,
-                    sha256=sha256,
-                    mapping=mapping,
-                    chunk_texts=chunk_texts,
-                    user_message=build_user_message(metadata, text),
-                )
-
     def _accept(result: _DocResult) -> None:
         """Fold one finished document into the report, the batch and the
         state file. Main thread only — which is what makes the report
         counters, the shipper and ``docs_state`` need no locks of their
-        own."""
-        work = result.work
-        report.parse_errors += result.parse_errors
-        report.facts_retries += 1 if result.retried else 0
-        report.facts_quotes_dropped += result.dropped
-        report.facts_quotes_repaired += result.repaired
-        report.facts_cache_hits += result.cache_hits
-        claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
-        shipper.add(
-            document={
-                "doc_id": work.doc_id,
-                "corpus_id": work.collection_id,
-                "stable_id": work.mapping.get("source_stable_id"),
-                "path": work.path,
-                "name": work.filename,
-                "sha256": work.mapping.get("source_sha256") or work.sha256,
-            },
-            nodes=result.nodes,
-            edges=result.edges,
-            claim_count=claim_count,
+        own. The fold itself is :func:`_fold_accepted_result`, shared with
+        :func:`_run_batch_pass` so a document's final "done" shape can
+        never drift between transports."""
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
         )
-        report.docs_extracted += 1
-        report.nodes_emitted += len(result.nodes)
-        report.edges_emitted += len(result.edges)
-        docs_state[work.file_id] = {
-            "status": "done",
-            "doc_id": work.doc_id,
-            "extracted_sha": work.sha256,
-            "model": model,
-            "prompt_fingerprint": fingerprint,
-            "prompt_version": PROMPT_VERSION,
-            "nodes": len(result.nodes),
-            "edges": len(result.edges),
-            "dropped": result.dropped,
-            "seconds": result.seconds,
-            "at": _now_iso(),
-        }
+        report.docs_via_sync += 1
         if shipper.should_flush():
             _flush()
 
@@ -1983,7 +2643,17 @@ def run_facts_extraction(
         # immediately, rather than only once the (possibly slow) first
         # document finishes.
         _report_progress(docs_done=0)
-        for work in _plan():
+        for work in _plan_documents(
+            connection=connection,
+            docs_state=docs_state,
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=wanted_doc_ids,
+            model=model,
+            fingerprint=fingerprint,
+            max_doc_chars=max_doc_chars,
+        ):
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
             # paid for whether or not this process waits for them.
@@ -2034,16 +2704,7 @@ def run_facts_extraction(
     rendered = report.render(
         model=model,
         prompt_origin=prompt_origin,
-        ontology={
-            "models": [m.get("slug") for m in ontology_models],
-            "node_types": sum(
-                1
-                for m in ontology_models
-                for d in (m["model"].get("datasets") or [])
-                if str((d or {}).get("source") or "").startswith("ontology_node_type:")
-            ),
-            "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
-        },
+        ontology=_ontology_report(ontology_models),
         usage=usage,
     )
     logger.info(
@@ -2053,6 +2714,471 @@ def run_facts_extraction(
         rendered["docs_extracted"],
         rendered["docs_unchanged"],
         rendered["docs_skipped_tabular"],
+        rendered["facts_failed"],
+        rendered["facts_quotes_dropped"],
+        rendered["claims_written"],
+    )
+    return rendered
+
+
+def _run_batch_pass(
+    connection_id: str,
+    *,
+    connection: Dict[str, Any],
+    model: str,
+    system_prompt: str,
+    fingerprint: str,
+    prompt_origin: str,
+    ontology_models: List[Dict[str, Any]],
+    doc_ids: Optional[Sequence[str]],
+    deadline: Any,
+    max_doc_chars: int,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    batch_client: Any | None = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    retry_mode: str = DEFAULT_RETRY_MODE,
+) -> Dict[str, Any]:
+    """The Batches-API transport's own pass — dispatched from
+    :func:`run_facts_extraction` when ``extraction.facts.transport`` (or
+    the ``transport`` override) resolves to ``"batch"``.
+
+    Flow: resume any batch a PRIOR pass left ``batch-submitted`` in state,
+    submit fresh batches for whatever :func:`_plan_documents` still finds
+    pending (:func:`_group_pending_into_batches`, respecting the request-
+    count and byte caps), then drain a queue of batch ids — poll each to
+    ``"ended"`` (bounded by ``deadline``, never a fixed wall-clock guess),
+    collect its results (:func:`_collect_batch_results`) and fold every one
+    through the SAME gate / corrective-retry-recovery / ingest-shipping
+    contract the sync transport uses (:func:`_fold_accepted_result`), so a
+    document's FINAL shape is transport-independent. A corrective-retry
+    batch (``extraction.facts.retry_transport: batch``, the default) is
+    submitted per collected initial batch and enqueued the same way, so it
+    drains through the identical poll/collect step.
+
+    Resumable by construction: every document that leaves the queue with a
+    transient outcome (submitted-but-not-yet-collected, errored, canceled,
+    expired, or a missing result row) either stays ``batch-submitted`` in
+    state (deadline hit mid-poll) or is cleared back to plain "pending"
+    (:func:`_requeue_or_fail`) for :func:`_plan_documents` to pick up next
+    pass — never silently dropped, never resubmitted twice.
+    """
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo
+
+    report = _Report()
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state["docs"]
+    batch_attempts: Dict[str, int] = state.setdefault("batch_attempts", {})
+    anonymize_marked = anonymize_marked_collection_ids(connection)
+    shipper = _BatchShipper(report=report, anonymize_marked=anonymize_marked, user=_ingest_identity())
+
+    files_repo = corpus_files_repo()
+    sources_repo = corpus_file_sources_repo()
+    wanted_doc_ids = {str(d) for d in doc_ids} if doc_ids else None
+
+    client, resolved_model = _ensure_batch_client(model, client=batch_client)
+    poll_s = _batch_poll_s()
+    batch_size = _batch_size()
+    retry_transport = _retry_transport_mode()
+
+    # `usage` is the combined running total (what a batch's ingest delta is
+    # computed against, exactly like the sync transport's own `_flush`);
+    # `batch_usage` is the SUBSET attributable to Batches-API calls, kept
+    # apart only so the final report can price it at the batch multiplier
+    # while a sync-transport corrective retry (`retry_transport: sync`)
+    # still prices at the synchronous rate.
+    usage = _empty_usage()
+    batch_usage = _empty_usage()
+    shipped_usage: Dict[str, Any] = {}
+
+    def _usage_delta() -> Dict[str, Any]:
+        return {k: int(v) - int(shipped_usage.get(k, 0)) for k, v in usage.items()}
+
+    def _flush() -> None:
+        try:
+            shipper.flush(usage=_usage_delta(), model=model)
+        except _IngestRefused:
+            # Counted by the shipper already; those documents keep no
+            # state entry, so the next pass resubmits them. A refusal must
+            # never abort the whole pass.
+            pass
+        else:
+            shipped_usage.update({k: int(v) for k, v in usage.items()})
+            save_state(connection_id, state)
+
+    def _record_usage(bucket: str, response_usage: Any) -> None:
+        from src.anonymization_ner import _usage_value
+
+        for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            value = _usage_value(response_usage, field)
+            usage[field] += value
+            if bucket == "batch":
+                batch_usage[field] += value
+        usage["calls"] += 1
+
+    docs_done = 0
+    docs_planned = 0
+
+    def _report_progress(current_path: Optional[str] = None) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress({"docs_done": docs_done, "docs_total": docs_planned, "current_path": current_path})
+        except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+            logger.debug("facts extraction: progress callback failed (%s) — continuing", type(exc).__name__)
+
+    def _accept(
+        work: "_Work",
+        nodes: List[dict],
+        edges: List[dict],
+        dropped: int,
+        retried: bool,
+        repaired: int,
+        parse_errors: int,
+    ) -> None:
+        nonlocal docs_done
+        result = _DocResult(
+            work=work,
+            nodes=nodes,
+            edges=edges,
+            dropped=dropped,
+            retried=retried,
+            repaired=repaired,
+            parse_errors=parse_errors,
+            seconds=0.0,
+        )
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
+        )
+        batch_attempts.pop(work.file_id, None)
+        report.docs_via_batch += 1
+        docs_done += 1
+        _report_progress(current_path=work.path or work.filename)
+        if shipper.should_flush():
+            _flush()
+
+    def _requeue(file_id: str, *, reason: str, permanent: bool) -> None:
+        nonlocal docs_done
+        _requeue_or_fail(
+            file_id,
+            reason=reason,
+            permanent=permanent,
+            docs_state=docs_state,
+            batch_attempts=batch_attempts,
+            report=report,
+        )
+        docs_done += 1
+        _report_progress()
+
+    def _sync_retry(message: str) -> str:
+        from src.anonymization_ner import _reply_text
+
+        response = client.messages.create(
+            model=resolved_model,
+            max_tokens=max_output_tokens,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": message}],
+        )
+        _record_usage("sync", getattr(response, "usage", None))
+        return _reply_text(response)
+
+    queue: "deque[str]" = deque()
+    # Documents whose initial-batch gate failed and whose corrective retry
+    # is deferred to a follow-up batch (`retry_transport: batch`) — flushed
+    # into ONE retry-batch submission right after the initial batch that
+    # produced them finishes collecting.
+    pending_retries: List[Tuple["_Work", List[dict], List[dict], List[Tuple[dict, str]], int]] = []
+
+    def _finalize_initial(work: "_Work", reply_text: str) -> None:
+        nodes, edges, parse_errors = parse_streams(reply_text)
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        failures = verbatim_failures([*nodes, *edges], **kwargs)
+        repaired = 0
+        if failures:
+            from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
+
+            repaired = repair_verbatim_failures(failures, document_text=CHUNK_JOIN_SEPARATOR.join(work.chunk_texts))
+            if repaired:
+                failures = verbatim_failures([*nodes, *edges], **kwargs)
+        if not failures:
+            _accept(work, nodes, edges, 0, False, repaired, parse_errors)
+            return
+        if retry_mode == "off":
+            # Per-connection / instance policy says no corrective retry at
+            # all (cost-levers lever A): drop the still-failing quotes and
+            # count them now, on either retry transport, exactly as the
+            # sync loop's `extract_one` does under the same setting.
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work, nodes=nodes, edges=edges, failures=failures, retry_reply=None, parse_errors=parse_errors
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        if retry_transport == "sync" and not _deadline_expired(deadline):
+            retry_reply = _sync_retry(_retry_message(work.user_message, failures))
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work,
+                nodes=nodes,
+                edges=edges,
+                failures=failures,
+                retry_reply=retry_reply,
+                parse_errors=parse_errors,
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        if retry_transport == "sync":
+            # Deadline already gone — no budget left for another call this
+            # pass; drop and count exactly as an exhausted retry would.
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work, nodes=nodes, edges=edges, failures=failures, retry_reply=None, parse_errors=parse_errors
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        # retry_transport == "batch": defer to the follow-up batch this
+        # initial batch's collection submits once every result is seen.
+        kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+        pending_retries.append((work, kept_nodes, kept_edges, failures, parse_errors))
+
+    def _finalize_retry(work: "_Work", entry: Dict[str, Any], reply_text: str) -> None:
+        kept_nodes = entry.get("kept_nodes") or []
+        kept_edges = entry.get("kept_edges") or []
+        parse_errors = int(entry.get("parse_errors") or 0)
+        failed_count = int(entry.get("failed_count") or 0)
+        final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+            work=work,
+            kept_nodes=kept_nodes,
+            kept_edges=kept_edges,
+            failed_count=failed_count,
+            retry_reply_text=reply_text,
+            parse_errors=parse_errors,
+        )
+        _accept(work, final_nodes, final_edges, dropped, True, 0, parse_errors2)
+
+    def _collect_batch(batch_id: str) -> None:
+        started = time.monotonic()
+        entries = [
+            (fid, e)
+            for fid, e in list(docs_state.items())
+            if isinstance(e, dict) and e.get("batch_id") == batch_id and e.get("status") == "batch-submitted"
+        ]
+        if not entries:
+            return
+        results = _collect_batch_results(client, batch_id)
+        succeeded = requeued = failed = 0
+        for file_id, entry in entries:
+            phase = entry.get("phase", "initial")
+            result = results.get(file_id)
+            if result is None:
+                _requeue(file_id, reason="missing_result", permanent=False)
+                requeued += 1
+                continue
+            result_type = getattr(result, "type", None)
+            if result_type == "succeeded":
+                loaded = _load_work_for_file(
+                    file_id, files_repo=files_repo, sources_repo=sources_repo, max_doc_chars=max_doc_chars
+                )
+                if loaded is None:
+                    docs_state.pop(file_id, None)
+                    batch_attempts.pop(file_id, None)
+                    report.facts_failed += 1
+                    logger.warning(
+                        "facts extraction: document %s vanished before its batch result could be collected", file_id
+                    )
+                    continue
+                work, truncated = loaded
+                if truncated:
+                    report.docs_truncated += 1
+                message = getattr(result, "message", None)
+                from src.anonymization_ner import _reply_text
+
+                reply_text = _reply_text(message)
+                _record_usage("batch", getattr(message, "usage", None))
+                if phase == "retry":
+                    _finalize_retry(work, entry, reply_text)
+                else:
+                    _finalize_initial(work, reply_text)
+                succeeded += 1
+            elif result_type == "errored":
+                error = getattr(result, "error", None)
+                error_type = str(getattr(error, "type", "") or "")
+                if error_type.startswith("invalid_request"):
+                    _requeue(
+                        file_id, reason=f"invalid_request: {getattr(error, 'message', error_type)}", permanent=True
+                    )
+                    failed += 1
+                else:
+                    _requeue(file_id, reason=f"errored: {error_type or 'unknown'}", permanent=False)
+                    requeued += 1
+            else:  # "canceled" / "expired" / anything unrecognized
+                _requeue(file_id, reason=str(result_type or "unknown"), permanent=False)
+                requeued += 1
+        elapsed = time.monotonic() - started
+        logger.info(
+            "facts extraction: connection %s — batch %s collected (%d succeeded, %d requeued, %d failed, %.1fs)",
+            connection_id,
+            batch_id,
+            succeeded,
+            requeued,
+            failed,
+            elapsed,
+        )
+
+    def _submit_and_track(works: Sequence["_Work"], messages_by_file: Dict[str, str], *, phase: str) -> str:
+        batch_id = _submit_batch(
+            client,
+            model=resolved_model,
+            system_prompt=system_prompt,
+            works=works,
+            messages_by_file=messages_by_file,
+            max_output_tokens=max_output_tokens,
+        )
+        submitted_at = _now_iso()
+        for w in works:
+            docs_state[w.file_id] = {
+                "status": "batch-submitted",
+                "batch_id": batch_id,
+                "custom_id": w.file_id,
+                "submitted_at": submitted_at,
+                "phase": phase,
+            }
+        save_state(connection_id, state)
+        logger.info(
+            "facts extraction: connection %s — batch %s submitted (%s, %d document(s))",
+            connection_id,
+            batch_id,
+            phase,
+            len(works),
+        )
+        return batch_id
+
+    # -- Phase 0: resume batches a PRIOR pass left in flight ---------------
+    resumed_ids = sorted(
+        {
+            e["batch_id"]
+            for e in docs_state.values()
+            if isinstance(e, dict) and e.get("status") == "batch-submitted" and e.get("batch_id")
+        }
+    )
+    for batch_id in resumed_ids:
+        queue.append(batch_id)
+
+    # -- Phase 1: submit fresh batches for whatever is still pending -------
+    pending_works = list(
+        _plan_documents(
+            connection=connection,
+            docs_state=docs_state,
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=wanted_doc_ids,
+            model=model,
+            fingerprint=fingerprint,
+            max_doc_chars=max_doc_chars,
+        )
+    )
+    docs_planned += len(pending_works)
+    _report_progress()
+    groups = _group_pending_into_batches(
+        pending_works, system_prompt=system_prompt, batch_size=batch_size, max_output_tokens=max_output_tokens
+    )
+    for group in groups:
+        if _deadline_expired(deadline):
+            report.interrupted = True
+            report.interrupted_reason = "timeout"
+            break
+        batch_id = _submit_and_track(group, {w.file_id: w.user_message for w in group}, phase="initial")
+        queue.append(batch_id)
+
+    # -- Phase 2: drain the queue — poll, collect, finalize; collecting a
+    #             batch may enqueue MORE ids (a follow-up retry batch) ----
+    while queue:
+        batch_id = queue.popleft()
+        stale = [
+            fid
+            for fid, e in list(docs_state.items())
+            if isinstance(e, dict)
+            and e.get("batch_id") == batch_id
+            and e.get("status") == "batch-submitted"
+            and _batch_is_expired_by_age(e.get("submitted_at"))
+        ]
+        if stale:
+            for file_id in stale:
+                _requeue(file_id, reason="expired (past the 29-day results window)", permanent=False)
+            continue
+        ended = _poll_batch_until_ended(client, batch_id, poll_s=poll_s, deadline=deadline)
+        if ended is None:
+            report.interrupted = True
+            report.interrupted_reason = "timeout"
+            break
+        _collect_batch(batch_id)
+        if pending_retries:
+            if _deadline_expired(deadline):
+                report.interrupted = True
+                report.interrupted_reason = "timeout"
+                # The failures that never got their retry are counted as
+                # dropped now — their INITIAL reply already shipped what
+                # passed the gate, and no more budget remains this pass to
+                # ship a follow-up batch for the rest.
+                for work, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                    _accept(work, kept_nodes, kept_edges, len(failures), False, 0, parse_errors)
+                pending_retries.clear()
+                break
+            retry_works = [w for w, *_ in pending_retries]
+            messages_by_file = {
+                w.file_id: _retry_message(w.user_message, failures) for w, _, _, failures, _ in pending_retries
+            }
+            retry_batch_id = _submit_batch(
+                client,
+                model=resolved_model,
+                system_prompt=system_prompt,
+                works=retry_works,
+                messages_by_file=messages_by_file,
+                max_output_tokens=max_output_tokens,
+            )
+            submitted_at = _now_iso()
+            for w, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                docs_state[w.file_id] = {
+                    "status": "batch-submitted",
+                    "batch_id": retry_batch_id,
+                    "custom_id": w.file_id,
+                    "submitted_at": submitted_at,
+                    "phase": "retry",
+                    "kept_nodes": kept_nodes,
+                    "kept_edges": kept_edges,
+                    "failed_count": len(failures),
+                    "parse_errors": parse_errors,
+                }
+            save_state(connection_id, state)
+            docs_planned += len(pending_retries)
+            logger.info(
+                "facts extraction: connection %s — batch %s submitted (retry, %d document(s))",
+                connection_id,
+                retry_batch_id,
+                len(pending_retries),
+            )
+            pending_retries.clear()
+            queue.append(retry_batch_id)
+
+    _flush()
+
+    usage["documents"] = report.docs_extracted
+    # Concurrency governs request FAN-OUT, which the batch transport has no
+    # use for (the Batches API itself parallelizes) — left honestly absent
+    # rather than reporting a number that governed nothing.
+    usage["concurrency"] = None
+    usage["concurrency_source"] = "not_applicable"
+    rendered = report.render(
+        model=model,
+        prompt_origin=prompt_origin,
+        ontology=_ontology_report(ontology_models),
+        usage=usage,
+        batch_usage=batch_usage,
+    )
+    logger.info(
+        "facts extraction (batch transport): connection %s — %d extracted (%d via batch, %d via sync retry), "
+        "%d failed, %d quotes dropped, %d claims written",
+        connection_id,
+        rendered["docs_extracted"],
+        rendered["docs_via_batch"],
+        rendered["docs_via_sync"],
         rendered["facts_failed"],
         rendered["facts_quotes_dropped"],
         rendered["claims_written"],
@@ -2107,6 +3233,7 @@ def maybe_run_after_crawl(
             exc,
         )
         return None
+
 
 
 

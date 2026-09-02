@@ -1589,6 +1589,33 @@ extraction:
     # without one, with a one-time log line, never a crash.
     # AGNES_EXTRACTION_FACTS_LLM_CACHE overrides this at the environment level.
     llm_cache: true
+    # Which API carries each document's extraction call. `sync` (default)
+    # is the synchronous Messages API, bound by the model account's
+    # tokens-per-minute limit — measured on a live instance at ~13k input +
+    # ~4.3k output tokens/document, a 285 documents/min pace needs ~1.2M
+    # output tokens/min, above what most accounts allow. `batch` uses the
+    # Anthropic Batches API instead: no per-minute ceiling and 50% the
+    # price, at the cost of latency (usually under an hour, up to 24h per
+    # batch) — the right trade for a bulk pass over an existing corpus, the
+    # wrong one for "extract this one document now". A batch-mode pass is
+    # resumable: a batch still in flight when the run's deadline expires
+    # stays recorded in the per-connection state file, and the NEXT pass
+    # collects it before submitting anything new.
+    transport: sync
+    # Documents per Batches-API submission. Hard-capped at the API's own
+    # per-batch ceilings (100,000 requests, 256 MB payload) regardless of
+    # this value.
+    batch_size: 500
+    # How often (seconds) an in-flight batch's status is re-checked while
+    # the run's deadline allows it.
+    batch_poll_s: 60
+    # Which transport carries the ONE corrective verbatim retry when the
+    # initial completion came from a batch. `batch` (default) keeps the
+    # retry off the model account's per-minute budget, at the cost of a
+    # second batch round-trip; `sync` trades that latency for an immediate
+    # per-document retry. Ignored in `transport: sync` — that retry is
+    # always sync, there is no other client to use.
+    retry_transport: batch
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails
