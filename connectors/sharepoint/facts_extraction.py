@@ -125,6 +125,54 @@ DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
 
+#: ``extraction.facts.transport``. The synchronous Messages API is bound by
+#: the model account's tokens-per-minute limit — measured on a live
+#: instance at ~13k input + ~4.3k output tokens/document, 285 documents/min
+#: needs ~1.2M output tokens/min, well above what most accounts allow. The
+#: Batches API has no per-minute ceiling and is half the price; the cost is
+#: latency (usually under an hour, up to 24h per batch) rather than rate
+#: limiting, which is the right trade for a bulk pass over an existing
+#: corpus and the wrong one for "extract this one document now".
+DEFAULT_TRANSPORT = "sync"
+
+#: ``extraction.facts.batch_size`` — documents per Batches-API submission.
+#: Hard-capped at the API's own per-batch REQUEST ceiling
+#: (:data:`MAX_BATCH_API_REQUESTS`); the payload-BYTE ceiling
+#: (:data:`MAX_BATCH_API_BYTES`) is enforced separately, per group, since a
+#: batch of the configured size can still be too large in bytes for a
+#: corpus of unusually long documents.
+DEFAULT_BATCH_SIZE = 500
+MAX_BATCH_API_REQUESTS = 100_000
+MAX_BATCH_API_BYTES = 256 * 1024 * 1024
+
+#: ``extraction.facts.batch_poll_s`` — how often an in-flight batch's
+#: ``processing_status`` is re-checked while the run's deadline allows it.
+DEFAULT_BATCH_POLL_S = 60.0
+
+#: Anthropic serves a batch's results for this many days after it ends. A
+#: ``batch-submitted`` state entry older than this is treated as expired
+#: WITHOUT a network call — a reference surviving this long in our own
+#: state file (a long-idle instance, a big gap between standalone passes)
+#: can never be collected either way.
+BATCH_RESULT_RETENTION_DAYS = 29
+
+#: ``extraction.facts.retry_transport`` — which transport carries the ONE
+#: corrective verbatim retry when the initial completion came from a
+#: batch. ``batch`` (the default) keeps the retry off the model account's
+#: per-minute budget, at the cost of a second batch round-trip;
+#: ``sync`` trades that latency for an immediate per-document retry.
+DEFAULT_RETRY_TRANSPORT = "batch"
+
+#: Cross-pass requeue ceiling for one document's batch attempt — the same
+#: "attempts accumulate across runs, given up after N" shape
+#: ``connectors.sharepoint.crawler._note_retry`` already applies to a
+#: failed download (there: :data:`connectors.sharepoint.crawler.
+#: _MAX_ITEM_RETRY_ATTEMPTS`). Applies to a transient batch outcome
+#: (errored-but-not-``invalid_request``, canceled, expired, or a missing
+#: result row) — an ``invalid_request`` error is never retried at all, it
+#: fails immediately.
+MAX_BATCH_REQUEUE_ATTEMPTS = 3
+
 #: Wall-clock budget for a STANDALONE run (``run_standalone_facts_extraction``
 #: — the ``sharepoint-facts-extraction`` job kind / ``POST …/facts-extract``
 #: / ``agnes admin sharepoint facts-extract``), in seconds. Deliberately its
@@ -251,6 +299,84 @@ def resolve_concurrency() -> Tuple[int, str]:
         )
         return clamped, "clamped"
     return clamped, "config"
+
+
+def _transport_mode() -> str:
+    """``extraction.facts.transport``: ``sync`` (default) or ``batch``.
+
+    An unrecognized value falls back to ``sync`` rather than raising — the
+    same "loudly named, quietly corrected" posture :func:`resolve_
+    concurrency` takes for an out-of-range value, since a typo in an
+    optional cost-shape knob must never turn into a run that refuses to
+    start.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "transport", default=DEFAULT_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_TRANSPORT,
+        )
+    return DEFAULT_TRANSPORT
+
+
+def _retry_transport_mode() -> str:
+    """``extraction.facts.retry_transport``: ``batch`` (default) or
+    ``sync``. Only consulted by the batch transport — the sync transport's
+    corrective retry is always sync, it has no other client to use."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "retry_transport", default=DEFAULT_RETRY_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.retry_transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_RETRY_TRANSPORT,
+        )
+    return DEFAULT_RETRY_TRANSPORT
+
+
+def _batch_size() -> int:
+    """``extraction.facts.batch_size``, default :data:`DEFAULT_BATCH_SIZE`,
+    hard-clamped to ``[1, MAX_BATCH_API_REQUESTS]`` — the Batches API's own
+    per-batch request ceiling, never just a suggestion."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_size", default=DEFAULT_BATCH_SIZE)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_size=%r is not an integer — using %d",
+            raw,
+            DEFAULT_BATCH_SIZE,
+        )
+        return DEFAULT_BATCH_SIZE
+    return max(1, min(MAX_BATCH_API_REQUESTS, value))
+
+
+def _batch_poll_s() -> float:
+    """``extraction.facts.batch_poll_s``, default :data:`DEFAULT_BATCH_POLL_S`."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_poll_s", default=DEFAULT_BATCH_POLL_S)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_poll_s=%r is not a number — using %.0f",
+            raw,
+            DEFAULT_BATCH_POLL_S,
+        )
+        return DEFAULT_BATCH_POLL_S
 
 
 def _model() -> str:
@@ -1821,6 +1947,7 @@ def maybe_run_after_crawl(
         )
         return None
     return run_facts_extraction(str(connection["id"]), deadline=deadline, on_progress=on_progress)
+
 
 def run_standalone_facts_extraction(
     connection_id: str,

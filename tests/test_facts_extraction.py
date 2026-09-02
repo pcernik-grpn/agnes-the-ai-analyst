@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import connectors.sharepoint.facts_extraction as fe
 from connectors.sharepoint.facts_extraction import (
     DEFAULT_CONCURRENCY,
     MAX_CONCURRENCY,
@@ -656,6 +657,76 @@ def test_an_unparseable_concurrency_falls_back_and_is_named(monkeypatch):
     assert resolve_concurrency() == (DEFAULT_CONCURRENCY, "invalid")
 
 
+# ---------------------------------------------------------------------------
+# Batch-transport config
+# ---------------------------------------------------------------------------
+
+
+def test_transport_defaults_to_sync(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._transport_mode() == "sync"
+
+
+def test_transport_reads_batch(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "transport"): "batch"})
+    assert fe._transport_mode() == "batch"
+
+
+def test_transport_falls_back_to_sync_on_garbage(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "transport"): "carrier-pigeon"})
+    assert fe._transport_mode() == "sync"
+
+
+def test_retry_transport_defaults_to_batch(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._retry_transport_mode() == "batch"
+
+
+def test_retry_transport_reads_sync(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_transport"): "sync"})
+    assert fe._retry_transport_mode() == "sync"
+
+
+def test_batch_size_defaults(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._batch_size() == fe.DEFAULT_BATCH_SIZE
+
+
+def test_batch_size_reads_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 42})
+    assert fe._batch_size() == 42
+
+
+def test_batch_size_is_hard_capped_at_the_api_ceiling(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 999_999})
+    assert fe._batch_size() == fe.MAX_BATCH_API_REQUESTS
+
+
+def test_batch_size_clamps_a_non_positive_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): 0})
+    assert fe._batch_size() == 1
+
+
+def test_batch_size_falls_back_on_garbage(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_size"): "lots"})
+    assert fe._batch_size() == fe.DEFAULT_BATCH_SIZE
+
+
+def test_batch_poll_s_defaults(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._batch_poll_s() == fe.DEFAULT_BATCH_POLL_S
+
+
+def test_batch_poll_s_reads_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_poll_s"): 5})
+    assert fe._batch_poll_s() == 5.0
+
+
+def test_batch_poll_s_floors_at_one_second(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "batch_poll_s"): 0})
+    assert fe._batch_poll_s() == 1.0
+
+
 def test_the_pool_actually_overlaps_calls():
     """Concurrency > 1 must really run calls in parallel — otherwise the
     knob is a lie that costs the same wall clock."""
@@ -989,13 +1060,9 @@ def test_a_document_ended_by_an_unavailable_model_still_counts_as_drained():
     src = Path("connectors/sharepoint/facts_extraction.py").read_text(encoding="utf-8")
     branch = src.split("except FactsExtractionUnavailable as exc:", 1)[1].split("except Exception", 1)[0]
     assert "docs_unavailable += 1" in branch, (
-        "a document whose model was unavailable has still left the queue and "
-        "must count toward docs_done"
+        "a document whose model was unavailable has still left the queue and must count toward docs_done"
     )
     assert "report.facts_failed += 1" not in branch, (
-        "facts_failed is a reported metric about the DOCUMENT — an unavailable "
-        "model must not inflate it"
+        "facts_failed is a reported metric about the DOCUMENT — an unavailable model must not inflate it"
     )
-    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, (
-        "the progress count must include it"
-    )
+    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, "the progress count must include it"
