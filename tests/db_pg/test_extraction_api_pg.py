@@ -214,3 +214,164 @@ def test_config_answers_on_postgres_too(tmp_path, monkeypatch, pg_engine):
     # consolidation); the drawer's Enabled row reads it from there.
     assert any(row["key"] == "sharepoint.enabled" for row in body["effective"])
     assert any(row["key"] == "extraction.timeout_s" for row in body["effective"])
+
+
+# ---------------------------------------------------------------------------
+# Fleet view (`GET /api/admin/sharepoint/extraction/runs`, 2026-09-02) — one
+# row per SharePoint connection, for an operator running several crawls at
+# once. Same PG-only posture as every other route in this module.
+# ---------------------------------------------------------------------------
+
+FLEET_URL = "/api/admin/sharepoint/extraction/runs"
+
+
+def test_fleet_default_scope_only_lists_currently_running_connections(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    idle = _connection(client, token, name="sp-idle")
+    running = _connection(client, token, name="sp-running")
+
+    repo = _repo()
+    done = repo.start(connection_id=idle)
+    repo.finish(done, status="done", report={"new": 3})
+    run_id = repo.start(connection_id=running)
+    repo.checkpoint(run_id, files_seen=40, files_done=40, progress={"new": 40})
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    ids = {row["connection_id"] for row in body["connections"]}
+    assert ids == {running}
+    assert body["totals"]["connections"] == 1
+    assert body["totals"]["active"] == 1
+    row = body["connections"][0]
+    assert row["run"]["id"] == run_id
+    assert row["run"]["files_done"] == 40
+
+
+def test_fleet_bare_call_defaults_to_the_active_scope(tmp_path, monkeypatch, pg_engine):
+    """No query params at all behaves like `?active=1` — the primary
+    "is it on pace right now" view, not the fuller `?all=1` picture."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    idle = _connection(client, token, name="sp-idle-bare")
+    repo = _repo()
+    done = repo.start(connection_id=idle)
+    repo.finish(done, status="done")
+
+    body = client.get(FLEET_URL, headers=_auth(token)).json()
+    assert body["connections"] == []
+    assert body["totals"]["connections"] == 0
+
+
+def test_fleet_all_scope_lists_every_connection_including_idle_ones(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    idle = _connection(client, token, name="sp-idle-all")
+    never_run = _connection(client, token, name="sp-never-run")
+
+    repo = _repo()
+    done = repo.start(connection_id=idle)
+    repo.finish(done, status="done", report={"new": 3})
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    ids = {row["connection_id"] for row in body["connections"]}
+    assert ids == {idle, never_run}
+    by_id = {row["connection_id"]: row for row in body["connections"]}
+    assert by_id[idle]["run"]["outcome"] == "done"
+    assert by_id[never_run]["run"] is None
+    assert by_id[never_run]["facts"]["docs_done"] is None
+    assert body["totals"]["connections"] == 2
+    assert body["totals"]["active"] == 0
+
+
+def test_fleet_all_wins_when_both_query_params_are_set(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    idle = _connection(client, token, name="sp-both")
+    repo = _repo()
+    done = repo.start(connection_id=idle)
+    repo.finish(done, status="done")
+
+    body = client.get(f"{FLEET_URL}?active=1&all=1", headers=_auth(token)).json()
+    assert {row["connection_id"] for row in body["connections"]} == {idle}
+
+
+def test_fleet_row_carries_the_facts_stage_from_the_same_run(tmp_path, monkeypatch, pg_engine):
+    """Crawl and facts are the SAME run row — the fleet row's `facts` reads
+    off it directly, no second per-connection query."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-facts")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.checkpoint(
+        run_id,
+        phase="facts",
+        files_seen=900,
+        files_done=900,
+        enumeration_done=True,
+        progress={"facts": {"docs_done": 12, "docs_total": 340}},
+    )
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    row = body["connections"][0]
+    assert row["run"]["phase"] == "facts"
+    assert row["facts"]["phase_active"] is True
+    assert row["facts"]["docs_done"] == 12
+    assert row["facts"]["docs_total"] == 340
+
+
+def test_fleet_row_flags_a_stuck_run_past_the_fleet_threshold(tmp_path, monkeypatch, pg_engine):
+    import sqlalchemy as sa
+
+    import app.api.admin_extraction as mod
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-stuck")
+
+    run_id = _repo().start(connection_id=conn_id)
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET checkpoint_at = now() - make_interval(secs => :s) WHERE id = :id"),
+            {"s": mod._FLEET_STUCK_AFTER_S + 60, "id": run_id},
+        )
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    row = body["connections"][0]
+    assert row["stuck"] is True
+    assert row["checkpoint_age_s"] > mod._FLEET_STUCK_AFTER_S
+    assert body["totals"]["stuck"] == 1
+
+
+def test_fleet_totals_sum_across_connections(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-totals-a")
+    conn_b = _connection(client, token, name="sp-totals-b")
+
+    repo = _repo()
+    run_a = repo.start(connection_id=conn_a)
+    repo.checkpoint(run_a, files_seen=100, files_done=100, progress={"new": 100})
+    run_b = repo.start(connection_id=conn_b)
+    repo.checkpoint(run_b, files_seen=50, files_done=50, progress={"new": 50})
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    assert body["totals"]["connections"] == 2
+    assert body["totals"]["active"] == 2
+    assert body["totals"]["files_done"] == 150
+    assert body["totals"]["files_seen"] == 150
+
+
+def test_fleet_ignores_non_sharepoint_connections(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    r = client.post(
+        "/api/admin/source-connections",
+        json={"name": "kbc-fleet", "source_type": "keboola", "config": {"stack_url": "https://connection.example.com"}},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert body["connections"] == []
+
+
+def test_fleet_requires_admin(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    r = client.get(FLEET_URL)
+    assert r.status_code == 401

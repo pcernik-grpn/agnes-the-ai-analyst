@@ -94,3 +94,81 @@ class TestFactsExtract:
             result = runner.invoke(app, ["admin", "sharepoint", "facts-extract", "does-not-exist"])
         assert result.exit_code == 1
         assert "connection_not_found" in result.output
+
+
+_FLEET_BODY = {
+    "connections": [
+        {
+            "connection_id": "conn_a",
+            "connection_name": "corp-sharepoint",
+            "run": {
+                "outcome": "running",
+                "phase": "facts",
+                "files_done": 900,
+                "files_seen": 900,
+                "error": None,
+                "usage": {"facts": {"input_tokens": 1000, "output_tokens": 200, "estimated_cost_usd": 0.5}},
+            },
+            "files_per_min": 12.5,
+            "checkpoint_age_s": 45.0,
+            "stuck": False,
+            "facts": {"phase_active": True, "docs_done": 12, "docs_total": 340},
+            "estimated_cost_usd": 0.5,
+        }
+    ],
+    "totals": {
+        "connections": 1,
+        "active": 1,
+        "stuck": 0,
+        "files_done": 900,
+        "files_seen": 900,
+        "files_per_min": 12.5,
+        "facts_docs_done": 12,
+        "facts_docs_total": 340,
+        "estimated_cost_usd": 0.5,
+    },
+    "as_of": "2026-09-02T12:00:00+00:00",
+}
+
+
+class TestRuns:
+    """`agnes admin sharepoint runs` — CLI counterpart to
+    `GET /api/admin/sharepoint/extraction/runs`."""
+
+    def test_bare_call_uses_the_active_scope(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("/api/admin/sharepoint/extraction/runs?active=1")
+        assert "corp-sharepoint" in result.output
+        assert "Totals" in result.output
+
+    def test_all_flag_broadens_the_scope(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "--all"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("/api/admin/sharepoint/extraction/runs?all=1")
+
+    def test_json_output_is_the_raw_body(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == _FLEET_BODY
+
+    def test_a_typed_501_is_reported_and_exits_nonzero(self):
+        body = {"detail": "extraction_runs requires postgres", "error": "requires_postgres_backend"}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(501, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 1
+        assert "requires postgres" in result.output
+
+    def test_watch_stops_cleanly_on_keyboard_interrupt(self):
+        """`--watch` loops until Ctrl-C — the second sleep() call raises to
+        simulate the interrupt, and the command must exit 0, not crash."""
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)) as mock_get,
+            patch("cli.commands.admin_sharepoint.time.sleep", side_effect=[None, KeyboardInterrupt()]),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "--watch"])
+        assert result.exit_code == 0, result.output
+        assert mock_get.call_count == 2

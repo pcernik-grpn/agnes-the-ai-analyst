@@ -3676,9 +3676,7 @@ async def library_page(
         try:
             _accessible = get_accessible_tables(user)
             _allowed = None if _accessible is None else set(_accessible)
-            _visible_metrics = [
-                m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None
-            ]
+            _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
         except Exception as e:  # noqa: BLE001 — one lost count, not the row
             logger.warning("/library: could not count visible metrics: %s", e)
         # Through the shared helper, not a second inline
@@ -4054,9 +4052,7 @@ async def library_page(
                 # 170px column while offering something true of every row in
                 # the band equally.
                 "band_link": (
-                    {"href": "/agents?from_template=1", "label": "Start from a template"}
-                    if key == "agent"
-                    else None
+                    {"href": "/agents?from_template=1", "label": "Start from a template"} if key == "agent" else None
                 ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
@@ -8696,6 +8692,28 @@ async def admin_tables(
         studio_enabled=get_studio_enabled(),
     )
     return templates.TemplateResponse(request, "admin_tables.html", ctx)
+
+
+@router.get("/admin/extraction", response_class=HTMLResponse)
+async def admin_extraction_fleet_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The SharePoint extraction fleet dashboard (2026-09-02): one screen for
+    an operator running several connections' crawl + facts passes at once —
+    is it on pace, is anything stuck, what is it costing.
+
+    Off-nav (see ``ADMIN_NAV_OFFNAV`` in ``app/web/admin_nav.py``), reached
+    from a source card's extraction status on ``/admin/data-sources`` — the
+    same posture ``/admin/sync`` and ``/admin/semantic-layer`` already take.
+    Shell-only: the table is fetched client-side from
+    ``GET /api/admin/sharepoint/extraction/runs`` (PG-only — a DuckDB-backed
+    instance gets the typed ``501`` explained inline rather than a page that
+    silently renders empty, the same posture ``/admin/semantic-layer`` takes
+    for its own PG-only report).
+    """
+    ctx = _build_context(request, user=user)
+    return templates.TemplateResponse(request, "admin_extraction.html", ctx)
 
 
 @router.get("/admin/sync", response_class=HTMLResponse)

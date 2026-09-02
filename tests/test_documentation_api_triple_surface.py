@@ -1287,6 +1287,23 @@ _EXEMPT: dict[str, str] = {
         "one run's stored report/skip list for the source card's run drawer — admin "
         "display primitive, no analyst CLI/MCP analogue"
     ),
+    # The extraction FLEET dashboard (/admin/extraction, 2026-09-02) — one
+    # row per connection of the SAME run counters the per-connection rows
+    # above already exempt, plus a derived rate and a derived "stuck" flag.
+    # Same admin-display-primitive class, EXCEPT this one IS CLI-reachable
+    # (`agnes admin sharepoint runs`) for an operator watching a multi-hour,
+    # multi-connection extraction over SSH with no browser open — the
+    # triple-surface mechanism only gates MCP + REST classification, so a
+    # CLI command can exist on an _EXEMPT row (see the facts-extract
+    # exemption below for the same pattern). Deliberately not MCP-exposed:
+    # it is a fleet-wide operational status read, not a bounded analyst
+    # query — an agent has no legitimate reason to poll every connection's
+    # live run state at once.
+    "/api/admin/sharepoint/extraction/runs": (
+        "one row per SharePoint connection's latest run for the extraction fleet "
+        "dashboard — admin display primitive, CLI-reachable (agnes admin sharepoint "
+        "runs) but deliberately not MCP-exposed"
+    ),
     # issue #1971 Part 3/4 — corporate-memory detection observability. Same
     # exemption class as the SharePoint extraction run-history rows above:
     # an admin panel's own data (run counters, a policy fingerprint) and an

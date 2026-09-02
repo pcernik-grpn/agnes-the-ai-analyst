@@ -78,8 +78,10 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -90,6 +92,38 @@ from src.audit_helpers import log_safe
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
+
+#: The fleet dashboard's own "go look at this" threshold — the checkpoint
+#: age past which a RUNNING run's row renders red on ``/admin/extraction``.
+#: Deliberately tighter than :data:`_STALL_AFTER_S` (30 min): that constant
+#: backs the per-connection card's authoritative ``stalled`` OUTCOME word,
+#: while this one is a faster, coarser tripwire meant to catch an
+#: operator's eye across a whole fleet of connections — a row flagged here
+#: can still resolve into a normal checkpoint moments later, so it never
+#: replaces ``outcome``, it only adds a "go look" flag next to it.
+_FLEET_STUCK_AFTER_S = 600
+
+#: How far back the fleet endpoint's own in-memory rate sampler looks when
+#: deriving files/min. NOT read from stored history — ``extraction_runs``
+#: keeps only the LATEST checkpoint per run, never a series — this is a
+#: series the endpoint builds itself across repeated polls (the fleet page
+#: polls every 5s while a run is active, which is what makes "consecutive
+#: checkpoints" a meaningful phrase here).
+_RATE_WINDOW_S = 900
+
+#: Safety cap on samples kept per run id. At one new sample roughly every
+#: 5s of polling this is ~15x the window — headroom for a slower poller
+#: (or several browser tabs) to still land two samples inside it, without
+#: letting a run polled for 20 hours grow its series without bound.
+_RATE_SAMPLES_CAP = 400
+
+#: Process-local, best-effort: a restart loses the series and the next call
+#: simply falls back to the since-``started_at`` average (see
+#: :func:`_files_per_min`) until two fresh samples land. Keyed by run id so
+#: a new run for the same connection starts its own series rather than
+#: inheriting the previous run's rate.
+_rate_samples_lock = threading.Lock()
+_rate_samples: Dict[str, "Deque[Tuple[float, int]]"] = {}
 
 
 #: How stale a ``running`` run's last checkpoint may be before the UI is
@@ -321,6 +355,258 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
         # `on_progress` docstring) — never invented ahead of that.
         "facts_progress": live.get("facts"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Fleet view (`GET /extraction/runs`, `/admin/extraction`) — one row per
+# SharePoint connection, for an operator running several crawls at once.
+# ---------------------------------------------------------------------------
+
+
+def _files_per_min(run: Dict[str, Any]) -> Optional[float]:
+    """Files/min over :data:`_RATE_WINDOW_S`, derived from consecutive
+    checkpoints THIS PROCESS has observed for this run.
+
+    ``extraction_runs`` stores only the LATEST checkpoint, never a history,
+    so there is no series to read back — this endpoint builds its own by
+    recording one sample per distinct ``checkpoint_at`` it sees across
+    repeated polls (the fleet page polls every 5s while a run is active,
+    which is what makes "consecutive checkpoints" a real signal here rather
+    than a single point).
+
+    Falls back to the run's average rate since ``started_at`` when the
+    window holds only one sample — the very first observation of this run,
+    or a fresh process that lost its in-memory series. Returns ``None`` when
+    neither is computable (no checkpoint yet, or zero files done).
+    """
+    run_id = run.get("id")
+    checkpoint_at = _parse_ts(run.get("checkpoint_at"))
+    files_done = int(run.get("files_done") or 0)
+    if not run_id or checkpoint_at is None:
+        return None
+
+    ts = checkpoint_at.timestamp()
+    with _rate_samples_lock:
+        series = _rate_samples.setdefault(str(run_id), deque(maxlen=_RATE_SAMPLES_CAP))
+        if not series or series[-1][0] != ts:
+            series.append((ts, files_done))
+        # Evict samples older than the window, relative to the NEWEST one —
+        # `checkpoint_at` is "when this was last true", never wall-clock now.
+        cutoff = ts - _RATE_WINDOW_S
+        while len(series) > 1 and series[0][0] < cutoff:
+            series.popleft()
+        oldest_ts, oldest_done = series[0]
+        newest_ts, newest_done = series[-1]
+
+    if newest_ts > oldest_ts and newest_done >= oldest_done:
+        elapsed_min = (newest_ts - oldest_ts) / 60.0
+        if elapsed_min > 0:
+            return round((newest_done - oldest_done) / elapsed_min, 2)
+
+    started_at = _parse_ts(run.get("started_at"))
+    if started_at is None or files_done <= 0:
+        return None
+    elapsed_min = max((checkpoint_at - started_at).total_seconds(), 1.0) / 60.0
+    return round(files_done / elapsed_min, 2)
+
+
+def _run_total_cost_usd(run: Optional[Dict[str, Any]]) -> float:
+    """Every stage's own priced cost, summed. ``usage`` is keyed by stage
+    (``ner`` / ``ocr`` / ``facts``), each carrying its OWN
+    ``estimated_cost_usd`` (see ``connectors.sharepoint.crawler.
+    _detector_usage`` / ``_ocr_run_usage`` and ``connectors.sharepoint.
+    facts_extraction._Report.render`` — the one place per stage a token
+    count becomes USD). A stage absent from ``usage`` spent nothing and
+    contributes 0, never an invented estimate. Written once, at
+    ``finish()`` — a still-``running`` run's cost is genuinely unknown
+    until then, not zero.
+    """
+    if not run:
+        return 0.0
+    usage = run.get("usage") or {}
+    total = 0.0
+    for stage in usage.values():
+        if isinstance(stage, dict):
+            total += float(stage.get("estimated_cost_usd") or 0)
+    return total
+
+
+#: The empty facts shape — a connection whose latest run never reached the
+#: facts phase (or has no run at all) renders every field ``None``, never
+#: ``0``: "0 documents done" and "the facts phase hasn't started" are
+#: different claims, and this surface never blurs them.
+_EMPTY_FLEET_FACTS: Dict[str, Any] = {
+    "phase_active": False,
+    "docs_done": None,
+    "docs_total": None,
+    "docs_extracted": None,
+    "docs_unchanged": None,
+    "docs_skipped_tabular": None,
+    "docs_skipped_no_text": None,
+    "docs_skipped_not_indexed": None,
+    "facts_failed": None,
+    "usage": {},
+}
+
+
+def _fleet_facts(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The facts stage's own numbers for one connection's latest run — read
+    off the SAME row the crawl side already reads, never a second
+    per-connection query or a re-read of the per-document idempotency state
+    file. Crawl and facts are literally the same run row: ``phase`` flips
+    from ``"crawl"`` to ``"facts"`` mid-run
+    (``connectors.sharepoint.crawler._RunRecorder.checkpoint_facts``), so
+    there is nothing else to fetch.
+
+    ``docs_done`` / ``docs_total`` come from ``progress.facts`` while the
+    facts phase is live (the pass's own growing "submitted so far" counters
+    — see :func:`run_facts_extraction`'s docstring for why ``docs_total`` is
+    a lower bound, not a corpus size). Once the pass FINISHES,
+    ``report.facts`` carries its outcome breakdown
+    (``docs_extracted``/``docs_unchanged``/the ``skipped-*`` reasons/
+    ``facts_failed``) and ``docs_done`` falls back to ``docs_extracted`` so
+    a finished run still answers "how many did it do".
+    """
+    if not run:
+        return dict(_EMPTY_FLEET_FACTS)
+    progress = run.get("progress") or {}
+    report = run.get("report") or {}
+    live_facts = progress.get("facts") or {}
+    final_facts = report.get("facts") or {}
+    out = dict(_EMPTY_FLEET_FACTS)
+    out["phase_active"] = str(run.get("phase") or "") == "facts" and str(run.get("status") or "") == "running"
+    if live_facts:
+        out["docs_done"] = live_facts.get("docs_done")
+        out["docs_total"] = live_facts.get("docs_total")
+    if final_facts:
+        out["docs_extracted"] = final_facts.get("docs_extracted")
+        out["docs_unchanged"] = final_facts.get("docs_unchanged")
+        out["docs_skipped_tabular"] = final_facts.get("docs_skipped_tabular")
+        out["docs_skipped_no_text"] = final_facts.get("docs_skipped_no_text")
+        out["docs_skipped_not_indexed"] = final_facts.get("docs_skipped_not_indexed")
+        out["facts_failed"] = final_facts.get("facts_failed")
+        if out["docs_done"] is None:
+            out["docs_done"] = final_facts.get("docs_extracted")
+    # The priced usage for JUST this stage — see `_run_total_cost_usd` for
+    # why it is only known once the run has finished.
+    out["usage"] = (run.get("usage") or {}).get("facts") or {}
+    return out
+
+
+@router.get("/extraction/runs")
+async def fleet_extraction_runs(
+    active: bool = Query(False, description="Only connections with a currently running run (the default scope)"),
+    show_all: bool = Query(
+        False, alias="all", description="Every SharePoint connection, running or not — wins over `active`"
+    ),
+    _user: dict = Depends(require_admin),
+):
+    """One row per SharePoint connection — the fleet dashboard for an
+    operator running several crawls at once: is it on pace, is anything
+    stuck, what is it costing.
+
+    Default scope (and ``?active=1``) is connections with a run CURRENTLY
+    ``running`` — an idle connection has nothing to say about "on pace" and
+    its absence here is the honest answer, not an omission. ``?all=1``
+    broadens to every SharePoint connection, each with its own latest run
+    (``null`` if it has never run) — ``all`` wins if both are passed.
+
+    Each row's ``run`` reuses :func:`_run_out` — the SAME projection the
+    per-connection status/history endpoints render, so a fleet row and a
+    source card can never disagree about one run — plus two fleet-only
+    additions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck`` (a
+    checkpoint older than :data:`_FLEET_STUCK_AFTER_S` on a row whose STORED
+    status is still ``running`` — deliberately not gated on the derived
+    ``outcome`` word, so a run already reclassified ``stalled`` or
+    job-``failed`` still trips it). ``facts`` is the facts stage's own
+    numbers, read off the same row (:func:`_fleet_facts`).
+
+    PG-only, same as every other route in this module: ``extraction_runs``
+    is a post-A3 table, so a DuckDB-backed instance gets the typed ``501``
+    from ``extraction_runs_repo()`` via the app-wide handler in
+    ``app/main.py`` — nothing here needs its own DuckDB fallback.
+    """
+    from src.repositories import extraction_runs_repo, source_connections_repo
+
+    connections = sorted(
+        source_connections_repo().list(source_type="sharepoint"),
+        key=lambda c: str(c.get("name") or c.get("id") or ""),
+    )
+    connection_ids = [str(c["id"]) for c in connections]
+    running_only = not show_all
+    latest = extraction_runs_repo().list_latest_for_connections(connection_ids, running_only=running_only)
+
+    now = datetime.now(timezone.utc)
+    rows: List[Dict[str, Any]] = []
+    totals: Dict[str, Any] = {
+        "connections": 0,
+        "active": 0,
+        "stuck": 0,
+        "files_done": 0,
+        "files_seen": 0,
+        "files_per_min": 0.0,
+        "facts_docs_done": 0,
+        "facts_docs_total": 0,
+        "estimated_cost_usd": 0.0,
+    }
+    for connection in connections:
+        connection_id = str(connection["id"])
+        run = latest.get(connection_id)
+        if run is None and not show_all:
+            # Nothing currently running for this connection — omitted from
+            # the active scope entirely, not represented as a blank row.
+            continue
+
+        stored_status = str(run.get("status") or "") if run else ""
+        run_out = _run_out(run, now=now) if run else None
+        files_per_min = _files_per_min(run) if run else None
+        checkpoint_age_s = _age_s(run.get("checkpoint_at"), now=now) if run else None
+        stuck = bool(
+            run
+            and stored_status == "running"
+            and checkpoint_age_s is not None
+            and checkpoint_age_s > _FLEET_STUCK_AFTER_S
+        )
+        facts = _fleet_facts(run)
+        cost = _run_total_cost_usd(run)
+
+        totals["connections"] += 1
+        if stored_status == "running":
+            totals["active"] += 1
+        if stuck:
+            totals["stuck"] += 1
+        if run_out:
+            totals["files_done"] += int(run_out.get("files_done") or 0)
+            totals["files_seen"] += int(run_out.get("files_seen") or 0)
+        if files_per_min:
+            totals["files_per_min"] += files_per_min
+        if facts.get("docs_done"):
+            totals["facts_docs_done"] += int(facts["docs_done"] or 0)
+        if facts.get("docs_total"):
+            totals["facts_docs_total"] += int(facts["docs_total"] or 0)
+        totals["estimated_cost_usd"] += cost
+
+        rows.append(
+            {
+                "connection_id": connection_id,
+                "connection_name": connection.get("name"),
+                "run": run_out,
+                "files_per_min": files_per_min,
+                "checkpoint_age_s": checkpoint_age_s,
+                "stuck": stuck,
+                "facts": facts,
+                "estimated_cost_usd": round(cost, 4),
+            }
+        )
+
+    totals["files_per_min"] = round(totals["files_per_min"], 2)
+    totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 4)
+
+    return {
+        "connections": rows,
+        "totals": totals,
+        "as_of": now.isoformat(),
     }
 
 

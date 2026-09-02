@@ -187,7 +187,11 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         # for the same reason now that it has no tab of its own (see the
         # "Semantic layer health" comment below) — it's still reachable from a
         # source card's pipeline cell, just not part of the strip.
-        "match": ["/admin/sync", "/admin/semantic-layer"],
+        # `/admin/extraction` (2026-09-02) is the same pattern once more: the
+        # SharePoint extraction FLEET dashboard, reached from a source card's
+        # extraction status, not a lens an admin picks among Sources/Tables/
+        # Packages — see ADMIN_NAV_OFFNAV below for the full reasoning.
+        "match": ["/admin/sync", "/admin/semantic-layer", "/admin/extraction"],
         # ── The one strip that is a PIPELINE, not a set of categories ──────
         # Sources, Tables and Packages are not three kinds of thing you choose
         # between; they are one flow seen from three places — where data comes
@@ -564,6 +568,19 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # you MANAGE, and this is a log you CHECK — and the cross-source version
         # of that question ("what failed today") is what /admin/activity is.
         "reached_from": "the SYNC cell on each source card (/admin/data-sources)",
+    },
+    {
+        "href": "/admin/extraction",
+        # The SharePoint extraction FLEET dashboard (2026-09-02): one row per
+        # connection for an operator running several crawl + facts passes at
+        # once. Same off-nav shape as /admin/sync — a status view an operator
+        # is SENT to, not a lens they pick among Sources/Tables/Packages.
+        # Intended entry point is a link from each source card's per-
+        # connection extraction status on /admin/data-sources (that page is
+        # under active, separate edit as this lands — wire the link there
+        # once both changes have merged); reachable directly at
+        # /admin/extraction in the interim.
+        "reached_from": "a link from each source card's extraction status (/admin/data-sources) — pending",
     },
     {
         "href": "/admin/semantic-layer",

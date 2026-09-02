@@ -1504,7 +1504,10 @@ analogue — Graph is the only caller.
 Mostly read-only surface (`app/api/admin_extraction.py`) behind the SharePoint
 source card's live crawl cell, its run-history drawer and its configuration
 drawer — plus one write, the cooperative stop below. No new page and no new
-nav entry — the card is the only client.
+nav entry for the per-connection routes below — the card is the only client.
+The fleet endpoint two paragraphs down (`.../extraction/runs` with no
+`{connection_id}`) is the one exception: it backs its own page,
+`/admin/extraction`.
 
 - /api/admin/sharepoint/connections/{connection_id}/extraction/status
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs
@@ -1573,7 +1576,31 @@ tell no run is currently active. `404` for an unknown or non-SharePoint
 connection. Audited as `extraction.stop_requested` (emitted by the fallback
 middleware — the handler writes no row of its own).
 
-Admin-only display primitives with no analyst CLI/MCP analogue.
+`GET /api/admin/sharepoint/extraction/runs` (no `{connection_id}` — one row
+per SharePoint CONNECTION, not one route per connection) is the extraction
+FLEET dashboard's own endpoint, behind `/admin/extraction`: an operator
+running several connections' crawl + facts passes at once needs one screen
+that answers "is it on pace, is anything stuck, what is it costing" rather
+than opening N source cards. Default scope (and `?active=1`) is connections
+with a run CURRENTLY `running`; `?all=1` broadens to every SharePoint
+connection, idle ones included, each with its own latest run or `null`.
+Every row reuses the SAME per-run projection the routes above render, plus
+two fleet-only fields: `files_per_min` (derived from consecutive checkpoints
+this endpoint itself has observed across repeated polls — the table is
+stored, never a history, so there is nothing to read back) and `stuck` (a
+checkpoint older than 10 minutes on a row whose STORED status is still
+`running` — a faster, coarser tripwire than `status`'s own 30-minute
+`stalled` derivation, meant to catch an operator's eye across a whole fleet
+rather than assert an outcome). `facts` carries the facts stage's own
+counters, read off the SAME run row (crawl and facts are literally one row;
+`phase` flips from `"crawl"` to `"facts"` mid-run). CLI:
+`agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
+refreshes every 10s).
+
+Admin-only display primitives; the per-connection routes above have no
+analyst CLI/MCP analogue, and the fleet endpoint is CLI-reachable but
+deliberately not MCP-exposed (a fleet-wide operational status read, not a
+bounded analyst query).
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

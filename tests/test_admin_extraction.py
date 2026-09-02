@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 BASE = "/api/admin/sharepoint/connections"
 
 
@@ -514,3 +516,200 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["facts_progress"] is None
+
+
+# ---------------------------------------------------------------------------
+# Fleet view (`GET /extraction/runs`, `/admin/extraction`, 2026-09-02) — the
+# pure helper functions first, no database required; the PG happy path (a
+# fleet row actually surfacing through the API) lives in
+# `tests/db_pg/test_extraction_api_pg.py`.
+# ---------------------------------------------------------------------------
+
+
+class TestFilesPerMin:
+    def test_falls_back_to_the_since_started_average_on_first_observation(self):
+        from app.api.admin_extraction import _files_per_min
+
+        started = datetime.now(timezone.utc) - timedelta(minutes=10)
+        checkpoint = started + timedelta(minutes=5)
+        run = {
+            "id": "er_rate_first_observation",
+            "started_at": started.isoformat(),
+            "checkpoint_at": checkpoint.isoformat(),
+            "files_done": 50,
+        }
+        assert _files_per_min(run) == pytest.approx(10.0, rel=0.05)
+
+    def test_derives_the_windowed_rate_from_two_consecutive_polls(self):
+        """Two calls with the SAME run id, spaced 5 minutes apart in
+        `checkpoint_at` — the windowed rate, not the since-start average
+        (which would read ~2.9/min over the same 21-minute span)."""
+        from app.api.admin_extraction import _files_per_min
+
+        started = datetime.now(timezone.utc) - timedelta(minutes=20)
+        first_checkpoint = started + timedelta(minutes=1)
+        _files_per_min(
+            {
+                "id": "er_rate_two_polls",
+                "started_at": started.isoformat(),
+                "checkpoint_at": first_checkpoint.isoformat(),
+                "files_done": 10,
+            }
+        )
+        second_checkpoint = first_checkpoint + timedelta(minutes=5)
+        rate = _files_per_min(
+            {
+                "id": "er_rate_two_polls",
+                "started_at": started.isoformat(),
+                "checkpoint_at": second_checkpoint.isoformat(),
+                "files_done": 60,
+            }
+        )
+        assert rate == pytest.approx(10.0, rel=0.05)
+
+    def test_none_with_no_files_done_and_no_history(self):
+        from app.api.admin_extraction import _files_per_min
+
+        now = datetime.now(timezone.utc)
+        run = {
+            "id": "er_rate_no_files",
+            "started_at": now.isoformat(),
+            "checkpoint_at": now.isoformat(),
+            "files_done": 0,
+        }
+        assert _files_per_min(run) is None
+
+    def test_none_without_a_checkpoint(self):
+        from app.api.admin_extraction import _files_per_min
+
+        assert _files_per_min({"id": "er_rate_no_checkpoint", "files_done": 5}) is None
+
+    def test_none_without_a_run_id(self):
+        from app.api.admin_extraction import _files_per_min
+
+        now = datetime.now(timezone.utc)
+        assert _files_per_min({"checkpoint_at": now.isoformat(), "files_done": 5}) is None
+
+
+class TestRunTotalCostUsd:
+    def test_sums_estimated_cost_across_every_stage(self):
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        run = {
+            "usage": {
+                "ner": {"estimated_cost_usd": 0.5},
+                "ocr": {"estimated_cost_usd": 0.25},
+                "facts": {"estimated_cost_usd": 1.25},
+            }
+        }
+        assert _run_total_cost_usd(run) == pytest.approx(2.0)
+
+    def test_a_stage_with_no_priced_cost_contributes_nothing(self):
+        """`{}` (no tokens spent) and a stage that never priced itself both
+        contribute 0 — never an invented estimate."""
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        assert _run_total_cost_usd({"usage": {"ner": {}}}) == 0.0
+
+    def test_missing_run_or_empty_usage_is_zero(self):
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        assert _run_total_cost_usd(None) == 0.0
+        assert _run_total_cost_usd({}) == 0.0
+        assert _run_total_cost_usd({"usage": {}}) == 0.0
+
+
+class TestFleetFacts:
+    def test_no_run_is_the_empty_shape_with_every_count_none(self):
+        from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
+
+        out = _fleet_facts(None)
+        assert out == _EMPTY_FLEET_FACTS
+        assert out["docs_done"] is None
+        assert out["usage"] == {}
+
+    def test_mutating_the_result_never_corrupts_the_shared_empty_constant(self):
+        from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
+
+        out = _fleet_facts(None)
+        out["docs_done"] = 999
+        assert _EMPTY_FLEET_FACTS["docs_done"] is None
+
+    def test_live_progress_while_the_facts_phase_is_running(self):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {
+            "status": "running",
+            "phase": "facts",
+            "progress": {"facts": {"docs_done": 12, "docs_total": 340}},
+        }
+        out = _fleet_facts(run)
+        assert out["phase_active"] is True
+        assert out["docs_done"] == 12
+        assert out["docs_total"] == 340
+        # Not known until `finish()` — a live pass has no outcome breakdown yet.
+        assert out["docs_extracted"] is None
+
+    def test_final_report_once_the_pass_has_finished(self):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {
+            "status": "done",
+            "phase": "facts",
+            "report": {
+                "facts": {
+                    "docs_extracted": 300,
+                    "docs_unchanged": 20,
+                    "docs_skipped_tabular": 5,
+                    "docs_skipped_no_text": 1,
+                    "docs_skipped_not_indexed": 2,
+                    "facts_failed": 3,
+                }
+            },
+            "usage": {"facts": {"estimated_cost_usd": 4.5, "input_tokens": 1000}},
+        }
+        out = _fleet_facts(run)
+        assert out["phase_active"] is False  # the row is `done`, not `running`
+        assert out["docs_done"] == 300  # falls back to docs_extracted
+        assert out["docs_extracted"] == 300
+        assert out["docs_skipped_tabular"] == 5
+        assert out["docs_skipped_no_text"] == 1
+        assert out["docs_skipped_not_indexed"] == 2
+        assert out["facts_failed"] == 3
+        assert out["usage"]["estimated_cost_usd"] == 4.5
+
+    def test_phase_active_is_false_outside_the_facts_phase(self):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {"status": "running", "phase": "crawl", "progress": {}}
+        assert _fleet_facts(run)["phase_active"] is False
+
+
+FLEET_URL = "/api/admin/sharepoint/extraction/runs"
+
+
+class TestFleetRoute:
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(FLEET_URL)
+        assert r.status_code == 401
+
+    def test_requires_admin(self, seeded_app):
+        token = seeded_app["analyst_token"]
+        r = seeded_app["client"].get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_typed_501_on_duckdb(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        _create_connection(client, token, name="sp-fleet-501")
+        r = client.get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_typed_501_even_with_no_sharepoint_connections_at_all(self, seeded_app):
+        """The repo factory raises before any connection list is even
+        walked — a DuckDB instance with zero SharePoint connections still
+        owes the typed 501, not a hollow 200 with an empty list."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        r = client.get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"

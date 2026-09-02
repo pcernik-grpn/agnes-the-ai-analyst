@@ -1,0 +1,300 @@
+{% extends "base_admin_page.html" %}
+{% block title %}Extraction fleet — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{# Section-level and PLAIN, matching /admin/sync and /admin/semantic-layer:
+   the h1 names the section ("Data"), the tab strip below names the pipeline
+   lens the reader is one click from. This page is off-nav (see
+   ADMIN_NAV_OFFNAV in app/web/admin_nav.py) — an operator is SENT here from
+   a source card's extraction status, not a lens they pick among Sources /
+   Tables / Data packages. #}
+{% set page_hero_title = "Data" %}
+{% set page_hero_subtitle = "One screen for every SharePoint connection's crawl and fact-graph pass: is it on pace, is anything stuck, what is it costing. Connections live at <a href=\"/admin/data-sources\">Sources</a>." %}
+{% set page_hero_plain = True %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<style>
+  /* Section head, strip and toolbar placement are the shared admin page
+     vocabulary (`.apg-*` in css/admin_page.css) — only what is specific to
+     this page's own table and cards lives here. */
+
+  .ext-summary { display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+  .ext-card {
+    background: var(--ds-surface); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); padding: 14px 18px; min-width: 140px; flex: 1;
+  }
+  .ext-card .label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ds-text-muted);
+  }
+  .ext-card .value {
+    font-size: 22px; font-weight: 700; color: var(--ds-text-primary); margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ext-card .value.danger { color: var(--ds-accent-danger-ink); }
+
+  .ext-scope { display: inline-flex; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .ext-scope a {
+    padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary);
+    text-decoration: none; background: var(--ds-surface);
+  }
+  .ext-scope a.active { background: var(--ds-primary); color: var(--ds-text-inverse); }
+  .ext-scope a + a { border-left: 1px solid var(--ds-border); }
+
+  .ext-fresh { flex: 0 0 auto; font-size: 12px; color: var(--ds-text-muted); white-space: nowrap; }
+
+  .ext-blank { text-align: center; padding: 34px 16px; font-size: 13px; color: var(--ds-text-secondary); }
+
+  .ext-conn { font-weight: 600; color: var(--ds-text-primary); }
+  .ext-sub { font-size: 11px; color: var(--ds-text-secondary); font-family: var(--font-mono, ui-monospace, monospace); }
+  .ext-num { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ext-error-cell {
+    font-size: 11px; color: var(--ds-accent-danger-ink); max-width: 260px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  tr.ext-row--stuck { background: var(--ds-accent-danger-bg); }
+  tr.ext-row--stuck .ext-conn { color: var(--ds-accent-danger-ink); }
+
+  /* No `.badge` base rule is declared in this page — every status pill below
+     reuses the shared `.badge` + `.badge--{info,warn,success,danger}`
+     vocabulary from components.css, tinted by the SAME accent tokens the
+     rest of the product's status pills use (design-system.md rule 4). */
+</style>
+{% endblock %}
+
+{% block page %}
+{% include "_admin_tabs.html" %}
+
+<div id="ext-pg-unavailable" class="apg-strip apg-strip--warn" role="status" hidden>
+  This dashboard needs the Postgres app-state backend — this instance still runs the DuckDB one.
+  Migrate it to see live extraction runs: <a href="/admin/database">Database backend</a>.
+</div>
+
+<div class="fbar apg-bar" id="ext-toolbar" role="group" aria-label="Extraction fleet scope">
+  <div class="ext-scope" role="group" aria-label="Scope">
+    <a href="#" id="ext-scope-active" data-scope="active">Active</a>
+    <a href="#" id="ext-scope-all" data-scope="all">All connections</a>
+  </div>
+  <span class="apg-bar__gap" aria-hidden="true"></span>
+  <span class="ext-fresh" id="ext-fresh"></span>
+</div>
+
+<div class="ext-summary" id="ext-summary" hidden>
+  <div class="ext-card">
+    <div class="label">Active</div>
+    <div class="value" id="ext-stat-active">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Files/min (fleet)</div>
+    <div class="value" id="ext-stat-rate">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Facts done</div>
+    <div class="value" id="ext-stat-facts">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Stuck?</div>
+    <div class="value" id="ext-stat-stuck">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Est. cost</div>
+    <div class="value" id="ext-stat-cost">—</div>
+  </div>
+</div>
+
+<div class="data-table-wrap">
+  <table class="data-table" id="ext-table">
+    <thead>
+      <tr>
+        <th>Connection</th>
+        <th>Phase</th>
+        <th>Files done / seen</th>
+        <th>Files/min</th>
+        <th>Facts done / pending</th>
+        <th>Tokens in / out</th>
+        <th>Est. cost</th>
+        <th>Last checkpoint</th>
+        <th>Error</th>
+      </tr>
+    </thead>
+    <tbody id="ext-tbody">
+      <tr><td colspan="9" class="ext-blank">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Scope: "active" (default — only connections with a run CURRENTLY
+// running, the "is it on pace right now" view) or "all" (every SharePoint
+// connection, idle ones included). Mirrors the API's own `?active=1` /
+// `?all=1` query params one-to-one.
+let extScope = "active";
+let extTimer = null;
+let extInFlight = false;
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
+function fmtAgo(seconds) {
+  if (seconds == null) return "—";
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
+  return Math.floor(seconds / 3600) + "h ago";
+}
+
+function fmtRate(rate) {
+  return rate == null ? "—" : rate.toFixed(1);
+}
+
+function fmtCost(usd) {
+  return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
+}
+
+// Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
+// a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
+// API side for why `usage` is keyed by stage and only populated once the
+// run has finished.
+function tokenTotals(usage) {
+  let inTok = 0, outTok = 0, any = false;
+  for (const stage of Object.values(usage || {})) {
+    if (!stage || typeof stage !== "object") continue;
+    if (typeof stage.input_tokens === "number") { inTok += stage.input_tokens; any = true; }
+    if (typeof stage.output_tokens === "number") { outTok += stage.output_tokens; any = true; }
+  }
+  return any ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
+}
+
+function factsCell(facts) {
+  if (!facts) return "—";
+  const done = facts.docs_done;
+  if (facts.phase_active) {
+    const total = facts.docs_total != null ? facts.docs_total : "?";
+    const pending = facts.docs_total != null && done != null ? Math.max(facts.docs_total - done, 0) : "?";
+    return `${done ?? 0} / ${total} <span class="ext-sub">(${pending} pending)</span>`;
+  }
+  if (done != null) {
+    // A pass that finished walked its whole corpus this run — nothing left
+    // pending FROM THIS PASS. Skipped/failed documents are their own
+    // counts, not represented as "pending" (they were looked at, not
+    // deferred).
+    return `${done} <span class="ext-sub">(0 pending)</span>`;
+  }
+  return "—";
+}
+
+function phaseCell(run) {
+  if (!run) return '<span class="badge">idle</span>';
+  const outcome = run.outcome;
+  const phase = run.phase || "crawl";
+  const cls = outcome === "failed" ? "badge--danger"
+    : outcome === "stalled" ? "badge--warn"
+    : outcome === "running" ? "badge--info"
+    : outcome === "interrupted" ? "badge--warn"
+    : "badge--success";
+  return `<span class="badge ${cls}">${esc(outcome)}</span> <span class="ext-sub">${esc(phase)}</span>`;
+}
+
+function renderRow(row) {
+  const run = row.run;
+  const filesDone = run ? (run.files_done ?? 0) : null;
+  const filesSeen = run ? (run.files_seen ?? 0) : null;
+  const usage = run ? (run.usage || {}) : {};
+  const cost = row.estimated_cost_usd || 0;
+  const tr = document.createElement("tr");
+  tr.className = row.stuck ? "ext-row--stuck" : "";
+  tr.innerHTML = `
+    <td>
+      <div class="ext-conn">${esc(row.connection_name || row.connection_id)}</div>
+      <div class="ext-sub">${esc(row.connection_id)}</div>
+    </td>
+    <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}</td>
+    <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}`}</td>
+    <td class="ext-num">${fmtRate(row.files_per_min)}</td>
+    <td class="ext-num">${factsCell(row.facts)}</td>
+    <td class="ext-num">${tokenTotals(usage)}</td>
+    <td class="ext-num">${fmtCost(cost)}</td>
+    <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
+    <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
+  `;
+  return tr;
+}
+
+function renderTable(body) {
+  const tbody = document.getElementById("ext-tbody");
+  const rows = body.connections || [];
+  if (!rows.length) {
+    const msg = extScope === "active"
+      ? "No SharePoint connection currently has a run in progress."
+      : "No SharePoint connections are registered.";
+    tbody.innerHTML = `<tr><td colspan="9" class="ext-blank">${msg}</td></tr>`;
+  } else {
+    tbody.innerHTML = "";
+    for (const row of rows) tbody.appendChild(renderRow(row));
+  }
+
+  const t = body.totals || {};
+  document.getElementById("ext-summary").hidden = false;
+  document.getElementById("ext-stat-active").textContent = t.active ?? 0;
+  document.getElementById("ext-stat-rate").textContent = fmtRate(t.files_per_min);
+  document.getElementById("ext-stat-facts").textContent = (t.facts_docs_done ?? 0).toLocaleString();
+  const stuckEl = document.getElementById("ext-stat-stuck");
+  stuckEl.textContent = t.stuck ?? 0;
+  stuckEl.classList.toggle("danger", (t.stuck || 0) > 0);
+  document.getElementById("ext-stat-cost").textContent = fmtCost(t.estimated_cost_usd);
+
+  document.getElementById("ext-fresh").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+function setScope(scope) {
+  extScope = scope;
+  document.getElementById("ext-scope-active").classList.toggle("active", scope === "active");
+  document.getElementById("ext-scope-all").classList.toggle("active", scope === "all");
+  return extTick();
+}
+
+async function extTick() {
+  if (extInFlight) return;
+  if (document.visibilityState !== "visible") return;
+  extInFlight = true;
+  try {
+    const qs = extScope === "all" ? "?all=1" : "?active=1";
+    const r = await fetch("/api/admin/sharepoint/extraction/runs" + qs, { credentials: "include" });
+    if (r.status === 501) {
+      document.getElementById("ext-pg-unavailable").hidden = false;
+      document.getElementById("ext-toolbar").hidden = true;
+      document.getElementById("ext-summary").hidden = true;
+      document.getElementById("ext-tbody").innerHTML = "";
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = await r.json();
+    renderTable(body);
+  } catch (e) {
+    document.getElementById("ext-fresh").textContent = "Refresh failed: " + e.message;
+  } finally {
+    extInFlight = false;
+  }
+}
+
+function extSchedule() {
+  if (extTimer) clearTimeout(extTimer);
+  extTimer = setTimeout(async () => { await extTick(); extSchedule(); }, 5000);
+}
+
+document.getElementById("ext-scope-active").addEventListener("click", (e) => { e.preventDefault(); setScope("active"); });
+document.getElementById("ext-scope-all").addEventListener("click", (e) => { e.preventDefault(); setScope("all"); });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { extTick(); extSchedule(); }
+});
+
+setScope("active");
+extSchedule();
+</script>
+{% endblock %}

@@ -276,3 +276,55 @@ def test_timestamps_round_trip_as_iso_strings(pg_engine, monkeypatch):
     parsed = datetime.fromisoformat(row["started_at"])
     assert parsed.tzinfo is not None
     assert abs(parsed - datetime.now(timezone.utc)) < timedelta(minutes=5)
+
+
+# -- list_latest_for_connections (fleet dashboard, 2026-09-02) --------------
+
+
+def test_list_latest_for_connections_picks_the_newest_row_per_connection(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    older = repo.start(connection_id="conn_a")
+    repo.finish(older, status="done")
+    newer = repo.start(connection_id="conn_a")
+    only = repo.start(connection_id="conn_b")
+
+    latest = repo.list_latest_for_connections(["conn_a", "conn_b"])
+    assert latest["conn_a"]["id"] == newer
+    assert latest["conn_b"]["id"] == only
+
+
+def test_list_latest_for_connections_omits_a_connection_with_no_run(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.start(connection_id="conn_a")
+
+    latest = repo.list_latest_for_connections(["conn_a", "conn_never_run"])
+    assert set(latest.keys()) == {"conn_a"}
+
+
+def test_list_latest_for_connections_empty_ids_returns_empty(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.list_latest_for_connections([]) == {}
+
+
+def test_list_latest_for_connections_running_only_excludes_finished_connections(pg_engine, monkeypatch):
+    """The fleet view's default (active) scope: a connection whose newest
+    run already finished has nothing to say about "is it on pace right now"
+    and must be absent, not represented with a stale finished row."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    finished = repo.start(connection_id="conn_a")
+    repo.finish(finished, status="done")
+    running = repo.start(connection_id="conn_b")
+
+    latest = repo.list_latest_for_connections(["conn_a", "conn_b"], running_only=True)
+    assert set(latest.keys()) == {"conn_b"}
+    assert latest["conn_b"]["id"] == running
+
+
+def test_list_latest_for_connections_running_only_still_prefers_newest_running_row(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    zombie = repo.start(connection_id="conn_a")
+    repo.checkpoint(zombie, files_seen=10, files_done=10)
+    current = repo.start(connection_id="conn_a")
+
+    latest = repo.list_latest_for_connections(["conn_a"], running_only=True)
+    assert latest["conn_a"]["id"] == current
