@@ -586,6 +586,46 @@ function stripSourcesFence(markdown) {
 
 const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
 
+/** Where an assumption came from, as the reader sees it.
+ *
+ *  The report behind this (TCRD-289) was a row of six `assumes …` chips:
+ *  "it's not clear enough where they originated and it's not easy to
+ *  understand why those assumptions were made". The statement alone cannot
+ *  answer either — "signed date proxied by close date" reads the same whether
+ *  the question asked for it, a definition says so, the CRM has no better
+ *  column, or the model guessed. So every `assumption:` line now carries an
+ *  `origin:` from the server's closed vocabulary (`ASSUMPTION_ORIGINS` in
+ *  app/chat/sources.py — the server normalizes, this map only labels) and a
+ *  one-sentence `why:`; the chip shows the origin as a badge in front of the
+ *  statement and the rationale on a second line.
+ *
+ *  Keys are the wire vocabulary; `tests/test_chat_sources_ui.py` pins them to
+ *  the server's so the two cannot drift. Copy is the product's voice, not the
+ *  model's: a badge is a category, and the model's own phrasing of where it
+ *  got something is exactly what the badge exists to replace. */
+const _ASSUMPTION_ORIGIN = {
+  user: { label: "from your question", title: "Your question said or implied this." },
+  definition: {
+    label: "from a definition",
+    title: "A metric definition, semantic model, glossary term or knowledge-base document says so.",
+  },
+  data: {
+    label: "data gap",
+    title: "The data does not carry what the question needs, so a proxy or a subset stood in.",
+  },
+  judgment: {
+    label: "own judgment",
+    title: "The answer's own choice — nothing in the question, the definitions or the data settles it.",
+  },
+};
+/** The absence, made visible the same way "none declared" is: a line with no
+ *  `origin:` (or one outside the vocabulary — the server hands those over as
+ *  null rather than guessing) gets a dashed badge, not a blank. */
+const _ASSUMPTION_ORIGIN_UNSTATED = {
+  label: "origin not stated",
+  title: "The answer did not say where this assumption came from.",
+};
+
 /** Where a claim's chip goes when you click it.
  *
  *  Checking a number means opening the thing it came from, so the chip that
@@ -633,6 +673,41 @@ function _bubbleHasFigure(bubble) {
   return false;
 }
 
+/** One `assumes …` chip: the kind label, the origin badge, the statement,
+ *  and — when the answer gave one — the rationale on its own line. Never a
+ *  link: an assumption names nothing to open (see _claimHref). */
+function _renderAssumptionChip(c) {
+  const known = c.origin && Object.prototype.hasOwnProperty.call(_ASSUMPTION_ORIGIN, c.origin);
+  const origin = known ? c.origin : "unstated";
+  const copy = known ? _ASSUMPTION_ORIGIN[c.origin] : _ASSUMPTION_ORIGIN_UNSTATED;
+  const chip = document.createElement("span");
+  chip.className = `msg-source-chip is-neutral is-assumption is-origin-${origin}`;
+  const kind = document.createElement("span");
+  kind.className = "msg-source-kind";
+  kind.textContent = _CLAIM_LABEL.assumption;
+  chip.appendChild(kind);
+  const badge = document.createElement("span");
+  badge.className = `msg-source-origin is-origin-${origin}`;
+  badge.textContent = copy.label;
+  badge.title = copy.title;
+  chip.appendChild(badge);
+  const text = document.createElement("span");
+  text.className = "msg-source-text";
+  text.textContent = c.ref || "";
+  chip.appendChild(text);
+  if (c.why) {
+    const why = document.createElement("span");
+    why.className = "msg-source-why";
+    const whyLabel = document.createElement("span");
+    whyLabel.className = "msg-source-why-label";
+    whyLabel.textContent = "why";
+    why.appendChild(whyLabel);
+    why.appendChild(document.createTextNode(c.why));
+    chip.appendChild(why);
+  }
+  return chip;
+}
+
 function renderSourcesChips(bubble, verdict) {
   if (!verdict) return;
   const claims = verdict.claims || [];
@@ -648,6 +723,15 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
+  // Two rows, not one. A `table:` is something the answer READ; an
+  // `assumption:` is something it DECIDED. Filed together under one SOURCES
+  // label, six `assumes …` chips read as neither (TCRD-289) — and the
+  // "none declared" signal below is about provenance, so it is judged on
+  // the tables and metrics alone: an answer that named only assumptions
+  // has, truthfully, declared no source.
+  const provenance = claims.filter((c) => c.kind !== "assumption");
+  const assumptions = claims.filter((c) => c.kind === "assumption");
+
   const wrap = document.createElement("div");
   wrap.className = "msg-sources";
 
@@ -656,16 +740,14 @@ function renderSourcesChips(bubble, verdict) {
   label.textContent = "Sources";
   wrap.appendChild(label);
 
-  if (!claims.length) {
+  if (!provenance.length) {
     const none = document.createElement("span");
     none.className = "msg-source-chip is-none";
     none.textContent = "none declared";
     wrap.appendChild(none);
-    bubble.appendChild(wrap);
-    return;
   }
 
-  for (const c of claims) {
+  for (const c of provenance) {
     // A table or metric claim is a link to the thing it names; an assumption
     // has nothing to open and stays a <span> (see _claimHref).
     const href = _claimHref(c);
@@ -694,6 +776,16 @@ function renderSourcesChips(bubble, verdict) {
     wrap.appendChild(chip);
   }
   bubble.appendChild(wrap);
+
+  if (!assumptions.length) return;
+  const arow = document.createElement("div");
+  arow.className = "msg-sources is-assumptions";
+  const alabel = document.createElement("span");
+  alabel.className = "msg-sources-label";
+  alabel.textContent = "Assumptions";
+  arow.appendChild(alabel);
+  for (const c of assumptions) arow.appendChild(_renderAssumptionChip(c));
+  bubble.appendChild(arow);
 }
 
 // ---------- Next-actions block ---------------------------------------------
@@ -2244,6 +2336,26 @@ function chatErrorCopy(raw, kind) {
   }
   if (/concurrency_cap/i.test(both)) {
     return "Too many conversations are running right now. Try again in a moment.";
+  }
+  // Agnes's OWN sender limits (enforce_sender_limits in app/chat/manager.py),
+  // delivered to the sender's own sockets only (so "you" is the reader),
+  // matched on the frame's kind before the agent-budget family below: they
+  // are not engine errors, so the fallback's "The engine reported:" would
+  // send the reader — and whoever they ask — to the wrong place. The
+  // per-conversation one is a budget of tokens billed across every turn,
+  // not a context limit, so the copy must not suggest the answer was too
+  // long or that the conversation should have been compacted (TCRD-291).
+  if (/max_session_tokens/i.test(both)) {
+    return "This conversation has reached its token budget, so it can't take another turn. " +
+      "Start a new conversation to keep going. An admin can raise the per-conversation budget.";
+  }
+  if (/daily_budget/i.test(both)) {
+    // Keyed on the SENDER (enforce_sender_limits sums the sender's own day),
+    // so it is "your" cap, not the instance's.
+    return "You've reached your daily spend cap on this instance. Try again tomorrow, or ask an admin to raise it.";
+  }
+  if (/rate_limit/i.test(both)) {
+    return "You're sending messages faster than this instance allows. Wait a few minutes and try again.";
   }
   if (/budget|429/i.test(both)) {
     return "This instance has used its message budget for the month. An admin can raise it.";

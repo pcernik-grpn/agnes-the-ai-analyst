@@ -93,7 +93,7 @@ default turn, which names the others.
 | `error`            | a mid-turn engine `error` event after partial text             |
 | `markdown`         | a tool returning a markdown table, rendered as a real table    |
 | `tabular`          | a table the MODEL writes, streamed a few characters per delta — the header row must not flash as raw pipes and the table must be styled while it grows (TCRD-288) |
-| `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip |
+| `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip; its three `assumption:` lines cover a stated origin + rationale, an `origin: judgment`, and a legacy line with neither (the "origin not stated" badge) |
 | `deliverable`      | a turn that registers `outputs/report.docx` + `outputs/deck.pptx` in the stub's sandbox file store — for the **Files** overlay |
 
 Knobs: `KAI_STUB_STEP_DELAY` (seconds between SSE records, default `0.35` so
@@ -142,7 +142,8 @@ Worth knowing before you trust a local result:
   `/api/kai/tickets` or `GET /api/kai/workspace`, so the broker scope split and
   the workspace tarball path are not exercised — `tests/test_kai_host.py`
   covers those from the host side.
-- **Auto-title still needs a real key.** `chat_sessions.title` stays `NULL`
-  locally because auto-title asks Haiku directly and skips silently (at debug
-  level) when neither `ANTHROPIC_API_KEY` nor a WIF configuration is present.
-  A null title in local dev is expected, not a bug.
+- **A model-written title still needs a real key.** Auto-title asks Haiku
+  directly, and without `ANTHROPIC_API_KEY` or a WIF configuration that call is
+  skipped. The session is titled all the same — with a cut of your own first
+  sentence (the deterministic fallback, TCRD-290) — so a sidebar title that
+  merely echoes your message in local dev is expected, not a bug.
