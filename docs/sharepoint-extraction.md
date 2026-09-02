@@ -24,7 +24,13 @@ into collections → (optional) facts extraction into the knowledge graph
   converter backends (`extraction` extra). Bare-metal pip installs need
   `pip install 'agnes[extraction]'`; a missing extra is refused up front
   with `409 extraction_dependencies_missing`, never a crawl that fails on
-  every file.
+  every file. Legacy Office/OpenDocument files (`.doc`/`.rtf`/`.odt`,
+  `.ppt`/`.odp`, `.xls`/`.ods`) are pre-converted through headless
+  LibreOffice before the markitdown route — the standard image bundles
+  `libreoffice-core`/`-writer`/`-calc`/`-impress`; a bare-metal install
+  additionally needs the `soffice` binary on `PATH`, or those specific
+  suffixes fail conversion (`MissingConversionDependency`) while every other
+  format keeps working.
 - **An Entra app registration** for the tenant: certificate (default) or
   client secret, with admin consent granted. This is the one step Agnes
   cannot do for you.
