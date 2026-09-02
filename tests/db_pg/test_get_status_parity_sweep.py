@@ -57,6 +57,9 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # from `facts_repo()` (see src/repositories/facts_ingest_runs_pg.py) so it
 # needs its own exemption entry even though the reason reads similarly.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "GET /api/admin/sharepoint/extraction/runs": (
+        "the extraction fleet feed reads `extraction_runs`, a PG-only table (fleet view, 2026-09-02)"
+    ),
     "GET /api/admin/semantic-model/coverage": (
         "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
     ),
