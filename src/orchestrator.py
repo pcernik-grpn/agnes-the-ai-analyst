@@ -329,6 +329,18 @@ def _count_unavailable_message(table_name: str, source_name: str) -> str:
     )
 
 
+def _count_marker_applies(count_unavailable: bool, parts) -> bool:
+    """Whether a corrupt-parts error may carry `COUNT_UNAVAILABLE_MARKER`.
+
+    The marker tells the access-policy guard "rows=0 is a placeholder, data
+    is still served" -- which is only true while something IS served. On a
+    first sync where every part was rejected and no previous manifest entry
+    exists to freeze, `parts` is empty: nothing is publishable, so the row
+    must keep reading as never-synced (fail closed), marker or not.
+    """
+    return bool(count_unavailable) and bool(parts)
+
+
 def _corrupt_parts_message(table_name: str, source_name: str, rejected, *, count_unavailable: bool) -> str:
     """The `sync_state.error` text for rejected parquet parts (#1364).
 
@@ -337,7 +349,9 @@ def _corrupt_parts_message(table_name: str, source_name: str, rejected, *, count
     carry the count marker itself — otherwise the placeholder `rows=0`
     would lose the only durable sign that it is not a verified count, and
     a still-served (frozen) mapping table would read as empty to the
-    access-policy guard."""
+    access-policy guard. Callers pass `count_unavailable` through
+    `_count_marker_applies`, so the marker is never written when nothing is
+    served at all."""
     message = (
         f"Corrupt parquet part(s) for table {table_name!r} in source "
         f"{source_name!r}: {', '.join(sorted(rejected))} — missing/"
@@ -1939,7 +1953,12 @@ class SyncOrchestrator:
                     # parts just written untouched.
                     repo.set_error(
                         sync_key,
-                        _corrupt_parts_message(table_name, source_name, rejected, count_unavailable=count_unavailable),
+                        _corrupt_parts_message(
+                            table_name,
+                            source_name,
+                            rejected,
+                            count_unavailable=_count_marker_applies(count_unavailable, parts),
+                        ),
                     )
         except Exception as e:
             logger.warning("Could not update sync_state: %s", e)

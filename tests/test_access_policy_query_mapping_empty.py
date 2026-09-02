@@ -400,6 +400,49 @@ def test_orchestrator_error_messages_keep_the_count_marker_when_combined():
     assert COUNT_UNAVAILABLE_MARKER in combined and "p1.parquet" in combined
 
 
+def test_count_marker_only_when_something_is_served():
+    """An all-rejected FIRST sync (no frozen prior manifest) publishes
+    nothing, so the corrupt-parts error must not carry the marker -- the
+    guard has to keep reading that table as never-synced."""
+    from src.orchestrator import _corrupt_parts_message, _count_marker_applies
+    from src.sync_state_key import COUNT_UNAVAILABLE_MARKER
+
+    assert _count_marker_applies(True, [{"path": "part-0.parquet", "size_bytes": 1}]) is True
+    assert _count_marker_applies(True, None) is False
+    assert _count_marker_applies(True, []) is False
+    assert _count_marker_applies(False, [{"path": "p", "size_bytes": 1}]) is False
+    unusable = _corrupt_parts_message("t", "s", {"part-0.parquet"}, count_unavailable=_count_marker_applies(True, None))
+    assert COUNT_UNAVAILABLE_MARKER not in unusable
+
+
+def test_helper_refuses_an_all_rejected_first_sync(e2e_env):
+    """The mirror of the frozen case: nothing served -> the corrupt-parts
+    error has no marker -> rows=0 is a real "no data" and the guard raises."""
+    from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.orchestrator import _corrupt_parts_message
+    from src.repositories.sync_state import SyncStateRepository
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(id="unusable_map", name="unusable_map", source_type="keboola", query_mode="local")
+        registry.set_policy_mapping("unusable_map", True)
+        state_repo = SyncStateRepository(conn)
+        state_repo.update_sync("unusable_map", rows=0, file_size_bytes=0, hash="")
+        state_repo.set_error(
+            "unusable_map", _corrupt_parts_message("unusable_map", "x", {"part-0.parquet"}, count_unavailable=False)
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(PolicyMappingEmpty, match="unusable_map"):
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM unusable_map WHERE email = $user_email)"
+        )
+
+
 def test_helper_treats_combined_corrupt_parts_and_uncounted_as_unknown(e2e_env):
     """The combined message (corrupt parts + count unavailable) still reads
     as "unknown", so a frozen-but-served mapping table is not refused."""
