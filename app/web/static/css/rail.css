@@ -2106,6 +2106,23 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
                     z-index 0s linear 0s;
     }
 
+    /* NOTE — where the admin peek's 400ms anti-pass-through delay went (#1989).
+       A block here used to raise the peek's opening delay from 120ms to 400ms
+       on `[data-rail-context="admin"]`, and hold the contents back with it, so
+       a pointer drifting across the admin nav had to mean it before the overlay
+       landed. It is gone because it is now unreachable, not because it was
+       wrong: on those pages the peek does not fire at all (`.rail-strip-only`,
+       see the section header), and a delay on an animation that never starts
+       is dead weight that reads as live tuning.
+
+       It also could not close the case that retired it. The delay bought
+       intent from the POINTER; the peek's other trigger is `:focus-within`,
+       and that rule deliberately kept the ordinary 120ms beat ("there is no
+       such thing as tabbing into the rail by accident"). Clicking the search
+       box focuses it — so the click path still put a 240px overlay on the
+       admin column, just 120ms after the click instead of on a stray pass.
+       Removing the peek there covers both triggers; delaying one covers one. */
+
     /* The peeked layout — the rows' expanded padding and gaps, which the
        collapsed rules above override with the centring values and which they
        animate back to over the same window the width uses. Nothing here is

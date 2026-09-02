@@ -1272,6 +1272,33 @@ class TestRailCollapseCss:
                 continue
             assert "var(--rail-peek-text-delay)" in rule, rule
 
+    def test_no_admin_only_peek_delay_comes_back(self) -> None:
+        """This guard replaces `test_the_admin_peek_makes_its_contents_wait_with_it`
+        (#1989), which pinned a 400ms anti-pass-through delay on
+        `[data-rail-context="admin"]` plus a matching `--rail-peek-text-delay`
+        so the contents waited with the width.
+
+        That delay is gone because it became unreachable, not because it was
+        wrong: on those pages the peek no longer fires at all (see
+        `test_the_peek_is_off_entirely_where_the_admin_column_is`), and a delay
+        on an animation that never starts is dead weight that reads as live
+        tuning.
+
+        It is worth a guard rather than a silent deletion because the delay is
+        the tempting fix and it cannot close the case. It buys intent from the
+        POINTER; the peek's other trigger is `:focus-within`, and #1989's own
+        rule deliberately kept that at the ordinary 120ms beat ("there is no
+        such thing as tabbing into the rail by accident"). But the search box is
+        focused by CLICKING it — so the click path still dropped a 240px overlay
+        on the admin column, 120ms after the click. Delaying one trigger covers
+        one trigger."""
+        # Comments only — the note left where the block was quotes the selector.
+        css = re.sub(r"/\*.*?\*/", "", RAIL_CSS, flags=re.S)
+        assert 'data-rail-context="admin"' not in css, (
+            "an admin-only peek rule is back; the peek does not fire there at all, "
+            "so this can only be tuning something that never runs"
+        )
+
     def test_body_clearance_is_the_icon_width_and_constant(self) -> None:
         """The 56px reservation must NOT change on hover/focus — the peeked
         rail is an overlay, so the page's own layout never moves."""

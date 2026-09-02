@@ -12,14 +12,210 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Added
 
+- **The LLM entity-detection tier can run against a self-hosted endpoint, and no longer believes an empty answer.** `extraction.anonymization.llm.{base_url,model,api_key_env,max_output_tokens}` points the `llm` detector at any endpoint speaking the Anthropic Messages shape (LiteLLM, vLLM's Anthropic route) instead of the instance's cloud credentials; the model id is used verbatim, so non-Claude ids work. Two server-side gates, neither optional, because that section is admin-writable and this endpoint receives document text BEFORE anonymization: the host must be listed in `AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST` (**default-closed** — unset allows nothing, unlike the connector-ATTACH host allowlist it mirrors), and `api_key_env` may only name a variable under the `AGNES_ANONYMIZATION_LLM_` prefix, checked before the value is read so config cannot point it at the vault key, the anonymization HMAC key, or a connector certificate — those sit outside that namespace by construction. A misconfiguration fails the pass; it never falls back to the cloud path. `max_output_tokens` is configurable because the adequate value belongs to the deployed model — one with a reasoning channel spends the same budget thinking and can exhaust it before emitting any JSON.
+- **An empty entity list is no longer accepted when the deterministic tier found names.** The hybrid detector's contract assumed `[]` always means "the model read this and found nothing"; measured against a 20B-class model, `[]` was also how it declined to read a document headed "Performance Review — Confidential", returning every name once that one word was removed. That failed OPEN — the document was ingested believing the `[]`, so everything only a reader could have found entered the corpus unredacted (the regex tier's own hits were still substituted; what escaped is the LLM's contribution), skewed toward the documents that most needed redaction. The document now raises `DetectionUnavailable` and is failed closed **when the deterministic tier found a high-confidence name** — an honorific-introduced person or a company with a legal-form marker. Deliberately not "regex found anything": pass 2 fires on any two adjacent capitalized tokens, so every Title-Cased Markdown heading is a `person` hit and gating on that would drop name-free release notes and policies. A partial net with no collateral damage, not a proof of redaction — a refusal on a document whose only names are bare full names is logged, not caught.
 ### Changed
 
 ### Fixed
 - **The collapsed sidebar no longer erases the Admin navigation** (issue #1956 item 6). On an Admin page the primary rail starts as a 56px icon strip and the Admin section's own nav sits immediately beside it, 200px wide — so the rail's peek, a 240px overlay, dropped straight on top of the column the admin was navigating with, and it disappeared on a stray mouse move. On any page carrying that column the rail no longer widens in place at all: not on hover, and not on focus either, because the search box is focused by *clicking* it, which put the mouse straight back on the same bug. What needs width now comes out beside the strip instead — a hovered or keyboard-focused row unfurls its own label as a chip, the onboarding progress panel opens sideways at full width rather than crushing itself into a ~40px ribbon of clipped step labels, and the search field flies out as a floating 280px box with its results under it (clicking the collapsed box focuses the field, which was previously unreachable by mouse). Clicking the toggle still pins the whole column open and remembers it, and the peek is untouched everywhere else in the app. Two tooltips that only repeated what opens beside them on the same hover are gone (the onboarding row's and the "Take Agnes to your tools" row's). And because the strip is now permanent there, its labels are screen-reader-readable at rest rather than hidden outright — every row in the collapsed strip used to be an unnamed link to assistive technology, relying on the peek to reveal the labels.
+- **A malformed port in an allowlisted URL is refused instead of raising.** `src/orchestrator_security.py::_url_host` read `urlparse().port` outside its own exception boundary; that property parses lazily and raises `ValueError` for a non-numeric or out-of-range port, so `https://host:notaport` propagated an unhandled exception out of every gate sharing the helper — `is_attach_host_allowed` (connector ATTACH), `is_semantic_git_host_allowed` (semantic git sources) and the new anonymization-LLM host gate. Such a URL now reads as "no host" and is refused. Allowed and refused verdicts for well-formed URLs are unchanged on every gate; the only behaviour that moves is crash to refusal.
+- **The admin rail's peek no longer rearranges itself before it opens, and an overflowing table shows a scrollbar in Firefox too.** (The rail half of this entry is superseded within this same release, along with the delay it refined — the admin peek does not open at all now, so neither the panel nor its contents have an opening beat to share.) And `.data-table-wrap`'s visible-scrollbar affordance was `::-webkit-*` only: Firefox on macOS follows the OS "show scroll bars automatically" setting, so on a trackpad it painted an overlay bar and a table without pinned actions hid columns with nothing on screen to say so. The standard `scrollbar-width`/`scrollbar-color` pair now applies behind `@supports not selector(::-webkit-scrollbar)` — ungated it would make Chrome drop the webkit rules and fall back to the overlay bar, which is the bug itself.
+- **The Ops Agent config the module ships now actually starts.** Validated on a live VM, which is where three things came out that no static test could: the `fluent_forward` receiver takes `listen_host`/`listen_port`, not `port` (the agent refuses to start on an unknown field — and a refusal means nothing accepts the containers' logs at all); `parse_json` needs `field: log`, because the receiver hands over a record whose fields are Docker's and the app's JSON is the *string* inside `log`, so parsing the record is a silent no-op that leaves every entry an opaque string at severity DEFAULT; and `modify_fields`' `default_value` is accepted. End-to-end proof on the dev instance: `severity >= WARNING AND jsonPayload.service = "scheduler"` returns the probe entry with its fields promoted.
+- **A refreshed Cloud Logging overlay no longer inherits the previous pipeline's probe verdict.** `agnes-auto-upgrade.sh` refreshes `docker-compose.gcp-logging.yml` in place from the pinned image, so within five minutes of the fluentd/Ops-Agent switch reaching `:stable` a running VM had the new overlay on disk — under the `.gcp-logging-ok` marker its **old** gcplogs probe had written. The tick re-probes only a marker-*less* overlay, so the gate engaged a pipeline nothing had verified: no outage, because the fluentd driver connects asynchronously, but every log line forwarded to a socket with no listener on a VM whose Ops Agent only arrives with a later Terraform apply. Silent total log loss — the exact failure the marker exists to prevent. A content change to the overlay now clears the marker, so the next probe verifies what is actually on disk and a VM without a collector degrades to `json-file` plus a warning. The clear is conditional on the content really changing; an unconditional one would re-probe every tick and, because the marker is hashed as config, churn a recreate every five minutes.
+- **The tick's arm/disarm messages name the cause the probe actually tests.** They described the gcplogs driver and pointed the reader at `roles/logging.logWriter`; the probe asks whether the Ops Agent is accepting on `127.0.0.1:24224`, which that role has nothing to do with. An operator following the old message would have gone and checked an IAM binding that was never the problem.
+- **The Cloud Logging probe marker now records which overlay it verified**, so a stale verdict is caught by comparing that stamp against the overlay on disk rather than by diffing the file across one auto-upgrade tick. The tick-diff form has a blind spot on the exact rollout that introduces it: `agnes-auto-upgrade.sh` replaces itself at the END of a tick, so the previous version refreshes the overlay — keeping the marker, having no clearing logic — and the new version's first run already sees before == after. A VM would then engage a pipeline nothing verified and lose every log line into a socket with no listener. An empty marker from an older image never matches the stamp, so such a VM re-probes once and is stamped from then on.
+- **A long suggested-action label no longer overflows a narrow chat bubble.** The follow-up chip put `.rdb-action-title` — `flex-shrink: 0`, `white-space: nowrap` — straight into the button, so it could not give up width; it now sits inside the `.rdb-action-txt` wrapper the landing row already uses, which is the shrinkable half.
+- **A Stop now reaches the kai engine on every path out of a turn.** Teardown cancels side tasks, and a cancel's stop IS a side task — so a teardown just after Stop killed the request in flight while the `_stop_requested` guard skipped its replacement, leaving the engine processing an answer nobody would read. Teardown now posts on `turn_in_flight` alone. Every recovery stop is also bounded to the same five seconds teardown always used (orphan clearing, read timeout, failed turn each added the client's own 120s read timeout on top of whatever had already gone wrong), and conflict recovery re-reads the cancel flag after that await — a Stop arriving while the orphan was being cleared used to be followed by a retry that submitted the very question the user cancelled.
+- **A chat turn Agnes gives up on is now stopped on the engine, instead of being left to refuse every later message.** On the `kai-agent` provider, `POST /api/chat/{id}/stop` was wired to exactly one caller — the user pressing Stop. Every involuntary end of a turn skipped it: the 120 s SSE read timeout (`no engine activity for 120s; giving up on the turn`), any mid-stream exception, and the handle teardown that `pause` and the manager's crash-respawn both perform. In each case Agnes emitted `done`, unlocked the composer and forgot the turn while the engine was still processing that message, so the next question in the same chat came back as `engine refused the turn (409): {'type': 'conflict', … 'A message is already being processed in this chat'}` — and whatever the engine went on to produce was written to its own store, never to the Agnes transcript, which is why the failure was invisible in `/admin/sessions`. All three paths now stop the turn upstream (teardown bounded at 5 s, best-effort, never blocking a pause). A refusal that never started a turn — a 500, an auth failure — deliberately still stops nothing.
+- **An orphaned engine turn no longer strands a chat.** An orphan outlives the process that made it: a hard container recreate never runs `pause`, so the stop above cannot cover it. Because the handle serializes its own turns, a `409` is never a turn Agnes has — it is always an orphan, so the provider now clears it (one `POST /stop`) and retries the message once. A conflict that survives that is reported in plain words ("The engine is still working on the previous message in this chat…") rather than as the vendor dict complete with its `exceptionId`, the same treatment the rejected-connector-token refusal already gets.
 - **A long chat conversation no longer dies with "Per-session token cap of 200000 reached … Start a new chat session".** `chat.max_session_tokens` counts the tokens *billed* over a conversation's whole life — every LLM call of an agentic turn re-sends the context, so one turn with a dozen tool calls bills several hundred thousand tokens while the context the engine compacts stays far under its limit. The cap only began to trip on engine sessions in 0.95.0, when broker-observed usage started reaching the manager, and its 200k default happened to equal a context window, so the refusal read as "compaction does not work". The default is now 2 000 000 (a runaway-conversation guard sized at ten context windows of re-sent input; `chat.daily_anthropic_spend_usd` remains the cost control), `0` disables it (and `daily_anthropic_spend_usd: 0` now disables the daily cap instead of refusing every message), the refusal names the budget that ran out and the next step instead of being presented as something "the engine reported", the WebSocket stays open after any sender-limit refusal (daily spend, conversation budget, message rate) instead of closing right behind the message and showing "Disconnected — click the conversation again to resume", the refusal reaches only the sender's own connections in a co-driven conversation instead of every participant, an explicit `chat.max_session_tokens` at or below 200 000 is warned about at load (the default change cannot reach a key that is set), a Slack `/agnes` slash command that hits one of those limits now gets the same explanation the mention and DM paths already gave, exactly once, instead of "Something went wrong handling that command", and the boot log and `GET /api/chat/readiness` (`unmetered_caps`) no longer claim the two caps are inert on the kai-agent provider.
 - **Streamed LLM usage is no longer counted twice.** The broker recovered a streamed completion's usage by summing the `message_start` and `message_delta` usage blocks, but every block on the stream is cumulative for the message — the closing delta repeats the input and cache totals — so input, cache reads and cache writes were recorded at exactly twice what the provider billed (and output one token high) on every streamed call. Everything metered from the broker inherited the doubling: `chat.max_session_tokens`, `chat.daily_anthropic_spend_usd`, agent `token_budget_monthly`, `usage_turns` and the admin chat-cost readout. The parser now keeps the per-field maximum across the blocks. Historical rows written before this fix over-state input and cache tokens by up to 2x.
 - **Chat titles are generated reliably.** On a real instance nearly two thirds of all chat sessions sat in the sidebar as "Untitled chat", for two independent reasons. First, the title was requested only once the assistant's first reply landed — so a session whose turn was refused (`409` while another message was in flight), hit the per-session token cap, or lost its process to a restart mid-turn never got one; a third of all sessions had a question but no reply row. The first **user** message is now the trigger (the first `assistant_message` stays as a backstop), so the title lands while the answer is still streaming and a lost turn changes nothing. Second, the first message was sent to the title model bare, as the user turn, and a request-shaped message ("Search SharePoint for…", "Have we done X for Y? For each one, tell me…") was *answered* instead of titled about half the time ("I don't have access to SharePoint…"); the answer-shaped guard then correctly discarded the reply. The message now travels as quoted data inside `<first_message>` tags under a prompt that says it was written to a different assistant and must not be answered, sampling is pinned to `temperature=0`, and the guard also catches answers that do not open in the first person ("Unable to determine", "…not visible to me" — both had been stored as titles). Re-run over the very messages that had failed on the reporting instance's Vertex path: 23 of 23 titled, previously 13 of 23 with two of those being answers. And when the model path still yields nothing — no credential, a timeout, a discarded reply — the manager falls back to a deterministic cut of the user's own first sentence, so a chat with a message never stays "Untitled chat". The write is conditional — a name the user gave the chat while the model was still thinking is never overwritten by the model's — and a rename now reaches every open tab of the session in persistence order (the rename endpoint used to update only the tab that made it). An opt-in live check (`tests/test_chat_auto_title_live.py`, `-m live`) replays request-shaped messages against the real model, first-party or Vertex.
+- **A tool step sits closer to the sentence it belongs to.** The messages
+  column is a flex column with a uniform 20px `gap`, and a step added 8px of
+  its own margin on top — so it stood 28px from the prose above it, WIDER than
+  the 20px between two separate messages. Backwards, for something that is part
+  of the turn rather than a turn of its own. The step and the group now carry a
+  negative vertical margin that claws that back to 12px; the approval gate and
+  the question card opt out and keep the container's own spacing, because those
+  are things to stop at rather than steps to skim past.
+- **A tool step reads as machinery, not as prose.** Its label was set in the
+  ANSWER's own `--ds-text-primary` and at a heavier weight than the answer
+  itself (500 against 400) — so the line whose whole job is to be skippable was
+  the most emphatic text in the transcript. Secondary ink at normal weight:
+  7.87:1 against the surface and 9.57:1 in dark, plainly readable and plainly
+  subordinate to the sentence above it.
+- **The step's status icon was coloured by dead CSS.** Two rules coloured it at
+  identical specificity (`.cloud-chat-tool--step.is-done` and
+  `.cloud-chat-tool.is-done`, both `(0,3,0)`), so the earlier one never applied
+  and only file order decided. The duplicate is deleted, and with the status
+  edge gone in the same release the icon is the ONLY carrier of a step's state —
+  which makes it a meaningful graphic owing 3:1 (WCAG 1.4.11). Measured against
+  the chat surface, info 3.82:1 and danger 4.83:1 are comfortable but success
+  came to 3.30:1, so success moves to `--ds-accent-success-ink` (7.13:1 light,
+  10.91:1 dark). The guard now asserts one rule per state, so a duplicate
+  cannot silently go dead again.
+- **A tool call in web chat is a line, not a card.** Folding a run into one
+  group (#1974) cut how MANY boxes a turn showed; each one was still a filled,
+  bordered, radiused slab with a 3px status edge at full reading width, so six
+  steps were still six slabs once you opened the group. A step now draws no box
+  at all: status moves to the icon (the smallest thing that can carry it), the
+  label drops the monospace treatment it never earned (it is a phrase —
+  "Reading the data catalog" — not an identifier), and the row packs left
+  instead of pinning a duration and a caret to an edge that no longer exists.
+  A settled group header says what clicking it does ("Show 6 steps" /
+  "Hide 6 steps") because with the box gone nothing else on the line looks like
+  a control. Opening a step is lighter too: it used to reveal three stacked
+  bordered rectangles (command, output, "show full output"), putting back at
+  the payload level the weight the row had just shed. The panels are plain now,
+  tied together by one continuous hairline down their left, the code and
+  console blocks carry a quiet tint sized to their CONTENT rather than to the
+  reading column (`agnes catalog` is thirteen characters and was painting a
+  full-width band), and "Show full output" reads as the link it is. The double
+  padding went with it — the shared code-block rule's spacing had been nesting
+  inside each panel's own. Console output is **not capped at all** — it is one
+  `<pre>` holding the whole thing, bounded on screen by its own `max-height`
+  and scrolled. A line cap there bought nothing and cost a click: the content
+  was going to be behind a scrollbar either way, and a long dump is a single
+  text node rather than the hundreds of elements a long table is. The table
+  still caps for that reason, but **expanding it now grows the same table in
+  place** instead of rendering a second copy underneath — a 5-row preview used
+  to sit above a full 400-row table that started over at row one, and the
+  console did the same with lines 1-12 above lines 1-22. One payload, one
+  element. Also strictly cheaper: the table's full copy used to be built
+  eagerly whether or not anyone opened it. The over-cap raw-JSON route stays a
+  real disclosure, because past 500 rows it is genuinely additional content
+  rather than a repeat. The chrome did not disappear, it moved:
+  `.cloud-chat-tool` is shared with the approval gate and the question card,
+  which are surfaces the reader has to act on, and those two now own the box
+  outright and are unchanged.
+- **A message's own controls sit with the message, not under the
+  suggestions.** The bubble's tail now reads: what the answer rested on
+  (`Sources` / `Assumes`), then what you can do with the ANSWER (timestamp,
+  copy, ask again), then what you might ask NEXT. The actions row used to come
+  last, which put a timestamp underneath an invitation and made the row read as
+  belonging to the follow-ups rather than to the message. The order holds on
+  both render paths even though they arrive in opposite sequences — live,
+  finalize renders sources and suggestions before the actions row exists; on a
+  history reload the actions row is already in the bubble before either. No
+  appender assumes it ran first: each places itself relative to what is
+  already there, and the three rules compose to the same tail either way.
+- **The SOURCES row says each thing once.** Three repetitions turned an
+  answer's provenance into noise. Every chip spelled its CATEGORY as a word,
+  so five cited tables meant reading "table" five times — it is a glyph now,
+  with the word on the chip's `aria-label` and tooltip. Every unverified chip
+  shouted `UNVERIFIED` in amber, which inverted the row's salience: the model
+  names more than it queries, so the common case became the dominant colour
+  and a genuinely checked source had no way to look calm. Verified is now the
+  quiet state (base chip, green glyph), unverified is carried in a dashed
+  border — both in `--ds-accent-*-ink`, not `-line`: the `-line` tokens are
+  tuned for a border on its own tinted fill, and on the chip's plain surface
+  they measured 2.94:1 and 1.41:1, below the 3:1 WCAG asks of a meaningful
+  graphic. The ink pair measures 6.36:1 / 6.88:1 in light and 9.68:1 / 11.2:1
+  in dark, and the category glyph inherits the chip's ink rather than naming a
+  third colour. The word is summarised once at the end of the row as
+  "N unverified" — counted over every reference, not just the visible ones.
+  And an `assumption` — a caveat about method, with nothing to open — left the
+  pill vocabulary it shared with two links for its own `Assumes` line. Past
+  four references the rest fold behind "+N more" (the same grow-in-place
+  control the tool results use) instead of wrapping the row onto a third line;
+  below four there is no control and nothing changes. Sources stay VISIBLE by
+  default rather than collapsing behind a summary: "shows you where each
+  answer came from" is the product's claim, and hiding it would make checking
+  an answer cost two clicks on every turn.
+- **Suggested follow-ups are a labelled column, not an unlabelled row.** They
+  stack one per line under a "Suggested actions" heading — wrapped into a row
+  they read as a toolbar acting on the answer, where stacked they read as what
+  they are: alternative next questions.
+- **The follow-up chips under an answer are the landing screen's suggestion
+  chip, not a lookalike.** Both offer the same thing — a question you can ask
+  next — and they had been described separately, which let them drift into two
+  visibly different components: 9px radius against 11px, an opaque surface
+  against a translucent one, no leading icon against one, and a hover that
+  recoloured the text against one that tinted the background. The answer's
+  chips now apply `.rdb-action` itself, so they cannot drift again, and the
+  row sits 16px below the answer instead of 10px, where it read as the last
+  line of the message rather than as its own offer. Making them match surfaced
+  that the LANDING chip was the one breaking the design-system shape rule (a
+  hand-set `11px` where every labelled button wears `--ds-radius-btn`), so it
+  moved onto the token rather than the rule being dropped to accommodate it.
+- **An answer that arrives as a document now reads like one.** Markdown
+  headings in a chat answer had no styling of their own and fell through to
+  the browser's defaults — `h1` at 2em (30px against a 15px body), `h2` at
+  1.5em — while the app reset zeroed every heading margin. Big enough to
+  shout, with no space to group anything, which is the specific way a long
+  answer was hard to scan: size signal and no structure signal. The scale
+  comes down to reading sizes (18 / 16 / inherit, semibold), and every heading
+  now carries far more room above it than below, so it binds to the block it
+  introduces instead of floating between two. Paragraph rhythm goes 6px → 8px
+  (at a 23px line box the breaks were nearly invisible), code blocks and
+  tables get 12px, and `hr` / `blockquote` — which had no rule at all — get
+  one. Nothing here changes what the model writes; it is how the same markdown
+  is painted.
+- **A tool card in web chat shows what the tool actually returned.** Three
+  content bugs in the tool-call renderer, all of them hitting the results
+  analysts see most. (1) A tabular result that arrived as a JSON **string** —
+  which is what `agnes query` over Bash returns, the path the workspace prompt
+  teaches first — never reached the table renderer: a 400-row answer rendered
+  as one line of JSON inside a paragraph, the rest behind "Show full result".
+  It now renders as the real table the object-shaped path always did, capped
+  with "Showing 5 of 400 rows." Narrow by construction: only a string that both
+  parses and coerces to a table changes, so CLI prose, markdown tables and
+  JSON strings of any other shape keep their existing rendering. (2) A console
+  table — `agnes query`'s default `--format table`, and how `agnes catalog` /
+  `agnes describe` print — was fed through markdown, which collapsed the
+  newlines and destroyed the column alignment that *is* the content; it now
+  renders in a monospace `<pre>` that scrolls sideways, capped in lines. (3) A
+  `command` / `sql` arg rendered as escaped JSON (`{"command": "agnes query
+  \"SELECT * FROM orders\""}`), making the reader undo the escaping to reach
+  the statement they opened the card for; it now renders as a code block in its
+  own language, unescaped and untruncated, with any remaining args still on the
+  JSON panel — and it renders THERE ONLY. A collapsed step no longer repeats
+  the command on its header line, where it was the single longest thing in a
+  settled transcript: the same string beside every row of a six-step run is
+  most of what made the trail feel crowded. A collapsed step is now a verb and
+  an outcome; a failed one keeps its diagnosis on that line, which is the one
+  case where something other than the verb is worth reading without expanding.
+  (`_summarizeArgs`, which existed only to fill that slot, is deleted rather
+  than left unused.) Display only — the renderer has no path back to the model, so
+  nothing here changes what an agent sees or answers.
+- **A code panel inside a chat tool card wears the card's own surface.** The
+  panel rules already asked for it, but `.cloud-chat-messages details
+  pre.code-block-wrap` out-ranked them (0,2,2 vs 0,1,1) and repainted every
+  panel with the transcript's near-black code background — a dark slab dropped
+  into a light card, for what is usually one line of shell. The `--ds-code-*`
+  token family deliberately does not follow onto that surface (every value in
+  it is tuned for contrast against the dark one), so these panels are
+  unhighlighted by design.
+- **An answer resting only on assumptions no longer draws an empty Sources
+  row.** The empty state was keyed on `claims.length`, but an assumption is
+  filtered out of the references two lines later — so an answer whose only
+  declaration was an assumption got the "Sources" label over nothing. Keyed on
+  the references now: it reads "none declared", which is what an answer resting
+  on assumptions alone has, and still states the assumptions on their own line.
+- **Every part of a message's tail places itself through one declared order.**
+  `_BUBBLE_TAIL_ORDER` names the five pieces — sources, assumes, the
+  facts-scope line, the actions row, the follow-ups — and `_placeInTail` is the
+  only way any of them lands. Each hand-rolled its own placement before, and
+  the facts-scope line did not participate at all: it appended, so it sat
+  *under* the suggestions it is meant to precede whenever they arrived first.
+  The order now converges from any arrival sequence, which matters because the
+  live and reload paths deliver these in opposite orders.
+- **Wide tool output scrolls instead of widening the column.** The console
+  block and the JSON payload shrink to their content via `display:
+  inline-block`, which takes the element's INTRINSIC width — so one long
+  unbroken line grew the block past the reading column rather than scrolling
+  inside its own `overflow`. The code panel beside them had `max-width: 100%`
+  from the start; the other two now do too.
+- **Grouped tool steps no longer overlap their own header.** The step's
+  negative vertical margin exists only to claw back the messages column's flex
+  `gap`; inside a group body there is no gap, so on ordinary block children it
+  collapsed the first row into the header and every later row into the one
+  above it — measured at -8px on every boundary. The grouped-child override
+  reset only the horizontal pair, and now resets all four.
 
+- **Global search finds tables and plugins, and stops repeating one document.** Three defects with one visible symptom — searching a table's name returned "only unrelated documents, the same one up to six times", and an installed plugin was never findable at all. A document is stored as many chunks and each was ranked separately, so one file arrived as six hits and took six of the caller's eight slots; the chunk bucket is now deduplicated by document, keeping each file's best passage, which leaves the ranking order otherwise untouched. Marketplace plugins are now a search source, RBAC-filtered on `marketplace_plugin` grants exactly as the Library's plugin band is (admin-disabled plugins stay invisible to everyone), and hits link to the plugin's own page across all three surfaces — the web combobox, `agnes search`, and the MCP `search` tool. And a hit whose *name* is what the caller typed is now pinned above the relevance ranking: scores were min-max normalized per source, so every source contributed a hit at exactly 1.0 no matter how weakly it matched, and ties broke alphabetically by type — which put a slide deck mentioning "BI" above the table actually named `bi_chargeability`, and left tables and plugins last by construction.
+- **Admin tables stop hiding their row actions, and the rail stops covering the admin sidebar.** An admin table that overflows now draws a real scrollbar instead of the overlay one macOS paints only mid-scroll, and on the four whose last column is the row's own verbs (Marketplaces, MCP sources, Semantic sources, Knowledge digests) that column is pinned to the right edge — so Sync now / Details / Edit stay reachable at any scroll offset instead of being the first thing the overflow takes. (The rail half of this entry — a 400ms anti-pass-through delay on the admin peek — is superseded within this same release: the peek no longer opens on those pages at all, so there is nothing left to delay. The delay bought intent from the pointer only, and the peek's other trigger, focus, is reached by clicking the search box.)
 ### Removed
 
 ### Internal
