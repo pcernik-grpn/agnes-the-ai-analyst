@@ -356,9 +356,17 @@ def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
     (the jobs table lives on both app-state backends), unlike the
     ``extraction_runs`` reads around it.
     """
+    from app.api.admin_sharepoint import _facts_extraction_idempotency_key
     from src.repositories import jobs_repo
 
-    key = f"{_FACTS_JOB_KIND}:{connection_id}"
+    # Ask the PRODUCER for the key rather than rebuilding its shape here:
+    # `POST …/facts-extract` is the only thing that mints these jobs, so a
+    # second copy of the format in this module is a silent-drift hazard —
+    # the reader would return `None` forever and the card would go blind
+    # with no symptom and no failing test. Pinned by
+    # `tests/test_admin_extraction.py::TestFactsJobInFlight
+    # ::test_the_lookup_follows_the_triggers_own_key_and_kind`.
+    key = _facts_extraction_idempotency_key(connection_id)
     repo = jobs_repo()
     for status in _FACTS_JOB_LIVE_STATUSES:
         for job in repo.list(status=status, kind=_FACTS_JOB_KIND, limit=200):

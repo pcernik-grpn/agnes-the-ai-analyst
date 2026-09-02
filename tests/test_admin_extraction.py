@@ -570,3 +570,37 @@ class TestFactsJobInFlight:
 
         assert jobs_repo().complete(job["id"], "w1", claimed["lease_token"], result={"docs_extracted": 0})
         assert _facts_job_in_flight("sp-running") is None
+
+    def test_the_lookup_follows_the_triggers_own_key_and_kind(self, seeded_app):
+        """The reader must find a job enqueued the way the TRIGGER enqueues it.
+
+        `_facts_job_in_flight` is a consumer of a key and kind that
+        `POST …/facts-extract` is the sole producer of
+        (`app/api/admin_sharepoint.py::_facts_extraction_idempotency_key`).
+        Every other test in this class enqueues with a literal, so all of
+        them stay green if the producer's shape ever changes — while the
+        card goes permanently blind and the button never locks, with no
+        symptom. This one enqueues through the producer's OWN key builder
+        and kind constant, so a change on that side fails here instead.
+        """
+        from app.api.admin_extraction import _FACTS_JOB_KIND, _facts_job_in_flight
+        from app.api.admin_sharepoint import _facts_extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        # The `list(kind=…)` filter must name the same job kind the key is
+        # prefixed with; the trigger builds both from that one string, so a
+        # rename on its side that left this constant behind would filter
+        # every real job out before the key is even compared.
+        assert _facts_extraction_idempotency_key("sp-contract") == f"{_FACTS_JOB_KIND}:sp-contract"
+
+        job = jobs_repo().enqueue(
+            _FACTS_JOB_KIND,
+            {"connection_id": "sp-contract"},
+            idempotency_key=_facts_extraction_idempotency_key("sp-contract"),
+        )
+        found = _facts_job_in_flight("sp-contract")
+        assert found is not None, (
+            "the status reader did not find a job enqueued with the trigger's own "
+            "idempotency key + kind — the two surfaces have drifted apart"
+        )
+        assert found["id"] == job["id"]
