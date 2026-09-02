@@ -131,6 +131,10 @@ _VERB_PATH_ALLOWLIST = frozenset(
         "/api/admin/mcp-sources/{source_id}/oauth/register",
         "/api/admin/metadata/{table_id}/push",
         "/api/admin/metrics/import",
+        # `clone` is the action of creating a sibling connection from this one (same
+        # credential material, zero scopes) — an action on a sub-resource, the same
+        # shape as the allowlisted marketplace /sync; there is no noun that names it.
+        "/api/admin/sharepoint/connections/{connection_id}/clone",
         # Ontology builder draft state machine (spec §13.2): the draft is
         # filled by two RPC actions with no idiomatic REST noun — `import`
         # translates a pasted/uploaded ontology into the unsaved draft (mirrors
