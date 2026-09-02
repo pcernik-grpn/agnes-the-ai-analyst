@@ -215,6 +215,35 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("```sources\ntable: engagements\nmetric: delivery/utilization\n```"),
         {"type": "finish"},
     ],
+    # A table the MODEL writes, streamed the way a model streams it — a few
+    # characters per delta, the header row and the delimiter row each split
+    # across several (TCRD-288). Marked renders a GFM table only once the
+    # delimiter row has one cell per header cell; until then the head is a
+    # paragraph of raw pipes, and a bare <table> carries none of the chat's
+    # table styling. `markdown` below puts a table in a TOOL RESULT, which
+    # arrives whole; this is the other case, and it is the one the reader
+    # sees on every answer with a table in it. Registered BEFORE `table`:
+    # `_pick_scenario` takes the first key found in the message, so a message
+    # naming both shapes gets this one.
+    "tabular": [
+        _text("Two engagements match, both closed won:\n\n"),
+        _text("| Client"),
+        _text(" | Sponsor"),
+        _text(" | Signed | Price"),
+        _text(" |\n|"),
+        _text("---|"),
+        _text("---|---"),
+        _text("|---|\n"),
+        _text("| **Northwind Parts**"),
+        _text(" | Alpine Capital | 2026"),
+        _text("-07-03 | $47,"),
+        _text("500 |\n| Harbor"),
+        _text(" Supply | Meridian Partners"),
+        _text(" | 2026-05-22 |"),
+        _text(" $125,000 |\n\n"),
+        _text("Both count as delivered work — executed SOW only."),
+        {"type": "finish"},
+    ],
     "table": [
         _text("Pulling the numbers.\n\n"),
         _tool_call("call_t", "Bash", {"command": 'agnes query "SELECT * FROM orders LIMIT 400"'}),
@@ -301,7 +330,7 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
         _text(
             "\n\nTry `interleaved`, `wall`, `table`, `fail`, `approval`, `error`, `markdown`, "
-            "`nextactions` or `deliverable`."
+            "`tabular`, `nextactions` or `deliverable`."
         ),
         {"type": "finish"},
     ],

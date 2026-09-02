@@ -44,7 +44,12 @@ from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
-from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
+from src.mcp_tooling import (
+    compact_search_results,
+    ensure_output_size,
+    ensure_query_output_size,
+    progressive_tool,
+)
 from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
@@ -174,12 +179,20 @@ def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict
     response carries ``searched_collections`` and a ``hint`` saying which
     case you are in; read them before concluding anything about
     permissions.
+
+    Long passages are shortened to fit the tool output budget rather than
+    failing the call. When the response carries ``truncated: true``, each hit
+    whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+    ``…``) — never summarise a prefix as the whole passage. Read the document
+    in full with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    lower ``k``; ``truncated_note`` says exactly what was cut.
     """
     params: dict = {"q": query, "k": k}
     if collection_id:
         params["corpus_id"] = collection_id
     try:
-        return api_get_json("/api/collections/search", **params)
+        return compact_search_results(api_get_json("/api/collections/search", **params), "collections_search")
     except V2ClientError as exc:
         raise ValueError(_mcp_error("collections_search", exc)) from exc
 
@@ -211,9 +224,17 @@ def knowledge_search(query: str, k: int = 10) -> dict:
     carries ``source: "local"`` and a ``note`` explaining the degradation.
     An HTTP error from a reachable server (``V2ClientError``) is NOT a
     fallback trigger — the server answered, its error is the truth.
+
+    Long passages are shortened to fit the tool output budget rather than
+    failing the call. When the response carries ``truncated: true``, each hit
+    whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+    ``…``) — never summarise a prefix as the whole passage. Read the document
+    in full with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    lower ``k``; ``truncated_note`` says exactly what was cut.
     """
     try:
-        return api_get_json("/api/knowledge/search", q=query, k=k)
+        return compact_search_results(api_get_json("/api/knowledge/search", q=query, k=k), "knowledge_search")
     except V2ClientError as exc:
         raise ValueError(_mcp_error("knowledge_search", exc)) from exc
     except httpx.TransportError as exc:
@@ -232,15 +253,20 @@ def knowledge_search(query: str, k: int = 10) -> dict:
         from src.ingest.retrieval import retrieval_mode
 
         results = local_search(query, workspace=Path(ws), k=k)
-        return {
-            "query": query,
-            "results": results,
-            # Mode of the LOCAL ranking that just ran — the laptop may lack
-            # the embeddings extra even when the server has it.
-            "retrieval": retrieval_mode(),
-            "source": "local",
-            "note": "server unreachable — searched local knowledge artifacts (documents only)",
-        }
+        # Same budget as the server path: a local artifact holds the same
+        # 3.2k-char chunks, and the model reading this is the same model.
+        return compact_search_results(
+            {
+                "query": query,
+                "results": results,
+                # Mode of the LOCAL ranking that just ran — the laptop may lack
+                # the embeddings extra even when the server has it.
+                "retrieval": retrieval_mode(),
+                "source": "local",
+                "note": "server unreachable — searched local knowledge artifacts (documents only)",
+            },
+            "knowledge_search",
+        )
 
 
 @tool(read_only=True)
