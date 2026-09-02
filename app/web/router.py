@@ -11659,20 +11659,31 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
         if s.id in seen:
             continue
         seen.add(s.id)
-        pinned = owned and s.pinned_at is not None
         archived = bool(s.archived)
+        # An archived conversation is never presented as pinned. `archive_session`
+        # clears `pinned_at` and the pin endpoint refuses a pin on an archived
+        # row, so the invariant holds at the source going forward — this is what
+        # makes it hold for rows written BEFORE it existed, on every instance, in
+        # place of a data migration the frozen DuckDB ladder could not carry.
+        pinned = owned and s.pinned_at is not None and not archived
         shared = bool(s.is_co_session) or not owned
-        # The segment set (see filter_toolbar.js `segments.multi`). `all` is a
-        # real token, not a wildcard, which is what keeps archived conversations
-        # out of every other view without a special case in the engine. Archived
-        # is deliberately exclusive: an archived chat is put away, so it should
-        # not also be sitting in Pinned.
-        buckets = ["archived"] if archived else ["all"]
-        if not archived:
-            if pinned:
-                buckets.append("pinned")
-            if shared:
-                buckets.append("shared")
+        # The LIFECYCLE STATE the page's `Show` radios filter on — one
+        # `exclusive` facet over `data-status` (filter_toolbar.js), so exactly
+        # one of Active / Archived / All is ever chosen. A set rather than a
+        # single value only so that `all` can be a token every row carries and
+        # the option of that name can mean what it says.
+        #
+        # `active` is the facet's `whenEmpty` value — what the list rests on
+        # before anything is chosen — which is how archived conversations stay
+        # out of the default view without a special case in the engine.
+        #
+        # Pinned and Shared are NOT in here. They are ATTRIBUTES, not states: a
+        # conversation carries them on either side of the archive, they are
+        # independent of each other, and they are independent toggle facets over
+        # the `data-pinned` / `data-shared` the row already carries. Mixing the
+        # two dimensions into one OR-group is what made combinations like
+        # "All + Shared" mean nothing.
+        status = ["all", "archived" if archived else "active"]
         agent_label = agent_names.get(s.agent_id or "", "Default agent")
         updated = s.last_message_at or s.started_at
         title = (s.title or "").strip() or "Untitled chat"
@@ -11693,7 +11704,7 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
                 "archived": archived,
                 "shared": shared,
                 "owned": owned,
-                "buckets": "|".join(buckets),
+                "status": "|".join(status),
                 # What the page's search box matches on — lowercased here so the
                 # engine's own lowercased query is a plain substring test.
                 "search": " ".join([title, agent_label, SURFACE_LABELS.get(s.surface.value, "")]).lower(),
@@ -11707,11 +11718,20 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
     # inside their own segment.
     rows.sort(key=lambda r: (r["pinned"], r["updated_iso"] or ""), reverse=True)
 
+    # The UNFILTERED tally per option — the same convention every other Filter
+    # menu in the app uses. `all` is the whole list, because that is what the
+    # option means now.
+    #
+    # `pinned` is live-only by construction (archiving unpins, and an archived
+    # row is never presented as pinned above), so the tally needs no `archived`
+    # clause. `shared` is genuinely orthogonal to the state — an archived
+    # co-session is coherent — so it spans the archive.
     counts = {
-        "all": sum(1 for r in rows if not r["archived"]),
-        "pinned": sum(1 for r in rows if r["pinned"] and not r["archived"]),
-        "shared": sum(1 for r in rows if r["shared"] and not r["archived"]),
+        "all": len(rows),
+        "active": sum(1 for r in rows if not r["archived"]),
         "archived": sum(1 for r in rows if r["archived"]),
+        "pinned": sum(1 for r in rows if r["pinned"]),
+        "shared": sum(1 for r in rows if r["shared"]),
     }
 
     # Facet options carry the UNFILTERED tally per value, matching how every
@@ -11742,9 +11762,10 @@ async def chats_page(
     grant; both failures bounce home rather than 403, matching the chat page (the
     rail hides the link for them too, so this guards a direct URL hit).
 
-    Rendering is server-side; search, the four segments (All / Pinned / Shared /
-    Archived), the Agent + Source facets, sort, the table ⇄ grid switch, the
-    row actions and the bulk bar are all client-side over those rows
+    Rendering is server-side; search, the Show controls (a lifecycle state —
+    Active / Archived / All, resting on Active — plus independent "Pinned only"
+    and "Shared only" toggles), the Agent + Source facets, sort, the row actions
+    and the bulk bar are all client-side over those rows
     (static/js/chats_page.js).
     """
     if not request.app.state.chat_config.enabled:

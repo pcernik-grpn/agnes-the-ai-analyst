@@ -13,12 +13,11 @@
    of the Library's table ⇄ grid switch — see the toolbar's own note below.
 
    What it adds that the Library has no need for:
-     · FOUR segments (All · Pinned · Shared · Archived) instead of an ownership
-       split. They are not mutually exclusive — a chat can be pinned AND shared —
-       so they ride the engine's `segments.multi` mode over a pipe-separated
-       `data-buckets` set rather than a single-value attribute. `all` is a real
-       token there, not a wildcard, which is exactly what keeps ARCHIVED
-       conversations out of the other three views without a special case.
+     · A Show block instead of an ownership split: a LIFECYCLE STATE
+       (Active · Archived · All — one chosen, resting on Active) and, separately,
+       the independent Pinned / Shared attributes. Two dimensions, two controls
+       — see the toolbar's own note below for why one list of four could not
+       answer the questions people actually have.
      · Multi-select + a bulk bar. Tidying up is the job people come here to do
        and it is inherently plural; doing it one row menu at a time is what makes
        a chat list feel unmanageable in the first place.
@@ -124,60 +123,122 @@
        exactly: a click opens a grouped popover, and each applied CATEGORY shows
        as a removable chip on the row above so the resting bar stays one line.
 
-       The four views (All · Pinned · Shared · Archived) live at the TOP of that
-       popover rather than as a segmented control on the bar. As tabs they were a
-       second, louder filter sitting beside the Filter button — two controls
-       doing one job, and the wider one spent its width on three counts a caller
-       reads once. In here they are what they are: the first thing you choose
-       when you narrow the list.
+       At the TOP of that popover, under "Show", are TWO GROUPS — and their
+       being two is the point.
 
-       They stay SINGLE-select (a chat is shown in one view at a time), which is
-       why they remain the engine's `segments` control rather than becoming
-       checkbox facets: `data-own` is the value it reads, the four are mutually
-       exclusive, and "no selection" is not a state they have — unlike a facet,
-       where it means "don't filter" and would let archived conversations back
-       into the default view.
+       All · Pinned · Shared · Archived were one list, first as tabs on the bar,
+       then as the engine's single-select `segments` control in here. Both
+       shapes were wrong for the same underlying reason: the four are not four
+       of a kind. `Archived` is a LIFECYCLE STATE — a conversation is live or
+       archived, never both, and the archive is hidden until asked for.
+       `Pinned` and `Shared` are ATTRIBUTES — independent flags a conversation
+       either carries or does not, on either side of that state.
 
-       Counts are the UNFILTERED tally per view — the same convention the
-       categories below use — and chats_page.js recomputes them after any action,
-       so archiving four chats moves four out of All and into Archived without a
-       reload. #}
+       Crammed into one control, the two dimensions produce controls that
+       cannot answer real questions. As segments (exactly one on) "my pinned
+       ones in the archive" was unaskable. As one OR-group of checkboxes it got
+       worse: `All` is a superset of `Shared`, so ticking both said nothing that
+       ticking `All` didn't, and `All` only existed at all because a checkbox
+       group already spends "nothing ticked" on "no filter" — leaving the option
+       named "everything" to actually mean "include the archive too".
+
+       So: a STATE group and an ATTRIBUTE group, ANDed.
+
+         Show   ( ) Active  ( ) Archived  ( ) All      ← `status`, pick one
+                [ ] Pinned only  [ ] Shared only       ← independent toggles
+
+       Every combination now means something — All + Pinned only is every
+       pinned conversation either side of the archive; Archived + Pinned only
+       is the pinned ones inside it; the resting state is the list you land on.
+
+       Both groups are ordinary FACETS, which is what makes them behave like
+       every other filter here: they chip beside the count, they count toward
+       the Filter badge, and Clear reaches all of them. Three engine options
+       carry the parts a plain facet lacks — `exclusive` (radios, selecting
+       replaces), `whenEmpty` (the resting value, which is a condition rather
+       than the absence of one, so archived rows stay out until asked and a
+       selection REPLACES it), and `spansSearch` (#1974). `segments` stays what
+       it is on /library — the top-level TABS, a real scope that means it.
+
+       Counts are the UNFILTERED tally per option — the same convention the
+       categories below use — and chats_page.js recomputes them after any
+       action, so archiving four chats moves four out of Active and into
+       Archived without a reload. An option that cannot change the list is not
+       rendered at all (a caller with nothing shared would get a row whose only
+       effect is to empty the page), which is the rule the categories below
+       already follow. #}
     <div class="fbar-filter">
       <button type="button" class="fbar-filter__btn" id="ch-filter-btn" aria-haspopup="true" aria-expanded="false">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
         Filter
-        {# The active view, written here by chats_page.js whenever it is not
-           "All". Without it the bar would not say which conversations are on
-           screen — the one thing the tabs did do at rest. Empty (and hidden) on
-           the default view, so the resting button is just "Filter". #}
-        <span class="ch-filter__view" id="ch-filter-view" hidden></span>
+        {# No bespoke "· Archived" label on the button any more. What is applied
+           is stated by the removable CHIPS beside the count, with every other
+           applied filter, and counted by the badge below — the label said which
+           view was on but could not turn it off, and a chip plus a label is the
+           same fact twice. #}
         <span class="fbar-filter__n" hidden>0</span>
       </button>
       <div class="fbar-menu fbar-menu--cats" id="ch-filter-menu" role="menu" aria-label="Filter chats" hidden>
-        <p class="fbar-menu__title" id="ch-seg-label">Show</p>
-        {# Still the engine's segmented control — same ids, same `data-own`
-           values, same wiring — restyled as a vertical option list so it reads
-           as part of the menu it now lives in (see `.ch-viewsel` in chats.css).
-           `radiogroup` because that is what it behaves like in here: four
-           options, exactly one chosen. #}
-        <div class="fbar-seg ch-viewsel" id="ch-seg" role="radiogroup" aria-labelledby="ch-seg-label">
-          <button type="button" class="fbar-seg__btn is-active" data-own="all" role="radio" aria-checked="true">
-            <span class="ch-viewsel__txt">All</span>
-            <span class="fbar-seg__n" data-seg-count="all">{{ chat_bucket_counts.all }}</span>
-          </button>
-          <button type="button" class="fbar-seg__btn" data-own="pinned" role="radio" aria-checked="false">
-            <span class="ch-viewsel__txt">Pinned</span>
-            <span class="fbar-seg__n" data-seg-count="pinned">{{ chat_bucket_counts.pinned }}</span>
-          </button>
-          <button type="button" class="fbar-seg__btn" data-own="shared" role="radio" aria-checked="false">
-            <span class="ch-viewsel__txt">Shared</span>
-            <span class="fbar-seg__n" data-seg-count="shared">{{ chat_bucket_counts.shared }}</span>
-          </button>
-          <button type="button" class="fbar-seg__btn" data-own="archived" role="radio" aria-checked="false">
-            <span class="ch-viewsel__txt">Archived</span>
-            <span class="fbar-seg__n" data-seg-count="archived">{{ chat_bucket_counts.archived }}</span>
-          </button>
+        <p class="fbar-menu__title" id="ch-status-label">Show</p>
+        {# Rows in the menu BODY rather than a `.fbar-cat` with its own popover:
+           this is the primary cut, so hiding it one hop behind a submenu would
+           cost a click to reach the thing most readers came for.
+           `.fbar-menu__opt` is the same option row the categories below render
+           inside their popovers, so a choice here and a tick there are visibly
+           the same act.
+
+           RADIOS, and `radiogroup`: the three are alternatives, one always
+           chosen (Active is the resting one, checked here so the group is never
+           in a "no choice" state the engine would have to invent a meaning
+           for). The engine re-asserts this from its own state on every apply,
+           so Clear and a chip's × both land back on Active. #}
+        <div class="ch-viewsel" role="radiogroup" aria-labelledby="ch-status-label">
+          {% for key, label in [
+               ('active', 'Active'), ('archived', 'Archived'), ('all', 'All'),
+             ] %}
+          <label class="fbar-menu__opt">
+            <input type="radio" name="ch-status" data-facet="status" value="{{ key }}"
+                   {% if key == 'active' %}checked{% endif %}>
+            <span class="fbar-menu__opt-text">{{ label }}</span>
+            <span class="fbar-menu__opt-n" data-opt-count="{{ key }}">{{ chat_bucket_counts[key] }}</span>
+          </label>
+          {% endfor %}
         </div>
+
+        {# The attribute group. Checkboxes, because these ARE independent — and
+           each is one condition rather than a category of values, so each is
+           its own `toggle` facet whose chip states the condition ("Pinned
+           only") instead of naming a category and listing values after a
+           colon. ANDed with the state above and with each other, like every
+           other pair of facets on the page.
+
+           `data-pinned` / `data-shared` are the attributes the rows already
+           carry for the pin indicator and the Shared pill, so there is nothing
+           new on the row to keep in step. Rendered only when the count is
+           non-zero: an option whose only possible effect is to empty the list
+           is not a filter, it is a dead end (and "Shared 0" sitting in the menu
+           was exactly that). #}
+        {# The wrapper is emitted only when at least one option qualifies. A
+           CSS guard cannot do this job: `:empty` is false for an element that
+           contains whitespace, and Jinja leaves plenty, so `.ch-onlys:not(:empty)`
+           matched a wrapper with zero option rows and painted its divider and
+           margin over nothing — a stray rule under the radios on any instance
+           with nothing pinned and nothing shared. #}
+        {% set _onlys = [
+             ('pinned', 'Pinned only', chat_bucket_counts.pinned),
+             ('shared', 'Shared only', chat_bucket_counts.shared),
+           ] | selectattr(2) | list %}
+        {% if _onlys %}
+        <div class="ch-onlys" role="group" aria-labelledby="ch-status-label">
+          {% for key, label, n in _onlys %}
+          <label class="fbar-menu__opt">
+            <input type="checkbox" data-facet="{{ key }}" value="1">
+            <span class="fbar-menu__opt-text">{{ label }}</span>
+            <span class="fbar-menu__opt-n" data-opt-count="{{ key }}">{{ n }}</span>
+          </label>
+          {% endfor %}
+        </div>
+        {% endif %}
 
         {# The optional refinements, each revealing its own options in a secondary
            popover (see .fbar-cat in filter_toolbar.css). A category renders only
@@ -282,11 +343,14 @@
        thing hiding rows: during a search there is nothing for it to offer,
        because a search already looks in every view. #}
     <button type="button" class="ch-hidden-note" id="ch-show-archived" hidden></button>
-    {# The applied facets, as removable chips, on the same line as the count —
+    {# Every applied filter, as removable chips, on the same line as the count —
        they are one sentence ("4 of 31, because Agent is Revenue Analyst"), and
        splitting them put the number here and the chips in the toolbar above.
+       The Show groups chip here too now ("Show: Archived", "Pinned only"),
+       which is what makes them take their filters off where they are
+       displayed.
        `filter_toolbar.js` resolves `#ch-chips` off `document`, so it keeps its
-       id wherever it sits. Hidden until a facet is applied. #}
+       id wherever it sits. Hidden until a filter is applied. #}
     <div class="fbar-chips" id="ch-chips" hidden></div>
   </div>
   </div>
@@ -317,8 +381,12 @@
          data-item-id="{{ c.id }}"
          data-href="{{ c.href }}"
          data-title="{{ c.title }}"
-         {# The segment set — see `segments.multi` in filter_toolbar.js. #}
-         data-buckets="{{ c.buckets }}"
+         {# The lifecycle state, as a set so `all` can be a token every row
+            carries — see the `status` facet in filter_toolbar.js. The Pinned /
+            Shared attributes are NOT in here; they are their own toggle facets
+            over `data-pinned` / `data-shared` below, which the row carries
+            anyway for the pin indicator and the Shared pill. #}
+         data-status="{{ c.status }}"
          data-name="{{ c.title | lower }}"
          data-agent="{{ c.agent_key }}"
          data-agent-label="{{ c.agent_label }}"
@@ -392,10 +460,13 @@
     {% endfor %}
   </div>
   {# No-results state — shown by the engine when the filters exclude every row. #}
+  {# "or another view" until the four views became two filter groups — there is
+     no view to send anyone to any more. Names the two things that can actually
+     be narrowing the list, in the order they are most likely to be the cause. #}
   <div class="ch-empty" id="ch-noresults" hidden>
     <h3>Nothing matches these filters</h3>
-    <p>Try a different search term, or another view.</p>
-    <button type="button" class="cc-btn" data-fbar-reset>Clear filters</button>
+    <p>Try a shorter search term, or take a filter off above.</p>
+    <button type="button" class="cc-btn" data-fbar-reset>Clear search and filters</button>
   </div>
   {% else %}
   <div class="ch-empty">
