@@ -62,6 +62,20 @@ Failure posture, in the two flavours this module keeps strictly apart:
 Cost: this is the expensive stage, so it is off by default
 (``extraction.facts.enabled``) and reports what it spent
 (``facts_usage``, into the run report and ``extraction_runs.usage``).
+
+Two transports share everything above except step 3's actual model call.
+``extraction.facts.transport: sync`` (default) is the flow just described.
+``transport: batch`` submits pending documents through the Anthropic
+Batches API instead — no per-minute rate ceiling and half the price, at
+the cost of latency (usually under an hour, up to 24h per batch): the
+right trade for a bulk pass over hundreds of thousands of documents, the
+wrong one for "extract this one document now". A batch-mode pass
+(:func:`_run_batch_pass`) is resumable — a batch still in flight when the
+run's deadline expires stays recorded in the per-document state file, and
+the next pass collects it before submitting anything new — and folds every
+result through the SAME gate, corrective-retry-recovery and ingest-shipping
+contract the sync transport uses, so a document's final shape never
+reveals which transport produced it.
 """
 
 from __future__ import annotations
