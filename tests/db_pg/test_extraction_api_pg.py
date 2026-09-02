@@ -52,8 +52,66 @@ def test_status_reads_never_run_as_null_not_as_zeros(tmp_path, monkeypatch, pg_e
     body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
     assert body["running"] is None
     assert body["last_completed"] is None
+    assert body["last_failed"] is None
     assert body["runs_total"] == 0
     assert body["as_of"]
+
+
+def test_status_surfaces_an_exhausted_jobs_run_as_last_failed(tmp_path, monkeypatch, pg_engine):
+    """2026-09 incident: a job the worker runtime marked 'failed' closes
+    its own `extraction_runs` row (`ExtractionRunsPgRepository.
+    fail_for_job`) — this run is no longer 'running', so `last_completed`
+    (which deliberately excludes 'failed') would otherwise make it
+    invisible. `last_failed` is what the source card reads instead, with
+    the job's own error text intact."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id, job_id="job-1")
+    repo.checkpoint(run_id, files_seen=12, files_done=12)
+    repo.fail_for_job("job-1", error="lease expired after max attempts")
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["running"] is None
+    assert body["last_completed"] is None
+    assert body["last_failed"]["id"] == run_id
+    assert body["last_failed"]["outcome"] == "failed"
+    assert body["last_failed"]["error"] == "lease expired after max attempts"
+    assert body["last_failed"]["files_done"] == 12
+
+
+def test_status_hides_last_failed_when_a_newer_run_completed(tmp_path, monkeypatch, pg_engine):
+    """An old failure must never eclipse the run that actually finished
+    last — a retry that succeeded is the more relevant fact."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    repo.start(connection_id=conn_id, job_id="job-1")
+    repo.fail_for_job("job-1", error="boom")
+    done = repo.start(connection_id=conn_id, job_id="job-2")
+    repo.finish(done, status="done", report={"new": 3})
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["last_completed"]["id"] == done
+    assert body["last_failed"] is None
+
+
+def test_status_hides_last_failed_while_a_new_run_is_in_progress(tmp_path, monkeypatch, pg_engine):
+    """A fresh attempt already running for this connection is the relevant
+    signal — an older failure alongside it would only be noise."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    repo.start(connection_id=conn_id, job_id="job-1")
+    repo.fail_for_job("job-1", error="boom")
+    repo.start(connection_id=conn_id, job_id="job-2")  # still running
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["running"] is not None
+    assert body["last_failed"] is None
 
 
 def test_a_live_run_surfaces_with_absolute_counters(tmp_path, monkeypatch, pg_engine):

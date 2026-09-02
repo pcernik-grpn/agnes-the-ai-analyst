@@ -211,6 +211,71 @@ def test_last_completed_counts_an_interrupted_run(pg_engine, monkeypatch):
     assert repo.last_completed("conn_a")["id"] == run_id
 
 
+def test_fail_for_job_closes_the_running_row_it_owns(pg_engine, monkeypatch):
+    """2026-09 incident: the worker runtime calls this the moment a job's
+    OWN `jobs` row reaches 'failed' (attempts exhausted, or an unhandled
+    exception past the last retry) — the matching `extraction_runs` row
+    must flip to 'failed' too, with the job's error and a `finished_at`,
+    in the SAME write."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="conn_a", job_id="job-1")
+
+    closed = repo.fail_for_job("job-1", error="lease expired after max attempts")
+
+    assert closed == run_id
+    row = repo.get(run_id)
+    assert row["status"] == "failed"
+    assert row["error"] == "lease expired after max attempts"
+    assert row["finished_at"] is not None
+
+
+def test_fail_for_job_is_a_no_op_when_no_running_row_matches(pg_engine, monkeypatch):
+    """No job_id ever opened a row (most job kinds), or the run already
+    finalized itself — either way, nothing to close, and no OTHER
+    connection's row is ever touched."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.fail_for_job("job-never-seen", error="boom") is None
+
+    run_id = repo.start(connection_id="conn_a", job_id="job-2")
+    repo.finish(run_id, status="done", report={"new": 1})
+    assert repo.fail_for_job("job-2", error="too late") is None
+    assert repo.get(run_id)["status"] == "done"
+
+
+def test_fail_for_job_never_touches_a_different_jobs_row(pg_engine, monkeypatch):
+    """A NEW run for the same connection under a fresh job_id must never be
+    closed by an OLDER job's own exhaustion sweep firing late."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.start(connection_id="conn_a", job_id="job-old")
+    new_run = repo.start(connection_id="conn_a", job_id="job-new")
+
+    closed = repo.fail_for_job("job-old", error="stale reclaim sweep")
+
+    assert closed != new_run
+    assert repo.get(new_run)["status"] == "running"
+
+
+def test_last_failed_finds_the_newest_failed_run_only(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    older = repo.start(connection_id="conn_a")
+    repo.finish(older, status="failed", error="first boom")
+    newer = repo.start(connection_id="conn_a")
+    repo.finish(newer, status="failed", error="second boom")
+    repo.start(connection_id="conn_a")  # still running — must never win
+
+    row = repo.last_failed("conn_a")
+    assert row["id"] == newer
+    assert row["error"] == "second boom"
+
+
+def test_last_failed_is_none_with_nothing_failed(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    done = repo.start(connection_id="conn_a")
+    repo.finish(done, status="done", report={"new": 5})
+
+    assert repo.last_failed("conn_a") is None
+
+
 def test_list_for_connection_is_newest_first_and_scoped(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     first = repo.start(connection_id="conn_a")

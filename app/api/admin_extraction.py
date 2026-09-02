@@ -695,6 +695,16 @@ async def extraction_status(
     run: it is what lets the card say "a facts pass is running" and lock
     its own "Extract facts now" button while one is, since that pass never
     appears in ``running``/``last_completed``.
+
+    ``last_failed`` is the newest run whose OWNING JOB the worker itself
+    marked ``failed`` (``app/worker/runtime.py``'s
+    ``_finalize_extraction_run_for_job`` — 2026-09 incident: an
+    attempts-exhausted `corpus-extraction` job must still be visible here,
+    even though :meth:`ExtractionRunsPgRepository.last_completed` itself
+    deliberately excludes a ``failed`` row). Only populated when nothing is
+    currently ``running`` AND it postdates ``last_completed`` — an old
+    failure from long before the run that actually finished last must
+    never eclipse it.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
@@ -703,10 +713,17 @@ async def extraction_status(
     now = datetime.now(timezone.utc)
     running = repo.get_running(connection_id)
     last_completed = repo.last_completed(connection_id)
+    last_failed = None if running else repo.last_failed(connection_id)
+    if last_failed and last_completed:
+        failed_at = _parse_ts(last_failed.get("started_at"))
+        completed_at = _parse_ts(last_completed.get("started_at"))
+        if failed_at is not None and completed_at is not None and failed_at <= completed_at:
+            last_failed = None
     return {
         "connection_id": connection_id,
         "running": _run_out(running, now=now) if running else None,
         "last_completed": _run_out(last_completed, now=now) if last_completed else None,
+        "last_failed": _run_out(last_failed, now=now) if last_failed else None,
         "runs_total": repo.count_for_connection(connection_id),
         "facts_job": _facts_job_in_flight(connection_id),
         # `POST …/extraction/stop` (below) always exists and always works —

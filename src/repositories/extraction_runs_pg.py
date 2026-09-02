@@ -354,6 +354,83 @@ class ExtractionRunsPgRepository:
                 abandoned.append(row["id"])
         return abandoned
 
+    def fail_for_job(self, job_id: str, *, error: str) -> Optional[str]:
+        """Finalize this JOB's own still-``running`` row to ``failed`` —
+        called from ``app/worker/runtime.py`` the moment the ``jobs`` row
+        itself reaches a terminal ``failed`` state (an unhandled exception
+        past its last retry, or ``reap_exhausted()`` closing out an
+        attempts-exhausted lease), in the SAME code path as that
+        finalize (2026-09 incident: a reclaim-exhausted `corpus-extraction`
+        job flipped its `jobs` row to `failed` while its `extraction_runs`
+        row stayed `running` forever — no reader, however patient, was
+        ever going to see this end on its own).
+
+        Matches on ``job_id``, not ``connection_id`` — unlike
+        :meth:`abandon_stale_running`, which runs at the START of a brand
+        new run for the same connection and may legitimately find an
+        earlier run's leftover row. This runs from a WORKER-INTERNAL sweep
+        that has no new run in flight and must touch only the row THIS job
+        actually opened; a fresh run already begun for the same connection
+        under a different ``job_id`` is a different row entirely and must
+        never be touched.
+
+        ``failed``, never ``interrupted`` — unlike a self-detected stop
+        (timeout, admin-requested), the JOB dying is unambiguously the
+        severity-first outcome ``_RunRecorder``'s own docstring already
+        picks for a crash (`failed` beats `interrupted`), and it is exactly
+        what `app/api/admin_extraction.py`'s ``_derived_outcome`` already
+        infers a job-status of `failed` as, at read time — this just makes
+        that inference a durable fact instead of only ever a live guess.
+
+        Returns the closed run id, or ``None`` when no ``running`` row
+        matched this ``job_id`` (the job never opened one — e.g. every kind
+        except ``corpus-extraction`` — or it had already finalized itself).
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "UPDATE extraction_runs SET "
+                    "  status = :status, "
+                    "  finished_at = :finished_at, "
+                    "  checkpoint_at = :finished_at, "
+                    "  error = :error "
+                    "WHERE job_id = :job_id AND status = :running "
+                    "RETURNING id"
+                ),
+                {
+                    "status": FAILED,
+                    "finished_at": _now(),
+                    "error": error,
+                    "job_id": job_id,
+                    "running": RUNNING,
+                },
+            ).first()
+        return str(row[0]) if row else None
+
+    def last_failed(self, connection_id: str) -> Optional[Dict[str, Any]]:
+        """The newest run that ended in ``failed`` — surfaced ALONGSIDE
+        :meth:`last_completed`, never merged into it: that method's own
+        contract (and its test coverage) deliberately keeps a hard failure
+        out of the "last run" figures an operator reads for corpus-health
+        trend numbers. Callers that want "what actually happened most
+        recently, including a break" (the source card, after a job the
+        runtime marked failed via :meth:`fail_for_job`) read this instead.
+        """
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM extraction_runs "
+                        "WHERE connection_id = :cid AND status = :failed "
+                        "ORDER BY started_at DESC LIMIT 1"
+                    ),
+                    {"cid": connection_id, "failed": FAILED},
+                )
+                .mappings()
+                .first()
+            )
+        return _decode_row(dict(row)) if row else None
+
     def list_for_connection(
         self,
         connection_id: str,

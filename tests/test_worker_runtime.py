@@ -1183,6 +1183,134 @@ def test_reap_exhausted_notifies_failed_webhook(worker_db, monkeypatch):
     assert calls == [("agent-1", job["id"], "failed")]
 
 
+# ---------------------------------------------------------------------------
+# JOB_MAX_ATTEMPTS_BY_KIND / job_max_attempts() (2026-09 incident: a worker
+# restart mid-crawl must not exhaust the same small budget a genuinely
+# broken handler uses)
+# ---------------------------------------------------------------------------
+
+
+def test_job_max_attempts_overrides_extraction_kinds_to_25():
+    from app.worker.registry import job_max_attempts
+
+    assert job_max_attempts("corpus-extraction") == 25
+    assert job_max_attempts("sharepoint-facts-extraction") == 25
+
+
+def test_job_max_attempts_falls_back_to_default_for_every_other_kind():
+    from app.worker.registry import DEFAULT_JOB_MAX_ATTEMPTS, job_max_attempts
+
+    assert DEFAULT_JOB_MAX_ATTEMPTS == 3
+    assert job_max_attempts("data-refresh") == 3
+    assert job_max_attempts("agent_response") == 3
+    assert job_max_attempts("some-unregistered-kind") == 3
+
+
+# ---------------------------------------------------------------------------
+# _finalize_extraction_run_for_job() — an exhausted job closes its own
+# extraction_runs row (2026-09 incident: 6 of 7 multi-hour SharePoint crawls
+# died with the `jobs` row flipped to 'failed' while `extraction_runs`
+# stayed 'running' forever, invisible to both the fleet view and the source
+# card).
+# ---------------------------------------------------------------------------
+
+
+def _patch_extraction_runs_repo(monkeypatch):
+    """Fake `extraction_runs_repo()` factory recording `fail_for_job` calls
+    — the real repository is Postgres-only (A3), so a plain unit/worker-loop
+    test against the DuckDB-backed ``worker_db`` fixture stubs it rather
+    than standing up a real Postgres instance."""
+    calls: list[tuple[str, str]] = []
+
+    class FakeExtractionRunsRepo:
+        def fail_for_job(self, job_id: str, *, error: str):
+            calls.append((job_id, error))
+            return "er_fake"
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+    return calls
+
+
+def test_exhausted_corpus_extraction_job_closes_its_extraction_run(worker_db, monkeypatch):
+    """A `corpus-extraction` job the runtime marks 'failed' via a live
+    `fail()` call (the handler raised on its LAST attempt) must also close
+    its own `extraction_runs` row, in the SAME code path — never a later,
+    separate sweep an operator has to trigger by hand."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise RuntimeError("crawl exploded")
+
+    register_kind(
+        JobKind(
+            name="corpus-extraction", handler=boom_handler, lane=LIGHT_LANE, lease_seconds=30, retry_in_seconds=None
+        )
+    )
+    calls = _patch_extraction_runs_repo(monkeypatch)
+
+    repo = jobs_repo()
+    job = repo.enqueue("corpus-extraction", {"connection_id": "conn-1"}, max_attempts=25)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    assert repo.get(job["id"])["status"] == "failed"
+    assert calls == [(job["id"], "crawl exploded")]
+
+
+def test_reap_exhausted_corpus_extraction_closes_its_extraction_run(worker_db, monkeypatch):
+    """Same guarantee via the OTHER finalize path: a job the reap sweep
+    itself finalizes (the worker holding its lease died outright — an OOM
+    kill, an image-swap recreate — so no live `fail()` call ever ran) must
+    close its own `extraction_runs` row too."""
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    calls = _patch_extraction_runs_repo(monkeypatch)
+    repo = jobs_repo()
+    job = repo.enqueue("corpus-extraction", {"connection_id": "conn-1"}, max_attempts=1)
+    claimed = repo.claim_next(kinds=["corpus-extraction"], worker_id="dead-worker", lease_seconds=-5)
+    assert claimed is not None
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.3))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+    assert calls == [(job["id"], "lease expired after max attempts")]
+
+
+def test_finalize_extraction_run_for_job_is_a_noop_for_non_owning_kinds(monkeypatch):
+    """Only `corpus-extraction` opens an `extraction_runs` row — a job of
+    any other kind reaching 'failed' must never even resolve the (PG-only)
+    repo, let alone attempt a write."""
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: touched.append(True))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "data-refresh", "boom")
+
+    assert touched == []
+
+
+def test_finalize_extraction_run_for_job_swallows_requires_postgres_backend(monkeypatch):
+    """A DuckDB-backed instance's `extraction_runs_repo()` raises the typed
+    `RequiresPostgresBackend` — this cleanup step is best-effort
+    observability (mirrors `connectors.sharepoint.crawler._RunRecorder`'s
+    own posture for every write to this table) and must never let that
+    escape into the job's own already-committed finalize."""
+    from app.worker import runtime as runtime_mod
+    from src.repositories import RequiresPostgresBackend
+
+    def _raise():
+        raise RequiresPostgresBackend("extraction_runs")
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction", "boom")  # must not raise
+
+
 def test_agent_response_fail_notifies_despite_retry_config_when_attempts_exhausted(worker_db, monkeypatch):
     """MEDIUM 2b: `fail()` finalizes to 'failed' whenever attempts are
     exhausted, REGARDLESS of the kind's static `retry_in_seconds` config —

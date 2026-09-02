@@ -908,12 +908,14 @@ def _dispatch_extraction_if_due(row: Dict[str, Any], schedule: str, now: datetim
     if not is_table_due(schedule, last_run_at, now=now):
         return False
 
+    from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
     job = jobs_repo().enqueue(
         "corpus-extraction",
         {"connection_id": row["id"]},
         idempotency_key=_extraction_idempotency_key(row["id"]),
+        max_attempts=job_max_attempts("corpus-extraction"),
     )
     if job["deduped"]:
         logger.info(
@@ -1757,9 +1759,7 @@ async def clone_connection(
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
 
-    cloned_config = {
-        k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS
-    }
+    cloned_config = {k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS}
 
     new_id = str(uuid4())
     repo.create(
@@ -2130,6 +2130,7 @@ async def trigger_extraction(
     if not usable:
         raise HTTPException(status_code=409, detail=error)
 
+    from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
     payload: Dict[str, Any] = {"connection_id": connection_id}
@@ -2150,6 +2151,7 @@ async def trigger_extraction(
         "corpus-extraction",
         payload,
         idempotency_key=_extraction_idempotency_key(connection_id),
+        max_attempts=job_max_attempts("corpus-extraction"),
     )
     if job["deduped"]:
         raise HTTPException(
@@ -2383,6 +2385,7 @@ async def trigger_facts_extraction(
     if not usable:
         raise HTTPException(status_code=409, detail=error)
 
+    from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
     payload: Dict[str, Any] = {"connection_id": connection_id}
@@ -2396,6 +2399,7 @@ async def trigger_facts_extraction(
         "sharepoint-facts-extraction",
         payload,
         idempotency_key=_facts_extraction_idempotency_key(connection_id),
+        max_attempts=job_max_attempts("sharepoint-facts-extraction"),
     )
     if job["deduped"]:
         raise HTTPException(

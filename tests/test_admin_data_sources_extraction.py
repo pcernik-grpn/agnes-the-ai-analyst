@@ -350,6 +350,74 @@ class TestRunRow:
         assert "ext-dot--ok" in html
         assert "error" not in html.lower()
 
+    def test_an_exhausted_jobs_run_surfaces_as_last_failed_with_its_error(self):
+        """2026-09 incident: a job the worker itself marked 'failed' (an
+        exhausted attempts budget, or an unhandled exception past the last
+        retry) closes its own `extraction_runs` row — the source card must
+        show it, with the job's own error text, even though `last_completed`
+        deliberately excludes a 'failed' row."""
+        exhausted = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_99",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T03:00:00+00:00",
+                "files_done": 4200,
+                "new": 4000,
+                "changed": 200,
+                "error": "lease expired after max attempts",
+                "usage": {},
+            },
+            "runs_total": 5,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=exhausted),
+        )
+        html = out["html"]
+        assert "ext-dot--danger" in html
+        assert "failed" in html
+        assert "lease expired after max attempts" in html
+        assert "ext-danger" in html
+
+    def test_last_failed_wins_over_last_completed_when_both_are_present(self):
+        """The server already gates `last_failed` to only exist when it is
+        the more recent terminal outcome — the card must prefer it."""
+        both = {
+            "running": None,
+            "last_completed": {
+                "id": "er_old_done",
+                "outcome": "done",
+                "finished_at": "2026-08-01T10:00:00+00:00",
+                "files_done": 10,
+                "new": 10,
+                "changed": 0,
+                "usage": {},
+            },
+            "last_failed": {
+                "id": "er_new_failed",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T03:00:00+00:00",
+                "files_done": 3,
+                "new": 3,
+                "changed": 0,
+                "error": "boom",
+                "usage": {},
+            },
+            "runs_total": 2,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=both),
+        )
+        html = out["html"]
+        assert "3 files" in html  # the FAILED run's own count
+        assert "10 files" not in html  # the older done run must not show
+        assert "boom" in html
+
     def test_the_error_summary_carries_the_run_id_for_the_lazy_fetch(self):
         """`ontoggle` fetches `.../extraction/runs/{run_id}` on first open —
         the connection id and run id must be recoverable from the markup
