@@ -71,7 +71,21 @@ def test_the_agent_config_parses_the_json_and_lifts_the_severity():
     logging_cfg = cfg["logging"]
 
     receivers = logging_cfg["receivers"]
-    assert any(r.get("type") == "fluent_forward" for r in receivers.values()), receivers
+    forward = [r for r in receivers.values() if r.get("type") == "fluent_forward"]
+    assert forward, receivers
+    for r in forward:
+        # The agent refuses to start on an unknown field, and a refusal means
+        # nothing accepts the containers' logs at all. `port` was rejected on
+        # a live VM; these are the names it takes.
+        assert "listen_port" in r and "port" not in r, r
+
+    parsers = [p for p in logging_cfg["processors"].values() if p.get("type") == "parse_json"]
+    assert parsers, logging_cfg["processors"]
+    for parser in parsers:
+        # Docker's fluentd driver hands over a record whose fields are its
+        # own; the app's JSON is the string in `log`. Parsing the record
+        # instead of that field is a silent no-op.
+        assert parser.get("field") == "log", parser
 
     processors = logging_cfg["processors"]
     assert any(p.get("type") == "parse_json" for p in processors.values()), processors
