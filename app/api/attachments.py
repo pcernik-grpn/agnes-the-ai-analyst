@@ -142,7 +142,7 @@ def _lookup_stored_path(
 
 def _row_visible_under_access_policy(
     rbac_key: str, attachment_id: str, decl: AttachmentSource, user: dict
-) -> bool:
+) -> tuple[bool, str | None]:
     """K3 — is the row ``attachment_id`` belongs to visible in ``user``'s
     policied view of the catalogue table?
 
@@ -162,24 +162,30 @@ def _row_visible_under_access_policy(
     (``policied_from_sql``) is needed, the same shortcut
     ``src.access_policy._count_through_relation`` takes.
 
-    Returns ``True`` unconditionally for a table with no policy attached
-    (or an admin-bypass caller) — ``policied_relation`` reports that as
-    ``policied=False`` — so the inert case never opens a second
-    connection. Fails CLOSED (``False``) on every other outcome: an
-    unresolvable identity, a policy that fails to parse/resolve, or the
-    existence query itself raising — a caller must never receive a row's
-    bytes because a policy failed to answer, only because it explicitly
-    said yes.
+    Returns ``(visible, failure_reason)``. ``visible=True`` unconditionally
+    for a table with no policy attached (or an admin-bypass caller) —
+    ``policied_relation`` reports that as ``policied=False`` — so the inert
+    case never opens a second connection (``failure_reason=None``).
+    Fails CLOSED (``visible=False``) on every other outcome: an
+    unresolvable identity, a failure to OPEN the analytics connection, or
+    the existence query itself raising — a caller must never receive a
+    row's bytes because a policy failed to answer, only because it
+    explicitly said yes. ``failure_reason`` is ``"policy_check_failed"``
+    for exactly those failure cases (finding C, follow-up review of PR
+    #2023 — the connection open used to sit OUTSIDE this guarded region
+    and could reach the caller as an unhandled 500) so the route's audit
+    row can tell "the policy check itself broke" apart from
+    ``failure_reason=None``'s "the policy ran and genuinely denies this
+    row" — both still 404 ``attachment_not_found`` to the client either
+    way, the distinction is audit-only.
     """
     try:
         relation = policied_relation(rbac_key, user)
     except (PolicyIdentityUnresolvable, PolicyError):
-        logger.warning(
-            "attachment.download: row-visibility policy could not be resolved for table %r", rbac_key
-        )
-        return False
+        logger.warning("attachment.download: row-visibility policy could not be resolved for table %r", rbac_key)
+        return False, "policy_check_failed"
     if not relation.policied:
-        return True
+        return True, None
 
     sql = (
         f"SELECT 1 FROM ({relation.relation_sql}) AS __agnes_attachment_row_check__ "
@@ -188,7 +194,21 @@ def _row_visible_under_access_policy(
     params = dict(relation.params)
     params["__agnes_attachment_row_id"] = attachment_id
 
-    conn = get_analytics_db_readonly()
+    # The connection OPEN lives inside this same guarded region as the
+    # execution below — it can fail for the same infra reasons
+    # `_lookup_stored_path`'s own open guards against (read-only open
+    # refused while a read-write handle is alive, corrupt/locked file,
+    # DuckLake catalog connectivity), and must fail closed exactly like an
+    # execution failure rather than propagate past this function.
+    try:
+        conn = get_analytics_db_readonly()
+    except Exception:
+        logger.warning(
+            "attachment.download: could not open the analytics DB for the row-visibility policy check for table %r",
+            rbac_key,
+            exc_info=True,
+        )
+        return False, "policy_check_failed"
     try:
         row = conn.execute(sql, params).fetchone()
     except Exception:
@@ -197,10 +217,10 @@ def _row_visible_under_access_policy(
             rbac_key,
             exc_info=True,
         )
-        return False
+        return False, "policy_check_failed"
     finally:
         conn.close()
-    return row is not None
+    return (row is not None), None
 
 
 def _open_contained(root: Path, stored: str | None) -> tuple[BinaryIO | None, os.stat_result | None, str]:
@@ -379,14 +399,25 @@ def download_attachment(
     # exact same 404 below — telling a caller "the row exists, your policy
     # just denies it" would itself be the disclosure a policy exists to
     # prevent.
-    if reg_row is not None and not _row_visible_under_access_policy(rbac_key, attachment_id, decl, user):
+    policy_failure_reason = None
+    row_visible = True
+    if reg_row is not None:
+        row_visible, policy_failure_reason = _row_visible_under_access_policy(rbac_key, attachment_id, decl, user)
+    if reg_row is not None and not row_visible:
         _audit(
             user,
             source,
             attachment_id,
             "error.404",
             error="attachment_not_found",
-            reason="policied_row_not_visible",
+            # `policy_check_failed` (finding C, follow-up review of PR
+            # #2023) distinguishes "the policy check itself broke" (an
+            # infra failure the guard fails closed on) from the default
+            # `policied_row_not_visible` -- "the policy ran and genuinely
+            # denies this row" -- so ops can tell the two apart in the
+            # audit trail. The client-visible 404 body is identical either
+            # way; the distinction is audit-only, on purpose (K3).
+            reason=policy_failure_reason or "policied_row_not_visible",
         )
         raise HTTPException(
             status_code=404,

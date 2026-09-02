@@ -534,9 +534,7 @@ class TestRowLevelAccessPolicy:
         assert hidden.json()["detail"]["code"] == missing.json()["detail"]["code"] == "attachment_not_found"
 
     def test_admin_god_mode_still_bypasses_the_row_policy(self, policied_jira_attachment_env, admin_user):
-        resp = policied_jira_attachment_env["client"].get(
-            "/api/attachments/jira/101/download", headers=admin_user
-        )
+        resp = policied_jira_attachment_env["client"].get("/api/attachments/jira/101/download", headers=admin_user)
         assert resp.status_code == 200
         assert resp.content == policied_jira_attachment_env["payload"]
 
@@ -564,11 +562,51 @@ class TestRowLevelAccessPolicy:
         assert resp.json()["detail"]["code"] == "attachment_not_found"
         assert jira_attachment_env["payload"] not in resp.content
 
+    def test_analytics_db_unavailable_fails_closed_not_500(self, policied_jira_attachment_env, monkeypatch):
+        """finding C (follow-up review of PR #2023): the policy guard's own
+        connection OPEN used to sit outside the guarded try/except, so a
+        failure to open the analytics DB propagated as an unhandled 500
+        instead of the guard's fail-closed 404 -- and bypassed the route's
+        audit entirely. Alice's persona is normally admitted by this
+        policy, so a 404 here is attributable ONLY to the guard fail-closing
+        on the open failure, not to the policy's own row filter."""
+        import app.api.attachments as attachments_mod
+
+        def _boom():
+            raise RuntimeError("analytics db unavailable")
+
+        monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", _boom)
+
+        resp = policied_jira_attachment_env["client"].get(
+            "/api/attachments/jira/101/download",
+            headers=_auth(policied_jira_attachment_env["alice_token"]),
+        )
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["detail"]["code"] == "attachment_not_found"
+
+        row = _last_audit_row()
+        assert row is not None
+        assert row[3] == "error.404"
+        import json as _json
+
+        params = _json.loads(row[4]) if isinstance(row[4], str) else row[4]
+        assert params.get("reason") == "policy_check_failed"
+
 
 class TestRowVisibleUnderAccessPolicyUnit:
     """Direct unit coverage of the resolver-facing helper, independent of
     the HTTP plumbing above -- pins the fail-closed contract for identity
-    and resolution failures that are hard to trigger end to end."""
+    and resolution failures that are hard to trigger end to end.
+
+    The helper returns ``(visible, failure_reason)``: ``failure_reason`` is
+    ``None`` when the policy body actually ran and answered (allow, or a
+    genuine row-level deny) -- the route keeps its existing
+    ``policied_row_not_visible`` audit reason for that case -- and
+    ``"policy_check_failed"`` when visible=False because something failed
+    BEFORE the policy could give a real answer (unresolvable identity, the
+    analytics DB failing to open, or the existence query itself raising),
+    so ops can tell "db unavailable" apart from "this row is not yours" in
+    the audit trail (finding C, follow-up review of PR #2023)."""
 
     def _decl(self):
         from src.attachment_sources import get_attachment_source
@@ -591,9 +629,9 @@ class TestRowVisibleUnderAccessPolicyUnit:
             raise AssertionError("must not open a connection for the non-policied case")
 
         monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", _boom)
-        assert (
-            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
-            is True
+        assert attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"}) == (
+            True,
+            None,
         )
 
     def test_fails_closed_on_identity_unresolvable(self, monkeypatch):
@@ -604,9 +642,9 @@ class TestRowVisibleUnderAccessPolicyUnit:
             raise PolicyIdentityUnresolvable("no identity")
 
         monkeypatch.setattr(attachments_mod, "policied_relation", _raise)
-        assert (
-            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
-            is False
+        assert attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"}) == (
+            False,
+            "policy_check_failed",
         )
 
     def test_fails_closed_on_policy_error(self, monkeypatch):
@@ -617,9 +655,9 @@ class TestRowVisibleUnderAccessPolicyUnit:
             raise PolicyError(table_id)
 
         monkeypatch.setattr(attachments_mod, "policied_relation", _raise)
-        assert (
-            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
-            is False
+        assert attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"}) == (
+            False,
+            "policy_check_failed",
         )
 
     def test_fails_closed_when_the_existence_query_raises(self, monkeypatch):
@@ -642,9 +680,34 @@ class TestRowVisibleUnderAccessPolicyUnit:
                 pass
 
         monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", lambda: _BoomConn())
-        assert (
-            attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"})
-            is False
+        assert attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"}) == (
+            False,
+            "policy_check_failed",
+        )
+
+    def test_fails_closed_when_opening_the_analytics_db_raises(self, monkeypatch):
+        """finding C (follow-up review of PR #2023): the connection OPEN
+        itself was previously outside the guarded region -- a failure there
+        propagated uncaught past this helper instead of failing closed like
+        every other policy-check failure."""
+        import app.api.attachments as attachments_mod
+        from src.access_policy import PoliciedRelation
+
+        monkeypatch.setattr(
+            attachments_mod,
+            "policied_relation",
+            lambda table_id, user: PoliciedRelation(
+                relation_sql="SELECT * FROM attachments", params={}, policied=True, table_id=table_id
+            ),
+        )
+
+        def _boom():
+            raise RuntimeError("analytics db unavailable")
+
+        monkeypatch.setattr(attachments_mod, "get_analytics_db_readonly", _boom)
+        assert attachments_mod._row_visible_under_access_policy("attachments", "101", self._decl(), {"id": "u1"}) == (
+            False,
+            "policy_check_failed",
         )
 
 
