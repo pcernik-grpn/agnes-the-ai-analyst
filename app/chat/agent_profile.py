@@ -279,6 +279,63 @@ job — true on every surface, and it needs no caveat on either side.
 """
 
 
+#: Provenance rails appended after :data:`FILE_DELIVERY_RAILS`, ungated.
+#:
+#: Third instance of the same gap: the "Say where every number came from"
+#: section of `config/claude_md_template.txt` is the ONLY text that asks for
+#: the ```sources trailer — the `table:` claims the server checks against the
+#: turn's tool calls, and the `assumption:` lines whose `origin:`/`why:`
+#: segments the chat renders as badges and rationale (TCRD-289) — and a
+#: persona REPLACES that template wholesale. So a persona'd agent's figures
+#: rendered as "Sources — none declared" and its assumptions never reached
+#: the reader at all, while the default agent, one prompt over, was held to
+#: the product's promise on every answer. (Devin Review on #2047.)
+#:
+#: Ungated for the same reason the file rails are: the renderer, the verdict
+#: and the push-sink strip (`app/chat/sources.py`) run on every surface a
+#: persona'd agent can answer from, so there is no instance where this text
+#: steers an agent at machinery that does not exist. The origin vocabulary is
+#: the server's (`ASSUMPTION_ORIGINS`), pinned by
+#: `tests/test_chat_sources_verdict.py` alongside the template's copy — one
+#: contract, three carriers, none allowed to drift.
+PROVENANCE_RAILS = """
+
+---
+
+## Say where every number came from
+
+Agnes adds this section to every agent; it holds regardless of the persona
+above.
+
+An answer that reports a figure ends with a fenced `sources` block — one
+claim per line, the LAST thing in the reply:
+
+    ```sources
+    table: hr_headcount
+    metric: headcount/active
+    assumption: active employees only | origin: user | why: you asked about "the team"
+    assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
+    ```
+
+- `table:` — the registry id (as `agnes catalog` gives it) of every table the
+  figure was computed from. `metric:` — the canonical metric id, when you
+  adapted one. Each is checked against the tools you actually ran; naming a
+  table you did not query is worse than naming none.
+- `assumption:` — anything the number depends on that you chose rather than
+  read, one per line, always with two more segments separated by ` | `:
+  `origin:` is ONE word from `user` (the question said or implied it),
+  `definition` (a metric definition, a semantic model or a document in the
+  knowledge base says so), `data` (the data forced it: a missing column or
+  value, so a proxy or a subset stood in), `judgment` (your own choice, with
+  nothing behind it); `why:` is one short sentence a reader could check. An
+  assumption without them is shown to the reader as "origin not stated".
+
+The chat lifts this block out of your reply and renders it as provenance next
+to the answer; it never appears as text. Never report a number whose origin
+you cannot name — when no tool call backs a figure, say so in the answer.
+"""
+
+
 def _facts_rails_enabled() -> bool:
     """Whether this instance has the `facts` feature switched on — the sole
     gate for appending :data:`FACTS_ACCESS_RAILS`. See that constant's
@@ -478,8 +535,10 @@ def build_profile(
     when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
     it (see that constant for why a persona needs its own copy of the
     fact-tool guidance too), then :data:`FILE_DELIVERY_RAILS` (the
-    ``outputs/`` handover convention, ungated — see that constant), and
-    finally :func:`_semantic_layer_section`.
+    ``outputs/`` handover convention, ungated — see that constant), then
+    :data:`PROVENANCE_RAILS` (the ```sources trailer with the assumption
+    origin/why contract, ungated — see that constant), and finally
+    :func:`_semantic_layer_section`.
     The early return above means this only ever applies where a persona
     actually replaces the workspace prompt; an agent with no persona keeps
     the full symlinked rails — including the template's own facts and
@@ -503,6 +562,7 @@ def build_profile(
     if _facts_rails_enabled():
         claude_md += FACTS_ACCESS_RAILS
     claude_md += FILE_DELIVERY_RAILS
+    claude_md += PROVENANCE_RAILS
     claude_md += _semantic_layer_section(user_email)
     return ChatProfile(
         slug=f"agent-{slug}",
