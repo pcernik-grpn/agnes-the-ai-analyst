@@ -206,11 +206,6 @@ server = [
     # SSE (Server-Sent Events) transport for the admin cache-warmup progress
     # stream (app/api/cache_warmup.py).
     "sse-starlette>=2.0",
-    # Optional observability — pure-Python, no compilation. Lazily initialized
-    # in src/observability/posthog_client.py and only emits events when
-    # POSTHOG_API_KEY is set in the environment. With the key unset the
-    # integration is fully off (no network, no init). See docs/observability.md.
-    "posthog>=3.7.0",
     # Rust-backed (ammonia) HTML sanitizer for admin-edited rich content
     # (news intro + body, curated marketplace-metadata.json descriptions).
     # Allowlist-based with per-tag attribute scoping; closes the bypass
@@ -242,8 +237,8 @@ server = [
     # (app/observability/metrics.py, three-plane wave 2D observability).
     # Pure-Python, no compilation, no network calls of its own — the app
     # just exposes an in-process CollectorRegistry for an operator's
-    # Prometheus server to scrape. Lives here (not the `observability` extra
-    # below, which is PostHog-only) so /metrics is always served with zero
+    # Prometheus server to scrape. A core server dependency so /metrics is
+    # always served with zero
     # extra config on any `.[server]` install, mirroring the always-on
     # /healthz probe. The CLI wheel has no long-running process to scrape.
     "prometheus_client>=0.20.0",
@@ -253,13 +248,6 @@ server = [
     # path shouldn't rely on another package's transitive pin — declared
     # directly here.
     "cryptography>=42.0.0",
-]
-observability = [
-    # Already carried by the `server` extra above — listed here too so
-    # operators who want to be explicit can `pip install -e
-    # ".[server,observability]"` and signal intent. Not a core dependency
-    # (the CLI wheel doesn't ship it); see the comment on `server` above.
-    "posthog>=3.7.0",
 ]
 embeddings = [
     # Self-hosted semantic embeddings for Collections retrieval (bge-small).

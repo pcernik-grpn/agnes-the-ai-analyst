@@ -42705,7 +42705,7 @@
     },
     "/api/debug/throw": {
       "get": {
-        "description": "Deliberate-crash route for verifying observability wiring.\n\nGated by ``DEBUG=1`` \u2014 returns 404 in production. Always raises after\nthe auth dependency resolves, so ``request.state.user`` is populated\nby the time the unhandled-exception handler captures the event. Use\nto confirm that PostHog receives the exception with full user context\n(``distinct_id``, ``user_id``, ``user_email``) and not just\n``request_id``.\n\nOptional query params let you pick the exception type and message:\n    /api/debug/throw?kind=ValueError&msg=hello",
+        "description": "Deliberate-crash route for verifying observability wiring.\n\nGated by ``DEBUG=1`` \u2014 returns 404 in production. Always raises after\nthe auth dependency resolves, so ``request.state.user`` is populated\nby the time the unhandled-exception handler runs. Use it to confirm\nthat a real unhandled exception reaches the log pipeline with the\nrequest context attached (``request_id``, path, method) and renders\nthe error page you expect.\n\nOptional query params let you pick the exception type and message:\n    /api/debug/throw?kind=ValueError&msg=hello",
         "operationId": "debug_throw_api_debug_throw_get",
         "parameters": [
           {

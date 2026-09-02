@@ -1288,8 +1288,8 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Operator-injected HTML/JS blocks rendered into base.html. "
                 "Each entry: {name: str, enabled: bool, placement: "
                 "head_start|head_end|body_end, html: str}. Used for feedback "
-                "widgets (Marker.io), analytics (GTM, PostHog), error capture "
-                "(Sentry). Rendered with | safe — admin trust boundary. Review "
+                "widgets, analytics tags, and error-capture snippets. Rendered with "
+                "| safe — admin trust boundary. Review "
                 "third-party widget privacy posture before enabling (most "
                 "capture session data). Restart required after save."
             ),

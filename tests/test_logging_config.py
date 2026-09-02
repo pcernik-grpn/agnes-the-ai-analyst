@@ -173,10 +173,10 @@ def test_json_formatter_includes_service_field():
     line = fmt.format(rec)
     parsed = json.loads(line)
     assert parsed["service"] == "myservice"
-    assert parsed["msg"] == "hello world"
-    assert parsed["lvl"] == "INFO"
+    assert parsed["message"] == "hello world"
+    assert parsed["severity"] == "INFO"
     assert parsed["logger"] == "test"
-    assert "ts" in parsed
+    assert "time" in parsed
 
 
 def test_json_formatter_includes_request_id_when_set():
@@ -242,8 +242,103 @@ def test_setup_logging_emits_parsable_json_in_prod(capsys):
     logging.getLogger("test").info("hello %s", "world")
     out = capsys.readouterr().err
     parsed = json.loads(out.strip().splitlines()[-1])
-    assert parsed["msg"] == "hello world"
+    assert parsed["message"] == "hello world"
     assert parsed["service"] == "app"
+
+
+def test_json_formatter_names_the_fields_a_log_collector_reads():
+    """`severity` / `message` / `time`, not `lvl` / `msg` / `ts`.
+
+    A collector that promotes a JSON line to a structured entry looks for
+    these names — Cloud Logging's Ops Agent among them. Under the old names
+    every line arrived at severity DEFAULT with the payload as one opaque
+    string, which is the same as having no levels at all.
+    """
+    rec = logging.LogRecord(
+        name="test", level=logging.WARNING, pathname=__file__, lineno=1, msg="careful", args=(), exc_info=None
+    )
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["severity"] == "WARNING"
+    assert parsed["message"] == "careful"
+    assert "time" in parsed
+    assert "lvl" not in parsed and "msg" not in parsed and "ts" not in parsed
+
+
+def test_json_formatter_carries_structured_extras():
+    """`logger.info(..., extra={...})` reaches the payload as real fields.
+
+    Without this a caller with something to record — an LLM call's model and
+    token counts, say — can only stringify it into the message, where it is
+    no longer filterable.
+    """
+    rec = logging.LogRecord(
+        name="test", level=logging.INFO, pathname=__file__, lineno=1, msg="llm call", args=(), exc_info=None
+    )
+    rec.event = "llm_generation"
+    rec.model = "claude-x"
+    rec.output_tokens = 512
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["event"] == "llm_generation"
+    assert parsed["model"] == "claude-x"
+    assert parsed["output_tokens"] == 512
+
+
+def test_json_formatter_extras_cannot_shadow_the_core_fields():
+    """An extra named like a core field must not rewrite it — a caller could
+    otherwise relabel its own line's severity or service by accident."""
+    rec = logging.LogRecord(
+        name="test", level=logging.ERROR, pathname=__file__, lineno=1, msg="real", args=(), exc_info=None
+    )
+    rec.severity = "DEBUG"
+    rec.message = "fake"
+    rec.service = "somewhere-else"
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["severity"] == "ERROR"
+    assert parsed["message"] == "real"
+    assert parsed["service"] == "app"
+
+
+def test_json_formatter_drops_unserializable_extras_without_losing_the_line():
+    """A field that will not serialize must not cost the whole log record."""
+
+    class Opaque:
+        def __repr__(self) -> str:
+            return "<opaque>"
+
+    rec = logging.LogRecord(
+        name="test", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None
+    )
+    rec.thing = Opaque()
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["message"] == "m"
+    assert parsed["thing"] == "<opaque>"
+
+
+def test_json_formatter_tags_the_deployment_environment(monkeypatch):
+    """One dashboard serves the whole fleet only if every line says where it
+    came from — otherwise a laptop's DEBUG noise sits next to production."""
+    monkeypatch.setenv("AGNES_DEPLOYMENT_ENV", "production")
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "production"
+
+
+def test_the_deployment_environment_falls_back_to_the_release_channel(monkeypatch):
+    monkeypatch.delenv("AGNES_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.setenv("RELEASE_CHANNEL", "dev")
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "dev"
+
+
+def test_an_unlabelled_deployment_says_so_rather_than_omitting_the_field(monkeypatch):
+    """A missing key and an unknown environment must not look the same to a
+    filter — `env != "production"` has to keep matching either way."""
+    monkeypatch.delenv("AGNES_DEPLOYMENT_ENV", raising=False)
+    monkeypatch.delenv("RELEASE_CHANNEL", raising=False)
+    rec = logging.LogRecord(name="t", level=logging.INFO, pathname=__file__, lineno=1, msg="m", args=(), exc_info=None)
+    parsed = json.loads(_JSONFormatter(service="app").format(rec))
+    assert parsed["env"] == "unknown"
 
 
 def test_setup_logging_silences_uvicorn_access_in_prod():
