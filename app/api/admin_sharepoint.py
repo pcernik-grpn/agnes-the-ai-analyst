@@ -861,10 +861,16 @@ def _record_extraction_dispatch(row: Dict[str, Any], job_id: str) -> None:
     # preserves keys listed there, and the ratchet test
     # (tests/test_sharepoint_config_carry_forward_ratchet.py) will fail
     # otherwise.
-    config["extraction"] = {
-        "last_run_at": datetime.now(timezone.utc).isoformat(),
-        "last_job_id": job_id,
-    }
+    # MERGE into the existing sub-object, never replace it: `config.extraction`
+    # also carries the per-connection overrides an admin set moments earlier
+    # (`facts.retry_mode` / `facts.transport`, `crawl.min_modified`, the Stop
+    # control's `stop_requested_at`). Replacing the dict here wiped them at
+    # the exact moment the crawl started (observed live 2026-09-02: a crawl
+    # triggered right after a `min_modified` PATCH ran unfiltered).
+    extraction = dict(config.get("extraction") or {})
+    extraction["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    extraction["last_job_id"] = job_id
+    config["extraction"] = extraction
     source_connections_repo().update(row["id"], config=config)
 
 

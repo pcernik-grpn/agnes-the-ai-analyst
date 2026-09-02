@@ -3488,3 +3488,45 @@ class TestFactsExtractionRefusalNamesTheSwitch:
         detail = r.json()["detail"]
         assert detail["error"] == "facts_extraction_disabled"
         assert detail["switch"] == "facts.enabled"
+
+
+class TestDispatchBookkeepingKeepsSiblings:
+    """`_record_extraction_dispatch` must merge `last_run_at`/`last_job_id`
+    into `config.extraction`, never replace the sub-object — the per-
+    connection overrides (`facts.*`, `crawl.min_modified`) live there too."""
+
+    def test_trigger_keeps_facts_and_crawl_overrides(self):
+        from app.api.admin_sharepoint import _record_extraction_dispatch
+
+        written = {}
+
+        class _Repo:
+            def update(self, cid, config=None):
+                written["config"] = config
+
+        import app.api.admin_sharepoint as mod
+
+        orig = mod.source_connections_repo
+        mod.source_connections_repo = lambda: _Repo()
+        try:
+            row = {
+                "id": "c1",
+                "config": {
+                    "tenant_id": "t",
+                    "extraction": {
+                        "facts": {"retry_mode": "off", "transport": "batch"},
+                        "crawl": {"min_modified": "2023-12-31"},
+                        "stop_requested_at": None,
+                    },
+                },
+            }
+            _record_extraction_dispatch(row, "job-1")
+        finally:
+            mod.source_connections_repo = orig
+
+        ext = written["config"]["extraction"]
+        assert ext["last_job_id"] == "job-1"
+        assert ext["last_run_at"]
+        assert ext["facts"] == {"retry_mode": "off", "transport": "batch"}
+        assert ext["crawl"] == {"min_modified": "2023-12-31"}
+        assert written["config"]["tenant_id"] == "t"
