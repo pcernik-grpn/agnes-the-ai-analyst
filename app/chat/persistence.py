@@ -14,6 +14,7 @@ back to plain ``SELECT … FROM chat_sessions WHERE …``.
 
 from __future__ import annotations
 
+import logging
 import json
 import secrets
 from datetime import datetime, timezone
@@ -29,6 +30,9 @@ from app.chat.types import (
     Surface,
     UserWorkdir,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _gen_id(prefix: str) -> str:
@@ -320,10 +324,17 @@ class ChatRepository:
         # chat_messages already references trips the FK+index limitation the
         # docstring of set_title describes (the plain UPDATE does not). DuckDB
         # answers a bare UPDATE with one row holding the affected-row count.
-        row = self._conn.execute(
-            "UPDATE chat_sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
-            [title, chat_id],
-        ).fetchone()
+        try:
+            row = self._conn.execute(
+                "UPDATE chat_sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
+                [title, chat_id],
+            ).fetchone()
+        except Exception:
+            # Never let the count read take the auto-title task down. Decide
+            # by re-reading the row: the UPDATE may well have landed.
+            logger.debug("set_title_if_unset: affected-row read failed for %s; re-reading", chat_id, exc_info=True)
+            current = self.get_session(chat_id)
+            return current is not None and current.title == title
         return bool(row and row[0])
 
     def set_pinned(self, chat_id: str, pinned: bool) -> None:

@@ -243,11 +243,17 @@ def test_generate_title_sync_sends_the_framed_request_at_temperature_zero(monkey
             "Search SharePoint for our 2024 engagement letters with the client and summarize the scope of each",
             "Search SharePoint for our 2024 engagement letters with the…",
         ),
-        # An abbreviation's period is not a sentence end.
+        # An abbreviation's period is not a sentence end — upper-case ones by
+        # construction, the common lower-case ones explicitly.
         (
             "Is Acme Widgets the same thing as A.B. Holdings? Walk me through it.",
             "Is Acme Widgets the same thing as A.B. Holdings",
         ),
+        (
+            "Compare cloud costs, e.g. AWS vs. Azure, for Q3. Then summarize.",
+            "Compare cloud costs, e.g. AWS vs. Azure, for Q3",
+        ),
+        ("List regions, i.e. EU and US, etc. Then rank them.", "List regions, i.e. EU and US, etc"),
         # Leading list/heading/emphasis markup goes; digits stay.
         ("- **Draft** the precedent section.\nCite prior work.", "Draft the precedent section"),
         ("\n\n# 2024 revenue by region\nbody", "2024 revenue by region"),
@@ -489,6 +495,28 @@ def test_set_title_if_unset_fills_only_an_empty_title(repo: ChatRepository):
     repo.set_title(s.id, "")
     assert repo.set_title_if_unset(s.id, "Filled") is True
     assert repo.set_title_if_unset("chat_does_not_exist", "x") is False
+
+
+def test_set_title_if_unset_survives_a_failing_count_read(repo: ChatRepository, monkeypatch):
+    """If DuckDB's affected-row read raises, the answer comes from re-reading
+    the row instead of crashing the auto-title task."""
+    s = repo.create_session(user_email="u@x", surface=Surface.WEB)
+    real_conn = repo._conn
+
+    class _FlakyConn:
+        def execute(self, sql, params=None):
+            if sql.lstrip().upper().startswith("UPDATE CHAT_SESSIONS SET TITLE"):
+                real_conn.execute(sql, params)  # the write itself lands...
+                raise RuntimeError("count read failed")  # ...but the count read blows up
+            return real_conn.execute(sql, params) if params is not None else real_conn.execute(sql)
+
+    monkeypatch.setattr(repo, "_conn", _FlakyConn())
+    assert repo.set_title_if_unset(s.id, "Model title") is True
+    monkeypatch.setattr(repo, "_conn", real_conn)
+    assert repo.get_session(s.id).title == "Model title"
+    # A second writer still loses, through the same re-read path.
+    monkeypatch.setattr(repo, "_conn", _FlakyConn())
+    assert repo.set_title_if_unset(s.id, "Other") is False
 
 
 def test_get_first_user_message(repo: ChatRepository):

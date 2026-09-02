@@ -187,7 +187,7 @@ def _warn_no_credential(exc: Exception) -> None:
         return
     _no_credential_warned = True
     logger.warning(
-        "auto-title disabled: no Anthropic credential available (set "
+        "auto-title model disabled: no Anthropic credential available (set "
         "ANTHROPIC_API_KEY, or the workload_identity vars "
         "ANTHROPIC_FEDERATION_RULE_ID / ANTHROPIC_ORGANIZATION_ID / "
         "ANTHROPIC_SERVICE_ACCOUNT_ID plus an identity token) — until one is "
@@ -247,9 +247,17 @@ _LEADING_MARKUP = re.compile(r"^[\s#>*\-•`]+")
 # a title's content, not its markup.
 _INLINE_MARKUP = re.compile(r"\*\*|`+")
 # End of the first sentence: a "?" or "!", or a "." that follows a lowercase
-# letter, digit or closing bracket (so "N.B." and "e.g." are not sentence
-# ends), followed by whitespace and a capital/opening quote, or end of text.
-_FIRST_SENTENCE = re.compile(r"^(.*?(?:[!?]|(?<=[a-z0-9)\]])\.))(?:\s+(?=[A-Z\"'(\[])|$)")
+# letter, digit or closing bracket and is then followed by whitespace and a
+# capital/opening quote (or end of text). Upper-case abbreviations ("N.B.",
+# "U.S.") never qualify because the dot follows a capital; the common
+# mid-sentence lower-case ones ("e.g.", "i.e.", "vs.") are excluded
+# explicitly, since "e.g. AWS" would otherwise read as a sentence end ("etc."
+# is usually sentence-final and deliberately not excluded). Other lower-case
+# abbreviations followed by a capitalised word still cut early — the cost is a
+# shorter fallback title, never a wrong one.
+_FIRST_SENTENCE = re.compile(
+    r"^(.*?(?:[!?]|(?<=[a-z0-9)\]])(?<!\be\.g)(?<!\bi\.e)(?<!\bvs)\.))(?:\s+(?=[A-Z\"'(\[])|$)"
+)
 
 
 def fallback_title(user_message: str) -> Optional[str]:
@@ -408,7 +416,7 @@ async def generate_title(
             # account, network hiccup...) — an ongoing operational problem,
             # not the expected keyless-instance state, so every occurrence
             # is surfaced (see #1526).
-            logger.warning("auto-title disabled: Anthropic WIF token mint failed: %s", exc)
+            logger.warning("auto-title model disabled: Anthropic WIF token mint failed: %s", exc)
         else:
             _warn_no_credential(exc)
         return None
