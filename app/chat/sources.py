@@ -12,7 +12,8 @@ sentence, and this module turns it into something the reader can check:
     ```sources
     table: hr_headcount
     metric: headcount/active
-    assumption: active employees only, contractors excluded
+    assumption: active employees only | origin: user | why: you asked about "the team"
+    assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
     ```
 
 Two things follow from that being parseable rather than prose:
@@ -23,6 +24,17 @@ Two things follow from that being parseable rather than prose:
   record of what the agent actually ran. A `table:` no tool call touched is
   reported to the reader as unverified. This is the part that separates
   "the prompt asks for it" from "the answer is accountable for it".
+
+An ``assumption:`` is the one claim nothing can check, so it carries its own
+accountability instead (TCRD-289 — a reader looking at six ``assumes …``
+chips could not tell where any of them came from, or why). Each line names
+its **origin** from a closed vocabulary (:data:`ASSUMPTION_ORIGINS`: the
+user's question, a definition, a gap in the data, or the analyst's own
+judgment) and a one-sentence **why**, as ``| origin: … | why: …`` segments
+after the statement. Both are parsed here and rendered next to the
+statement; a line without them is still a valid assumption — it renders as
+"origin not stated", which is the same visible-absence rule the block
+itself rests on.
 
 What this deliberately is NOT: enforcement in the sense of refusing the answer.
 That would need a second pass over the model on every turn, and it would trade
@@ -79,6 +91,112 @@ _CLAIM_RE = re.compile(r"^\s*(table|metric|assumption)\s*:\s*(.+?)\s*$", re.IGNO
 #: would render every honest assumption as "unverified".
 VERIFIABLE_KINDS = frozenset({"table", "metric"})
 
+#: Where an assumption came from — the closed vocabulary the workspace prompt
+#: asks for on an ``assumption:`` line's ``origin:`` segment. Closed on
+#: purpose: the UI turns each value into a badge with fixed copy
+#: (``_ASSUMPTION_ORIGIN`` in ``chat.js``), and a free-text origin would put
+#: the model's phrasing where the reader expects a category.
+#:
+#: - ``user``       — the question said or implied it.
+#: - ``definition`` — a metric definition, semantic model, glossary term or
+#:                    knowledge-base document says so.
+#: - ``data``       — the data forced it: the column does not exist or the
+#:                    value is missing, so a proxy or a subset stood in.
+#: - ``judgment``   — the analyst's own choice, with nothing behind it.
+#:
+#: Anything else normalizes to ``None`` — "origin not stated" — rather than
+#: to a guess. A model that went off-vocabulary is told so by the badge, the
+#: same way a table nothing queried is told so by "unverified".
+ASSUMPTION_ORIGINS: tuple[str, ...] = ("user", "definition", "data", "judgment")
+
+#: Tolerated spellings, lowercased. Kept short: an alias table that grows
+#: with every model quirk stops being a vocabulary.
+_ORIGIN_ALIASES: dict[str, str] = {
+    "user": "user",
+    "question": "user",
+    "asked": "user",
+    "request": "user",
+    "definition": "definition",
+    "defined": "definition",
+    "model": "definition",
+    "semantic": "definition",
+    "semantic model": "definition",
+    "metric": "definition",
+    "glossary": "definition",
+    "knowledge": "definition",
+    "knowledge base": "definition",
+    "docs": "definition",
+    "documentation": "definition",
+    "data": "data",
+    "schema": "data",
+    "missing": "data",
+    "missing data": "data",
+    "proxy": "data",
+    "judgment": "judgment",
+    "judgement": "judgment",
+    "own": "judgment",
+    "my own": "judgment",
+    "analyst": "judgment",
+    "default": "judgment",
+    "choice": "judgment",
+    "guess": "judgment",
+    "inference": "judgment",
+}
+
+#: The keyed segments an assumption line may carry after its statement,
+#: ``| key: value``. Two keys, a few tolerated spellings each.
+_SEGMENT_KEYS: dict[str, str] = {
+    "origin": "origin",
+    "from": "origin",
+    "source": "origin",
+    "why": "why",
+    "because": "why",
+    "reason": "why",
+    "rationale": "why",
+}
+#: Compiled FROM ``_SEGMENT_KEYS`` so the accepted spellings live in one place
+#: — a key added to the map above is recognized here without a second edit
+#: (Copilot review on #2047). Greedy body, stripped in code: no non-greedy
+#: pattern over model output (see the note on `_OPEN_RE`).
+_SEGMENT_RE = re.compile(
+    r"^\s*(" + "|".join(re.escape(k) for k in _SEGMENT_KEYS) + r")\s*:(.*)$",
+    re.IGNORECASE,
+)
+
+
+def normalize_origin(raw: Optional[str]) -> Optional[str]:
+    """One of :data:`ASSUMPTION_ORIGINS`, or ``None`` for anything else."""
+    if not raw:
+        return None
+    key = " ".join(raw.strip().strip("`'\"").lower().split())
+    return _ORIGIN_ALIASES.get(key)
+
+
+def _split_assumption(ref: str) -> tuple[str, Optional[str], Optional[str]]:
+    """``(statement, origin, why)`` out of one assumption line's body.
+
+    The statement is everything up to the first ``|`` segment that carries
+    a recognized key. A ``|`` inside prose is kept where it was: an
+    un-keyed segment continues whatever came before it — the statement, or
+    the ``why:`` a model wrote a pipe into — instead of being dropped or
+    mis-filed. ``origin`` is normalized (see :func:`normalize_origin`); an
+    empty ``why:`` is no rationale at all.
+    """
+    parts = ref.split("|")
+    buckets: dict[str, list[str]] = {"statement": [parts[0]], "origin": [], "why": []}
+    current = "statement"
+    for seg in parts[1:]:
+        m = _SEGMENT_RE.match(seg)
+        if m:
+            current = _SEGMENT_KEYS[m.group(1).lower()]
+            buckets[current] = [m.group(2)]
+        else:
+            buckets[current].append(seg)
+    statement = "|".join(buckets["statement"]).strip()
+    origin = normalize_origin("|".join(buckets["origin"])) if buckets["origin"] else None
+    why = "|".join(buckets["why"]).strip().strip("`").strip() or None
+    return statement, origin, why
+
 
 @dataclass(frozen=True)
 class SourceClaim:
@@ -86,6 +204,11 @@ class SourceClaim:
     ref: str
     #: None for kinds that carry nothing to check (see VERIFIABLE_KINDS).
     verified: Optional[bool] = None
+    #: ``assumption`` only: one of ASSUMPTION_ORIGINS, or None when the line
+    #: did not say (or said something outside the vocabulary).
+    origin: Optional[str] = None
+    #: ``assumption`` only: the one-sentence rationale, or None.
+    why: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -101,8 +224,18 @@ class SourcesVerdict:
     def to_dict(self) -> dict[str, Any]:
         return {
             "declared": self.declared,
-            "claims": [{"kind": c.kind, "ref": c.ref, "verified": c.verified} for c in self.claims],
+            "claims": [_claim_to_dict(c) for c in self.claims],
         }
+
+
+def _claim_to_dict(c: SourceClaim) -> dict[str, Any]:
+    """``origin``/``why`` ride only on assumptions — a table or metric claim
+    keeps the three-key shape it always had on the wire."""
+    d: dict[str, Any] = {"kind": c.kind, "ref": c.ref, "verified": c.verified}
+    if c.kind == "assumption":
+        d["origin"] = c.origin
+        d["why"] = c.why
+    return d
 
 
 def _first_block_span(content: str, open_re: re.Pattern[str] = _OPEN_RE):
@@ -204,13 +337,19 @@ def parse_claims(block_body: str) -> list[SourceClaim]:
         # Strip the backticks a model reaches for out of markdown habit; the
         # ref is compared against tool-call text, where it appears bare.
         ref = ref.strip("`").strip()
+        origin = why = None
+        if kind == "assumption":
+            ref, origin, why = _split_assumption(ref)
         if not ref:
             continue
+        # Deduplicated on the statement alone: the same assumption written
+        # twice with two rationales is still one assumption, and the reader
+        # gets the first.
         key = (kind, ref)
         if key in seen:
             continue
         seen.add(key)
-        out.append(SourceClaim(kind=kind, ref=ref))
+        out.append(SourceClaim(kind=kind, ref=ref, origin=origin, why=why))
     return out
 
 

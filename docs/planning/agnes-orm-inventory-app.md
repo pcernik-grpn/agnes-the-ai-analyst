@@ -433,13 +433,6 @@ Verdicts:
 - **Purpose**: package marker
 - **Verdict**: `infra`
 
-### `app/middleware/posthog_inject.py`
-- **Purpose**: HTML response middleware that injects a `<script>` tag for
-  PostHog when `POSTHOG_PUBLIC_KEY` is set.
-- **Category**: `middleware`
-- **Raw SQL**: none
-- **Verdict**: `infra`
-
 ### `app/middleware/request_id.py`
 - **Purpose**: assigns `x-request-id` per request; stashes on
   `request.state` for the logging filter.
