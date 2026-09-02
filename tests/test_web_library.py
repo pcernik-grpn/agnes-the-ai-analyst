@@ -1286,3 +1286,54 @@ def test_the_agent_template_band_link_survives_the_definitions_move():
     #    near a section band.
     assert ".lib-band__link {" in src
     assert "lib-defs__link" not in src, "the retired Definitions-band classes are gone"
+
+
+def test_definitions_link_avoids_a_tab_with_nothing_in_it(seeded_app):
+    """Metrics is the default landing, not the unconditional one.
+
+    An instance whose semantic layer holds glossary terms and no metrics was
+    told "0 metrics, 3 glossary terms" and then sent to the metrics tab — the
+    one empty list on the page (Devin Review on #2069). The link follows the
+    counts it just stated.
+    """
+    _seed_definitions(metrics=0, terms=3)
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert 'href="/semantic-layer?tab=all_glossary"' in r.text
+    assert 'href="/semantic-layer?tab=all_metrics"' not in r.text
+
+
+def test_one_unreadable_count_does_not_erase_the_definitions_row(seeded_app, monkeypatch):
+    """The three counts had ONE exception boundary between them, so a single
+    failing read removed the whole row and told a reader with a populated
+    semantic layer that they had none (Devin Review on #2069). Each read now
+    stands alone: the failed one degrades, the others still state their
+    number."""
+    _seed_definitions(metrics=2, terms=3)
+
+    import app.web.router as router
+
+    def _boom(*a, **k):
+        raise RuntimeError("metric table unavailable")
+
+    monkeypatch.setattr(router, "metric_repo", _boom)
+
+    c = seeded_app["client"]
+    r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert "glossary term" in r.text, (
+        "a failed metric read must not take the glossary count down with it"
+    )
+    assert "3 glossary term" in r.text
+
+
+def test_a_saturated_glossary_count_is_not_stated_as_an_exact_total():
+    """`_glossary_terms_count` reads at most `_GLOSSARY_COUNT_LIMIT` rows, so
+    at or past that limit the number it returns IS the limit. Rendering it
+    bare states a cap as a total (Devin Review on #2069)."""
+    from app.web.router import _GLOSSARY_COUNT_LIMIT, _glossary_count_label
+
+    assert _glossary_count_label(0) == "0"
+    assert _glossary_count_label(_GLOSSARY_COUNT_LIMIT - 1) == str(_GLOSSARY_COUNT_LIMIT - 1)
+    assert _glossary_count_label(_GLOSSARY_COUNT_LIMIT) == f"{_GLOSSARY_COUNT_LIMIT}+"

@@ -3620,9 +3620,25 @@ async def library_page(
         # No `conn` argument: /library takes no raw ``Depends(_get_db)``
         # connection, and passing one would be the backend-split bug class on a
         # Postgres instance. The default path reads through the repo factory.
-        _accessible = get_accessible_tables(user)
-        _allowed = None if _accessible is None else set(_accessible)
-        _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
+        # One boundary per read, not one around all three. The comment below
+        # claimed the model read already had its own guard; it did not — a
+        # single `try` wrapped every read, so one failing table removed the
+        # whole Definitions row and the reader was told a populated semantic
+        # layer does not exist (Devin Review on #2069). A count that cannot be
+        # read now degrades to "none of those", and the row still states the
+        # two that could.
+        _visible_metrics: list = []
+        _glossary_count = 0
+        _has_readable_model = False
+
+        try:
+            _accessible = get_accessible_tables(user)
+            _allowed = None if _accessible is None else set(_accessible)
+            _visible_metrics = [
+                m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None
+            ]
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count visible metrics: %s", e)
         # Through the shared helper, not a second inline
         # `glossary_repo().list(limit=500)`: this strip and the
         # `/semantic-layer` tab strip show the SAME number to the same caller
@@ -3630,7 +3646,10 @@ async def library_page(
         # drift. Only the count is wanted here — the strip states how much
         # vocabulary exists and links out; the terms themselves are read and
         # searched on the page that owns them.
-        _glossary_count = _glossary_terms_count()
+        try:
+            _glossary_count = _glossary_terms_count()
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count glossary terms: %s", e)
 
         # Whether to offer the "Browse the semantic layer" link below — a
         # readable-model check scoped to what THIS caller can reach, the same
@@ -3640,9 +3659,9 @@ async def library_page(
         # model with no metrics/glossary projected yet (or a purely native,
         # browse-only model) still counts — gating on the flat projection's
         # counts would hide the one thing this UI exists to browse. Read in
-        # its own guard so a semantic_models failure leaves the metric and
-        # glossary counts already computed above intact instead of
-        # suppressing the strip entirely.
+        # its own guard (see above) so a semantic_models failure leaves the
+        # metric and glossary counts intact instead of suppressing the strip
+        # entirely.
         #
         # The models are no longer ROWS on this page — the whole layer is one
         # destination now (see the note above), and `/semantic-layer`'s Models
@@ -3650,12 +3669,18 @@ async def library_page(
         # validation status. What survives here is the single question this
         # page still has to answer: does this caller have a readable document
         # at all, which decides where the strip's one link should land.
-        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        try:
+            _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not resolve a readable semantic model: %s", e)
 
         if _visible_metrics or _glossary_count or _has_readable_model:
             library_definitions = {
                 "metric_count": len(_visible_metrics),
                 "glossary_count": _glossary_count,
+                # The sentence says "N glossary terms"; N saturates at the
+                # read limit, so say so rather than stating a cap as a total.
+                "glossary_count_label": _glossary_count_label(_glossary_count),
                 # Where the strip's ONE link lands. The strip offers a single
                 # call to action by design — two competing links beside a
                 # sentence is the band this replaced — so the target has to
@@ -3670,7 +3695,20 @@ async def library_page(
                 # clicks a promise about words and numbers and arrives at a list
                 # of documents. The tab strip carries them on to the models in
                 # one click, which is the right way round.
-                "browse_href": "/semantic-layer?tab=all_metrics",
+                # ...with one exception the paragraph above did not consider:
+                # an instance that HAS a semantic layer but no metrics in it.
+                # Sending that reader to the metrics tab lands them on the one
+                # empty list on the page, having just been told the layer holds
+                # 40 glossary terms (Devin Review on #2069). Pick the first tab
+                # that actually holds something, in the order the card counts
+                # them; metrics stay the default whenever they exist.
+                "browse_href": (
+                    "/semantic-layer?tab=all_metrics"
+                    if _visible_metrics
+                    else "/semantic-layer?tab=all_glossary"
+                    if _glossary_count
+                    else "/semantic-layer"
+                ),
             }
     except Exception as e:
         logger.warning("/library: could not resolve the semantic layer: %s", e)
@@ -4467,8 +4505,20 @@ def _glossary_terms_count() -> int:
     """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
     unbounded mode (it bounds a full-table scan) — comfortably above the
     tens-to-low-hundreds scale this feature targets, so an exact count in
-    practice rather than a true cap."""
+    practice rather than a true cap.
+
+    "In practice" is not "always", which is why :func:`_glossary_count_label`
+    exists: a registry at or past the limit renders ``500+`` rather than
+    stating 500 as an exact total (Devin Review on #2069)."""
     return len(glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT))
+
+
+def _glossary_count_label(count: int) -> str:
+    """The count as the page should SAY it — ``500+`` once it saturates.
+
+    The number itself stays an int for every caller that does arithmetic or a
+    truthiness check on it; only the rendered label changes."""
+    return f"{_GLOSSARY_COUNT_LIMIT}+" if count >= _GLOSSARY_COUNT_LIMIT else str(count)
 
 
 @router.get("/semantic-layer", response_class=HTMLResponse)
@@ -4675,6 +4725,7 @@ async def semantic_layer_list(
         metric_categories=metric_categories,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
+        glossary_count_label=_glossary_count_label(glossary_count),
         glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
