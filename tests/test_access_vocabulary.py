@@ -15,6 +15,8 @@ The Library's words win: they are the ones a human reads. Design:
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.web import vocabulary
@@ -232,7 +234,18 @@ class TestRowsAndTheirHandlerAgree:
         src = self._source()
         # Rows now carry their kind too (the keyboard rail wears it), so the
         # attribute order differs — match on the class plus the row id.
-        assert src.count('<div class="ax-r" data-kind=') == 2   # one per view
+        #
+        # Matched as an ELEMENT, not as one exact literal. The invariant is
+        # that both views emit the same row element — a `div.ax-r` carrying
+        # `data-kind` — so the delegated `[data-rid]` handler reaches rows in
+        # either view. It says nothing about the class list being a single
+        # bare token, and the bundle view now appends a modifier
+        # (`ax-r--scope`, marking an audience that is a scope rather than a
+        # group). Pinning the literal forbade a modifier the invariant does
+        # not care about, which is a guard failing on something it was not
+        # written to protect.
+        row_element = re.compile(r'<div class="ax-r(?:\$\{[^{}]*\}|[^">])*"[^>]*?data-kind=')
+        assert len(row_element.findall(src)) == 2   # one per view
         assert "<tr data-type=" not in src
         assert 'class="ax-gs ax-gs--bb' in src             # a bundle is a group-shaped row
 
@@ -267,3 +280,70 @@ class TestActingOnARowDoesNotCloseIt:
         src = self._source()
         assert "const open = selectedGroup === g.id;" in src
         assert '${open ? "open" : ""}' in src
+
+
+class TestAnEveryoneAudienceIsNotARoster:
+    """An everyone-scoped grant must not be reported as a group with members.
+
+    The grant is STORED against the seeded `Everyone` group as its carrier
+    (the column is NOT NULL, and the unique key on it is what keeps one
+    everyone-grant per resource), so `group_id` still names a group on the
+    wire. Rendering it as one produced two false statements on the page:
+    the audience row read "Everyone · 41 people", and the collapsed line
+    read "Everyone · 41 people" above it.
+
+    Both invite the same two wrong conclusions — that a roster decides this,
+    and that a member leaving the group would change it. Neither is true:
+    the audience is every account, and anyone who joins later. In the
+    collapsed line the count is not merely mis-attributed but the wrong
+    QUANTITY, because an everyone grant dominates every other group on the
+    line rather than adding to it.
+
+    `audience` is the server's own answer (`/api/admin/access-overview`),
+    computed with `reaches_everyone`, so it is correct on the frozen DuckDB
+    ladder too — where there is no `scope` column and the carrier match is
+    the only available signal.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_both_renderers_branch_on_the_server_s_answer(self):
+        src = self._source()
+        # The audience row, and the collapsed line above it.
+        assert 'grant.audience === "everyone"' in src
+        assert '(g) => g.audience === "everyone"' in src
+
+    def _group_row(self) -> str:
+        """Just the audience-row renderer.
+
+        Scoped deliberately: a member count is CORRECT in several other
+        renderers on this page — the group picker lists real groups and
+        their rosters — so a whole-file assertion would fail on code that is
+        right, which is the guard being wrong rather than the page.
+        """
+        src = self._source()
+        start = src.index("const groupRow = (r, grant) => {")
+        return src[start : src.index("\n    };", start)]
+
+    def test_the_audience_row_does_not_count_before_it_knows_the_kind(self):
+        row = self._group_row()
+        # It used to take the count first, unconditionally, and had no way to
+        # not print it. The kind of audience must be established first.
+        assert "const n = g.member_count ?? 0;" not in row
+        assert "member_count" in row  # the ordinary-group branch still counts
+        assert row.index("isEveryone") < row.index("member_count")
+
+    def test_the_page_says_what_an_everyone_audience_reaches(self):
+        src = self._source()
+        assert "every account, and anyone who joins" in src   # the audience row
+        assert "everyone, and anyone who joins" in src        # the collapsed line
+
+    def test_the_row_still_says_people_for_an_ordinary_group(self):
+        """The fix must not cost the ordinary case its member count."""
+        src = self._source()
+        assert '=== 1 ? "person" : "people"' in src

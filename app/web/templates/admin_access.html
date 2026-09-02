@@ -2198,6 +2198,24 @@
      word. The mark is the shared one (js/kind_glyph.js `group`), sized
      down from the Library's 26px because these rows are denser and the
      mark is a qualifier here, not the row's subject. */
+  /* The audience that is not a group. A left rule and the shared accent, so
+     an everyone-scoped row reads as a different KIND of row before its text
+     is read — the same treatment the mock uses for the Everyone audience. */
+  .ax-r--scope{
+    border-left: 3px solid var(--ds-primary);
+    padding-left: 9px;
+  }
+  /* "every account, and anyone who joins" needs ~211px; the reach column in
+     this view is a FIXED 10rem at every width. Widening that track is the
+     wrong trade — the name column is the `1fr`, so on a narrow pane it is
+     what gives the space back, and it collapses to two letters. Let this one
+     row's line wrap instead: it fits at any width, and costs the other rows
+     nothing because they still say "N people" on one line. */
+  .ax-r--scope .ax-r__d{
+    white-space: normal;
+    overflow: visible;
+    line-height: 1.35;
+  }
   .ax-r__nm--g { display: flex; align-items: center; gap: 8px; }
   .ax-r__nm--g .ds-kindtag--glyph { width: 22px; height: 22px; }
   .ax-r__nm--g .ds-kindtag--glyph svg { width: 13px; height: 13px; }
@@ -4857,15 +4875,33 @@
     //: names things, a bundle's list names audiences) but the anatomy —
     //: label, subject, control, consequence — does not.
     const groupRow = (r, grant) => {
-      const g = groupsById.get(grant.group_id);
-      if (!g) return "";
       const tier = grant.requirement === "required" ? "required" : "available";
-      const n = g.member_count ?? 0;
       const who = whoGranted(grant);
+      /* An everyone-scoped grant is STORED against the seeded `Everyone`
+         group as its carrier, so `grant.group_id` names a group here — and
+         rendering it as one is exactly the attribution the scope exists to
+         stop. It read "Everyone · 41 people", which invites the reader to
+         believe a roster decides this, and that a member leaving would
+         change it. Neither is true: the audience is every account, and
+         anyone who joins later.
+
+         `grant.audience` is the server's answer (`access-overview`), and it
+         is computed with `reaches_everyone` so it is right on the frozen
+         DuckDB ladder too, where there is no `scope` column at all. */
+      const isEveryone = grant.audience === "everyone";
+      const gid = isEveryone ? "everyone" : grant.group_id;
+      const g = isEveryone ? null : groupsById.get(grant.group_id);
+      if (!isEveryone && !g) return "";
+      const label = isEveryone ? "Everyone" : titleOf(g);
+      /* No count, because there is no number to give that would not be a
+         smaller claim than the truth. */
+      const detail = isEveryone
+        ? "every account, and anyone who joins"
+        : `${g.member_count ?? 0} ${(g.member_count ?? 0) === 1 ? "person" : "people"}`;
       return `
-      <div class="ax-r" data-kind="${esc(kindToken(r.t))}" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(g.id)}">
-        <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(titleOf(g))}</span></span>
-        <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${
+      <div class="ax-r${isEveryone ? " ax-r--scope" : ""}" data-kind="${esc(kindToken(r.t))}" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(gid)}">
+        <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(label)}</span></span>
+        <span class="ax-r__d">${esc(detail)}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
         <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by })}</span>
         <span class="ax-r__rd ax-r__manage">${manageCell({ managedBy: grant.managed_by })}</span>
@@ -4899,9 +4935,18 @@
          line says which it is: nobody else can reach this AND it belongs to
          someone — i.e. working as intended. */
       const prov = itemProvenance(r.i);
+      /* An everyone-scoped grant DOMINATES: naming the groups and counting
+         their members is not merely mis-attributed here, it is the wrong
+         quantity — the audience is not a roster, and no other group on the
+         line adds anyone to it. `reach` is a count of today's accounts, and
+         printing it invites the reader to believe that number is the answer.
+         Straight from the server's `audience`, so it is right on DuckDB too. */
+      const reachesAll = (r.held || []).some((g) => g.audience === "everyone");
       const reachLine = nobody
         ? "granted to nobody"
-        : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+        : reachesAll
+          ? "everyone, and anyone who joins"
+          : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
       const meta = prov ? `${reachLine} · ${prov}` : reachLine;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
