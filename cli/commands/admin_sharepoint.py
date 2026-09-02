@@ -1,8 +1,13 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Four surfaces:
+Five surfaces:
 
+  - ``extract`` — the manual crawl trigger with its per-run options
+    (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``);
+    CLI counterpart to ``POST /api/admin/sharepoint/connections/
+    {connection_id}/extract`` — the same job the source card's "Run
+    extraction now" button enqueues.
   - ``facts-extract`` — the standalone fact-graph trigger.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
     ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``
@@ -23,15 +28,18 @@ Four surfaces:
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     facts-config``.
 
-The crawl / ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
+The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
 op" exemption class, `tests/test_documentation_api_triple_surface.py`) —
-``facts-extract`` earns a CLI counterpart because an operator asking "how do
-we get the fact graph populated with what we already have?" needs an answer
-that does not require opening a browser (a support runbook, a script run
-against a remote instance). ``runs`` earns one for the same reason a monitor
-does: an operator watching an 8-connection, ~20-hour extraction over SSH has
-no browser open at all.
+``extract`` and ``facts-extract`` earn a CLI counterpart because an operator
+asking "how do we re-read everything in this scope?" or "how do we get the
+fact graph populated with what we already have?" needs an answer that does
+not require opening a browser (a support runbook, a script run against a
+remote instance); both are deliberately NOT MCP-exposed — an agent-invokable
+tool that can kick off a full re-crawl or an LLM pass over an entire corpus
+is a cost surface no analyst query needs. ``runs`` earns one for the same
+reason a monitor does: an operator watching a ~20-hour extraction over SSH
+has no browser open at all.
 """
 
 from __future__ import annotations
@@ -82,6 +90,79 @@ def _fail(resp) -> None:
         msg = resp.text or f"HTTP {resp.status_code}"
     typer.echo(f"Error ({resp.status_code}): {msg}", err=True)
     raise typer.Exit(1)
+
+
+@admin_sharepoint_app.command("extract")
+def extract(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    concurrency: Optional[int] = typer.Option(
+        None,
+        "--concurrency",
+        min=1,
+        max=16,
+        help="Files of one delta page pipelined at once for this run (1 = sequential). "
+        "Default: the configured extraction.crawler.concurrency.",
+    ),
+    timeout_s: Optional[int] = typer.Option(
+        None,
+        "--timeout-s",
+        min=0,
+        max=86400,
+        help="Hard ceiling for this one run, seconds (0 = unbounded). Default: the configured extraction.timeout_s.",
+    ),
+    resync: bool = typer.Option(
+        False,
+        "--resync",
+        help="Drop the persisted deltaLinks and item-failure queue first, so every drive "
+        "re-enumerates from scratch. Already-ingested files are NOT re-downloaded (cTags "
+        "are kept) — the recovery path for a connection whose change cursor ran past "
+        "documents it never ingested.",
+    ),
+    force_reprocess: bool = typer.Option(
+        False,
+        "--force-reprocess",
+        help="Re-read every file in scope, ignoring the change cursor AND the per-file cTags "
+        "for this run only: every document is re-downloaded, re-converted and re-ingested "
+        "(and re-extracted, when fact extraction is on). Costs a full crawl. Nothing is "
+        "written to the crawl state up front, so an interrupted run resumes as before.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Run the built-in crawl for this connection now.
+
+    Enqueues the ``corpus-extraction`` job — the same job the source card's
+    "Run extraction now" button triggers — with the SAME per-run options
+    that card offers. Every option is for this run only; nothing here
+    changes a configured value.
+
+    Refuses with a clear reason rather than a bare HTTP error: ``409
+    extraction_disabled`` (``sharepoint.enabled`` is off), ``409
+    extraction_dependencies_missing`` (the ``extraction`` extra is not
+    installed), ``409 extraction_already_running`` (a run is already
+    queued/running for this connection), ``404`` (unknown or non-SharePoint
+    connection id).
+    """
+    payload: dict = {}
+    if concurrency is not None:
+        payload["concurrency"] = concurrency
+    if timeout_s is not None:
+        payload["timeout_s"] = timeout_s
+    if resync:
+        payload["resync"] = True
+    if force_reprocess:
+        payload["force_reprocess"] = True
+
+    resp = api_post(
+        f"/api/admin/sharepoint/connections/{connection_id}/extract",
+        json=payload or None,
+    )
+    if resp.status_code != 202:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    typer.echo(f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')})")
 
 
 @admin_sharepoint_app.command("facts-extract")

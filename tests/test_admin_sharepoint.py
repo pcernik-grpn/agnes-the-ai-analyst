@@ -3453,3 +3453,38 @@ class TestConnectionClone:
         params = _audit_params(rows[0])
         assert params == {"source_connection_id": conn_id, "name": "clone-audit-target"}
         assert rows[0]["resource"] == f"source_connection:{new_id}"
+
+class TestFactsExtractionRefusalNamesTheSwitch:
+    """The ``409 facts_extraction_disabled`` body names WHICH of the two
+    switches is off in a machine-readable ``switch`` key (additive to the
+    ``error``/``message`` pair) — the source card's "Extract facts now"
+    button renders that key as its disabled reason, so the UI and the API
+    can never disagree about what an admin has to flip."""
+
+    FACTS_EXTRACT = "{base}/{cid}/facts-extract"
+
+    def test_cost_switch_off_names_extraction_facts_enabled(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"sharepoint": {"enabled": True}, "facts": {"enabled": True}}),
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-switch-cost")
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert detail["error"] == "facts_extraction_disabled"
+        assert detail["switch"] == "extraction.facts.enabled"
+
+    def test_surface_off_names_facts_enabled(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"sharepoint": {"enabled": True}, "extraction": {"facts": {"enabled": True}}}),
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-switch-surface")
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        detail = r.json()["detail"]
+        assert detail["error"] == "facts_extraction_disabled"
+        assert detail["switch"] == "facts.enabled"
