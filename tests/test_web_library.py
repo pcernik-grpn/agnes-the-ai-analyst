@@ -1247,3 +1247,42 @@ def test_the_definitions_glyph_is_in_both_sources():
     assert "definitions:" in js
     assert path in macro and path in js, "the same drawing, not two drawings of the same idea"
 
+
+def test_the_agent_template_band_link_survives_the_definitions_move():
+    """#2015's "Start from a template" link is band-level, and this branch
+    rewrote the band it sits in.
+
+    The regression it guards against is silent: the router keeps passing
+    `band_link`, so nothing errors — the macro that renders it was simply
+    dropped along with the Definitions band it used to share classes with, and
+    the link disappears. Main has no test for that link at all, which is why it
+    could go unnoticed; a parallel session caught it, not me.
+
+    Asserted as the CHAIN rather than through a rendered page: the rows come
+    from `user_store_installs_repo`, so a live render needs a store install
+    seeded, and each link below is a place the chain has actually broken —
+    populated, called, rendered, styled.
+    """
+    from pathlib import Path
+
+    router = Path("app/web/router.py").read_text(encoding="utf-8")
+    src = Path("app/web/templates/library.html").read_text(encoding="utf-8")
+
+    # 1. the router still populates it for the agent section
+    assert '"band_link": (' in router
+    assert '{"href": "/agents?from_template=1", "label": "Start from a template"}' in router
+
+    # 2. the macro exists, and renders the link as a real anchor
+    macro = src.split("{% macro band_link(link) %}", 1)[1].split("{% endmacro %}", 1)[0]
+    assert 'href="{{ link.href }}"' in macro
+    assert "{{ link.label }}" in macro
+
+    # 3. …and is CALLED. This is the link that was missing.
+    assert "{{ band_link(sec.band_link) }}" in src
+
+    # 4. …and is styled. Its own class names now: on main the macro borrowed
+    #    `.lib-defs__link(s)` from the Definitions band, which this branch turns
+    #    into a page-level row, so those names would describe a block nowhere
+    #    near a section band.
+    assert ".lib-band__link {" in src
+    assert "lib-defs__link" not in src, "the retired Definitions-band classes are gone"

@@ -122,6 +122,25 @@
 </div>
 {% endif %}
 {% endmacro %}
+{# One link ACROSS from a band to where its subject continues (#2015). The
+   Agent templates band uses it to open the builder's template picker: the band
+   says what a template IS, and the link is the one thing you can do with it
+   that does not happen here. A sibling of the collapse toggle, never inside it
+   — that toggle is a <button>, and an anchor nested in a button is neither
+   valid nor clickable.
+
+   Its own class names. On main this macro borrowed the Definitions band's
+   the Definitions band, which this branch turns into a page-level row — so
+   those names now describe a block that is nowhere near a section band, and
+   reusing them for an agent-template link would tie #2015's link to a thing
+   that moved. Same rendering, named for what it is. #}
+{% macro band_link(link) %}
+{% if link %}
+<div class="lib-band__links">
+  <a class="lib-band__link" href="{{ link.href }}">{{ link.label }} &rarr;</a>
+</div>
+{% endif %}
+{% endmacro %}
 {% macro library_row(c, child=False, last_child=False) %}
             {# `draggable` is a FILE affordance: a file moves into a collection,
                collections never nest. Computed once so the leading slot and the
@@ -1499,6 +1518,29 @@
      `.lib-browse`) opens the gap where the page stops describing itself and
      starts offering controls. The eye finds the three zones without reading
      any of them. */
+  /* A band carrying a link across (#2015): the toggle takes the room, the link
+     sits at the end. Kept off `.lib-band` itself so a band without a link is
+     laid out exactly as before. */
+  .lib-band--link { display: flex; align-items: center; }
+  .lib-band--link .fbar-grouptoggle { flex: 1 1 auto; min-width: 0; }
+  .lib-band__links {
+    flex: none;
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    padding: 0 16px 0 10px;
+  }
+  .lib-band__link {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ds-primary);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .lib-band__link:hover { text-decoration: underline; }
+  @media (max-width: 640px) {
+    .lib-band--link { flex-wrap: wrap; }
+  }
   /* One ROW, not a card with a paragraph in it. Everything sits on a single
      baseline — glyph, name, the info affordance, the counts, the way in — so
      the block is a line of page metadata rather than a section the reader has
@@ -2559,7 +2601,7 @@
     {# The band is the block host of the shared component (`.fbar-groupband`),
        sticky at the top of its own section so the group you are reading stays
        named while its rows scroll. #}
-    <div class="fbar-groupband lib-band">{{ group_toggle(sec) }}</div>
+    <div class="fbar-groupband lib-band{% if sec.band_link %} lib-band--link{% endif %}">{{ group_toggle(sec) }}{{ band_link(sec.band_link) }}</div>
     <div class="lib-tablewrap">
       <table class="data-table lib-table">
         {# The SAME colgroup in every group — that plus `table-layout: fixed` is
