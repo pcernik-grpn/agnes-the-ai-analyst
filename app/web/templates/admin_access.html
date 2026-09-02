@@ -3965,13 +3965,10 @@
     findActive = -1;
     if (!q) { out.innerHTML = ""; closeFind(); return; }
     const seq = ++findSeq;
-    let people = [];
-    try {
-      const r = await fetch(`${USERS_LIST_API}?search=${encodeURIComponent(q)}&limit=${FIND_LIMIT}`,
-                            { credentials: "include" });
-      people = r.ok ? await r.json() : [];
-      if (!Array.isArray(people)) people = people.users || [];
-    } catch (e) { people = []; }
+    // window.AgnesPeopleSearch (js/people_search.js) — the SAME lookup the
+    // group drawer's own People field uses, so the two "find an account"
+    // boxes on this page can never answer a query differently.
+    const people = await window.AgnesPeopleSearch.search(q, FIND_LIMIT);
     if (seq !== findSeq) return; // a later keystroke already answered
 
     if (!people.length) {

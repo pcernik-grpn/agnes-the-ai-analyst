@@ -117,8 +117,11 @@ class TestTheFlowItself:
         js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
         assert "'DELETE'" not in js, "the drawer can remove a member — that is the editor returning"
         assert "rmmember" not in js
-        # What it may do: find someone, and put them in the new group.
-        assert "'/api/users'" in js and "/members" in js
+        # What it may do: find someone, and put them in the new group. The
+        # find itself goes through the shared lookup (js/people_search.js),
+        # not a hand-rolled `/api/users` fetch of its own — see
+        # TestPeopleSearchIsOneImplementation below for why that matters.
+        assert "window.AgnesPeopleSearch.search(" in js and "/members" in js
 
     def test_seeding_is_creation_only(self):
         """On an existing group the field must be gone, not merely empty —
@@ -194,3 +197,57 @@ class TestOverviewCarriesTheTier:
         overview = c.get("/api/admin/access-overview", headers=_auth(token)).json()
         row = next(g for g in overview["grants"] if g["resource_id"] == "tier-probe")
         assert row["requirement"] == "required"
+
+
+class TestPeopleSearchIsOneImplementation:
+    """The New-group modal's People field (js/components/group_drawer.js)
+    and the group detail pane's own "add someone" search
+    (admin_access.html, `.ax-people__find`) answer the same question — is
+    there an account matching this text — and used to each carry their own
+    copy of the fetch + response-shape handling to get there. Nothing kept
+    the two copies agreeing, which is how the modal's copy went stale
+    while the detail pane's kept working: same-looking code, two places to
+    fix a bug in, one of them missed.
+
+    `js/people_search.js` (`window.AgnesPeopleSearch.search`) is now the
+    ONLY place that builds the `/api/users?search=` request; both call it.
+    These tests pin that there is exactly one implementation left, not
+    that the URL string happens to match today — a second, independently
+    -written copy could rot the same way even if it starts out identical.
+    """
+
+    TEMPLATES = Path("app/web/templates")
+
+    def test_the_shared_lookup_hits_the_admin_search_endpoint(self):
+        js = (STATIC / "js" / "people_search.js").read_text(encoding="utf-8")
+        assert "window.AgnesPeopleSearch" in js
+        assert "/api/users" in js
+        assert "?search=" in js and "encodeURIComponent" in js
+        # Never a wrapped `{ users: [...] }` assumption without a bare-array
+        # fallback — `GET /api/users` returns a bare JSON array.
+        assert "Array.isArray" in js
+
+    def test_it_is_loaded_globally_before_it_is_used(self):
+        """Both callers live on pages that include `_app_scripts.html`; the
+        helper has to be registered there, not copy-pasted into either
+        template's own `<script src>` list."""
+        app_scripts = (self.TEMPLATES / "_app_scripts.html").read_text(encoding="utf-8")
+        assert "js/people_search.js" in app_scripts
+
+    def test_group_drawer_calls_the_shared_lookup_not_its_own_fetch(self):
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "window.AgnesPeopleSearch.search(" in js
+        # No second, hand-rolled build of the same URL — the exact
+        # divergence that let this field go stale while the detail pane's
+        # search kept working.
+        assert "'/api/users'" not in js
+        assert "?search=" not in js
+
+    def test_group_detail_search_calls_the_shared_lookup_not_its_own_fetch(self):
+        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
+        assert "window.AgnesPeopleSearch.search(" in html
+        # The ax-find "add someone" box's OWN runFind must not still build
+        # its own `/api/users?search=` URL — the shared helper is the only
+        # thing allowed to.
+        assert "USERS_LIST_API}?search=" not in html
+
