@@ -2565,8 +2565,6 @@ KNOWN_UNTESTED = {
     # DB state (internal migration endpoint)
     "GET /api/admin/db-state",
     "POST /api/admin/db-state/migrate",
-    # Observability (PostHog proxy) — external service
-    "POST /api/observability/capture",
     # Admin adoption / usage dashboards — DuckDB analytics, not business state
     "GET /api/admin/adoption",
     "GET /api/admin/usage",
