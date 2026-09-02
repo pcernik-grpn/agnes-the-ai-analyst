@@ -16,8 +16,8 @@ to the repo's sequential revision-id convention. ``downgrade()`` is the
 true inverse — the table is new, so dropping it restores the previous
 schema exactly.
 
-Revision ID: 0096_facts_llm_cache
-Revises: 0095_memory_detection_runs
+Revision ID: 0097_facts_llm_cache
+Revises: 0096_sharepoint_connection_state
 Create Date: 2026-09-02
 """
 
@@ -29,8 +29,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0096_facts_llm_cache"
-down_revision: Union[str, None] = "0095_memory_detection_runs"
+revision: str = "0097_facts_llm_cache"
+down_revision: Union[str, None] = "0096_sharepoint_connection_state"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
