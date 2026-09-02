@@ -1373,8 +1373,13 @@ def policied_bq_remote_for_preview(seeded_app, mock_extract_factory, monkeypatch
 
 
 @pytest.fixture
-def policied_databricks_remote_for_preview(seeded_app, mock_extract_factory, monkeypatch):
-    """Same shape as `policied_bq_remote_for_preview`, on `source_type='databricks'`."""
+def policied_databricks_remote_attach_off(seeded_app, mock_extract_factory, monkeypatch):
+    """Same shape as `policied_bq_remote_for_preview`, on
+    `source_type='databricks'`, with the instance left at its DEFAULT
+    configuration -- `data_source.databricks.attach_enabled` off, which is
+    what a real instance looks like unless an operator opted into the
+    experimental Unity Catalog ATTACH.
+    """
     from src.db import get_system_db
     from src.orchestrator import SyncOrchestrator
     from src.repositories.table_registry import TableRegistryRepository
@@ -1417,6 +1422,19 @@ def policied_databricks_remote_for_preview(seeded_app, mock_extract_factory, mon
         conn.close()
 
     return seeded_app
+
+
+@pytest.fixture
+def policied_databricks_remote_for_preview(policied_databricks_remote_attach_off, monkeypatch):
+    """The same rows with the experimental Unity Catalog ATTACH enabled --
+    which is what the local view seeded above stands in for. Without it a
+    `query_mode='remote'` Databricks row has no local analytics view at
+    all, and the preview refuses up front with
+    `policy_preview_remote_unsupported` (see
+    `TestPolicyPreviewRemoteDatabricks`).
+    """
+    monkeypatch.setattr("connectors.databricks.attach.attach_enabled", lambda: True)
+    return policied_databricks_remote_attach_off
 
 
 @pytest.mark.journey
@@ -1645,3 +1663,132 @@ class TestPolicyPreviewTranspiled:
         )
         assert resp.status_code == 422, resp.text
         assert "policy_preview_transpile_failed" in resp.text
+
+
+@pytest.mark.journey
+class TestPolicyPreviewRemoteDatabricks:
+    """Both admin previews execute the policy body on the server's LOCAL
+    read-only analytics connection. A `query_mode='remote'` Databricks row
+    only has a view there when the experimental Unity Catalog ATTACH is on
+    (`data_source.databricks.attach_enabled`, default off), so with the
+    default configuration both used to die on the first `SELECT COUNT(*)`
+    with an opaque "Table with name ... does not exist" catalog error.
+    They now refuse up front and say why (#1979, review follow-up).
+    """
+
+    def test_attach_is_off_by_default(self, policied_databricks_remote_attach_off):
+        """The premise of the two refusal tests below, asserted rather than
+        assumed: nothing in that fixture enables the ATTACH."""
+        from connectors.databricks.attach import attach_enabled
+
+        assert attach_enabled() is False
+
+    def test_single_persona_preview_refuses_with_a_reason(self, policied_databricks_remote_attach_off):
+        c = policied_databricks_remote_attach_off["client"]
+        token = policied_databricks_remote_attach_off["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_dbx_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_preview_remote_unsupported: "), detail
+        # The refusal has to name the switch that lifts it and reassure the
+        # admin that live reads are not what is broken here.
+        assert "attach_enabled" in detail
+        assert "warehouse" in detail
+
+    def test_preview_groups_refuses_with_a_reason(self, policied_databricks_remote_attach_off):
+        c = policied_databricks_remote_attach_off["client"]
+        token = policied_databricks_remote_attach_off["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_dbx_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_preview_remote_unsupported: "), detail
+        assert "attach_enabled" in detail
+
+    def test_attach_enabled_lifts_the_refusal(self, policied_databricks_remote_for_preview):
+        """With the ATTACH on there IS a local view, so the preview runs
+        normally -- the refusal is keyed on the missing view, not on the
+        engine."""
+        c = policied_databricks_remote_for_preview["client"]
+        token = policied_databricks_remote_for_preview["admin_token"]
+
+        for path, body in (
+            ("policy/preview", {"as_groups": ["Finance"]}),
+            ("policy/preview-groups", {}),
+        ):
+            resp = c.post(
+                f"/api/admin/registry/preview_dbx_invoices/{path}",
+                json=body,
+                headers=_auth(token),
+            )
+            if resp.status_code != 200:
+                assert not resp.json()["detail"].startswith("policy_preview_remote_unsupported"), resp.text
+
+    def test_remote_bigquery_table_is_not_refused(self, policied_bq_remote_for_preview):
+        """BigQuery `remote` rows DO get a local view (the BQ ATTACH is the
+        ordinary path, not an opt-in), so the new screen must not touch
+        them."""
+        c = policied_bq_remote_for_preview["client"]
+        token = policied_bq_remote_for_preview["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/preview_bq_invoices/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_materialized_databricks_table_is_not_refused(self, seeded_app, mock_extract_factory, monkeypatch):
+        """A `query_mode='materialized'` Databricks row's scheduler already
+        wrote local rows, so the preview has a real view to read regardless
+        of the ATTACH switch."""
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola",
+            [{"name": "preview_dbx_materialized", "data": [{"id": "1", "unit": "Finance"}]}],
+        )
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="preview_dbx_materialized",
+                name="preview_dbx_materialized",
+                source_type="databricks",
+                bucket="main.fin",
+                source_table="invoices",
+                query_mode="materialized",
+            )
+            registry.set_access_policy(
+                "preview_dbx_materialized",
+                sql="SELECT * FROM preview_dbx_materialized WHERE list_contains($user_groups, unit)",
+                note="restrict to the caller's unit",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/preview_dbx_materialized/policy/preview",
+            json={"as_groups": ["Finance"]},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text

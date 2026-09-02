@@ -7069,6 +7069,42 @@ def _policy_preview_dialect(row: dict) -> Optional[str]:
     return source_type if source_type in ("bigquery", "databricks") else None
 
 
+def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
+    """Why an admin preview cannot run against this table at all, or ``None``.
+
+    Both previews below execute the policy body on the server's LOCAL
+    read-only analytics connection (``get_analytics_db_readonly``). A
+    ``query_mode='remote'`` Databricks row only has a local view there when
+    the experimental Unity Catalog ATTACH is enabled -- otherwise
+    ``connectors/databricks/extract_init.py::rebuild_from_registry`` writes
+    no view at all and the first ``SELECT COUNT(*)`` fails with an opaque
+    "Table with name ... does not exist" catalog error that says nothing
+    about the actual cause.
+
+    A typed refusal rather than dispatching the preview to the SQL
+    warehouse: both previews would have to grow that path to stay
+    consistent with each other, and the all-groups sweep would turn one
+    warehouse round trip per group into the preview's cost model -- native
+    warehouse execution of previews is a separate feature, not a bugfix.
+    Live analyst reads are untouched either way; they never come through
+    here.
+    """
+    if row.get("query_mode") != "remote" or row.get("source_type") != "databricks":
+        return None
+
+    from connectors.databricks.attach import attach_enabled
+
+    if attach_enabled():
+        return None
+    return (
+        "the admin preview executes the policy on the server's local analytics view, and a "
+        "Databricks `remote` table only has one when `data_source.databricks.attach_enabled` "
+        "(the experimental Unity Catalog attach) is on. Live analyst reads are unaffected -- "
+        "they run natively on the SQL warehouse through the same transpiled policy; enable the "
+        "attach to preview here, or preview the policy against a `materialized` copy of the table"
+    )
+
+
 def _policy_preview_mapping_warning(policy_sql: str) -> Optional[str]:
     """review plan P2.6 -- an empty/never-synced ``policy_mapping`` table
     behind a ``JOIN`` reads, from a live query, as an ordinary empty
@@ -7268,6 +7304,13 @@ async def preview_table_policy(
             "transpiled": transpiled,
             "mapping_warning": mapping_warning,
         }
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
+        )
 
     from src.access_policy_validate import PolicyValidationError, probe_policy
     from src.db import get_analytics_db_readonly
@@ -7500,6 +7543,13 @@ async def preview_table_policy_all_groups(
                 "policy resolver refuses to bind -- it can never be served to any caller; "
                 "rewrite the policy to compare the variable as a value"
             ),
+        )
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
         )
 
     group_names = [g["name"] for g in user_groups_repo().list_all()]
