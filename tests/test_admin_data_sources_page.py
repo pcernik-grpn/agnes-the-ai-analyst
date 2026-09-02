@@ -2051,6 +2051,15 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "all 12 documents" in html
         assert "not just what changed" in html
 
+    def test_run_options_carry_a_retry_failed_checkbox(self):
+        """The admin-facing surface for `retry_failed` (REST × CLI × UI
+        parity, see `POST …/extract`'s `retry_failed` option) — a checkbox
+        alongside resync/force, never a route of its own."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert 'id="ds-sp-runopts-retry-sp-conn-1"' in html
+        assert "Retry failed items" in html
+
     def test_force_reprocess_help_falls_back_when_the_document_count_is_unknown(self):
         fs = dict(self._FILE_SOURCE)
         fs["crawl"] = {}

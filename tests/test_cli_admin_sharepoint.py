@@ -505,6 +505,17 @@ class TestExtract:
         _, kwargs = mock_post.call_args
         assert kwargs["json"] == {"resync": True}
 
+    def test_retry_failed_rides_the_payload_as_true(self):
+        """The targeted alternative to `--resync` — same key the source
+        card's checkbox sends, so REST × CLI × UI never drift."""
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e6", "status": "queued"})
+        ) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1", "--retry-failed"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"retry_failed": True}
+
     def test_json_output(self):
         body = {"job_id": "e5", "status": "queued"}
         with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(202, body)):

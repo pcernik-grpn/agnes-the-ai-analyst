@@ -67,6 +67,7 @@ _SIGNATURES = (
     "function _extErrorsSummaryHtml(connId, runId, errorCount) {",
     "async function _extLoadErrorDetail(details) {",
     "function _extErrorItemsHtml(runDetail) {",
+    "function _extFailedOrSkippedItemsHtml(items, truncated, heading) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
@@ -438,6 +439,33 @@ class TestRunRow:
         assert "failed" in html
         assert "1,263 error" in html or "1263 error" in html
         assert "ext-danger" in html
+
+    def test_a_last_run_with_unsupported_files_shows_a_neutral_not_a_warn_line(self):
+        """Never an error — nothing was attempted — so it must never read
+        alongside the danger-toned error/skip lines with the same tone."""
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_u1",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "skipped_unsupported": 3,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        html = out["html"]
+        assert "3 files skipped" in html
+        assert "not an error" in html
+        assert "ext-dot--danger" not in html
 
     def test_a_clean_last_run_shows_no_error_line_and_a_green_dot(self):
         clean_last = {
@@ -852,6 +880,25 @@ class TestRunsDrawer:
         html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "ext-errors" not in html
 
+    def test_a_run_with_unsupported_files_shows_a_neutral_line_in_the_drawer(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_u2",
+                    "outcome": "done",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 30.0,
+                    "files_done": 12,
+                    "errors": 0,
+                    "skipped_unsupported": 2,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "2 files skipped" in html
+        assert "not an error" in html
+
 
 class TestErrorDetail:
     """`_extErrorItemsHtml` — the itemized rows rendered once the per-run
@@ -906,6 +953,75 @@ class TestErrorDetail:
     def test_no_recorded_items_is_an_honest_empty_state(self):
         html = self._html({"items": [], "total": 0, "listed": 0, "truncated": False})
         assert "No per-file detail" in html
+
+    def _detail_html(self, **report):
+        out = _run_js(f"console.log(JSON.stringify({{html: _extErrorItemsHtml({json.dumps({'report': report})})}}));")
+        return out["html"]
+
+    def test_failed_items_are_rendered_alongside_errors_detail(self):
+        html = self._detail_html(
+            failed_items=[
+                {
+                    "path": "Reports/f1.docx",
+                    "item_id": "item1",
+                    "drive_id": "b!drive1",
+                    "reason_type": "convert_failed",
+                    "reason": "markitdown said no",
+                    "suffix": ".docx",
+                }
+            ],
+            failed_items_truncated=False,
+        )
+        assert "Reports/f1.docx" in html
+        assert "markitdown said no" in html
+        assert "retry_failed" in html
+
+    def test_a_failed_item_with_no_path_reads_as_redacted_not_blank(self):
+        """An anonymize-marked scope's item — see `CrawlStats.
+        note_failed_item`'s docstring."""
+        html = self._detail_html(
+            failed_items=[
+                {
+                    "path": None,
+                    "item_id": "item1",
+                    "drive_id": "b!drive1",
+                    "reason_type": "convert_failed",
+                    "reason": "UnsupportedFormatException",
+                    "suffix": ".xlsx",
+                }
+            ],
+        )
+        assert "redacted" in html
+        assert "UnsupportedFormatException" in html
+
+    def test_failed_items_truncation_is_named(self):
+        html = self._detail_html(
+            failed_items=[{"path": "a.docx", "reason": "boom"}],
+            failed_items_truncated=True,
+        )
+        assert "truncated" in html
+
+    def test_skipped_items_are_rendered_with_their_own_heading(self):
+        html = self._detail_html(
+            skipped_items=[
+                {
+                    "path": "Decks/q3.pbix",
+                    "item_id": "item9",
+                    "drive_id": "b!drive1",
+                    "reason_type": "unsupported_type",
+                    "reason": "no conversion backend recognizes this file type",
+                    "suffix": ".pbix",
+                }
+            ],
+        )
+        assert "Decks/q3.pbix" in html
+        assert "no conversion backend" in html
+        assert "not an error" in html
+
+    def test_no_failed_or_skipped_items_adds_no_extra_section(self):
+        html = self._detail_html(errors_detail={"items": [], "total": 0, "listed": 0, "truncated": False})
+        assert "retry_failed" not in html
+        assert "not an error" not in html
 
 
 class TestStopReasonVocabularyAgrees:

@@ -4,10 +4,10 @@ connector maintenance, plus the split-a-large-site management pair below.
 Six surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
-    (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``);
-    CLI counterpart to ``POST /api/admin/sharepoint/connections/
-    {connection_id}/extract`` — the same job the source card's "Run
-    extraction now" button enqueues.
+    (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
+    ``--retry-failed``); CLI counterpart to ``POST /api/admin/sharepoint/
+    connections/{connection_id}/extract`` — the same job the source card's
+    "Run extraction now" button enqueues.
   - ``facts-extract`` — the standalone fact-graph trigger.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
     ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``
@@ -132,6 +132,15 @@ def extract(
         "(and re-extracted, when fact extraction is on). Costs a full crawl. Nothing is "
         "written to the crawl state up front, so an interrupted run resumes as before.",
     ),
+    retry_failed: bool = typer.Option(
+        False,
+        "--retry-failed",
+        help="Give every item this connection's own failure queue already knows about one "
+        "more chance — including ones already given up on after repeated failures — "
+        "without a full --resync. The targeted recovery for a handful of permanently-stuck "
+        "documents (a conversion crash, a transient download error). This run's ordinary "
+        "incremental delta walk still runs afterward, unaffected.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Run the built-in crawl for this connection now.
@@ -157,6 +166,8 @@ def extract(
         payload["resync"] = True
     if force_reprocess:
         payload["force_reprocess"] = True
+    if retry_failed:
+        payload["retry_failed"] = True
 
     resp = api_post(
         f"/api/admin/sharepoint/connections/{connection_id}/extract",

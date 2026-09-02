@@ -2708,6 +2708,11 @@ function _sharepointFactsHtml(row) {
       Re-enumerate from scratch (drop the change cursor, keep already-ingested files)
     </label>
     <span class="field-hint" style="flex-basis:100%;">Use after widening a crawl filter or when the change cursor ran past files it never ingested: every folder is listed again, but a file whose content is unchanged is not re-downloaded.</span>
+    <label class="field-hint" for="ds-sp-runopts-retry-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-retry-${row.id}">
+      Retry failed items
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">Gives every document already known to have failed (including ones given up on after repeated failures) one more chance — no full re-enumeration, just this connection's own failure queue.</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
@@ -3348,11 +3353,14 @@ async function runSpExtraction(id) {
   const forceReprocess = !!(forceEl && forceEl.checked);
   const resyncEl = document.getElementById(`ds-sp-runopts-resync-${id}`);
   const resync = !!(resyncEl && resyncEl.checked);
+  const retryEl = document.getElementById(`ds-sp-runopts-retry-${id}`);
+  const retryFailed = !!(retryEl && retryEl.checked);
   const overrides = {};
   if (conc !== null) overrides.concurrency = conc;
   if (timeout !== null) overrides.timeout_s = timeout;
   if (forceReprocess) overrides.force_reprocess = true;
   if (resync) overrides.resync = true;
+  if (retryFailed) overrides.retry_failed = true;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
@@ -3374,6 +3382,7 @@ async function runSpExtraction(id) {
       // row and clicking "Start run" again does not silently re-process
       // everything a second time.
       if (forceEl) forceEl.checked = false;
+      if (retryEl) retryEl.checked = false;
       // The dispatch stamps `config.extraction.last_run_at` on the connection
       // row, and the body's "In-Agnes extraction" line reads it — so this
       // needs the rows re-read too, not just the strip.
@@ -8061,21 +8070,54 @@ async function _extLoadErrorDetail(details) {
    reading a status code right next to one needs the exact word, not a
    paraphrase. */
 function _extErrorItemsHtml(runDetail) {
-  const envelope = (runDetail.report && runDetail.report.errors_detail) || {};
+  const report = runDetail.report || {};
+  const envelope = report.errors_detail || {};
   const items = envelope.items || [];
-  if (!items.length) {
-    return `<div class="ds-empty">No per-file detail was recorded for this run.</div>`;
+  let html = "";
+  if (items.length) {
+    const rows = items.map((item) => {
+      const status = item.status_code != null ? ` · HTTP ${_extNum(item.status_code)}` : "";
+      const detail = item.detail ? `: ${_extEsc(item.detail)}` : "";
+      return `<li><code>${_extEsc(item.path || "(no path)")}</code> — ${_extEsc(item.reason || "error")}${status}${detail}</li>`;
+    });
+    const total = envelope.total || items.length;
+    const note = envelope.truncated
+      ? `<div class="ext-sub">${_extNum(total)} total — showing the ${_extNum(envelope.listed)} most recent.</div>`
+      : "";
+    html += `<ul class="ext-errors__list">${rows.join("")}</ul>${note}`;
+  } else {
+    html += `<div class="ds-empty">No per-file detail was recorded for this run.</div>`;
   }
-  const rows = items.map((item) => {
-    const status = item.status_code != null ? ` · HTTP ${_extNum(item.status_code)}` : "";
-    const detail = item.detail ? `: ${_extEsc(item.detail)}` : "";
-    return `<li><code>${_extEsc(item.path || "(no path)")}</code> — ${_extEsc(item.reason || "error")}${status}${detail}</li>`;
-  });
-  const total = envelope.total || items.length;
-  const note = envelope.truncated
-    ? `<div class="ext-sub">${_extNum(total)} total — showing the ${_extNum(envelope.listed)} most recent.</div>`
-    : "";
-  return `<ul class="ext-errors__list">${rows.join("")}</ul>${note}`;
+  html += _extFailedOrSkippedItemsHtml(
+    report.failed_items,
+    report.failed_items_truncated,
+    "Convert-stage failures — retried by a `retry_failed` run"
+  );
+  html += _extFailedOrSkippedItemsHtml(
+    report.skipped_items,
+    report.skipped_items_truncated,
+    "Skipped — no conversion backend for this file type (not an error)"
+  );
+  return html;
+}
+
+/* Shared renderer for `report.failed_items` and `report.skipped_items` —
+   the SAME flat-list shape (`path`/`item_id`/`reason_type`/`reason`/
+   `suffix`), each capped independently of `errors_detail`'s own 200-item
+   sample (see `connectors.sharepoint.crawler._FAILED_ITEMS_CAP` = 5000).
+   `path` is `null` for an anonymize-marked scope's item — rendered as
+   "(redacted)", never blank, so a reader can tell "no path was ever kept"
+   from "the path happened to be empty". */
+function _extFailedOrSkippedItemsHtml(items, truncated, heading) {
+  if (!items || !items.length) return "";
+  const rows = items
+    .map((item) => {
+      const path = item.path != null ? _extEsc(item.path) : `<em>(redacted)</em>`;
+      return `<li><code>${path}</code> — ${_extEsc(item.reason || item.reason_type || "")}</li>`;
+    })
+    .join("");
+  const note = truncated ? `<div class="ext-sub">list truncated — not every failure is shown.</div>` : "";
+  return `<div class="ext-sub" style="margin-top:8px;"><strong>${_extEsc(heading)}</strong></div><ul class="ext-errors__list">${rows}</ul>${note}`;
 }
 
 /* The `Run` fact row. Counters are absolute; the caption names the moment
@@ -8119,6 +8161,11 @@ function _extRunRowHtml(connId, st) {
     // healthy just because its one visible warning happens to be 7 oversize
     // files while 1,263 others failed silently underneath it.
     if (last.errors) sub += _extErrorsSummaryHtml(connId, last.id, last.errors);
+    if (last.skipped_unsupported) {
+      // Never an error — nothing was attempted, so this reads as a neutral
+      // fact, not a warning, distinct from the danger-toned line above.
+      sub += `<div class="ext-sub">${_extNum(last.skipped_unsupported)} file${last.skipped_unsupported === 1 ? "" : "s"} skipped — unsupported type, not an error</div>`;
+    }
     if (last.skips_total) {
       sub += `<div class="ext-sub ext-warn">${_extNum(last.skips_total)} document${last.skips_total === 1 ? "" : "s"} not indexed — see the run</div>`;
     }
@@ -8453,6 +8500,9 @@ function _extRunsHtml(connId, body) {
     // Same severity-first ordering as the card's own last-run block: a
     // failure reads before a policy skip.
     if (run.errors) detail += _extErrorsSummaryHtml(connId, run.id, run.errors);
+    if (run.skipped_unsupported) {
+      detail += `<div class="ext-sub">${_extNum(run.skipped_unsupported)} file${run.skipped_unsupported === 1 ? "" : "s"} skipped — unsupported type, not an error</div>`;
+    }
     if (run.skips_total) {
       const listed = run.skips_listed != null && run.skips_listed !== run.skips_total
         ? ` (${_extNum(run.skips_listed)} listed by name)`

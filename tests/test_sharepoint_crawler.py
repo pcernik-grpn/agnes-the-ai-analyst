@@ -266,6 +266,7 @@ def _run(
     monkeypatch,
     scopes: Optional[List[str]] = None,
     force_reprocess: bool = False,
+    retry_failed: bool = False,
 ) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
@@ -276,6 +277,8 @@ def _run(
         payload["scopes"] = scopes
     if force_reprocess:
         payload["force_reprocess"] = True
+    if retry_failed:
+        payload["retry_failed"] = True
     return crawler.run_builtin_crawl(payload)
 
 
@@ -758,6 +761,44 @@ class TestFailureRetryQueue:
         assert third["item_retry_given_up"] == 0
         assert third["retry_backlog"]["given_up"] == 1
 
+    def test_retry_failed_gives_a_given_up_item_one_more_chance_without_a_full_resync(self, crawl_env, monkeypatch):
+        """The admin-facing ``retry_failed`` run option (``POST …/extract``
+        ``{"retry_failed": true}``): the cheap alternative to ``resync`` for
+        a connection with a handful of permanently-stuck items — no full
+        re-enumeration, just one more pass over this drive's own backlog,
+        including entries already ``given_up``."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+        recovered = {"value": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response() if recovered["value"] else httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        second = _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["given_up"] is True
+
+        # An ORDINARY run (no `retry_failed`) leaves a given-up item alone —
+        # baseline confirming the flag is what makes the difference below.
+        plain = _run(connection, monkeypatch)
+        assert plain["item_retry_recovered"] == 0
+        assert "graph:item1" in _state(crawl_env)["failed_items"]
+
+        recovered["value"] = True
+        retried = _run(connection, monkeypatch, retry_failed=True)
+
+        assert retried["item_retry_recovered"] == 1
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item1"
+        assert "graph:item1" not in _state(crawl_env)["failed_items"]
+        assert second["retry_backlog"]["given_up"] == 1  # sanity: it really was stuck before the retry
+
 
 class TestForcedResync:
     def test_resync_flag_re_enumerates_from_scratch_but_keeps_ctags(self, crawl_env, monkeypatch):
@@ -1089,6 +1130,152 @@ class TestConversion:
 
         assert report["convert_failed"] == 1
         assert FakeIngestor.instances[-1].ingested == []
+
+
+# --------------------------------------------------------------------------
+# Failed/skipped item visibility (owner decision 2026-09-02, live whole-site
+# crawl finding: a conversion failure was invisible outside the worker log
+# and the delta cursor moved past it for good).
+# --------------------------------------------------------------------------
+
+
+class TestFailedAndSkippedItemVisibility:
+    def test_a_convert_failure_is_recorded_with_item_id_drive_id_and_suffix(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(RuntimeError("nope"))
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["failed_items_truncated"] is False
+        row = report["failed_items"][0]
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+        assert row["reason_type"] == "convert_failed"
+        assert row["suffix"] == ".docx"
+        assert row["path"].endswith("brief.docx")
+        assert "nope" in row["reason"]
+
+    def test_convert_empty_is_recorded_in_failed_items_but_never_counted_an_error(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert len(report["failed_items"]) == 1
+        assert report["failed_items"][0]["reason_type"] == "convert_empty"
+
+    def test_an_anonymized_scope_records_no_raw_path_for_a_failed_item(self, crawl_env, monkeypatch):
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(RuntimeError("nope"))
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        row = report["failed_items"][0]
+        assert row["path"] is None
+        # Never redacted away — these are opaque Graph identifiers, not
+        # document content, and `retry_failed` needs them.
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+
+    def test_a_format_with_no_conversion_backend_is_skipped_never_an_error(self, crawl_env, monkeypatch):
+        from connectors.sharepoint.convert import UnsupportedConversionFormat
+
+        def _boom(path, mime):
+            raise UnsupportedConversionFormat("deck.pbix", "no conversion backend recognizes this file type")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="deck.pbix")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert report["convert_failed"] == 0
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_items_truncated"] is False
+        row = report["skipped_items"][0]
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+        assert row["reason_type"] == "unsupported_type"
+        assert row["suffix"] == ".pbix"
+        assert row["path"].endswith("deck.pbix")
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_failed_items_is_bounded_with_an_honest_truncated_flag(self):
+        stats = crawler.CrawlStats()
+        for i in range(crawler._FAILED_ITEMS_CAP + 50):
+            stats.note_failed_item(
+                path=f"Reports/f{i}.docx",
+                item_id=f"item{i}",
+                drive_id="b!drive1",
+                reason_type="convert_failed",
+                reason="boom",
+                suffix=".docx",
+            )
+
+        report = stats.report(max_file_mb=50)
+        assert len(report["failed_items"]) == crawler._FAILED_ITEMS_CAP
+        assert report["failed_items_truncated"] is True
+
+    def test_skipped_items_is_bounded_with_an_honest_truncated_flag(self):
+        stats = crawler.CrawlStats()
+        for i in range(crawler._FAILED_ITEMS_CAP + 50):
+            stats.note_skipped_unsupported(
+                path=f"Reports/f{i}.pbix",
+                item_id=f"item{i}",
+                drive_id="b!drive1",
+                reason="no backend",
+                suffix=".pbix",
+            )
+
+        report = stats.report(max_file_mb=50)
+        assert len(report["skipped_items"]) == crawler._FAILED_ITEMS_CAP
+        assert report["skipped_items_truncated"] is True
+        assert report["skipped_unsupported"] == crawler._FAILED_ITEMS_CAP + 50
+
+    def test_a_run_with_nothing_wrong_reports_empty_lists(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["failed_items"] == []
+        assert report["failed_items_truncated"] is False
+        assert report["skipped_items"] == []
+        assert report["skipped_items_truncated"] is False
+        assert report["skipped_unsupported"] == 0
 
 
 class TestConversionCrashIsolation:

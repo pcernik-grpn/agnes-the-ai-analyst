@@ -170,6 +170,17 @@ _OVERSIZE_SAMPLE = 20
 #: itself is capped to at ``finish()`` — so the in-memory sample and the
 #: stored one never disagree about how many are honestly kept.
 _ERROR_SAMPLE = 200
+#: Cap on the per-run ``failed_items``/``skipped_items`` lists an admin can
+#: retry or just read (owner decision 2026-09-02, live whole-site crawl
+#: finding: a conversion failure was invisible outside the worker log and
+#: the delta cursor moved past it for good). Far larger than
+#: :data:`_ERROR_SAMPLE` on purpose — that sample is a diagnostic preview,
+#: this list is what ``retry_failed`` and an admin reading the run actually
+#: work from, so it needs to name every failure a realistic bad run
+#: produces, not just the first couple hundred. A pathological run beyond
+#: this many still gets an honest ``*_truncated: true`` rather than an
+#: unbounded row.
+_FAILED_ITEMS_CAP = 5000
 #: Completed items kept in the live checkpoint's `activity.recent` list.
 _RECENT_ACTIVITY_SAMPLE = 5
 #: A conversion worker is recycled after converting this many documents,
@@ -1043,6 +1054,40 @@ class CrawlStats:
     #: decisions, not failures, and never land here; only the reasons that
     #: also bump :attr:`errors` do. See :meth:`note_error`.
     errors_detail: List[Dict[str, Any]] = field(default_factory=list)
+    #: A document that could not be added to the corpus at the CONVERT
+    #: stage — ``convert_failed`` (a backend was tried and failed: a
+    #: markitdown/pypdfium2 exception, a native crash, a per-item timeout —
+    #: the caller words all three into one ``detail`` string already) or
+    #: ``convert_empty`` (converted fine, produced no text). Unlike
+    #: ``errors_detail`` above, an admin can act on this list directly —
+    #: it carries ``item_id``/``drive_id`` (:meth:`note_failed_item`), which
+    #: is what an operator-requested retry (``retry_failed``) needs to name
+    #: the exact item, and it survives past this run's ``errors_detail``
+    #: sample because it is capped far larger
+    #: (:data:`_FAILED_ITEMS_CAP` = 5000, not :data:`_ERROR_SAMPLE`). Never
+    #: the raw ``path`` for an anonymize-marked scope's item — see
+    #: :meth:`note_failed_item`.
+    failed_items: List[Dict[str, Any]] = field(default_factory=list)
+    #: How many :meth:`note_failed_item` calls this run made, UNCAPPED —
+    #: the true count behind :attr:`failed_items`, so ``report()`` can say
+    #: honestly whether the stored list is the whole story.
+    _failed_items_seen: int = field(default=0, repr=False, compare=False)
+    #: A file no conversion backend even attempts — video/audio containers
+    #: with no usable codec path, Power BI ``.pbix``, OneNote ``.one``, and
+    #: similar formats (see ``connectors.sharepoint.convert.
+    #: UnsupportedConversionFormat``). Deliberately NOT an error: nothing was
+    #: attempted and nothing failed, so it must never inflate ``errors`` or
+    #: ``convert_failed`` the way a genuine conversion failure does — see
+    #: :meth:`note_skipped_unsupported`.
+    skipped_unsupported: int = 0
+    #: Itemized counterpart to :attr:`skipped_unsupported`, same shape and
+    #: same cap as :attr:`failed_items` — kept as a SEPARATE list (never
+    #: merged into ``failed_items``) so a caller can tell "we didn't even
+    #: try" from "we tried and it didn't work" without inspecting each row.
+    skipped_items: List[Dict[str, Any]] = field(default_factory=list)
+    #: Uncapped count behind :attr:`skipped_items`, mirroring
+    #: :attr:`_failed_items_seen`.
+    _skipped_items_seen: int = field(default=0, repr=False, compare=False)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -1198,6 +1243,73 @@ class CrawlStats:
             self.errors_detail.append({"path": path, "reason": reason, "detail": detail, "status_code": status_code})
             del self.errors_detail[_ERROR_SAMPLE:]
 
+    def note_failed_item(
+        self,
+        *,
+        path: Optional[str],
+        item_id: str,
+        drive_id: str,
+        reason_type: str,
+        reason: str,
+        suffix: str,
+    ) -> None:
+        """One document that could not be added to the corpus at the
+        convert stage — ``reason_type`` is ``"convert_failed"`` or
+        ``"convert_empty"`` (see :attr:`failed_items`'s docstring).
+
+        ``path`` must already be ``None`` for an anonymize-marked scope's
+        item — the caller (:func:`_process_item`) decides that, mirroring
+        the existing rule that keeps only the exception TYPE, never the
+        message, for that scope's ``convert_failed`` detail (see
+        :func:`_convert_failure_detail`). ``item_id``/``drive_id`` are Graph
+        object identifiers, not document content, so they are kept
+        regardless of ``anonymize`` — they are what a later
+        ``retry_failed`` run, or an admin reading this list, needs to name
+        the item. ``reason`` is truncated to 200 characters — this is a
+        summary row, not the full ``errors_detail`` message.
+        """
+        with self._lock:
+            self._failed_items_seen += 1
+            self.failed_items.append(
+                {
+                    "path": path,
+                    "item_id": item_id,
+                    "drive_id": drive_id,
+                    "reason_type": reason_type,
+                    "reason": (reason or "")[:200],
+                    "suffix": suffix,
+                }
+            )
+            del self.failed_items[_FAILED_ITEMS_CAP:]
+
+    def note_skipped_unsupported(
+        self,
+        *,
+        path: Optional[str],
+        item_id: str,
+        drive_id: str,
+        reason: str,
+        suffix: str,
+    ) -> None:
+        """One document no conversion backend even attempted — never an
+        error, never a retry candidate (see :attr:`skipped_unsupported`'s
+        docstring). Same anonymize rule as :meth:`note_failed_item`: ``path``
+        is ``None`` when the caller's scope is anonymize-marked."""
+        with self._lock:
+            self.skipped_unsupported += 1
+            self._skipped_items_seen += 1
+            self.skipped_items.append(
+                {
+                    "path": path,
+                    "item_id": item_id,
+                    "drive_id": drive_id,
+                    "reason_type": "unsupported_type",
+                    "reason": (reason or "")[:200],
+                    "suffix": suffix,
+                }
+            )
+            del self.skipped_items[_FAILED_ITEMS_CAP:]
+
     def enter_item_activity(self, path: str) -> int:
         """One file's download/convert/ingest pipeline STARTING, for the
         live ``activity`` checkpoint block. Returns a token to pass back to
@@ -1270,6 +1382,9 @@ class CrawlStats:
             "errors": self.errors,
             "convert_failed": self.convert_failed,
             "anonymize_failed": self.anonymize_failed,
+            # Never an error — see `skipped_unsupported`'s docstring: no
+            # backend was even attempted, so nothing failed.
+            "skipped_unsupported": self.skipped_unsupported,
             "excluded_subtree_skips": self.excluded_subtree_skips,
             "permission_skips": self.permission_skips,
             "filtered_by_age": self.filtered_by_age,
@@ -1324,6 +1439,23 @@ class CrawlStats:
             # but has no single file to name, so it is counted here without
             # a row of its own.
             "errors_detail": cap_skips(list(self.errors_detail), total=self.errors),
+            # Retry-able convert-stage failures (`failed_items`'s docstring)
+            # — the surface an admin reads to see WHICH documents are
+            # missing and `retry_failed` (`run_builtin_crawl`) works from.
+            # A PLAIN list, not `cap_skips`'s envelope: that helper's own
+            # cap (`extraction_runs_pg._SKIPS_CAP` = 200) is a different,
+            # smaller number than this list's own (`_FAILED_ITEMS_CAP` =
+            # 5000, already applied at `note_failed_item()` time), so
+            # reusing it here would silently re-truncate down to 200.
+            # `failed_items_truncated` names the same "list is shorter than
+            # the true count" fact `cap_skips`'s `truncated` would, just
+            # against this list's own cap.
+            "failed_items": list(self.failed_items),
+            "failed_items_truncated": self._failed_items_seen > len(self.failed_items),
+            # Never attempted, never an error — see `skipped_unsupported`'s
+            # docstring. Same shape/cap discipline as `failed_items` above.
+            "skipped_items": list(self.skipped_items),
+            "skipped_items_truncated": self._skipped_items_seen > len(self.skipped_items),
         }
 
 
@@ -2889,7 +3021,7 @@ class _PreparedDocument:
     needs no branch of its own on ``anonymize`` to know which to use.
     """
 
-    outcome: str  # "ok" | "convert_failed" | "convert_empty" | "anonymize_failed"
+    outcome: str  # "ok" | "convert_failed" | "convert_empty" | "convert_unsupported" | "anonymize_failed"
     markdown: str = ""
     source_sha256: str = ""
     path: str = ""
@@ -3077,6 +3209,13 @@ def _prepare_document(
     gate.
     """
     source_sha256 = _sha256_file(tmp_path)
+    # Lazy, and only needed to catch a specific exception TYPE (the pool
+    # path below never imports this module at all — it only compares the
+    # class NAME the child sent back over the pipe) — see
+    # `connectors.sharepoint.convert.UnsupportedConversionFormat`'s
+    # docstring for why this is counted apart from `convert_failed`.
+    from connectors.sharepoint.convert import UnsupportedConversionFormat
+
     try:
         if convert_pool is not None:
             outcome = convert_pool.convert(convert_slot, tmp_path, mime)
@@ -3085,6 +3224,9 @@ def _prepare_document(
                     detail = "exceeded its own memory limit"
                 elif outcome.detail_type == "ConvertedTooLarge":
                     detail = outcome.detail_message
+                elif outcome.detail_type == "UnsupportedConversionFormat":
+                    logger.info("sharepoint crawl: no conversion backend for %s — skipped, not an error", path)
+                    return _PreparedDocument("convert_unsupported", detail=outcome.detail_message)
                 else:
                     detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
                 logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
@@ -3093,6 +3235,14 @@ def _prepare_document(
         else:
             converted = convert_to_markdown(tmp_path, mime)
             markdown = str(getattr(converted, "markdown", "") or "")
+    except UnsupportedConversionFormat as exc:
+        # Only reachable via the non-pool (inline) path above — the pool
+        # path never raises here, it reports `outcome.ok=False` instead
+        # (see the branch just above). Kept distinct from the broad
+        # `except Exception` below for the same reason that branch is:
+        # nothing was attempted, so this is a skip, not a failure.
+        logger.info("sharepoint crawl: no conversion backend for %s — skipped, not an error", path)
+        return _PreparedDocument("convert_unsupported", detail=str(exc))
     except _ConvertTimedOut as exc:
         # The child was still ALIVE but did not answer within the per-item
         # time bound (see `_DEFAULT_ITEM_TIMEOUT_S`) — killed and, when a
@@ -3360,9 +3510,27 @@ async def _process_item(
             # The local copy never persists — success, skip, or failure.
             tmp_path.unlink(missing_ok=True)
 
+        # `path` for the operator-facing `failed_items`/`skipped_items` lists
+        # below — never the raw drive-relative path for an anonymize-marked
+        # scope, mirroring the same rule `_convert_failure_detail` already
+        # applies to the `reason` text (only the exception TYPE survives for
+        # that scope, never the message). `item_id`/`drive_id` are opaque
+        # Graph identifiers, not document content, so they are kept
+        # regardless — they are what a later `retry_failed` run needs.
+        record_path = None if ctx.anonymize else path
+        item_id = str(item.get("id") or "")
+        suffix = Path(name).suffix.lower()
         if prepared.outcome == "convert_failed":
             stats.add(convert_failed=1, errors=1)
             stats.note_error(path, "convert_failed", detail=prepared.detail)
+            stats.note_failed_item(
+                path=record_path,
+                item_id=item_id,
+                drive_id=target.drive_id,
+                reason_type="convert_failed",
+                reason=prepared.detail,
+                suffix=suffix,
+            )
             outcome_label = "convert_failed"
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
@@ -3370,8 +3538,34 @@ async def _process_item(
             # Not a failure to retry: the document converted fine and
             # genuinely has no text. Unlike the other three outcomes here,
             # running it through the pipeline again cannot change the answer.
+            # Still recorded in `failed_items` (2026-09-02 owner decision:
+            # visibility for "why is this document missing" must not depend
+            # on the retry queue) — never bumps `errors`.
             stats.add(convert_failed=1)
+            stats.note_failed_item(
+                path=record_path,
+                item_id=item_id,
+                drive_id=target.drive_id,
+                reason_type="convert_empty",
+                reason="conversion succeeded but produced no extractable text",
+                suffix=suffix,
+            )
             outcome_label = "convert_empty"
+            return
+        if prepared.outcome == "convert_unsupported":
+            # No backend was even attempted — never an error, never a
+            # retry candidate (see `CrawlStats.skipped_unsupported`'s
+            # docstring). Listed separately from `failed_items` so a reader
+            # never has to inspect a reason string to tell "we didn't try"
+            # from "we tried and it failed".
+            stats.note_skipped_unsupported(
+                path=record_path,
+                item_id=item_id,
+                drive_id=target.drive_id,
+                reason=prepared.detail,
+                suffix=suffix,
+            )
+            outcome_label = "convert_unsupported"
             return
         if prepared.outcome == "anonymize_failed":
             stats.add(anonymize_failed=1)
@@ -3759,6 +3953,7 @@ async def _retry_failed_items(
     deadline: Optional[_Deadline],
     recorder: Optional["_RunRecorder"],
     convert_pool: Optional[_ConvertProcessPool] = None,
+    include_given_up: bool = False,
 ) -> None:
     """Replay every item THIS drive previously failed on, before asking
     Graph for what changed.
@@ -3774,6 +3969,17 @@ async def _retry_failed_items(
     :data:`_MAX_ITEM_RETRY_ATTEMPTS` is skipped here — it stays recorded,
     just not retried every run.
 
+    ``include_given_up`` (the admin-requested ``retry_failed`` run option,
+    see :func:`run_builtin_crawl`) bypasses the ``given_up`` filter below —
+    the cheap, surgical alternative to ``resync`` for a connection with a
+    handful of permanently-stuck items: no full re-enumeration, just one
+    more pass over exactly what this drive's own backlog already knows is
+    broken, by the SAME item dict a normal run replays (never a fresh Graph
+    metadata fetch — see the docstring above). A repeat failure counts
+    normally (``_note_retry`` leaves ``given_up`` set; it does not re-trip
+    the already-crossed bound), so an item that is still broken after an
+    operator's retry still reads as given-up, honestly.
+
     Sequential and outside the page/concurrency machinery on purpose: the
     backlog is normally tiny (persistently-failing files, not a fresh
     page), and giving it its own governor/pool would buy nothing but risk
@@ -3785,7 +3991,7 @@ async def _retry_failed_items(
         for stable_id, entry in failed_items.items()
         if entry.get("state_key") == target.state_key
         and isinstance(entry.get("item"), dict)
-        and not entry.get("given_up")
+        and (include_given_up or not entry.get("given_up"))
     ]
     if not pending:
         return
@@ -3847,9 +4053,14 @@ async def _crawl_drive(
     stop_watcher: Optional["_StopWatcher"] = None,
     force_reprocess: bool = False,
     convert_pool: Optional[_ConvertProcessPool] = None,
+    retry_failed: bool = False,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
+
+    ``retry_failed`` (the admin-requested run option, see
+    :func:`run_builtin_crawl`) is passed straight to :func:`_retry_failed_items`
+    as ``include_given_up`` — see that function's docstring.
 
     ``recorder`` (optional, defaults to no recording) rides the checkpoint
     this function already writes — see :class:`_RunRecorder`.
@@ -3904,6 +4115,7 @@ async def _crawl_drive(
         deadline=deadline,
         recorder=recorder,
         convert_pool=convert_pool,
+        include_given_up=retry_failed,
     )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
@@ -4491,6 +4703,7 @@ async def _run_crawl_async(
     timeout_s: Optional[float] = None,
     concurrency: Optional[int] = None,
     force_reprocess: bool = False,
+    retry_failed: bool = False,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     # A stop requested for a PREVIOUS run (already finished, failed, or one
@@ -4632,6 +4845,7 @@ async def _run_crawl_async(
                         stop_watcher=stop_watcher,
                         convert_pool=convert_pool,
                         force_reprocess=force_reprocess,
+                        retry_failed=retry_failed,
                     )
         finally:
             # Done converting for this run either way (success, a scope
@@ -4834,8 +5048,16 @@ def run_builtin_crawl(payload: dict) -> dict:
     up front: an interrupted forced run leaves the connection exactly as
     resumable as before the run started, and the fresh deltaLink/cTags a
     completed forced run observes are what land in state at the end, the
-    same as any other run). Credentials are resolved from the row, never
-    from the payload.
+    same as any other run), and ``retry_failed`` (truthy — this run's
+    per-drive backlog replay (see the module docstring's "a per-item
+    failure never advances past itself") ALSO includes items already
+    ``given_up`` on, not just the ones still under
+    :data:`_MAX_ITEM_RETRY_ATTEMPTS`; every other drive behaviour is
+    unchanged, including the ordinary incremental delta walk that follows
+    the backlog replay. The cheap, targeted alternative to ``resync`` for a
+    connection with a handful of permanently-stuck documents — see
+    :func:`_retry_failed_items`'s ``include_given_up`` for the mechanism).
+    Credentials are resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
     this connection's crawl state, so the job result and the state file can
@@ -4873,6 +5095,7 @@ def run_builtin_crawl(payload: dict) -> dict:
                 timeout_s=payload.get("timeout_s"),
                 concurrency=payload.get("concurrency"),
                 force_reprocess=bool(payload.get("force_reprocess")),
+                retry_failed=bool(payload.get("retry_failed")),
             )
         )
     except SharePointSettingsError as exc:

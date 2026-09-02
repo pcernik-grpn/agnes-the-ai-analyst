@@ -2403,6 +2403,26 @@ class TestExtractionTrigger:
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "force_reprocess": True}
 
+    def test_retry_failed_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """The targeted alternative to `resync` (see
+        `connectors.sharepoint.crawler._retry_failed_items`'s
+        `include_given_up`): no key when unset, `retry_failed: true` when
+        the admin ticks the box — and nothing else rides along uninvited."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-retry-failed")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_failed": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "retry_failed": True}
+
     def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
         """The crawler would clamp these silently; the endpoint refuses them
         instead, where the admin can see why the run isn't what they asked
