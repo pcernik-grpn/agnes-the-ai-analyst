@@ -6801,12 +6801,12 @@ async def update_table(
             finally:
                 probe_conn.close()
 
-        # Capture the fully-validated policy fields before stripping them
-        # out of ``merged`` (register() doesn't accept them — see the v116
-        # comment above) so the setter calls after register() below persist
-        # exactly what was just validated.
-        _final_access_policy_sql = merged.get("access_policy_sql")
-        _final_access_policy_note = merged.get("access_policy_note")
+        # Strip the policy fields out of ``merged`` now that every check
+        # above has been evaluated against them (register() doesn't accept
+        # them — see the v116 comment above). What gets PERSISTED for those
+        # fields is re-derived under the write lock below, against the
+        # registry row as it is THERE rather than against this pre-lock
+        # snapshot.
         for _policy_key in (
             "access_policy_sql",
             "access_policy_note",
@@ -6823,35 +6823,6 @@ async def update_table(
 
         repo.register(id=table_id, **merged)
 
-        # finding 1 (second follow-up review of PR #2023) -- keyed on an
-        # ACTUAL change, not on the mere presence of the keys. The Edit modal
-        # round-trips every field, so a save that touched something else
-        # entirely re-sends the identical policy body + note; treating that as
-        # a write re-stamped ``access_policy_updated_at``/``_updated_by``,
-        # emitted a dedicated ``access_policy.set`` audit row, and appended a
-        # history revision that changed nothing -- three lies about a policy
-        # nobody edited. Compares the FINAL merged value against the stored
-        # one, exactly like the ``policy_mapping`` sibling just below.
-        # ``_norm_policy_text`` folds ``None`` and ``""`` together so a
-        # cleared note reads as cleared on both sides, while a genuine clear
-        # (a real body -> ``None``) still counts as a change.
-        _policy_body_written = ("access_policy_sql" in updates or "access_policy_note" in updates) and (
-            _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(existing.get("access_policy_sql"))
-            or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(existing.get("access_policy_note"))
-        )
-        _final_policy_mapping = bool(
-            updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
-        )
-        # finding 2 (follow-up review of PR #2023) — a mapping-only edit is a
-        # policy edit as far as the history is concerned: a revision stores
-        # ``policy_mapping`` and the panel's diff names a mapping toggle
-        # explicitly. Only an ACTUAL flip counts, though — the Edit modal
-        # round-trips every field, so `"policy_mapping" in updates` alone
-        # would fill the history with rows that changed nothing.
-        _policy_mapping_flipped = "policy_mapping" in updates and _final_policy_mapping != bool(
-            existing.get("policy_mapping")
-        )
-
         # finding 1 (follow-up review of PR #2023) — hold a per-table lock
         # across BOTH the policy write and its history append. Without it,
         # two concurrent PUTs on this table can commit policy A, commit
@@ -6862,14 +6833,66 @@ async def update_table(
         # ``_access_policy_write_lock`` and ``_record_access_policy_revision``.
         # A DuckDB instance has no revision store, hence nothing to misorder:
         # there the lock is a nullcontext and this runs exactly as before.
-        # Taken only for a PUT that actually writes a policy field, so an
-        # unrelated edit neither waits on nor blocks a policy save.
+        # Taken for any PUT that CARRIES a policy field — whether it actually
+        # CHANGES one can only be judged against the row inside the lock (see
+        # below), so that judgement has to be made under it. An edit that
+        # touches no policy field at all still neither waits on nor blocks a
+        # policy save.
         _policy_lock = (
             _access_policy_write_lock(table_id)
-            if (_policy_body_written or _policy_mapping_flipped)
+            if any(k in updates for k in ("access_policy_sql", "access_policy_note", "policy_mapping"))
             else contextlib.nullcontext()
         )
         with _policy_lock:
+            # finding 3 (third follow-up review of PR #2023) — re-read the
+            # registry row INSIDE the lock and merge this PUT's policy fields
+            # onto THAT, not onto the pre-lock ``existing``/``merged``
+            # snapshot. Otherwise: request A edits the body and commits under
+            # the lock; request B (a mapping-only flip) computed its finals
+            # from the pre-A row, takes the lock, and both writes back and
+            # records A's PREDECESSOR body — the newest revision holds a
+            # policy nobody saved, so "restore this version" restores the
+            # wrong one. Only the policy write and its revision snapshot need
+            # the current row; every validation and interlock above
+            # legitimately runs against the pre-lock one (they judge the
+            # shape this PUT is asking for, which A cannot change).
+            _current = repo.get(table_id) or existing
+            _final_access_policy_sql = (
+                updates["access_policy_sql"] if "access_policy_sql" in updates else _current.get("access_policy_sql")
+            )
+            _final_access_policy_note = (
+                updates["access_policy_note"] if "access_policy_note" in updates else _current.get("access_policy_note")
+            )
+            # finding 1 (second follow-up review of PR #2023) -- keyed on an
+            # ACTUAL change, not on the mere presence of the keys. The Edit
+            # modal round-trips every field, so a save that touched something
+            # else entirely re-sends the identical policy body + note;
+            # treating that as a write re-stamped ``access_policy_updated_at``
+            # /``_updated_by``, emitted a dedicated ``access_policy.set``
+            # audit row, and appended a history revision that changed nothing
+            # -- three lies about a policy nobody edited. Compares the FINAL
+            # value against the stored one, exactly like the
+            # ``policy_mapping`` sibling just below. ``_norm_policy_text``
+            # folds ``None`` and ``""`` together so a cleared note reads as
+            # cleared on both sides, while a genuine clear (a real body ->
+            # ``None``) still counts as a change.
+            _policy_body_written = ("access_policy_sql" in updates or "access_policy_note" in updates) and (
+                _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(_current.get("access_policy_sql"))
+                or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(_current.get("access_policy_note"))
+            )
+            _final_policy_mapping = bool(
+                updates["policy_mapping"] if "policy_mapping" in updates else _current.get("policy_mapping")
+            )
+            # finding 2 (follow-up review of PR #2023) — a mapping-only edit
+            # is a policy edit as far as the history is concerned: a revision
+            # stores ``policy_mapping`` and the panel's diff names a mapping
+            # toggle explicitly. Only an ACTUAL flip counts, though — the Edit
+            # modal round-trips every field, so `"policy_mapping" in updates`
+            # alone would fill the history with rows that changed nothing.
+            _policy_mapping_flipped = "policy_mapping" in updates and _final_policy_mapping != bool(
+                _current.get("policy_mapping")
+            )
+
             # Persist the access-policy fields through their dedicated setters
             # (Task 2's set_access_policy/set_policy_mapping) — only called when
             # this PUT actually touched one of them, so an unrelated edit never
@@ -6897,12 +6920,25 @@ async def update_table(
             # never enters the trail), so the trail records THAT a policy changed
             # but never what it was — and restoring needs the body.
             if _policy_body_written or _policy_mapping_flipped:
+                # Snapshot the row as PERSISTED, re-read after the setters,
+                # rather than the computed finals: a mapping-only flip leaves
+                # the body untouched, so its "final" body is whatever is
+                # stored — and only a read can say what that is. Nothing can
+                # slip between the setters and this read, because we hold the
+                # per-table write lock; so unlike the computed finals, this
+                # snapshot cannot disagree with the database. (Falls back to
+                # the computed values only if the row vanished underneath us.)
+                _persisted = repo.get(table_id) or {
+                    "access_policy_sql": _final_access_policy_sql,
+                    "access_policy_note": _final_access_policy_note,
+                    "policy_mapping": _final_policy_mapping,
+                }
                 _record_access_policy_revision(
                     table_id,
-                    existing=existing,
-                    policy_sql=_final_access_policy_sql,
-                    policy_note=_final_access_policy_note,
-                    policy_mapping=_final_policy_mapping,
+                    existing=_current,
+                    policy_sql=_persisted.get("access_policy_sql"),
+                    policy_note=_persisted.get("access_policy_note"),
+                    policy_mapping=bool(_persisted.get("policy_mapping")),
                     saved_by=user.get("email"),
                 )
 

@@ -18,6 +18,8 @@ order, and the restore round-trip) lives in
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 
@@ -528,3 +530,105 @@ class TestNoOpResendsRecordNothing:
         assert r.status_code == 200, r.text
         assert fake_store.records == [], fake_store.records
         assert self._audit_rows(action="access_policy.clear", resource=table_id) == []
+
+
+class TestRevisionSnapshotIsTakenUnderTheLock:
+    """finding 3 (third follow-up review of PR #2023): the merged policy
+    values a save persists (and records) must be derived from the registry
+    row as it is INSIDE the per-table write lock, not from the pre-lock
+    snapshot the handler read on the way in.
+
+    The race the lock alone does not close: request A edits the body and
+    commits under the lock; request B -- a mapping-only flip -- already
+    computed its finals from the pre-A row, then takes the lock and records
+    a revision carrying A's PREDECESSOR body. The newest revision is then a
+    policy nobody saved, and "restore this version" restores the wrong one.
+    """
+
+    def _policied_table(self, c, token, store, name, *, sql, note):
+        table_id = _register(c, token, name=name, server_only=True)
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": sql, "access_policy_note": note},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(store.records) == 1
+        return table_id
+
+    def test_mapping_only_flip_records_the_body_committed_under_the_lock(self, seeded_app, fake_store, monkeypatch):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(
+            c,
+            token,
+            fake_store,
+            "rev_race_snapshot",
+            sql="SELECT * FROM rev_race_snapshot WHERE 1 = 1",
+            note="the body request B read on its way in",
+        )
+
+        from src.repositories import table_registry_repo
+
+        a_sql = "SELECT * FROM rev_race_snapshot WHERE 2 = 2"
+        a_note = "request A's newer reason"
+
+        @contextlib.contextmanager
+        def _racing_lock(locked_table_id: str):
+            # Request A commits between B's pre-lock read and B taking the
+            # lock -- i.e. exactly when B can no longer see it without
+            # re-reading. Writing it from ``__enter__`` is what makes this
+            # deterministic instead of thread-timing-dependent.
+            table_registry_repo().set_access_policy(
+                locked_table_id, sql=a_sql, note=a_note, updated_by="request-a@example.com"
+            )
+            fake_store.events.append(f"lock_enter:{locked_table_id}")
+            try:
+                yield
+            finally:
+                fake_store.events.append(f"lock_exit:{locked_table_id}")
+
+        monkeypatch.setattr(fake_store, "policy_write_lock", _racing_lock)
+
+        r = c.put(f"/api/admin/registry/{table_id}", json={"policy_mapping": True}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+
+        row = table_registry_repo().get(table_id)
+        assert row["access_policy_sql"] == a_sql, "request A's body must survive a mapping-only flip"
+
+        latest = fake_store.records[-1]
+        assert latest["policy_sql"] == row["access_policy_sql"]
+        assert latest["policy_note"] == row["access_policy_note"] == a_note
+        assert latest["policy_mapping"] is True, "and it carries request B's own mapping flip"
+
+    def test_sequential_body_edit_then_mapping_flip_records_both_in_order(self, seeded_app, fake_store):
+        """The uncontended path is unchanged: two ordinary saves leave two
+        revisions, newest last, each carrying the state it saved."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(
+            c,
+            token,
+            fake_store,
+            "rev_sequential_snapshot",
+            sql="SELECT * FROM rev_sequential_snapshot WHERE 1 = 1",
+            note="v1",
+        )
+
+        second_sql = "SELECT * FROM rev_sequential_snapshot WHERE 2 = 2"
+        assert (
+            c.put(
+                f"/api/admin/registry/{table_id}",
+                json={"access_policy_sql": second_sql, "access_policy_note": "v2"},
+                headers=_auth(token),
+            ).status_code
+            == 200
+        )
+        assert (
+            c.put(f"/api/admin/registry/{table_id}", json={"policy_mapping": True}, headers=_auth(token)).status_code
+            == 200
+        )
+
+        assert [(r["policy_sql"], r["policy_note"], r["policy_mapping"]) for r in fake_store.records] == [
+            ("SELECT * FROM rev_sequential_snapshot WHERE 1 = 1", "v1", False),
+            (second_sql, "v2", False),
+            (second_sql, "v2", True),
+        ], fake_store.records

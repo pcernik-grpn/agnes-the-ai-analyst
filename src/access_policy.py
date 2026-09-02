@@ -1163,16 +1163,22 @@ def raise_if_policy_mapping_empty(
         if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
     ]
     for mapping_row in mapping_rows:
-        # `sync_state.table_id` is keyed by the registry `id` once a writer
-        # has resolved it there (B1, `src.sync_state_key`), but an older row
-        # may still be keyed by the table's `name` -- the pre-B1 convention
-        # every writer used before the registry existed (see
-        # `app/api/v2_sample.py::_not_synced_detail`, which tries the same
-        # name-then-id order for the identical reason). Looking up by `id`
-        # alone made a populated-but-name-keyed mapping table read as
-        # "never synced", refusing every query a policy joins it from.
+        # ID first, NAME only as a fallback. Every current writer keys
+        # `sync_state.table_id` by the registry `id` (B1,
+        # `src.sync_state_key`), so the id-keyed row is the one that stays
+        # current; a name-keyed row is the pre-B1 convention, kept working
+        # here because a populated-but-name-keyed mapping table otherwise
+        # read as "never synced" and refused every query a policy joins it
+        # from. The order matters because the two can COEXIST: migration
+        # `0072_sync_state_id_backfill_v124` deliberately leaves a legacy
+        # name-keyed row in place when a row already occupies the target id
+        # (`table_id` is the primary key -- backfilling would drop one row's
+        # history). Trusting the name-keyed row first then meant the stale
+        # legacy one always won: zero rows on it vetoed a healthy mapping
+        # table, and rows on it hid a mapping table that is genuinely empty
+        # now (#1979, review follow-up).
         state = None
-        for key in dict.fromkeys((mapping_row.get("name"), mapping_row.get("id"))):
+        for key in dict.fromkeys((mapping_row.get("id"), mapping_row.get("name"))):
             if not key:
                 continue
             state = sync_state_repo().get_table_state(key)

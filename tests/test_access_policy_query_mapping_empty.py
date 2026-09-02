@@ -541,6 +541,51 @@ class TestHelperNameKeyedSyncState:
             "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_c_name WHERE email = $user_email)"
         )
 
+    def test_duplicate_rows_prefer_the_populated_id_keyed_row(self, e2e_env):
+        """(d) BOTH rows exist -- migration 0072 deliberately leaves the
+        legacy name-keyed row in place when an id-keyed row already occupies
+        the target primary key. The ID row is the one every writer
+        (``src.sync_state_key``) keeps current, so a stale name-keyed row
+        showing zero rows must NOT veto a healthy mapping table."""
+        from src.access_policy import raise_if_policy_mapping_empty
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            self._seed_mapping_row(conn, table_id="mapping_d_id", name="mapping_d_name")
+            self._write_sync_state(conn, key="mapping_d_name", rows=0)
+            self._write_sync_state(conn, key="mapping_d_id", rows=7)
+        finally:
+            conn.close()
+
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_d_name WHERE email = $user_email)"
+        )
+
+    def test_duplicate_rows_report_the_id_keyed_rows_last_sync(self, e2e_env):
+        """(e) the mirror of (d): a stale name-keyed row still claiming rows
+        must not HIDE a mapping table the canonical id-keyed row records as
+        empty -- and the reported ``last_sync`` must come from that ID row."""
+        from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+        from src.db import get_system_db
+
+        conn = get_system_db()
+        try:
+            self._seed_mapping_row(conn, table_id="mapping_e_id", name="mapping_e_name")
+            self._write_sync_state(conn, key="mapping_e_name", rows=9)
+            id_state = self._write_sync_state(conn, key="mapping_e_id", rows=0)
+        finally:
+            conn.close()
+
+        assert id_state is not None
+
+        with pytest.raises(PolicyMappingEmpty) as exc_info:
+            raise_if_policy_mapping_empty(
+                "SELECT * FROM orders WHERE unit IN (SELECT unit FROM mapping_e_name WHERE email = $user_email)"
+            )
+        assert exc_info.value.mapping_table == "mapping_e_name"
+        assert exc_info.value.last_sync == id_state["last_sync"]
+
 
 class TestQueryEndpointWithNameKeyedMappingSyncState:
     """(a), end to end: a policy joining a populated but name-keyed mapping
