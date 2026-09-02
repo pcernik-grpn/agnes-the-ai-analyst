@@ -27,7 +27,8 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType, list_resource_types
-from src.grant_scopes import carrier_group_id
+from src.grant_scopes import EVERYONE_TARGET_ID, EVERYONE_TARGET_LABEL, carrier_group_id
+from src.grant_scopes import reaches_everyone
 from src.grant_scopes import normalize as normalize_scope
 from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
@@ -216,6 +217,13 @@ async def access_overview(
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
 
+    # Resolved once for the whole payload rather than per row.
+    try:
+        _carrier = carrier_group_id()
+    except Exception as e:  # noqa: BLE001 - a missing carrier must not 500 the page
+        logger.warning("access-overview: could not resolve the everyone carrier: %s", e)
+        _carrier = None
+
     groups = []
     for g in groups_rows:
         groups.append(
@@ -319,6 +327,21 @@ async def access_overview(
             # revocable kinds under "not yours", including the Library shares
             # an admin most often opens this page to check.
             "section": grant_section(r.get("source")),
+            # WHO this row reaches, as the page should label it: the
+            # `everyone` sentinel, or a group id. Sent because the page must
+            # not have to know about the carrier — an everyone-scoped row is
+            # stored against the seeded `Everyone` group and would otherwise
+            # render as that group's own grant, which is the attribution the
+            # scope exists to stop.
+            #
+            # `reaches_everyone` rather than `scope` alone, so this answers on
+            # BOTH backends: the frozen DuckDB ladder has no `scope` column,
+            # and there an everyone-grant IS a grant on the carrier. Reading
+            # the column alone would leave a DuckDB instance unable to show
+            # an Everyone audience at all.
+            "audience": (
+                EVERYONE_TARGET_ID if reaches_everyone(r, _carrier) else r["group_id"]
+            ),
             # WHO the grant reaches. NULL/absent means the members of
             # `group_id`; 'everyone' means every account, and `group_id` is
             # then a carrier the page must not attribute the grant to.
@@ -336,6 +359,49 @@ async def access_overview(
     # rendering `scope` as an audience instead of attributing the row to its
     # carrier group — that is the Access page's own work, not this
     # projection's.
+
+    # ── Audiences: what the page's list is made of ───────────────────────
+    #
+    # An audience is a group OR "everyone". `groups` above stays exactly as
+    # it was for every existing consumer; this is the shape the redesigned
+    # list reads, and it is the answer to "how does an admin see and manage
+    # what everyone gets".
+    #
+    # The everyone entry is NOT a group and says so: no member roster, no
+    # member count, nothing to administer — its reach is every account by
+    # construction. Its grant count comes from the same `reaches_everyone`
+    # test as the rows, so the count and the list can never disagree, and it
+    # works on the backend with no `scope` column.
+    _everyone_grants = [g for g in grants if g["audience"] == EVERYONE_TARGET_ID]
+    audiences = [
+        {
+            "id": EVERYONE_TARGET_ID,
+            "kind": "scope",
+            "name": EVERYONE_TARGET_LABEL,
+            # Every account, and anyone who joins later — which is the whole
+            # difference from the group this replaces.
+            "reaches_all": True,
+            "grant_count": len(_everyone_grants),
+        }
+    ] + [
+        {
+            "id": g["id"],
+            "kind": "group",
+            "name": g["name"],
+            "reaches_all": False,
+            "grant_count": g["grant_count"],
+            "member_count": g["member_count"],
+            "origin": g["origin"],
+        }
+        for g in groups
+        # The carrier is not offered as an audience of its own: its
+        # everyone-scoped rows are the entry above, and its own grants are
+        # counted there too, so listing it again would offer the same reach
+        # twice under two names. On an instance where it still holds
+        # membership-scoped rows of a withheld type they remain reachable
+        # through `groups`/`grants`, which are untouched.
+        if _carrier is None or g["id"] != _carrier
+    ]
 
     # Per-resource-type hierarchies. Driven by the registry in
     # app.resource_types — adding a new type there is the one place that
@@ -395,6 +461,7 @@ async def access_overview(
 
     return {
         "groups": groups,
+        "audiences": audiences,
         "grants": grants,
         "resources": resources,
         "families": families,

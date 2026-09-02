@@ -277,3 +277,143 @@ def test_the_overview_payload_carries_a_section_per_grant(monkeypatch):
         "a marketplace-sync row is rewritten on its next run; revoking it here "
         "does not stick, so it must not sit among rows that do"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket 04 — how an admin sees and manages what EVERYONE gets
+# ---------------------------------------------------------------------------
+
+
+def _overview(monkeypatch, rows, groups, carrier_id=None):
+    """Drive `access_overview` over a fixed set of rows."""
+    import asyncio
+
+    import app.api.access as access_mod
+
+    class _Grants:
+        def list_all(self, *a, **k):
+            return list(rows)
+
+        def count_for_group(self, gid):
+            return sum(1 for r in rows if r["group_id"] == gid)
+
+    class _Groups:
+        def list_all(self):
+            return list(groups)
+
+        def get_by_name(self, name):
+            return next((g for g in groups if g["name"] == name), None)
+
+    class _Members:
+        def count_members(self, gid):
+            return 0
+
+        def list_members_for_group(self, gid):
+            return []
+
+    monkeypatch.setattr(access_mod, "resource_grants_repo", lambda: _Grants())
+    monkeypatch.setattr(access_mod, "user_groups_repo", lambda: _Groups())
+    monkeypatch.setattr(access_mod, "user_group_members_repo", lambda: _Members())
+    monkeypatch.setattr(access_mod, "carrier_group_id", lambda: carrier_id, raising=False)
+
+    import dataclasses
+
+    from app.resource_types import enabled_resource_types
+
+    quiet = [dataclasses.replace(s, list_blocks=lambda: []) for s in enabled_resource_types()]
+    monkeypatch.setattr(access_mod, "enabled_resource_types", lambda: quiet, raising=False)
+    monkeypatch.setattr("app.resource_types.enabled_resource_types", lambda: quiet, raising=False)
+
+    return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        access_mod.access_overview(user={"id": "admin1", "email": "admin@x"})
+    )
+
+
+def _row(gid, rid, scope=None, rtype="marketplace_plugin"):
+    return {
+        "id": f"g-{rid}", "group_id": gid, "resource_type": rtype, "resource_id": rid,
+        "requirement": "available", "assigned_at": None, "assigned_by": "admin@x",
+        "source": None, "scope": scope, "group_name": "x",
+    }
+
+
+def test_everyone_is_an_audience_with_its_own_grant_count(monkeypatch):
+    """The answer to "how does an admin see and manage what everyone gets".
+
+    An everyone-scoped grant is STORED against the carrier group, so a page
+    reading `group_id` alone would render it as that group's own grant —
+    exactly the attribution the scope exists to stop. So the payload labels
+    each row's audience, and lists `everyone` as an audience in its own
+    right, with a count that comes from the same test as the rows.
+    """
+    carrier = "grp-everyone"
+    groups = [
+        {"id": carrier, "name": "Everyone", "is_system": True, "created_by": "system:seed",
+         "created_at": None, "description": None},
+        {"id": "grp-d", "name": "Delivery", "is_system": False, "created_by": "admin",
+         "created_at": None, "description": None},
+    ]
+    rows = [
+        _row(carrier, "acme/for-everyone", scope="everyone"),
+        _row("grp-d", "acme/for-delivery"),
+    ]
+    payload = _overview(monkeypatch, rows, groups, carrier_id=carrier)
+
+    by_id = {a["id"]: a for a in payload["audiences"]}
+    assert "everyone" in by_id, "no Everyone audience — the grant would be unreachable"
+    ev = by_id["everyone"]
+    assert ev["kind"] == "scope", "Everyone must not be presented as a group"
+    assert ev["reaches_all"] is True
+    assert "member_count" not in ev, (
+        "a member count on Everyone invites an admin to manage a roster that "
+        "decides nothing"
+    )
+    assert ev["grant_count"] == 1
+
+    assert carrier not in by_id, (
+        "the carrier group is listed as an audience of its own, so the same reach "
+        "is offered twice under two names"
+    )
+    assert by_id["grp-d"]["kind"] == "group"
+
+    audience_of = {g["id"]: g["audience"] for g in payload["grants"]}
+    assert audience_of["g-acme/for-everyone"] == "everyone"
+    assert audience_of["g-acme/for-delivery"] == "grp-d"
+
+
+def test_the_everyone_audience_works_without_a_scope_column(monkeypatch):
+    """On the frozen DuckDB ladder there is no `scope`, and an everyone-grant
+    IS a grant on the carrier. Reading the column alone would leave that
+    backend unable to show an Everyone audience at all — so the test is
+    `reaches_everyone`, which answers on both.
+    """
+    carrier = "grp-everyone"
+    groups = [
+        {"id": carrier, "name": "Everyone", "is_system": True, "created_by": "system:seed",
+         "created_at": None, "description": None},
+    ]
+    # No `scope` key at all — exactly what the DuckDB repo returns.
+    row = _row(carrier, "acme/for-everyone")
+    row.pop("scope")
+    payload = _overview(monkeypatch, [row], groups, carrier_id=carrier)
+
+    ev = next(a for a in payload["audiences"] if a["id"] == "everyone")
+    assert ev["grant_count"] == 1, (
+        "a DuckDB instance shows no Everyone grants, so an admin cannot see or "
+        "manage what everyone gets"
+    )
+    assert payload["grants"][0]["audience"] == "everyone"
+
+
+def test_a_missing_carrier_does_not_break_the_page(monkeypatch):
+    """An instance whose seeded group is gone still renders. The Everyone
+    audience is then empty rather than absent — the admin sees that nothing
+    reaches everyone, which is true, instead of a 500."""
+    groups = [
+        {"id": "grp-d", "name": "Delivery", "is_system": False, "created_by": "admin",
+         "created_at": None, "description": None},
+    ]
+    payload = _overview(monkeypatch, [_row("grp-d", "acme/p")], groups, carrier_id=None)
+    ev = next(a for a in payload["audiences"] if a["id"] == "everyone")
+    assert ev["grant_count"] == 0
+    assert payload["grants"][0]["audience"] == "grp-d"
