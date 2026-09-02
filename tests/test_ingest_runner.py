@@ -103,6 +103,34 @@ def test_ingest_txt_creates_chunks(e2e_env, tmp_path):
     assert row["processing_detail"]["chunk_count"] == len(chunks)
 
 
+def test_ingest_uses_preloaded_text_and_skips_the_disk_re_read(e2e_env, tmp_path):
+    """A caller that already has the document's text in memory (the
+    SharePoint crawl pipeline: `_prepare_document` converts, then
+    `_Ingestor.ingest` writes it and calls `ingest_file`) must not pay a
+    redundant read of the same content back off disk — a real, measured
+    contributor to the crawl's parent-process memory pressure (a second
+    full-size copy of the converted markdown, on top of every copy already
+    held by convert/anonymize/encode/store). Proven here by pointing
+    `storage_path` at a file that does not exist at all: if `ingest_file`
+    ever fell back to reading it, this fails loudly instead of indexing the
+    preloaded text.
+    """
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    corpus_id = _new_corpus("ing-preloaded")
+    missing_path = str(tmp_path / "does-not-exist.md")
+    file_id = _add_file(corpus_id, "doc.md", "md", missing_path)
+
+    status = ingest_file(file_id, preloaded_text="already-converted markdown body")
+    assert status == "indexed"
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_status"] == "indexed"
+    chunks = corpus_chunks_repo().list_for_file(file_id)
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "already-converted markdown body"
+
+
 def test_ingest_image_stays_pending_for_vision_slice(e2e_env, tmp_path, monkeypatch):
     import src.ingest.vision as vision
 

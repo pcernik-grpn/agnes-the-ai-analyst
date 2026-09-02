@@ -11,12 +11,20 @@ they were looking at — and the templates' own comments said so out loud
 Three LIVE pages remain, each named for what it is FOR:
 
 ===========================  ==========================================
-``/semantic-layer``          **Semantic models** — the stored documents,
-                             plus the flat metric and glossary registries
-                             as its "All metrics" / "All glossary" tabs
+``/semantic-layer``          **Definitions** — the words and numbers the
+                             organization agreed on: the stored documents
+                             on its Models tab, and the flat metric and
+                             glossary registries on the other two
 ``/admin/semantic-layer``    **Semantic layer health** — is it complete
 ``/admin/semantic-sources``  **Semantic sources** — where documents come from
 ===========================  ==========================================
+
+The analyst-facing page is "Definitions" and the two admin pages keep
+"semantic layer" on purpose. It is the same rule as the rest of this table —
+each page is named for what it is FOR — applied to two audiences: an admin
+OPERATES the layer (is it healthy, where do its documents come from), an
+analyst READS the definitions. "Semantic model" survives as the name of a
+document type, on the tab that lists those documents.
 
 ``/catalog/semantics`` is the fourth, and it is no longer a page: #1707 N5
 folded the flat projection into the model list and left a 308 behind. Two
@@ -52,7 +60,7 @@ import pytest
 #: URL → the one name that page may carry. Update this table and the
 #: templates together; nothing else in the suite encodes these names.
 PAGE_NAMES: dict[str, str] = {
-    "/semantic-layer": "Semantic models",
+    "/semantic-layer": "Definitions",
     "/admin/semantic-layer": "Semantic layer health",
     "/admin/semantic-sources": "Semantic sources",
 }
@@ -66,7 +74,7 @@ RETIRED_PAGES: dict[str, str] = {
 
 #: The door on /admin/semantic-layer, asserted as a full anchor: a bare
 #: substring check would pass on a stray href in a CSS comment.
-HEALTH_DOOR = '<a href="/semantic-layer">Semantic models →</a>'
+HEALTH_DOOR = '<a href="/semantic-layer">Definitions →</a>'
 
 
 def _auth(token: str) -> dict:
@@ -108,10 +116,41 @@ def test_page_title_is_the_decided_name(seeded_app, path: str, name: str) -> Non
     assert _page_name(_render(seeded_app, path), path) == name
 
 
+def test_every_page_under_the_area_carries_its_name(seeded_app) -> None:
+    """A model's own page is INSIDE Definitions, so its <title> breadcrumb
+    names it. This is the half a rename forgets: the landing page changes and
+    the pages one click deeper keep the old word in the browser tab — which is
+    the one place a reader compares two of them side by side."""
+    from src.repositories import semantic_model_repo
+
+    semantic_model_repo().upsert(
+        id="manual/_/naming",
+        slug="naming",
+        name="naming",
+        description="Seeded so this guard runs instead of skipping.",
+        document="# fixture, not schema-authored",
+        document_json={"semantic_model": [{"name": "naming", "datasets": []}]},
+        spec_version="0.2.0.dev0",
+        content_hash="hash-naming",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+    title = re.search(
+        r"<title>(.*?)</title>", _render(seeded_app, "/semantic-layer/naming"), re.DOTALL
+    ).group(1)
+    assert "Definitions" in title, title
+    assert "Semantic models" not in title, title
+
+
 def test_health_page_door_points_at_semantic_models(seeded_app) -> None:
     """/admin/semantic-layer reports on the stored documents, so its "browse"
     link opens the documents — the same target /admin/semantic-sources uses,
-    under the target's own name."""
+    under the target's own name. Which is why this label moved with the
+    rename: a door labelled for a name the destination no longer carries is
+    the drift this file exists to catch."""
     body = _render(seeded_app, "/admin/semantic-layer")
     assert HEALTH_DOOR in body, "the health page's door must be a labelled link to /semantic-layer"
     assert 'href="/catalog/semantics"' not in body, (

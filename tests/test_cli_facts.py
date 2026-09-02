@@ -73,6 +73,47 @@ def test_search_happy_path_labels_server_origin_and_renders_table():
     assert "role=engineer" in result.output
 
 
+# ---------------------------------------------------------------------------
+# type-map
+# ---------------------------------------------------------------------------
+
+
+def test_type_map_renders_node_and_edge_type_tables():
+    data = {
+        "types": [{"type": "client", "count": 3}, {"type": "industry", "count": 5}],
+        "total": 8,
+        "edge_types": [{"type": "in_industry", "count": 4}, {"type": "owned_by", "count": 2}],
+    }
+
+    def fake_get(path, **kwargs):
+        assert path == "/api/facts/type-map"
+        return _resp(200, data)
+
+    with patch("cli.commands.facts.api_get", side_effect=fake_get):
+        result = runner.invoke(app, ["facts", "type-map"])
+
+    assert result.exit_code == 0, result.output
+    assert "client" in result.output
+    assert "in_industry" in result.output
+    assert "owned_by" in result.output
+    assert "4" in result.output
+
+
+def test_type_map_json_mode_emits_raw_response():
+    data = {
+        "types": [{"type": "client", "count": 1}],
+        "total": 1,
+        "edge_types": [{"type": "in_industry", "count": 1}],
+    }
+
+    with patch("cli.commands.facts.api_get", return_value=_resp(200, data)):
+        result = runner.invoke(app, ["facts", "type-map", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert "edge_types" in result.output
+    assert "in_industry" in result.output
+
+
 def test_search_renders_conflicted_attribute_marker():
     subjects = [
         {

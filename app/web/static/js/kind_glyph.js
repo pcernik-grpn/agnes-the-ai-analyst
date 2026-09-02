@@ -45,6 +45,12 @@
   memory: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 3c-1.7 0-3 1.3-3 3-1.6.2-3 1.5-3 3.2 0 .6.2 1.2.5 1.7-.6.6-1 1.4-1 2.4 0 1.5.9 2.7 2.2 3.2 0 1.7 1.4 3 3.1 3 .8 0 1.5-.3 2-.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3c1.7 0 3 1.3 3 3 1.6.2 3 1.5 3 3.2 0 .6-.2 1.2-.5 1.7.6.6 1 1.4 1 2.4 0 1.5-.9 2.7-2.2 3.2 0 1.7-1.4 3-3.1 3-.8 0-1.5-.3-2-.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3v18" stroke="currentColor" stroke-width="1.6"/></svg>',
   plugins: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 4a2 2 0 1 1 4 0v2h3a1 1 0 0 1 1 1v3h2a2 2 0 1 1 0 4h-2v3a1 1 0 0 1-1 1h-3v-2a2 2 0 1 0-4 0v2H7a1 1 0 0 1-1-1v-3H4a2 2 0 1 1 0-4h2V7a1 1 0 0 1 1-1h3V4Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   recipes: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 3v4h4M8.5 12h7M8.5 16h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  // The agreed vocabulary — metrics and glossary terms. See the macro's own
+  // note: an open reference book, deliberately NOT the 'data' cylinder,
+  // which means a store of rows to query rather than the rule applied to
+  // them. This key has no `--ds-kind-definitions` colour token; the one
+  // surface that draws it picks its own tile colour.
+  definitions: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 7.2C10.4 5.7 7.9 5.1 4 5.6v12.6c3.9-.5 6.4.1 8 1.6 1.6-1.5 4.1-2.1 8-1.6V5.6c-3.9-.5-6.4.1-8 1.6Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 7.2v12.6" stroke="currentColor" stroke-width="1.6"/></svg>',
   skill: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M13 3 4 14h6l-1 7 9-11h-6l1-7Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>',
   };
 

@@ -4576,6 +4576,42 @@
         "title": "FactsCorrectionRequest",
         "type": "object"
       },
+      "FactsExtractionRunOptions": {
+        "description": "Optional per-run overrides for one manual facts-extraction trigger.\nThe body itself is optional \u2014 a bare ``POST`` runs over the whole\ncorpus with the configured budget, mirroring :class:`ExtractionRunOptions`'s\n\"absent means configured\" contract for the crawl trigger.",
+        "properties": {
+          "doc_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Narrow the pass to these documents only (corpus_file_sources.source_doc_id) \u2014 the 'test one document against a prompt change' path, never persisted beyond this one run.",
+            "title": "Doc Ids"
+          },
+          "timeout_s": {
+            "anyOf": [
+              {
+                "maximum": 86400.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hard ceiling for this one run, seconds (0 = unbounded). Its OWN budget \u2014 see connectors.sharepoint.facts_extraction.run_standalone_facts_extraction's docstring for why this is never the crawl's extraction.timeout_s.",
+            "title": "Timeout S"
+          }
+        },
+        "title": "FactsExtractionRunOptions",
+        "type": "object"
+      },
       "FactsIngestAnonymizationReport": {
         "description": "OPTIONAL producer declaration that (some of) this batch went through\nthe anonymize-in-front pipeline (spec \u00a79: source -> crawl -> convert ->\nanonymize -> Agnes) before ingestion. Additive to the wire contract \u2014 a\nproducer that never anonymizes omits this field entirely.\n\n``scopes`` is keyed by ``corpus_id`` (the collection id, matching the\nconnect wizard's own scope-row shape); a key that does not resolve to a\nreal collection is KEPT, not rejected \u2014 this is a self-reported tally,\nnot a join against ``file_corpora`` (spec \u00a79.2's \"current limits\": Agnes\nrecords the declaration, it cannot verify the content was anonymized).",
         "properties": {
@@ -32347,6 +32383,86 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/facts-extract": {
+      "post": {
+        "description": "Admin/ops-triggered one-off run of the ``sharepoint-facts-extraction``\njob for this connection \u2014 build the fact graph over whatever this\nconnection's collections ALREADY hold, without running a crawl first\n(the operator question \"how do we get the fact graph populated with\nwhat we already have?\", which previously had no answer but \"re-run the\nwhole crawl\"). Enqueues ``connectors.sharepoint.facts_extraction\n.run_standalone_facts_extraction`` (via\n``app/worker/kinds.py::_run_sharepoint_facts_extraction``) with\n``{\"connection_id\": connection_id}`` plus, only when set, ``doc_ids``\nand ``timeout_s`` from an optional :class:`FactsExtractionRunOptions`\nbody \u2014 the SAME \"absent means configured\" mechanics as\n:func:`trigger_extraction`'s ``ExtractionRunOptions`` above.\n\n404 on an unknown/non-sharepoint connection BEFORE the facts readiness\ngate below (same ordering as :func:`trigger_extraction`). Then refuses\ncleanly \u2014 never a job that fails later in a worker \u2014 with ``409\nfacts_extraction_disabled`` when either of the stage's two switches\n(``extraction.facts.enabled``, ``facts.enabled``) is off; see\n:func:`_facts_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_facts_extraction_idempotency_key`), distinct from every other\njob kind's own key for the same connection \u2014 a facts-extraction trigger\nand a crawl trigger (or an ACL sync, or a subtree sweep) can always run\nside by side. ``enqueue()``'s own ``\"deduped\"`` return value decides\n202 vs. ``409 facts_extraction_already_running``.",
+        "operationId": "trigger_facts_extraction_api_admin_sharepoint_connections__connection_id__facts_extract_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/FactsExtractionRunOptions"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Options"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Trigger Facts Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": {
       "delete": {
         "description": "Forget one site previously added by URL (see :func:`add_manual_site`).\nPurely local bookkeeping \u2014 unlike a confirmed scope, a manual site owns\nno collection and no grants, so there is nothing else to reconcile.",
@@ -40455,7 +40571,7 @@
         ]
       },
       "get": {
-        "description": "Return a collection's metadata + file list.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.",
+        "description": "Return a collection's metadata + a bounded preview of its files.\n\nRequires the caller to hold a grant on this collection (admins exempt).\nReturns **404** (not 403) when the collection does not exist, so that\nunprivileged callers cannot probe for existence via the error code\ndifference.\n\n``files`` is capped at ``DEFAULT_FILE_LIST_LIMIT`` (oldest-first, the\nordering this endpoint always used) \u2014 ``files_total`` is the collection's\nreal file count and ``files_truncated`` says whether ``files`` is the\nwhole thing or a preview of it. A caller that needs the rest, or wants to\nsearch/paginate/filter, uses ``GET /{collection_id}/files``.",
         "operationId": "get_collection_api_collections__collection_id__get",
         "parameters": [
           {
@@ -40589,7 +40705,7 @@
     },
     "/api/collections/{collection_id}/files": {
       "get": {
-        "description": "List all files in a collection (all processing statuses).",
+        "description": "List files in a collection (all processing statuses) \u2014 paginated,\noptionally filtered by filename/path substring (``q``) and/or exact\n``processing_status`` (``status``), in ``order`` (``newest`` here by\ndefault \u2014 the dashboard's most useful default; see\n``corpus_files_repo().list_for_corpus`` for the full set and its\n``, id ASC`` tie-break).\n\n``limit``/``offset`` are clamped, never rejected \u2014 see\n``_clamp_file_list_limit``/``_clamp_file_list_offset``. A blank ``q`` or\n``status`` (``?q=``, what every HTML form sends for an unset optional)\nmeans \"no filter\", exactly like the ``corpus_id`` handling in\n``search_collections`` above.\n\n``total`` is the row count AFTER the ``q``/``status`` filters and BEFORE\n``limit``/``offset`` \u2014 the number of matches a caller paging through\n``q`` can trust, not the collection's whole file count.",
         "operationId": "list_files_api_collections__collection_id__files_get",
         "parameters": [
           {
@@ -40598,6 +40714,68 @@
             "required": true,
             "schema": {
               "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "newest",
+              "title": "Order",
               "type": "string"
             }
           },
@@ -43173,7 +43351,7 @@
     },
     "/api/facts/type-map": {
       "get": {
-        "description": "Live counts per node type over everything the caller can see \u2014 the\nhead of the Library's Knowledge tab, where each type is a way in.\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach. A type nobody can see\nis absent rather than reported as ``0``, so the response never\ndistinguishes \"no such type here\" from \"none you may read\" \u2014 the same\nnon-disclosure ``search()`` makes. Response: ``{\"types\": [{\"type\",\n\"count\"}], \"total\"}``, ordered by type.",
+        "description": "Live counts per node type AND per edge (relationship) type over\neverything the caller can see \u2014 the head of the Library's Knowledge\ntab, where each node type is a way in, and the cheap primer to read\nBEFORE calling ``POST /api/facts/neighbors`` with an ``edge_types``\nfilter on a well-connected node (a live-run finding: omitting\n``edge_types`` because the caller had no cheap way to learn a valid\nname pulled every relationship off the node instead of the one wanted).\n\nSame visibility gate as :func:`facts_search` with no ``type``, just\naggregated: a node type's ``count`` is exactly how many subjects a\n``search(type=...)`` would let this caller reach, and an edge type's\n``count`` is exactly how many edges of that type\n``neighbors(edge_types=[that type])`` would let this caller reach from\nsomewhere. A type nobody can see is absent rather than reported as\n``0``, so the response never distinguishes \"no such type here\" from\n\"none you may read\" \u2014 the same non-disclosure ``search()``/``neighbors()``\nmake. Response: ``{\"types\": [{\"type\", \"count\"}], \"total\",\n\"edge_types\": [{\"type\", \"count\"}]}``, both lists ordered by type.",
         "operationId": "facts_type_map_api_facts_type_map_get",
         "parameters": [
           {
@@ -62404,6 +62582,48 @@
               "default": 1,
               "title": "Facts Page",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "files_page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "title": "Files Page",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
             }
           },
           {

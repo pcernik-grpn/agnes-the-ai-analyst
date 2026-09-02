@@ -467,3 +467,50 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["activity"] is None
+
+    def test_the_row_s_own_phase_column_is_surfaced(self):
+        """Owner-frustration fix, 2026-09-02: the row stayed `phase="crawl"`
+        for the whole facts pass, which is its own small lie. Surfaced
+        straight from the column so a caller does not have to unpack
+        `activity` to know it."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "running", "phase": "facts", "progress": {}})
+        assert out["phase"] == "facts"
+
+    def test_facts_progress_is_absent_during_the_crawl_phase(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "running", "phase": "crawl", "progress": {"new": 5}})
+        assert out["facts_progress"] is None
+
+    def test_facts_progress_rides_the_same_checkpoint_projection_as_activity(self):
+        """`docs_done`/`docs_total` come from the SAME checkpoint write as
+        `activity` (`_RunRecorder.checkpoint_facts`) — never a separate
+        lookup, so the two can never disagree."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "running",
+                "phase": "facts",
+                "progress": {
+                    "activity": {"phase": "facts", "current_path": "a.docx", "recent": []},
+                    "facts": {"docs_done": 340, "docs_total": 1200},
+                    # The crawl's own last numbers stay in the SAME blob —
+                    # a facts checkpoint layers on top of them, never wipes
+                    # them.
+                    "new": 812,
+                },
+            }
+        )
+        assert out["facts_progress"] == {"docs_done": 340, "docs_total": 1200}
+        assert out["activity"]["phase"] == "facts"
+        assert out["new"] == 812
+
+    def test_a_finished_run_has_no_facts_progress(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
+        assert out["facts_progress"] is None

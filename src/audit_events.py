@@ -1301,6 +1301,16 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin manually triggered a SharePoint subtree sweep for one connection (POST .../subtree-sweep).",
     ),
+    # Standalone fact-graph trigger — build the graph over an already-indexed
+    # corpus, no crawl required. Mirrors sweep_triggered's own "handler
+    # writes nothing itself; fallback middleware emits this" posture
+    # (src/audit_posture.py).
+    "sharepoint_facts.extraction_triggered": AuditEvent(
+        "sharepoint_facts.extraction_triggered",
+        "mutation",
+        "An admin manually triggered a standalone SharePoint fact-extraction pass for one connection "
+        "(POST .../facts-extract).",
+    ),
     # -- read-only view-as (app/auth/view_as.py) ---------------------------
     # Both rows are attributed to the VIEWER and name the target in
     # `resource`, so "who looked through whose eyes, and when" is one query.

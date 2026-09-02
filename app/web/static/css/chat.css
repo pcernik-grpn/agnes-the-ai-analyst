@@ -1950,6 +1950,66 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   cursor: progress;
 }
 
+/* ============================================================ jump to latest
+   Shown only while the reader has scrolled off the floor of a thread — see
+   the smart auto-scroll section in chat.js. Anchored to .cloud-chat-form's
+   position: relative (the same anchor the slash menu uses), which is the one
+   element that is positioned in BOTH the default and the rail layout, so one
+   rule seats it over the composer in each.
+
+   Deliberately quiet: it sits between the reader and the answer they are
+   reading, so it wears the secondary ink and the surface's own fill rather
+   than the send button's accent. It is a way back, not a call to action. */
+.cloud-chat-jump {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;                 /* over the rail layout's floating composer (3) */
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 6px var(--space-3);
+  border: 1px solid var(--ds-border);
+  /* A LABELLED button, so --ds-radius-btn and not --ds-radius-pill, even
+     though its size and its job both read pill-ish (design-tokens.css states
+     the rule; #2049 moved the landing chip onto the token for the same
+     reason). */
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  /* The SAME floating vocabulary as .cloud-chat-slash-menu, which hangs off
+     this very anchor: surface fill, hairline border, elevated shadow. In dark
+     the fill and the page are 1.08:1 apart and a light theme's shadow is
+     nearly invisible, so on both themes it is the shadow that separates the
+     chip from the prose under it — and --shadow-elevated is the one that
+     carries real weight in dark (rgba(0,0,0,.55)). --shadow-sm did not. */
+  box-shadow: var(--shadow-elevated);
+  color: var(--ds-text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+/* `display: inline-flex` above would otherwise beat the [hidden] default. */
+.cloud-chat-jump[hidden] { display: none; }
+.cloud-chat-jump svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+/* Ink only. A fill swap would have to move in opposite directions per theme
+   (--ds-surface-dim is lighter than the surface in dark, darker in light), and
+   a hover that means "raised" here and "pressed" there is worse than none. */
+.cloud-chat-jump:hover {
+  color: var(--ds-text-primary);
+  border-color: var(--ds-primary);
+}
+.cloud-chat-jump:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
+}
+
 /* ============================================================ slash menu
    Filterable "/" catalog (GET /api/chat/skills) — pops up above the
    composer, anchored to .cloud-chat-form's position: relative. Visual

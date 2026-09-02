@@ -434,6 +434,31 @@ if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
   fi
 fi
 
+# Self-update: extract *this* script too (shipped at the TOP level of
+# /opt/agnes-host/, unlike its scripts/ops/ home in the repo — see the
+# Dockerfile's chmod 0755 list). Without this, the very fix that lets
+# auto-upgrade track host artifacts would itself never land on running
+# VMs — a self-perpetuating "old script" problem. Atomic via .new + mv
+# (the running bash keeps reading its old inode); chmod before the
+# rename. The next tick (5 min later) runs the new logic. Any failure —
+# no extract container, an image predating the artifact — leaves the
+# existing script in place.
+if [ -n "$EXTRACT_CID" ] && \
+   docker cp "$EXTRACT_CID:/opt/agnes-host/agnes-auto-upgrade.sh" \
+     /usr/local/bin/agnes-auto-upgrade.sh.new >/dev/null 2>&1; then
+  if ! cmp -s /usr/local/bin/agnes-auto-upgrade.sh.new \
+                /usr/local/bin/agnes-auto-upgrade.sh; then
+    chmod +x /usr/local/bin/agnes-auto-upgrade.sh.new
+    mv -f /usr/local/bin/agnes-auto-upgrade.sh.new \
+          /usr/local/bin/agnes-auto-upgrade.sh
+    logger -t agnes-auto-upgrade "self-update: replaced /usr/local/bin/agnes-auto-upgrade.sh"
+  else
+    rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
+  fi
+else
+  rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
+fi
+
 # Source the single shared resolver (scripts/ops/agnes-compose-file.sh —
 # just refreshed above as part of CONFIG_FILES) here, AFTER the artifact
 # refresh so a Caddyfile or gcp-logging overlay that just landed THIS tick
@@ -919,27 +944,3 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
     # drifting. See the prune block above the pull.)
 fi
 
-# Self-update: extract *this* script too (shipped at the TOP level of
-# /opt/agnes-host/, unlike its scripts/ops/ home in the repo — see the
-# Dockerfile's chmod 0755 list). Without this, the very fix that lets
-# auto-upgrade track host artifacts would itself never land on running
-# VMs — a self-perpetuating "old script" problem. Atomic via .new + mv
-# (the running bash keeps reading its old inode); chmod before the
-# rename. The next tick (5 min later) runs the new logic. Any failure —
-# no extract container, an image predating the artifact — leaves the
-# existing script in place.
-if [ -n "$EXTRACT_CID" ] && \
-   docker cp "$EXTRACT_CID:/opt/agnes-host/agnes-auto-upgrade.sh" \
-     /usr/local/bin/agnes-auto-upgrade.sh.new >/dev/null 2>&1; then
-  if ! cmp -s /usr/local/bin/agnes-auto-upgrade.sh.new \
-                /usr/local/bin/agnes-auto-upgrade.sh; then
-    chmod +x /usr/local/bin/agnes-auto-upgrade.sh.new
-    mv -f /usr/local/bin/agnes-auto-upgrade.sh.new \
-          /usr/local/bin/agnes-auto-upgrade.sh
-    logger -t agnes-auto-upgrade "self-update: replaced /usr/local/bin/agnes-auto-upgrade.sh"
-  else
-    rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
-  fi
-else
-  rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
-fi

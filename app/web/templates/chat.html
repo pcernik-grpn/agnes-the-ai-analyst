@@ -609,6 +609,22 @@
            role="listbox" aria-label="Skills and commands">
         <ul id="chat-slash-menu-results" class="cloud-chat-slash-menu-results"></ul>
       </div>
+      {# Jump to latest — the way back down. A turn that is still writing stops
+         following the moment the reader scrolls up (chat.js → the smart
+         auto-scroll section), which is what makes reading a long answer while
+         it streams possible at all; this is what tells them the turn moved on
+         without them, and puts them back on it.
+
+         Inside the form because the form is the one element that is
+         position: relative in BOTH layouts (it anchors the slash menu above),
+         so `bottom: 100%` seats the button over the composer in each. It is
+         absolutely positioned, so it is not a grid item and cannot disturb the
+         default layout's two-column composer row. Hidden until it has
+         something to fix; chat.js owns the toggle. #}
+      <button type="button" id="chat-jump-latest" class="cloud-chat-jump" hidden>
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Jump to latest</span>
+      </button>
       {# Pasted attachments — a strip ABOVE the pill, inside the form.
 
          It cannot live inside .cloud-chat-composer: that pill is a fixed-height
