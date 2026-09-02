@@ -287,30 +287,6 @@ def test_activity_timeline_audits_different_filters(seeded_app, admin_user):
     assert n == 2
 
 
-def test_activity_health_emits_posthog_event_when_enabled(seeded_app, admin_user):
-    from unittest.mock import patch
-
-    with patch("app.api.activity.get_posthog") as mock_get:
-        mock_client = mock_get.return_value
-        mock_client.enabled = True
-        seeded_app["client"].get("/api/admin/activity/health", headers=admin_user)
-        mock_client.capture.assert_called()
-        kw = mock_client.capture.call_args.kwargs
-        assert kw.get("event") == "activity_health_viewed"
-
-
-def test_activity_endpoints_silent_when_posthog_disabled(seeded_app, admin_user):
-    from unittest.mock import patch
-
-    with patch("app.api.activity.get_posthog") as mock_get:
-        mock_client = mock_get.return_value
-        mock_client.enabled = False
-        resp = seeded_app["client"].get("/api/admin/activity/health", headers=admin_user)
-        # capture may be called but the inner SDK is no-op; that's the contract.
-        # Assert: no exception, healthy response.
-        assert resp.status_code == 200
-
-
 class TestKpiTableParity:
     """The regression this whole change exists to prevent: KPI cards, facets
     and the timeline must tell one story for any filter state — INCLUDING

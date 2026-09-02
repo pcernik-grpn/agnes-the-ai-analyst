@@ -13,6 +13,11 @@ budget:
   except the optional ``semantic_validation`` advisory is shortened and then
   dropped BEFORE the rows are: an advisory must never fail a query that would
   otherwise have returned.
+- ``compact_search_results`` — the SEARCH tools' counterpart: a response that
+  would not fit the budget is shortened (prose fields become marked prefixes,
+  then lowest-ranked hits are dropped) instead of refused, because a search
+  hit is an excerpt already and a shorter excerpt still answers "what matched
+  and where"; the model is told exactly what was cut and how to read the rest.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import json
 import os
 from collections.abc import Callable, MutableMapping
 from typing import Any
+
+import pydantic_core
 
 DEFAULT_MAX_OUTPUT_CHARS = 100_000
 MAX_OUTPUT_CHARS_ENV = "AGNES_MCP_MAX_OUTPUT_CHARS"
@@ -130,6 +137,233 @@ def ensure_query_output_size(payload: Any) -> Any:
     # The rows are what is big. Drop the advisory entirely and let the
     # pre-existing guard speak about the result itself.
     return ensure_output_size({**payload, "semantic_validation": None}, "query")
+
+
+# ── search-result compaction ───────────────────────────────────────────────────
+
+#: Budget for a SEARCH tool's serialized response. Deliberately separate from
+#: ``DEFAULT_MAX_OUTPUT_CHARS``: that cap REFUSES an oversized ``query`` result
+#: (rows are data an agent computes over, so a silently-incomplete set is worse
+#: than none), while a search hit is already an excerpt — a shorter excerpt is
+#: still a correct answer to "what matched, and where". 20k chars is the ceiling
+#: ``collection_file_read`` already applies to one file's text, and sits well
+#: inside the tool-result limit of the agent SDKs that consume these servers.
+#: The incident behind it: ten 3.2k-char document chunks came back as a 52k-char
+#: ``knowledge_search`` result that the chat engine refused outright and wrote
+#: to a file the model could not read — a search that found the answer, and a
+#: turn that could not use it.
+DEFAULT_SEARCH_MAX_CHARS = 20_000
+SEARCH_MAX_CHARS_ENV = "AGNES_MCP_SEARCH_MAX_CHARS"
+
+#: Per-hit fields that hold prose and may be shortened. Everything else on a
+#: hit — ids, names, scores, the pivot hint — is an identifier or a number a
+#: follow-up call depends on, and is never touched.
+SEARCH_TEXT_FIELDS: tuple[str, ...] = ("text", "snippet", "description", "definition", "content")
+
+#: Top-level prose the search endpoints echo back — the caller's own query
+#: (unbounded: a pasted paragraph is a legal query), and the empty-result
+#: ``hint`` / offline ``note``. Capped alongside the hit fields, or a long
+#: query alone could keep the response over budget after every hit was
+#: dropped (Devin Review on #2046).
+SEARCH_ENVELOPE_FIELDS: tuple[str, ...] = ("query", "hint", "note")
+
+#: A prose field is never cut below this. Once every field is at the floor and
+#: the response still does not fit, whole hits are dropped from the tail
+#: instead — ten unreadable stubs are worth less than five readable prefixes.
+SEARCH_TEXT_FLOOR = 200
+
+#: Appended to every shortened field, so the cut is visible inline as well as
+#: in the hit's ``truncated_fields``.
+SEARCH_TRUNCATED_MARK = "…"
+
+
+def search_max_chars() -> int:
+    """Resolve the search-result budget: env override, else default. ``0`` disables."""
+    raw = os.environ.get(SEARCH_MAX_CHARS_ENV, "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_SEARCH_MAX_CHARS
+
+
+def wire_size(payload: Any) -> int:
+    """Characters FastMCP puts on the wire for a dict tool result.
+
+    FastMCP serializes a non-string return value with
+    ``pydantic_core.to_json(result, fallback=str, indent=2)`` — pretty-printed,
+    unicode kept as-is — and that text is what an MCP client measures against
+    its tool-result limit. This calls the same serializer with the same
+    arguments rather than approximating it with ``json.dumps`` (the two differ
+    on floats, datetimes and key ordering, and an approximation that ran
+    short would let an oversized result through — Copilot review on #2046).
+    ``ensure_output_size`` measures the compact ``json.dumps`` form; its cap
+    is an order of magnitude looser, so the difference never mattered there.
+    """
+    return len(pydantic_core.to_json(payload, fallback=str, indent=2).decode("utf-8"))
+
+
+def _shorten(value: str, cap: int) -> str:
+    return value[:cap].rstrip() + SEARCH_TRUNCATED_MARK
+
+
+def _apply_cap(hits: list[Any], cap: int) -> list[Any]:
+    """Every prose field longer than ``cap`` becomes a marked prefix.
+
+    Always derived from the ORIGINAL hits (never from a previous pass), so a
+    shorter cap re-cuts the full text and the mark is appended exactly once.
+    """
+    out: list[Any] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            out.append(hit)
+            continue
+        fields = [f for f in SEARCH_TEXT_FIELDS if isinstance(hit.get(f), str) and len(hit[f]) > cap]
+        if not fields:
+            out.append(hit)
+            continue
+        shortened = {**hit, **{f: _shorten(hit[f], cap) for f in fields}}
+        shortened["truncated"] = True
+        shortened["truncated_fields"] = fields
+        out.append(shortened)
+    return out
+
+
+def _cap_envelope(payload: dict, cap: int) -> dict:
+    """The payload with its own prose fields (:data:`SEARCH_ENVELOPE_FIELDS`)
+    cut to ``cap`` and listed in a top-level ``truncated_fields``."""
+    fields = [f for f in SEARCH_ENVELOPE_FIELDS if isinstance(payload.get(f), str) and len(payload[f]) > cap]
+    if not fields:
+        return payload
+    return {**payload, **{f: _shorten(payload[f], cap) for f in fields}, "truncated_fields": fields}
+
+
+def _with_results(payload: dict, tool_name: str, hits: list[Any], *, total: int, budget: int) -> dict:
+    shortened = sum(1 for h in hits if isinstance(h, dict) and h.get("truncated_fields"))
+    dropped = total - len(hits)
+    what: list[str] = []
+    if shortened:
+        what.append(
+            f"{shortened} of {total} results carry shortened text (a PREFIX — see each hit's `truncated_fields`)"
+        )
+    if dropped:
+        what.append(f"{dropped} lower-ranked result(s) of {total} were dropped")
+    if payload.get("truncated_fields"):
+        what.append(f"the response's own {', '.join(payload['truncated_fields'])} field(s) were shortened")
+    note = (
+        f"{tool_name}: {'; '.join(what)} to fit the {budget:,}-character tool output budget. "
+        "To read a shortened document chunk in full, call "
+        "collection_file_read(collection_id=<hit.corpus_id>, file_id=<hit.file_id>); "
+        "otherwise narrow the query or lower `k`."
+    )
+    return {**payload, "results": hits, "truncated": True, "truncated_note": note}
+
+
+def compact_search_results(payload: Any, tool_name: str, *, budget: int | None = None) -> Any:
+    """Fit a search response into the tool-output budget — shorten first, drop last.
+
+    The counterpart of :func:`ensure_output_size` for the search tools, and
+    the opposite contract on purpose: that guard RAISES so an agent never
+    computes over silently-incomplete query rows; this one never raises,
+    because a search hit is an excerpt already — a shorter excerpt is still a
+    true answer to "what matched, and where", whereas an error that names a
+    file the model cannot open (what an MCP client does with a result over
+    its limit) is a search that found the answer and a turn that lost it.
+
+    A response that already fits is returned untouched — the same object.
+    Otherwise every prose field is cut to the LARGEST common cap at which the
+    serialized response (:func:`wire_size` — what the client actually
+    measures) fits — so the budget is spent on text, not left idle by a
+    coarse cut. Size is monotonic in the cap only BETWEEN the distinct field
+    lengths: the moment the cap reaches a field's length that field comes
+    back whole and sheds its mark and its ``truncated_fields`` entry, so the
+    size can step DOWN as the cap goes up (Copilot review on #2046). The
+    search therefore walks those intervals from the longest down, and
+    binary-searches only inside the first one whose start fits, where the
+    monotonicity holds exactly. If even the floor does not fit, hits are
+    dropped from the tail, i.e. lowest-ranked first (results arrive
+    ranked). Nothing is cut silently: every shortened hit
+    carries ``truncated: true`` and ``truncated_fields``, its text ends in
+    ``…``, and the payload carries ``truncated: true`` plus a
+    ``truncated_note`` saying what was cut and how to read the rest.
+
+    Compacted: ``payload["results"]`` (a list) and the payload's own prose
+    fields (:data:`SEARCH_ENVELOPE_FIELDS` — the echoed query, the
+    empty-result ``hint``, the offline ``note``), which take part in the same
+    cap search so a paragraph-long query cannot keep the response over
+    budget on its own; anything else (``retrieval``, counts) is small by
+    construction and passes through. When even an empty result list with
+    every prose field at the floor does not fit, the budget is smaller than
+    the response envelope itself — a misconfiguration — and the return is a
+    minimal note saying so (naming the knob) rather than an oversized
+    payload the client would refuse. A ``budget`` of ``0`` disables the
+    compaction.
+    """
+    effective = search_max_chars() if budget is None else budget
+    if effective <= 0 or not isinstance(payload, dict):
+        return payload
+    results = payload.get("results")
+    if not isinstance(results, list) or wire_size(payload) <= effective:
+        return payload
+
+    hits = list(results)
+    total = len(hits)
+
+    def _candidate(kept: list[Any], cap: int) -> dict:
+        return _with_results(
+            _cap_envelope(payload, cap), tool_name, _apply_cap(kept, cap), total=total, budget=effective
+        )
+
+    def _fits(candidate: dict) -> bool:
+        return wire_size(candidate) <= effective
+
+    # Largest cap that fits. Within an interval between two consecutive
+    # distinct field lengths the set of shortened fields is fixed, so the
+    # size is monotone non-decreasing in the cap (a longer prefix, rstrip
+    # included, is never shorter) and a binary search is exact. At a
+    # boundary a field comes back whole and the size can drop, so the
+    # intervals are tried from the longest down: the first whose START fits
+    # contains the global maximum. The top interval — cap at or above the
+    # longest field — is the untouched payload, already known not to fit.
+    lengths = sorted(
+        {len(h[f]) for h in hits if isinstance(h, dict) for f in SEARCH_TEXT_FIELDS if isinstance(h.get(f), str)}
+        | {len(payload[f]) for f in SEARCH_ENVELOPE_FIELDS if isinstance(payload.get(f), str)}
+    )
+    bounds = [SEARCH_TEXT_FLOOR] + [n for n in lengths if n > SEARCH_TEXT_FLOOR]
+    for j in range(len(bounds) - 2, -1, -1):
+        lo, hi = bounds[j], bounds[j + 1] - 1
+        if not _fits(_candidate(hits, lo)):
+            continue
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _fits(_candidate(hits, mid)):
+                lo = mid
+            else:
+                hi = mid - 1
+        return _candidate(hits, lo)
+
+    # Even the floor does not fit: drop lowest-ranked hits until it does.
+    kept = hits
+    candidate = _candidate(kept, SEARCH_TEXT_FLOOR)
+    while kept:
+        kept = kept[:-1]
+        candidate = _candidate(kept, SEARCH_TEXT_FLOOR)
+        if _fits(candidate):
+            return candidate
+    # Even an empty result list with every prose field at the floor does not
+    # fit: the budget is smaller than the response envelope itself. Returning
+    # the oversized shape would recreate the client's refusal this helper
+    # exists to prevent, so answer with the smallest honest thing — what
+    # happened and which knob fixes it (Devin Review on #2046).
+    return {
+        "results": [],
+        "truncated": True,
+        "truncated_note": (
+            f"{tool_name}: {total} result(s) withheld — the {effective:,}-character tool output budget "
+            f"({SEARCH_MAX_CHARS_ENV}) is smaller than the response envelope itself; raise it."
+        ),
+    }
 
 
 def summarize_docstring(doc: str | None) -> tuple[str, bool]:
