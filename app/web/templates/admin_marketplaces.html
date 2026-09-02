@@ -803,10 +803,34 @@ async function openDetails(id, name) {
   sub.innerHTML = `<code>${esc(id)}</code>${m && m.url ? ` · <span class="mp-url" title="${esc(m.url)}">${esc(m.url)}</span>` : ""}`;
   // One instance-wide schedule, stated as such — there is no per-marketplace
   // cadence to imply by putting a different number on each row.
+  //
+  // Two branches, both mirroring the row cell above rather than inventing a
+  // second vocabulary for the same facts:
+  //
+  //   * A BUNDLED marketplace never enters either sync path —
+  //     `sync_marketplace` opens with `if spec.get("is_builtin"): raise
+  //     MarketplaceNotSyncable`. Promising it a nightly run and pointing at a
+  //     "Sync now" the row does not offer describes something the server
+  //     refuses.
+  //   * `last_synced_at` is stamped on FAILURE too: both error branches in
+  //     `src/marketplace.py` call `update_sync_status(..., synced_at=now,
+  //     error=str(e))`. So the timestamp alone means "last attempted", and
+  //     calling it "Last synced" tells an admin a failed refresh worked.
+  //     `last_error` is the discriminator — set on failure, cleared when a
+  //     commit_sha arrives clean.
   const syncEl = document.getElementById("details-sync");
-  syncEl.innerHTML = `<b>Sync</b> — every night at 03:00 UTC (next: ${esc(nextNightlySync())})`
-    + (m && m.last_synced_at ? `. Last synced ${esc(fmtDate(m.last_synced_at))}.` : ". Never synced yet.")
-    + ` Use <b>Sync now</b> on the marketplace row to pull immediately.`;
+  if (m && m.is_builtin) {
+    syncEl.innerHTML = `<b>Sync</b> — none. Bundled content ships with Agnes and is re-seeded on boot; there is no git remote to pull from.`;
+  } else {
+    const when = !m || !m.last_synced_at
+      ? ". Never synced yet."
+      : m.last_error
+      ? `. Last attempt ${esc(fmtDate(m.last_synced_at))} failed: ${esc(m.last_error)}.`
+      : `. Last synced ${esc(fmtDate(m.last_synced_at))}.`;
+    syncEl.innerHTML = `<b>Sync</b> — every night at 03:00 UTC (next: ${esc(nextNightlySync())})`
+      + when
+      + ` Use <b>Sync now</b> on the marketplace row to pull immediately.`;
+  }
 
   const body = document.getElementById("details-body");
   body.innerHTML = `<div class="empty">Loading plugins…</div>`;
