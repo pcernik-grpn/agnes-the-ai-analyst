@@ -35,6 +35,7 @@ it. What this suite pins:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 TEMPLATES = Path("app/web/templates")
@@ -445,27 +446,50 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
 
 
 class TestTheGridsTableStaysInsideThePage:
-    """The five-column package table outgrows its column below ~1400px.
+    """The five-column package table has to FIT its column, not just scroll.
 
-    `.data-table-wrap` is a bare <div> that nine admin templates wrap a table
-    in, and no sheet defines it — so when the table's ~1105px of min-content
-    exceeded the available width it simply ran out of the page: "Shared with"
-    and "Actions" off the right edge, and the whole document scrolling
-    sideways. The wrapper is named for containing exactly this.
+    `.data-table-wrap` scrolls its own overflow (style-custom.css, #1707 A6),
+    and that alone was not enough here. `.adp-row__desc` is `nowrap` +
+    ellipsis, and under `table-layout: auto` a nowrap cell never ellipsises —
+    the browser widens the COLUMN to the whole sentence instead. Measured at
+    1440px: 1173px for the Package column, 1627px of table inside a 1204px
+    box, "Shared with" cut in half and the Edit button 400px past the right
+    edge, behind a nested scrollbar macOS does not paint until you are
+    already scrolling.
+
+    `table-layout: fixed` turns the ellipsis on and makes the <colgroup>
+    binding — the same fix /admin/users, /admin/tables and the Library table
+    already carry — with a `min-width` floor under it and the Actions column
+    pinned for the widths below that floor.
     """
 
-    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
+    def test_the_table_is_sized_by_its_colgroup_not_by_its_longest_sentence(
+        self,
+    ) -> None:
         src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        assert ".data-table-wrap { overflow-x: auto; }" in src
+        assert "table-layout: fixed" in src
+        # The floor: fixed layout divides whatever width it is given, so
+        # without one a narrow window shrinks Actions below its own button
+        # instead of handing the overflow to the wrap.
+        assert "min-width: 900px" in src
 
-    def test_the_narrow_columns_keep_their_floor(self) -> None:
-        """The two cells that were cramped: a nowrap chip rendered narrower
-        than its own text, and a category on two lines."""
+    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
+        """Page-local no longer: the rule lives on the shared class."""
+        sheet = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+        assert re.search(
+            r"\.data-table-wrap\s*\{[^}]*overflow-x\s*:\s*auto", sheet, re.DOTALL
+        )
+
+    def test_the_one_verb_stays_reachable_when_it_does_scroll(self) -> None:
+        """Below the floor the wrap scrolls, and an off-screen action is not
+        recoverable the way an off-screen destination is — you can scroll back
+        to a column, you cannot click a button that is not there."""
         src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        assert "min-width: 92px" in src and "min-width: 148px" in src
-        # Scoped to a 5-column row, so the 3-column Memory Domains table below
-        # — same classes, no Tables or Category column — is untouched.
-        assert "tr:has(> :nth-child(5))" in src
+        packages, domains = src.split("Memory Domains", 1)
+        assert 'class="data-table adp-table data-table--pinned-actions"' in packages
+        # NOT on the Memory Domains table: the pin targets `td:last-child`,
+        # and that table's last column is "Shared with", not a verb.
+        assert "data-table--pinned-actions" not in domains
 
     def test_the_chip_is_capped_by_its_cell_not_by_a_fraction_of_it(self) -> None:
         """`max-width: 60%` of a ~100px column was 41px of pill around 58px of
