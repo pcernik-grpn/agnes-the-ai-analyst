@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -17,14 +18,43 @@ import pytest
 # --- /marketplace/format-guide -------------------------------------------
 
 
-def test_format_guide_requires_login(seeded_app):
-    """Anonymous user gets redirected (302) to /login — no public access."""
+_BROWSER_ACCEPT = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/marketplace/format-guide",
+        "/marketplace/guide/flea",
+        "/marketplace/flea/96b9d50176604140bc682575402f9304",
+        "/marketplace/curated/some-marketplace/some-plugin",
+    ],
+)
+def test_marketplace_html_page_signed_out_redirects_to_login(seeded_app, path):
+    """A signed-out browser on any /marketplace/* HTML page lands on /login
+    with ``next`` pointing back — the same contract every other HTML page
+    honours — never a raw ``{"detail": ...}`` JSON 401.
+
+    Regression: ``"/marketplace/"`` sat in ``_API_PATH_PREFIXES`` (app/main.py),
+    so a shared deep link to a plugin looked broken to anyone not signed in.
+    """
     client = seeded_app["client"]
-    r = client.get("/marketplace/format-guide", follow_redirects=False)
-    # The guide endpoint is wrapped by the same auth dependency the rest of
-    # /marketplace/* uses; the exact response is a 302/303 to /login or a
-    # 401 depending on the auth provider. Either way it's not a 200.
-    assert r.status_code in (302, 303, 307, 401)
+    client.cookies.clear()
+    r = client.get(path, headers=_BROWSER_ACCEPT, follow_redirects=False)
+    assert r.status_code == 302, r.text
+    assert r.headers["location"] == f"/login?next={quote(path, safe='')}"
+
+
+@pytest.mark.parametrize("path", ["/marketplace/info", "/marketplace/cowork/some-plugin.zip"])
+def test_marketplace_api_path_signed_out_stays_json_401(seeded_app, path):
+    """The machine-facing paths under the same prefix keep the raw JSON 401
+    (CLI / installer clients parse ``{"detail": ...}``, never a redirect)."""
+    client = seeded_app["client"]
+    client.cookies.clear()
+    r = client.get(path, headers=_BROWSER_ACCEPT, follow_redirects=False)
+    assert r.status_code == 401
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json()["detail"] == "Missing or invalid Authorization header"
 
 
 def test_format_guide_renders_for_logged_in_user(seeded_app):
