@@ -126,7 +126,7 @@ DEFAULT_BATCH_CLAIMS = 1_000
 #: and retry backoff instead of throughput.
 DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 16
+MAX_CONCURRENCY = 64
 
 #: ``extraction.facts.transport``. The synchronous Messages API is bound by
 #: the model account's tokens-per-minute limit — measured on a live
@@ -267,7 +267,7 @@ def resolve_concurrency() -> Tuple[int, str]:
     """``(workers, source)`` for ``extraction.facts.concurrency``.
 
     ``source`` is ``config``, ``clamped`` (a configured value outside
-    ``[1, 16]``, corrected rather than obeyed), ``invalid`` (unparseable —
+    ``[1, 64]``, corrected rather than obeyed), ``invalid`` (unparseable —
     the default, loudly named rather than silently assumed), or ``default``.
     Both halves travel into the run report: an operator comparing two runs'
     wall clock must be able to see what parallelism each actually used, and
@@ -2442,7 +2442,7 @@ def run_facts_extraction(
     -> str`` method and a ``usage`` dict.
 
     Documents are extracted through a bounded pool
-    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 16]``).
+    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 64]``).
     Only the model half runs in a worker (:func:`extract_one`); the walk,
     every database read, the ingest and the state file stay on this
     thread, and results are consumed in SUBMISSION order — so a run at

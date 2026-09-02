@@ -150,8 +150,10 @@ _DEFAULT_MAX_FILE_MB = 50
 #: ``1`` is the pre-parallel behaviour, exactly (see :func:`_process_page`).
 _DEFAULT_CONCURRENCY = 6
 #: Hard ceiling on the configured value. Past this the extra parallelism buys
-#: 429s, temp-file pressure and RAM, never throughput.
-_MAX_CONCURRENCY = 32
+#: 429s, temp-file pressure and RAM, never throughput. Sized for a large
+#: conversion box (one core per in-flight file; the crawl parent holds
+#: roughly 2 GB per in-flight file) — a small VM should stay well under it.
+_MAX_CONCURRENCY = 64
 #: Ceiling on a PER-RUN ``payload["concurrency"]`` override. Lower than the
 #: configured ceiling on purpose: an ad-hoc run (an admin pressing "run now")
 #: is the wrong place to go looking for a tenant's throttling limit.

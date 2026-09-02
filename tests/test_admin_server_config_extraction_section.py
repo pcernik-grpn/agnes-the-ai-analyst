@@ -42,6 +42,8 @@ DATA_DIR/cache plumbing needed here.
 
 from __future__ import annotations
 
+import pytest
+
 import yaml
 
 
@@ -51,6 +53,13 @@ def _auth(token: str) -> dict:
 
 def _clear_extraction_env(monkeypatch):
     monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+
+def _client(seeded_app, monkeypatch):
+    """(client, admin token) with the extraction env cleared — the shape the
+    run-knob tests below share."""
+    _clear_extraction_env(monkeypatch)
+    return seeded_app["client"], seeded_app["admin_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +392,7 @@ def test_crawler_concurrency_bounds_match_the_crawlers_clamp():
     from connectors.sharepoint.crawler import _MAX_CONCURRENCY
 
     assert _CRAWLER_CONCURRENCY_MIN == 1
-    assert _CRAWLER_CONCURRENCY_MAX == _MAX_CONCURRENCY == 32
+    assert _CRAWLER_CONCURRENCY_MAX == _MAX_CONCURRENCY == 64
 
 
 def test_post_crawler_concurrency_persists_and_get_reflects_it(seeded_app, monkeypatch):
@@ -436,7 +445,7 @@ def test_post_crawler_concurrency_keeps_sibling_crawler_keys(seeded_app, monkeyp
 def test_crawler_concurrency_out_of_range_is_refused_not_reclamped(seeded_app, monkeypatch):
     _clear_extraction_env(monkeypatch)
     client = seeded_app["client"]
-    for value in (0, 33, -1):
+    for value in (0, 65, -1):
         resp = client.post(
             "/api/admin/server-config",
             json={"sections": {"extraction": {"crawler": {"concurrency": value}}}},
@@ -504,3 +513,68 @@ def test_saved_crawler_concurrency_is_what_the_next_crawl_run_reads(seeded_app, 
     assert _crawl_concurrency() == 2
     # A run with no per-run override uses the configured value, and says so.
     assert _resolve_concurrency(None) == (2, 2, "config")
+
+
+# ---------------------------------------------------------------------------
+# Run knobs an admin needs without server access (2026-09-02): lane
+# concurrency, and the facts stage's stream_every / run_timeout_s / transport /
+# retry_mode instance defaults — declared, validated, persisted.
+# ---------------------------------------------------------------------------
+
+
+def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    fields = client.get("/api/admin/server-config", headers=_auth(token)).json()["known_fields"]["extraction"]
+    from app.worker.runtime import _DEFAULT_EXTRACTION_CONCURRENCY
+    from connectors.sharepoint.facts_extraction import DEFAULT_STANDALONE_TIMEOUT_S
+
+    assert fields["concurrency"]["kind"] == "int"
+    assert fields["concurrency"]["default"] == _DEFAULT_EXTRACTION_CONCURRENCY
+    facts = fields["facts"]["fields"]
+    assert facts["stream_every"] == {**facts["stream_every"], "kind": "int", "default": 0}
+    assert facts["run_timeout_s"]["default"] == DEFAULT_STANDALONE_TIMEOUT_S
+    assert facts["transport"]["default"] == "sync"
+    assert facts["retry_mode"]["default"] == "on_gate_fail"
+
+
+def test_caps_match_the_stages_own_clamps():
+    from app.api.admin import _FACTS_CONCURRENCY_MAX, _LANE_CONCURRENCY_MAX
+    from connectors.sharepoint.facts_extraction import MAX_CONCURRENCY
+
+    assert _FACTS_CONCURRENCY_MAX == MAX_CONCURRENCY == 64
+    assert _LANE_CONCURRENCY_MAX == 64
+
+
+def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"concurrency": 12, "facts": {"stream_every": 300, "transport": "batch", "retry_mode": "off", "run_timeout_s": 7200}}}},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
+    assert got["concurrency"] == 12
+    assert got["facts"]["stream_every"] == 300
+    assert got["facts"]["transport"] == "batch"
+    assert got["facts"]["retry_mode"] == "off"
+    assert got["facts"]["run_timeout_s"] == 7200
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"concurrency": 0},
+        {"concurrency": 65},
+        {"facts": {"concurrency": 65}},
+        {"facts": {"stream_every": -1}},
+        {"facts": {"run_timeout_s": 5}},
+        {"facts": {"transport": "carrier-pigeon"}},
+        {"facts": {"retry_mode": "sometimes"}},
+        {"facts": {"stream_every": "300"}},
+    ],
+)
+def test_run_knobs_out_of_range_or_wrong_type_are_refused(seeded_app, monkeypatch, patch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post("/api/admin/server-config", json={"sections": {"extraction": patch}}, headers=_auth(token))
+    assert resp.status_code == 422, resp.text
