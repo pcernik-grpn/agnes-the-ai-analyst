@@ -983,10 +983,17 @@ async def preview_anonymization(
         from src.anonymization_ner import DetectionUnavailable, LLMDetector, hybrid_detector
 
         detection_unavailable = (DetectionUnavailable,)
-        llm = LLMDetector()
-        detector = hybrid_detector(llm)
 
     try:
+        if choice == "llm":
+            # Constructed INSIDE the try: `LLMDetector()` resolves the model,
+            # which for a self-hosted endpoint runs the host and key-env
+            # allowlist gates and raises `DetectionUnavailable` on a
+            # misconfiguration. Built outside, that escaped as an unhandled
+            # 500 — losing precisely the 502 whose message names
+            # AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST as the fix.
+            llm = LLMDetector()
+            detector = hybrid_detector(llm)
         result = anonymize_markdown(text, key=key, detector=detector)
     except CustomTermError as exc:
         # The operator's own custom_terms are unusable. A 400 rather than a
