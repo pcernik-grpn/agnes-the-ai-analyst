@@ -13,6 +13,7 @@
      - glossary  -> /semantic-layer?tab=all_glossary  (#1108, retargeted #1707)
      - knowledge -> /corporate-memory
      - chunk     -> /library
+     - plugin    -> /marketplace/curated/<marketplace_id>/<name>  (#1956 item 5)
    All API-derived strings are set via textContent — never innerHTML — so a
    malicious document title / table name can't inject markup.
    No global hotkey: Cmd/Ctrl-K is already the admin/chat command palette. */
@@ -30,10 +31,18 @@
         { type: "table", heading: "Tables" },
         { type: "metric", heading: "Metrics" },
         { type: "glossary", heading: "Glossary" },
+        { type: "plugin", heading: "Plugins" },
         { type: "knowledge", heading: "Knowledge" },
         { type: "chunk", heading: "Documents" },
     ];
-    var TYPE_LABELS = { table: "Table", metric: "Metric", glossary: "Term", knowledge: "Knowledge", chunk: "Document" };
+    var TYPE_LABELS = {
+        table: "Table",
+        metric: "Metric",
+        glossary: "Term",
+        plugin: "Plugin",
+        knowledge: "Knowledge",
+        chunk: "Document",
+    };
 
     var debounceTimer = null;
     var activeController = null;
@@ -48,6 +57,18 @@
         // hint and the old /catalog/semantics 308 cannot read it.
         if (hit.type === "metric") return "/semantic-layer?tab=all_metrics";
         if (hit.type === "glossary") return "/semantic-layer?tab=all_glossary";
+        if (hit.type === "plugin") {
+            // The plugin's own page — the same href the Library's plugin band
+            // links to. Each half of the `<marketplace_id>/<name>` path is
+            // encoded separately so the separator survives; a plugin with no
+            // marketplace falls back to the band itself.
+            var mid = hit.marketplace_id;
+            var nm = hit.slug || hit.name;
+            if (mid && nm) {
+                return "/marketplace/curated/" + encodeURIComponent(mid) + "/" + encodeURIComponent(nm);
+            }
+            return "/library?section=plugin";
+        }
         if (hit.type === "knowledge") return "/corporate-memory";
         if (hit.type === "chunk") return "/library";
         return "#";
@@ -57,6 +78,7 @@
         if (hit.type === "table") return hit.name || "Untitled table";
         if (hit.type === "metric") return hit.display_name || hit.name || "Metric";
         if (hit.type === "glossary") return hit.term || "Term";
+        if (hit.type === "plugin") return hit.display_name || hit.name || "Plugin";
         if (hit.type === "knowledge") return hit.title || "Untitled";
         if (hit.type === "chunk") return hit.filename || "Document";
         return "";
@@ -114,7 +136,21 @@
             renderMessage("No results.");
             return;
         }
-        GROUPS.forEach(function (group) {
+        /* Group order is fixed — structured things first, prose last — with
+           one exception: when the caller typed something's NAME, the server
+           marks that hit `exact` and pins it to the top of the ranking, and a
+           fixed group order would put it back under three tables it did not
+           ask for. The group holding an exact match leads instead. Only that
+           group moves; everything after it keeps the usual order, so the
+           panel is not re-shuffled per keystroke for an ordinary query. */
+        var lead = null;
+        results.some(function (r) { if (r.exact) { lead = r.type; return true; } return false; });
+        var ordered = lead
+            ? GROUPS.filter(function (g) { return g.type === lead; }).concat(
+                  GROUPS.filter(function (g) { return g.type !== lead; }))
+            : GROUPS;
+
+        ordered.forEach(function (group) {
             var hits = results.filter(function (r) { return r.type === group.type; });
             if (!hits.length) return;
             var heading = document.createElement("div");

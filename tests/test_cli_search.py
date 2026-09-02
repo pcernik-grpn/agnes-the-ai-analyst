@@ -122,7 +122,7 @@ def test_search_server_prints_sources_line():
     with patch("cli.commands.search.api_get_json", return_value=_BODY):
         r = runner.invoke(search_app, ["invoices"])
     assert r.exit_code == 0, r.output
-    assert "sources: documents + knowledge + catalog + metrics + glossary (server)" in r.output
+    assert "sources: documents + knowledge + catalog + metrics + glossary + plugins (server)" in r.output
 
 
 def test_search_no_matches_still_prints_sources_line():
@@ -130,7 +130,7 @@ def test_search_no_matches_still_prints_sources_line():
         r = runner.invoke(search_app, ["x"])
     assert r.exit_code == 0
     assert "No matches." in r.output
-    assert "sources: documents + knowledge + catalog + metrics + glossary (server)" in r.output
+    assert "sources: documents + knowledge + catalog + metrics + glossary + plugins (server)" in r.output
 
 
 def test_search_local_and_explicit_scope_server_conflict_exits_1():
