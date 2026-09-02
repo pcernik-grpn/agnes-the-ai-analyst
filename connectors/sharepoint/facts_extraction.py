@@ -79,6 +79,18 @@ the next pass collects it before submitting anything new — and folds every
 result through the SAME gate, corrective-retry-recovery and ingest-shipping
 contract the sync transport uses, so a document's final shape never
 reveals which transport produced it.
+
+Independently, ``extraction.facts.provider: inherit`` (default) | ``anthropic``
+| ``vertex`` decides WHICH LLM provider builds the client — ``inherit``
+follows this instance's own ``ai.provider`` (see
+:func:`resolve_effective_provider`), fixing an incident where an instance
+whose chat already ran through Google Vertex AI kept building an Anthropic
+client for this stage and exhausted its Anthropic workspace's monthly usage
+cap while the Vertex project had headroom. The two knobs interact at exactly
+one point: the Anthropic Batches API has no Vertex equivalent, so a pass
+resolved to ``provider: vertex`` always runs the ``sync`` transport
+(:func:`_resolve_run_transport`), regardless of ``extraction.facts.transport``
+— one warning log line naming why, never an error.
 """
 
 from __future__ import annotations
@@ -134,6 +146,21 @@ MAX_CONCURRENCY = 64
 #: limiting, which is the right trade for a bulk pass over an existing
 #: corpus and the wrong one for "extract this one document now".
 DEFAULT_TRANSPORT = "sync"
+
+#: ``extraction.facts.provider`` — which LLM provider this stage's client is
+#: built against. ``inherit`` (the default) follows the instance's own
+#: ``ai.provider`` (see :func:`resolve_effective_provider`); ``anthropic`` /
+#: ``vertex`` pin this stage to one provider regardless of it. Exists
+#: because this stage otherwise shared ``src.anonymization_ner.build_client``
+#: wholesale — a ladder where a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY``
+#: wins over Vertex even when ``ai.provider: vertex`` is configured (the
+#: right default for a detector with no per-connection concept of its own).
+#: On a live instance that had moved chat traffic to Vertex but still had a
+#: leftover Anthropic key in the environment, that precedence meant this
+#: stage kept spending against the Anthropic workspace until it hit its
+#: monthly usage cap, while the Vertex project had headroom the whole time.
+DEFAULT_PROVIDER = "inherit"
+_VALID_PROVIDERS = frozenset({"inherit", "anthropic", "vertex"})
 
 #: ``extraction.facts.batch_size`` — documents per Batches-API submission.
 #: Hard-capped at the API's own per-batch REQUEST ceiling
@@ -520,6 +547,91 @@ def resolve_transport(connection: Optional[Dict[str, Any]] = None) -> Tuple[str,
                 sorted(_VALID_TRANSPORTS),
             )
     return _transport_mode(), "instance"
+
+
+def _provider_setting() -> str:
+    """``extraction.facts.provider``: ``inherit`` (default), ``anthropic``,
+    or ``vertex``. An unrecognized value falls back to ``inherit`` — the
+    same loudly-named, quietly-corrected posture :func:`_transport_mode`
+    takes for a garbage value.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "provider", default=DEFAULT_PROVIDER)
+    value = str(raw or "").strip().lower()
+    if value in _VALID_PROVIDERS:
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.provider=%r is not one of %s — using %s",
+            raw,
+            sorted(_VALID_PROVIDERS),
+            DEFAULT_PROVIDER,
+        )
+    return DEFAULT_PROVIDER
+
+
+def resolve_provider(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(setting, source)`` for a PASS's LLM provider SETTING — a
+    per-connection override first, the instance-level :func:`_provider_setting`
+    otherwise; the exact shape of :func:`resolve_transport`, for the same
+    reason. The override lives at ``connection.config.extraction.facts.
+    provider``, a sibling of ``transport``/``retry_mode`` there, set through
+    the same ``PATCH …/extraction/facts-config`` call.
+
+    The returned value can itself be ``"inherit"`` — this resolves only
+    WHICH SETTING is in force, not the concrete client provider a pass
+    actually builds; see :func:`resolve_effective_provider` for that.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("provider")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_PROVIDERS:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.provider=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                sorted(_VALID_PROVIDERS),
+            )
+    return _provider_setting(), "instance"
+
+
+def resolve_effective_provider(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(provider, source)`` — ALWAYS a concrete ``"anthropic"`` or
+    ``"vertex"``, the provider whose client this pass actually builds
+    (:func:`_build_facts_client`).
+
+    :func:`resolve_provider` resolves the SETTING, which may be ``"inherit"``
+    (the default) — meaning "follow this instance's ai.provider", read the
+    same way every other server-side LLM call-site reads it
+    (``connectors.llm.factory.vertex_config_or_none``, the SAME resolution
+    ``ai.provider: vertex`` gets everywhere else). This is deliberately a
+    DIFFERENT resolution than ``src.anonymization_ner.build_client``'s own
+    ladder, which lets a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` win
+    over Vertex even when ``ai.provider: vertex`` is configured — the right
+    default for the anonymization detector, which has no per-connection
+    override of its own, and the wrong one here: an instance that migrated
+    its chat traffic to Vertex but left a now-exhausted Anthropic key in the
+    environment must not have facts extraction silently keep spending
+    against it.
+
+    ``source`` extends :func:`resolve_provider`'s own with a ``:inherit``
+    suffix when the setting resolved through ``ai.provider`` rather than
+    naming a provider outright — an operator reading a run report can tell
+    "this connection is pinned" from "this connection follows the instance
+    default, which currently means X".
+    """
+    setting, source = resolve_provider(connection)
+    if setting != "inherit":
+        return setting, source
+    from connectors.llm.factory import vertex_config_or_none
+
+    if vertex_config_or_none() is not None:
+        return "vertex", f"{source}:inherit"
+    return "anthropic", f"{source}:inherit"
 
 
 def _retry_should_fire(
@@ -1113,8 +1225,74 @@ def repair_verbatim_failures(
 
 # --------------------------------------------------------------------------
 # The model call — same credentials, same client, same retry classification
-# as src/anonymization_ner.py
+# as src/anonymization_ner.py, EXCEPT for provider selection (see
+# :func:`_build_facts_client`), which this stage resolves itself rather than
+# delegating to ``build_client``'s static-key-wins-over-Vertex ladder.
 # --------------------------------------------------------------------------
+
+
+def _vertex_model_id(model: str) -> str:
+    """``model`` translated for Vertex — ``to_vertex_model_id`` with one
+    extra substitution: this stage's own zero-config default
+    (``src.anonymization_ner.FALLBACK_MODEL``, ``"claude-haiku-4-5"``, no
+    dated snapshot) passes through ``to_vertex_model_id`` UNCHANGED, since
+    that function only rewrites an ALREADY-dated id's ``-YYYYMMDD`` suffix
+    to Vertex's ``@YYYYMMDD`` spelling — and an undated id is not a Vertex-
+    recognized model there (Vertex requires an explicit snapshot). The known-
+    good Vertex snapshot for the same Haiku tier is
+    ``connectors.llm.factory.MODEL_TIERS["haiku"]``
+    (``"claude-haiku-4-5-20251001"``) — substituted here, and ONLY here, so
+    every other caller of the shared bare default (the anonymization
+    detector, scan OCR) is unaffected: both run against the first-party
+    Anthropic API, where the undated alias is valid.
+    """
+    from connectors.llm.factory import MODEL_TIERS
+    from connectors.llm.vertex_provider import to_vertex_model_id
+
+    from src.anonymization_ner import FALLBACK_MODEL
+
+    resolved = MODEL_TIERS["haiku"] if model == FALLBACK_MODEL else model
+    return to_vertex_model_id(resolved)
+
+
+def _build_facts_client(provider: str, model: str, timeout_s: float) -> Tuple[Any, str]:
+    """The client for one pass's resolved :func:`resolve_effective_provider`.
+
+    ``"anthropic"`` delegates to ``src.anonymization_ner.build_client`` — its
+    own static-key-then-Vertex-ADC ladder, unchanged, and shared with the
+    anonymization detector and scan OCR. ``"vertex"`` builds an
+    ``AnthropicVertex`` client DIRECTLY instead, deliberately bypassing that
+    ladder: the caller already resolved WHICH provider this pass must use
+    (an explicit ``extraction.facts.provider: vertex``, or ``inherit``
+    reading ``ai.provider: vertex``), and a static ``ANTHROPIC_API_KEY`` /
+    ``LLM_API_KEY`` sitting in the environment for an unrelated reason — the
+    root cause of the incident this knob exists to fix — must never
+    silently override that choice.
+
+    Raises :class:`FactsExtractionUnavailable` — never a bare exception —
+    naming the missing setting when ``provider == "vertex"`` but this
+    instance has no usable Vertex configuration.
+    """
+    if provider == "vertex":
+        from connectors.llm.factory import vertex_config_or_none
+        from connectors.llm.vertex_provider import create_vertex_client
+
+        vertex = vertex_config_or_none()
+        if vertex is None:
+            raise FactsExtractionUnavailable(
+                "extraction.facts.provider resolved to 'vertex' but this instance has no usable Vertex "
+                "configuration — set ai.provider: vertex and ai.vertex.project_id (optionally "
+                "ai.vertex.region) in instance.yaml, or the ANTHROPIC_VERTEX_PROJECT_ID env var"
+            )
+        project_id, region = vertex
+        return create_vertex_client(project_id=project_id, region=region, timeout=timeout_s), _vertex_model_id(model)
+
+    from src.anonymization_ner import DetectionUnavailable, build_client
+
+    try:
+        return build_client(model, timeout_s)
+    except DetectionUnavailable as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
 
 
 def _empty_usage() -> Dict[str, int]:
@@ -1131,14 +1309,18 @@ def _empty_usage() -> Dict[str, int]:
 class _Extractor:
     """One run's model client, prompt and token accounting.
 
-    Credential resolution, the Vertex branch, the retry classification and
-    the reply-text extraction are all
+    The retry classification and the reply-text extraction are
     ``src.anonymization_ner``'s — imported, not copied, so this stage can
-    never drift into a second (weaker) definition of "which key, which
-    client, which failure is worth retrying". Private names are imported
-    deliberately: duplicating them is strictly worse than depending on
-    them, and the same lazy cross-module private import is already the
-    convention between the crawler and ``app.worker.kinds``.
+    never drift into a second (weaker) definition of "which failure is worth
+    retrying". Private names are imported deliberately: duplicating them is
+    strictly worse than depending on them, and the same lazy cross-module
+    private import is already the convention between the crawler and
+    ``app.worker.kinds``. Client construction itself is
+    :func:`_build_facts_client` — the resolved ``provider`` decides whether
+    that delegates to ``src.anonymization_ner.build_client`` (the anthropic
+    case) or builds an ``AnthropicVertex`` client directly (the vertex case,
+    bypassing that shared ladder's own static-key-wins-over-Vertex
+    precedence — see :func:`_build_facts_client`'s docstring for why).
 
     **Called from several worker threads at once** (see
     :func:`run_facts_extraction`'s bounded pool), so the two pieces of
@@ -1161,6 +1343,7 @@ class _Extractor:
         backoff_s: float = DEFAULT_BACKOFF_S,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         sleep: Callable[[float], None] = time.sleep,
+        provider: Optional[str] = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.model = model or _model()
@@ -1174,19 +1357,15 @@ class _Extractor:
         self._sleep = sleep
         self._usage_lock = threading.Lock()
         self._client_lock = threading.Lock()
+        #: ALWAYS a concrete provider ("anthropic"/"vertex"), never
+        #: "inherit" — the caller resolves that via
+        #: :func:`resolve_effective_provider` before constructing this.
+        self.provider = provider or "anthropic"
 
     def _ensure_client(self) -> Tuple[Any, str]:
         with self._client_lock:
             if self._client is None:
-                from src.anonymization_ner import DetectionUnavailable, build_client
-
-                try:
-                    self._client, self._call_model = build_client(self.model, self.timeout_s)
-                except DetectionUnavailable as exc:
-                    # Same condition, this stage's own name for it: no
-                    # credential means the pass cannot run, not that the
-                    # corpus has no facts.
-                    raise FactsExtractionUnavailable(str(exc)) from exc
+                self._client, self._call_model = _build_facts_client(self.provider, self.model, self.timeout_s)
             return self._client, (self._call_model or self.model)
 
     def _create(self, user_message: str) -> Any:
@@ -1427,6 +1606,9 @@ class _Report:
         ontology: Dict[str, Any],
         usage: Dict[str, Any],
         batch_usage: Optional[Dict[str, Any]] = None,
+        provider: str = "anthropic",
+        provider_source: str = "instance",
+        transport: str = "sync",
     ) -> Dict[str, Any]:
         """``batch_usage`` is the SUBSET of ``usage`` that came from the
         Batches API (a batch-mode pass whose corrective retry fell back to
@@ -1435,6 +1617,14 @@ class _Report:
         the synchronous rate, and summed. ``None`` (every sync-mode call
         site) prices the whole of ``usage`` at the synchronous rate, exactly
         as before this parameter existed.
+
+        ``provider`` / ``provider_source`` are :func:`resolve_effective_provider`'s
+        own output and ``transport`` is the transport this pass ACTUALLY ran
+        (which can differ from :func:`resolve_transport`'s answer — a
+        vertex-resolved provider always runs ``sync``, see
+        :func:`run_facts_extraction`) — so an operator reading one run's
+        report can see what actually spent money, not just what the
+        instance/connection was configured to try.
         """
         from src.llm_pricing import cost_usd
 
@@ -1469,6 +1659,9 @@ class _Report:
             "interrupted_reason": self.interrupted_reason,
             "model": model,
             "prompt_origin": prompt_origin,
+            "provider": provider,
+            "provider_source": provider_source,
+            "transport": transport,
             # What parallelism this pass actually ran at, and where that
             # number came from (`config` / `clamped` / `invalid` /
             # `default` / `caller`). Both, because an operator comparing
@@ -2406,6 +2599,33 @@ def _ingest_identity() -> Any:
     return ensure_scheduler_user()
 
 
+def _resolve_run_transport(
+    *,
+    connection_id: str,
+    transport: Optional[str],
+    connection: Optional[Dict[str, Any]],
+    effective_provider: str,
+) -> str:
+    """The transport ONE pass actually runs — an explicit ``transport`` (the
+    test seam) wins; otherwise :func:`resolve_transport`'s answer — downgraded
+    from ``"batch"`` to ``"sync"`` when ``effective_provider`` is
+    ``"vertex"``: the Anthropic Batches API has no Vertex equivalent, and
+    this is never an error and never a silent switch — ONE warning naming
+    why, and the caller reports the (possibly-downgraded) return value as
+    the pass's ACTUAL transport (:meth:`_Report.render`'s own ``transport``
+    field), not what was configured.
+    """
+    mode = transport if transport is not None else resolve_transport(connection)[0]
+    if mode == "batch" and effective_provider == "vertex":
+        logger.warning(
+            "facts extraction: connection %s resolved provider=vertex but transport=batch — the "
+            "Anthropic Batches API has no Vertex equivalent, falling back to transport=sync for this pass",
+            connection_id,
+        )
+        return "sync"
+    return mode
+
+
 def run_facts_extraction(
     connection_id: str,
     *,
@@ -2418,6 +2638,7 @@ def run_facts_extraction(
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
     transport: Optional[str] = None,
     batch_client: Any | None = None,
+    provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -2469,6 +2690,17 @@ def run_facts_extraction(
     transport's own test seam (an object exposing ``.messages.batches.
     create/retrieve/results``), unused for a sync pass.
 
+    ``provider`` overrides ``extraction.facts.provider`` (the test seam,
+    same convention — a concrete ``"anthropic"``/``"vertex"`` here skips
+    :func:`resolve_effective_provider` entirely; ``None`` resolves it). The
+    Anthropic Batches API has no Vertex equivalent: when the resolved
+    provider is ``"vertex"`` and the resolved transport is ``"batch"``, this
+    function falls back to ``"sync"`` with ONE warning naming why, rather
+    than an error or a silent switch — the effective provider AND transport
+    are then reported by :meth:`_Report.render` (``provider``,
+    ``provider_source``, ``transport``), so an operator sees what actually
+    ran, not just what was configured.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -2496,13 +2728,22 @@ def run_facts_extraction(
 
     model = _model()
 
+    # Provider resolution — independent of the transport dispatch below, but
+    # the transport dispatch depends on ITS answer (batch is Anthropic-API-
+    # only). An explicit `provider` (the test seam) wins outright; otherwise
+    # `resolve_effective_provider` — connection override, then the instance
+    # setting, then (when either resolves to "inherit", the default) this
+    # instance's own `ai.provider`.
+    effective_provider, provider_source = (
+        (provider, "caller") if provider in ("anthropic", "vertex") else resolve_effective_provider(connection)
+    )
+
     # Transport dispatch — the ONE branch point between the two transports.
-    # Everything above this line (connection, ontology, prompt, model) is
-    # shared; nothing below it runs for a batch-mode pass.
-    # An explicit `transport` (the test seam) wins; otherwise the
-    # connection's own override, then the instance default — so one site
-    # can run its curated connection sync and its long tail on batches.
-    mode = transport if transport is not None else resolve_transport(connection)[0]
+    # Everything above this line (connection, ontology, prompt, model,
+    # provider) is shared; nothing below it runs for a batch-mode pass.
+    mode = _resolve_run_transport(
+        connection_id=connection_id, transport=transport, connection=connection, effective_provider=effective_provider
+    )
     if mode == "batch":
         # Same precedence as the sync loop below: an explicit `retry_mode`
         # (the test seam) wins, else the connection's override, else the
@@ -2521,10 +2762,12 @@ def run_facts_extraction(
             batch_client=batch_client,
             on_progress=on_progress,
             retry_mode=retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0],
+            provider=effective_provider,
+            provider_source=provider_source,
         )
 
     if extractor is None:
-        extractor = _Extractor(system_prompt=system_prompt, model=model)
+        extractor = _Extractor(system_prompt=system_prompt, model=model, provider=effective_provider)
     else:
         model = getattr(extractor, "model", model)
 
@@ -2733,6 +2976,9 @@ def run_facts_extraction(
         prompt_origin=prompt_origin,
         ontology=_ontology_report(ontology_models),
         usage=usage,
+        provider=getattr(extractor, "provider", effective_provider),
+        provider_source=provider_source,
+        transport=mode,
     )
     logger.info(
         "facts extraction: connection %s — %d extracted, %d unchanged, %d failed, %d quotes dropped, %d claims written",
@@ -2762,6 +3008,8 @@ def _run_batch_pass(
     batch_client: Any | None = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
     retry_mode: str = DEFAULT_RETRY_MODE,
+    provider: str = "anthropic",
+    provider_source: str = "instance",
 ) -> Dict[str, Any]:
     """The Batches-API transport's own pass — dispatched from
     :func:`run_facts_extraction` when ``extraction.facts.transport`` (or
@@ -3196,6 +3444,9 @@ def _run_batch_pass(
         ontology=_ontology_report(ontology_models),
         usage=usage,
         batch_usage=batch_usage,
+        provider=provider,
+        provider_source=provider_source,
+        transport="batch",
     )
     logger.info(
         "facts extraction (batch transport): connection %s — %d extracted (%d via batch, %d via sync retry), "

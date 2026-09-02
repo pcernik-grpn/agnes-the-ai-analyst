@@ -215,3 +215,96 @@ class TestTransportOverride:
         )
 
         assert r.status_code == 422
+
+
+class TestProviderOverride:
+    """`provider` rides the same PATCH but is only touched when PRESENT in
+    the body — the same convention `transport` uses, for the same reason:
+    a retry-mode-only call must not silently move a connection off (or
+    onto) Vertex."""
+
+    def test_setting_vertex_is_written_and_resolved_from_the_connection(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-provider-set")
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": "vertex"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        # An explicit connection override is honoured verbatim — the
+        # "effective" client provider matches even though this instance has
+        # no usable Vertex config (a real pass would fail loudly instead,
+        # see FactsExtractionUnavailable; this endpoint only resolves).
+        assert r.json()["provider"] == {
+            "value": "vertex",
+            "source": "connection",
+            "effective": "vertex",
+            "effective_source": "connection",
+        }
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["extraction"]["facts"]["provider"] == "vertex"
+
+    def test_a_retry_mode_only_patch_leaves_the_provider_alone(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-provider-untouched")
+        client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": "anthropic"}, headers=_auth(token))
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"retry_mode": "off"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["retry_mode"] == {"value": "off", "source": "connection"}
+        assert r.json()["provider"]["value"] == "anthropic"
+        assert r.json()["provider"]["source"] == "connection"
+
+    def test_an_explicit_null_clears_the_provider_override(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-provider-clear")
+        client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": "vertex"}, headers=_auth(token))
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": None}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        # Cleared → falls back to the instance default ("inherit"), which in
+        # turn resolves through ai.provider — no Vertex configured here, so
+        # the effective client provider is anthropic.
+        assert r.json()["provider"] == {
+            "value": "inherit",
+            "source": "instance",
+            "effective": "anthropic",
+            "effective_source": "instance:inherit",
+        }
+
+    def test_an_invalid_provider_is_refused_with_422(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-provider-invalid")
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": "openai"}, headers=_auth(token))
+
+        assert r.status_code == 422
+
+    def test_inherit_follows_ai_provider_when_vertex_is_configured(self, seeded_app, monkeypatch):
+        """The exact incident this knob exists for, from the resolver's
+        side: a connection left on the default ('inherit') must follow
+        ai.provider — regardless of a static Anthropic key sitting in the
+        environment, which `resolve_effective_provider` never consults."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-still-set-but-workspace-is-exhausted")
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-provider-inherit-vertex")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"provider": "inherit"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["provider"] == {
+            "value": "inherit",
+            "source": "connection",
+            "effective": "vertex",
+            "effective_source": "connection:inherit",
+        }

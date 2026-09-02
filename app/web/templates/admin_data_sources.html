@@ -2400,28 +2400,32 @@ function _sharepointIdentityLine(config) {
   return bits.join(" · ");
 }
 
-/* Per-connection facts-extraction policy override (retry_mode / transport) —
-   `PATCH .../extraction/facts-config`
+/* Per-connection facts-extraction policy override (retry_mode / transport /
+   provider) — `PATCH .../extraction/facts-config`
    (`app/api/admin_extraction.py::patch_extraction_facts_config`). Its own
    render helper, its own save function (`saveSpFactsPolicy` below), so this
    control never entangles with the run-options row or the "Extract facts
-   now" button it sits next to. The two selects read the CONNECTION-level
+   now" button it sits next to. The three selects read the CONNECTION-level
    override straight off `row.config.extraction.facts` — the same rows
    payload `loadConnections()` already fetched, no extra round trip — and an
    empty selection ("Instance default") means "no override", exactly what
    the PATCH body's `null` clears. The resolved value and its source
    ("connection"/"instance") are shown only after Save, from the endpoint's
-   own response — there is no resolver on this side to guess it beforehand. */
+   own response — there is no resolver on this side to guess it beforehand.
+   `provider` exists so a connection whose Anthropic key has hit its
+   workspace usage cap can be pinned to `vertex` without an instance-wide
+   `ai.provider` change. */
 function _extRenderFactsPolicy(row) {
   const facts = ((row.config || {}).extraction || {}).facts || {};
   const retryMode = typeof facts.retry_mode === "string" ? facts.retry_mode : "";
   const transport = typeof facts.transport === "string" ? facts.transport : "";
+  const provider = typeof facts.provider === "string" ? facts.provider : "";
   const opt = (current, value, label) =>
     `<option value="${_esc(value)}"${current === value ? " selected" : ""}>${_esc(label)}</option>`;
   const label = _esc(row.name || row.id || "");
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy and API transport (cost levers). Leave both on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
+    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy, API transport and LLM provider (cost levers). Leave all three on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
     <span class="ds-src__fact-v">
       <select id="ds-sp-factspolicy-retry-${row.id}" class="ds-dropdown-native" aria-label="Facts retry mode for ${label}">
         ${opt(retryMode, "", "Instance default")}
@@ -2433,6 +2437,12 @@ function _extRenderFactsPolicy(row) {
         ${opt(transport, "", "Instance default")}
         ${opt(transport, "sync", "Sync")}
         ${opt(transport, "batch", "Batch")}
+      </select>
+      <select id="ds-sp-factspolicy-provider-${row.id}" class="ds-dropdown-native" aria-label="Facts provider for ${label}">
+        ${opt(provider, "", "Instance default")}
+        ${opt(provider, "inherit", "Inherit (ai.provider)")}
+        ${opt(provider, "anthropic", "Anthropic")}
+        ${opt(provider, "vertex", "Vertex")}
       </select>
       <span class="field-hint" id="ds-sp-factspolicy-status-${row.id}"></span>
     </span>
@@ -3447,22 +3457,26 @@ async function runSpFactsExtraction(id) {
 
 /* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
    `PATCH .../extraction/facts-config`
-   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Both
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). All three
    selects are always sent — the empty "Instance default" option maps to
    `null`, which the endpoint reads as "clear the override", the same
    least-surprise reading the endpoint's own docstring describes. The
    response carries the RESOLVED value and its source ("connection" once an
    override is set, "instance" once cleared) — shown here rather than
    guessed, since this page has no copy of the instance-level default to
-   resolve against itself. */
+   resolve against itself. `provider` also carries an `effective` field
+   (always a concrete "anthropic"/"vertex", never "inherit") — shown too,
+   since that is what a pass actually spends against. */
 async function saveSpFactsPolicy(id) {
   const retrySel = document.getElementById(`ds-sp-factspolicy-retry-${id}`);
   const transportSel = document.getElementById(`ds-sp-factspolicy-transport-${id}`);
+  const providerSel = document.getElementById(`ds-sp-factspolicy-provider-${id}`);
   const statusEl = document.getElementById(`ds-sp-factspolicy-status-${id}`);
-  if (!retrySel || !transportSel) return;
+  if (!retrySel || !transportSel || !providerSel) return;
   const body = {
     retry_mode: retrySel.value || null,
     transport: transportSel.value || null,
+    provider: providerSel.value || null,
   };
   if (statusEl) statusEl.textContent = "Saving…";
   try {
@@ -3476,7 +3490,12 @@ async function saveSpFactsPolicy(id) {
     if (r.ok) {
       const rm = respBody.retry_mode || {};
       const tr = respBody.transport || {};
-      if (statusEl) statusEl.textContent = `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source})`;
+      const pr = respBody.provider || {};
+      if (statusEl) {
+        statusEl.textContent =
+          `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source}) · ` +
+          `Provider: ${pr.value} (${pr.source}) — effective: ${pr.effective}`;
+      }
       showToast("Facts policy saved.", true);
       // Keep the in-memory row current — a later `renderConnList()` (e.g.
       // after `loadConnections()`) must redraw the just-saved override, not
@@ -3488,6 +3507,7 @@ async function saveSpFactsPolicy(id) {
         const facts = { ...(conn.config.extraction.facts || {}) };
         if (body.retry_mode === null) delete facts.retry_mode; else facts.retry_mode = body.retry_mode;
         if (body.transport === null) delete facts.transport; else facts.transport = body.transport;
+        if (body.provider === null) delete facts.provider; else facts.provider = body.provider;
         conn.config.extraction.facts = facts;
       }
     } else {

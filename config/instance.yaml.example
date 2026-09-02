@@ -1589,6 +1589,22 @@ extraction:
     # without one, with a one-time log line, never a crash.
     # AGNES_EXTRACTION_FACTS_LLM_CACHE overrides this at the environment level.
     llm_cache: true
+    # Which LLM provider carries this stage's calls. `inherit` (default)
+    # follows this instance's own `ai.provider` above — vertex when chat/LLM
+    # traffic already runs through Google Vertex AI, anthropic otherwise.
+    # `anthropic` / `vertex` pin this stage to one provider REGARDLESS of
+    # ai.provider — e.g. an instance that migrated chat to Vertex but wants
+    # facts extraction to keep spending against a still-working Anthropic
+    # key, or the reverse: a connection pinned to `vertex` once its
+    # Anthropic workspace hit its monthly usage cap, without waiting for
+    # ai.provider to change instance-wide. A single connection can override
+    # this too — see `config.extraction.facts.provider` on the connection
+    # row, PATCH /api/admin/sharepoint/connections/{id}/extraction/
+    # facts-config or `agnes admin sharepoint facts-config --provider`.
+    # The Anthropic Batches API has no Vertex equivalent: a pass resolved to
+    # `vertex` always runs the `sync` transport below, regardless of this
+    # instance's `transport` setting — one warning log line, never an error.
+    provider: inherit
     # Which API carries each document's extraction call. `sync` (default)
     # is the synchronous Messages API, bound by the model account's
     # tokens-per-minute limit — measured on a live instance at ~13k input +

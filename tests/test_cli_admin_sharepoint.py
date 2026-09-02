@@ -302,6 +302,91 @@ class TestFactsConfig:
         assert "connection_not_found" in result.output
 
 
+class TestFactsConfigProvider:
+    """`--provider` / `--clear-provider` — the same PRESENT-in-body
+    convention `--transport` uses: a provider-only call re-sends the
+    connection's CURRENT retry-mode override rather than wiping it, which is
+    why it needs a mocked `api_get` (the CLI's own re-fetch) as well as
+    `api_patch`."""
+
+    def test_provider_only_patches_and_resends_the_current_retry_mode(self):
+        body = {
+            "connection_id": "conn1",
+            "retry_mode": {"value": "always", "source": "connection"},
+            "provider": {
+                "value": "vertex",
+                "source": "connection",
+                "effective": "vertex",
+                "effective_source": "connection",
+            },
+        }
+        with (
+            patch(
+                "cli.commands.admin_sharepoint.api_get",
+                return_value=_resp(200, {"config": {"extraction": {"facts": {"retry_mode": "always"}}}}),
+            ) as mock_get,
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--provider", "vertex"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once()
+        args, kwargs = mock_patch.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/facts-config"
+        assert kwargs["json"] == {"retry_mode": "always", "provider": "vertex"}
+        assert "vertex" in result.output
+
+    def test_clear_provider_sends_a_null_provider(self):
+        body = {
+            "connection_id": "conn1",
+            "retry_mode": {"value": "on_gate_fail", "source": "instance"},
+            "provider": {
+                "value": "inherit",
+                "source": "instance",
+                "effective": "anthropic",
+                "effective_source": "instance:inherit",
+            },
+        }
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, {"config": {}})),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--clear-provider"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"retry_mode": None, "provider": None}
+        assert "inherit" in result.output
+        assert "anthropic" in result.output
+
+    def test_provider_and_clear_provider_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "facts-config", "conn1", "--provider", "vertex", "--clear-provider"]
+        )
+        assert result.exit_code == 1
+        assert "not both" in result.output
+
+    def test_an_invalid_provider_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--provider", "openai"])
+        assert result.exit_code == 1
+        assert "must be one of" in result.output
+
+    def test_provider_alone_satisfies_the_required_flag_check(self):
+        body = {
+            "connection_id": "conn1",
+            "provider": {
+                "value": "anthropic",
+                "source": "connection",
+                "effective": "anthropic",
+                "effective_source": "connection",
+            },
+        }
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, {"config": {}})),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--provider", "anthropic"])
+        assert result.exit_code == 0, result.output
+
+
 class TestCrawlConfig:
     """`agnes admin sharepoint crawl-config` — CLI counterpart to
     `PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config`."""

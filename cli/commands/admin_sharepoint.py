@@ -21,10 +21,12 @@ Six surfaces:
     every SharePoint connection at once. CLI counterpart to
     ``GET /api/admin/sharepoint/extraction/runs`` — the same endpoint
     ``/admin/extraction`` polls.
-  - ``facts-config`` — a per-connection retry-policy override (cost-levers
-    task, lever A): one high-value connection keeps the corrective retry ON
-    while a long-tail connection runs with it OFF, set without an
-    instance.yaml edit. CLI counterpart to
+  - ``facts-config`` — a per-connection retry-policy/transport/provider
+    override (cost-levers task, lever A): one high-value connection keeps
+    the corrective retry ON while a long-tail connection runs with it OFF,
+    or a connection is pinned to a specific LLM provider (e.g. off a
+    workspace that hit its usage cap), set without an instance.yaml edit.
+    CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     facts-config``.
   - ``crawl-config`` — a per-connection age filter: a backfill run can crawl
@@ -74,6 +76,7 @@ admin_sharepoint_app.add_typer(connection_app, name="connection")
 _console = Console(width=200)
 
 _RETRY_MODES = ("off", "on_gate_fail", "always")
+_PROVIDERS = ("inherit", "anthropic", "vertex")
 
 
 def _fail(resp) -> None:
@@ -506,20 +509,37 @@ def facts_config(
     clear_transport: bool = typer.Option(
         False, "--clear-transport", help="Remove the transport override — falls back to extraction.facts.transport."
     ),
+    provider: Optional[str] = typer.Option(
+        None,
+        "--provider",
+        help=f"Per-connection override for which LLM provider carries this stage's calls: one of "
+        f"{', '.join(_PROVIDERS)}. inherit (the instance default) follows this instance's ai.provider; "
+        "anthropic/vertex pin this stage regardless of it. The Anthropic Batches API has no Vertex "
+        "equivalent — a connection resolved to vertex always runs the sync transport. Left untouched "
+        "when not given.",
+    ),
+    clear_provider: bool = typer.Option(
+        False, "--clear-provider", help="Remove the provider override — falls back to extraction.facts.provider."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
-    """Set (or clear) this connection's own ``extraction.facts.retry_mode``
-    and/or ``extraction.facts.transport``, overriding the instance-level
-    defaults (cost-levers task, lever A) — a curated, high-stakes
-    connection can keep the corrective retry ON and run sync (a dropped
-    quote there is a lost citation, and its facts should land in minutes)
-    while a long-tail connection runs with retries OFF on the Batches API,
-    without an instance.yaml edit that would flip every connection at once.
+    """Set (or clear) this connection's own ``extraction.facts.retry_mode``,
+    ``extraction.facts.transport`` and/or ``extraction.facts.provider``,
+    overriding the instance-level defaults (cost-levers task, lever A) — a
+    curated, high-stakes connection can keep the corrective retry ON and run
+    sync (a dropped quote there is a lost citation, and its facts should
+    land in minutes) while a long-tail connection runs with retries OFF on
+    the Batches API, without an instance.yaml edit that would flip every
+    connection at once. ``--provider`` is the same lever for the incident
+    this knob exists to fix: a connection whose Anthropic key has hit its
+    workspace usage cap can be pinned to ``vertex`` without waiting for the
+    instance-wide ``ai.provider`` to change.
 
     ``--retry-mode`` / ``--clear`` are mutually exclusive and one is
-    required unless ``--transport`` / ``--clear-transport`` is given.
-    Prints the RESOLVED values and where they came from (``connection`` or
-    ``instance``) — the same shape the admin config drawer would show.
+    required unless ``--transport`` / ``--clear-transport`` / ``--provider``
+    / ``--clear-provider`` is given. Prints the RESOLVED values and where
+    they came from (``connection`` or ``instance``) — the same shape the
+    admin config drawer would show.
     """
     if clear and retry_mode is not None:
         typer.echo("Error: pass either --retry-mode or --clear, not both", err=True)
@@ -527,9 +547,17 @@ def facts_config(
     if clear_transport and transport is not None:
         typer.echo("Error: pass either --transport or --clear-transport, not both", err=True)
         raise typer.Exit(1)
+    if clear_provider and provider is not None:
+        typer.echo("Error: pass either --provider or --clear-provider, not both", err=True)
+        raise typer.Exit(1)
     touching_transport = clear_transport or transport is not None
-    if not clear and retry_mode is None and not touching_transport:
-        typer.echo("Error: one of --retry-mode or --clear is required (or --transport / --clear-transport)", err=True)
+    touching_provider = clear_provider or provider is not None
+    if not clear and retry_mode is None and not touching_transport and not touching_provider:
+        typer.echo(
+            "Error: one of --retry-mode or --clear is required "
+            "(or --transport / --clear-transport / --provider / --clear-provider)",
+            err=True,
+        )
         raise typer.Exit(1)
     if retry_mode is not None and retry_mode not in _RETRY_MODES:
         typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
@@ -537,18 +565,23 @@ def facts_config(
     if transport is not None and transport not in ("sync", "batch"):
         typer.echo("Error: --transport must be sync or batch", err=True)
         raise typer.Exit(1)
+    if provider is not None and provider not in _PROVIDERS:
+        typer.echo(f"Error: --provider must be one of {', '.join(_PROVIDERS)}", err=True)
+        raise typer.Exit(1)
 
     # The retry policy keeps its original contract (omitted == cleared), so a
-    # transport-only call re-sends the connection's current retry override
-    # rather than wiping it.
+    # transport/provider-only call re-sends the connection's current retry
+    # override rather than wiping it.
     payload: dict = {"retry_mode": retry_mode}
-    if not clear and retry_mode is None and touching_transport:
+    if not clear and retry_mode is None and (touching_transport or touching_provider):
         current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
         if current.status_code == 200:
             facts_now = (((current.json().get("config") or {}).get("extraction") or {}).get("facts")) or {}
             payload["retry_mode"] = facts_now.get("retry_mode")
     if touching_transport:
         payload["transport"] = None if clear_transport else transport
+    if touching_provider:
+        payload["provider"] = None if clear_provider else provider
 
     resp = api_patch(
         f"/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
@@ -565,6 +598,12 @@ def facts_config(
     resolved_t = body.get("transport") or {}
     if resolved_t:
         typer.echo(f"transport: {resolved_t.get('value')} (source: {resolved_t.get('source')})")
+    resolved_p = body.get("provider") or {}
+    if resolved_p:
+        typer.echo(
+            f"provider: {resolved_p.get('value')} (source: {resolved_p.get('source')}) "
+            f"— effective: {resolved_p.get('effective')}"
+        )
 
 
 @admin_sharepoint_app.command("crawl-config")
