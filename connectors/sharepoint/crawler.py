@@ -2434,6 +2434,48 @@ class _PreparedDocument:
     detail: str = ""
 
 
+def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
+    """The ``(path, filename)`` an anonymize-marked scope stores instead of
+    the real ones — same key, same detector as the document body.
+
+    The source name and folder path are routinely the single most
+    re-identifying string in a document (a deal name, a client name); an
+    anonymize-marked scope's promise that "Agnes never holds the original at
+    all" (``docs/anonymization.md``) is broken if they survive verbatim
+    while the body is redacted.
+
+    Each path SEGMENT is anonymized independently — not the path as one
+    string — and the ``"/"`` separator structure is kept: two files under
+    the same real folder still share the same anonymized folder prefix
+    (the substitution is deterministic under one key), so prefix matching,
+    the exclusion index and the corpus-map resolver keep working the same
+    SHAPE against the anonymized tree they worked against the real one, even
+    though no segment is readable any more.
+
+    The returned ``path``'s leaf segment keeps the SOURCE file's extension
+    (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
+    mirroring the exact relationship the un-anonymized values already have
+    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
+    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
+    converted markdown's own name). Only the identity-bearing STEM changes,
+    never the suffix a downstream reader keys extension logic on.
+
+    Routing decisions (which collection, which exclusion rule) are made
+    EARLIER in the pipeline against the RAW path — those decisions come from
+    admin-configured real folder names and must see the real thing. This
+    function only prepares what gets PERSISTED.
+    """
+    stem = Path(name).stem or name
+    suffix = Path(name).suffix
+    anonymized_stem = str(anonymize_markdown(stem, key=key, detector=detector).text)
+    filename = f"{anonymized_stem}.md"
+    folder = path.rsplit("/", 1)[0] if "/" in path else ""
+    segments = [
+        str(anonymize_markdown(segment, key=key, detector=detector).text) for segment in folder.split("/") if segment
+    ]
+    anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
+    return anonymized_path, filename
+
 def _convert_failure_detail(detail_type: str, detail_message: str, *, anonymize: bool) -> str:
     """The ``detail`` a ``"convert_failed"`` outcome is allowed to carry,
     decided by THIS scope's anonymize flag — see :func:`_prepare_document`'s

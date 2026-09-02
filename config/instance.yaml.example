@@ -1073,6 +1073,10 @@ chat:
   #        keep working).
   # none — internal-only network: the sandbox reaches nothing but the
   #        containers on that network (breaks in-sandbox package installs).
+  #        A skill's `requirements.txt` can therefore never install at
+  #        runtime under this mode, at any point in the session — its
+  #        packages must be baked into the sandbox image (see the
+  #        Dockerfile's hand-maintained pip list) or shipped some other way.
   # allowlist — the internal network of `none` PLUS the egress-proxy sidecar
   #        (compose profile `chat-docker-egress`): sandboxes get HTTP(S)_PROXY
   #        pointed at it and may reach only docker_egress_allow_hosts, each

@@ -133,7 +133,19 @@ def elevation_paused(subject_user_id: Optional[str] = None) -> bool:
     Passing no subject keeps the old request-scoped meaning, and an unknown
     caller still honours the pause: it only ever reduces privilege, so the
     conservative answer is the safe one.
+
+    A read-only view-as (``app/auth/view_as.py``) always reads as paused for
+    the identity it narrows to. ``can_access`` does not route its god-mode
+    branch through ``is_user_admin`` — it inlines the Admin-group membership
+    test and then consults this function — so this is the second half of the
+    same suppression, not a duplicate of it. Both halves are needed: one
+    covers the gates built on ``is_user_admin``, this one covers the grant
+    check.
     """
+    from app.auth.view_as import is_narrowed_subject
+
+    if is_narrowed_subject(subject_user_id):
+        return True
     if not _elevation_paused.get():
         return False
     if subject_user_id is None:

@@ -638,6 +638,7 @@ resource "google_compute_instance" "vm" {
     kai_agent_jwt_secret         = var.kai_agent_jwt_secret
     kai_agent_e2b_key_secret     = var.kai_agent_e2b_key_secret
     extraction_worker_enabled    = each.value.extraction_worker_enabled
+    extraction_worker_image      = var.extraction_worker_image
     extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
     extraction_worker_cpus       = each.value.extraction_worker_cpus
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no

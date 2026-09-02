@@ -988,18 +988,22 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 #      and the job queue itself lives in Postgres — nothing here belongs on
 #      the data disk.
 #
-#   2. The `extraction-worker` service turned always-on, with NO image
-#      override. The base docker-compose.yml hides the service behind the
-#      `extraction-worker` compose profile; `profiles: !reset []` in the
-#      overlay clears that, so the OVERLAY's presence in COMPOSE_FILE is the
-#      entire switch — no --profile plumbing through the startup/upgrade/
-#      applier scripts, all of which disagree about profile handling. The
-#      image itself is left to fall through to docker-compose.prod.yml's own
-#      pin, which already points this service at the same AGNES_IMAGE_REPO/
-#      AGNES_TAG as app/scheduler: the built-in extraction pipeline needs
-#      nothing bundled that image does not already carry, so following the
-#      app's own tag is correct — a separate producer-bundled image variant
-#      existed only for the retired external-producer mode.
+#   2. The `extraction-worker` service turned always-on. The base
+#      docker-compose.yml hides the service behind the `extraction-worker`
+#      compose profile; `profiles: !reset []` in the overlay clears that, so
+#      the OVERLAY's presence in COMPOSE_FILE is the entire switch — no
+#      --profile plumbing through the startup/upgrade/applier scripts, all
+#      of which disagree about profile handling. Image: by DEFAULT (no
+#      extraction_worker_image) the overlay sets no `image:` key at all and
+#      the service falls through to docker-compose.prod.yml's own pin — the
+#      same AGNES_IMAGE_REPO/AGNES_TAG as app/scheduler, since the built-in
+#      extraction pipeline needs nothing bundled that image does not already
+#      carry. This is what keeps the worker from drifting behind the app's
+#      own image as the fleet auto-upgrades. extraction_worker_image (below,
+#      via .env) is an OPTIONAL, deliberate override for the rare case an
+#      operator genuinely wants the worker on a different tag than the app
+#      (a canary, holding the worker back mid-rollout) — see that variable's
+#      own description for why a pin left in place risks a crash loop.
 #
 # The coordination declaration rides .env (AGNES_COORDINATION_BACKEND +
 # AGNES_REDIS_URL, written into the .env heredoc below) and NOT
@@ -1026,9 +1030,19 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 # already in .env here). On an instance still running the frozen DuckDB
 # app-state backend the app will refuse to start with a named error —
 # migrate the backend first, then enable this flag.
-# No registry auth to arrange here: the worker pulls the same image as
-# app/scheduler, already authenticated above (IMAGE_HOST / gcloud auth
-# configure-docker, further up this script).
+# Registry auth only matters here when extraction_worker_image deliberately
+# points the worker at a DIFFERENT registry than the app's own (same
+# best-effort posture as IMAGE_HOST further up this script). Unset (the
+# default), the worker pulls the same image as app/scheduler, already
+# authenticated above.
+%{ if extraction_worker_image != "" ~}
+EXTRACTION_IMAGE="${extraction_worker_image}"
+EXTRACTION_IMAGE_HOST="$${EXTRACTION_IMAGE%%/*}"
+case "$EXTRACTION_IMAGE_HOST" in
+    *-docker.pkg.dev) gcloud auth configure-docker "$EXTRACTION_IMAGE_HOST" --quiet \
+        || echo "WARN: gcloud auth configure-docker $EXTRACTION_IMAGE_HOST failed — the extraction-worker image pull will likely fail below" >&2 ;;
+esac
+%{ endif ~}
 
 # Quoted heredoc: the $${...} below are resolved by docker compose from
 # /opt/agnes/.env at `compose up` time, not by this shell.
@@ -1049,11 +1063,16 @@ services:
   extraction-worker:
     # Clears the base compose's `profiles: ["extraction-worker"]` so the
     # service is always-on whenever this overlay is in COMPOSE_FILE. No
-    # `image:` here — docker-compose.prod.yml already pins this service to
-    # the same AGNES_IMAGE_REPO/AGNES_TAG as app/scheduler, and the built-in
-    # extraction pipeline needs nothing that image does not already carry.
-    # No mem_limit/cpus here either — the base service already interpolates
-    # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env.
+    # mem_limit/cpus here — the base service already interpolates
+    # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env. Default (no
+    # extraction_worker_image set) is no `image:` key at all here either, so
+    # the service inherits docker-compose.prod.yml's own AGNES_IMAGE_REPO/
+    # AGNES_TAG pin, the SAME ref app/scheduler run — this is what stops the
+    # worker drifting behind the database's migrations as the fleet
+    # auto-upgrades.
+%{ if extraction_worker_image != "" ~}
+    image: $${AGNES_EXTRACTION_WORKER_IMAGE}
+%{ endif ~}
     profiles: !reset []
     # Additive merge on top of the base service's `app: service_healthy`.
     depends_on:
@@ -1358,6 +1377,14 @@ AGNES_COORDINATION_BACKEND=redis
 AGNES_REDIS_URL=redis://redis:6379/0
 AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
+%{ if extraction_worker_image != "" ~}
+# A deliberate, TEMPORARY divergence from the app's own image/tag (a
+# canary, holding the worker back during an app rollout) — see the
+# extraction_worker_image variable's own description for the crash-loop
+# risk of leaving this set once the app has migrated the database past
+# what this pin's image can run.
+AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
+%{ endif ~}
 # The app-side gate for the `corpus-extraction` job kind is the single
 # `sharepoint` switch (app/instance_config.py::feature_enabled) — env
 # overrides instance.yaml, the SAME posture as AGNES_COORDINATION_BACKEND/

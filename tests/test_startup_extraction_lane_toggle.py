@@ -3,8 +3,10 @@
 ``extraction_worker_enabled`` engages, per VM, the two halves that only work
 together: a ``redis`` compose service (the multi-process coordination backend
 the startup guard requires the moment ``AGNES_ROLE=worker`` exists) and the
-``extraction-worker`` service re-pinned to the operator's image built with
-the ``extraction`` optional extra. Default OFF — a module bump alone must never move the existing fleet.
+``extraction-worker`` service, which by DEFAULT follows the app's own image
+(``extraction_worker_image`` unset) and can be deliberately pinned to a
+different tag when set (a canary, holding the worker back mid-rollout).
+Default OFF — a module bump alone must never move the existing fleet.
 
 Same read-the-template pattern as ``test_startup_chat_provider_toggle.py``.
 The invariants pinned here are each a real failure mode found while doing the
@@ -66,11 +68,10 @@ def test_both_object_types_declare_the_fields_default_off():
         assert re.search(r"extraction_worker_enabled\s*=\s*optional\(bool,\s*false\)", block)
         assert re.search(r'extraction_worker_mem_limit\s*=\s*optional\(string,\s*"4g"\)', block)
         assert re.search(r'extraction_worker_cpus\s*=\s*optional\(string,\s*"2.0"\)', block)
-    # Deprecated, ignored — kept declared (module-level, like kai_agent_image
-    # used to be per-instance) so a root module still setting it does not
-    # fail `terraform plan` with "unsupported argument". Neither variable is
-    # forwarded to the startup script any more; see test_main_tf_forwards_
-    # and_validates and test_tpl_gates_everything_on_the_flag below.
+    # extraction_worker_image is module-level (like kai_agent_image), still
+    # forwarded and still able to pin the worker away from the app image —
+    # see test_main_tf_forwards_and_validates below for the (now optional,
+    # not required) plumbing.
     assert re.search(r'variable\s+"extraction_worker_image"\s*\{', body)
     # Both extraction_worker_image and extraction_producer_command are
     # DEPRECATED (external-producer mode removed, 2026-09-01): they must
@@ -90,15 +91,36 @@ def test_main_tf_forwards_and_validates():
     assert re.search(r"extraction_worker_enabled\s*=\s*each\.value\.extraction_worker_enabled", body)
     assert re.search(r"extraction_worker_mem_limit\s*=\s*each\.value\.extraction_worker_mem_limit", body)
     assert re.search(r"extraction_worker_cpus\s*=\s*each\.value\.extraction_worker_cpus", body)
-    # The worker follows the app image now (docker-compose.prod.yml's own
-    # AGNES_IMAGE_REPO/AGNES_TAG pin) — neither deprecated variable is
-    # forwarded to the startup script any more, and there is nothing left to
-    # validate at plan time: an enabled instance can never render an empty
-    # `image:` because the overlay no longer sets one.
-    assert not re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
+    # extraction_worker_image IS still forwarded — it is an optional,
+    # deliberate override (a canary, holding the worker back), not dead
+    # config like extraction_producer_command.
+    assert re.search(r"extraction_worker_image\s*=\s*var\.extraction_worker_image", body)
     assert not re.search(r"extraction_producer_command\s*=\s*var\.extraction_producer_command", body)
-    assert "extraction_worker_image" not in body
     assert "extraction_producer_command" not in body
+    # There is nothing to validate at plan time any more: empty is a valid,
+    # DEFAULT value (the overlay renders no `image:` key at all), so the old
+    # "requires extraction_worker_image on the module" precondition — which
+    # made the override mandatory rather than optional — is gone.
+    assert not re.search(
+        r"!each\.value\.extraction_worker_enabled\s*\|\|\s*var\.extraction_worker_image\s*!=\s*\"\"",
+        body,
+    )
+    assert "requires extraction_worker_image on the module" not in body
+
+
+def _matching_endif(body: str, if_pos: int) -> int:
+    """The `%{ endif ~}` that closes the `%{ if ... ~}` starting at
+    `if_pos`, correctly skipping past any NESTED if/endif pairs in between
+    (extraction_worker_image's own conditionals now nest inside this one)."""
+    depth = 0
+    for m in re.finditer(r"%\{\s*if\b.*?~\}|%\{\s*endif\s*~\}", body[if_pos:]):
+        if m.group(0).lstrip("%{ ").startswith("if"):
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                return if_pos + m.start()
+    raise AssertionError(f"no matching %{{ endif ~}} found for the if at {if_pos}")
 
 
 def test_tpl_gates_everything_on_the_flag():
@@ -123,23 +145,72 @@ def test_tpl_gates_everything_on_the_flag():
         idx = body.index(needle)
         # The needle must sit inside SOME extraction_worker_enabled block:
         # the nearest guard above it must be ours, unclosed at that point.
+        # extraction_worker_image nests its OWN if/endif pairs inside this
+        # block now, so the true closing endif has to be nesting-aware.
         opening = body.rindex(guard, 0, idx)
-        closing = body.index("%{ endif ~}", opening)
+        closing = _matching_endif(body, opening)
         assert opening < idx < closing, f"{needle!r} must be gated on extraction_worker_enabled"
 
 
-def test_tpl_writes_no_producer_or_image_env_lines():
-    """Regression guard for the pin-rot/tag-drift bug (TCRD-306-ish): the
-    worker used to be re-pinned to a separate, module-supplied image and
-    invocation command, both leftovers of the retired external-producer
-    mode. Neither may be written into the VM's .env — the worker follows
-    the app's own AGNES_IMAGE_REPO/AGNES_TAG pin from docker-compose.prod.yml
-    like every other in-repo service."""
+def test_tpl_writes_no_producer_env_line():
+    """The external-producer mode is gone: AGNES_EXTRACTION_PRODUCER_COMMAND
+    must never be written into the VM's .env — it would be dead config that
+    misleads the next operator into thinking a producer exists to point at.
+    (extraction_worker_image is a different story — see
+    test_overlay_and_env_image_line_are_conditional below: it is a live,
+    optional override, not a producer-era leftover.)"""
     body = (MODULE / "startup-script.sh.tpl").read_text()
-    assert "AGNES_EXTRACTION_WORKER_IMAGE" not in body
     assert "AGNES_EXTRACTION_PRODUCER_COMMAND" not in body
-    assert "extraction_worker_image" not in body
     assert "extraction_producer_command" not in body
+
+
+def test_overlay_and_env_image_line_are_conditional():
+    """The target shape (course-corrected from an earlier, stricter draft
+    of this fix): extraction_worker_image is a legitimate, OPTIONAL override
+    — an operator may deliberately want the worker on a different tag than
+    the app (a canary, holding the worker back mid-rollout) — but it must
+    default to OFF. Empty (the default) -> no `image:` key at all, so the
+    service inherits docker-compose.prod.yml's own AGNES_IMAGE_REPO/
+    AGNES_TAG pin, which is what actually stops the worker drifting behind
+    the database's migrations. Set -> the overlay pins the worker to that
+    ref, exactly as before this fix."""
+    body = (MODULE / "startup-script.sh.tpl").read_text()
+    guard = '%{ if extraction_worker_image != "" ~}'
+    endif = "%{ endif ~}"
+    assert body.count(guard) == 3, (
+        "expected exactly three guarded blocks: registry auth, the overlay's "
+        "image: line, and the .env line"
+    )
+
+    # 1. The overlay's image: line, inside the extraction-worker service.
+    overlay = _extraction_overlay_heredoc(body)
+    worker = _extraction_worker_block(overlay)
+    assert guard in worker, "the extraction-worker image: line must be gated on extraction_worker_image != \"\""
+    opening = worker.index(guard)
+    closing = worker.index(endif, opening)
+    image_line = "image: $${AGNES_EXTRACTION_WORKER_IMAGE}"
+    assert image_line in worker, "the extraction-worker service must be ABLE to carry a pinned image"
+    assert opening < worker.index(image_line) < closing, "the image: line must sit inside its own guard"
+    # No stray, unconditional `image:` line elsewhere in the service.
+    unconditional = worker[: opening] + worker[closing + len(endif) :]
+    yaml_lines = [ln for ln in unconditional.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert not any(re.match(r"^\s*image:", ln) for ln in yaml_lines), (
+        "outside its own guard, the extraction-worker service must carry no "
+        "unconditional image override"
+    )
+
+    # 2. The .env line, inside the outer extraction_worker_enabled block.
+    env_guard_idx = body.index(guard, body.index("AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}"))
+    env_closing = body.index(endif, env_guard_idx)
+    env_line = "AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}"
+    assert env_guard_idx < body.index(env_line, env_guard_idx) < env_closing
+
+    # 3. The registry-auth block (best-effort gcloud configure-docker),
+    # gated the same way — it only matters when a pin actually exists.
+    assert 'EXTRACTION_IMAGE="${extraction_worker_image}"' in body
+    auth_guard_idx = body.index(guard, 0, env_guard_idx)
+    auth_closing = body.index(endif, auth_guard_idx)
+    assert auth_guard_idx < body.index('EXTRACTION_IMAGE="${extraction_worker_image}"') < auth_closing
 
 
 def test_coordination_rides_env_not_instance_yaml():
@@ -190,20 +261,9 @@ def test_overlay_shape():
     )
 
     worker = _extraction_worker_block(overlay)
-    # Pin-rot/tag-drift guard: the overlay must not re-pin the worker to a
-    # separate image — docker-compose.prod.yml already pins this service to
-    # ${AGNES_IMAGE_REPO}:${AGNES_TAG}, exactly like app/scheduler, and a
-    # second override here is exactly the bug this test locks shut (a worker
-    # image immutably pinned ahead of the DB migrations the fleet's
-    # auto-upgrade applies eventually crash-loops it forever).
-    yaml_lines = [ln for ln in worker.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    assert not any(re.match(r"^\s*image:", ln) for ln in yaml_lines), (
-        "the extraction-worker service must carry no image override — it "
-        "follows AGNES_IMAGE_REPO/AGNES_TAG from docker-compose.prod.yml "
-        "like every other in-repo service"
-    )
-    # The two things this overlay still must do to the service: clear its
-    # profile gate and wire it to wait on redis.
+    # The image line's presence/absence is a separate, dedicated test below
+    # (test_overlay_and_env_image_line_are_conditional) — it is legitimately
+    # conditional now, not simply absent.
     assert "profiles: !reset []" in worker
     assert re.search(r"depends_on:\s*\n\s*redis:\s*\n\s*condition:\s*service_healthy", worker), (
         "extraction-worker must additively depend_on redis: service_healthy"

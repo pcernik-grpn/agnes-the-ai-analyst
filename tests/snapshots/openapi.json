@@ -1401,6 +1401,43 @@
         "title": "Body_upload_session_api_upload_sessions_post",
         "type": "object"
       },
+      "Body_view_as_enter_admin_view_as_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "next": {
+            "default": "",
+            "title": "Next",
+            "type": "string"
+          },
+          "user_id": {
+            "default": "",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "title": "Body_view_as_enter_admin_view_as_post",
+        "type": "object"
+      },
+      "Body_view_as_exit_admin_view_as_exit_post": {
+        "properties": {
+          "csrf_token": {
+            "default": "",
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "next": {
+            "default": "",
+            "title": "Next",
+            "type": "string"
+          }
+        },
+        "title": "Body_view_as_exit_admin_view_as_exit_post",
+        "type": "object"
+      },
       "BootstrapRequest": {
         "properties": {
           "email": {
@@ -1487,6 +1524,34 @@
           "message"
         ],
         "title": "BuilderTurnRequest",
+        "type": "object"
+      },
+      "BulkRejectRequest": {
+        "description": "Reject every ``pending`` id in ``item_ids``. Issue #1957.\n\nDeliberately narrower than ``BulkUpdateRequest``: no ``updates`` dict and\nno action choice \u2014 this is a bulk REJECT only, never a generic bulk\nstatus setter. See ``admin_bulk_reject`` for why there is no bulk-approve\ncounterpart.",
+        "properties": {
+          "item_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Ids",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "item_ids"
+        ],
+        "title": "BulkRejectRequest",
         "type": "object"
       },
       "BulkUpdateRequest": {
@@ -11608,6 +11673,49 @@
         "title": "UpdateAgentRequest",
         "type": "object"
       },
+      "UpdateCollectionRequest": {
+        "description": "The editable metadata of a collection \u2014 every field optional.\n\nPRESENCE is the signal, not the value: ``{\"description\": null}`` clears\nthe description while a request that omits ``description`` leaves it\nalone. The handler reads ``model_fields_set`` for exactly that reason, so\ndo NOT give these fields non-None defaults \u2014 that would erase the\ndistinction the repository layer was built to keep.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "slug": {
+            "anyOf": [
+              {
+                "maxLength": 100,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slug"
+          }
+        },
+        "title": "UpdateCollectionRequest",
+        "type": "object"
+      },
       "UpdateConnectionBody": {
         "properties": {
           "config": {
@@ -16920,6 +17028,102 @@
           }
         },
         "summary": "Admin User Detail Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/view-as": {
+      "post": {
+        "description": "Begin a read-only view-as session for ``user_id``.\n\nPOST-only and CSRF-gated (``web_csrf`` double-submit, the\n:func:`slack_bind_confirm` shape): a mode change reachable from a menu\nitem must not fire on ambient cookie auth alone \u2014 security playbook \u00a710,\nwhich this repo learned from a GET that bound an attacker's Slack identity\nto a victim's account.\n\n``Depends(require_admin)`` is the gate. It also makes the mode\nnon-nestable for free: while a view-as is active the caller is not an\nadmin (``app.auth.access.is_user_admin`` answers False for the narrowed\nsubject), so re-entering requires exiting first \u2014 and the read-only guard\nrefuses this very POST anyway.",
+        "operationId": "view_as_enter_admin_view_as_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_view_as_enter_admin_view_as_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View As Enter",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/admin/view-as/exit": {
+      "post": {
+        "description": "End a read-only view-as session \u2014 clear the ticket cookie, nothing else.\n\nThe one path ``ViewAsReadOnlyMiddleware`` lets through as a non-GET while\nthe mode is active, so it is deliberately the smallest handler in the\nfile: it reads no target, writes no state, and touches exactly one cookie.\n\nIt mounts **no auth dependency**, and that is the point rather than an\noversight. ``get_current_user`` resolves to the TARGET while the mode is\non, so ``require_admin`` would 403 the very person trying to leave and\n``get_optional_user`` would hand back an identity that is not the actor's.\nThe caller is instead identified by the HttpOnly, server-signed ticket\nitself, and the action is gated by the same ``web_csrf`` double-submit\ntoken as every other state-changing web POST \u2014 a cross-site page can read\nneither.",
+        "operationId": "view_as_exit_admin_view_as_exit_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_view_as_exit_admin_view_as_exit_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "View As Exit",
         "tags": [
           "web"
         ]
@@ -36566,7 +36770,7 @@
     },
     "/api/admin/users/{user_id}/library-preview": {
       "get": {
-        "description": "What the person's Library actually shows \u2014 the RESULT, where\n/effective-access is the why.\n\nComputed by ``StackResolver.browse``, the same grants-based projection\nthe /library page renders the target's shared bands from \u2014 deliberately\nNOT ``browse_admin`` and NOT a re-derivation from the grant rows, so\nthis preview cannot drift from the page it claims to predict (the\nLibrary's contract is no admin god-mode, and that applies to a preview\nOF a person just as it does to the person themselves). Covers the two\ngoverned kinds the resolver serves to the Library (data packages,\nmemory domains); the other granted kinds keep their per-type fold in\nthe Simulate chain.",
+        "description": "What the person's Library actually shows \u2014 the RESULT, where\n/effective-access is the why.\n\nEvery section is computed by the SAME projection the /library page\nrenders that person's shared bands from \u2014 ``StackResolver.browse`` for\nthe two governed kinds, ``app.services.library_grants`` for the two the\nresolver does not serve. Deliberately NOT ``browse_admin``, and never a\nprivate re-derivation from the grant rows, so this preview cannot drift\nfrom the page it claims to predict (the Library's contract is no admin\ngod-mode, and that applies to a preview OF a person just as it does to\nthe person themselves).\n\nCovers every GRANTED kind the Library lists: data packages, curated\nmarketplace plugins, recipes, memory domains \u2014 in the Library's own\nreading order, so the panel looks like the page. It used to iterate the\ntwo governed kinds alone, which meant \"I can see it in admin but they\ncannot see it in their Library\" got a real answer about a data package\nand silence about a plugin.\n\nDeliberately NOT here: what the person INSTALLED for themselves from the\ncommunity store, and anything they authored. Those are theirs, not an\nadmin's grant, and this lens answers what the grants do.",
         "operationId": "user_library_preview_api_admin_users__user_id__library_preview_get",
         "parameters": [
           {
@@ -40215,6 +40419,77 @@
           }
         },
         "summary": "Get Collection",
+        "tags": [
+          "collections"
+        ]
+      },
+      "patch": {
+        "description": "Rename a collection or change its description/slug (owner or admin).\n\nThe gate is deliberately OWNER-OR-ADMIN rather than\n``require_collection_access``: a group grant conveys READ access, and a\ngrantee renaming somebody else's collection out from under them is not a\nread. Same predicate as ``delete_collection`` below, so the two\nowner-level actions on a collection agree about who may take them.\n\nPresence-based, per field: a field the request omits is untouched, and\n``description: null`` clears it. Editing NOTHING is a 400 rather than a\nsilent 200 \u2014 a client that meant to change something and named no known\nfield has a bug, and answering \"fine\" hides it.\n\n``slug`` is normalised the same way ``create_collection`` normalises it,\nso a patched slug always resolves via ``/library/{slug}``; a collision on\nthe unique index returns **409**. Renaming does NOT move the slug on its\nown: the slug is this collection's URL, and silently re-deriving it from\nthe new name would break every link and bookmark already pointing here.\nCallers that want the URL to follow the name pass both.\n\nA **source-managed** collection (fed by a connection's confirmed scope)\nis refused with the same typed **409** the upload path uses: its name is\nderived from the source scope, so a rename here would be silently\nreverted by the next sync \u2014 the \"a scheduled sync must not revert a\ndownstream edit\" rule the semantic layer states as ``409 source_owned``.",
+        "operationId": "update_collection_api_collections__collection_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "collection_id",
+            "required": true,
+            "schema": {
+              "title": "Collection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Collection",
         "tags": [
           "collections"
         ]
@@ -48024,6 +48299,70 @@
           }
         },
         "summary": "Admin Batch",
+        "tags": [
+          "memory"
+        ]
+      }
+    },
+    "/api/memory/admin/bulk-reject": {
+      "post": {
+        "description": "Reject every ``pending`` id in ``item_ids`` \u2014 the bulk counterpart to\n``POST /admin/reject`` (issue #1957: the review queue otherwise forces an\nadmin to reject harvested candidates one at a time).\n\n``bulk-update`` above excludes ``status`` from its allowlist because a\nbulk status flip would bypass the dedicated governance endpoints and\ntheir per-item audit rows (PR #126 review) \u2014 that objection was about\nAUDIT, not about bulkness. This endpoint resolves it by looping the exact\nsingle-item governance path instead of a generic field setter: the same\nstatus transition (``repo.update_status(item_id, \"rejected\")``) and the\nsame ``corporate_memory.reject`` audit action per item that a one-by-one\nclick would write (``batch: True`` in the params distinguishes it from a\nsingle click, the same convention ``/admin/batch``'s reject action uses).\n\nOnly ``pending`` items are rejected. Anything else \u2014 already approved or\nrevoked, or an unknown id \u2014 is reported per-id and never raises, so one\nstale id in a large selection can't abort the rest. 200 even on partial\nfailure, mirroring ``admin_bulk_update``.\n\nDeliberately NO bulk-approve sibling. Approving in bulk injects items\ninto every analyst's ``.claude/rules/`` without a human reading each one\nfirst (issue #1957's own warning), so that capability stays single-item\n(``POST /admin/approve``) or on the audited-but-broader ``/admin/batch``\nsurface \u2014 this narrower, safety-focused endpoint adds no path to it.",
+        "operationId": "admin_bulk_reject_api_memory_admin_bulk_reject_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkRejectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Admin Bulk Reject",
         "tags": [
           "memory"
         ]

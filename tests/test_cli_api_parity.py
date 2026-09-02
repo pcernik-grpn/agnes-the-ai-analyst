@@ -91,17 +91,69 @@ def _patch_cli_to_testclient(monkeypatch, modules: List[str], client, token: str
         kwargs["headers"] = _normalize(kwargs["headers"])
         return client.delete(path, **kwargs)
 
+    # The `cli.v2_client` family (`api_*_json`) is a second, JSON-shaped
+    # generation of the same helpers: they return parsed JSON and raise
+    # V2ClientError instead of handing back a Response. Commands built on
+    # them (e.g. `agnes collections`) need that CONTRACT preserved through
+    # the bridge, not just the transport — a Response object where the
+    # command expects a dict fails inside the command rather than at the
+    # seam, which is a confusing way to learn the harness didn't cover it.
+    from cli.v2_client import V2ClientError
+
+    def _json_or_raise(r, *, allow_empty: bool = False):
+        if r.status_code >= 400:
+            body = r.json() if "json" in r.headers.get("content-type", "") else r.text
+            raise V2ClientError(status_code=r.status_code, body=body)
+        if allow_empty and not r.content:
+            return {}
+        return r.json()
+
+    def _get_json(path: str, **params):
+        return _json_or_raise(client.get(path, params=params or None, headers=dict(auth)))
+
+    def _post_json(path: str, payload: dict):
+        return _json_or_raise(client.post(path, json=payload, headers=dict(auth)))
+
+    def _put_json(path: str, payload: dict):
+        return _json_or_raise(client.put(path, json=payload, headers=dict(auth)), allow_empty=True)
+
+    def _patch_json(path: str, payload: dict):
+        return _json_or_raise(client.patch(path, json=payload, headers=dict(auth)), allow_empty=True)
+
+    def _delete_json(path: str):
+        return _json_or_raise(client.delete(path, headers=dict(auth)), allow_empty=True)
+
     for mod_name in modules:
-        for name, repl in (
+        # `api_delete` is the one name BOTH families export, with different
+        # return contracts. Which replacement a module gets is decided by
+        # which family it imported: a module carrying `api_*_json` names is a
+        # v2_client caller and must get the JSON-shaped delete.
+        import importlib
+
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:  # pragma: no cover - a bad module name is a test bug
+            mod = None
+        v2_style = mod is not None and any(
+            hasattr(mod, n) for n in ("api_get_json", "api_post_json", "api_patch_json", "api_put_json")
+        )
+        replacements = [
             ("api_get", _get),
             ("api_post", _post),
             ("api_put", _put),
-            ("api_delete", _delete),
-        ):
+            ("api_delete", _delete_json if v2_style else _delete),
+            ("api_get_json", _get_json),
+            ("api_post_json", _post_json),
+            ("api_put_json", _put_json),
+            ("api_patch_json", _patch_json),
+        ]
+        for name, repl in replacements:
+            if mod is not None and not hasattr(mod, name):
+                # Module didn't import this helper — nothing to redirect.
+                continue
             try:
                 monkeypatch.setattr(f"{mod_name}.{name}", repl)
             except AttributeError:
-                # Module didn't import this helper — skip silently.
                 pass
 
 
@@ -298,6 +350,7 @@ def parity_env(seeded_app, monkeypatch):
             "cli.commands.admin_mcp",
             "cli.commands.admin_connection",
             "cli.commands.mcp",
+            "cli.commands.collections",
         ],
         client=client,
         token=admin_token,
@@ -559,6 +612,91 @@ class TestStackArtefactAddRemoveParity:
         conn.close()
 
         assert delta_api == delta_cli == []
+
+
+# ---------------------------------------------------------------------------
+# Collections metadata edit
+# ---------------------------------------------------------------------------
+
+
+class TestCollectionEditParity:
+    """``PATCH /api/collections/{id}`` ↔ ``agnes collections edit``."""
+
+    def _seed(self, parity_env) -> str:
+        r = parity_env["client"].post(
+            "/api/collections",
+            json={"name": "OldName", "description": "old desc"},
+            headers=_auth(parity_env["admin_token"]),
+        )
+        assert r.status_code == 201, r.text
+        return r.json()["id"]
+
+    def _snapshot(self, conn, corpus_id: str) -> tuple:
+        row = conn.execute("SELECT name, slug, description FROM file_corpora WHERE id = ?", [corpus_id]).fetchone()
+        return (tuple(row), _snapshot_audit_actions(conn, prefix="collection.update"))
+
+    def test_edit_parity(self, parity_env):
+        corpus_id = self._seed(parity_env)
+
+        r = parity_env["client"].patch(
+            f"/api/collections/{corpus_id}",
+            json={"name": "NewName", "description": "new desc"},
+            headers=_auth(parity_env["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        conn = get_system_db()
+        delta_api = self._snapshot(conn, corpus_id)
+        conn.close()
+
+        # Reset to the seeded state + a clean audit log.
+        conn = get_system_db()
+        conn.execute(
+            "UPDATE file_corpora SET name = 'OldName', description = 'old desc' WHERE id = ?",
+            [corpus_id],
+        )
+        _reset_audit_log(conn)
+        conn.close()
+
+        parity_env["run_cli"](["collections", "edit", corpus_id, "--name", "NewName", "--description", "new desc"])
+        conn = get_system_db()
+        delta_cli = self._snapshot(conn, corpus_id)
+        conn.close()
+
+        assert delta_api == delta_cli
+        assert delta_api[0][0] == "NewName"
+        assert delta_api[0][2] == "new desc"
+        # Exactly one audit row on each path — the CLI must not double-log or
+        # skip the trail the endpoint writes.
+        assert len(delta_api[1]) == 1
+
+    def test_clearing_the_description_is_the_same_on_both_paths(self, parity_env):
+        """`--description ""` is the CLI's only way to say "remove it", and it
+        has to reach the API as an explicit clear rather than as an omitted
+        field (which would mean "leave it alone")."""
+        corpus_id = self._seed(parity_env)
+
+        r = parity_env["client"].patch(
+            f"/api/collections/{corpus_id}",
+            json={"description": None},
+            headers=_auth(parity_env["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        conn = get_system_db()
+        desc_api = conn.execute("SELECT description FROM file_corpora WHERE id = ?", [corpus_id]).fetchone()[0]
+        conn.close()
+
+        conn = get_system_db()
+        conn.execute("UPDATE file_corpora SET description = 'old desc' WHERE id = ?", [corpus_id])
+        _reset_audit_log(conn)
+        conn.close()
+
+        parity_env["run_cli"](["collections", "edit", corpus_id, "--description", ""])
+        conn = get_system_db()
+        desc_cli = conn.execute("SELECT description FROM file_corpora WHERE id = ?", [corpus_id]).fetchone()[0]
+        conn.close()
+
+        assert desc_api is None
+        assert desc_cli is None
 
 
 # ---------------------------------------------------------------------------

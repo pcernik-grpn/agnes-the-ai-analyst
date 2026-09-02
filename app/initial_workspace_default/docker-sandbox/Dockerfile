@@ -25,7 +25,10 @@ FROM python:3.13-slim
 #   docker inspect -f '{{ index .Config.Labels "agnes.chat-sandbox.contract" }}' agnes-chat-sandbox:latest
 # v2: added `matplotlib` to the pip install block below (charts) — an image
 # still reporting "1" predates that dependency and cannot draw a chart.
-LABEL agnes.chat-sandbox.contract="2"
+# v3: added `python-pptx` / `python-docx` / `openpyxl` to the pip install
+# block below (office-document skills) — an image still reporting "2" or
+# earlier predates them and such a skill silently cannot work.
+LABEL agnes.chat-sandbox.contract="3"
 
 # Node.js is required by claude-agent-sdk: it shells out to the
 # `@anthropic-ai/claude-code` CLI for its MCP handshake, and without that
@@ -55,6 +58,20 @@ RUN npm install -g @anthropic-ai/claude-code
 # `/tmp` and a user told to open a path that does not exist on their machine.
 # The workspace CLAUDE.md pairs this with the delivery half of the rule: a
 # chart is returned as inline SVG in the reply, never as a file.
+#
+# `python-pptx` / `python-docx` / `openpyxl` are the same story for a curated
+# marketplace skill that authors a deck, a document or a workbook (#1977): the
+# skill ships a `requirements.txt` naming them, and nothing installs it — a
+# mid-turn `pip install` in front of the user at best, and under
+# `chat.docker_egress_mode: none` no route to PyPI at all, so such a skill
+# would simply never work. Baking them here is the only way it can. Costs
+# roughly 6 MB of wheels (python-docx pulls in lxml); accepted since it buys
+# every present and future office-document skill, not just one. Hand-
+# maintained by deliberate choice, NOT derived from the requirements.txt files
+# installed marketplace plugins actually ship: auto-baking whatever a curated
+# plugin asks for would let publishing a plugin change what code runs,
+# unreviewed, in every OTHER user's sandbox on their next spawn — a supply-
+# chain lever this image must not hand a plugin author.
 RUN pip install --no-cache-dir \
     "claude-agent-sdk>=0.2.87,<0.3.0" \
     "duckdb>=1.5.2" \
@@ -68,7 +85,10 @@ RUN pip install --no-cache-dir \
     "pandas>=2.0.0" \
     "numpy>=1.24.0" \
     "sqlglot>=30.0.0" \
-    "matplotlib>=3.8"
+    "matplotlib>=3.8" \
+    "python-pptx>=1.0" \
+    "python-docx>=1.1" \
+    "openpyxl>=3.1"
 
 # --- Filesystem contract ----------------------------------------------------
 # ChatManager pins the sandbox env (app/chat/manager.py::_spawn_runner):

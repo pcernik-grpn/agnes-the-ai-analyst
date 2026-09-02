@@ -473,6 +473,216 @@ def test_wait_workspace_ready_times_out_best_effort(tmp_path: Path, monkeypatch,
     assert "possibly-incomplete workspace" in capsys.readouterr().err
 
 
+def _write_skill(plugins_root: Path, plugin: str, skill: str, *, requirements: "str | None") -> None:
+    """Lay out one marketplace skill under ``plugins_root/<plugin>/skills/<skill>/``,
+    matching what ``export_marketplace_tree`` actually writes into the workspace."""
+    skill_dir = plugins_root / plugin / "skills" / skill
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {skill}\n---\nbody\n", encoding="utf-8")
+    if requirements is not None:
+        (skill_dir / "requirements.txt").write_text(requirements, encoding="utf-8")
+
+
+def test_skill_requirement_files_finds_files_and_skips_skills_without_one(tmp_path: Path):
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "curated__deck", "deck-builder", requirements="python-pptx>=1.0\n")
+    _write_skill(plugins_root, "curated__deck", "no-deps-skill", requirements=None)
+
+    found = runner._skill_requirement_files(tmp_path, ["deck-builder"])
+
+    assert found == [plugins_root / "curated__deck" / "skills" / "deck-builder" / "requirements.txt"]
+
+
+def test_skill_requirement_files_finds_nested_directories(tmp_path: Path):
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "plug-a", "skill-one", requirements="openpyxl>=3.1\n")
+    # A multi-skill plugin one level deeper than the common case.
+    _write_skill(plugins_root, "plug-b", "nested/deep", requirements="python-docx>=1.1\n")
+
+    found = runner._skill_requirement_files(tmp_path, ["skill-one", "deep"])
+
+    assert len(found) == 2
+    assert all(p.name == "requirements.txt" for p in found)
+
+
+def test_skill_requirement_files_empty_enabled_names_returns_empty(tmp_path: Path):
+    """`[]` is the common case (no stack plugins at all) and must short-circuit
+    before finding anything — even when a tree happens to be on disk."""
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "curated__deck", "deck-builder", requirements="python-pptx>=1.0\n")
+
+    assert runner._skill_requirement_files(tmp_path, []) == []
+
+
+def test_skill_requirement_files_missing_workspace_returns_empty(tmp_path: Path):
+    from app.chat import runner
+
+    missing = tmp_path / "does-not-exist"
+    assert runner._skill_requirement_files(missing, ["some-plugin"]) == []
+
+
+def test_skill_requirement_files_no_marketplace_tree_returns_empty(tmp_path: Path):
+    from app.chat import runner
+
+    # workspace exists, but nothing ever wrote a marketplace tree into it
+    # (no stack plugins, or chat.bootstrap_marketplace off).
+    assert runner._skill_requirement_files(tmp_path, ["some-plugin"]) == []
+
+
+def test_warmup_skipped_under_egress_none(tmp_path: Path, monkeypatch, capsys):
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "curated__deck", "deck-builder", requirements="python-pptx>=1.0\n")
+    monkeypatch.setenv("AGNES_DOCKER_EGRESS_MODE", "none")
+    spawned = []
+    monkeypatch.setattr(runner, "_spawn", lambda coro: spawned.append(coro))
+
+    runner._warmup_skill_dependencies(tmp_path, ["deck-builder"])
+
+    assert spawned == []
+    assert "docker_egress_mode=none" in capsys.readouterr().err
+
+
+def test_warmup_skipped_when_no_requirements_files(tmp_path: Path, monkeypatch):
+    from app.chat import runner
+
+    monkeypatch.setenv("AGNES_DOCKER_EGRESS_MODE", "open")
+    spawned = []
+    monkeypatch.setattr(runner, "_spawn", lambda coro: spawned.append(coro))
+
+    runner._warmup_skill_dependencies(tmp_path, ["some-plugin-with-no-deps"])
+
+    assert spawned == []
+
+
+def test_warmup_invoked_detached_when_files_exist_and_egress_allows(tmp_path: Path, monkeypatch):
+    """`_spawn` (the fire-and-forget mechanism the stdin reader also uses) is
+    handed the warm-up coroutine — never awaited inline — so a slow pip
+    resolve cannot delay `runner_ready`."""
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "curated__deck", "deck-builder", requirements="python-pptx>=1.0\n")
+    monkeypatch.setenv("AGNES_DOCKER_EGRESS_MODE", "open")
+
+    seen_files = []
+
+    async def _fake_run_dependency_warmup(req_files):
+        seen_files.append(req_files)
+
+    monkeypatch.setattr(runner, "_run_dependency_warmup", _fake_run_dependency_warmup)
+    spawned = []
+    monkeypatch.setattr(runner, "_spawn", lambda coro: spawned.append(coro))
+
+    runner._warmup_skill_dependencies(tmp_path, ["deck-builder"])
+
+    assert len(spawned) == 1
+    asyncio.run(spawned[0])  # actually run what was scheduled, like the real event loop would
+    assert seen_files == [[plugins_root / "curated__deck" / "skills" / "deck-builder" / "requirements.txt"]]
+
+
+def test_warmup_invoked_under_allowlist_egress_too(tmp_path: Path, monkeypatch):
+    from app.chat import runner
+    from app.chat.marketplace_payload import MARKETPLACE_TREE_SUBDIR
+
+    plugins_root = tmp_path / MARKETPLACE_TREE_SUBDIR / "plugins"
+    _write_skill(plugins_root, "curated__deck", "deck-builder", requirements="python-pptx>=1.0\n")
+    monkeypatch.setenv("AGNES_DOCKER_EGRESS_MODE", "allowlist")
+    spawned = []
+    monkeypatch.setattr(runner, "_spawn", lambda coro: spawned.append(coro))
+    monkeypatch.setattr(runner, "_run_dependency_warmup", lambda req_files: _noop_coro())
+
+    runner._warmup_skill_dependencies(tmp_path, ["deck-builder"])
+
+    assert len(spawned) == 1
+    asyncio.run(spawned[0])
+
+
+async def _noop_coro() -> None:
+    return None
+
+
+def test_run_dependency_warmup_builds_one_pip_call_for_every_file(tmp_path: Path, monkeypatch):
+    """ONE subprocess covers every discovered requirements file — never one
+    pip invocation per file."""
+    from app.chat import runner
+
+    req_a = tmp_path / "a" / "requirements.txt"
+    req_b = tmp_path / "b" / "requirements.txt"
+    req_a.parent.mkdir(parents=True)
+    req_b.parent.mkdir(parents=True)
+    req_a.write_text("python-pptx>=1.0\n", encoding="utf-8")
+    req_b.write_text("openpyxl>=3.1\n", encoding="utf-8")
+
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _FakeProc()
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", _fake_exec)
+
+    asyncio.run(runner._run_dependency_warmup([req_a, req_b]))
+
+    args = captured["args"]
+    assert args.count("-r") == 2
+    assert str(req_a) in args
+    assert str(req_b) in args
+    assert "--break-system-packages" in args
+    assert captured["kwargs"]["stdin"] == runner.subprocess.DEVNULL
+
+
+def test_run_dependency_warmup_survives_exec_raising(monkeypatch, capsys):
+    """A missing pip / broken sandbox must not crash the fire-and-forget task
+    (and, transitively, must never crash `amain()` or the whole spawn)."""
+    from app.chat import runner
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("no pip on PATH")
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", _boom)
+
+    asyncio.run(runner._run_dependency_warmup([Path("/tmp/requirements.txt")]))  # must not raise
+
+    assert "skill deps warm-up failed" in capsys.readouterr().err
+
+
+def test_run_dependency_warmup_logs_nonzero_exit(monkeypatch, capsys):
+    from app.chat import runner
+
+    class _FakeProc:
+        async def wait(self):
+            return 1
+
+    async def _fake_exec(*args, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", _fake_exec)
+
+    asyncio.run(runner._run_dependency_warmup([Path("/tmp/requirements.txt")]))
+
+    assert "pip exited 1" in capsys.readouterr().err
+
+
 def _make_fake_sdk(monkeypatch, *, with_stream_event: bool):
     """Inject a fake ``claude_agent_sdk`` module into sys.modules and return
     it. ``_real_agent_loop`` imports the SDK lazily inside the function, so
