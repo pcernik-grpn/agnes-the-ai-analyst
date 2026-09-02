@@ -215,6 +215,35 @@ _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: 0 disables the cap. Not enforceable on every platform (notably macOS,
 #: where this repo's tests run) — see ``_install_memory_limit``.
 _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
+#: How long a single item's CONVERSION may run before its worker is killed
+#: and the file counted an ordinary, attributable ``convert_failed`` — the
+#: per-item TIME bound. Nothing previously bounded how long one document
+#: could occupy a worker slot: the run-level deadline (``extraction.
+#: timeout_s``) is only checked BETWEEN items, and a cooperative stop
+#: request is polled at those same quiescent points, so a single item stuck
+#: inside native conversion code made both unreachable. Observed on a live
+#: deployment: one file occupied a slot for over nine minutes — 9m16s of
+#: CPU and 5.8 GB RSS — with no bound at all; the run's deadline never
+#: fired, an operator's stop request went unanswered for 20+ minutes, and
+#: the kernel's OOM killer eventually ended the run, taking ~140 unrelated
+#: in-flight files down with it.
+#:
+#: This bound lives at the CONVERSION-SUBPROCESS boundary
+#: (:meth:`_ConvertProcessPool.convert`), not around the worker THREAD that
+#: calls :func:`_prepare_document` (hash -> convert -> anonymize): a Python
+#: thread cannot be forcibly cancelled, so a naive ``asyncio`` timeout
+#: around that thread would abandon the runaway call while it keeps running
+#: and keeps occupying one of this run's fixed ``ThreadPoolExecutor``
+#: slots — over a large crawl, repeated timeouts would eventually exhaust
+#: every slot and recreate the exact stall this bound exists to prevent,
+#: just delayed. The conversion child is the one span of an item's pipeline
+#: that already crosses an OS process boundary, so it is the one span that
+#: can be forcibly reclaimed (SIGKILL) without leaking anything — the same
+#: reasoning that motivated isolating conversion in its own process to
+#: begin with, extended from crash isolation to hang isolation.
+#: Configurable (``extraction.crawler.item_timeout_s``); 0 disables it (the
+#: pre-bound behaviour exactly).
+_DEFAULT_ITEM_TIMEOUT_S = 300
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS
@@ -551,6 +580,14 @@ class _RunRecorder:
         self._progress_lock = threading.Lock()
         self._last_progress_at = 0.0
         self._last_progress_items_done = 0
+        # Bookkeeping for `maybe_checkpoint_facts` — kept SEPARATE from the
+        # crawl's own above rather than reused: the two phases never run
+        # concurrently for one run, but they count different units (files
+        # vs. documents), and sharing the item-count field would start the
+        # facts phase however many files short of the crawl's own tally,
+        # silencing the item-count threshold for the rest of the pass.
+        self._last_facts_progress_at = 0.0
+        self._last_facts_progress_docs_done = 0
 
     def _resolve(self) -> Any:
         if self._repo is None:
@@ -661,6 +698,78 @@ class _RunRecorder:
             self._last_progress_at = now
             self._last_progress_items_done = stats.items_done
         self.checkpoint(stats)
+
+    def checkpoint_facts(
+        self, stats: "CrawlStats", *, docs_done: int, docs_total: int, current_path: Optional[str] = None
+    ) -> None:
+        """The facts phase's own checkpoint (owner-frustration fix,
+        2026-09-02): a healthy multi-hour facts pass never wrote here at
+        all, so :data:`_STALL_AFTER_S`-derived liveness in
+        ``app/api/admin_extraction.py`` declared it dead the moment it ran
+        longer than the crawl phase's own checkpoint cadence — exactly
+        backwards, since the facts phase is the run's most expensive part.
+
+        Writes ``phase="facts"`` — the row stops claiming "crawl" for a
+        stage that finished long ago — and a ``progress`` block LAYERED
+        onto the crawl's own last snapshot rather than replacing it:
+        `files_seen`/`files_done`/`new`/`changed`/... stay exactly what
+        the crawl left them (still an honest fact about this run), because
+        a `progress` write REPLACES the whole JSONB blob (see
+        ``ExtractionRunsPgRepository.checkpoint``), and the crawl's own
+        counters are not reported anywhere else while this run is still
+        ``running``. `enumeration_done=True`: the crawl's own file
+        enumeration genuinely finished before this stage could start.
+        """
+        if not self.run_id:
+            return
+        progress = _progress_snapshot(stats)
+        progress["activity"] = {
+            "phase": "facts",
+            "current_path": current_path,
+            "current_started_at": _now_iso() if current_path else None,
+            "recent": progress["activity"].get("recent", []),
+        }
+        progress["facts"] = {"docs_done": docs_done, "docs_total": docs_total}
+        try:
+            self._resolve().checkpoint(
+                self.run_id,
+                phase="facts",
+                files_seen=stats.items_seen,
+                files_done=stats.items_done,
+                enumeration_done=True,
+                progress=progress,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: facts checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def maybe_checkpoint_facts(
+        self,
+        stats: "CrawlStats",
+        *,
+        docs_done: int,
+        docs_total: int,
+        current_path: Optional[str] = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Rate-limited sibling of :meth:`checkpoint_facts`, same cadence
+        rule as :meth:`maybe_checkpoint` (:data:`_PROGRESS_CHECKPOINT_
+        INTERVAL_S` / :data:`_PROGRESS_CHECKPOINT_EVERY_ITEMS`) — over its
+        OWN bookkeeping fields (`_last_facts_progress_at`/`_last_facts_
+        progress_docs_done`), never the crawl phase's, so the very first
+        call after the crawl hands off is always due.
+        """
+        if not self.run_id:
+            return
+        now = clock()
+        with self._progress_lock:
+            items_since = docs_done - self._last_facts_progress_docs_done
+            due = (now - self._last_facts_progress_at) >= _PROGRESS_CHECKPOINT_INTERVAL_S
+            due = due or items_since >= _PROGRESS_CHECKPOINT_EVERY_ITEMS
+            if not due:
+                return
+            self._last_facts_progress_at = now
+            self._last_facts_progress_docs_done = docs_done
+        self.checkpoint_facts(stats, docs_done=docs_done, docs_total=docs_total, current_path=current_path)
 
     def finish(
         self,
@@ -2011,6 +2120,28 @@ class _ConvertCrashed(Exception):
         super().__init__(f"conversion worker terminated ({signal_name})")
 
 
+class _ConvertTimedOut(Exception):
+    """The child process handling this call did not answer within the
+    per-item time bound (``timeout_s`` — see :data:`_DEFAULT_ITEM_TIMEOUT_S`)
+    and was killed.
+
+    Raised only inside :meth:`_ConvertProcessPool.convert`, on the PARENT
+    side, after the stuck worker has already been reclaimed (SIGKILL, then
+    the pre-forked spare promoted when one is ready — see
+    :meth:`_ConvertProcessPool._reclaim_timed_out_slot`). Deliberately a
+    SEPARATE type from :class:`_ConvertCrashed`, worded differently by the
+    caller (:func:`_prepare_document`): this worker did not crash, it was
+    still alive and simply too slow, so calling it a "crash" would misname
+    the failure for an operator reading the run report. Treated the same
+    way in every other respect — the file is counted as ``convert_failed``
+    and the crawl moves on.
+    """
+
+    def __init__(self, timeout_s: float) -> None:
+        self.timeout_s = timeout_s
+        super().__init__(f"conversion worker did not answer within {timeout_s:.0f}s")
+
+
 def _peak_rss_bytes() -> int:
     """This (calling) process's peak resident-set size, in bytes.
 
@@ -2222,12 +2353,17 @@ class _ConvertProcessPool:
         recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
         recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
         memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
+        timeout_s: float = 0.0,
     ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
         self._size = max(1, int(size))
         self._recycle_after_docs = max(0, int(recycle_after_docs))
         self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
         self._memory_limit_bytes = max(0, int(memory_limit_bytes))
+        #: Per-item CONVERSION bound — see :data:`_DEFAULT_ITEM_TIMEOUT_S`.
+        #: 0 disables it (block on ``conn.recv()`` exactly as before this
+        #: existed).
+        self._timeout_s = max(0.0, float(timeout_s))
         self._procs: List[Optional[Any]] = [None] * self._size
         self._conns: List[Optional[Connection]] = [None] * self._size
         self._doc_counts: List[int] = [0] * self._size
@@ -2276,12 +2412,14 @@ class _ConvertProcessPool:
     def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
         """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
         worker and returns its outcome, or raises :class:`_ConvertCrashed`
-        when that worker died instead of answering — the caller turns that
-        into the same ``convert_failed`` outcome an ordinary exception
-        would, with the signal named in the log line. Also where recycling
-        (see the class docstring) is decided and, when a spare is ready,
-        carried out — after this call's own result is already determined,
-        so a recycle never changes what THIS file's outcome was."""
+        when that worker died instead of answering, or :class:`_ConvertTimedOut`
+        when it is still alive but did not answer within ``timeout_s`` (see
+        :data:`_DEFAULT_ITEM_TIMEOUT_S`) — the caller turns either into the
+        same ``convert_failed`` outcome an ordinary exception would, worded
+        for what actually happened. Also where recycling (see the class
+        docstring) is decided and, when a spare is ready, carried out —
+        after this call's own result is already determined, so a recycle
+        never changes what THIS file's outcome was."""
         proc = self._procs[slot]
         conn = self._conns[slot]
         if proc is None or conn is None or not proc.is_alive():
@@ -2290,6 +2428,12 @@ class _ConvertProcessPool:
             raise _ConvertCrashed(detail)
         try:
             conn.send((str(tmp_path), mime))
+            if self._timeout_s > 0 and not conn.poll(self._timeout_s):
+                # Still alive, just too slow — reclaim the slot (SIGKILL,
+                # since a genuine native hang can freely ignore SIGTERM) and
+                # tell the caller this was a TIMEOUT, not a crash.
+                self._reclaim_timed_out_slot(slot)
+                raise _ConvertTimedOut(self._timeout_s)
             reply: _ConvertReply = conn.recv()
         except (EOFError, OSError):
             detail = self._exit_detail(proc)
@@ -2317,6 +2461,26 @@ class _ConvertProcessPool:
         if code > 0:
             return f"exit code {code}"
         return "unknown"
+
+    def _reclaim_timed_out_slot(self, slot: int) -> None:
+        """Forcibly reclaim slot ``slot`` after its worker failed to answer
+        within ``timeout_s`` (see :data:`_DEFAULT_ITEM_TIMEOUT_S`).
+
+        SIGKILL, never :meth:`Process.terminate`'s SIGTERM: a worker stuck
+        inside native conversion code — the same class of failure crash
+        isolation already guards against, just hanging instead of aborting
+        — can freely ignore a termination request, and this path must not
+        itself risk hanging waiting for a process that will never
+        cooperate. Recovery mirrors a crash: :meth:`_swap_in_spare`
+        promotes the pre-forked SPARE immediately when one is ready
+        (safe from ANY thread, same as a crash or a recycle); otherwise the
+        slot stays down until the next :meth:`repair`.
+        """
+        proc = self._procs[slot]
+        if proc is not None and proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5)
+        self._swap_in_spare(slot)
 
     def _swap_in_spare(self, slot: int) -> bool:
         """Retire slot's ACTIVE process (dead from a crash, or simply past
@@ -2476,6 +2640,7 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
     anonymized_path = "/".join([*segments, f"{anonymized_stem}{suffix}"])
     return anonymized_path, filename
 
+
 def _convert_failure_detail(detail_type: str, detail_message: str, *, anonymize: bool) -> str:
     """The ``detail`` a ``"convert_failed"`` outcome is allowed to carry,
     decided by THIS scope's anonymize flag — see :func:`_prepare_document`'s
@@ -2623,6 +2788,16 @@ def _prepare_document(
         else:
             converted = convert_to_markdown(tmp_path, mime)
             markdown = str(getattr(converted, "markdown", "") or "")
+    except _ConvertTimedOut as exc:
+        # The child was still ALIVE but did not answer within the per-item
+        # time bound (see `_DEFAULT_ITEM_TIMEOUT_S`) — killed and, when a
+        # spare was ready, already replaced by `convert_pool.convert`
+        # itself. Worded distinctly from a crash: this file did not abort,
+        # it simply ran too long, which is a different, equally attributable
+        # reason. The crawl continues with the next file.
+        detail = f"conversion exceeded the {exc.timeout_s:.0f}s per-item time budget"
+        logger.warning("sharepoint crawl: conversion timed out for %s: %s", path, detail)
+        return _PreparedDocument("convert_failed", detail=detail)
     except _ConvertCrashed as exc:
         # The child that was converting this file died from a signal (a
         # native abort/segfault, not a Python exception) — the one failure
@@ -3256,6 +3431,7 @@ async def _retry_failed_items(
     detector: Any,
     deadline: Optional[_Deadline],
     recorder: Optional["_RunRecorder"],
+    convert_pool: Optional[_ConvertProcessPool] = None,
 ) -> None:
     """Replay every item THIS drive previously failed on, before asking
     Graph for what changed.
@@ -3289,6 +3465,16 @@ async def _retry_failed_items(
     for _stable_id, entry in pending:
         if deadline is not None:
             deadline.check()
+        # Same repair the sequential page path does before each item, and safe
+        # for the same reason: this loop never creates a thread pool, so no
+        # other thread can be holding the lock a fork would copy. Without the
+        # pool threaded through here at all, a retry converted INLINE — outside
+        # the child-process isolation, outside its RLIMIT_AS ceiling and
+        # outside recycling — so the one file that timed out could stall every
+        # later crawl, which is the failure this backlog exists to end
+        # (Devin Review on #2058).
+        if convert_pool is not None:
+            convert_pool.repair()
         stats.add(items_seen=1)
         stats.enter_item()
         started = time.monotonic()
@@ -3304,6 +3490,8 @@ async def _retry_failed_items(
                 max_file_mb=max_file_mb,
                 anonymization_key=anonymization_key,
                 detector=detector,
+                convert_pool=convert_pool,
+                convert_slot=0,
             )
         finally:
             stats.exit_item(time.monotonic() - started)
@@ -3388,6 +3576,7 @@ async def _crawl_drive(
         detector=detector,
         deadline=deadline,
         recorder=recorder,
+        convert_pool=convert_pool,
     )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
@@ -3564,6 +3753,19 @@ def _convert_child_memory_limit_bytes() -> int:
     return mb * 1024 * 1024
 
 
+def _item_timeout_seconds() -> int:
+    """``extraction.crawler.item_timeout_s`` — see
+    :data:`_DEFAULT_ITEM_TIMEOUT_S`. 0 (or negative, or unparseable)
+    disables the per-item bound — the pre-bound behaviour exactly."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "item_timeout_s", default=_DEFAULT_ITEM_TIMEOUT_S)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_ITEM_TIMEOUT_S
+
+
 def _crawl_concurrency() -> int:
     """``extraction.crawler.concurrency`` — how many items of ONE delta page
     the crawl pipelines at a time.
@@ -3722,7 +3924,11 @@ def _ocr_run_usage(scan_ocr_module: Any) -> Dict[str, Any]:
 
 
 def maybe_run_facts_extraction(
-    connection: Dict[str, Any], *, deadline: Optional[_Deadline] = None
+    connection: Dict[str, Any],
+    *,
+    deadline: Optional[_Deadline] = None,
+    stats: Optional["CrawlStats"] = None,
+    recorder: Optional["_RunRecorder"] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run the LLM fact-extraction stage over what this crawl just ingested,
     or return ``None`` when it is switched off.
@@ -3737,10 +3943,30 @@ def maybe_run_facts_extraction(
     ``ingestor.ingest`` call: this whole coroutine owns its worker's
     EXTRACTION lane slot, and there is no concurrent work for an event loop
     to interleave.
+
+    ``stats``/``recorder`` are this run's own — when both are given, this
+    wires the pass's ``on_progress`` seam to :meth:`_RunRecorder.
+    maybe_checkpoint_facts`, which is what makes a healthy multi-hour facts
+    pass keep checkpointing instead of reading `stalled` the moment it
+    outlasts the crawl phase's own cadence. Either left ``None`` (a caller
+    with no crawl run to attach to, e.g. a standalone facts trigger) simply
+    runs the pass without a liveness checkpoint of its own — never an
+    error, since a caller with no run row has nowhere to write one.
     """
     from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
 
-    return maybe_run_after_crawl(connection, deadline=deadline)
+    on_progress = None
+    if stats is not None and recorder is not None:
+
+        def on_progress(update: Dict[str, Any]) -> None:
+            recorder.maybe_checkpoint_facts(
+                stats,
+                docs_done=int(update.get("docs_done") or 0),
+                docs_total=int(update.get("docs_total") or 0),
+                current_path=update.get("current_path"),
+            )
+
+    return maybe_run_after_crawl(connection, deadline=deadline, on_progress=on_progress)
 
 
 def _resolve_anonymization_key(scopes: Sequence[Dict[str, Any]]) -> Optional[bytes]:
@@ -3827,6 +4053,7 @@ async def _run_crawl_async(
         recycle_after_docs=_convert_recycle_after_docs(),
         recycle_rss_bytes=_convert_recycle_rss_bytes(),
         memory_limit_bytes=_convert_child_memory_limit_bytes(),
+        timeout_s=_item_timeout_seconds(),
     )
     convert_pool.start()
     auth = GraphAuth(
@@ -3923,7 +4150,7 @@ async def _run_crawl_async(
         # records the run as FAILED, exactly like any other crash: the
         # crawl's own work is already durable, and the facts pass resumes
         # from its per-document state next run.
-        facts_report = maybe_run_facts_extraction(connection, deadline=deadline)
+        facts_report = maybe_run_facts_extraction(connection, deadline=deadline, stats=stats, recorder=recorder)
     except BaseException as exc:
         # A crashed — or deliberately stopped — run still owes the operator
         # its numbers and its state: the rows are already ingested, so record
