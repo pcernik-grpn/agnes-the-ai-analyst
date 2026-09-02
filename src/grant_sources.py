@@ -150,6 +150,39 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
 }
 
 
+#: The two sections `/admin/access` groups grant rows into (the effort's
+#: ticket 10). Both names say where the ACTION lives, not who owns the row —
+#: which is the axis that answer picked.
+SECTION_CHANGE_HERE = "change_here"
+SECTION_SET_ELSEWHERE = "set_elsewhere"
+
+
+def section_for(source: Optional[str]) -> str:
+    """Which section a grant row belongs in.
+
+    Keyed on :attr:`GrantSource.revocable`, so a future writer picks its own
+    side by declaring one field and the page needs no list to maintain.
+
+    The axis is **can the admin act on this row**, not **who wrote it**. Nine
+    writers are not the admin, but only two produce rows a revoke cannot
+    remove (``marketplace_sync`` re-asserts nightly; ``sharepoint_wizard``
+    rewrites its scope's collection grants). Grouping by authorship would
+    file seven revocable kinds under "not yours" — including the Library
+    shares an admin most often opens this page to check.
+
+    Everything unrecognised lands in ``change_here``, deliberately: a row
+    with no recorded source (every grant predating the column, and every
+    grant on a DuckDB instance, where the column does not exist), a row this
+    page itself wrote, and a stale key from a writer removed in a later
+    release. All three are revocable and nothing re-asserts them, so the
+    actionable section is the correct home rather than a fallback.
+    """
+    spec = GRANT_SOURCES.get(source or "")
+    if spec is not None and not spec.revocable:
+        return SECTION_SET_ELSEWHERE
+    return SECTION_CHANGE_HERE
+
+
 def describe(source: Optional[str]) -> Optional[dict]:
     """The row's provenance as the API sends it, or ``None``.
 

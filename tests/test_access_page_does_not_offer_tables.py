@@ -148,3 +148,132 @@ def test_the_overview_projection_omits_tables_but_keeps_table_grants(monkeypatch
         "an existing table grant vanished from the payload — the rows already "
         "written would be invisible and unremovable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket 10 — the page's two sections, decided on the actionability axis
+# ---------------------------------------------------------------------------
+
+
+def test_grant_sections_split_on_whether_the_admin_can_act():
+    """`Change here` / `Set elsewhere`, keyed on `revocable`.
+
+    The question this answered assumed the split was "mine versus the
+    machine's" — one writer against nine. Measured against
+    `src/grant_sources.py`, nine writers are not the admin but only TWO
+    produce rows a revoke cannot remove: the nightly marketplace sync
+    re-asserts, and the SharePoint wizard rewrites its scope's collection
+    grants. The other seven revoke cleanly and stay revoked.
+
+    So grouping by authorship would file seven revocable kinds under "not
+    yours" — including the Library shares an admin most often opens the page
+    to check. Both section names say where the ACTION lives, which is the
+    axis that was chosen.
+    """
+    from src.grant_sources import (
+        GRANT_SOURCES,
+        SECTION_CHANGE_HERE,
+        SECTION_SET_ELSEWHERE,
+        section_for,
+    )
+
+    elsewhere = {k for k in GRANT_SOURCES if section_for(k) == SECTION_SET_ELSEWHERE}
+    assert elsewhere == {"marketplace_sync", "sharepoint_wizard"}, (
+        f"exactly the two re-asserting writers belong in the inert section, got {elsewhere}"
+    )
+
+    # The seven an admin came here to act on.
+    for key in (
+        "library_share",
+        "share_request",
+        "collection_create",
+        "skill_contribution",
+        "mcp_source_default",
+        "chat_seed",
+        "system_plugin_migration",
+    ):
+        assert section_for(key) == SECTION_CHANGE_HERE, (
+            f"{key} revokes cleanly, so it belongs where the admin can act on it"
+        )
+
+
+def test_an_unrecorded_source_is_actionable_not_quarantined():
+    """The default matters more than the mapping.
+
+    A row with no source is every grant predating the provenance column and
+    every grant on a DuckDB instance, where the column does not exist at all.
+    A stale key is a writer removed in a later release. All are revocable and
+    nothing re-asserts them, so the actionable section is the right home —
+    filing them under "set elsewhere" would hide working controls behind a
+    heading that says they do not work.
+    """
+    from src.grant_sources import ACCESS_PAGE, SECTION_CHANGE_HERE, section_for
+
+    assert section_for(None) == SECTION_CHANGE_HERE
+    assert section_for("") == SECTION_CHANGE_HERE
+    assert section_for("a_writer_deleted_in_2027") == SECTION_CHANGE_HERE
+    assert section_for(ACCESS_PAGE) == SECTION_CHANGE_HERE
+
+
+def test_the_overview_payload_carries_a_section_per_grant(monkeypatch):
+    """Sent, not re-derived client-side — so the rule has one home."""
+    import asyncio
+
+    import app.api.access as access_mod
+
+    rows = [
+        {
+            "id": "g-own", "group_id": "grp-1", "resource_type": "chat",
+            "resource_id": "chat", "requirement": "available", "assigned_at": None,
+            "assigned_by": "admin@x", "source": None, "scope": None, "group_name": "D",
+        },
+        {
+            "id": "g-sync", "group_id": "grp-1", "resource_type": "marketplace_plugin",
+            "resource_id": "acme/p", "requirement": "available", "assigned_at": None,
+            "assigned_by": "system", "source": "marketplace_sync", "scope": None,
+            "group_name": "D",
+        },
+    ]
+
+    class _Grants:
+        def list_all(self, *a, **k):
+            return list(rows)
+
+        def count_for_group(self, gid):
+            return len(rows)
+
+    class _Groups:
+        def list_all(self):
+            return [{"id": "grp-1", "name": "D", "is_system": False, "created_by": "a"}]
+
+        def get_by_name(self, name):
+            return None
+
+    class _Members:
+        def count_members(self, gid):
+            return 0
+
+        def list_members_for_group(self, gid):
+            return []
+
+    monkeypatch.setattr(access_mod, "resource_grants_repo", lambda: _Grants())
+    monkeypatch.setattr(access_mod, "user_groups_repo", lambda: _Groups())
+    monkeypatch.setattr(access_mod, "user_group_members_repo", lambda: _Members())
+
+    import dataclasses
+
+    from app.resource_types import enabled_resource_types
+
+    quiet = [dataclasses.replace(s, list_blocks=lambda: []) for s in enabled_resource_types()]
+    monkeypatch.setattr(access_mod, "enabled_resource_types", lambda: quiet, raising=False)
+    monkeypatch.setattr("app.resource_types.enabled_resource_types", lambda: quiet, raising=False)
+
+    payload = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        access_mod.access_overview(user={"id": "admin1", "email": "admin@x"})
+    )
+    by_id = {g["id"]: g for g in payload["grants"]}
+    assert by_id["g-own"]["section"] == "change_here"
+    assert by_id["g-sync"]["section"] == "set_elsewhere", (
+        "a marketplace-sync row is rewritten on its next run; revoking it here "
+        "does not stick, so it must not sit among rows that do"
+    )

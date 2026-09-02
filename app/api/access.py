@@ -31,6 +31,7 @@ from src.grant_scopes import carrier_group_id
 from src.grant_scopes import normalize as normalize_scope
 from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
+from src.grant_sources import section_for as grant_section
 from src.repositories.user_groups import SystemGroupProtected
 
 from src.repositories import (
@@ -307,6 +308,17 @@ async def access_overview(
             # control here that will fail.
             "source": r.get("source"),
             "managed_by": _managed_by(r.get("source")),
+            # Which of the page's two sections this row belongs in — the
+            # effort's ticket 10. Sent rather than re-derived client-side so
+            # the rule lives in ONE place (`grant_sources.revocable`) and a
+            # future writer picks its own side by declaring that field.
+            #
+            # The axis is whether the ADMIN CAN ACT on the row, not who wrote
+            # it. Nine writers are not the admin; only two produce rows a
+            # revoke cannot remove. Grouping by authorship would file seven
+            # revocable kinds under "not yours", including the Library shares
+            # an admin most often opens this page to check.
+            "section": grant_section(r.get("source")),
             # WHO the grant reaches. NULL/absent means the members of
             # `group_id`; 'everyone' means every account, and `group_id` is
             # then a carrier the page must not attribute the grant to.
