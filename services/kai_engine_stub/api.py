@@ -303,7 +303,20 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("```\n\n"),
         _text("```sources\n"),
         _text("table: orders\n"),
-        _text("assumption: paid orders only\n"),
+        # Three assumption lines, one per shape the renderer distinguishes
+        # (TCRD-289): a stated origin from the closed vocabulary with its
+        # rationale, the origin the reader most needs to notice (the model's
+        # own judgment), and a legacy line with neither — which must render
+        # as "origin not stated", never be dropped.
+        _text(
+            "assumption: paid orders only | origin: user"
+            " | why: you asked about revenue, and an unpaid order is not revenue yet\n"
+        ),
+        _text(
+            "assumption: CZ market = shipping country | origin: judgment"
+            " | why: orders carry no market column, so the shipping address stood in\n"
+        ),
+        _text("assumption: refunds not subtracted\n"),
         _text("```"),
         {"type": "finish"},
     ],

@@ -93,7 +93,7 @@ default turn, which names the others.
 | `error`            | a mid-turn engine `error` event after partial text             |
 | `markdown`         | a tool returning a markdown table, rendered as a real table    |
 | `tabular`          | a table the MODEL writes, streamed a few characters per delta — the header row must not flash as raw pipes and the table must be styled while it grows (TCRD-288) |
-| `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip |
+| `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip; its three `assumption:` lines cover a stated origin + rationale, an `origin: judgment`, and a legacy line with neither (the "origin not stated" badge) |
 | `deliverable`      | a turn that registers `outputs/report.docx` + `outputs/deck.pptx` in the stub's sandbox file store — for the **Files** overlay |
 
 Knobs: `KAI_STUB_STEP_DELAY` (seconds between SSE records, default `0.35` so
