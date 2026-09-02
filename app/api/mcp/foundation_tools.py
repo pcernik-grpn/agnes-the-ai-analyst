@@ -1045,15 +1045,12 @@ def register_foundation_tools(
     @tool(read_only=True)
     async def fact_type_map() -> dict:
         """List every fact (node) type AND every edge (relationship) type
-        in the graph, each with a live count of what YOU can see. Use this
-        to orient BEFORE `fact_search` when you do not yet know what node
-        types exist — each `types` row's `type` is a valid
-        `fact_search(type=...)` argument — AND before `fact_neighbors` on a
-        well-connected subject: each `edge_types` row's `type` is a valid
-        entry in `fact_neighbors(edge_types=[...])`. Learning the edge type
-        name here (e.g. `in_industry`) costs one small call; omitting
-        `edge_types` on a hub node instead returns every relationship type
-        it has, which is the expensive way to find the one you wanted.
+        with a live count of what YOU can see — orient here BEFORE
+        `fact_search` (node types) and BEFORE `fact_neighbors` on a
+        well-connected subject (edge types, e.g. `in_industry` for
+        `fact_neighbors(edge_types=[...])`): learning the name here is one
+        small call, versus an unfiltered traversal returning every
+        relationship type a hub node has.
 
         Counted through the same visibility gate `fact_search`/
         `fact_neighbors` apply, so a number is what you could actually
