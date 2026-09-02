@@ -4646,7 +4646,12 @@ async def semantic_layer_list(
     #: ways depending on which tab you were looking at.
     from app.web.semantic_layer_view import model_glossary, model_of, projected_metric_ids
 
-    term_model: dict[str, str] = {}
+    #: Every model that declares a term, not the last one to be seen. Two
+    #: models sharing a term used to overwrite each other here, so the row's
+    #: "defined in" badge named whichever document the iteration happened to
+    #: reach last — a provenance claim decided by dict ordering (Devin Review
+    #: on #2070). Collected as a list, sorted, and labelled honestly below.
+    term_models: dict[str, list[str]] = {}
     metric_model: dict[str, str] = {}
     model_titles: dict[str, str] = {}
     for _row in newest_by_slug.values():
@@ -4657,7 +4662,7 @@ async def semantic_layer_list(
             for _entry in model_glossary(_doc):
                 _term = str(_entry.get("term") or "").strip()
                 if _term:
-                    term_model[_term.casefold()] = _slug
+                    term_models.setdefault(_term.casefold(), []).append(_slug)
             for _mid in projected_metric_ids(_row):
                 metric_model[_mid] = _slug
         except Exception as e:  # noqa: BLE001 - one bad document costs its own provenance
@@ -4691,7 +4696,8 @@ async def semantic_layer_list(
 
         for t in glossary_all:
             term = str(t.get("term") or "")
-            slug = term_model.get(term.casefold())
+            slugs = sorted(set(term_models.get(term.casefold(), [])))
+            slug = slugs[0] if slugs else None
             glossary_terms.append(
                 {
                     **t,
@@ -4700,7 +4706,17 @@ async def semantic_layer_list(
                     "definition_text": render_plain(t.get("definition")),
                     "facet_model": slug or _DIRECT_KEY,
                     "facet_source": str(t.get("source") or "manual"),
-                    "defined_in_label": model_titles.get(slug or "", "") if slug else _DIRECT_LABEL,
+                    #: Names the first model alphabetically and SAYS when there
+                    #: are more, rather than presenting one of several as the
+                    #: only answer. The facet value stays single (the toolbar
+                    #: facet is single-valued here) but is now deterministic.
+                    "defined_in_label": (
+                        _DIRECT_LABEL
+                        if not slug
+                        else model_titles.get(slug, slug)
+                        if len(slugs) == 1
+                        else f"{model_titles.get(slug, slug)} +{len(slugs) - 1} more"
+                    ),
                     #: Whether the rendered definition shows anything its
                     #: plain-text preview cannot — a link, emphasis, a list.
                     #: This is the ONLY thing that puts the definition inside

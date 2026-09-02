@@ -1582,3 +1582,48 @@ class TestTheModelFilterAnswersAsYouType:
         body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
         assert "form.addEventListener('submit', function (e) { e.preventDefault(); apply(); });" in body
 
+
+
+def _seed_model_declaring(slug: str, term: str) -> None:
+    """A stored model whose AGNES extension declares one glossary term."""
+    from src.repositories import semantic_model_repo
+
+    doc = _document_json(slug)
+    doc["semantic_model"][0].setdefault("custom_extensions", []).append(
+        {"vendor_name": "agnes", "data": json.dumps({"glossary": [{"term": term, "definition": "x"}]})}
+    )
+    semantic_model_repo().upsert(
+        id=f"manual/_/{slug}",
+        slug=slug,
+        name=slug,
+        description="Fixture.",
+        document="# fixture",
+        document_json=doc,
+        spec_version="0.2.0.dev0",
+        content_hash=f"hash-{slug}",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+
+
+def test_a_term_two_models_declare_does_not_claim_one_of_them(seeded_app):
+    """`term_model[term] = slug` let the LAST model iterated win, so a term
+    declared by two documents was stamped with whichever one dict ordering
+    happened to reach last — a provenance claim decided by iteration order
+    (Devin Review on #2070). The badge now names one deterministically AND
+    says there are more."""
+    from src.repositories import glossary_repo
+
+    _seed_model_declaring("alpha-model", "Churn")
+    _seed_model_declaring("zulu-model", "Churn")
+    glossary_repo().create(id="g-churn", term="Churn", definition="Customers lost.")
+
+    c = seeded_app["client"]
+    r = c.get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert "+1 more" in r.text, (
+        "a term two documents declare must not be presented as belonging to one of them"
+    )
