@@ -54,6 +54,20 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **BREAKING: the MCP SSE `?token=` query-parameter auth fallback is now off by default** (the audited remainder of #1656). A request authenticating with only `?token=` on `/api/mcp/sse` is refused exactly like a request with no credential at all (`401`, reason `no_token`) unless an operator opts back in via `mcp.allow_query_param_token: true` in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) — a token in the query string is captured by every request-logging intermediary and by browser history (CWE-598), and every connection snippet Agnes hands out (`/mcp-connect`) is header-based already. The `Authorization: Bearer` header path — PAT or session JWT, on both HTTP MCP transports — is unaffected; when the fallback is explicitly enabled, behavior (including the one-time CWE-598 warning) is unchanged.
 
 ### Fixed
+- **An answer resting only on assumptions no longer draws an empty Sources
+  row.** The empty state was keyed on `claims.length`, but an assumption is
+  filtered out of the references two lines later — so an answer whose only
+  declaration was an assumption got the "Sources" label over nothing. Keyed on
+  the references now: it reads "none declared", which is what an answer resting
+  on assumptions alone has, and still states the assumptions on their own line.
+- **Every part of a message's tail places itself through one declared order.**
+  `_BUBBLE_TAIL_ORDER` names the five pieces — sources, assumes, the
+  facts-scope line, the actions row, the follow-ups — and `_placeInTail` is the
+  only way any of them lands. Each hand-rolled its own placement before, and
+  the facts-scope line did not participate at all: it appended, so it sat
+  *under* the suggestions it is meant to precede whenever they arrived first.
+  The order now converges from any arrival sequence, which matters because the
+  live and reload paths deliver these in opposite orders.
 - **A message's own controls sit with the message, not under the
   suggestions.** The bubble's tail now reads: what the answer rested on
   (`Sources` / `Assumes`), then what you can do with the ANSWER (timestamp,

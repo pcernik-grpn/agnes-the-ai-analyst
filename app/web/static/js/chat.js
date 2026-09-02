@@ -644,6 +644,37 @@ const _CLAIM_ICON = { table: "table", metric: "chart-line" };
 //: is no control at all and nothing about the row changes.
 const _SOURCES_VISIBLE = 4;
 
+//: The bubble's tail, in the order it reads: what the answer rested on, then
+//: what you can do with the ANSWER, then what you might ask NEXT. Every piece
+//: arrives on its own schedule and the two render paths deliver them in
+//: OPPOSITE orders — live, finalize renders provenance before the actions row
+//: exists; on a history reload the actions row is already there before any of
+//: it. So no appender may assume it ran first.
+//:
+//: This list is the contract, and `_placeInTail` is the only way to honour it:
+//: each piece inserts before the first LATER kind already present, and falls
+//: back to appending. Hand-rolling that per appender is what let the
+//: facts-scope line land under the suggestions it is supposed to precede.
+const _BUBBLE_TAIL_ORDER = [
+  ".msg-sources",
+  ".msg-assumptions",
+  ".msg-facts-scope",
+  ".msg-actions",
+  ".cloud-chat-next-actions",
+];
+
+function _placeInTail(bubble, node, selector) {
+  const rank = _BUBBLE_TAIL_ORDER.indexOf(selector);
+  for (let i = rank + 1; rank !== -1 && i < _BUBBLE_TAIL_ORDER.length; i++) {
+    const later = bubble.querySelector(`:scope > ${_BUBBLE_TAIL_ORDER[i]}`);
+    if (later) {
+      bubble.insertBefore(node, later);
+      return;
+    }
+  }
+  bubble.appendChild(node);
+}
+
 function renderSourcesChips(bubble, verdict) {
   if (!verdict) return;
   const claims = verdict.claims || [];
@@ -659,17 +690,6 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
-  // Provenance is part of the MESSAGE, so it sits above the actions row (time,
-  // copy, ask again) — which on a history reload is already in the bubble by
-  // the time this runs. Same two-sided rule the actions row and the follow-up
-  // suggestions follow: each appender places itself relative to whatever is
-  // already there, so the tail reads the same however the pieces arrive.
-  const place = (node) => {
-    const actionsRow = bubble.querySelector(":scope > .msg-actions");
-    if (actionsRow) bubble.insertBefore(node, actionsRow);
-    else bubble.appendChild(node);
-  };
-
   const wrap = document.createElement("div");
   wrap.className = "msg-sources";
 
@@ -678,20 +698,25 @@ function renderSourcesChips(bubble, verdict) {
   label.textContent = "Sources";
   wrap.appendChild(label);
 
-  if (!claims.length) {
-    const none = document.createElement("span");
-    none.className = "msg-source-chip is-none";
-    none.textContent = "none declared";
-    wrap.appendChild(none);
-    place(wrap);
-    return;
-  }
-
   // An assumption is not a source in the same sense: it is a caveat about
   // method with nothing to open, and chipping it beside two links made both
   // harder to read. It gets its own line below, as the prose it is.
   const refs = claims.filter((c) => c.kind !== "assumption");
   const assumptions = claims.filter((c) => c.kind === "assumption");
+
+  // Keyed on REFERENCES, not on claims. An answer resting only on assumptions
+  // has declared no sources — and keying this on `claims.length` drew the
+  // "Sources" label over an empty row for exactly that case, since the
+  // assumptions are filtered out again two lines above. (Review on #2049.)
+  if (!refs.length) {
+    const none = document.createElement("span");
+    none.className = "msg-source-chip is-none";
+    none.textContent = "none declared";
+    wrap.appendChild(none);
+    _placeInTail(bubble, wrap, ".msg-sources");
+    if (assumptions.length) _renderAssumptions(bubble, assumptions);
+    return;
+  }
 
   const list = document.createElement("span");
   list.className = "msg-sources-list";
@@ -759,21 +784,25 @@ function renderSourcesChips(bubble, verdict) {
     flag.appendChild(document.createTextNode(`${unverified} unverified`));
     wrap.appendChild(flag);
   }
-  place(wrap);
+  _placeInTail(bubble, wrap, ".msg-sources");
+  if (assumptions.length) _renderAssumptions(bubble, assumptions);
+}
 
-  if (assumptions.length) {
-    const row = document.createElement("div");
-    row.className = "msg-assumptions";
-    const alabel = document.createElement("span");
-    alabel.className = "msg-sources-label";
-    alabel.textContent = "Assumes";
-    row.appendChild(alabel);
-    const text = document.createElement("span");
-    text.className = "msg-assumption";
-    text.textContent = assumptions.map((c) => c.ref).join("; ");
-    row.appendChild(text);
-    place(row);
-  }
+/** The `Assumes` line — prose about method, on its own row under the sources.
+ *  Split out so the no-references path above can reach it too: an answer that
+ *  rests only on assumptions still has assumptions to state. */
+function _renderAssumptions(bubble, assumptions) {
+  const row = document.createElement("div");
+  row.className = "msg-assumptions";
+  const label = document.createElement("span");
+  label.className = "msg-sources-label";
+  label.textContent = "Assumes";
+  row.appendChild(label);
+  const text = document.createElement("span");
+  text.className = "msg-assumption";
+  text.textContent = assumptions.map((c) => c.ref).join("; ");
+  row.appendChild(text);
+  _placeInTail(bubble, row, ".msg-assumptions");
 }
 
 // ---------- Next-actions block ---------------------------------------------
@@ -869,7 +898,11 @@ function renderFactsScopeLine(bubble) {
     const docWord = docCount === 1 ? "document" : "documents";
     const colWord = colCount === 1 ? "collection" : "collections";
     line.textContent = `Answered from ${docCount} ${docWord} in ${colCount} ${colWord} you can access.`;
-    bubble.appendChild(line);
+    // Provenance, so it belongs with the sources — above the actions row and
+    // above the follow-ups. A bare append put it UNDER the suggestions
+    // whenever they arrived first, contradicting the tail order the rest of
+    // the file documents. (Review on #2049.)
+    _placeInTail(bubble, line, ".msg-facts-scope");
   }
   _resetFactsTurnEvidence();
 }
@@ -930,18 +963,11 @@ function renderNextActions(bubble, actions, pending = false) {
     });
     row.appendChild(btn);
   }
-  // The tail of a bubble reads: what the answer rested on (sources, assumes),
-  // then what you can do with the answer (time, copy, ask again), then what
-  // you might ask NEXT. The suggestions are the only forward-looking thing
-  // here, so they close the bubble — sitting them above the actions row put a
-  // timestamp underneath an invitation and made the row look like it belonged
-  // to the suggestions rather than to the message.
-  //
-  // Appended unconditionally, which is what makes that true on BOTH paths:
-  // live the actions row does not exist yet and arrives later (it inserts
-  // itself above these — see attachMessageActions), on reload it is already
-  // there and this lands after it. Neither path has to know which ran first.
-  bubble.appendChild(row);
+  // Last in `_BUBBLE_TAIL_ORDER`: the suggestions are the only forward-looking
+  // thing in the tail, so they close the bubble. Sitting them above the
+  // actions row put a timestamp underneath an invitation and made the row look
+  // like it belonged to the suggestions rather than to the message.
+  _placeInTail(bubble, row, ".cloud-chat-next-actions");
 }
 
 function _clearNextActions() {
@@ -2771,15 +2797,10 @@ function attachMessageActions(article, copyText) {
 
   const wrap = document.createElement("div");
   wrap.className = "msg-actions";
-  // The other half of the tail order described in renderNextActions: this row
-  // belongs to the MESSAGE, so it sits above any follow-up suggestions rather
-  // than below them. Whichever of the two renders first, the pair lands the
-  // same way round.
-  const appendRow = () => {
-    const suggestions = bubble.querySelector(":scope > .cloud-chat-next-actions");
-    if (suggestions) bubble.insertBefore(wrap, suggestions);
-    else bubble.appendChild(wrap);
-  };
+  // This row belongs to the MESSAGE, so it sits above any follow-up
+  // suggestions rather than below them — see `_BUBBLE_TAIL_ORDER`, which is
+  // where that order is declared for every piece of the tail.
+  const appendRow = () => _placeInTail(bubble, wrap, ".msg-actions");
 
   const ts = article.dataset.createdAt
     ? new Date(article.dataset.createdAt)

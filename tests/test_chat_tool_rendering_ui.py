@@ -684,24 +684,28 @@ def test_the_bubble_tail_reads_sources_then_actions_then_suggestions():
     there, and the three rules compose to one order either way."""
     js = _read(CHAT_JS)
 
-    # Sources sit above the actions row (matters on reload, where it exists).
-    sources = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
-    assert 'bubble.querySelector(":scope > .msg-actions")' in sources and "insertBefore" in sources
-    # `place()` is the only appender; the fallback inside it is the sole
-    # bubble.appendChild in the function.
-    assert sources.count("bubble.appendChild(") == 1, "every placement goes through the ordered `place`"
-    assert sources.count("place(") >= 3, "the sources row, the empty state and the assumes row all use it"
+    # The order is declared ONCE, and `_placeInTail` is the only way to honour
+    # it. Hand-rolling the placement per appender is what let the facts-scope
+    # line land under the suggestions it is supposed to precede (review on
+    # #2049) — so the guard is that nothing in the tail appends by hand.
+    order = js[js.index("const _BUBBLE_TAIL_ORDER") : js.index("function _placeInTail")]
+    for sel in (".msg-sources", ".msg-assumptions", ".msg-facts-scope", ".msg-actions", ".cloud-chat-next-actions"):
+        assert f'"{sel}"' in order, f"{sel} is part of the tail and must declare its rank"
+    assert order.index('".msg-sources"') < order.index('".msg-actions"') < order.index('".cloud-chat-next-actions"'), (
+        "what the answer rested on, then what you can do with it, then what to ask next"
+    )
 
-    # The actions row sits above the suggestions (matters live, where the
-    # suggestions render first).
-    actions = js[js.index("function attachMessageActions") : js.index("/** Whether a persisted assistant row")]
-    assert 'bubble.querySelector(":scope > .cloud-chat-next-actions")' in actions
-    assert "insertBefore(wrap, suggestions)" in actions
-
-    # The suggestions close the bubble, unconditionally.
-    nxt = js[js.index("function renderNextActions") : js.index("function _clearNextActions")]
-    assert "bubble.appendChild(row);" in nxt
-    assert "insertBefore" not in nxt, "the suggestions are last — nothing to insert above"
+    for fn_name, end in (
+        ("function renderSourcesChips", "// ---------- Next-actions block"),
+        ("function renderFactsScopeLine", "function renderNextActions"),
+        ("function attachMessageActions", "/** Whether a persisted assistant row"),
+        ("function renderNextActions", "function _clearNextActions"),
+    ):
+        body = js[js.index(fn_name) : js.index(end)]
+        assert "_placeInTail(" in body, f"{fn_name} must place itself through the shared contract"
+        assert "bubble.appendChild(" not in body, (
+            f"{fn_name} appends by hand — that is how a tail element ends up in the wrong place"
+        )
 
 
 def test_over_cap_result_keeps_a_raw_json_route():

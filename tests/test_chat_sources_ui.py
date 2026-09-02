@@ -220,6 +220,26 @@ def test_the_source_chip_states_use_ink_not_line_tokens():
     assert icon and "color: inherit;" in icon.group(1)
 
 
+def test_an_answer_resting_only_on_assumptions_declares_no_sources():
+    """`refs`, not `claims`. An assumption is filtered out of the references two
+    lines later, so keying the empty state on `claims.length` drew the "Sources"
+    label over a row with nothing under it for exactly the answer that rests on
+    assumptions alone. An answer resting only on assumptions has declared no
+    sources — and it still states the assumptions, on their own line, which is
+    why that path reaches `_renderAssumptions` before returning.
+    (Review on #2049.)"""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
+    assert "if (!refs.length) {" in fn, "the empty state is keyed on references, not on claims"
+    assert "if (!claims.length) {" not in fn
+    empty = fn[fn.index("if (!refs.length) {") :]
+    empty = empty[: empty.index("\n  }")]
+    assert "none declared" in empty
+    assert "_renderAssumptions(bubble, assumptions)" in empty, (
+        "an answer with only assumptions still has assumptions to state"
+    )
+
+
 def test_a_long_source_row_caps_before_it_wraps():
     """Past the cap the rest fold behind "+N more" rather than wrapping the row
     to a second and third line. Under it there is no control at all — the

@@ -2093,7 +2093,7 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 
 /* Next-action chips — the model's suggested follow-ups, lifted out of the
    ```next_actions trailer and rendered under the latest answer only.
-   
+
    The CHIP itself is the landing screen's `.rdb-action` (chat_dashboard.css),
    applied by chat.js rather than re-described here. It is the same offer in
    both places — a question you can ask next — and describing it twice is what
