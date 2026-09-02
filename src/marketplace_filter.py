@@ -176,9 +176,10 @@ def required_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: 
     stays importable without the FastAPI app — same reason
     ``resolve_allowed_plugins`` reimplements its group lookup here.
     """
+    # No early return on an empty group set: an everyone-scoped grant
+    # (0098) reaches an account regardless of membership, so a caller in no
+    # group still has a Required set to compute.
     group_ids = _user_group_ids(user_id, conn) if user_id else set()
-    if not group_ids:
-        return set()
     rows = resource_grants_repo().list_for_groups(list(group_ids), "store_entity")
     return {
         r["resource_id"] for r in rows if (r.get("requirement") or "available") == "required" and r.get("resource_id")
@@ -197,9 +198,8 @@ def granted_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: s
     Same reason as the sibling for living here rather than importing from
     ``app.auth.access``: the serve path stays importable without the app.
     """
+    # No early return on an empty group set — see the sibling above.
     group_ids = _user_group_ids(user_id, conn) if user_id else set()
-    if not group_ids:
-        return set()
     rows = resource_grants_repo().list_for_groups(list(group_ids), "store_entity")
     return {r["resource_id"] for r in rows if r.get("resource_id")}
 
@@ -406,9 +406,13 @@ def resolve_allowed_plugins(conn: duckdb.DuckDBPyConnection, user: dict) -> List
     # (i.e. it wasn't stale Google sync) — the JOIN simply returned 0
     # rows because it was running against an empty DuckDB. The repo's
     # PG mirror runs the same logical JOIN against the live engine.
+    # No early return on an empty group set. `list_granted_for_groups`
+    # already handles one (it binds NULL rather than an invalid `IN ()`), and
+    # on Postgres an everyone-scoped grant matches by scope rather than by
+    # the group IN-list — so a caller in no group can still be served. That
+    # is what `marketplace_plugins.is_system` did before 0098, and the reach
+    # had to survive the flag.
     group_ids = _user_group_ids(user_id, conn) if user_id else set()
-    if not group_ids:
-        return []
     rows = marketplace_plugins_repo().list_granted_for_groups(group_ids)
 
     result: List[dict] = []

@@ -631,3 +631,91 @@ def test_list_for_groups_returns_same_ids_both_backends(rbac_repos):
 
     # Empty group_ids list — no query, empty result, on both engines.
     assert grants.list_for_groups([], "marketplace_plugin") == []
+
+
+def test_an_everyone_scope_survives_the_authorization_path_for_a_groupless_account(
+    pg_engine, monkeypatch
+):
+    """The scope is only real if the AUTHORIZATION path honours it.
+
+    Not a repository test — the repositories were already correct. Four
+    functions in ``app.auth.access`` short-circuited on an empty group set
+    (``if not group_ids: return False``) and never reached them, and two more
+    in ``src.marketplace_filter`` did the same on the serve path. Every one of
+    those was right while "everyone" was a group nobody could be outside of;
+    each became a silent denial the moment it became a scope.
+
+    Postgres-only, because the scope is: on DuckDB an everyone-grant is a
+    grant on the carrier group and reaching it does require membership, which
+    is the documented divergence.
+
+    A groupless account is the whole point of this test. It is rare — no API
+    path can remove the auto-membership (``remove_member`` takes
+    ``require_source='admin'``) — which is exactly why no existing test
+    covered it, and why the bug was invisible until the model changed.
+    """
+    import uuid as _uuid
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic import command
+    from alembic.config import Config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    carrier_id = _uuid.uuid4().hex
+    user_id = "u-" + _uuid.uuid4().hex[:8]
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO user_groups (id, name, description, is_system, created_by) "
+                "VALUES (:id, 'Everyone', 'System', TRUE, 'system:seed') "
+                "ON CONFLICT (name) DO NOTHING"
+            ),
+            {"id": carrier_id},
+        )
+        carrier_id = conn.execute(
+            sa.text("SELECT id FROM user_groups WHERE name = 'Everyone'")
+        ).scalar_one()
+        conn.execute(
+            sa.text("INSERT INTO users (id, email, name) VALUES (:id, :e, 'Groupless')"),
+            {"id": user_id, "e": f"{user_id}@example.com"},
+        )
+        # No membership row at all — deliberately.
+        conn.execute(
+            sa.text(
+                "INSERT INTO resource_grants "
+                "(id, group_id, resource_type, resource_id, requirement, scope) "
+                "VALUES (:id, :g, 'chat', 'chat', 'available', 'everyone')"
+            ),
+            {"id": _uuid.uuid4().hex, "g": carrier_id},
+        )
+
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    import importlib
+
+    import src.repositories as repositories
+
+    importlib.reload(repositories)
+    try:
+        from app.auth.access import can_access, has_explicit_grant
+
+        assert can_access(user_id, "chat", "chat") is True, (
+            "the authorization gate denied access an everyone-scoped grant gives"
+        )
+        assert has_explicit_grant(user_id, "chat", "chat") is True, (
+            "the nav-affordance read missed it, so chat would be granted but hidden"
+        )
+        assert can_access(user_id, "chat", "some-other-chat") is False
+    finally:
+        importlib.reload(repositories)
+        db_pg.dispose()

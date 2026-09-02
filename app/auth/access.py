@@ -306,9 +306,12 @@ def can_access(
         # Elevation paused (consent gate): fall through to the explicit
         # group-grant path — the admin sees exactly what their grants say.
 
-    if not group_ids:
-        return False
-
+    # NO early return on an empty group set. An everyone-scoped grant
+    # (migration 0098) reaches an account regardless of which groups it is
+    # in — including one in no group at all, which is the case the old
+    # group model could not express and the reason the scope exists. The
+    # repositories answer an empty list correctly; short-circuiting here
+    # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
     if conn is not None and not use_pg():
@@ -345,8 +348,12 @@ def _allowed_ids_for_user(
     DuckDB and Postgres behave identically — never raw SQL on ``conn``.
     """
     group_ids = _user_group_ids(user_id, conn=conn)
-    if not group_ids:
-        return frozenset()
+    # NO early return on an empty group set. An everyone-scoped grant
+    # (migration 0098) reaches an account regardless of which groups it is
+    # in — including one in no group at all, which is the case the old
+    # group model could not express and the reason the scope exists. The
+    # repositories answer an empty list correctly; short-circuiting here
+    # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
     if conn is not None and not use_pg():
@@ -400,8 +407,12 @@ def required_store_entity_ids(
     :func:`_allowed_ids_for_user` — reads go through the repository factory.
     """
     group_ids = _user_group_ids(user_id, conn=conn)
-    if not group_ids:
-        return frozenset()
+    # NO early return on an empty group set. An everyone-scoped grant
+    # (migration 0098) reaches an account regardless of which groups it is
+    # in — including one in no group at all, which is the case the old
+    # group model could not express and the reason the scope exists. The
+    # repositories answer an empty list correctly; short-circuiting here
+    # would deny access the grants say exists.
     from app.resource_types import ResourceType
     from src.repositories import resource_grants_repo, use_pg
 
@@ -446,8 +457,12 @@ def has_explicit_grant(
     Postgres-backed instance and hid the nav link even when chat was granted.)
     """
     group_ids = _user_group_ids(user_id, conn=conn)
-    if not group_ids:
-        return False
+    # NO early return on an empty group set. An everyone-scoped grant
+    # (migration 0098) reaches an account regardless of which groups it is
+    # in — including one in no group at all, which is the case the old
+    # group model could not express and the reason the scope exists. The
+    # repositories answer an empty list correctly; short-circuiting here
+    # would deny access the grants say exists.
     from src.repositories import use_pg, resource_grants_repo
 
     if conn is not None and not use_pg():
