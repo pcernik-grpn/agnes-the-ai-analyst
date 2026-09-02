@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Drive one eval round from a YAML run-config, or ingest an operator-pasted
-manual transcript (A1/A2/A3). Fact-graph build-order step 5 -- design spec
-Sec 16, EQ0 (Sec 15.3).
+manual transcript (A1/A2, or A3 as a fallback). Fact-graph build-order step
+5 -- design spec Sec 16, EQ0 (Sec 15.3).
+
+API-driven arms: A0 (bare Anthropic), A3 (Anthropic + the context pack as a
+prompt-cached system turn -- `system_file` / `system` in the run-config is
+REQUIRED, A3 without a pack is just A0) and A4 (Agnes). A1/A2 are manual
+transcript import only.
 
 Usage:
     .venv/bin/python -m scripts.eval.run_eval run --config path/to/round.yaml
     .venv/bin/python -m scripts.eval.run_eval run --config round.yaml --arm A0 --prompt X1
+    .venv/bin/python -m scripts.eval.run_eval run --config round.yaml --arm A3
     .venv/bin/python -m scripts.eval.run_eval import-transcript \\
         --round R0 --arm A1 --prompt X1 --run 1 --persona principal \\
         --transcript-file transcript.txt --input-tokens 1200 --output-tokens 340
@@ -37,15 +43,29 @@ from scripts.eval.arms import (  # noqa: E402
     manual_transcript_record,
 )
 from scripts.eval.config import RunConfig, load_run_config  # noqa: E402
-from scripts.eval.prompts import API_DRIVEN_ARMS, MANUAL_ARMS, load_prompts  # noqa: E402
+from scripts.eval.prompts import API_DRIVEN_ARMS, MANUAL_ARMS, TRANSCRIPT_IMPORT_ARMS, load_prompts  # noqa: E402
 from scripts.eval.records import TokenCounts, Turn, write_record  # noqa: E402
 
 _SURFACES: dict[str, type[AgentSurface]] = {"chat": ChatSurface, "slack": SlackSurface}
 
 
 def build_executor(arm: str, arm_config: dict) -> ArmExecutor:
+    has_pack = bool(arm_config.get("system") or arm_config.get("system_file"))
     if arm == "A0":
+        if has_pack:
+            raise ValueError(
+                "arm 'A0' is the no-context hallucination floor -- move `system`/`system_file` "
+                "to the A3 stanza (A0 with a pack is just A3 mislabeled)"
+            )
         return AnthropicArm(**arm_config)
+    if arm == "A3":
+        if not has_pack:
+            raise ValueError(
+                "arm 'A3' needs a context pack: set `system_file` (a path, resolved against the "
+                "current working directory) or `system` (inline text) under arm_config.A3 -- "
+                "A3 without a pack is just A0"
+            )
+        return AnthropicArm(arm="A3", **arm_config)
     if arm == "A4":
         cfg = dict(arm_config)
         surface_name = cfg.pop("surface", "chat")
@@ -60,7 +80,7 @@ def build_executor(arm: str, arm_config: dict) -> ArmExecutor:
         surface = surface_cls(base_url, agent_slug)
         return AgnesArm(surface, persona_tokens=persona_tokens, timeout_s=timeout_s)
     raise ValueError(
-        f"arm {arm!r} has no API executor -- A1/A2/A3 are manual-transcript "
+        f"arm {arm!r} has no API executor -- A1/A2 are manual-transcript "
         f"import only, see `import-transcript` (arms.py module docstring)"
     )
 
@@ -112,8 +132,11 @@ def _cmd_import_transcript(args: argparse.Namespace) -> int:
     if prompt is None:
         print(f"error: unknown prompt id {args.prompt!r}, expected one of {sorted(prompts)}", file=sys.stderr)
         return 2
-    if args.arm not in ("A1", "A2", "A3"):
-        print(f"error: import-transcript is for manual arms A1/A2/A3, got {args.arm!r}", file=sys.stderr)
+    if args.arm not in TRANSCRIPT_IMPORT_ARMS:
+        print(
+            f"error: import-transcript is for manual arms A1/A2 (or A3 as a fallback), got {args.arm!r}",
+            file=sys.stderr,
+        )
         return 2
 
     transcript_text = Path(args.transcript_file).read_text(encoding="utf-8")
@@ -152,10 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     imp_p = sub.add_parser(
         "import-transcript",
-        help="Ingest an operator-pasted manual transcript for A1/A2/A3",
+        help="Ingest an operator-pasted manual transcript for A1/A2 (A3 too, as the fallback to `run --arm A3`)",
     )
     imp_p.add_argument("--round", required=True)
-    imp_p.add_argument("--arm", required=True, choices=("A1", "A2", "A3"))
+    imp_p.add_argument("--arm", required=True, choices=TRANSCRIPT_IMPORT_ARMS)
     imp_p.add_argument("--prompt", required=True, help="Prompt id, e.g. X1")
     imp_p.add_argument("--run", required=True, type=int, help="Run index (1..N)")
     imp_p.add_argument("--persona", default=None)
