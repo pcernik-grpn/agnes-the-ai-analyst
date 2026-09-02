@@ -1694,9 +1694,14 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   background: var(--ds-surface-dim);
   border-radius: var(--radius-sm);
   /* Sized to the table, not to the column — same reason as the code block
-     above. A 43-column catalog listing has no business painting 750px. */
+     above. A 43-column catalog listing has no business painting 750px.
+     `max-width` is the other half of that: without it an inline-block takes
+     its INTRINSIC width, so one long unbroken line grows the block past the
+     reading column instead of scrolling inside the `overflow` below.
+     (Review on #2049.) */
   display: inline-block;
   vertical-align: top;
+  max-width: 100%;
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: var(--text-xs);
   line-height: 1.5;
@@ -1751,8 +1756,12 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   padding: var(--space-2) var(--space-3);
   background: var(--ds-surface-dim);
   border-radius: var(--radius-sm);
+  /* Shrink to the payload, but never past the column: an inline-block with no
+     max-width takes its intrinsic width, so a single long JSON string would
+     widen the block rather than scroll inside it. (Review on #2049.) */
   display: inline-block;
   vertical-align: top;
+  max-width: 100%;
   font-size: var(--text-xs);
   max-height: 280px;
   overflow: auto;

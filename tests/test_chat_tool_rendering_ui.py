@@ -1868,6 +1868,28 @@ def test_an_answer_that_is_a_document_reads_like_one():
         assert sel + " {" in css, f"{sel} still falls through to the browser default"
 
 
+def test_every_shrink_to_content_payload_still_stops_at_the_column():
+    """`display: inline-block` takes the element's INTRINSIC width. Three tool
+    payloads use it so a short one does not paint a full-width band — and every
+    one of them also holds content that does not wrap (`white-space: pre`, long
+    JSON strings, long command lines). Without `max-width` the block grows past
+    the reading column on one long line instead of scrolling inside its own
+    `overflow`, which is the whole point of the scroll region.
+
+    The code panel had this from the start; the console block and the JSON
+    payload did not, which is the inconsistency this pins. (Review on #2049.)"""
+    css = _read(CHAT_CSS)
+    for sel in (
+        ".cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {",
+        ".cloud-chat-tool-console {",
+        ".cloud-chat-tool-result.is-json pre {",
+    ):
+        rule = css[css.index(sel) :]
+        rule = rule[: rule.index("\n}")]
+        assert "display: inline-block;" in rule, f"{sel} no longer shrinks to content — re-point this guard"
+        assert "max-width: 100%;" in rule, f"{sel} shrinks to content but is unbounded — a long line escapes the column"
+
+
 def test_tool_group_css_uses_ds_tokens_only():
     css = _read(CHAT_CSS)
     # Anchored on the group's own last rule rather than on ".cloud-chat-tool-head
