@@ -145,6 +145,25 @@ distribution mirror, and the api-role write conversions) map onto:
   output (each mirrored scope's ``excluded_subtrees``) is read straight off
   the connection's scope rows by the built-in crawler, which HONORS the
   exclusions itself.
+- ``sharepoint-facts-extraction`` (EXTRACTION — shares ``corpus-extraction``'s
+  lane) — run one fact-extraction pass over a connection's ALREADY-INDEXED
+  corpus, without a crawl. Before this kind existed, ``maybe_run_after_crawl``
+  chained onto a crawl's tail was the ONLY way this pass ever ran — so an
+  operator wanting to (re)build the graph over documents already sitting in
+  ``corpus_files`` had no answer but "re-run the whole crawl", and a crawl
+  that ran long could leave the chained pass with none of its own time
+  (observed live: a 900s crawl left it an already-expired deadline, stopping
+  it after 3 documents). This kind gives the pass its own trigger (``POST
+  …/connections/{id}/facts-extract``, ``agnes admin sharepoint
+  facts-extract``) and its own wall-clock budget
+  (``extraction.facts.run_timeout_s``, independent of the crawl's
+  ``extraction.timeout_s``). A thin delegate to
+  ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+  — same posture as every other kind here: this handler owns only the
+  ``sharepoint.enabled`` gate, the two facts-specific switches
+  (``extraction.facts.enabled`` / ``facts.enabled``) are that function's own
+  job. Registered UNCONDITIONALLY, same no-op posture as
+  ``sharepoint-acl-sync`` above.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
 function/method and does not reimplement any of its logic. Each import is
@@ -1376,6 +1395,59 @@ def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
     return run_subtree_sweep(payload)
 
 
+def _run_sharepoint_facts_extraction(payload: dict) -> dict:
+    """``sharepoint-facts-extraction`` — run ONE fact-extraction pass over a
+    SharePoint connection's ALREADY-INDEXED corpus, without running a crawl
+    first. The operator's own trigger — "how do we get the fact graph
+    populated with what we already have?" required re-running an entire
+    crawl before this kind existed, which is absurd for a corpus already
+    sitting in ``corpus_files``.
+
+    A thin delegate, exactly like ``_run_corpus_extraction`` above: the
+    walk, the model calls, the verbatim gate, the ingest batching and the
+    per-document state all live in
+    ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+    — which ALSO enforces the stage's own two cost/surface gates
+    (``extraction.facts.enabled`` / ``facts.enabled``), loudly, via
+    ``FactsExtractionDisabled``, rather than this handler duplicating that
+    check. This handler owns exactly one thing that function does not: the
+    ``sharepoint.enabled`` gate, same posture as ``corpus-extraction``.
+
+    ``payload``:
+      - ``connection_id`` (required)
+      - ``doc_ids`` (optional list[str]) — narrow the pass to specific
+        documents (``corpus_file_sources.source_doc_id``) — the "test one
+        document" path already supported by ``run_facts_extraction`` and
+        threaded straight through here.
+      - ``timeout_s`` (optional) — overrides ``extraction.facts.run_timeout_s``
+        for this one run (0 = unbounded). Its OWN budget, never the crawl's
+        ``extraction.timeout_s`` — see
+        ``run_standalone_facts_extraction``'s docstring for why a
+        crawl-chained pass sharing the crawl's own deadline is exactly the
+        problem a standalone trigger with its own budget avoids (observed
+        live: a 900s crawl left the chained pass an already-expired
+        deadline, stopping it after 3 documents).
+
+    Returns the pass report (see
+    ``connectors.sharepoint.facts_extraction._Report.render``).
+
+    No-op guard: raises (so the job fails cleanly) when ``sharepoint.enabled``
+    is false — same "this job only ever exists because something explicitly
+    enqueued it" rationale as ``corpus-extraction`` above.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("sharepoint-facts-extraction: sharepoint.enabled is false — refusing to run")
+
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    connection_id = str(payload["connection_id"])
+    doc_ids = payload.get("doc_ids")
+    timeout_s = payload.get("timeout_s")
+    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s)
+
+
 #: Kinds whose payload gets this claimed job's own ``id`` merged in before
 #: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
 #: per-kind flag on ``JobKind``: only ``corpus-extraction`` has anywhere to
@@ -1669,6 +1741,28 @@ def register_all_kinds() -> None:
             # No automatic retry — same rationale as corpus-extraction: a
             # failed multi-hour sweep (throttling, a Graph outage mid-walk)
             # needs an operator to look at it, not an unattended re-run.
+            retry_in_seconds=None,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="sharepoint-facts-extraction",
+            handler=_run_sharepoint_facts_extraction,
+            # Same lane as corpus-extraction: an LLM-calling document-
+            # processing stage, the same cost/resource class — shares its
+            # concurrency ceiling rather than getting its own.
+            lane=EXTRACTION_LANE,
+            # Heartbeat-protected, NOT tied to the pass's own
+            # extraction.facts.run_timeout_s (its wall-clock bound, enforced
+            # separately inside run_standalone_facts_extraction, between
+            # documents) — same shape as corpus-extraction's own lease
+            # above. See the module docstring's lease/retry tuning note.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
+            # No automatic retry: a failed pass (no model credential, an
+            # exhausted retry budget) needs an operator to look at it, not
+            # an unattended re-run — and a resumed run already picks up
+            # from the persisted per-document state anyway, same rationale
+            # as corpus-extraction above.
             retry_in_seconds=None,
         )
     )

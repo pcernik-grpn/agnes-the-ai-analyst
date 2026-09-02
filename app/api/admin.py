@@ -1059,9 +1059,9 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "default": _flag_default_path(("extraction", "facts", "enabled"), False),
                     "hint": (
                         "OFF by default, and this is a COST decision: this is the only stage "
-                        "that spends model tokens per document — measured $0.011 for a typical "
-                        "~5k-token document on the default Haiku-class model, $0.020 when the "
-                        "corrective verbatim retry fires, roughly 3x that on Sonnet. Needs "
+                        "that spends model tokens per document — a live 187-document pass "
+                        "measured $0.0542/document on the default Haiku-class model, roughly "
+                        "3x on Sonnet; re-measure rather than trust either figure blindly. Needs "
                         "facts.enabled too: with the fact-graph surface off the pass is skipped "
                         "rather than writing claims no endpoint would serve. Spreadsheets and "
                         "CSVs are never sent to the model, and a re-run re-extracts only "

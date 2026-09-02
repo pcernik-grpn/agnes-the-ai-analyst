@@ -345,7 +345,14 @@ class TestCatalogSemanticsLinkFromCatalog:
         Asserted on the template rather than on a render because the section
         is conditional on the instance having definitions to show, and seeding
         metrics + glossary entries here would be testing the Library's empty
-        state rather than the presence of the link."""
+        state rather than the presence of the link.
+
+        The URL itself moved: the row now carries ONE link whose target the
+        route resolves (`defs.browse_href`), so that it can follow the counts
+        the row just stated instead of always opening the metrics tab — which
+        on an instance holding only glossary terms was the one empty list on
+        the page. The template is checked for the door, the route for where it
+        leads; grepping the template alone would now assert nothing."""
         from pathlib import Path
 
         library = Path("app/web/templates/library.html").read_text(encoding="utf-8")
@@ -358,13 +365,28 @@ class TestCatalogSemanticsLinkFromCatalog:
             "library.html no longer carries the door — under the rail the Definitions "
             "row is the page's entry point (see the IA note in _app_rail.html)"
         )
-        assert '"browse_href": "/semantic-layer?tab=all_metrics"' in router, (
+        # Asserted on the `browse_href` VALUE rather than on one literal:
+        # the target stopped being a constant when it started following the
+        # counts the row states (metrics, else glossary, else the models front
+        # door), so pinning the old single-string form would fail on a change
+        # that made the link better rather than worse.
+        browse = router.split('"browse_href"', 1)[1].split("}", 1)[0]
+        assert "/semantic-layer?tab=all_metrics" in browse, (
             "the door's target is gone from the router"
+        )
+        assert "/semantic-layer?tab=all_metrics" in router, (
+            "the route no longer resolves the metric registry as a landing"
         )
         assert "/catalog/semantics" not in library, (
             "library.html still emits the retired URL — the 308 is for links Agnes "
             "does not control, not for its own emitters"
         )
+        # Not asserted on router.py: that module DEFINES the 308 handler, so
+        # the string is supposed to be there. What must not happen is the
+        # /library route resolving a reader ONTO it, which is the same claim
+        # narrowed to the value the row actually links.
+        browse = router.split('"browse_href"', 1)[1].split("}", 1)[0]
+        assert "/catalog/semantics" not in browse
 
 
 class TestCatalogSemanticsWayOut:

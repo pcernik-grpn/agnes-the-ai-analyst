@@ -470,6 +470,46 @@
 <span class="detail-status{% if tone %} detail-status--{{ tone }}{% endif %}">{{ label }}</span>
 {% endmacro %}
 
+{# ── Pager ─────────────────────────────────────────────────────────────
+   ONE control for every paginated section on a detail page (a collection's
+   Files list, its Facts list, …): Previous / "Page X of Y · N items" / Next.
+   Renders nothing when there is only one page.
+
+   Both directions are ALWAYS drawn — the unavailable one gets
+   `detail-pager__btn--disabled` rather than being omitted, so the control
+   never changes width as the reader pages back and forth.
+
+   `qs` is the page's full set of OTHER active query params (built once by
+   the route and shared across every section's pager call — see
+   `_pager_href` in app/web/router.py); `page_param` is the ONE key this
+   particular control varies. `pager_href` is a Jinja GLOBAL the route
+   registers, not a macro import, so it copies `qs`, overrides `page_param`
+   and drops defaults without this macro having to know the route's other
+   page keys.
+
+   `anchor_id`, when given, targets the link at the section's own fragment
+   (`#anchor_id`) so paging one section does not jump the reader back to the
+   top of a long page — the OTHER section-scroll bug the bare `?facts_page=`
+   links had alongside dropping every other param. #}
+{% macro pager(current, total_pages, total_items, page_param, qs, anchor_id=None, item_noun='item') %}
+{% if total_pages > 1 %}
+{% set _frag = ('#' ~ anchor_id) if anchor_id else '' %}
+<nav class="detail-pager" aria-label="Pagination">
+  {% if current > 1 %}
+  <a class="detail-pager__btn" href="{{ pager_href(qs, page_param, current - 1) }}{{ _frag }}" rel="prev">{{ ico('back') }}Previous</a>
+  {% else %}
+  <span class="detail-pager__btn detail-pager__btn--disabled" aria-disabled="true">{{ ico('back') }}Previous</span>
+  {% endif %}
+  <span class="detail-pager__status">Page {{ current }} of {{ total_pages }} &middot; {{ total_items }} {{ item_noun }}{{ 's' if total_items != 1 else '' }}</span>
+  {% if current < total_pages %}
+  <a class="detail-pager__btn detail-pager__btn--next" href="{{ pager_href(qs, page_param, current + 1) }}{{ _frag }}" rel="next">Next{{ ico('back') }}</a>
+  {% else %}
+  <span class="detail-pager__btn detail-pager__btn--next detail-pager__btn--disabled" aria-disabled="true">Next{{ ico('back') }}</span>
+  {% endif %}
+</nav>
+{% endif %}
+{% endmacro %}
+
 {# ── Activity timeline ────────────────────────────────────────────────
    The ONE component for every "what happened to this thing, and when"
    list — activity, and version history, which is the same shape wearing
@@ -1293,6 +1333,29 @@
   .detail-status--warn   { background: var(--ds-accent-warn-bg);    border-color: var(--ds-accent-warn-line);    color: var(--ds-accent-warn-ink); }
   .detail-status--danger { background: var(--ds-accent-danger-bg);  border-color: var(--ds-accent-danger-line);  color: var(--ds-accent-danger-ink); }
   .detail-status--info   { background: var(--ds-accent-info-bg);    border-color: var(--ds-accent-info-line);    color: var(--ds-accent-info-ink); }
+
+  /* ── Pager — shared control for every paginated section (Files, Facts, …).
+     Both directions always render; the unavailable one is disabled rather
+     than absent, so the control never changes width as the reader pages. */
+  .detail-pager {
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--ds-border-light);
+    font-size: 12.5px; color: var(--ds-text-secondary);
+  }
+  .detail-pager__btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 5px 12px; border-radius: 999px; border: 1px solid var(--ds-border);
+    background: var(--ds-surface); color: var(--kind); text-decoration: none;
+    font-weight: 600; white-space: nowrap;
+  }
+  .detail-pager__btn svg { width: 13px; height: 13px; }
+  .detail-pager__btn--next svg { transform: rotate(180deg); }
+  .detail-pager__btn:hover { background: var(--kind-soft); border-color: var(--kind); }
+  .detail-pager__btn--disabled {
+    color: var(--ds-text-muted); background: var(--ds-surface-dim); border-color: var(--ds-border-light);
+    cursor: default; pointer-events: none;
+  }
+  .detail-pager__status { flex: none; white-space: nowrap; }
 
   .detail-timeline { margin: 0; padding: 0 0 0 20px; list-style: none; border-left: 1px solid var(--ds-border); }
   .detail-timeline__item { position: relative; padding-bottom: 18px; }

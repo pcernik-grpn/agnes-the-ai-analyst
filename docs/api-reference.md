@@ -1213,6 +1213,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
+- /api/admin/sharepoint/connections/{connection_id}/facts-extract
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1310,6 +1311,26 @@ mechanics to `POST …/acl-sync` above (same enqueue/flag-gate/dedup shape,
 sweep_already_running`), except the explicit-connection payload also bypasses
 the job's own per-connection due-guard (`acl_sync.sweep_interval_days`), so
 this always triggers a real sweep rather than a same-day no-op.
+
+`POST …/facts-extract` is the admin/ops trigger for the
+`sharepoint-facts-extraction` job — build the fact graph over whatever this
+connection's collections ALREADY hold, without running a crawl first (the
+only way this pass ran before this route existed was chained onto a crawl's
+tail, `maybe_run_after_crawl`, sharing that crawl's own budget). Optional
+JSON body `{doc_ids?, timeout_s?}`: `doc_ids` narrows the pass to specific
+documents (`corpus_file_sources.source_doc_id`), `timeout_s` overrides this
+run's OWN wall-clock budget (`extraction.facts.run_timeout_s`, default 3600s,
+0 = unbounded — never the crawl's `extraction.timeout_s`). Enqueues
+`{"connection_id": connection_id, ["doc_ids"], ["timeout_s"]}` and returns
+`202 {"job_id", "status"}`; `409 feature_disabled` when the `sharepoint`
+switch is off (router-level gate); `409 facts_extraction_disabled` when
+either of the stage's own two switches (`extraction.facts.enabled`,
+`facts.enabled`) is off, checked BEFORE enqueue so a misconfigured instance
+never gets a job that fails 30+ minutes later in a worker; `409
+facts_extraction_already_running` when one is already queued/running for
+this connection (its own idempotency key, distinct from every other kind's
+— a facts-extraction trigger never dedups against a crawl, an ACL sync or a
+subtree sweep). CLI: `agnes admin sharepoint facts-extract <connection_id>`.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
@@ -2221,6 +2242,30 @@ stored — otherwise a caller with mere collection READ access (enough to see
 a real member's id and filename in this same listing) could re-upload an
 unrelated file under a member's own anchor and have it silently resolve to
 (and overwrite) that member's row.
+
+**Listing files is paginated.** `GET .../files` answers
+`{files, total, limit, offset}` — `limit` defaults to **25** and clamps to
+`1..200`, `offset` clamps to `>= 0`, and neither is ever a `422`: the web
+page builds these query strings itself and a validation error would break its
+own pagination links. `total` is the count AFTER the filters below and BEFORE
+`limit`/`offset`, so a caller paging a search can trust it as the number of
+matches rather than the collection's size. `GET /api/collections/{collection_id}`
+applies the same cap to its inline `files` and reports `files_total` +
+`files_truncated`, so a reader can tell "this collection has 25 files" from
+"this is the first page of 3000". **This is breaking** for a caller that
+assumed either list was complete.
+
+`q` filters by **case-insensitive substring** over `filename` and `path`, with
+LIKE metacharacters escaped so `report_v2` does not also match `reportXv2`.
+Note the deliberate difference from `GET /api/collections/search`, which
+searches document *contents* whole-word with no wildcard: `q=smlou` finds
+`smlouva.pdf` here and finds nothing there. `status` filters on an exact
+`processing_status`. A blank `?q=` or `?status=` — what an HTML form sends for
+an unset optional — means "no filter", never "match nothing". `order` is one
+of `newest` (the default here) / `oldest` / `name` / `size`; an unrecognised
+value falls back to `oldest` rather than erroring. Every ordering carries an
+`id ASC` tie-break, because files uploaded in one batch share a `created_at`
+and without it a page boundary would repeat or skip rows.
 
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The

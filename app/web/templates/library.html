@@ -114,7 +114,7 @@
           aria-label="What definitions are. {{ _defs_tip }}">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1" fill="currentColor" stroke="none"/></svg>
   </button>
-  <span class="lib-defs__counts">{{ defs.metric_count }} metric{{ '' if defs.metric_count == 1 else 's' }}, {{ defs.glossary_count }} glossary term{{ '' if defs.glossary_count == 1 else 's' }}</span>
+  <span class="lib-defs__counts">{{ defs.metric_count }} metric{{ '' if defs.metric_count == 1 else 's' }}, {{ defs.glossary_count_label }} glossary term{{ '' if defs.glossary_count == 1 else 's' }}</span>
   {# The destination is called Definitions now, so the door is too. It used
      to say "Browse semantic models" and land on the Models tab — which
      shows neither of the two things this line counts. #}

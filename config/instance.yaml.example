@@ -1465,19 +1465,37 @@ extraction:
     # the ceiling a single heavy document can still reach. 0 disables the
     # cap; not enforceable on every platform (notably macOS).
     convert_child_memory_limit_mb: 1536
+    # How long (seconds) a single item's CONVERSION may run before its
+    # worker is killed and the file counted an ordinary, attributable
+    # `convert_failed` -- the per-item TIME bound. Without it, nothing
+    # bounds how long one document can occupy a worker slot: the run's own
+    # `timeout_s` above is only checked BETWEEN items, and a cooperative
+    # stop request is polled at those same points, so a single stuck item
+    # makes both unreachable -- observed on a live deployment as one file
+    # occupying a slot for over nine minutes before the container's own
+    # memory limit, not this setting, ended the run. 300s (5 minutes) is
+    # generous enough for a legitimately large document on a loaded host
+    # while still keeping the worst case per file small against a corpus of
+    # thousands. 0 disables the bound (the pre-fix behaviour).
+    item_timeout_s: 300
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.
   facts:
     # OFF by default, and this is a COST decision, not a capability one:
-    # this is the only stage that spends model tokens per document.
-    # Measured against the shipped prompt + a 22-type ontology: $0.011 for a
-    # typical ~5k-token document on the default Haiku-class model, $0.020
-    # when the corrective verbatim retry fires, ~$0.045 for a 30k-token
-    # one — so a 10,000-document corpus is a $110-200 first pass. Sonnet is
-    # roughly 3x those figures. Re-runs are far cheaper: a document
-    # is re-extracted only when its content, the model, or the effective
-    # prompt changed, and the prompt + ontology prefix is cached.
+    # this is the only stage that spends model tokens per document. A live
+    # 187-document pass measured $0.0542/document on the default
+    # Haiku-class model (docs/superpowers/specs/2026-09-02-fact-extraction-
+    # cost-levers.md) — well above the $0.011-0.045 range previously
+    # claimed here, and the prompt + ontology prefix is NOT currently
+    # cached (it sits below this model's minimum cacheable prefix length).
+    # The corrective verbatim retry below was the dominant cost (85.6% of
+    # documents, 29-46% of the bill) before most first-attempt failures
+    # were closed by a deterministic, zero-token quote repair — re-measure
+    # rather than trust either figure blindly; a 10,000-document corpus is
+    # on the order of several hundred dollars for a first pass. Sonnet is
+    # roughly 3x. Re-runs are far cheaper: a document is re-extracted only
+    # when its content, the model, or the effective prompt changed.
     # Spreadsheets and CSVs are never sent to the model at all.
     # Needs `facts.enabled` (the fact-graph surface) as well — with that
     # off, the pass is skipped rather than writing claims nothing can read.
@@ -1493,6 +1511,16 @@ extraction:
     # anonymizer's). Accepts a tier name (haiku/sonnet/opus) or a concrete
     # model id. Empty falls back to `extraction.model`, then Haiku.
     model: ""
+    # Wall-clock budget (seconds) for a STANDALONE run — POST
+    # /connections/{id}/facts-extract, `agnes admin sharepoint
+    # facts-extract`, the `sharepoint-facts-extraction` job kind. Its OWN
+    # knob, never `extraction.timeout_s` above (the crawl's): a
+    # crawl-chained pass (the tail of a corpus-extraction run) shares the
+    # crawl's budget by construction, which can leave it little or nothing
+    # once a large crawl runs long — a standalone run is not fighting a
+    # crawl for time, so it gets a budget of its own. 0 disables the bound
+    # (unbounded), same convention as `extraction.timeout_s`.
+    run_timeout_s: 3600
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails
@@ -1538,6 +1566,55 @@ extraction:
     # ~$5 per 1,000 documents at the default Haiku-class model. Opt in when
     # the recall is worth that per-corpus bill.
     detector: "regex"
+    # OPTIONAL: point the `llm` tier at a SELF-HOSTED endpoint instead of the
+    # instance's cloud model credentials. Leave `base_url` empty (the
+    # default) and nothing here applies — the tier uses ANTHROPIC_API_KEY /
+    # LLM_API_KEY / Vertex ADC exactly as before.
+    #
+    # The endpoint must speak the Anthropic Messages shape
+    # (`POST {base_url}/v1/messages`); LiteLLM, vLLM's Anthropic route and
+    # similar proxies all expose it in front of a local model. That surface
+    # rather than OpenAI chat-completions because this tier needs per-call
+    # token `usage` and a cacheable system-prompt breakpoint.
+    #
+    # TWO GATES, both server-side and neither optional, because this whole
+    # section is admin-writable and this endpoint receives document text
+    # BEFORE anonymization — names, emails, account numbers:
+    #
+    #   1. The host of `base_url` must be listed in
+    #      AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST (comma-separated
+    #      host or host:port) in the server's environment. DEFAULT-CLOSED:
+    #      unset allows nothing, so an edited `base_url` cannot quietly
+    #      redirect documents off-network.
+    #   2. `api_key_env` may only name a variable under the
+    #      AGNES_ANONYMIZATION_LLM_ prefix. It is checked BEFORE the value is
+    #      read, so config cannot point it at the vault key, the anonymization
+    #      HMAC key, or a connector certificate and have that sent as a bearer
+    #      token — those are outside the namespace by construction.
+    #
+    # A misconfiguration here FAILS the anonymize pass; it never falls back
+    # to the cloud path. Falling back would either start billing a model the
+    # operator did not choose or ship documents somewhere they did not intend.
+    llm:
+      base_url: ""              # e.g. "https://llm.internal:8443"
+      # The id the endpoint serves, used VERBATIM — no tier resolution, so
+      # non-Claude ids are fine and required (e.g. "qwen3.5-9b").
+      model: ""
+      # Omit or leave empty for the default name
+      # (AGNES_ANONYMIZATION_LLM_API_KEY); any other AGNES_ANONYMIZATION_LLM_*
+      # name works too, for a deployment running more than one endpoint. An
+      # endpoint that wants no auth is fine — the variable simply stays unset.
+      api_key_env: ""
+      # Per-call output ceiling; 0 or unset uses the built-in 4096.
+      #
+      # Size this to the DEPLOYED MODEL, not to the expected answer. A model
+      # with a reasoning channel spends this same budget thinking before it
+      # answers and can exhaust it mid-thought, which arrives here as an
+      # empty reply and fails the document closed. A 20B reasoning model
+      # measured on real documents needed >16384 and still failed under
+      # concurrency; a model with no reasoning channel answered the same
+      # documents in ~200 tokens.
+      max_output_tokens: 0
     # Deterministic identifier tiers — the shapes a *name* detector cannot
     # find, because they are not names: they are decided from characters
     # alone. Each runs before entity substitution and each is individually
