@@ -34,7 +34,10 @@ async def _send_or_explain_limit_ephemeral(send, response_url: str) -> bool:
     on the api-role producer and the cross-gateway forward there is no local
     sink to carry the frame, so left uncaught it unwound into
     ``_run_logged``'s generic "Something went wrong handling that command"
-    (TCRD-291 sibling of the mention path's ``_send_or_explain_limit``).
+    (TCRD-291 sibling of the mention path's ``_send_or_explain_limit``). On
+    the local path an ``EphemeralCommandSink`` shares this response_url; it
+    skips sender-limit ``error`` frames (``SENDER_LIMIT_FRAME_KINDS``) so the
+    refusal is posted exactly once, from here.
     """
     from services.slack_bot.events import _SENDER_LIMIT_MESSAGES
 

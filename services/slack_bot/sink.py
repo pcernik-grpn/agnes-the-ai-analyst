@@ -287,8 +287,9 @@ class EphemeralCommandSink:
 
     Posts the FIRST assistant_message of the turn to the caller's
     response_url, then ignores further frames. error/cancelled are also
-    surfaced once so a budget/rate failure is visible. Never stays
-    attached — the session's permanent sink (web/DM) keeps streaming.
+    surfaced once — except a sender-limit refusal, which the command handler
+    explains itself (see ``send_json``). Never stays attached — the session's
+    permanent sink (web/DM) keeps streaming.
     """
 
     def __init__(self, *, response_url: str) -> None:
@@ -306,9 +307,20 @@ class EphemeralCommandSink:
                 self._delivered = True
                 await send_ephemeral(self._response_url, content)
         elif t == "error":
+            from app.chat.manager import SENDER_LIMIT_FRAME_KINDS
+
             kind = data.get("kind", "")
             msg = data.get("message", "")
             self._delivered = True
+            if kind in SENDER_LIMIT_FRAME_KINDS:
+                # A sender-limit refusal (daily spend, conversation token
+                # budget, message rate) reaches the slash-command user twice
+                # otherwise: once here as the raw frame and once from the
+                # handler's ``_send_or_explain_limit_ephemeral``, which catches
+                # the same refusal's RuntimeError and posts the tailored
+                # ``_SENDER_LIMIT_MESSAGES`` copy to this response_url. The
+                # handler's copy wins; the turn is still over for this sink.
+                return
             parts = [p for p in (kind, msg) if p]
             detail = ": ".join(parts)
             text = f":warning: {detail}" if detail else ":warning:"

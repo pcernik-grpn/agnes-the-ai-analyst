@@ -4885,6 +4885,11 @@ def _seed_daily_tokens_from_db_if_needed(
 #: ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader loops in app/api/chat.py),
 #: so they are named here rather than re-typed.
 SENDER_LIMIT_REASONS = frozenset({"daily_budget_exhausted", "max_session_tokens_exhausted", "rate_limit_exceeded"})
+#: The ``kind`` of the ``error`` frame ``enforce_sender_limits`` broadcasts for
+#: each of those refusals, in the same order. A sink that shares its delivery
+#: channel with a handler that already explains the refusal (the Slack
+#: slash command's ``EphemeralCommandSink``) uses this to post it once.
+SENDER_LIMIT_FRAME_KINDS = frozenset({"daily_budget", "max_session_tokens", "rate_limit"})
 
 
 def session_token_budget_message(used: int, cap: int) -> str:
