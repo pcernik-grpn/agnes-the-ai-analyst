@@ -1819,9 +1819,34 @@ class FactsPgRepository:
             if is_admin
             else {"readable": list(readable), "tiered_hidden": tiered_hidden, "audience_pairs": audience_pairs}
         )
+        # An edge's own evidence is not the whole of what makes it reachable:
+        # `neighbors` resolves the OTHER endpoint per hop and skips the edge
+        # when that fact is withheld, so an edge into a `wrong`/`restricted`
+        # fact was counted here while no traversal could ever produce it — and
+        # for a type that is empty once those are removed, a nonzero count is
+        # exactly the existence oracle the docstring above says this must not
+        # be (Devin Review on #2079).
+        #
+        # Deliberately narrowed to the endpoint CORRECTIONS rather than
+        # composed with `_visible_facts_for_corpus_cte`: that CTE requires a
+        # fact to carry evidence in its own right, which is STRICTER than the
+        # endpoint test `neighbors` applies — a fact evidenced only through
+        # the incident edge passes there and would vanish here, making the map
+        # under-count edges the caller really can traverse. Matching the
+        # over-count with an under-count is not a fix.
+        endpoint_gate = (
+            " WHERE NOT EXISTS ("
+            "SELECT 1 FROM corrections co WHERE co.subject_kind = 'fact' "
+            "AND co.subject_id IN (e.src, e.dst) "
+            "AND co.verdict IN ('wrong', 'restricted') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM corrections cr WHERE cr.subject_kind = 'fact' "
+            "AND cr.subject_id = co.subject_id AND cr.verdict = 'revealed'))"
+        )
         sql = sa.text(
             f"WITH {cte} "
-            "SELECT e.type, COUNT(*) AS n FROM edge_visible v JOIN edges e ON e.id = v.subject_id "
+            "SELECT e.type, COUNT(*) AS n FROM edge_visible v JOIN edges e ON e.id = v.subject_id"
+            f"{endpoint_gate} "
             "GROUP BY e.type ORDER BY e.type"
         )
         with self._engine.connect() as conn:
