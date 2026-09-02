@@ -1491,8 +1491,14 @@ summary.cloud-chat-tool-group-head:focus-visible .cloud-chat-tool-group-label {
 }
 .cloud-chat-tool-group-body > .cloud-chat-tool {
   max-width: none;
-  margin-left: 0;
-  margin-right: 0;
+  /* ALL FOUR sides, not just the horizontal pair. A step's negative vertical
+     margin exists solely to claw back the messages column's flex `gap`
+     (see .cloud-chat-tool) — and inside the group body there is no gap to
+     claw back: these are ordinary block children, so the -8px collapsed the
+     first row into the header and every later row into the one above it.
+     Measured at -8px on every boundary. Zero here, with the step head's own
+     padding supplying the rhythm. (Review on #2049.) */
+  margin: 0;
 }
 
 .cloud-chat-tool-head {

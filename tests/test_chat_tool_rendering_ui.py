@@ -1732,6 +1732,18 @@ def test_a_step_sits_tighter_to_its_prose_than_two_messages_do():
     # The premise: the gap it is compensating for.
     assert "gap: var(--space-5);" in css
 
+    # And the place that gap does NOT exist. Inside the group body a step is an
+    # ordinary block child, so the compensation has nothing to compensate for
+    # and collapsed every row into the one above it — measured at -8px on each
+    # boundary, header included. The override has to reset all FOUR sides; when
+    # it reset only the horizontal pair the vertical margins stayed negative.
+    grouped = css[css.index(".cloud-chat-tool-group-body > .cloud-chat-tool {") :]
+    grouped = grouped[: grouped.index("}")]
+    assert "margin: 0;" in grouped, (
+        "grouped steps must reset all four margins — the negative vertical pair overlaps them"
+    )
+    assert "margin-left" not in grouped, "the horizontal-only reset is what left the overlap"
+
     step = css[css.index(".cloud-chat-tool--step {") :]
     step = step[: step.index("}")]
     assert "padding: 0" in step
