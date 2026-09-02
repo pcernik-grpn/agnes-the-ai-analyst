@@ -2138,6 +2138,8 @@ def run_facts_extraction(
     max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
     concurrency: Optional[int] = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    transport: Optional[str] = None,
+    batch_client: Any | None = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -2177,6 +2179,15 @@ def run_facts_extraction(
     this is observability, never load-bearing, the same posture every
     other progress signal in this pipeline takes.
 
+    ``transport`` overrides ``extraction.facts.transport`` (the test seam;
+    ``None`` reads config, same convention as ``concurrency`` above). When
+    resolved to ``"batch"`` this function dispatches everything below to
+    :func:`_run_batch_pass` — the sync loop's own connection/ontology/
+    prompt resolution above this point is shared by both, but nothing
+    past the dispatch runs for a batch-mode pass. ``batch_client`` is that
+    transport's own test seam (an object exposing ``.messages.batches.
+    create/retrieve/results``), unused for a sync pass.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -2203,6 +2214,27 @@ def run_facts_extraction(
     fingerprint = prompt_fingerprint(system_prompt)
 
     model = _model()
+
+    # Transport dispatch — the ONE branch point between the two transports.
+    # Everything above this line (connection, ontology, prompt, model) is
+    # shared; nothing below it runs for a batch-mode pass.
+    mode = transport if transport is not None else _transport_mode()
+    if mode == "batch":
+        return _run_batch_pass(
+            connection_id,
+            connection=connection,
+            model=model,
+            system_prompt=system_prompt,
+            fingerprint=fingerprint,
+            prompt_origin=prompt_origin,
+            ontology_models=ontology_models,
+            doc_ids=doc_ids,
+            deadline=deadline,
+            max_doc_chars=max_doc_chars,
+            batch_client=batch_client,
+            on_progress=on_progress,
+        )
+
     if extractor is None:
         extractor = _Extractor(system_prompt=system_prompt, model=model)
     else:
@@ -2400,6 +2432,460 @@ def run_facts_extraction(
         rendered["docs_extracted"],
         rendered["docs_unchanged"],
         rendered["docs_skipped_tabular"],
+        rendered["facts_failed"],
+        rendered["facts_quotes_dropped"],
+        rendered["claims_written"],
+    )
+    return rendered
+
+
+def _run_batch_pass(
+    connection_id: str,
+    *,
+    connection: Dict[str, Any],
+    model: str,
+    system_prompt: str,
+    fingerprint: str,
+    prompt_origin: str,
+    ontology_models: List[Dict[str, Any]],
+    doc_ids: Optional[Sequence[str]],
+    deadline: Any,
+    max_doc_chars: int,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    batch_client: Any | None = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """The Batches-API transport's own pass — dispatched from
+    :func:`run_facts_extraction` when ``extraction.facts.transport`` (or
+    the ``transport`` override) resolves to ``"batch"``.
+
+    Flow: resume any batch a PRIOR pass left ``batch-submitted`` in state,
+    submit fresh batches for whatever :func:`_plan_documents` still finds
+    pending (:func:`_group_pending_into_batches`, respecting the request-
+    count and byte caps), then drain a queue of batch ids — poll each to
+    ``"ended"`` (bounded by ``deadline``, never a fixed wall-clock guess),
+    collect its results (:func:`_collect_batch_results`) and fold every one
+    through the SAME gate / corrective-retry-recovery / ingest-shipping
+    contract the sync transport uses (:func:`_fold_accepted_result`), so a
+    document's FINAL shape is transport-independent. A corrective-retry
+    batch (``extraction.facts.retry_transport: batch``, the default) is
+    submitted per collected initial batch and enqueued the same way, so it
+    drains through the identical poll/collect step.
+
+    Resumable by construction: every document that leaves the queue with a
+    transient outcome (submitted-but-not-yet-collected, errored, canceled,
+    expired, or a missing result row) either stays ``batch-submitted`` in
+    state (deadline hit mid-poll) or is cleared back to plain "pending"
+    (:func:`_requeue_or_fail`) for :func:`_plan_documents` to pick up next
+    pass — never silently dropped, never resubmitted twice.
+    """
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo
+
+    report = _Report()
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state["docs"]
+    batch_attempts: Dict[str, int] = state.setdefault("batch_attempts", {})
+    anonymize_marked = anonymize_marked_collection_ids(connection)
+    shipper = _BatchShipper(report=report, anonymize_marked=anonymize_marked, user=_ingest_identity())
+
+    files_repo = corpus_files_repo()
+    sources_repo = corpus_file_sources_repo()
+    wanted_doc_ids = {str(d) for d in doc_ids} if doc_ids else None
+
+    client, resolved_model = _ensure_batch_client(model, client=batch_client)
+    poll_s = _batch_poll_s()
+    batch_size = _batch_size()
+    retry_transport = _retry_transport_mode()
+
+    # `usage` is the combined running total (what a batch's ingest delta is
+    # computed against, exactly like the sync transport's own `_flush`);
+    # `batch_usage` is the SUBSET attributable to Batches-API calls, kept
+    # apart only so the final report can price it at the batch multiplier
+    # while a sync-transport corrective retry (`retry_transport: sync`)
+    # still prices at the synchronous rate.
+    usage = _empty_usage()
+    batch_usage = _empty_usage()
+    shipped_usage: Dict[str, Any] = {}
+
+    def _usage_delta() -> Dict[str, Any]:
+        return {k: int(v) - int(shipped_usage.get(k, 0)) for k, v in usage.items()}
+
+    def _flush() -> None:
+        try:
+            shipper.flush(usage=_usage_delta(), model=model)
+        except _IngestRefused:
+            # Counted by the shipper already; those documents keep no
+            # state entry, so the next pass resubmits them. A refusal must
+            # never abort the whole pass.
+            pass
+        else:
+            shipped_usage.update({k: int(v) for k, v in usage.items()})
+            save_state(connection_id, state)
+
+    def _record_usage(bucket: str, response_usage: Any) -> None:
+        from src.anonymization_ner import _usage_value
+
+        for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            value = _usage_value(response_usage, field)
+            usage[field] += value
+            if bucket == "batch":
+                batch_usage[field] += value
+        usage["calls"] += 1
+
+    docs_done = 0
+    docs_planned = 0
+
+    def _report_progress(current_path: Optional[str] = None) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress({"docs_done": docs_done, "docs_total": docs_planned, "current_path": current_path})
+        except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+            logger.debug("facts extraction: progress callback failed (%s) — continuing", type(exc).__name__)
+
+    def _accept(
+        work: "_Work",
+        nodes: List[dict],
+        edges: List[dict],
+        dropped: int,
+        retried: bool,
+        repaired: int,
+        parse_errors: int,
+    ) -> None:
+        nonlocal docs_done
+        result = _DocResult(
+            work=work,
+            nodes=nodes,
+            edges=edges,
+            dropped=dropped,
+            retried=retried,
+            repaired=repaired,
+            parse_errors=parse_errors,
+            seconds=0.0,
+        )
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
+        )
+        batch_attempts.pop(work.file_id, None)
+        report.docs_via_batch += 1
+        docs_done += 1
+        _report_progress(current_path=work.path or work.filename)
+        if shipper.should_flush():
+            _flush()
+
+    def _requeue(file_id: str, *, reason: str, permanent: bool) -> None:
+        nonlocal docs_done
+        _requeue_or_fail(
+            file_id,
+            reason=reason,
+            permanent=permanent,
+            docs_state=docs_state,
+            batch_attempts=batch_attempts,
+            report=report,
+        )
+        docs_done += 1
+        _report_progress()
+
+    def _sync_retry(message: str) -> str:
+        from src.anonymization_ner import _reply_text
+
+        response = client.messages.create(
+            model=resolved_model,
+            max_tokens=max_output_tokens,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": message}],
+        )
+        _record_usage("sync", getattr(response, "usage", None))
+        return _reply_text(response)
+
+    queue: "deque[str]" = deque()
+    # Documents whose initial-batch gate failed and whose corrective retry
+    # is deferred to a follow-up batch (`retry_transport: batch`) — flushed
+    # into ONE retry-batch submission right after the initial batch that
+    # produced them finishes collecting.
+    pending_retries: List[Tuple["_Work", List[dict], List[dict], List[Tuple[dict, str]], int]] = []
+
+    def _finalize_initial(work: "_Work", reply_text: str) -> None:
+        nodes, edges, parse_errors = parse_streams(reply_text)
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        failures = verbatim_failures([*nodes, *edges], **kwargs)
+        repaired = 0
+        if failures:
+            from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
+
+            repaired = repair_verbatim_failures(failures, document_text=CHUNK_JOIN_SEPARATOR.join(work.chunk_texts))
+            if repaired:
+                failures = verbatim_failures([*nodes, *edges], **kwargs)
+        if not failures:
+            _accept(work, nodes, edges, 0, False, repaired, parse_errors)
+            return
+        if retry_transport == "sync" and not _deadline_expired(deadline):
+            retry_reply = _sync_retry(_retry_message(work.user_message, failures))
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work,
+                nodes=nodes,
+                edges=edges,
+                failures=failures,
+                retry_reply=retry_reply,
+                parse_errors=parse_errors,
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        if retry_transport == "sync":
+            # Deadline already gone — no budget left for another call this
+            # pass; drop and count exactly as an exhausted retry would.
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work, nodes=nodes, edges=edges, failures=failures, retry_reply=None, parse_errors=parse_errors
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        # retry_transport == "batch": defer to the follow-up batch this
+        # initial batch's collection submits once every result is seen.
+        kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+        pending_retries.append((work, kept_nodes, kept_edges, failures, parse_errors))
+
+    def _finalize_retry(work: "_Work", entry: Dict[str, Any], reply_text: str) -> None:
+        kept_nodes = entry.get("kept_nodes") or []
+        kept_edges = entry.get("kept_edges") or []
+        parse_errors = int(entry.get("parse_errors") or 0)
+        failed_count = int(entry.get("failed_count") or 0)
+        final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+            work=work,
+            kept_nodes=kept_nodes,
+            kept_edges=kept_edges,
+            failed_count=failed_count,
+            retry_reply_text=reply_text,
+            parse_errors=parse_errors,
+        )
+        _accept(work, final_nodes, final_edges, dropped, True, 0, parse_errors2)
+
+    def _collect_batch(batch_id: str) -> None:
+        started = time.monotonic()
+        entries = [
+            (fid, e)
+            for fid, e in list(docs_state.items())
+            if isinstance(e, dict) and e.get("batch_id") == batch_id and e.get("status") == "batch-submitted"
+        ]
+        if not entries:
+            return
+        results = _collect_batch_results(client, batch_id)
+        succeeded = requeued = failed = 0
+        for file_id, entry in entries:
+            phase = entry.get("phase", "initial")
+            result = results.get(file_id)
+            if result is None:
+                _requeue(file_id, reason="missing_result", permanent=False)
+                requeued += 1
+                continue
+            result_type = getattr(result, "type", None)
+            if result_type == "succeeded":
+                loaded = _load_work_for_file(
+                    file_id, files_repo=files_repo, sources_repo=sources_repo, max_doc_chars=max_doc_chars
+                )
+                if loaded is None:
+                    docs_state.pop(file_id, None)
+                    batch_attempts.pop(file_id, None)
+                    report.facts_failed += 1
+                    logger.warning(
+                        "facts extraction: document %s vanished before its batch result could be collected", file_id
+                    )
+                    continue
+                work, truncated = loaded
+                if truncated:
+                    report.docs_truncated += 1
+                message = getattr(result, "message", None)
+                from src.anonymization_ner import _reply_text
+
+                reply_text = _reply_text(message)
+                _record_usage("batch", getattr(message, "usage", None))
+                if phase == "retry":
+                    _finalize_retry(work, entry, reply_text)
+                else:
+                    _finalize_initial(work, reply_text)
+                succeeded += 1
+            elif result_type == "errored":
+                error = getattr(result, "error", None)
+                error_type = str(getattr(error, "type", "") or "")
+                if error_type.startswith("invalid_request"):
+                    _requeue(
+                        file_id, reason=f"invalid_request: {getattr(error, 'message', error_type)}", permanent=True
+                    )
+                    failed += 1
+                else:
+                    _requeue(file_id, reason=f"errored: {error_type or 'unknown'}", permanent=False)
+                    requeued += 1
+            else:  # "canceled" / "expired" / anything unrecognized
+                _requeue(file_id, reason=str(result_type or "unknown"), permanent=False)
+                requeued += 1
+        elapsed = time.monotonic() - started
+        logger.info(
+            "facts extraction: connection %s — batch %s collected (%d succeeded, %d requeued, %d failed, %.1fs)",
+            connection_id,
+            batch_id,
+            succeeded,
+            requeued,
+            failed,
+            elapsed,
+        )
+
+    def _submit_and_track(works: Sequence["_Work"], messages_by_file: Dict[str, str], *, phase: str) -> str:
+        batch_id = _submit_batch(
+            client,
+            model=resolved_model,
+            system_prompt=system_prompt,
+            works=works,
+            messages_by_file=messages_by_file,
+            max_output_tokens=max_output_tokens,
+        )
+        submitted_at = _now_iso()
+        for w in works:
+            docs_state[w.file_id] = {
+                "status": "batch-submitted",
+                "batch_id": batch_id,
+                "custom_id": w.file_id,
+                "submitted_at": submitted_at,
+                "phase": phase,
+            }
+        save_state(connection_id, state)
+        logger.info(
+            "facts extraction: connection %s — batch %s submitted (%s, %d document(s))",
+            connection_id,
+            batch_id,
+            phase,
+            len(works),
+        )
+        return batch_id
+
+    # -- Phase 0: resume batches a PRIOR pass left in flight ---------------
+    resumed_ids = sorted(
+        {
+            e["batch_id"]
+            for e in docs_state.values()
+            if isinstance(e, dict) and e.get("status") == "batch-submitted" and e.get("batch_id")
+        }
+    )
+    for batch_id in resumed_ids:
+        queue.append(batch_id)
+
+    # -- Phase 1: submit fresh batches for whatever is still pending -------
+    pending_works = list(
+        _plan_documents(
+            connection=connection,
+            docs_state=docs_state,
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=wanted_doc_ids,
+            model=model,
+            fingerprint=fingerprint,
+            max_doc_chars=max_doc_chars,
+        )
+    )
+    docs_planned += len(pending_works)
+    _report_progress()
+    groups = _group_pending_into_batches(
+        pending_works, system_prompt=system_prompt, batch_size=batch_size, max_output_tokens=max_output_tokens
+    )
+    for group in groups:
+        if _deadline_expired(deadline):
+            report.interrupted = True
+            report.interrupted_reason = "timeout"
+            break
+        batch_id = _submit_and_track(group, {w.file_id: w.user_message for w in group}, phase="initial")
+        queue.append(batch_id)
+
+    # -- Phase 2: drain the queue — poll, collect, finalize; collecting a
+    #             batch may enqueue MORE ids (a follow-up retry batch) ----
+    while queue:
+        batch_id = queue.popleft()
+        stale = [
+            fid
+            for fid, e in list(docs_state.items())
+            if isinstance(e, dict)
+            and e.get("batch_id") == batch_id
+            and e.get("status") == "batch-submitted"
+            and _batch_is_expired_by_age(e.get("submitted_at"))
+        ]
+        if stale:
+            for file_id in stale:
+                _requeue(file_id, reason="expired (past the 29-day results window)", permanent=False)
+            continue
+        ended = _poll_batch_until_ended(client, batch_id, poll_s=poll_s, deadline=deadline)
+        if ended is None:
+            report.interrupted = True
+            report.interrupted_reason = "timeout"
+            break
+        _collect_batch(batch_id)
+        if pending_retries:
+            if _deadline_expired(deadline):
+                report.interrupted = True
+                report.interrupted_reason = "timeout"
+                # The failures that never got their retry are counted as
+                # dropped now — their INITIAL reply already shipped what
+                # passed the gate, and no more budget remains this pass to
+                # ship a follow-up batch for the rest.
+                for work, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                    _accept(work, kept_nodes, kept_edges, len(failures), False, 0, parse_errors)
+                pending_retries.clear()
+                break
+            retry_works = [w for w, *_ in pending_retries]
+            messages_by_file = {
+                w.file_id: _retry_message(w.user_message, failures) for w, _, _, failures, _ in pending_retries
+            }
+            retry_batch_id = _submit_batch(
+                client,
+                model=resolved_model,
+                system_prompt=system_prompt,
+                works=retry_works,
+                messages_by_file=messages_by_file,
+                max_output_tokens=max_output_tokens,
+            )
+            submitted_at = _now_iso()
+            for w, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                docs_state[w.file_id] = {
+                    "status": "batch-submitted",
+                    "batch_id": retry_batch_id,
+                    "custom_id": w.file_id,
+                    "submitted_at": submitted_at,
+                    "phase": "retry",
+                    "kept_nodes": kept_nodes,
+                    "kept_edges": kept_edges,
+                    "failed_count": len(failures),
+                    "parse_errors": parse_errors,
+                }
+            save_state(connection_id, state)
+            docs_planned += len(pending_retries)
+            logger.info(
+                "facts extraction: connection %s — batch %s submitted (retry, %d document(s))",
+                connection_id,
+                retry_batch_id,
+                len(pending_retries),
+            )
+            pending_retries.clear()
+            queue.append(retry_batch_id)
+
+    _flush()
+
+    usage["documents"] = report.docs_extracted
+    # Concurrency governs request FAN-OUT, which the batch transport has no
+    # use for (the Batches API itself parallelizes) — left honestly absent
+    # rather than reporting a number that governed nothing.
+    usage["concurrency"] = None
+    usage["concurrency_source"] = "not_applicable"
+    rendered = report.render(
+        model=model,
+        prompt_origin=prompt_origin,
+        ontology=_ontology_report(ontology_models),
+        usage=usage,
+        batch_usage=batch_usage,
+    )
+    logger.info(
+        "facts extraction (batch transport): connection %s — %d extracted (%d via batch, %d via sync retry), "
+        "%d failed, %d quotes dropped, %d claims written",
+        connection_id,
+        rendered["docs_extracted"],
+        rendered["docs_via_batch"],
+        rendered["docs_via_sync"],
         rendered["facts_failed"],
         rendered["facts_quotes_dropped"],
         rendered["claims_written"],
