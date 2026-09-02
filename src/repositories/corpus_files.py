@@ -110,13 +110,83 @@ class CorpusFilesRepository:
             return None
         return self._decode_row(dict(zip(self._COLS, row)))
 
-    def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
-        """All files for a given corpus, ordered by created_at."""
-        rows = self.conn.execute(
-            f"SELECT {self._SELECT} FROM corpus_files WHERE corpus_id = ? ORDER BY created_at",
-            [corpus_id],
-        ).fetchall()
+    # ``order`` is mapped through this literal dict — never interpolated as a
+    # raw caller string — so an unrecognised value simply falls back to
+    # "oldest" instead of raising or reaching SQL as text. Every fragment ends
+    # in ``, id ASC``: files uploaded in one batch share a ``created_at``, and
+    # without that tie-break a page 2 lookup can repeat or skip rows.
+    _ORDER_SQL = {
+        "oldest": "created_at ASC, id ASC",
+        "newest": "created_at DESC, id ASC",
+        "name": "LOWER(filename) ASC, id ASC",
+        "size": "size_bytes DESC NULLS LAST, id ASC",
+    }
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE metacharacters so untrusted search text matches
+        literally (see ``users.py::get_by_email_prefix`` for the same idiom)."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _filter_clause(self, corpus_id: str, q: Optional[str], status: Optional[str]) -> tuple[str, List[Any]]:
+        """Shared WHERE-clause builder for ``list_for_corpus``/``count_for_corpus``.
+
+        Blank (``None``/empty/whitespace-only) ``q``/``status`` means "no
+        filter" — never "match nothing".
+        """
+        where = ["corpus_id = ?"]
+        params: List[Any] = [corpus_id]
+        q_norm = q.strip() if q else ""
+        if q_norm:
+            pattern = f"%{self._escape_like(q_norm)}%"
+            where.append("(LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\')")
+            params.extend([pattern, pattern])
+        status_norm = status.strip() if status else ""
+        if status_norm:
+            where.append("processing_status = ?")
+            params.append(status_norm)
+        return " AND ".join(where), params
+
+    def list_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+        order: str = "oldest",
+    ) -> List[Dict[str, Any]]:
+        """Files for a given corpus, paginated/filtered/ordered.
+
+        Backwards compatible: a bare ``list_for_corpus(corpus_id)`` call
+        keeps returning every row ordered by ``created_at`` ascending, as it
+        always has — 14 existing callers depend on this.
+        """
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        order_sql = self._ORDER_SQL.get(order, self._ORDER_SQL["oldest"])
+        sql = f"SELECT {self._SELECT} FROM corpus_files WHERE {where_sql} ORDER BY {order_sql}"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        if offset:
+            sql += " OFFSET ?"
+            params.append(offset)
+        rows = self.conn.execute(sql, params).fetchall()
         return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
+
+    def count_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        """Row count for ``list_for_corpus`` under the same ``q``/``status``
+        filters (and nothing else — no limit/offset applies to a count)."""
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        row = self.conn.execute(f"SELECT COUNT(*) FROM corpus_files WHERE {where_sql}", params).fetchone()
+        return int(row[0]) if row else 0
 
     def count_by_storage_path(self, corpus_id: str, storage_path: str) -> int:
         """How many rows in this corpus reference ``storage_path``.
