@@ -572,24 +572,68 @@ def test_an_edited_prompt_forces_a_re_extraction(pg_env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_a_spreadsheet_is_never_sent_to_the_model(pg_env):
+def test_a_spreadsheet_is_extracted_like_any_other_document(pg_env):
+    """No tabular skip: a spreadsheet's markdown-table conversion goes
+    through the exact same walk, model call and verbatim gate as prose —
+    its cells and rows can state facts, so it must reach the model."""
     _seed_collection()
     _seed_connection()
     _seed_ontology()
     _seed_document(
         file_id="cf_1",
         doc_id="doc1",
-        text="| a | b |\n| 1 | 2 |",
+        text="| Department | Budget |\n| Marketing | 45000 |",
+        filename="numbers.md",
+        path="Finance/numbers.xlsx",
+    )
+    node = {
+        "id": "engagement:marketing-budget",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "Marketing | 45000"}],
+    }
+
+    extractor = StubExtractor([_stream(node)])
+    report = _run(extractor)
+
+    assert report["docs_skipped_tabular"] == 0
+    assert report["docs_extracted"] == 1
+    assert extractor.seen != [], "a spreadsheet's markdown table must reach the model"
+
+
+def test_a_stale_skipped_tabular_state_entry_is_re_planned(pg_env):
+    """A per-document state entry written by an older Agnes version (before
+    the tabular skip was removed) must not be trusted as "done" — the next
+    pass re-extracts it exactly like a document that was never processed."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(
+        file_id="cf_1",
+        doc_id="doc1",
+        text="| Department | Budget |\n| Marketing | 45000 |",
         filename="numbers.md",
         path="Finance/numbers.xlsx",
     )
 
-    extractor = StubExtractor([_stream()])
+    from connectors.sharepoint.facts_extraction import save_state
+
+    save_state(
+        CONNECTION_ID,
+        {"version": 1, "docs": {"cf_1": {"status": "skipped-tabular", "at": "2026-01-01T00:00:00+00:00"}}},
+    )
+
+    node = {
+        "id": "engagement:marketing-budget",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "Marketing | 45000"}],
+    }
+    extractor = StubExtractor([_stream(node)])
     report = _run(extractor)
 
-    assert report["docs_skipped_tabular"] == 1
-    assert report["docs_extracted"] == 0
-    assert extractor.seen == []
+    assert report["docs_extracted"] == 1
+    assert extractor.seen != [], "a stale skipped-tabular entry must not block re-extraction"
 
 
 def test_a_not_yet_indexed_document_is_left_for_the_next_pass(pg_env):

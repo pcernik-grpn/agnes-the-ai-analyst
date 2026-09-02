@@ -2701,11 +2701,8 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
 
     The returned ``path``'s leaf segment keeps the SOURCE file's extension
     (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
-    mirroring the exact relationship the un-anonymized values already have
-    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
-    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
-    converted markdown's own name). Only the identity-bearing STEM changes,
-    never the suffix a downstream reader keys extension logic on.
+    mirroring the exact relationship the un-anonymized values already have.
+    Only the identity-bearing STEM changes, never the suffix.
 
     Routing decisions (which collection, which exclusion rule) are made
     EARLIER in the pipeline against the RAW path — those decisions come from
@@ -2755,11 +2752,8 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
 
     The returned ``path``'s leaf segment keeps the SOURCE file's extension
     (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
-    mirroring the exact relationship the un-anonymized values already have
-    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
-    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
-    converted markdown's own name). Only the identity-bearing STEM changes,
-    never the suffix a downstream reader keys extension logic on.
+    mirroring the exact relationship the un-anonymized values already have.
+    Only the identity-bearing STEM changes, never the suffix.
 
     Routing decisions (which collection, which exclusion rule) are made
     EARLIER in the pipeline against the RAW path — those decisions come from
