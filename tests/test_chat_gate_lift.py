@@ -419,6 +419,75 @@ def test_cmd_agnes_owned_elsewhere_forwards_without_local_attach(monkeypatch):
     assert ephemerals and ephemerals[0][0] == "https://hooks.slack/r1", "response_url must get the standard ack"
 
 
+def _cmd_agnes_with_refusing_send(monkeypatch, *, owner: str, reason: str) -> list[tuple[str, str]]:
+    """Dispatch `/agnes hi` against a manager whose ``send_user_message`` refuses
+    with ``RuntimeError(reason)`` — the shape ``enforce_sender_limits`` raises —
+    and return the ephemerals posted to the response_url."""
+    import app.auth.access as _access
+    import services.slack_bot.commands as cmds
+    import services.slack_bot.events as ev
+
+    monkeypatch.setattr(_access, "can_access", lambda *a, **k: True)
+    monkeypatch.setattr(ev.routing, "this_gateway_id", lambda: "gw-A")
+    monkeypatch.setattr(ev.routing, "owner_of", lambda chat_id: owner)
+
+    app, _repo, mgr, conn = _build_isolated_dm_app_state(monkeypatch)
+    from services.slack_bot.binding import _ensure_table
+
+    _ensure_table(conn)
+    conn.execute("UPDATE users SET slack_user_id = 'U123' WHERE email = 'bob@example.com'")
+
+    async def refusing_send(chat_id, text, **kw):
+        raise RuntimeError(reason)
+
+    mgr.send_user_message = refusing_send
+
+    async def fake_open_im(uid):
+        return "D1"
+
+    ephemerals: list[tuple[str, str]] = []
+
+    async def fake_ephemeral(url, text):
+        ephemerals.append((url, text))
+
+    monkeypatch.setattr(cmds, "open_im", fake_open_im)
+    monkeypatch.setattr(cmds, "send_ephemeral", fake_ephemeral)
+    cmd = {"command": "/agnes", "user_id": "U123", "text": "hi agnes", "response_url": "https://hooks.slack/r1"}
+    asyncio.run(cmds.dispatch_command(app, cmd))
+    return ephemerals
+
+
+@pytest.mark.parametrize("owner", ["gw-B", "gw-A"])
+def test_cmd_agnes_explains_a_sender_limit_refusal_instead_of_a_generic_apology(monkeypatch, owner):
+    """A sender-limit refusal (here the conversation token budget) raised out
+    of ``send_user_message`` used to escape ``_cmd_agnes`` into ``_run_logged``'s
+    catch-all, so the slash-command user read "Something went wrong handling
+    that command" while a mention or DM of the same session got the tailored
+    ``_SENDER_LIMIT_MESSAGES`` copy. Both the cross-gateway forward (owner
+    ``gw-B``) and the local send (owner ``gw-A``) now post that copy to the
+    response_url — and never the "On it" ack, which would promise a reply
+    that is not coming."""
+    from services.slack_bot.events import _SENDER_LIMIT_MESSAGES
+
+    ephemerals = _cmd_agnes_with_refusing_send(monkeypatch, owner=owner, reason="max_session_tokens_exhausted")
+    texts = [t for _url, t in ephemerals]
+    assert _SENDER_LIMIT_MESSAGES["max_session_tokens_exhausted"] in texts
+    assert not any(t.startswith("On it") for t in texts), texts
+    assert all(url == "https://hooks.slack/r1" for url, _t in ephemerals)
+
+
+def test_slash_limit_helper_reraises_unknown_runtime_errors():
+    """Non-vacuity: only the three sender-limit reasons are explained; any other
+    RuntimeError keeps propagating to ``_run_logged`` exactly as before."""
+    import services.slack_bot.commands as cmds
+
+    async def boom():
+        raise RuntimeError("sandbox exploded")
+
+    with pytest.raises(RuntimeError, match="sandbox exploded"):
+        asyncio.run(cmds._send_or_explain_limit_ephemeral(boom(), "https://hooks.slack/r1"))
+
+
 def test_slack_dm_live_without_sink_reestablishes_slack_sink(monkeypatch):
     """FINDING 6 (owner side): after a cross-gateway takeover the owner's
     LiveSession exists with sinks=[] — the DM handler used to skip sink

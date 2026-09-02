@@ -142,7 +142,8 @@ Worth knowing before you trust a local result:
   `/api/kai/tickets` or `GET /api/kai/workspace`, so the broker scope split and
   the workspace tarball path are not exercised — `tests/test_kai_host.py`
   covers those from the host side.
-- **Auto-title still needs a real key.** `chat_sessions.title` stays `NULL`
-  locally because auto-title asks Haiku directly and skips silently (at debug
-  level) when neither `ANTHROPIC_API_KEY` nor a WIF configuration is present.
-  A null title in local dev is expected, not a bug.
+- **A model-written title still needs a real key.** Auto-title asks Haiku
+  directly, and without `ANTHROPIC_API_KEY` or a WIF configuration that call is
+  skipped. The session is titled all the same — with a cut of your own first
+  sentence (the deterministic fallback, TCRD-290) — so a sidebar title that
+  merely echoes your message in local dev is expected, not a bug.
