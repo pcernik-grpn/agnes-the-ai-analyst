@@ -1440,9 +1440,14 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     # §15.1 — an empty (or never-synced) policy_mapping dependency only
     # matters for a persona actually reading THROUGH the policy; the admin
     # bypass (§12) reads unfiltered, so it is irrelevant to what they see.
+    # The protected table is named to the shared helper so its policy's own
+    # mandatory ``FROM <itself>`` is not read as an empty mapping dependency
+    # when this table is ALSO marked ``policy_mapping=True`` and merely has
+    # no rows yet -- that is an ``empty_slice``, not a broken mapping
+    # (#1979, review follow-up).
     if relation.policied:
         try:
-            raise_if_policy_mapping_empty(policy_sql)
+            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=row.get("name"))
         except PolicyMappingEmpty as exc:
             return {"applies": True, "rows_visible": None, "reason": "mapping_empty", "note": str(exc)}
 

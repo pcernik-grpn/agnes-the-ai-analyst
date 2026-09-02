@@ -1056,11 +1056,76 @@ def row_scope_payload(policied_table_ids: list[str] | tuple[str, ...] | None) ->
 # ---------------------------------------------------------------------------
 
 
-def raise_if_policy_mapping_empty(policy_sql: str) -> None:
+def _protected_table_self_names(*, table_name: str | None, table_id: str | None) -> set[str]:
+    """Lower-cased names by which a policy body may refer to its OWN
+    protected table -- the set ``raise_if_policy_mapping_empty`` subtracts
+    from the tables a body references before asking "is this mapping
+    dependency empty".
+
+    Best-effort by design: an unknown/unregistered identifier contributes
+    only itself, and a registry lookup failure degrades to the same. Getting
+    this set too SMALL only restores the old (over-strict) behavior for that
+    call; it can never widen what a caller sees.
+    """
+    names: set[str] = set()
+    if table_name:
+        names.add(table_name.lower())
+    if table_id:
+        names.add(table_id.lower())
+    if not names:
+        return names
+
+    from src.repositories import table_registry_repo
+
+    repo = table_registry_repo()
+    for key in (table_id, table_name):
+        if not key:
+            continue
+        try:
+            row = repo.get(key) or repo.get_by_name(key)
+        except Exception:
+            row = None
+        if not row:
+            continue
+        for field in ("name", "source_table"):
+            value = row.get(field)
+            if value:
+                # A `bucket.source_table` reference parses with the bucket as
+                # the schema and only the final identifier as `Table.name`,
+                # which is what `referenced_names` above collects -- so the
+                # bare `source_table` is the form that has to be excluded.
+                names.add(str(value).lower())
+    return names
+
+
+def raise_if_policy_mapping_empty(
+    policy_sql: str,
+    *,
+    table_name: str | None = None,
+    table_id: str | None = None,
+) -> None:
     """Fail closed with a NAMED reason (`PolicyMappingEmpty`) when a
     ``policy_mapping`` table ``policy_sql`` references currently has zero
     (or never-synced) rows, rather than let a broken upstream sync read as
     "you legitimately have no data" via a bare zero count/row-set.
+
+    ``table_name`` / ``table_id`` name the PROTECTED table -- the one this
+    policy body belongs to -- and exclude it from the check. Every caller
+    should pass one: a policy body ALWAYS references its own table
+    (``SELECT ... FROM <table> WHERE ...``), so a table that is both
+    policied and itself marked ``policy_mapping=True`` (referenceable from
+    OTHER policies) turned its own mandatory ``FROM`` into an "empty mapping
+    dependency" the moment it held zero rows -- and every read of a
+    brand-new or genuinely empty table failed instead of returning an empty
+    result (#1979, review follow-up). An empty protected table is a
+    legitimate answer; an empty table some OTHER policy joins against is
+    still the trap this check exists for, and still raises.
+
+    Either identifier resolves to the same exclusion set: the registry
+    row's ``name`` plus its ``source_table`` (a body may name the physical
+    ``bucket.source_table`` form, of which sqlglot reports only the final
+    identifier). Matching is case-insensitive on both sides, like the
+    mapping-table match itself.
 
     Cheap by design: reads ``sync_state`` -- the row count already recorded
     by the last successful sync -- rather than a live ``COUNT(*)`` against
@@ -1088,6 +1153,7 @@ def raise_if_policy_mapping_empty(policy_sql: str) -> None:
     # versa) silently misses the mapping row, and this whole check no-ops
     # (PR #2023 review, finding 1).
     referenced_names = {t.name.lower() for t in statement.find_all(exp.Table) if t.name}
+    referenced_names -= _protected_table_self_names(table_name=table_name, table_id=table_id)
     if not referenced_names:
         return
 

@@ -1681,7 +1681,11 @@ def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
     function ``GET /api/me/effective-access``
     (`app/api/access.py::_table_policy_diagnosis`) calls for its
     ``reason: mapping_empty`` diagnosis, so the two surfaces can never
-    disagree about which tables trip this check.
+    disagree about which tables trip this check. The protected table is
+    named to that helper (``table_id=``) so its policy's own mandatory
+    ``FROM <itself>`` is not mistaken for an empty mapping dependency when
+    the table is ALSO marked ``policy_mapping=True`` and simply has no rows
+    yet (#1979, review follow-up).
     """
     if not policied_table_ids:
         return
@@ -1692,7 +1696,7 @@ def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
         if not policy_sql:
             continue
         try:
-            raise_if_policy_mapping_empty(policy_sql)
+            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=(row or {}).get("name"))
         except PolicyMappingEmpty as exc:
             raise HTTPException(
                 status_code=500,

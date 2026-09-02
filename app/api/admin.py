@@ -6246,6 +6246,22 @@ def _access_policy_write_lock(table_id: str):
         return contextlib.nullcontext()
 
 
+def _norm_policy_text(value: Optional[str]) -> Optional[str]:
+    """Fold the two ways "no value" arrives for an access-policy text field
+    into one, so a comparison against the stored row does not read a
+    round-tripped empty string as an edit.
+
+    The Edit modal serializes an untouched empty textarea as ``""`` while
+    the registry stores ``NULL``; whitespace-only is the same nothing. A
+    genuine clear (a real body -> ``None``/``""``) still compares as a
+    change, because the OTHER side is a real body.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _record_access_policy_revision(
     table_id: str,
     *,
@@ -6373,6 +6389,14 @@ async def update_table(
     # old "null = no-op" semantics for some field, it should omit the field
     # from the body instead of sending null — that's the canonical PUT shape.
     updates = request.model_dump(exclude_unset=True)
+    # Whether this PUT actually CHANGED the stored access policy, and the
+    # values it left behind. Computed inside the `if updates:` block below;
+    # pre-seeded here because the dedicated `access_policy.set`/`.clear`
+    # audit row keys off them AFTER that block, and an empty PUT body never
+    # reaches it.
+    _policy_body_written = False
+    _final_access_policy_sql = existing.get("access_policy_sql")
+    _final_access_policy_note = existing.get("access_policy_note")
     # View-name / id collision guard, mirrored from register_table's
     # `existing_by_name` check. `table_registry.name` has no DB-level
     # uniqueness constraint and register_table only pre-checks it against
@@ -6799,7 +6823,22 @@ async def update_table(
 
         repo.register(id=table_id, **merged)
 
-        _policy_body_written = "access_policy_sql" in updates or "access_policy_note" in updates
+        # finding 1 (second follow-up review of PR #2023) -- keyed on an
+        # ACTUAL change, not on the mere presence of the keys. The Edit modal
+        # round-trips every field, so a save that touched something else
+        # entirely re-sends the identical policy body + note; treating that as
+        # a write re-stamped ``access_policy_updated_at``/``_updated_by``,
+        # emitted a dedicated ``access_policy.set`` audit row, and appended a
+        # history revision that changed nothing -- three lies about a policy
+        # nobody edited. Compares the FINAL merged value against the stored
+        # one, exactly like the ``policy_mapping`` sibling just below.
+        # ``_norm_policy_text`` folds ``None`` and ``""`` together so a
+        # cleared note reads as cleared on both sides, while a genuine clear
+        # (a real body -> ``None``) still counts as a change.
+        _policy_body_written = ("access_policy_sql" in updates or "access_policy_note" in updates) and (
+            _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(existing.get("access_policy_sql"))
+            or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(existing.get("access_policy_note"))
+        )
         _final_policy_mapping = bool(
             updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
         )
@@ -6827,7 +6866,7 @@ async def update_table(
         # unrelated edit neither waits on nor blocks a policy save.
         _policy_lock = (
             _access_policy_write_lock(table_id)
-            if (_policy_body_written or "policy_mapping" in updates)
+            if (_policy_body_written or _policy_mapping_flipped)
             else contextlib.nullcontext()
         )
         with _policy_lock:
@@ -6842,8 +6881,8 @@ async def update_table(
                     note=_final_access_policy_note,
                     updated_by=user.get("email"),
                 )
-            if "policy_mapping" in updates:
-                repo.set_policy_mapping(table_id, bool(updates["policy_mapping"]))
+            if _policy_mapping_flipped:
+                repo.set_policy_mapping(table_id, _final_policy_mapping)
 
             # #1979 — record the state the policy was just saved in, so the
             # editor's history panel can offer "restore this version". Keyed on
@@ -6882,7 +6921,7 @@ async def update_table(
     # action: this feature's own docs call "who looked at whose data, when"
     # the first question after an incident, and that applies just as much to
     # who CHANGED a policy as to who previewed one.
-    if "access_policy_sql" in updates:
+    if _policy_body_written:
         # `log_safe`, not a bare `audit_repo().log`: this is a SECOND write
         # for one event, so a failure here must not fail a policy save that
         # already landed (and is already recorded by the `update_table` row
@@ -7183,7 +7222,12 @@ def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
     )
 
 
-def _policy_preview_mapping_warning(policy_sql: str) -> Optional[str]:
+def _policy_preview_mapping_warning(
+    policy_sql: str,
+    *,
+    table_id: Optional[str] = None,
+    table_name: Optional[str] = None,
+) -> Optional[str]:
     """review plan P2.6 -- an empty/never-synced ``policy_mapping`` table
     behind a ``JOIN`` reads, from a live query, as an ordinary empty
     result: indistinguishable from "you legitimately have no data"
@@ -7199,11 +7243,18 @@ def _policy_preview_mapping_warning(policy_sql: str) -> Optional[str]:
     admin to check effective-access by hand. Best-effort: any failure other
     than the named condition is swallowed -- this is a hint, not a new
     failure mode for the preview itself.
+
+    ``table_id``/``table_name`` name the PROTECTED table and are passed
+    straight through, so the policy's own mandatory ``FROM <itself>`` is
+    never warned about when that table is also marked
+    ``policy_mapping=True`` and simply has no rows yet -- the same
+    exclusion the live-query and effective-access surfaces apply, because
+    all three call this one helper (#1979, review follow-up).
     """
     from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
 
     try:
-        raise_if_policy_mapping_empty(policy_sql)
+        raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=table_name)
     except PolicyMappingEmpty as exc:
         return str(exc)
     except Exception:
@@ -7351,7 +7402,7 @@ async def preview_table_policy(
     # mapping_empty short-circuit (§15.1) for the same condition. Persona
     # resolution above already ran, so this is only reached for a persona
     # that resolves cleanly (an existing `as_user`, or any `as_groups`).
-    mapping_warning = _policy_preview_mapping_warning(policy_sql)
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
     if mapping_warning:
         # Finding B (follow-up review of PR #2023) -- this early return skips
         # every live query below, but it is still a preview that shows one
@@ -7587,7 +7638,7 @@ async def preview_table_policy_all_groups(
     # that never synced at all has no view to query, so every group would
     # otherwise report the same "table does not exist" error individually
     # instead of one explanation up front.
-    mapping_warning = _policy_preview_mapping_warning(policy_sql)
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
     if mapping_warning:
         # Finding B (follow-up review of PR #2023) -- same reasoning as the
         # single-persona preview's early return above: still audited, just

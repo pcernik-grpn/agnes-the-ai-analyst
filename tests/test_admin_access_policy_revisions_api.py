@@ -389,3 +389,142 @@ class TestPolicyWriteLock:
         from src.repositories import table_registry_repo
 
         assert table_registry_repo().get(table_id)["access_policy_sql"] is not None
+
+
+class TestNoOpResendsRecordNothing:
+    """finding 1 (second follow-up review of PR #2023): the Edit modal
+    round-trips EVERY field, so a save that changed something unrelated
+    (or nothing at all) re-sends the identical ``access_policy_sql`` +
+    ``access_policy_note``. Keying the policy write on the mere PRESENCE of
+    those keys turned each such resend into a `set_access_policy` call (a
+    fresh ``access_policy_updated_at``/``_updated_by`` stamp), a dedicated
+    ``access_policy.set`` audit row, and a history revision that changed
+    nothing -- three lies about a policy nobody touched. The condition now
+    compares the FINAL value against the stored one, exactly like its
+    ``policy_mapping`` sibling already did.
+    """
+
+    def _policied_table(self, c, token, store, name):
+        table_id = _register(c, token, name=name, server_only=True)
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "why"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(store.records) == 1
+        return table_id
+
+    def _audit_rows(self, **filters):
+        from src.repositories import audit_repo
+
+        result = audit_repo().query(**filters)
+        return list(result[0] if isinstance(result, tuple) else result)
+
+    def test_resending_the_identical_policy_records_nothing(self, seeded_app, fake_store):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(c, token, fake_store, "rev_body_noop")
+
+        from src.repositories import table_registry_repo
+
+        stamped_at = table_registry_repo().get(table_id)["access_policy_updated_at"]
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": f"SELECT * FROM {table_id}",
+                "access_policy_note": "why",
+                "description": "an unrelated edit that round-trips the policy fields",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        assert len(fake_store.records) == 1, fake_store.records
+        row = table_registry_repo().get(table_id)
+        assert row["access_policy_updated_at"] == stamped_at, "a no-op resend re-stamped the policy metadata"
+        assert row["description"] == "an unrelated edit that round-trips the policy fields"
+
+        # Exactly one dedicated `access_policy.set` row -- the real attach.
+        rows = self._audit_rows(action="access_policy.set", resource=table_id)
+        assert len(rows) == 1, rows
+
+    def test_resending_the_identical_policy_calls_no_setter(self, seeded_app, fake_store, monkeypatch):
+        """The metadata assertion above proves the observable effect; this
+        proves the mechanism -- ``set_access_policy`` is never reached, so
+        the write lock and the revision append have nothing to order."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(c, token, fake_store, "rev_body_noop_setter")
+
+        from src.repositories import table_registry_repo
+
+        repo_cls = type(table_registry_repo())
+        calls: list[str] = []
+        original = repo_cls.set_access_policy
+
+        def _spy(self, *args, **kwargs):
+            calls.append("set_access_policy")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(repo_cls, "set_access_policy", _spy)
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "why"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert calls == [], calls
+
+    def test_changing_only_the_note_still_records(self, seeded_app, fake_store):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(c, token, fake_store, "rev_note_only")
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "a better reason"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        assert len(fake_store.records) == 2, fake_store.records
+        assert fake_store.records[-1]["policy_note"] == "a better reason"
+        assert fake_store.records[-1]["policy_sql"] == f"SELECT * FROM {table_id}"
+
+    def test_clearing_the_policy_still_records(self, seeded_app, fake_store):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = self._policied_table(c, token, fake_store, "rev_clear_still_records")
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": None},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        assert len(fake_store.records) == 2, fake_store.records
+        assert fake_store.records[-1]["policy_sql"] is None
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get(table_id)["access_policy_sql"] is None
+
+        rows = self._audit_rows(action="access_policy.clear", resource=table_id)
+        assert len(rows) == 1, rows
+
+    def test_clearing_an_already_clear_policy_records_nothing(self, seeded_app, fake_store):
+        """A table that never had a policy, PUT with an explicit
+        ``access_policy_sql: null`` (what the modal sends for an empty
+        editor), must not manufacture a "cleared" revision -- nothing was
+        cleared."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = _register(c, token, name="rev_clear_noop", server_only=True)
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": None, "access_policy_note": None},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert fake_store.records == [], fake_store.records
+        assert self._audit_rows(action="access_policy.clear", resource=table_id) == []

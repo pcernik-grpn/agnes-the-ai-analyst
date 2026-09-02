@@ -46,6 +46,12 @@ RETURNS_POLICY_SQL = "SELECT * FROM returns WHERE unit IN (SELECT unit FROM user
 # Deliberately mixed-case reference to the SAME synced-but-empty
 # `user_access3` mapping table `tbl_returns` uses above.
 SHIPMENTS_POLICY_SQL = "SELECT * FROM shipments WHERE unit IN (SELECT unit FROM User_Access3 WHERE email = $user_email)"
+# `ledger` is BOTH policied and itself referenceable from other policies
+# (`policy_mapping=True`), and it is genuinely empty. Its policy body -- like
+# every policy body -- references its OWN table, which pre-fix made that
+# mandatory self-reference look like an empty mapping dependency and failed
+# every read of the table (finding 2, second follow-up review of PR #2023).
+LEDGER_POLICY_SQL = "SELECT * FROM ledger WHERE owner_email = $user_email"
 
 
 @pytest.fixture
@@ -108,6 +114,10 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
             # the mapping table's view genuinely resolves (case-insensitively
             # too) with zero rows, rather than erroring on a missing column.
             {"name": "user_access3", "data": []},
+            # `ledger` synced fine -- it is simply an empty table (brand new,
+            # or genuinely without rows yet). Columns rewritten below for the
+            # same reason as `user_access3`.
+            {"name": "ledger", "data": []},
             # user_access is registered as policy_mapping below but is
             # deliberately absent from this extract batch -- never synced,
             # no sync_state row at all.
@@ -115,6 +125,7 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
     )
     _conn = duckdb.connect(str(db_path))
     _conn.execute('CREATE OR REPLACE TABLE "user_access3" (email VARCHAR, unit VARCHAR)')
+    _conn.execute('CREATE OR REPLACE TABLE "ledger" (id VARCHAR, owner_email VARCHAR)')
     _conn.close()
 
     SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
@@ -141,6 +152,12 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
         registry.register(id="tbl_returns", name="returns", source_type="keboola", query_mode="local", server_only=True)
         registry.set_access_policy("tbl_returns", sql=RETURNS_POLICY_SQL, note="mapping filter", updated_by="admin")
 
+        # Policied AND referenceable from other policies AND empty -- the
+        # exact three-way overlap finding 2 is about.
+        registry.register(id="ledger", name="ledger", source_type="keboola", query_mode="local", server_only=True)
+        registry.set_access_policy("ledger", sql=LEDGER_POLICY_SQL, note="own rows only", updated_by="admin")
+        registry.set_policy_mapping("ledger", True)
+
         # Registered as a mapping table, but never extracted/synced.
         registry.register(id="user_access", name="user_access", source_type="keboola", query_mode="local")
         registry.set_policy_mapping("user_access", True)
@@ -161,6 +178,7 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
         grant_table_via_package(conn, "tbl_products", "u_team_a", group_name="TeamA")
         grant_table_via_package(conn, "tbl_shipments", "u_team_a", group_name="TeamA")
         grant_table_via_package(conn, "tbl_returns", "u_team_a", group_name="TeamA")
+        grant_table_via_package(conn, "ledger", "u_team_a", group_name="TeamA")
     finally:
         conn.close()
 
@@ -298,3 +316,141 @@ def test_helper_matches_mapping_table_name_case_insensitively(e2e_env):
     with pytest.raises(PolicyMappingEmpty) as exc_info:
         raise_if_policy_mapping_empty(policy_sql)
     assert exc_info.value.mapping_table == "cost_centres"
+
+
+def _find_table_entry(payload: dict, table_id: str):
+    return next((t for t in payload.get("tables") or [] if t["table_id"] == table_id), None)
+
+
+class TestPoliciedTableIsNotItsOwnEmptyMapping:
+    """finding 2 (second follow-up review of PR #2023): a policy body ALWAYS
+    references its own table (``SELECT ... FROM <table> WHERE ...``). When
+    that table is also marked ``policy_mapping=True`` (referenceable from
+    OTHER policies) and currently has zero rows, the mandatory
+    self-reference read as an empty mapping dependency and every read of the
+    table failed with ``policy_mapping_empty`` -- an empty table is a
+    legitimate answer, not a broken upstream sync. The protected table
+    excludes ITSELF from the check; a reference to any OTHER empty
+    referenceable table still trips it, on all three surfaces.
+    """
+
+    def test_query_returns_an_empty_result_not_a_mapping_error(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM ledger"},
+            headers=_auth(mapping_workspace["team_a_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 0, body
+        # Still disclosed as filtered -- an empty slice is a slice.
+        assert body["row_scope"] is not None
+        assert "ledger" in body["row_scope"]["policied_tables"]
+
+    def test_effective_access_reports_empty_slice_not_mapping_empty(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/me/effective-access", headers=_auth(mapping_workspace["team_a_token"]))
+        assert r.status_code == 200, r.text
+        entry = _find_table_entry(r.json(), "ledger")
+        assert entry is not None, r.json()
+        assert entry["policy"]["applies"] is True
+        assert entry["policy"]["reason"] != "mapping_empty", entry
+        assert entry["policy"]["reason"] == "empty_slice", entry
+        assert entry["policy"]["rows_visible"] == 0
+
+    def test_admin_preview_shows_no_mapping_warning(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/admin/registry/ledger/policy/preview",
+            json={"as_user": "team-a@example.com"},
+            headers=_auth(mapping_workspace["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["mapping_warning"] is None, r.text
+
+    def test_admin_preview_groups_shows_no_mapping_warning(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/admin/registry/ledger/policy/preview-groups",
+            json={},
+            headers=_auth(mapping_workspace["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["mapping_warning"] is None, r.text
+
+    def test_another_empty_mapping_table_still_trips_effective_access(self, mapping_workspace):
+        """The control: ``tbl_orders`` joins ``user_access`` -- a DIFFERENT
+        referenceable table that never synced -- and must still be reported
+        as ``mapping_empty``."""
+        c = mapping_workspace["client"]
+        r = c.get("/api/me/effective-access", headers=_auth(mapping_workspace["team_a_token"]))
+        assert r.status_code == 200, r.text
+        entry = _find_table_entry(r.json(), "tbl_orders")
+        assert entry is not None, r.json()
+        assert entry["policy"]["reason"] == "mapping_empty", entry
+
+    def test_another_empty_mapping_table_still_warns_in_the_admin_preview(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/admin/registry/tbl_orders/policy/preview",
+            json={"as_user": "team-a@example.com"},
+            headers=_auth(mapping_workspace["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["mapping_warning"], r.text
+        assert "user_access" in r.json()["mapping_warning"]
+
+
+class TestHelperSelfReferenceExclusion:
+    """Unit tests on ``raise_if_policy_mapping_empty`` itself -- the ONE
+    implementation all three surfaces call, so the exclusion contract is
+    pinned here rather than only through the routes."""
+
+    @pytest.fixture
+    def two_empty_mapping_tables(self, e2e_env):
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            for tid in ("ledger", "cost_centres"):
+                registry.register(id=tid, name=tid, source_type="keboola", query_mode="local")
+                registry.set_policy_mapping(tid, True)
+                # Deliberately no sync_state row -- never synced.
+        finally:
+            conn.close()
+
+    def test_self_reference_is_excluded(self, two_empty_mapping_tables):
+        from src.access_policy import raise_if_policy_mapping_empty
+
+        raise_if_policy_mapping_empty("SELECT * FROM ledger WHERE owner = $user_email", table_name="ledger")
+
+    def test_self_reference_exclusion_is_case_insensitive(self, two_empty_mapping_tables):
+        from src.access_policy import raise_if_policy_mapping_empty
+
+        raise_if_policy_mapping_empty("SELECT * FROM Ledger WHERE owner = $user_email", table_name="LEDGER")
+
+    def test_self_reference_can_be_named_by_table_id(self, two_empty_mapping_tables):
+        from src.access_policy import raise_if_policy_mapping_empty
+
+        raise_if_policy_mapping_empty("SELECT * FROM ledger WHERE owner = $user_email", table_id="ledger")
+
+    def test_another_empty_mapping_table_still_raises(self, two_empty_mapping_tables):
+        from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+
+        with pytest.raises(PolicyMappingEmpty) as exc_info:
+            raise_if_policy_mapping_empty(
+                "SELECT * FROM ledger WHERE unit IN (SELECT unit FROM cost_centres WHERE email = $user_email)",
+                table_name="ledger",
+            )
+        assert exc_info.value.mapping_table == "cost_centres"
+
+    def test_without_the_self_name_the_check_is_unchanged(self, two_empty_mapping_tables):
+        """No ``table_name``/``table_id`` given (the pre-existing signature)
+        keeps the old behavior -- every referenced mapping table counts."""
+        from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+
+        with pytest.raises(PolicyMappingEmpty):
+            raise_if_policy_mapping_empty("SELECT * FROM ledger WHERE owner = $user_email")
