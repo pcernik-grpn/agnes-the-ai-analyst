@@ -23,6 +23,35 @@ from services.slack_bot.binding import (
 from services.slack_bot.sender import open_im, send_ephemeral
 from services.slack_bot.sink import EphemeralCommandSink
 
+
+async def _send_or_explain_limit_ephemeral(send, response_url: str) -> bool:
+    """Run one send coroutine; answer a sender-limit refusal (daily spend,
+    conversation token budget, message rate) with the same ephemeral copy the
+    mention/DM handlers post, via the slash command's single-shot
+    ``response_url``. Returns ``True`` when the message was accepted, ``False``
+    when it was refused (and explained) — the caller must not ack a refused
+    send. The refusal is a bare ``RuntimeError`` whose message is the reason;
+    on the api-role producer and the cross-gateway forward there is no local
+    sink to carry the frame, so left uncaught it unwound into
+    ``_run_logged``'s generic "Something went wrong handling that command"
+    (TCRD-291 sibling of the mention path's ``_send_or_explain_limit``). On
+    the local path an ``EphemeralCommandSink`` shares this response_url; it
+    skips sender-limit ``error`` frames (``SENDER_LIMIT_FRAME_KINDS``) so the
+    refusal is posted exactly once, from here.
+    """
+    from services.slack_bot.events import _SENDER_LIMIT_MESSAGES
+
+    try:
+        await send
+    except RuntimeError as exc:
+        msg = _SENDER_LIMIT_MESSAGES.get(str(exc))
+        if msg is None:
+            raise
+        await send_ephemeral(response_url, msg)
+        return False
+    return True
+
+
 logger = logging.getLogger(__name__)
 
 _BG_TASKS: set[asyncio.Task] = set()
@@ -179,14 +208,18 @@ async def _cmd_agnes(app, cmd: dict) -> None:
                 f"You're at your session limit ({config.concurrency_per_user}); run `/agnes-new` to free one.",
             )
             return
-        await produce_inbound_user_message(
-            repo,
-            config,
-            session.id,
-            text,
-            slack_origin={"channel": im_channel, "thread_ts": ""},
+        accepted = await _send_or_explain_limit_ephemeral(
+            produce_inbound_user_message(
+                repo,
+                config,
+                session.id,
+                text,
+                slack_origin={"channel": im_channel, "thread_ts": ""},
+            ),
+            response_url,
         )
-        await send_ephemeral(response_url, "On it — Agnes will reply in your DM.")
+        if accepted:
+            await send_ephemeral(response_url, "On it — Agnes will reply in your DM.")
         return
 
     try:
@@ -216,12 +249,16 @@ async def _cmd_agnes(app, cmd: dict) -> None:
     from services.slack_bot.events import _owned_by_other_gateway
 
     if await _owned_by_other_gateway(session.id):
-        await mgr.send_user_message(
-            session.id,
-            text,
-            slack_origin={"channel": im_channel, "thread_ts": ""},
+        accepted = await _send_or_explain_limit_ephemeral(
+            mgr.send_user_message(
+                session.id,
+                text,
+                slack_origin={"channel": im_channel, "thread_ts": ""},
+            ),
+            response_url,
         )
-        await send_ephemeral(response_url, "On it — Agnes will reply in your DM.")
+        if accepted:
+            await send_ephemeral(response_url, "On it — Agnes will reply in your DM.")
         return
 
     # Attach a one-shot ephemeral sink only if no permanent sink (web/DM)
@@ -242,7 +279,7 @@ async def _cmd_agnes(app, cmd: dict) -> None:
                 "Agnes is still starting up — please rerun `/agnes` in a few seconds.",
             )
             return
-    await mgr.send_user_message(session.id, text)
+    await _send_or_explain_limit_ephemeral(mgr.send_user_message(session.id, text), response_url)
 
 
 async def _kill_locally_or_forward(app, chat_id: str, *, reason: str) -> None:

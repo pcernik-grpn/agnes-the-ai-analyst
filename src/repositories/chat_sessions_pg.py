@@ -191,6 +191,19 @@ class ChatSessionPgRepository:
                 {"title": title, "id": chat_id},
             )
 
+    def set_title_if_unset(self, chat_id: str, title: str) -> bool:
+        """Set ``title`` only while the session still has none; ``True`` if
+        this call wrote it. One conditional UPDATE, so a rename that landed
+        while the caller was busy (auto-title awaiting the model while the
+        user renamed the chat) is never overwritten. Mirrors
+        ``ChatRepository.set_title_if_unset``."""
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text("UPDATE chat_sessions SET title = :title WHERE id = :id AND (title IS NULL OR title = '')"),
+                {"title": title, "id": chat_id},
+            )
+            return (result.rowcount or 0) > 0
+
     def set_pinned(self, chat_id: str, pinned: bool) -> None:
         """Pin (``pinned_at = now``) or unpin (``pinned_at = NULL``) a session.
 

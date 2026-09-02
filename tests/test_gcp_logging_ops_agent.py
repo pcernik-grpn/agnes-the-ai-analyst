@@ -71,7 +71,21 @@ def test_the_agent_config_parses_the_json_and_lifts_the_severity():
     logging_cfg = cfg["logging"]
 
     receivers = logging_cfg["receivers"]
-    assert any(r.get("type") == "fluent_forward" for r in receivers.values()), receivers
+    forward = [r for r in receivers.values() if r.get("type") == "fluent_forward"]
+    assert forward, receivers
+    for r in forward:
+        # The agent refuses to start on an unknown field, and a refusal means
+        # nothing accepts the containers' logs at all. `port` was rejected on
+        # a live VM; these are the names it takes.
+        assert "listen_port" in r and "port" not in r, r
+
+    parsers = [p for p in logging_cfg["processors"].values() if p.get("type") == "parse_json"]
+    assert parsers, logging_cfg["processors"]
+    for parser in parsers:
+        # Docker's fluentd driver hands over a record whose fields are its
+        # own; the app's JSON is the string in `log`. Parsing the record
+        # instead of that field is a silent no-op.
+        assert parser.get("field") == "log", parser
 
     processors = logging_cfg["processors"]
     assert any(p.get("type") == "parse_json" for p in processors.values()), processors
@@ -99,3 +113,42 @@ def test_installing_the_agent_can_never_fail_the_boot():
     assert "|| true" in block or "|| echo" in block or "|| {" in block, (
         "the collector install is not failure-tolerant"
     )
+
+
+def test_the_probe_marker_records_which_overlay_it_verified():
+    """A probe verdict belongs to ONE pipeline, so the marker has to say
+    which — otherwise a caller cannot tell a current verdict from a stale one.
+
+    `agnes_gcp_logging_probe` therefore writes the overlay's own sha256 into
+    `.gcp-logging-ok` rather than touching it empty."""
+    src = (Path("scripts/ops") / "agnes-compose-file.sh").read_text(encoding="utf-8")
+    arm = src.split("agnes_gcp_logging_probe()", 1)[1].split("\n}", 1)[0]
+    assert "sha256sum" in arm and ".gcp-logging-ok" in arm, (
+        "the probe must stamp the marker with the overlay it verified, not touch it empty"
+    )
+
+
+def test_a_stale_verdict_is_detected_by_the_marker_stamp_not_by_a_tick_diff():
+    """The auto-upgrade script replaces ITSELF at the end of a tick.
+
+    So on the rollout that introduces this check, the PREVIOUS version of the
+    script refreshes `docker-compose.gcp-logging.yml` — keeping the marker,
+    because it has no clearing logic — and installs the new script. The new
+    script's first run, five minutes later, computes its before-hash from an
+    overlay that has ALREADY been refreshed: before == after, the branch never
+    fires, and the stale verdict survives exactly the upgrade it exists to
+    catch (Devin Review on #2057).
+
+    Comparing the marker's own stamp against the overlay on disk has no such
+    blind spot: it is a property of the two files, not of who refreshed them
+    or when. This pins that the comparison is the stamped form."""
+    src = (Path("scripts/ops") / "agnes-auto-upgrade.sh").read_text(encoding="utf-8")
+    block = src.split("docker-compose.gcp-logging.yml is placement-driven", 1)[1][:4000]
+    assert "GCP_OVERLAY_BEFORE" not in block, (
+        "a before/after comparison within one tick cannot fire on the rollout "
+        "that introduces it — the previous script does the refresh"
+    )
+    assert "cat /opt/agnes/.gcp-logging-ok" in block, (
+        "the stale check must read the marker's own stamp"
+    )
+    assert 'rm -f /opt/agnes/.gcp-logging-ok' in block

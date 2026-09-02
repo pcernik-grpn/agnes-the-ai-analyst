@@ -13,6 +13,9 @@
 {{ detail.styles() }}
 <link rel="stylesheet" href="{{ static_url('css/file_preview.css') }}">
 <script src="{{ static_url('js/file_preview.js') }}" defer></script>
+{# Band 2 of the Files search ("In the documents") — fired after paint, only
+   when the container it targets exists (i.e. only when `?q=` is set). #}
+<script src="{{ static_url('js/library_content_search.js') }}" defer></script>
 {# The sharing badge in the rail IS the sharing control, so the page ships the
    dialog behind it. Only for a caller who may re-share this collection —
    otherwise the badge stays a read-out and there is nothing to load. #}
@@ -54,6 +57,14 @@
   .file__name a { color: inherit; text-decoration: none; }
   .file__name a:hover { color: var(--kind); text-decoration: underline; }
   .file__meta { font-size: 0.76rem; color: var(--ds-text-muted); }
+  {# A crawled/source-managed file carries the folder it came from at the
+     source — thrown away until now, though it is often the one thing that
+     tells two same-named files apart. A second, quieter meta line, only
+     when the row actually has one. #}
+  .file__meta--path {
+    font-size: 0.72rem; color: var(--ds-text-muted); font-family: var(--ds-font-mono, inherit);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+  }
   .file__reason { font-size: 0.76rem; color: var(--ds-warn-ink); margin-top: 2px; }
   .status-pill { flex: none; font-size: 0.72rem; font-weight: var(--font-medium); padding: 2px 10px; border-radius: var(--radius-full); color: var(--ds-text-secondary); background: color-mix(in srgb, var(--ds-text-secondary) 10%, var(--ds-surface)); }
   .status-pill.ok { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); }
@@ -103,6 +114,41 @@
   .file__del svg { width: 15px; height: 15px; }
   .file__del[disabled] { opacity: .5; cursor: default; }
 
+  /* Files search + status filter — one form, GET, no JS required. */
+  .files-search { margin: 0 0 var(--space-3); }
+  .files-search__row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+  .files-search__row .search-input { flex: 1 1 220px; min-width: 160px; }
+  .files-search__row select.search-input { flex: 0 0 auto; min-width: 170px; }
+  .files-search__note { margin: var(--space-2) 0 0; font-size: 0.8rem; color: var(--ds-text-secondary); }
+  .files-search__note a { color: var(--kind); text-decoration: none; font-weight: var(--font-medium); }
+  .files-search__note a:hover { text-decoration: underline; }
+
+  /* "In the documents" — Band 2 of the Files search, filled in by
+     js/library_content_search.js after the page paints. */
+  .content-search { margin-top: var(--space-5); padding-top: var(--space-4); border-top: 1px solid var(--ds-border-light); }
+  .content-search__title {
+    display: flex; align-items: center; gap: 6px; margin: 0 0 var(--space-1);
+    font-size: 0.85rem; font-weight: var(--font-semibold); color: var(--ds-text-primary);
+  }
+  .content-search__title svg { width: 14px; height: 14px; color: var(--kind); }
+  .content-search__note { margin: 0 0 var(--space-3); font-size: 0.76rem; color: var(--ds-text-muted); }
+  .content-search__body { display: flex; flex-direction: column; gap: var(--space-2); }
+  .content-search__loading, .content-search__empty, .content-search__error, .content-search__hint {
+    font-size: 0.82rem; color: var(--ds-text-muted); margin: 0;
+  }
+  .content-search__error { color: var(--ds-warn-ink); }
+  .cs-hit { padding: var(--space-3) var(--space-4); background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: var(--radius-lg); }
+  .cs-hit__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+  .cs-hit__name { font-weight: var(--font-medium); color: var(--ds-text-primary); }
+  .cs-hit__name a { color: inherit; text-decoration: none; }
+  .cs-hit__name a:hover { color: var(--kind); text-decoration: underline; }
+  .cs-hit__badge {
+    flex: none; font-size: 0.68rem; font-weight: var(--font-medium); color: var(--ds-text-muted);
+    background: var(--ds-surface-dim, var(--ds-surface)); border: 1px solid var(--ds-border);
+    border-radius: var(--radius-full); padding: 1px 8px;
+  }
+  .cs-hit__snippet { margin: 4px 0 0; font-size: 0.8rem; line-height: 1.5; color: var(--ds-text-secondary); }
+
   /* Facts section (spec §13.2 "Collection detail") */
   .facts-type-counts { display: flex; flex-wrap: wrap; gap: var(--space-2); margin: 0 0 var(--space-3); }
   .facts-type-chip {
@@ -111,10 +157,16 @@
     border-radius: var(--radius-full); padding: 2px 10px;
   }
   .facts-list { display: flex; flex-direction: column; gap: var(--space-2); }
+  {# Same card as `.file` above — padding, background, border, radius were
+     already identical; what was missing was the interactive weight (the
+     hover lift), which is what made a fact row read as flat/static text next
+     to the file list's rows. #}
   .fact-row {
     padding: var(--space-3) var(--space-4); background: var(--ds-surface);
     border: 1px solid var(--ds-border); border-radius: var(--radius-lg);
+    transition: border-color .14s ease, box-shadow .14s ease;
   }
+  .fact-row:hover { border-color: color-mix(in srgb, var(--kind) 35%, var(--ds-border)); box-shadow: var(--ds-shadow-sm); }
   .fact-row__head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--space-2); }
   .fact-row__type {
     font-size: 0.72rem; font-weight: var(--font-medium); text-transform: uppercase; letter-spacing: 0.04em;
@@ -130,9 +182,9 @@
   }
   .fact-conflict__key { font-size: 0.78rem; font-weight: var(--font-medium); color: var(--ds-warn-ink); }
   .fact-conflict__values { margin: var(--space-1) 0 0; padding-left: 1.2em; font-size: 0.82rem; color: var(--ds-text-secondary); }
-  .facts-pager { display: flex; align-items: center; gap: var(--space-3); margin-top: var(--space-3); font-size: 0.82rem; color: var(--ds-text-secondary); }
-  .facts-pager a { color: var(--kind); text-decoration: none; }
-  .facts-pager a:hover { text-decoration: underline; }
+  {# The Facts pager is now `detail.pager()` (macros/_detail.html) — the
+     SAME control the Files section uses below — so there is no page-local
+     `.facts-pager` rule left to keep here. #}
   .facts-review { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--ds-border); }
   .facts-review__title { font-size: 0.82rem; font-weight: var(--font-semibold); color: var(--ds-text-secondary); margin: 0 0 var(--space-2); }
   .fact-review-row { font-size: 0.85rem; color: var(--ds-text-primary); padding: 4px 0; }
@@ -152,29 +204,46 @@
    as a collection (two-sheet glyph, N files). Adding a second file promotes a
    file into a collection. The noun follows the same rule so the copy never
    calls a lone file a "collection" — this is what fixes the one-file illusion,
-   in both IAs (topnav already used "collection"; single-file is count-based). #}
-{% set _n = (files or [])|length %}
+   in both IAs (topnav already used "collection"; single-file is count-based).
+
+   Derived from `files_total_all` — the collection's TRUE, unfiltered size —
+   and NEVER from `files` (the current page/search slice): a 26-file
+   collection whose Files section happens to be on page 2 (1 row left) or
+   whose search box narrows the visible rows to 1 must still read as a
+   collection, not silently promote into looking like a single-file artefact.
+   `single_file` is the one true row the route fetches directly (unfiltered,
+   unpaginated) whenever `files_total_all == 1`, so this identity never
+   depends on the page slice containing that row. #}
+{% set _n = files_total_all %}
 {% set _single = _n == 1 %}
-{% set _f0 = files[0] if _single else none %}
+{% set _f0 = single_file if (_single and single_file) else none %}
 {% set _noun = 'file' if _single else 'collection' %}
 {# Title is the artefact's NAME (what the caller typed), for both shapes — a
    single-file artefact keeps the file glyph + filename-in-meta, but its name
    is honored rather than overwritten by the filename. #}
-{% set _title = collection.name or (_f0.filename if _single else '') %}
+{% set _title = collection.name or (_f0.filename if _f0 else '') %}
 {% set _hero_glyph = 'doc' if _single else 'library' %}
 {# The resource type follows the same count rule as the noun and the glyph: a
    one-file artefact IS a file (amber), two-or-more is a collection (coral).
    Three signals, one source of truth. #}
 {% set _kind = 'file' if _single else 'library' %}
-{% if _single %}
+{% if _f0 %}
   {% set _meta = [{'icon': 'file', 'text': _f0.filename ~ ' · ' ~ ((_f0.size_bytes or 0)|humanbytes(1))}] %}
 {% else %}
   {% set _meta = [{'icon': 'file', 'text': (_n|string) ~ ' file' ~ ('s' if _n != 1 else '')}] %}
 {% endif %}
 {% set _desc = collection.description or ('One file in your library — add more to build a collection.' if _single else 'The files in this collection, indexed so your agents can search them.') %}
 {# How many of the files are searchable — the one number that says whether
-   this collection is actually usable yet. #}
-{% set _indexed = (files or []) | selectattr('processing_status', 'equalto', 'indexed') | list | length %}
+   this collection is actually usable yet. Also total-based, never the page
+   slice: the fraction must read the same on every page/search. #}
+{% set _indexed = files_indexed_total %}
+{# Display labels for the Files status filter — same five-state lifecycle as
+   `_INGEST_LABELS` (app/web/router.py), but that dict is written for the
+   per-row "why isn't this searchable yet" note ("Not indexed yet") and has
+   no entry for the common "indexed" case; the filter needs a plain word for
+   every state, including that one. #}
+{% set _INGEST_STATUS_LABELS = {'indexed': 'Indexed', 'processing': 'Processing', 'pending': 'Pending',
+                                'needs_review': 'Needs review', 'rejected': 'Rejected'} %}
 
 {# Secondary actions live in the overflow menu, so the header carries the one
    action a reader would take — the same rule every other detail page follows.
@@ -263,9 +332,53 @@
 {{ detail.section_close() }}
 {% endif %}
 
-{{ detail.section_open('Files', icon='file') }}
+{{ detail.section_open('Files', icon='file', id='files-section') }}
+  {# One search box, two bands (see `.content-search` below): this form is
+     Band 1 — a plain GET, so it works with no JS and the result is a
+     shareable URL. It matches FILE NAMES only (substring, case-insensitive)
+     — a genuinely different, cheaper search than Band 2's content match. A
+     status select sits beside it; both narrow the SAME `files` list below.
+     `facts_page` rides along as a hidden field so submitting a Files search
+     never resets where the reader was in the Facts section. #}
+  <form class="files-search" method="get" action="#files-section">
+    <div class="files-search__row">
+      <input type="search" name="q" class="search-input" placeholder="Search files by name…"
+             value="{{ files_q }}" aria-label="Search files by name">
+      <select name="status" class="search-input ds-dropdown-native" aria-label="Filter by processing status"
+              onchange="this.form.submit()">
+        <option value="">All statuses ({{ files_total_all }})</option>
+        {# `.items()`, never bare `{% for s in files_status_counts %}`: every
+           dict/list a route hands `_build_context` is recursively wrapped in
+           `_FlexDict` (app/web/router.py) so templates can dot-access a
+           missing key without a Jinja UndefinedError — but its `__iter__` is
+           overridden to yield VALUES, not keys, for legacy Flask-template
+           compatibility. `facts_summary.type_counts.items()` above already
+           works around this the same way. #}
+        {% for s, n in files_status_counts.items() %}
+        <option value="{{ s }}"{% if files_status == s %} selected{% endif %}>{{ _INGEST_STATUS_LABELS.get(s, s) }} ({{ n }})</option>
+        {% endfor %}
+      </select>
+      {% if pager_qs.facts_page and pager_qs.facts_page > 1 %}
+      <input type="hidden" name="facts_page" value="{{ pager_qs.facts_page }}">
+      {% endif %}
+      {{ ds.button("Search", variant="secondary", size="sm", attrs='type="submit"') }}
+    </div>
+    {% if files_q or files_status %}
+    <p class="files-search__note">
+      {{ files_total }} of {{ files_total_all }} file{{ 's' if files_total_all != 1 else '' }}
+      {%- if files_q %} match{{ 'es' if files_total == 1 else '' }} “{{ files_q }}”{% endif -%}
+      {%- if files_status %} with status {{ _INGEST_STATUS_LABELS.get(files_status, files_status)|lower }}{% endif -%}.
+      <a href="{{ pager_href({'facts_page': pager_qs.facts_page}, 'files_page', 1) }}#files-section">Clear</a>
+    </p>
+    {% endif %}
+  </form>
+
   {% if not files %}
+    {% if files_q or files_status %}
+    {{ detail.empty('No files match this search.', icon='search') }}
+    {% else %}
     {{ detail.empty('No files yet — drop some below.', icon='file') }}
+    {% endif %}
   {% else %}
   <div class="files">
     {% for f in files %}
@@ -305,6 +418,11 @@
           {% else %}
             <div class="file__meta">{{ ft or "file" }}</div>
           {% endif %}
+          {# A crawled/source-managed file's folder at the source — see
+             `.file__meta--path`. Omitted for a manual upload, which has none. #}
+          {% if f.path %}
+            <div class="file__meta file__meta--path" title="{{ f.path }}">{{ f.path }}</div>
+          {% endif %}
           {% if reason and f.processing_status in ("rejected", "needs_review") %}
             <div class="file__reason">{{ reason }}</div>
           {% endif %}
@@ -327,6 +445,32 @@
       </div>
     {% endfor %}
   </div>
+  {{ detail.pager(files_page, files_total_pages, files_total, 'files_page', pager_qs, anchor_id='files-section', item_noun='file') }}
+  {% endif %}
+
+  {# Band 2 — "In the documents": content matches, fetched client-side AFTER
+     the page paints (js/library_content_search.js), never from this route —
+     scoring every chunk of the corpus is expensive (src/ingest/retrieval.py)
+     and a reader who only typed a filename must not pay for it. Only
+     rendered when there is a query to run; a blank search has nothing for
+     either band to show. #}
+  {% if files_q %}
+  <div class="content-search" id="content-search"
+       data-corpus-id="{{ collection.id }}" data-collection-slug="{{ collection.slug }}" data-q="{{ files_q }}">
+    <h3 class="content-search__title">{{ detail.ico('search') }}In the documents</h3>
+    <p class="content-search__note">
+      Matches whole words inside file CONTENTS — not the same as the file-name search
+      above, which matches any substring. There is no wildcard, so “smlou” will not
+      find “smlouva”.
+    </p>
+    <div class="content-search__body" data-role="content-search-body" aria-live="polite"></div>
+    <noscript>
+      <p class="content-search__empty">
+        Enable JavaScript to search inside documents, or
+        <a href="/chat?q={{ files_q | urlencode }}">ask {{ instance_brand_short or 'Agnes' }}</a> instead.
+      </p>
+    </noscript>
+  </div>
   {% endif %}
 {{ detail.section_close() }}
 
@@ -340,7 +484,7 @@
    readable rows. Ungated by `detail.redesign` — like Files/Add files above,
    this is main-column state, not a redesign-wave restyle. #}
 {% if facts_summary %}
-{{ detail.section_open('Facts', icon='sitemap') }}
+{{ detail.section_open('Facts', icon='sitemap', id='facts-section') }}
   {% if facts_summary.type_counts %}
   <p class="facts-type-counts">
     {% for t, n in facts_summary.type_counts.items() %}
@@ -374,17 +518,14 @@
     </div>
     {% endfor %}
   </div>
-  {% if facts_summary.total > facts_summary.page_size %}
-  <div class="facts-pager">
-    {% if facts_summary.page > 1 %}
-    <a href="?facts_page={{ facts_summary.page - 1 }}">&larr; Previous</a>
-    {% endif %}
-    <span>Page {{ facts_summary.page }} of {{ ((facts_summary.total - 1) // facts_summary.page_size) + 1 }}</span>
-    {% if facts_summary.limit_applied %}
-    <a href="?facts_page={{ facts_summary.page + 1 }}">Next &rarr;</a>
-    {% endif %}
-  </div>
-  {% endif %}
+  {# `((total - 1) // page_size) + 1` is the exact page count — `total` is
+     always a full COUNT (never limit-probed, see `collection_facts_summary`),
+     so this is more reliable than `limit_applied` (a same-page LIMIT+1 probe)
+     ever was, and it is what let the route CLAMP `facts_page` instead of
+     rendering an empty list under a page number nothing links back from. #}
+  {% set _facts_total_pages = ((facts_summary.total - 1) // facts_summary.page_size) + 1 %}
+  {{ detail.pager(facts_summary.page, _facts_total_pages, facts_summary.total, 'facts_page', pager_qs,
+                  anchor_id='facts-section', item_noun='fact') }}
   {# Self-describing payload: every item carries a `kind` discriminator, so
      a new review-item shape (spec §7.3's `single_valued_conflict`) is a
      branch here, not a whole new section. #}

@@ -362,3 +362,56 @@ def test_every_chrome_context_builder_supplies_the_brand_the_rail_renders():
     request = Request(scope)
     ctx = _router._build_context(request)
     assert ctx.get("instance_brand_short"), "_build_context must carry instance_brand_short through from _chrome_ctx"
+
+
+def _rail_css_rules() -> list[str]:
+    """The stylesheet split into rules, comments stripped FIRST.
+
+    Stripping first matters: several of these selectors are quoted inside the
+    explanatory comments beside them, and a split that runs before the strip
+    would happily match a rule that exists only in prose.
+    """
+    import re
+    from pathlib import Path
+
+    css = Path("app/web/static/css/rail.css").read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [r.strip() for r in css.split("}") if r.strip()]
+
+
+def test_focusing_the_home_link_does_not_hide_it():
+    """The logo row's `:focus-within` hides the orb so the collapse toggle can
+    take the 56px slot. That matched when the focused element WAS the orb, so
+    tabbing to Home hid Home — focus left on something invisible and
+    unclickable, and the next visible control only reachable by tabbing past it
+    (Devin Review on #2074).
+    """
+    hiders = [
+        r
+        for r in _rail_css_rules()
+        if ".rail-logo-row:focus-within .rail-logo" in r and "opacity: 0" in r
+    ]
+    assert hiders, "expected the orb-gives-way-to-toggle rule to still exist"
+    for rule in hiders:
+        assert ".rail-logo:not(:focus-within)" in rule, (
+            "the orb must give way when focus is elsewhere in the row, never when "
+            "the keyboard is on the orb itself"
+        )
+
+
+def test_the_setup_row_gets_a_label_chip_like_every_other_strip_row():
+    """On the peekless strip a row's name appears as a hover/focus chip built
+    from its label element. The Setup row is a `.rail-i` whose label is
+    `.rail-getstarted-body`, not `.rail-i-label`, so it was the one glyph in
+    the strip that named nothing (Devin Review on #2074)."""
+    chip_rules = [
+        r
+        for r in _rail_css_rules()
+        if ".rail-strip-only .rail-i:hover .rail-i-label" in r
+    ]
+    assert chip_rules, "expected the strip's label-chip rules to exist"
+    for rule in chip_rules:
+        assert ".rail-i:hover .rail-getstarted-body" in rule, (
+            "the Setup row's label element must be listed wherever the chip is, "
+            "including the reduced-motion block that turns its transition off"
+        )

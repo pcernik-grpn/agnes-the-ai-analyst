@@ -132,6 +132,44 @@ _CONFIG_SECRET_ONLY_ENVS: frozenset[str] = frozenset(
 # connector-ATTACH trust boundary can never share membership by accident.
 _PRODUCER_KEY_ENVS: frozenset[str] = frozenset({"AGNES_ANONYMIZATION_HMAC_KEY"})
 
+# Env var NAME holding the bearer token for a SELF-HOSTED entity-detection
+# endpoint (`extraction.anonymization.llm.api_key_env`, resolved by
+# `src.anonymization_ner.build_detector_client`).
+#
+# A FOURTH consumer class, and — for the same reason the three above are
+# separate — deliberately its own rule. `extraction` is an admin-writable
+# server-config section (`app/api/admin.py::_STATIC_EDITABLE_SECTIONS`), so
+# the NAME here is attacker-reachable by anyone who can reach the admin
+# config editor. Unguarded, `api_key_env: AGNES_VAULT_KEY` (or
+# `AGNES_ANONYMIZATION_HMAC_KEY`, or a SharePoint certificate) would be read
+# and sent as an `Authorization: Bearer` header to the configured endpoint.
+# Membership never overlaps `_PRODUCER_KEY_ENVS` or the connector-ATTACH
+# token envs: the HMAC key must never be reachable as an LLM bearer token,
+# and this token must never be usable as a `_remote_attach` `token_env`.
+#: Structural rule rather than a one-element set: an allowlist whose only
+#: member is the default name makes `api_key_env` a knob with exactly one
+#: legal value, which is a knob in name only. A deployment that runs two
+#: endpoints, or names its secret per environment, needs room — but only
+#: inside a namespace that cannot reach another trust class. `AGNES_VAULT_KEY`,
+#: `AGNES_ANONYMIZATION_HMAC_KEY` and every connector credential are outside
+#: it by construction, which is the property that matters.
+_ANONYMIZATION_LLM_KEY_ENV_PREFIX = "AGNES_ANONYMIZATION_LLM_"
+
+# Where that bearer token — and, far more sensitively, every PRE-anonymization
+# document — may be sent. `extraction.anonymization.llm.base_url` is
+# admin-writable config, so this is the same credential-egress shape as the
+# connector `_remote_attach` url that audit F10/F11 closed, with a worse
+# payload: the LLM tier streams the raw document text, names and account
+# numbers included, to whatever host the URL names.
+#
+# UNLIKE `is_attach_host_allowed`, this list is DEFAULT-CLOSED. That function
+# is default-open for backward compatibility with deployments that predate
+# it; a self-hosted detector endpoint is new surface with no installed base,
+# so the safe default costs an operator one env var and closes the hole for
+# everyone who never reads this file. An unset allowlist does not disable the
+# check — it refuses every custom `base_url`.
+_ANONYMIZATION_LLM_HOST_ALLOWLIST_ENV = "AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST"
+
 # Names must additionally match this regex (defense against weird input).
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
@@ -268,6 +306,72 @@ def is_producer_key_env_allowed(name: str) -> bool:
     return name in _PRODUCER_KEY_ENVS
 
 
+def is_anonymization_llm_key_env_allowed(name: str) -> bool:
+    """Return True if ``name`` may be read and sent as the bearer token of a
+    self-hosted entity-detection endpoint
+    (``extraction.anonymization.llm.api_key_env``).
+
+    Same two checks as the siblings (structural regex, then membership) but
+    against :data:`_ANONYMIZATION_LLM_KEY_ENVS`. Do not reuse
+    :func:`is_producer_key_env_allowed` here and do not reuse this for the
+    HMAC key: the whole point of the split is that a config value an admin
+    can type must not be able to name a secret from another trust class.
+    """
+    if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
+        return False
+    # A bare prefix match would accept the prefix itself; require something
+    # after it so the name identifies a variable rather than the namespace.
+    return name.startswith(_ANONYMIZATION_LLM_KEY_ENV_PREFIX) and len(name) > len(
+        _ANONYMIZATION_LLM_KEY_ENV_PREFIX
+    )
+
+
+def is_anonymization_llm_host_allowed(url: str) -> bool:
+    """Return True if pre-anonymization document text (and the endpoint's
+    bearer token) may be sent to ``url``.
+
+    DEFAULT-CLOSED, unlike :func:`is_attach_host_allowed`: an unset or empty
+    :data:`_ANONYMIZATION_LLM_HOST_ALLOWLIST_ENV` allows NOTHING, so an
+    operator who never configures it cannot be silently exfiltrating
+    documents through an edited ``base_url``. See that constant's docstring
+    for why this one does not inherit the sibling's backward-compatible
+    default-open posture.
+
+    Fail-closed on an unparseable host for the same reason as the sibling: a
+    host we cannot extract is a host we cannot prove was approved.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False
+    allow = {h.lower() for h in _parse_csv_env(_ANONYMIZATION_LLM_HOST_ALLOWLIST_ENV)}
+    if not allow:
+        return False
+    host = _url_host(url)
+    if not host:
+        return False
+    # Three ways to match, and deliberately no fourth:
+    #
+    #   1. exactly, `h:8443` vs an entry of `h:8443`;
+    #   2. a ported url against a BARE entry, `h:8443` vs `h` — the operator
+    #      pinned a host and does not care which port;
+    #   3. a url with NO explicit port against an entry carrying that
+    #      scheme's DEFAULT port, `https://h` vs `h:443`. `_url_host` omits a
+    #      default port (urlparse reports `.port` as None for `https://h`),
+    #      so without this an allowlist of `h:443` refuses the very endpoint
+    #      it was written to permit.
+    #
+    # What is NOT done is stripping the port from the ENTRY side: an operator
+    # who wrote `h:8443` pinned that port, and letting `h:9999` in through the
+    # bare host would silently discard the pin.
+    bare = host.split(":", 1)[0]
+    if host in allow or bare in allow:
+        return True
+    if ":" in host:
+        return False
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    default_port = {"https": 443, "http": 80}.get(scheme)
+    return default_port is not None and f"{bare}:{default_port}" in allow
+
+
 def log_effective_policy() -> None:
     """Log the effective extension + token-env allowlists at INFO once.
 
@@ -308,12 +412,18 @@ def _url_host(url: str) -> str:
 
     try:
         parsed = urlparse(url if "://" in url else f"//{url}", scheme="")
-    except Exception:
+        if not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower()
+        # `.port` is a PROPERTY that parses lazily and raises ValueError on a
+        # non-numeric or out-of-range port ("h:notaport", "h:99999") — so it
+        # belongs inside this boundary, not after it. Outside, a malformed URL
+        # propagated the exception to every caller: a 500 from the admin
+        # preview instead of its 502, and a crawl aborting before its
+        # per-document fail-closed handling could run.
+        return f"{host}:{parsed.port}" if parsed.port else host
+    except Exception:  # noqa: BLE001 — unparseable is "no host", never a crash
         return ""
-    if not parsed.hostname:
-        return ""
-    host = parsed.hostname.lower()
-    return f"{host}:{parsed.port}" if parsed.port else host
 
 
 def is_attach_host_allowed(url: str) -> bool:

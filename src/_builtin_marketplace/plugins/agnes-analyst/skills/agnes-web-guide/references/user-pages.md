@@ -38,13 +38,13 @@ user sees there, and when to send them.
 
 ## Data & semantics
 
-- `/semantic-layer` — the semantic models: datasets, fields, relationships,
-  metrics, glossary. Each model opens at `/semantic-layer/{slug}` and each
-  object at `/semantic-layer/{slug}/{object_id}`.
-  Two more tabs on the same page list every metric and glossary term
-  registered here, document-backed or not:
-  `/semantic-layer?tab=all_metrics` and `/semantic-layer?tab=all_glossary`.
-  "What is our canonical MRR?" → the All metrics tab (or
+- `/semantic-layer` — **Definitions**: the organization's metrics, glossary
+  and the semantic models they are projected from, in three views of one
+  page. Metrics and glossary terms are listed whether or not a document
+  backs them (`?tab=all_metrics`, `?tab=all_glossary`); the models view
+  lists the stored documents, each opening at `/semantic-layer/{slug}` and
+  each object at `/semantic-layer/{slug}/{object_id}`.
+  "What is our canonical MRR?" → the metrics view (or
   `agnes catalog --metrics` in chat).
 
 ## Skills, plugins & the store

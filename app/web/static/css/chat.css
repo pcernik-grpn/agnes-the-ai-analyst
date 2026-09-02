@@ -545,7 +545,10 @@ body.chat-page-body main { margin: 0; padding: 0; }
 
 .msg-body :first-child { margin-top: 0; }
 .msg-body :last-child  { margin-bottom: 0; }
-.msg-body p { margin: 6px 0; }
+/* 6px against a 23px line box read as one continuous slab — paragraph breaks
+   were nearly invisible, so a multi-paragraph answer had no place for the eye
+   to rest. */
+.msg-body p { margin: 8px 0; }
 
 /* Markdown lists. The global reset zeroes list padding; with the default
    list-style-position: outside that renders the markers in the negative
@@ -553,8 +556,65 @@ body.chat-page-body main { margin: 0; padding: 0; }
    markers ("10.", "11.") visibly overflow the left edge. Restore an indent
    wide enough for two-digit markers so they sit inside the bubble. */
 .msg-body ol,
-.msg-body ul { margin: 6px 0; padding-left: 1.8em; }
-.msg-body li { margin: 2px 0; }
+.msg-body ul { margin: 8px 0; padding-left: 1.8em; }
+.msg-body li { margin: 3px 0; }
+.msg-body li > ul,
+.msg-body li > ol { margin: 3px 0; }
+
+/* ---- Markdown typography inside an answer ------------------------------
+   An answer that arrives as a DOCUMENT — headings, steps, code, a table —
+   had no rules of its own here, so it fell through to the browser's
+   defaults: `h1` at 2em (30px against a 15px body) and `h2` at 1.5em, both
+   with the app reset's margin zeroed. Big enough to shout, with no space to
+   group anything, which is the specific way it was hard to scan — size
+   signal and no structure signal.
+
+   Two corrections. The SCALE comes down to reading sizes: this is a reply in
+   a conversation, not a page, and it is never competing with a page title
+   for the top of the screen. And every heading now carries far more space
+   ABOVE it than below — that asymmetry is what makes a heading read as
+   belonging to the block it introduces rather than floating between two. */
+.msg-body h1,
+.msg-body h2,
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  font-weight: var(--font-semibold);
+  line-height: 1.35;
+  color: var(--ds-text-primary);
+}
+.msg-body h1 { margin: 20px 0 8px; font-size: var(--text-lg); }
+.msg-body h2 { margin: 20px 0 6px; font-size: var(--text-md); }
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 { margin: 16px 0 4px; font-size: inherit; }
+/* Back-to-back headings are one unit — a section title over its subtitle —
+   so the lower one drops the gap it would otherwise open. */
+.msg-body h1 + h2,
+.msg-body h2 + h3,
+.msg-body h3 + h4 { margin-top: 8px; }
+
+/* Blocks that are not prose get more room than a paragraph: they are objects
+   in the flow, and reading resumes after them. The code block's own margin
+   lives with the shared `pre.code-block-wrap` rule further down (same
+   specificity as anything written here, and later in the file, so it wins —
+   changed there rather than out-specified here). */
+.msg-body .cloud-chat-table-wrap,
+.msg-body table { margin: var(--space-3) 0; }
+
+.msg-body hr {
+  margin: 20px 0;
+  border: 0;
+  border-top: 1px solid var(--ds-border);
+}
+.msg-body blockquote {
+  margin: 10px 0;
+  padding: 2px 0 2px var(--space-3);
+  border-left: 2px solid var(--ds-border);
+  color: var(--ds-text-secondary);
+}
 
 /* Streaming caret — anchored at the cursor position of the body so it
    actually sits where new tokens land. */
@@ -701,19 +761,61 @@ body.chat-page-body main { margin: 0; padding: 0; }
   color: var(--ds-text-secondary);
   background: var(--ds-surface-dim);
 }
-.msg-source-kind {
-  font-family: var(--ds-font);
-  color: var(--ds-text-muted);
+/* The chips hold the row's own list, so the label and the trailing controls
+   stay put while the list grows. */
+.msg-sources-list {
+  display: contents;
 }
-.msg-source-chip.is-ok {
-  border-color: var(--ds-accent-success-line);
-  background: var(--ds-accent-success-bg);
+/* The category, as a glyph instead of a repeated word (chat.js _CLAIM_ICON).
+   The word rides the chip's aria-label and tooltip. */
+.msg-source-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  /* Follows the chip's own ink rather than carrying a third colour. The glyph
+     is the only thing on the chip that states the category now, so it is a
+     meaningful graphic under WCAG 1.4.11 and owes 3:1 — inheriting an ink that
+     already clears 4.5:1 as text satisfies that by construction, in both
+     themes, with no second value to keep in sync. */
+  color: inherit;
+}
+.msg-source-icon svg {
+  width: 12px;
+  height: 12px;
+}
+/* VERIFIED is the calm state, deliberately: it wears the base chip and adds
+   nothing. It used to be painted success-green, which — with unverified in
+   amber — made a row of sources into a traffic light where nothing was
+   neutral. Green on the routine case also spent the strongest signal the row
+   has on its least surprising outcome. */
+/* -ink, NOT -line. The `-line` tokens are tuned for borders sitting on their
+   own tinted fill; on the chip's plain --ds-surface-dim the success line
+   measured 2.94:1 and the warn line 1.41:1 — a state marker you cannot see.
+   The -ink pair measures 6.36:1 and 6.88:1 here, and 9.68:1 / 11.2:1 in dark. */
+.msg-source-chip.is-ok .msg-source-icon {
   color: var(--ds-accent-success-ink);
 }
+/* Unverified stays marked, and now carries it in the BORDER rather than in a
+   fill plus a shouted word: dashed reads as provisional at a glance, and the
+   count says it once for the whole row (.msg-source-flag). */
 .msg-source-chip.is-unverified {
-  border-color: var(--ds-accent-warn-line);
-  background: var(--ds-accent-warn-bg);
+  border-style: dashed;
+  border-color: var(--ds-accent-warn-ink);
   color: var(--ds-accent-warn-ink);
+}
+/* "+3 more" / "Show fewer" — the same link-shaped control the tool results
+   use, sized to sit on this row. */
+.msg-source-more {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: var(--text-xs);
+  color: var(--ds-primary);
+  cursor: pointer;
+}
+.msg-source-more:hover,
+.msg-source-more:focus-visible {
+  text-decoration: underline;
 }
 .msg-source-chip.is-none {
   border-style: dashed;
@@ -740,14 +842,27 @@ a.msg-source-chip.is-link:focus-visible {
   border-color: var(--ds-primary);
   text-decoration: underline;
 }
+/* The verdict for the whole row, said once at the end of it — it used to be a
+   badge repeated inside every unverified chip. No longer inside a chip, so it
+   owns its own type and spacing. */
 .msg-source-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-family: var(--ds-font);
+  font-size: var(--text-xs);
   font-weight: var(--font-semibold);
   text-transform: uppercase;
-  /* NO font-size shrink here. `0.85em` of the chip's own --text-xs came out at
-     8.5px measured — the one word on this row that must be readable, set
-     smaller than everything around it. Caps + weight carry the emphasis. */
+  /* NO font-size shrink relative to the chips. `0.85em` of the chip's own
+     --text-xs came out at 8.5px measured — the one phrase on this row that
+     must be readable, set smaller than everything around it. Caps + weight
+     carry the emphasis. */
   letter-spacing: 0.03em;
+  color: var(--ds-accent-warn-ink);
+}
+.msg-source-flag svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* Assumptions get their own row under the sources row (TCRD-289). A `table:`
@@ -877,7 +992,9 @@ a.msg-source-chip.is-link:focus-visible {
 .msg-body pre.code-block-wrap,
 .cloud-chat-messages details pre.code-block-wrap {
   position: relative;
-  margin: var(--space-2) 0;
+  /* --space-3, matching the table above it: a code block is an object in the
+     prose flow, and 8px left it crowding the sentence that introduced it. */
+  margin: var(--space-3) 0;
   padding: var(--space-3);
   background: var(--ds-code-bg);
   color: var(--ds-code-ink);
@@ -1225,20 +1342,98 @@ pre.code-block-wrap code .hljs-deletion {
    panels directly (only oversize payloads keep a nested toggle).
    A failed call stays collapsed too and carries its diagnosis on the
    header line instead (see .cloud-chat-tool-summary.is-error). */
+/* Shared by the THREE things that wear this class — a tool-call step, an
+   approval gate, a question card. Only the reading column and the type scale
+   are shared. The chrome is deliberately NOT: a step is a trace line the
+   reader skims past, the other two are surfaces the reader has to act on, and
+   giving a trace line the same box as a decision made a turn's machinery
+   shout as loudly as its answer (#1974 item 1, second pass). */
 .cloud-chat-tool {
-  margin: var(--space-2) auto;
-  padding: var(--space-3) var(--space-4);
+  /* NEGATIVE on purpose. `.cloud-chat-messages` is a flex column with a
+     uniform `gap: var(--space-5)` (20px), which cannot be targeted per pair —
+     so an 8px margin here made a step sit 28px from the sentence above it,
+     WIDER than the 20px between two separate messages. That is backwards: a
+     step belongs to the turn it sits inside, and should read tighter to its
+     own prose than two messages read to each other. This claws back 8px of the
+     container gap, landing at 12px. */
+  margin: calc(var(--space-2) * -1) auto;
   max-width: var(--chat-reading-width);
+  color: var(--ds-text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* The card chrome, now owned by the two cards that need it. Both recolor it
+   further down (.cloud-chat-approval / .cloud-chat-question), which is why
+   this block declares the box and not its palette. */
+.cloud-chat-approval,
+.cloud-chat-question {
+  /* Undo the step's negative margin: these keep the container's own spacing,
+     because an approval gate or a question is a thing to stop at, not a step
+     to skim past. */
+  margin-top: 0;
+  margin-bottom: 0;
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--ds-border);
   border-left-width: 3px;
   border-radius: var(--radius-md);
   background: var(--ds-surface-dim);
-  color: var(--ds-text-secondary);
-  font-size: var(--text-sm);
 }
-.cloud-chat-tool.is-running { border-left-color: var(--ds-accent-info-line); }
-.cloud-chat-tool.is-done    { border-left-color: var(--ds-accent-success-line); }
-.cloud-chat-tool.is-error   { border-left-color: var(--ds-accent-danger-line); }
+
+/* ---- A tool-call step: a line, not a card ------------------------------
+   No fill, no border, no radius — the status lives in the icon, the smallest
+   thing that can carry it, and the row's whole job is to be skippable.
+   Expanding one still opens the args/result panels below it; those keep their
+   own hairline box, which is then the only box in the picture and so reads as
+   "here is the payload" rather than as more furniture. */
+.cloud-chat-tool--step {
+  padding: 0;
+}
+/* Left-packed, same as the group head above: icon · name · args · timing ·
+   caret, then empty space. Nothing is pinned to the right edge. */
+.cloud-chat-tool--step > .cloud-chat-tool-head > .cloud-chat-tool-summary {
+  flex: 0 1 auto;
+}
+.cloud-chat-tool--step > .cloud-chat-tool-head {
+  align-items: center;
+  /* A step is one line: the args summary already ellipsizes (see
+     .cloud-chat-tool-summary), so wrapping could only ever be worse. The
+     approval and question heads keep the base `wrap` — their reason lines are
+     prose and have to be allowed to flow. */
+  flex-wrap: nowrap;
+  padding: var(--space-1) 0;
+}
+/* The label is a human phrase ("Reading the data catalog"), not an identifier
+   — the same reason the definition-lookup variant below drops the mono
+   treatment. Scoped to the step, so the approval/question heads are
+   untouched. */
+.cloud-chat-tool--step .cloud-chat-tool-name {
+  font-family: inherit;
+  /* A step is machinery, not prose. It was set in the ANSWER's own ink and a
+     HEAVIER weight than the answer itself (500 against 400) — so the line
+     whose whole job is to be skippable was the most emphatic text in the
+     transcript. Secondary ink at normal weight measures 7.87:1 against the
+     surface here and 9.57:1 in dark: plainly readable, plainly subordinate to
+     the sentence above it. */
+  color: var(--ds-text-secondary);
+  font-weight: var(--font-normal);
+}
+/* Status lives in the icon — see the single `.cloud-chat-tool.is-*` block
+   further down. There is deliberately no `--step` copy of it here: the two
+   selectors carry the same specificity (0,3,0), so a copy above the original
+   would silently never apply, which is exactly what happened when this file
+   had both. */
+/* The detail hanging off an open step. ONE continuous hairline down the left
+   of every panel, rather than a rectangle each: a step that opened onto three
+   stacked white boxes (command, output, "show full output") was back to being
+   the heaviest thing on the screen the moment you looked inside it. The panels
+   abut deliberately — zero margin between them — so their rule segments join
+   into a single line tying the whole detail to the row above. */
+.cloud-chat-tool--step[open] > .cloud-chat-tool-args,
+.cloud-chat-tool--step[open] > .cloud-chat-tool-result {
+  margin: 0 0 0 var(--space-3);
+  padding: var(--space-2) 0 var(--space-2) var(--space-4);
+  border-left: 1px solid var(--ds-border);
+}
 /* A continuation bubble: the second and later text parts of a replayed turn,
    each sitting under the tool card it followed. It is the same assistant
    bubble, minus the avatar gutter's second copy of the avatar — the message
@@ -1257,9 +1452,10 @@ pre.code-block-wrap code .hljs-deletion {
    `.msg-bubble` (`flex: 0 1 auto; max-width: 80%`) and needed margin/width
    overrides to cope, which still left every card as wide as its own message's
    longest line instead of the reading column. */
-.cloud-chat-tool.is-replayed {
-  border-left-color: var(--ds-border);
-}
+/* Nothing left to neutralise: a step has no status edge, and _buildToolCard /
+   _updateToolGroupSummary give an outcome-less replayed row NO icon rather
+   than a tick it cannot evidence. The class still means what it meant — it
+   just needs no paint of its own. */
 
 /* ---- Tool-call group --------------------------------------------------
    A RUN of consecutive tool calls, folded into one <details> (chat.js →
@@ -1268,12 +1464,15 @@ pre.code-block-wrap code .hljs-deletion {
    inside it unchanged. A run of one is never wrapped, so this markup only
    exists where it saves the reader something.
 
-   The header borrows the card's own vocabulary deliberately: same dim
-   surface, same 3px status edge, same chevron. A group is a card-shaped
-   thing standing for cards, and giving it a second visual language would
-   read as a different kind of object. */
+   The header speaks the STEP's vocabulary, not a card's: same status icon,
+   same type scale, no box. It is one line of text that opens a list of lines
+   — a group that were a card standing over borderless rows would be the
+   heaviest thing on the screen while meaning the least. */
 .cloud-chat-tool-group {
-  margin: var(--space-2) auto;
+  /* Same reasoning as a lone step (see .cloud-chat-tool): a run of steps is
+     part of the turn, so it sits tighter to the prose than the container's
+     uniform gap allows on its own. */
+  margin: calc(var(--space-2) * -1) auto;
   max-width: var(--chat-reading-width);
 }
 summary.cloud-chat-tool-group-head {
@@ -1282,18 +1481,11 @@ summary.cloud-chat-tool-group-head {
   gap: var(--space-2);
   cursor: pointer;
   list-style: none;
-  padding: var(--space-2) var(--space-4);
-  border: 1px solid var(--ds-border);
-  border-left: 3px solid var(--ds-border);
-  border-radius: var(--radius-md);
-  background: var(--ds-surface-dim);
+  padding: var(--space-1) 0;
   color: var(--ds-text-secondary);
   font-size: var(--text-sm);
 }
 summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
-.cloud-chat-tool-group.is-running > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-info-line); }
-.cloud-chat-tool-group.is-done    > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-success-line); }
-.cloud-chat-tool-group.is-error   > .cloud-chat-tool-group-head { border-left-color: var(--ds-accent-danger-line); }
 .cloud-chat-tool-group-icon {
   flex: 0 0 auto;
   font-size: var(--text-md);
@@ -1303,7 +1495,7 @@ summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool-group.is-done    .cloud-chat-tool-group-icon { color: var(--ds-accent-success-line); }
 .cloud-chat-tool-group.is-error   .cloud-chat-tool-group-icon { color: var(--ds-accent-danger-line); }
 .cloud-chat-tool-group-label {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1311,11 +1503,30 @@ summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
   font-weight: var(--font-medium);
   color: var(--ds-text-primary);
 }
+/* Once the run has settled the label IS the control — "Show 6 steps" / "Hide
+   6 steps" (chat.js → _updateToolGroupSummary) — so it reads as the link it
+   behaves like. While the run is still going the label is the name of the step
+   in progress: a status, not something to click, and it keeps ordinary ink. */
+.cloud-chat-tool-group:not(.is-running) > .cloud-chat-tool-group-head .cloud-chat-tool-group-label {
+  color: var(--ds-primary);
+}
+summary.cloud-chat-tool-group-head:hover .cloud-chat-tool-group-label,
+summary.cloud-chat-tool-group-head:focus-visible .cloud-chat-tool-group-label {
+  text-decoration: underline;
+}
+/* Everything on the line packs LEFT, and the row's leftover width is simply
+   empty. Nothing stretches: with the box gone there is no edge for a count or
+   a caret to sit against, and pinning them right left a rail of marks
+   floating in whitespace with nothing to belong to. */
 .cloud-chat-tool-group-meta {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   font-size: var(--text-xs);
   color: var(--ds-text-muted);
   font-variant-numeric: tabular-nums;
+}
+.cloud-chat-tool-group-head > .cloud-chat-tool-chevron {
+  order: -1;
+  margin-right: calc(var(--space-1) * -1);
 }
 .cloud-chat-tool-group[open] > .cloud-chat-tool-group-head .cloud-chat-tool-chevron {
   transform: rotate(90deg);
@@ -1328,8 +1539,14 @@ summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
 }
 .cloud-chat-tool-group-body > .cloud-chat-tool {
   max-width: none;
-  margin-left: 0;
-  margin-right: 0;
+  /* ALL FOUR sides, not just the horizontal pair. A step's negative vertical
+     margin exists solely to claw back the messages column's flex `gap`
+     (see .cloud-chat-tool) — and inside the group body there is no gap to
+     claw back: these are ordinary block children, so the -8px collapsed the
+     first row into the header and every later row into the one above it.
+     Measured at -8px on every boundary. Zero here, with the step head's own
+     padding supplying the rhythm. (Review on #2049.) */
+  margin: 0;
 }
 
 .cloud-chat-tool-head {
@@ -1357,8 +1574,16 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   font-size: var(--text-md);
   line-height: 1;
 }
+/* The icon is the ONLY thing carrying a step's status now that a step draws no
+   status edge, so each of these is a meaningful graphic owing 3:1 (WCAG
+   1.4.11). Measured against the chat surface: info-line 3.82:1 and danger-line
+   4.83:1 are comfortable, but success-line came to 3.30:1 — clearing the floor
+   by too little for the state a reader sees most — so success takes -ink
+   (7.13:1 light, 10.91:1 dark). Only steps ever wear `is-done`; the approval
+   and question cards resolve out of `is-running` without it, so this is scoped
+   to the step by the state, not by a second selector. */
 .cloud-chat-tool.is-running .cloud-chat-tool-icon { color: var(--ds-accent-info-line); }
-.cloud-chat-tool.is-done    .cloud-chat-tool-icon { color: var(--ds-accent-success-line); }
+.cloud-chat-tool.is-done    .cloud-chat-tool-icon { color: var(--ds-accent-success-ink); }
 .cloud-chat-tool.is-error   .cloud-chat-tool-icon { color: var(--ds-accent-danger-line); }
 /* The header names a reader-facing ACTION ("Querying data"), not a tool id —
    it reads as prose, so it gets the prose face. The raw id lives in the
@@ -1421,40 +1646,126 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 }
 .cloud-chat-tool[open] .cloud-chat-tool-chevron { transform: rotate(90deg); }
 
+/* A panel is just a caption over a payload. The box it used to draw is now the
+   open step's left rule (above), so nesting one here would be a rectangle
+   inside a rectangle — which is exactly what the Command panel looked like:
+   a bordered white box whose only content was another padded block holding
+   thirteen characters. */
 .cloud-chat-tool-args,
 .cloud-chat-tool-json,
 .cloud-chat-tool-result-full {
   margin-top: var(--space-2);
-  padding: var(--space-2);
-  background: var(--ds-surface);
-  border: 1px solid var(--ds-border);
-  border-radius: var(--radius-sm);
+  padding: 0;
 }
-/* The label over a formatted-JSON panel (Args / Result) — same voice as
-   the toggles below, but it is a heading, not a control. */
+/* The caption over a panel (Command / SQL / Args / Result) — a heading, not a
+   control, and close enough to what it labels to read as attached to it. */
 .cloud-chat-tool-panel-label {
+  margin-bottom: var(--space-1);
   font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.8px;
   color: var(--ds-text-muted);
   user-select: none;
 }
-.cloud-chat-tool-result-full > summary {
+/* "Show all 22 lines" / "Show less" / "Raw JSON" are controls, so they read
+   like the group header's Show/Hide rather than like a caption — same accent,
+   sentence case, no box of their own. `.cloud-chat-tool-result-more` is a real
+   <button>: it grows the payload in place rather than disclosing a hidden one,
+   which is not what a <summary> means (see chat.js -> _expandInPlace). */
+.cloud-chat-tool-result-full > summary,
+.cloud-chat-tool-result-more {
   cursor: pointer;
   user-select: none;
   font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  color: var(--ds-text-muted);
+  color: var(--ds-primary);
+}
+.cloud-chat-tool-result-more {
+  display: block;
+  margin-top: var(--space-1);
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+}
+.cloud-chat-tool-result-full > summary:hover,
+.cloud-chat-tool-result-full > summary:focus-visible,
+.cloud-chat-tool-result-more:hover,
+.cloud-chat-tool-result-more:focus-visible {
+  text-decoration: underline;
 }
 .cloud-chat-tool-args pre,
 .cloud-chat-tool-json pre,
 .cloud-chat-tool-result-full pre {
-  margin: var(--space-2) 0 0;
-  padding: 0;
-  background: transparent;
+  margin: 0;
   font-size: var(--text-xs);
   overflow-x: auto;
+}
+/* A code panel inside a tool card wears the CARD's surface, not the
+   transcript's dark code chrome. The rule directly above already asks for
+   that — `background: transparent` over the panel's own --ds-surface — but
+   `.cloud-chat-messages details pre.code-block-wrap` outranks it (0,2,2 vs
+   0,1,1) and repainted every panel --ds-code-bg: a dark slab dropped into a
+   white card, for what is usually one line of shell. The selectors here carry
+   three classes so the panel's own intent wins. Geometry is deliberately left
+   to the rules above and below; only the paint is corrected.
+
+   The --ds-code-* token family cannot come along onto that surface. Every
+   value in it is tuned to clear 5.5:1 against the near-black --ds-code-bg
+   (see the token block near the top of this file), so on a light card it
+   would be the unreadable half of the very problem that block exists to fix.
+   The token spans fall back to the card's ink instead — these panels are
+   unhighlighted by design, and short shell/SQL/JSON reads fine without it. */
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap {
+  /* A quiet tint rather than the transcript's near-black slab: enough to read
+     as code, and somewhere for the hover copy button to sit. Geometry is
+     corrected here too — the shared rule's --space-3 padding and --space-2
+     margin were nesting inside the panel's own, which is most of why one line
+     of shell occupied a box five lines tall. */
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+  border-radius: var(--radius-sm);
+  /* Shrink to the code, not to the column. `agnes catalog` is thirteen
+     characters and was painting a band the full width of the reading column;
+     inline-block sizes the tint to what is actually in it, and max-width keeps
+     a long statement inside the column and scrolling. */
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+}
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap code,
+.cloud-chat-messages .cloud-chat-tool pre.code-block-wrap code [class*="hljs-"] {
+  color: inherit;
+}
+/* Console output whose alignment is the content (a rich box table from
+   `agnes query` / `agnes catalog`): monospace, unwrapped, scrolling
+   sideways rather than reflowing — a wrapped column is a broken column. */
+.cloud-chat-tool-console {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
+  border-radius: var(--radius-sm);
+  /* Sized to the table, not to the column — same reason as the code block
+     above. A 43-column catalog listing has no business painting 750px.
+     `max-width` is the other half of that: without it an inline-block takes
+     its INTRINSIC width, so one long unbroken line grows the block past the
+     reading column instead of scrolling inside the `overflow` below.
+     (Review on #2049.) */
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  color: var(--ds-text-primary);
+  white-space: pre;
+  max-height: 280px;
+  overflow: auto;
+}
+.cloud-chat-tool-result-full .cloud-chat-tool-console {
+  margin-top: var(--space-2);
 }
 
 .cloud-chat-tool-result {
@@ -1496,10 +1807,15 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool-result-preview > :last-child  { margin-bottom: 0; }
 .cloud-chat-tool-result.is-json pre {
   margin: 0;
-  padding: var(--space-2);
-  background: var(--ds-surface);
-  border: 1px solid var(--ds-border);
+  padding: var(--space-2) var(--space-3);
+  background: var(--ds-surface-dim);
   border-radius: var(--radius-sm);
+  /* Shrink to the payload, but never past the column: an inline-block with no
+     max-width takes its intrinsic width, so a single long JSON string would
+     widen the block rather than scroll inside it. (Review on #2049.) */
+  display: inline-block;
+  vertical-align: top;
+  max-width: 100%;
   font-size: var(--text-xs);
   max-height: 280px;
   overflow: auto;
@@ -1632,6 +1948,66 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 .cloud-chat-send-btn:disabled {
   opacity: 0.55;
   cursor: progress;
+}
+
+/* ============================================================ jump to latest
+   Shown only while the reader has scrolled off the floor of a thread — see
+   the smart auto-scroll section in chat.js. Anchored to .cloud-chat-form's
+   position: relative (the same anchor the slash menu uses), which is the one
+   element that is positioned in BOTH the default and the rail layout, so one
+   rule seats it over the composer in each.
+
+   Deliberately quiet: it sits between the reader and the answer they are
+   reading, so it wears the secondary ink and the surface's own fill rather
+   than the send button's accent. It is a way back, not a call to action. */
+.cloud-chat-jump {
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;                 /* over the rail layout's floating composer (3) */
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 6px var(--space-3);
+  border: 1px solid var(--ds-border);
+  /* A LABELLED button, so --ds-radius-btn and not --ds-radius-pill, even
+     though its size and its job both read pill-ish (design-tokens.css states
+     the rule; #2049 moved the landing chip onto the token for the same
+     reason). */
+  border-radius: var(--ds-radius-btn);
+  background: var(--ds-surface);
+  /* The SAME floating vocabulary as .cloud-chat-slash-menu, which hangs off
+     this very anchor: surface fill, hairline border, elevated shadow. In dark
+     the fill and the page are 1.08:1 apart and a light theme's shadow is
+     nearly invisible, so on both themes it is the shadow that separates the
+     chip from the prose under it — and --shadow-elevated is the one that
+     carries real weight in dark (rgba(0,0,0,.55)). --shadow-sm did not. */
+  box-shadow: var(--shadow-elevated);
+  color: var(--ds-text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+}
+/* `display: inline-flex` above would otherwise beat the [hidden] default. */
+.cloud-chat-jump[hidden] { display: none; }
+.cloud-chat-jump svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+/* Ink only. A fill swap would have to move in opposite directions per theme
+   (--ds-surface-dim is lighter than the surface in dark, darker in light), and
+   a hover that means "raised" here and "pressed" there is worse than none. */
+.cloud-chat-jump:hover {
+  color: var(--ds-text-primary);
+  border-color: var(--ds-primary);
+}
+.cloud-chat-jump:focus-visible {
+  outline: var(--ds-focus-outline);
+  outline-offset: var(--ds-focus-outline-offset);
 }
 
 /* ============================================================ slash menu
@@ -1839,40 +2215,42 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 }
 
 /* Next-action chips — the model's suggested follow-ups, lifted out of the
-   ```next_actions trailer and rendered under the latest answer only. */
+   ```next_actions trailer and rendered under the latest answer only.
+
+   The CHIP itself is the landing screen's `.rdb-action` (chat_dashboard.css),
+   applied by chat.js rather than re-described here. It is the same offer in
+   both places — a question you can ask next — and describing it twice is what
+   let the two drift into visibly different components: 9px radius against
+   11px, an opaque surface against a translucent one, a hover that recoloured
+   the text against one that tinted the background. Only what is genuinely
+   different about this context lives below.
+
+   The row stays LEFT-aligned where the landing row centres: there it is a
+   hero above the composer, here it hangs off the end of an answer. */
 .cloud-chat-next-actions {
+  /* A COLUMN, one suggestion per line. Wrapped in a row they read as a
+     toolbar — a set of controls acting on the answer — where stacked and
+     left-aligned they read as what they are: alternative next questions, the
+     same shape as a list of choices. It also keeps a long suggestion from
+     making its neighbour look truncated. */
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  /* Far enough to read as its own offer rather than as the answer's last
+     line. 10px put it inside the paragraph rhythm it sits after. */
+  margin-top: var(--space-4);
 }
-.cloud-chat-next-action {
-  border: 1px solid var(--ds-border);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  /* --ds-radius-btn, not -pill: pill is badge language; these are labelled
-     buttons (design-system shape rule). */
-  border-radius: var(--ds-radius-btn);
-  padding: 4px 12px;
-  font-size: 0.85rem;
-  cursor: pointer;
-  text-align: left;
-}
-.cloud-chat-next-action:hover:not([disabled]) {
-  border-color: var(--ds-primary);
-  color: var(--ds-primary);
+.cloud-chat-next-actions-hd {
+  margin: 0 0 var(--space-1);
 }
 /* Drawn mid-stream: the follow-ups are on screen the moment the trailer
    closes, but the turn is still running and a click would submit into it.
-   Muted and inert until finalize re-renders the row enabled. */
-.cloud-chat-next-action[disabled] {
-  color: var(--ds-text-muted);
-  cursor: default;
-}
-.cloud-chat-next-action:focus-visible {
-  outline: var(--ds-focus-outline);
-  outline-offset: var(--ds-focus-outline-offset);
-}
+   The greying comes from `.rdb-action:disabled` with the rest of the chip —
+   this only stops the TITLE opting back out, since `.rdb-action-title` sets
+   its own colour and would otherwise stay full-strength inside a greyed
+   button. */
+.cloud-chat-next-action[disabled] .rdb-action-title { color: inherit; }
 
 .cloud-chat-capabilities-footer {
   margin-top: var(--space-1);

@@ -76,6 +76,41 @@ def _seed_collection_grant(corpus_id: str, user_id: str) -> None:
     conn.close()
 
 
+def _seed_files_direct(
+    corpus_id: str,
+    filenames: list[str],
+    *,
+    status: str = "indexed",
+    path_prefix: str | None = None,
+) -> list[str]:
+    """Insert ``corpus_files`` rows directly through the repo factory,
+    bypassing upload/ingest — fast seeding for pagination/search tests that
+    don't care about file bytes or background processing.
+
+    ``add()`` always inserts at ``processing_status='pending'``; ``status``
+    is applied afterwards via ``set_status`` (skipped when ``"pending"`` is
+    asked for, which is the insert default already).
+    """
+    from src.repositories import corpus_files_repo
+
+    repo = corpus_files_repo()
+    ids = []
+    for i, name in enumerate(filenames):
+        fid = repo.add(
+            corpus_id=corpus_id,
+            filename=name,
+            sha256=f"sha_{corpus_id}_{i}",
+            file_type="text/plain",
+            size_bytes=10,
+            storage_path=None,
+            path=f"{path_prefix}/{name}" if path_prefix else None,
+        )
+        if status != "pending":
+            repo.set_status(fid, status=status)
+        ids.append(fid)
+    return ids
+
+
 class TestCreateCollection:
     def test_admin_creates_collection(self, seeded_app):
         c = seeded_app["client"]
@@ -2605,3 +2640,249 @@ class TestSharePointIngestGateUpload:
             headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 201, resp.text
+
+
+class TestFileListPagination:
+    """GET /api/collections/{id}/files — limit/offset/q/status/order.
+
+    Builds directly on Task A's ``corpus_files_repo().list_for_corpus`` /
+    ``count_for_corpus`` (see ``_seed_files_direct``); these tests cover the
+    HTTP-layer contract: default limit, real clamping (never 422), the
+    blank-param-means-no-filter trap, and that ``total`` reflects the
+    filtered count rather than the whole collection.
+    """
+
+    def _collection(self, seeded_app, name: str = "Pagination Target") -> str:
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"]))
+        assert cr.status_code == 201, cr.text
+        return cr.json()["id"]
+
+    def test_default_limit_is_25(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, [f"file_{i:03d}.txt" for i in range(30)])
+
+        resp = c.get(f"/api/collections/{corpus_id}/files", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["files"]) == 25
+        assert body["total"] == 30
+        assert body["limit"] == 25
+        assert body["offset"] == 0
+
+    def test_paging_covers_everything_without_overlap(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        names = [f"file_{i:03d}.txt" for i in range(23)]
+        _seed_files_direct(corpus_id, names)
+
+        seen: list[str] = []
+        offset = 0
+        limit = 10
+        while True:
+            resp = c.get(
+                f"/api/collections/{corpus_id}/files",
+                params={"limit": limit, "offset": offset, "order": "name"},
+                headers=_auth(seeded_app["admin_token"]),
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body["total"] == 23
+            page_names = [f["filename"] for f in body["files"]]
+            seen.extend(page_names)
+            if len(page_names) < limit:
+                break
+            offset += limit
+        # 'name' order is LOWER(filename) ASC; our zero-padded names already
+        # sort lexically the same as numerically, so this also proves no
+        # page repeated or skipped a row (the ", id ASC" tie-break at work).
+        assert seen == sorted(names)
+        assert len(seen) == len(set(seen)) == 23
+
+    def test_total_reflects_q_filter(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["report_jan.txt", "report_feb.txt", "notes.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"q": "report"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["total"] == 2
+        assert {f["filename"] for f in body["files"]} == {"report_jan.txt", "report_feb.txt"}
+
+    def test_total_reflects_status_filter(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        ids = _seed_files_direct(corpus_id, ["a.txt", "b.txt", "c.txt"], status="pending")
+        from src.repositories import corpus_files_repo
+
+        corpus_files_repo().set_status(ids[0], status="indexed")
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"status": "indexed"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["files"][0]["file_id"] == ids[0]
+
+    def test_blank_q_and_status_mean_no_filter(self, seeded_app):
+        """``?q=&status=`` (what every HTML form sends for an unset optional)
+        must behave as "no filter" — the exact live-bug pattern the
+        ``?corpus_id=`` comment on ``search_collections`` documents, one
+        query parameter over."""
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["one.txt", "two.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"q": "", "status": ""},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["total"] == 2
+        assert len(body["files"]) == 2
+
+    def test_q_matches_path_too(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt"], path_prefix="Contracts/2026")
+        _seed_files_direct(corpus_id, ["b.txt"], path_prefix="Notes")
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"q": "contracts"},  # case-insensitive, matches the path not the filename
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["files"][0]["filename"] == "a.txt"
+
+    def test_limit_zero_clamps_to_one(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt", "b.txt", "c.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"limit": 0},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["limit"] == 1
+        assert len(body["files"]) == 1
+        assert body["total"] == 3
+
+    def test_limit_huge_clamps_to_200(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt", "b.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"limit": 99999},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["limit"] == 200
+        assert len(body["files"]) == 2  # clamped, but there's nowhere near 200 rows to return
+
+    def test_offset_negative_clamps_to_zero(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt", "b.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"offset": -5},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["offset"] == 0
+        assert len(body["files"]) == 2
+
+    def test_unknown_order_falls_back_without_erroring(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt", "b.txt"])
+
+        resp = c.get(
+            f"/api/collections/{corpus_id}/files",
+            params={"order": "not_a_real_order; DROP TABLE corpus_files"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["files"]) == 2
+
+    def test_non_member_still_denied_not_a_paged_list(self, seeded_app):
+        """RBAC is unaffected by pagination: a caller with no grant is denied
+        exactly as before — never handed a (possibly empty) paged listing."""
+        corpus_id = self._collection(seeded_app, "Paged RBAC Guard")
+        resp = seeded_app["client"].get(
+            f"/api/collections/{corpus_id}/files",
+            params={"limit": 5, "q": "anything"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 403
+
+
+class TestGetCollectionFilesPreview:
+    """GET /api/collections/{id} — the inline ``files`` list is now bounded
+    to the same default limit (25) as the dedicated files endpoint, with
+    ``files_total`` / ``files_truncated`` telling the caller whether it's
+    looking at the whole collection or a preview of it.
+    """
+
+    def _collection(self, seeded_app, name: str = "Preview Target") -> str:
+        c = seeded_app["client"]
+        cr = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"]))
+        assert cr.status_code == 201, cr.text
+        return cr.json()["id"]
+
+    def test_small_collection_is_not_truncated(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, ["a.txt", "b.txt"])
+
+        resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["files"]) == 2
+        assert body["files_total"] == 2
+        assert body["files_truncated"] is False
+
+    def test_large_collection_is_truncated_to_25(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+        _seed_files_direct(corpus_id, [f"file_{i:03d}.txt" for i in range(30)])
+
+        resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["files"]) == 25
+        assert body["files_total"] == 30
+        assert body["files_truncated"] is True
+
+    def test_empty_collection_is_not_truncated(self, seeded_app):
+        c = seeded_app["client"]
+        corpus_id = self._collection(seeded_app)
+
+        resp = c.get(f"/api/collections/{corpus_id}", headers=_auth(seeded_app["admin_token"]))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["files"] == []
+        assert body["files_total"] == 0
+        assert body["files_truncated"] is False

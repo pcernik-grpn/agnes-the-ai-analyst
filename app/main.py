@@ -1951,21 +1951,10 @@ async def lifespan(app):
                     # into the runner frame protocol. Gated above on
                     # KAI_HOST_JWT_SECRET (_chat_kai_agent_ok).
                     provider = KaiEngineProvider(base_url=app.state.chat_config.kai_agent_url)
-                    # Two cost caps read chat_messages.tokens_in/out, which only
-                    # a usage-carrying frame writes; the engine's stream carries
-                    # none. Both ship LIVE defaults ($20/day, 200k/session), so
-                    # this provider silently removes two budgets instance-wide.
-                    # Say so at boot rather than let it surface as a bill —
-                    # `/api/chat/readiness` reports the same list as
-                    # `unmetered_caps` so /admin can show it too.
-                    for _cap in ("daily_anthropic_spend_usd", "max_session_tokens"):
-                        if getattr(app.state.chat_config, _cap, None):
-                            logger.warning(
-                                "chat provider 'kai-agent': %s is configured but NOT enforced — the engine "
-                                "stream carries no token usage, so nothing accrues against it. Cap engine "
-                                "spend per agent with token_budget_monthly instead.",
-                                _cap,
-                            )
+                    # `daily_anthropic_spend_usd` and `max_session_tokens` are
+                    # metered on this provider too, from the usage the broker
+                    # observes while forwarding the engine's LLM calls
+                    # (app/chat/turn_usage.py) — no "not enforced" warning here.
                 mgr = ChatManager(
                     provider=provider,
                     workdir_mgr=workdir_mgr,
@@ -3203,6 +3192,14 @@ def create_app() -> FastAPI:
 
     # Paths served as API responses (JSON / ZIP / git smart-HTTP) — never
     # redirect a 401 here to the HTML login page; clients expect the raw 401.
+    #
+    # Under ``/marketplace/`` only the two machine-facing routes are listed
+    # (``/marketplace/info`` diagnostics, ``/marketplace/cowork/*.zip``
+    # bundles); the detail / guide pages beneath the same prefix are HTML and
+    # must send a signed-out browser to /login like every other page. A bare
+    # ``"/marketplace/"`` entry once covered the whole subtree and turned
+    # every shared plugin deep link into a raw JSON 401 for anyone not
+    # signed in.
     _API_PATH_PREFIXES: tuple[str, ...] = (
         "/api/",
         "/auth/",
@@ -3211,7 +3208,8 @@ def create_app() -> FastAPI:
         "/webhooks/",
         "/marketplace.zip",
         "/marketplace.git",
-        "/marketplace/",
+        "/marketplace/info",
+        "/marketplace/cowork/",
         "/admin/chat",
     )
 
@@ -3416,8 +3414,9 @@ def create_app() -> FastAPI:
           ``_catch_all_404`` route at the end of ``app.web.router`` provides a
           matched route for unrouted paths).
         - API prefixes (``/api/``, ``/auth/``, ``/marketplace.zip``,
-          ``/marketplace.git``, ``/marketplace/``) and non-HTML clients → JSON
-          ``{"detail": "..."}`` per the existing contract.
+          ``/marketplace.git``, ``/marketplace/info``, ``/marketplace/cowork/``)
+          and non-HTML clients → JSON ``{"detail": "..."}`` per the existing
+          contract.
         """
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
 

@@ -59,6 +59,12 @@ RAIL_HTML = Path("app/web/templates/_app_rail.html").read_text(encoding="utf-8")
 FILTER_TOOLBAR_CSS = Path("app/web/static/css/filter_toolbar.css").read_text(encoding="utf-8")
 ADMIN_NAV_JS = Path("app/web/static/js/admin/admin_nav.js").read_text(encoding="utf-8")
 RAIL_TOGGLE_JS = Path("app/web/static/js/rail_toggle.js").read_text(encoding="utf-8")
+# The compound that fires the collapsed rail's peek, named once so the guards
+# below assert on the BEHAVIOUR rather than on a literal that has now been
+# rewritten three times (`.rail-no-peek` for the collapse that just happened,
+# then a hover-only gate for the pages carrying the admin secondary nav, then
+# `.rail-strip-only` when that gate proved reachable by clicking the search box).
+PEEK_TRIGGER = ":where(:not(.rail-strip-only)):is(:hover, :focus-within)"
 
 # Routes deliberately outside the sidebar's scope — see admin_nav.py's module
 # docstring for why each is excluded.
@@ -742,7 +748,7 @@ class TestRailCollapsePreference:
         monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
         c = seeded_app["client"]
         admin_text = c.get("/admin/users", headers=self._auth(seeded_app["admin_token"])).text
-        assert 'class="rail rail-icon-mode"' in admin_text
+        assert 'class="rail rail-icon-mode rail-strip-only"' in admin_text
         assert 'class="admin-nav"' in admin_text
 
         lib_text = c.get("/library", headers=self._auth(seeded_app["admin_token"])).text
@@ -835,7 +841,7 @@ class TestRailCollapsePreference:
         c = seeded_app["client"]
         resp = c.get("/admin/users", headers=self._auth(seeded_app["admin_token"]))
         text = resp.text
-        nav = text.split('<nav class="rail rail-icon-mode"', 1)[1].split("</nav>", 1)[0]
+        nav = text.split('<nav class="rail rail-icon-mode', 1)[1].split("</nav>", 1)[0]
         assert "rail-admin-summary" not in nav
         assert "rail-admin-flyout" not in nav
         assert 'rail-i on" href="/admin"' in nav
@@ -988,7 +994,7 @@ class TestRailCollapseCss:
         # Hover and keyboard :focus-within both peek it open — no separate
         # "pinned open" class any more (clicking the toggle persists the
         # preference instead, which removes .rail-icon-mode outright).
-        assert ":is(:hover, :focus-within) {" in block
+        assert PEEK_TRIGGER + " {" in block
         assert "rail-pinned-open" not in RAIL_CSS
         assert "width: 240px;" in block
 
@@ -1004,7 +1010,7 @@ class TestRailCollapseCss:
         # below), and pinning the exact string made this fail for a change that
         # left its actual invariant — delayed open, instant close — intact.
         peek = re.search(
-            r'html\[data-ui-layout="rail"\] \.rail\.rail-icon-mode[^ ]*:is\(:hover, :focus-within\) \{([^}]*)\}',
+            r'html\[data-ui-layout="rail"\] \.rail\.rail-icon-mode\S*:is\(:hover\S*, :focus-within\) \{([^}]*)\}',
             block,
         )
         assert peek, "no rule peeks the collapsed rail open"
@@ -1021,7 +1027,7 @@ class TestRailCollapseCss:
         while the width is still animating replays the overlap for 160ms."""
         block = self._desktop_block()
         peek = re.search(
-            r'html\[data-ui-layout="rail"\] \.rail\.rail-icon-mode[^ ]*:is\(:hover, :focus-within\) \{([^}]*)\}',
+            r'html\[data-ui-layout="rail"\] \.rail\.rail-icon-mode\S*:is\(:hover\S*, :focus-within\) \{([^}]*)\}',
             block,
         )
         assert peek
@@ -1061,7 +1067,7 @@ class TestRailCollapseCss:
         stayed 240px wide on top of it, and nothing looked collapsed until the
         caller wandered off. Every peek rule is gated on `:not(.rail-no-peek)`,
         which rail_toggle.js parks on the rail for exactly that window."""
-        peeks = re.findall(r"\.rail\.rail-icon-mode(:not\(\.rail-no-peek\))?:is\(:hover, :focus-within\)", RAIL_CSS)
+        peeks = re.findall(r"\.rail\.rail-icon-mode(:not\(\.rail-no-peek\))?\S*:is\(:hover, :focus-within\)", RAIL_CSS)
         assert peeks, "no peek rules found"
         assert all(peeks), "a peek rule is missing its :not(.rail-no-peek) gate — a collapse can stall open on it"
         # The class is inert on its own: it must never carry declarations of
@@ -1071,6 +1077,157 @@ class TestRailCollapseCss:
         assert "rail-no-peek" in RAIL_TOGGLE_JS
         assert "function releasePeek" in RAIL_TOGGLE_JS
         assert "pointermove" in RAIL_TOGGLE_JS, "release must not rely on mouseleave alone (the rail shrinks away)"
+
+    def test_the_peek_is_off_entirely_where_the_admin_column_is(self) -> None:
+        """A peek is a 240px overlay; the admin secondary nav is a 200px column
+        starting at the rail's own right edge. On an admin page the two are the
+        same pixels, so opening the peek erased the navigation in use (#1956
+        item 6). Every peek rule is gated on `.rail-strip-only`.
+
+        BOTH triggers, and the second one is why this test is not called
+        `..._hover_peek_...` any more. The first cut gated only `:hover` and
+        kept `:focus-within`, reasoning that focus is deliberate where a pointer
+        pass is not — but the search box is focused BY CLICKING IT, so one click
+        on the magnifier still replaced the admin column and the reported bug
+        came back by a second route. Any trigger that can widen this rail in
+        place is a way back to it."""
+        # Comments stripped first: this section's own header spells the gate out
+        # in prose, and matching prose is not matching CSS.
+        css = re.sub(r"/\*.*?\*/", "", RAIL_CSS, flags=re.S)
+        peeks = re.findall(r"\.rail\.rail-icon-mode(\S*):is\(:hover, :focus-within\)", css)
+        assert peeks, "no peek rules found"
+        for gate in peeks:
+            assert gate == ":not(.rail-no-peek):where(:not(.rail-strip-only))", gate
+        # No surviving hover-only form: a rule that gates one trigger and not the
+        # other is exactly the bug this replaced.
+        assert ":hover:where(:not(.rail-strip-only))" not in css
+        assert ":hover:not(.rail-strip-only)" not in css
+
+    def test_the_gate_costs_the_peek_no_specificity(self) -> None:
+        """`:where()`, never a bare `:not()`, and it is load-bearing rather than
+        stylistic. `:is()` takes the specificity of its most specific argument,
+        and a plain `:not(.rail-strip-only)` on the compound would add a class to
+        every peek rule — silently outranking the `:focus-within`-only rule that
+        follows them (the one dropping the reveal delay for keyboard callers,
+        which wins today on source order alone)."""
+        # Comments stripped first — the header quotes the very selector this
+        # guard forbids, as the explanation of why.
+        css = re.sub(r"/\*.*?\*/", "", RAIL_CSS, flags=re.S)
+        assert ":not(.rail-strip-only):is(" not in css
+        assert ":where(:not(.rail-strip-only)):is(" in css
+        # The rule the specificity tie protects, still present and still last.
+        delay_free = 'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):focus-within .rail-i-label'
+        assert delay_free in css
+        assert css.index(delay_free) > css.index(PEEK_TRIGGER + " .rail-i-label")
+
+    def test_search_flies_out_instead_of_opening_the_column(self) -> None:
+        """The path that proved the hover-only gate wrong. A 40px box is not
+        typable, so search needs width — it just must not take it from the
+        column beside it. The field flies out to the right of the strip; the
+        results list follows the field rather than the strip it came from."""
+        block = self._desktop_block()
+        flyout = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only'
+            " .rail-search:focus-within .rail-search-input {",
+            1,
+        )[1].split("}", 1)[0]
+        assert "left: calc(100% + 6px)" in flyout, "the field must leave the strip, not widen it"
+        assert "opacity: 1" in flyout
+        # At rest it is the invisible click target — focus is unreachable
+        # otherwise, since the real box is not rendered in the strip.
+        rest = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-search-input {', 1
+        )[1].split("}", 1)[0]
+        assert "opacity: 0" in rest and "inset: 0" in rest
+        assert "height: 100%" in rest, "the base row-height outranks inset:0 and the target overhangs its box"
+        panel = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-search-panel {', 1
+        )[1].split("}", 1)[0]
+        assert "left: calc(100% + 6px)" in panel
+
+    def test_a_hovered_row_still_names_itself_with_a_chip(self) -> None:
+        """Turning the peek off cannot leave a 56px strip of unlabelled glyphs.
+        Hovering one row unfurls THAT row's label beside its icon — 34px of chip
+        over the neighbouring column instead of 240px of overlay erasing it."""
+        block = self._desktop_block()
+        chip_sel = (
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only'
+            " .rail-i:hover .rail-i-label,"
+        )
+        assert chip_sel in block
+        chip = block.split(chip_sel, 1)[1].split("{", 1)[1].split("}", 1)[0]
+        assert "position: absolute" in chip, "the chip must leave the 56px column, not stretch it"
+        assert "visibility: visible" in chip and "opacity: 1" in chip
+        # Inert: a tooltip that takes the pointer would eat the click it annotates.
+        assert "pointer-events: none" in chip
+        # It reuses the row's OWN label element rather than a `data-label` copy —
+        # two sources for one string is how a renamed row ends up named twice.
+        assert "content:" not in chip
+
+    def test_the_chip_also_names_a_row_for_the_keyboard(self) -> None:
+        """With the focus peek gone too, nothing else names a row for a keyboard
+        caller — so the chip answers both triggers. `:focus-visible` and not
+        `:focus`, or a row clicked with the mouse would leave a chip pinned
+        behind the pointer after it moved away."""
+        block = self._desktop_block()
+        assert (
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only'
+            " .rail-i:focus-visible .rail-i-label" in block
+        )
+        assert (
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus '
+            not in block
+        ), "plain :focus pins a chip behind a mouse click"
+
+    def test_the_strips_labels_stay_in_the_accessibility_tree(self) -> None:
+        """A row a screen reader can only call "link" is not navigation.
+
+        The shared collapse rule parks every label at `visibility: hidden`,
+        which removes it from the accessibility tree as well as the screen.
+        That was survivable while the peek existed — reaching the rail restored
+        every label at once. With no peek, the strip would be permanently
+        unnamed, so on this rail the labels are screen-reader-only instead:
+        clipped to 1px, taking no space, still in the tree.
+
+        No `aria-label` anywhere: the row already contains its name, and a copy
+        in an attribute is a second source for one string. The guard checks that
+        too, because adding one is the tempting wrong fix."""
+        block = self._desktop_block()
+        sr = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i-label,', 1
+        )[1].split("{", 1)[1].split("}", 1)[0]
+        assert "visibility: visible" in sr, "a hidden label is not in the accessibility tree"
+        assert "display: none" not in sr, "nor is a display:none one"
+        assert "clip-path: inset(50%)" in sr and "width: 1px" in sr
+        assert 'aria-label="Library"' not in RAIL_HTML
+        assert 'aria-label="New chat"' not in RAIL_HTML
+
+    def test_the_chips_host_row_unclips_itself(self) -> None:
+        """The collapsed-only Chats stand-in clips itself (`overflow: hidden`, up
+        with the fold rules) so its glyph cannot spill mid-fold — and that clip
+        would take the chip's left half with it."""
+        block = self._desktop_block()
+        host = block.split(
+            'html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover,', 1
+        )[1].split("{", 1)[1].split("}", 1)[0]
+        assert "overflow: visible" in host
+        assert "position: relative" in host, "the chip is absolutely positioned against this row"
+
+    def test_the_class_is_rendered_for_paint_and_reconciled_against_the_dom(self) -> None:
+        """A path is only a GUESS at what a template renders — an /admin route
+        whose feature flag is off answers with the plain error page, which has no
+        second column. So the server renders the class for first paint (a hover
+        cannot wait on JS to learn whether it may peek) and rail_toggle.js
+        reconciles it against the DOM in BOTH directions once the document is
+        parsed, or a stale guess outlives the page it was made for."""
+        assert "rail-strip-only" in RAIL_HTML
+        assert 'querySelector(".admin-nav")' in RAIL_TOGGLE_JS
+        toggle_call = re.search(
+            r'rail\.classList\.toggle\("rail-strip-only",\s*(.+?)\);',
+            RAIL_TOGGLE_JS,
+        )
+        assert toggle_call, "the class must be TOGGLED, not merely added — removal is half the job"
+        assert ".admin-nav" in toggle_call.group(1)
 
     def test_the_column_opens_before_anything_inside_it_appears(self) -> None:
         """The sequence the whole peek depends on: width first, content second,
@@ -1095,7 +1252,17 @@ class TestRailCollapseCss:
         reveals = [
             rule
             for rule in re.findall(r"\.rail-icon-mode[^{]*(?::hover|:focus-within)[^{]*\{[^}]*\}", block)
-            if "opacity: 1;" in rule
+            # `.rail-strip-only` is the rail that CANNOT hover-peek (the pages
+            # carrying the admin secondary nav, #1956 item 6). Its label chip is a
+            # tooltip, not a reveal: there is no column opening for it to trail, and
+            # a tooltip that waits out the width's 120ms anti-pass-through delay is a
+            # tooltip nobody sees. Excluded by the selector rather than by name, so a
+            # SECOND chip rule cannot slip past this guard by being called something
+            # else — and so a genuine peek rule can never land in the exemption.
+            # The COMPOUND `.rail-icon-mode.rail-strip-only` is what identifies
+            # it, not the bare class: every peek rule mentions `.rail-strip-only`
+            # too, inside the `:hover:where(:not(…))` that gates it.
+            if "opacity: 1;" in rule and ".rail-icon-mode.rail-strip-only" not in rule.split("{", 1)[0]
         ]
         assert len(reveals) >= 3, reveals
         for rule in reveals:
@@ -1104,6 +1271,33 @@ class TestRailCollapseCss:
             if ".rail-logo-row .rail-logo" in rule:
                 continue
             assert "var(--rail-peek-text-delay)" in rule, rule
+
+    def test_no_admin_only_peek_delay_comes_back(self) -> None:
+        """This guard replaces `test_the_admin_peek_makes_its_contents_wait_with_it`
+        (#1989), which pinned a 400ms anti-pass-through delay on
+        `[data-rail-context="admin"]` plus a matching `--rail-peek-text-delay`
+        so the contents waited with the width.
+
+        That delay is gone because it became unreachable, not because it was
+        wrong: on those pages the peek no longer fires at all (see
+        `test_the_peek_is_off_entirely_where_the_admin_column_is`), and a delay
+        on an animation that never starts is dead weight that reads as live
+        tuning.
+
+        It is worth a guard rather than a silent deletion because the delay is
+        the tempting fix and it cannot close the case. It buys intent from the
+        POINTER; the peek's other trigger is `:focus-within`, and #1989's own
+        rule deliberately kept that at the ordinary 120ms beat ("there is no
+        such thing as tabbing into the rail by accident"). But the search box is
+        focused by CLICKING it — so the click path still dropped a 240px overlay
+        on the admin column, 120ms after the click. Delaying one trigger covers
+        one trigger."""
+        # Comments only — the note left where the block was quotes the selector.
+        css = re.sub(r"/\*.*?\*/", "", RAIL_CSS, flags=re.S)
+        assert 'data-rail-context="admin"' not in css, (
+            "an admin-only peek rule is back; the peek does not fire there at all, "
+            "so this can only be tuning something that never runs"
+        )
 
     def test_body_clearance_is_the_icon_width_and_constant(self) -> None:
         """The 56px reservation must NOT change on hover/focus — the peeked
@@ -1124,7 +1318,7 @@ class TestRailCollapseCss:
         are the whole reason to peek it."""
         icon_mode_section = RAIL_CSS.split("── Collapsed rail")[1].split("Small + tablet screens")[0]
         assert ".rail-icon-mode .rail-history" in icon_mode_section
-        expanded = ":is(:hover, :focus-within) .rail-history"
+        expanded = PEEK_TRIGGER + " .rail-history"
         assert expanded in icon_mode_section
         # The restore must come AFTER the hide, or the cascade drops it.
         assert icon_mode_section.index(".rail-icon-mode .rail-history") < icon_mode_section.index(expanded)
@@ -1152,7 +1346,7 @@ class TestRailCollapseCss:
         collapsed = re.search(r"\.rail-icon-mode \.rail-logo-txt,(.*?)\{[^}]*visibility: hidden;[^}]*\}", block, re.S)
         assert collapsed and "rail-getstarted-body" in collapsed.group(1)
         revealed = re.search(
-            r":is\(:hover, :focus-within\) \.rail-logo-txt,(.*?)\{[^}]*visibility: visible;[^}]*\}",
+            r":is\(:hover\S*, :focus-within\) \.rail-logo-txt,(.*?)\{[^}]*visibility: visible;[^}]*\}",
             block,
             re.S,
         )
@@ -1197,9 +1391,25 @@ class TestRailCollapseCss:
         # peek's z-index note quotes the toolbar's `position: fixed`), and
         # matching prose is not matching CSS.
         block = re.sub(r"/\*.*?\*/", "", self._desktop_block(), flags=re.S)
-        peek_rules = re.findall(r":is\(:hover, :focus-within\)[^{]*\{([^}]*)\}", block)
+        peek_rules = re.findall(r":is\(:hover\S*, :focus-within\)([^{]*)\{([^}]*)\}", block)
         assert peek_rules
-        for body in peek_rules:
+        # The two SEARCH rules are the documented exception, and this guard only
+        # began to see them when they joined the shared peek trigger — they used
+        # to hand-roll `:hover, :focus-within`, which no regex here matched, so
+        # the flip was invisible rather than absent. Both are deliberate and the
+        # reason is written at the rules: an invisible 42px input still claims its
+        # width, which squeezed the magnifier to `left: -2px` and clipped it
+        # against the strip's edge, so the input leaves the flow (`display`) and
+        # the icon changes positioning scheme with it. Exempted by SELECTOR, one
+        # entry each with its reason, so a new discrete flip cannot arrive under
+        # cover of these.
+        exempt = {
+            ".rail-search-input": "leaves the flow entirely; an invisible input still claims 42px",
+            ".rail-search-icon": "changes positioning scheme with the input it sits in",
+        }
+        for selector, body in peek_rules:
+            if any(target in selector for target in exempt):
+                continue
             for prop in ("justify-content:", "position:", "display:", "inset:"):
                 assert prop not in body, f"discrete property {prop} flips on peek: {body!r}"
 

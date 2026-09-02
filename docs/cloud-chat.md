@@ -179,26 +179,45 @@ settings:
 
 ## Cost & limits
 
-Per-user defaults (configurable in `/admin/server-config`):
+Per-user defaults (the three per-sender limits are editable under
+"Chat access" in `/admin/server-config`; they are read once at startup, so a
+save applies after the app process restarts):
 
 | Setting | Default |
 |---|---|
 | Concurrent sessions per user | 3 |
 | Idle TTL | 30 min |
-| Anthropic spend cap | $20 / day |
-| Cumulative tokens per session | 200 k |
+| LLM spend cap per person, per UTC day (`chat.daily_anthropic_spend_usd`) | $20 / day (`0` disables) |
+| Tokens billed per conversation, cumulative (`chat.max_session_tokens`) | 2 M (`0` disables) |
+| Messages per sender per hour (`chat.rate_messages_per_hour`) | 100 |
 | Per-tool-call wall clock | 90 s |
 | BigQuery scan per session | 20 GiB |
 | Sandbox pause after disconnect linger | 60 s (`chat.detach_linger_seconds`) |
 | Paused sandbox GC TTL | 7 days (`chat.paused_ttl_seconds`) |
 | On-detach policy | `pause` (`chat.on_detach`) |
 
-Token-derived caps (the spend cap and per-session token cap) are metered
-on both providers. The kai-agent engine's stream carries no usage numbers,
-so engine turns are metered from broker-observed usage instead: the broker
-accumulates each session's provider-reported usage and the manager folds it
-into the turn at persist (see the provider notes below). Message-rate and
-concurrency caps apply everywhere.
+Token-derived caps (the spend cap and per-conversation token budget) are
+metered on both providers. The kai-agent engine's stream carries no usage
+numbers, so engine turns are metered from broker-observed usage instead: the
+broker accumulates each session's provider-reported usage and the manager
+folds it into the turn at persist (see the provider notes below).
+Message-rate and concurrency caps apply everywhere. `0` disables either
+token-derived cap.
+
+**`chat.max_session_tokens` is a budget, not a context window.** It sums
+the tokens *billed* over a conversation's whole life — input, output and
+cache writes of every LLM call, across every turn (cache reads are
+excluded). An agentic turn re-sends the conversation to the model on every
+tool call, so a single turn with a dozen tool calls bills several hundred
+thousand tokens while the context itself stays far below the model's limit.
+Compaction is the engine's job and bounds that context; it cannot lower a
+cumulative sum. Set this knob near a context window (the old 200 k default)
+and it trips a few turns into any real conversation with a refusal that
+reads as "compaction does not work". The default is sized as a
+runaway-conversation guard — ten context windows of re-sent input; the
+per-sender daily spend cap is the cost control. When it trips, the user is
+told the conversation has reached its token budget and to start a new one;
+the reason string surfaces to operators as `max_session_tokens_exhausted`.
 
 **Session lifecycle.** What a session holds depends on the provider:
 under `docker` it is a per-session container; under `kai-agent` it is a
@@ -841,8 +860,9 @@ Model ids: operators may write either spelling of a dated snapshot —
 `claude-…-YYYYMMDD` (first-party) or `claude-…@YYYYMMDD` (Vertex) — in
 `agents.model` and `chat.agent_api_utility_models`; the broker compares them
 canonically. Cost note: `daily_anthropic_spend_usd` estimates spend with the
-hard-coded Sonnet prices in `app/chat/manager.py` — under Vertex this stays
-the same approximation it is on the first-party API.
+price table in `src/llm_pricing.py`, at the most expensive general-purpose
+tier when a message carries no model — under Vertex this stays the same
+approximation it is on the first-party API.
 
 ## Operator setup details
 
