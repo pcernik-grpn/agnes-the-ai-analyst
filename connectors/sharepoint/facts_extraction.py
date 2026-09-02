@@ -711,6 +711,31 @@ class _Extractor:
         ) from last_error
 
 
+def _deadline_expired(deadline: Any) -> bool:
+    """Whether the run's shared deadline has elapsed.
+
+    ``connectors.sharepoint.crawler._Deadline.expired`` is a METHOD, not a
+    property. Gating on ``getattr(deadline, "expired", False)`` therefore
+    tested the BOUND METHOD for truthiness — always true — which aborted
+    every deadline-carrying pass on its first planning iteration and
+    reported it as ``interrupted: timeout``. That reads as a plausible
+    operator-facing outcome, so the stage looked like it had merely run out
+    of time rather than never having run at all.
+
+    The defaulted ``getattr`` was there to tolerate substituted stubs, so
+    that tolerance is kept: an object without the attribute is not expired,
+    and one exposing ``expired`` as a plain bool is honoured as-is.
+    """
+    if deadline is None:
+        return False
+    expired = getattr(deadline, "expired", None)
+    if expired is None:
+        return False
+    if callable(expired):
+        return bool(expired())
+    return bool(expired)
+
+
 def _retry_message(base_user_message: str, failures: Sequence[Tuple[dict, str]]) -> str:
     """The ONE corrective retry: the model is shown exactly which quotes
     failed, and asked to re-emit only those facts."""
@@ -1445,7 +1470,7 @@ def run_facts_extraction(
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
             # paid for whether or not this process waits for them.
-            if deadline is not None and getattr(deadline, "expired", False):
+            if _deadline_expired(deadline):
                 report.interrupted = True
                 report.interrupted_reason = "timeout"
                 break
