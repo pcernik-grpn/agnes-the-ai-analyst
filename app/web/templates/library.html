@@ -58,6 +58,19 @@
    search box narrows the list, and when a query matches a metric or term the
    band says so — the only one-step term lookup the rail chrome has (it renders
    no global search box, by design). #}
+{# One link ACROSS from a band to where its subject continues. The Agent
+   templates band uses it to open the builder's template picker: the band says
+   what a template IS, and the link is the one thing you can do with it that
+   does not happen here. A sibling of the collapse toggle, never inside it —
+   that toggle is a <button>, and an anchor nested in a button is neither valid
+   nor clickable. #}
+{% macro band_link(link) %}
+{% if link %}
+<div class="lib-defs__links">
+  <a class="lib-defs__link" href="{{ link.href }}">{{ link.label }} &rarr;</a>
+</div>
+{% endif %}
+{% endmacro %}
 {% macro defs_links(defs) %}
 {% if defs %}
 <div class="lib-defs__links" id="lib-defs" data-defs-search="{{ defs.search }}">
@@ -2459,7 +2472,7 @@
     {# The band is the block host of the shared component (`.fbar-groupband`),
        sticky at the top of its own section so the group you are reading stays
        named while its rows scroll. #}
-    <div class="fbar-groupband lib-band{% if sec.defs %} lib-band--defs{% endif %}">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}</div>
+    <div class="fbar-groupband lib-band{% if sec.defs or sec.band_link %} lib-band--defs{% endif %}">{{ group_toggle(sec) }}{{ defs_links(sec.defs) }}{{ band_link(sec.band_link) }}</div>
     {% if sec.defs %}<p class="lib-defs__hit" id="lib-defs-hit" hidden></p>{% endif %}
     <div class="lib-tablewrap">
       <table class="data-table lib-table">

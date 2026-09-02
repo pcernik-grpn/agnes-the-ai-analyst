@@ -270,74 +270,6 @@ templates.env.filters["cover_w"] = cover_variant_url
 templates.env.filters["has_cover_variant"] = has_cover_variant
 
 
-# ---- PostHog template wiring ----
-# Two Jinja globals injected into every render so the `_posthog.html` partial
-# (included from `base.html` and `base_login.html`) can render the browser
-# snippet — or render nothing when the integration is disabled.
-#
-#   posthog_config              process-level static config (host, project key,
-#                               replay flag, extra mask selector). Resolved
-#                               once on first access.
-#   posthog_user_block(request) per-request identify payload honoring the
-#                               operator-chosen identify mode. Returns None
-#                               for anonymous renders.
-def _posthog_config_global() -> dict:
-    from src.observability import get_posthog
-
-    pc = get_posthog()
-    if not pc.enabled:
-        return {"enabled": False}
-    return {
-        "enabled": True,
-        "host": pc.host,
-        "api_key_public": pc.api_key_public,
-        "replay_enabled": pc.replay_enabled,
-        "replay_mask_selector_extra": pc.replay_mask_selector_extra,
-        "environment": pc.environment,
-        "release": pc.release,
-    }
-
-
-def _posthog_user_block(request: Request | None) -> dict | None:
-    from src.observability import get_posthog
-
-    pc = get_posthog()
-    if not pc.enabled:
-        return None
-    mode = pc.identify_mode
-    if mode == "none":
-        return None
-    user = None
-    if request is not None:
-        try:
-            user = getattr(request.state, "user", None)
-        except Exception:
-            user = None
-    if not user:
-        return None
-
-    def _get(attr: str):
-        if isinstance(user, dict):
-            return user.get(attr)
-        return getattr(user, attr, None)
-
-    distinct_id = _get("id") or _get("user_id") or _get("email")
-    if not distinct_id:
-        return None
-    props: dict = {}
-    if mode in ("email", "full"):
-        email = _get("email")
-        if email:
-            props["email"] = str(email)
-    if mode == "full":
-        name = _get("name") or _get("full_name")
-        if name:
-            props["name"] = str(name)
-    return {"distinct_id": str(distinct_id), "props": props}
-
-
-templates.env.globals["posthog_config"] = _posthog_config_global()
-templates.env.globals["posthog_user_block"] = _posthog_user_block
 # Stateless asset helper — register as a global so EVERY template resolves CSS/JS
 # URLs even on routes that build a minimal context (e.g. the studio pages).
 # Without this, base_ds.html emits <link href=""> and the page renders unstyled.
@@ -549,7 +481,9 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "data_app": ("/library?section=files", "Library"),
     "plugin": ("/library?section=plugin", "All plugins"),
     "skill": ("/library?section=skill", "All skills"),
-    "agent": ("/library?section=agent", "All agents"),
+    # "All agents" pointed at the templates band — the one link most likely
+    # to be read as "the agents I run", which live at /agents.
+    "agent": ("/library?section=agent", "All agent templates"),
     "files": ("/library?section=files", "Library"),
     # The flat metric/glossary registries are not a `type_key`: they are a
     # destination the Semantic models band links OUT to, not one of the
@@ -3438,7 +3372,14 @@ async def library_page(
                 href=f"/marketplace/flea/{inst['id']}?from=library",
                 glyph="doc",
                 type_key="agent",
-                type_label="Agent",
+                # "Agent" was the row's tag while the section above it said
+                # "Agent templates" and /agents held something else entirely
+                # (#1956 item 3). The two are different things: a template is
+                # a portable role DEFINITION, an agent is a running one with
+                # its own scope, budget and address. The `/agents` picker
+                # already spells this out for the same entity; the Library
+                # never got the fix.
+                type_label="Agent template",
                 origin="installed",
                 origin_label="From the marketplace",
                 added=inst.get("installed_at") or inst.get("created_at"),
@@ -3939,7 +3880,11 @@ async def library_page(
         "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
-        "agent": "Assistants you installed.",
+        # NOT "assistants": these are definitions, and the thing they define
+        # is not running. Says both jobs, because installing one does both —
+        # every agent gains the specialist, and you can start an agent of your
+        # own from it (the row's second action).
+        "agent": "Reusable role definitions. Install one and your agents gain a ready-made specialist — or start an agent of your own from it.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
         "semantic_model": "What your data means — your agents answer with these.",
@@ -4026,6 +3971,22 @@ async def library_page(
                 # built). Only this section supplies them; every other renders
                 # its band exactly as before.
                 "defs": definitions_footer if key == "semantic_model" else None,
+                # One link across to the OTHER half of the story: the band
+                # explains what a template IS, and this is the one thing you do
+                # with it that does not happen here. It opens the builder's
+                # template picker directly, so the label is literally true
+                # rather than a signpost to a page you then have to work out.
+                #
+                # Band-level, not per row. A row already carries the act that
+                # belongs to it — adding the template to your agents — and a
+                # second link beside that one competed with it for a fixed
+                # 170px column while offering something true of every row in
+                # the band equally.
+                "band_link": (
+                    {"href": "/agents?from_template=1", "label": "Start from a template"}
+                    if key == "agent"
+                    else None
+                ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
