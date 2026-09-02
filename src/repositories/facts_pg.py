@@ -615,6 +615,31 @@ class FactsPgRepository:
             )
         return int(result.rowcount or 0)
 
+    def reassign_file_corpus(self, corpus_file_id: str, target_corpus_id: str) -> int:
+        """Repoint one file's claims at the collection it now lives in; return
+        the count.
+
+        ``claims.corpus_id`` is denormalized from ``corpus_files`` on purpose —
+        it is THE visibility predicate (an indexed equality filter, never a
+        join through ``corpus_files`` on a traversal hop). Denormalized means
+        it does not follow the file on its own, and nothing followed it: moving
+        a file between collections updated ``corpus_files.corpus_id`` and left
+        every claim pointing at the old one (Devin Review on #2068). Two
+        consequences, and the visible one is the smaller: the graph facets
+        grouped the file's facts under the collection it had left, and — since
+        this column is what visibility is filtered on — its facts stayed
+        readable to the OLD collection's audience and invisible to the new
+        one's. Called on the move path, immediately after the file row moves.
+        """
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                sa.text(
+                    "UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"
+                ),
+                {"target": target_corpus_id, "file_id": corpus_file_id},
+            )
+        return int(result.rowcount or 0)
+
     def upsert_correction(
         self,
         *,

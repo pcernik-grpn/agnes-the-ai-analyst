@@ -1768,6 +1768,29 @@ async def move_file(
     if not cf_repo.move_to_corpus(file_id, target_id):
         raise HTTPException(status_code=404, detail="file_not_found")
 
+    # The file row has moved; its CLAIMS have not. `claims.corpus_id` is
+    # denormalized from `corpus_files` and is the column fact visibility is
+    # filtered on, so leaving it behind does not merely file the facts under
+    # the old collection in the graph facets — it leaves them readable to the
+    # collection the file just left. Best-effort by design: the fact graph is
+    # Postgres-only and optional, so an instance without it must still be able
+    # to move a file.
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        moved_claims = facts_repo().reassign_file_corpus(file_id, target_id)
+        if moved_claims:
+            logger.info(
+                "corpus_file move repointed %s claim(s) file_id=%s to=%s",
+                moved_claims,
+                file_id,
+                target_id,
+            )
+    except RequiresPostgresBackend:
+        pass  # no fact graph on this backend — nothing to repoint
+    except Exception as e:
+        logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
+
     source_emptied = False
     try:
         if not cf_repo.list_for_corpus(collection_id):
