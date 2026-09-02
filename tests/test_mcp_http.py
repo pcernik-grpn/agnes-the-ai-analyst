@@ -1334,3 +1334,90 @@ class TestOutputGuard:
             MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(wide))
             with pytest.raises(MCPOutputTooLarge, match="rows"):
                 _run(mod.describe("t1"))
+
+
+# ── search-result compaction (TCRD-287) ────────────────────────────────────────
+
+
+def _big_search_payload(k: int = 10) -> dict:
+    """Ten 3.2k-char chunks — the ~52k-char ``knowledge_search`` result the chat
+    engine refused ("exceeds maximum allowed tokens") and wrote to a file the
+    model could not read."""
+    return {
+        "query": "kůň",
+        "results": [
+            {
+                "chunk_id": f"ch_{i}",
+                "corpus_id": "col_0123456789abcdef",
+                "file_id": f"cf_{i}",
+                "filename": f"report-{i}.pdf",
+                "ordinal": i,
+                "text": ("Příliš žluťoučký kůň úpěl ďábelské ódy. " * 200)[:3_200],
+                "score": 1.0,
+                "confidence": "high",
+                "matched_on": "body",
+                "type": "chunk",
+            }
+            for i in range(k)
+        ],
+        "retrieval": "hybrid",
+    }
+
+
+class TestSearchCompaction:
+    def _get(self, mod, coro_factory, resp_data):
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(resp_data))
+            return _run(coro_factory(mod))
+
+    def test_knowledge_search_oversized_result_is_compacted_not_refused(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        big = _big_search_payload()
+        assert wire_size(big) > 30_000  # ten chunker-sized hits; the incident's 52k carried fifteen
+        out = self._get(mod, lambda m: m.knowledge_search("kůň"), big)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert len(out["results"]) == 10
+        assert all(h["truncated_fields"] == ["text"] for h in out["results"])
+        assert "collection_file_read" in out["truncated_note"]
+
+    def test_collections_search_oversized_result_is_compacted_too(self):
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS, wire_size
+
+        mod = _import_mod()
+        big = _big_search_payload()
+        out = self._get(mod, lambda m: m.collections_search("kůň"), big)
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert out["truncated"] is True
+        assert "collections_search" in out["truncated_note"]
+
+    def test_small_result_passes_through_unchanged(self):
+        mod = _import_mod()
+        small = _big_search_payload(1)
+        assert self._get(mod, lambda m: m.knowledge_search("kůň"), small) == small
+
+    def test_env_budget_zero_disables(self, monkeypatch):
+        mod = _import_mod()
+        monkeypatch.setenv("AGNES_MCP_SEARCH_MAX_CHARS", "0")
+        big = _big_search_payload()
+        assert self._get(mod, lambda m: m.knowledge_search("kůň"), big) == big
+
+    def test_the_text_fastmcp_puts_on_the_wire_is_inside_the_budget(self):
+        """The assertion that matters for the incident: not the dict, the TEXT
+        the MCP client receives and measures. Drive the tool through FastMCP's
+        own call path and measure the content block it produces."""
+        from src.mcp_tooling import DEFAULT_SEARCH_MAX_CHARS
+
+        mod = _import_mod()
+        big = _big_search_payload()
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(return_value=_mock_resp(big))
+            result = _run(mod.mcp.call_tool("knowledge_search", {"query": "kůň"}))
+        content = result[0] if isinstance(result, tuple) else result
+        texts = [block.text for block in content if getattr(block, "type", "") == "text"]
+        assert texts, "knowledge_search produced no text content block"
+        assert sum(len(t) for t in texts) <= DEFAULT_SEARCH_MAX_CHARS

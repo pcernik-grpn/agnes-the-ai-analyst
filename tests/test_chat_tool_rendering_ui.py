@@ -353,6 +353,14 @@ def test_streaming_renders_markdown_not_textcontent():
     assert "renderAnswerMarkdown(" in stream, "streaming and finalize must share the pipeline"
     assert "renderMermaidBlocks" not in stream, "no mermaid on partial content"
     assert "enhanceCodeBlocks" not in stream, "heavy enhancement waits for finalize"
+    # The LIGHT table pass is the exception (TCRD-288): marked's bare <table>
+    # has no border, no padding and a centered bold header, so without it a
+    # streamed table looked like a different widget until finalize.
+    assert "enhanceTables(currentAssistantBody)" in stream, "a streamed table is styled while it grows"
+    flush = js[js.index("function _flushStreamingTail") : js.index("function _resetStreamingState")]
+    assert "enhanceTables(currentAssistantBody)" in flush, (
+        "the full-text flush replaces the DOM — a cancelled/error frame must not un-style the table"
+    )
 
 
 def test_finalize_clears_the_stream_timer():
@@ -507,6 +515,106 @@ def test_streaming_safe_text_executable():
     assert res["opener_after_closed_block"] == "```sql\nSELECT 1\n```\n\n", (
         "fence parity: the withhold point is the trailer's own opener, not the last backticks"
     )
+
+
+def test_streaming_safe_text_withholds_a_table_head_until_its_delimiter_row():
+    """TCRD-288. Marked renders a GFM table only once the delimiter row has one
+    cell per header cell; until then the header line, and then the growing
+    delimiter row, come out as a paragraph of raw pipes. The painter withholds
+    exactly that window — a lone pipe line with no table row above it, or that
+    header plus a delimiter still streaming — and releases it at the newline
+    that ends the delimiter row. A data row is never withheld: a table already
+    on screen keeps growing row by row. Runs the SHIPPED helper under node."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _streamingSafeText") : js.index("function _scheduleStreamRender")]
+    cases = {
+        "header_alone": "Intro:\n\n| Name | Rev |",
+        "header_then_newline": "Intro:\n\n| Name | Rev |\n",
+        "delimiter_partial": "Intro:\n\n| Name | Rev |\n|---|-",
+        "delimiter_complete_no_newline": "Intro:\n\n| Name | Rev |\n|---|---|",
+        "delimiter_done": "Intro:\n\n| Name | Rev |\n|---|---|\n",
+        "row_partial": "Intro:\n\n| Name | Rev |\n|---|---|\n| Ac",
+        "rows": "Intro:\n\n| Name | Rev |\n|---|---|\n| Acme | 1 |\n| Bob | 2 |",
+        "dash_only_data_row": "| a |\n|---|\n| - |",
+        "header_interrupting_a_paragraph": "Intro:\n| Name | Rev |",
+        "pipe_in_prose": "Use a | b here",
+        "pipe_inside_open_code": "```sql\nSELECT a | b",
+        "head_after_closed_code": "```sql\nSELECT 1\n```\n\n| a | b |",
+        "open_trailer_after_table": "| a | b |\n|---|---|\n| 1 | 2 |\n\n```next_actions\n- x",
+        # Prose that opens with a pipe is indistinguishable from a header's
+        # first cell until either a second pipe or the newline arrives — so it
+        # is withheld while short, and released once it has run longer than
+        # any first cell could (the bound caps the cost of the false positive).
+        "pipe_prose_short": "Note:\n| a note that starts with a pipe",
+        "pipe_prose_long": "Note:\n| " + "a note that starts with a pipe and keeps going " * 3,
+        "long_first_cell_then_pipe": "Note:\n| " + "x" * 90 + " | Rev",
+    }
+    script = (
+        fn
+        + f"\nprocess.stdout.write(JSON.stringify(Object.fromEntries(Object.entries({json.dumps(cases)}).map(([k, v]) => [k, _streamingSafeText(v)]))));\n"
+    )
+    res = json.loads(_node_run(script))
+    assert res["pipe_prose_short"] == "Note:\n", "a short lone pipe line could still be a header's first cell"
+    assert res["pipe_prose_long"] == cases["pipe_prose_long"], (
+        "a lone pipe line past the first-cell bound with no second pipe is prose — released"
+    )
+    assert res["long_first_cell_then_pipe"] == "Note:\n", "a second pipe makes it a header candidate again"
+    assert res["header_alone"] == "Intro:\n\n", "a header with no delimiter yet is a paragraph of pipes — hidden"
+    assert res["header_then_newline"] == "Intro:\n\n"
+    assert res["delimiter_partial"] == "Intro:\n\n", "the delimiter row is still streaming"
+    assert res["delimiter_complete_no_newline"] == "Intro:\n\n", "released at the delimiter's newline"
+    assert res["delimiter_done"] == cases["delimiter_done"], "head complete — marked renders a table from here"
+    assert res["row_partial"] == cases["row_partial"], "a data row is never withheld: the table grows live"
+    assert res["rows"] == cases["rows"]
+    assert res["dash_only_data_row"] == cases["dash_only_data_row"], (
+        "a `| - |` DATA row under a real head is a row, not a delimiter in progress"
+    )
+    assert res["header_interrupting_a_paragraph"] == "Intro:\n", "GFM lets a table interrupt a paragraph"
+    assert res["pipe_in_prose"] == cases["pipe_in_prose"], "only a line that OPENS with a pipe is a table row"
+    assert res["pipe_inside_open_code"] == cases["pipe_inside_open_code"], "inside an open code fence a pipe is code"
+    assert res["head_after_closed_code"] == "```sql\nSELECT 1\n```\n\n", "fence parity first, then the table head"
+    assert res["open_trailer_after_table"] == "| a | b |\n|---|---|\n| 1 | 2 |\n\n", (
+        "a finished table stays; the open trailer after it is withheld as before"
+    )
+
+
+def test_a_table_streamed_token_by_token_never_renders_as_raw_pipes():
+    """The property the helper exists for, checked against the SHIPPED marked
+    build rather than a re-statement of its rules: replay a model-written
+    table one character at a time through `_streamingSafeText` and parse
+    every prefix — no prefix may yield a paragraph that opens with a pipe,
+    and the table must appear the moment the delimiter row's newline lands
+    (not at the end of the turn). Fails on the pre-fix painter, which handed
+    marked the raw prefix."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _streamingSafeText") : js.index("function _scheduleStreamRender")]
+    marked = Path("app/web/static/vendor/marked.min.js").resolve()
+    full = (
+        "Here are the numbers:\n\n"
+        "| Client | Sponsor (PE parent) | Price |\n"
+        "|---|---|---|\n"
+        "| **Northwind Parts** | Alpine Capital | $47,500 |\n"
+        "| Harbor Supply | Meridian Partners | $125,000 |\n\n"
+        "Both are closed won."
+    )
+    head_done = full.index("|---|---|---|\n") + len("|---|---|---|\n")
+    script = (
+        fn
+        + f"\nconst marked = require({json.dumps(str(marked))});\n"
+        + f"const full = {json.dumps(full)};\n"
+        + "const rawPipe = [], table = [];\n"
+        + "for (let i = 1; i <= full.length; i++) {\n"
+        + "  const html = marked.parse(_streamingSafeText(full.slice(0, i)));\n"
+        + "  if (/<p>\\s*\\|/.test(html)) rawPipe.push(i);\n"
+        + "  if (html.includes('<table')) table.push(i);\n"
+        + "}\n"
+        + "process.stdout.write(JSON.stringify({rawPipe, firstTable: table.length ? table[0] : null, "
+        + "tableCount: table.length}));\n"
+    )
+    res = json.loads(_node_run(script))
+    assert res["rawPipe"] == [], f"raw-pipe paragraph rendered at prefixes {res['rawPipe'][:5]}"
+    assert res["firstTable"] == head_done, "the table appears at the delimiter row's newline, not at turn end"
+    assert res["tableCount"] == len(full) - head_done + 1, "and stays a table for every later prefix"
 
 
 # ── turn-stopping events: visible in the transcript, not only the status bar ─
