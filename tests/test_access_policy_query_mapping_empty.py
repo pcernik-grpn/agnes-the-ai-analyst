@@ -23,11 +23,16 @@ Three tables:
   through it must behave exactly as before this change: an ordinary
   filtered 200.
 - ``tbl_products``: no policy at all -- completely unaffected, control case.
-- ``tbl_shipments`` (server_only): policied, joins ``User_Access3`` -- a
-  mapping table that DID sync (a real ``sync_state`` row) but has zero rows,
-  referenced in mixed case. Because the table DID sync, its view genuinely
-  exists in DuckDB (case-insensitively), so pre-fix this executed normally
-  and silently returned 0 rows instead of tripping the empty-mapping check
+- ``tbl_returns`` (server_only): policied, joins ``user_access3`` (exact
+  case) -- a mapping table that DID sync (a real ``sync_state`` row) but has
+  zero rows. Exercises the "sync ran, mapping table is just empty" half of
+  the trap, which is also the case with a non-``None`` ``last_sync``
+  (finding 2).
+- ``tbl_shipments`` (server_only): policied, joins ``User_Access3`` -- the
+  SAME synced-but-empty mapping table as ``tbl_returns``, referenced in a
+  different case. Because the table DID sync, its view genuinely exists in
+  DuckDB (case-insensitively), so pre-fix this executed normally and
+  silently returned 0 rows instead of tripping the empty-mapping check
   (finding 1, PR #2023 review).
 """
 
@@ -37,8 +42,9 @@ import pytest
 
 ORDERS_POLICY_SQL = "SELECT * FROM orders WHERE unit IN (SELECT unit FROM user_access WHERE email = $user_email)"
 INVOICES_POLICY_SQL = "SELECT * FROM invoices WHERE unit IN (SELECT unit FROM user_access2 WHERE email = $user_email)"
-# Deliberately mixed-case reference to the synced-but-empty `user_access3`
-# mapping table.
+RETURNS_POLICY_SQL = "SELECT * FROM returns WHERE unit IN (SELECT unit FROM user_access3 WHERE email = $user_email)"
+# Deliberately mixed-case reference to the SAME synced-but-empty
+# `user_access3` mapping table `tbl_returns` uses above.
 SHIPMENTS_POLICY_SQL = "SELECT * FROM shipments WHERE unit IN (SELECT unit FROM User_Access3 WHERE email = $user_email)"
 
 
@@ -81,6 +87,13 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
                     {"id": "2", "unit": "TeamB", "qty": "7"},
                 ],
             },
+            {
+                "name": "returns",
+                "data": [
+                    {"id": "1", "unit": "TeamA", "qty": "1"},
+                    {"id": "2", "unit": "TeamB", "qty": "2"},
+                ],
+            },
             # user_access2 IS synced -- a real matching row for team-a.
             {
                 "name": "user_access2",
@@ -91,7 +104,7 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
             # just empty" rather than "sync never ran". `create_mock_extract`
             # treats an empty `data` list as "remote or empty table" and
             # stubs in an `(id VARCHAR)`-only table -- overwritten below with
-            # the real `email`/`unit` columns the policy body references, so
+            # the real `email`/`unit` columns the policy bodies reference, so
             # the mapping table's view genuinely resolves (case-insensitively
             # too) with zero rows, rather than erroring on a missing column.
             {"name": "user_access3", "data": []},
@@ -125,6 +138,9 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
         )
         registry.set_access_policy("tbl_shipments", sql=SHIPMENTS_POLICY_SQL, note="mapping filter", updated_by="admin")
 
+        registry.register(id="tbl_returns", name="returns", source_type="keboola", query_mode="local", server_only=True)
+        registry.set_access_policy("tbl_returns", sql=RETURNS_POLICY_SQL, note="mapping filter", updated_by="admin")
+
         # Registered as a mapping table, but never extracted/synced.
         registry.register(id="user_access", name="user_access", source_type="keboola", query_mode="local")
         registry.set_policy_mapping("user_access", True)
@@ -144,6 +160,7 @@ def mapping_workspace(seeded_app, mock_extract_factory, monkeypatch):
         grant_table_via_package(conn, "tbl_invoices", "u_team_a", group_name="TeamA")
         grant_table_via_package(conn, "tbl_products", "u_team_a", group_name="TeamA")
         grant_table_via_package(conn, "tbl_shipments", "u_team_a", group_name="TeamA")
+        grant_table_via_package(conn, "tbl_returns", "u_team_a", group_name="TeamA")
     finally:
         conn.close()
 
@@ -170,6 +187,28 @@ def test_empty_mapping_table_returns_structured_error_not_empty_rows(mapping_wor
     assert detail["table"] == "tbl_orders"
     assert detail["mapping_table"] == "user_access"
     assert "user_access" in detail["note"]
+    # finding 2 (PR #2023 review): the diagnostic includes `last_sync` --
+    # `None` here because `user_access` never synced at all (no sync_state
+    # row), matching the diagnosis this exception itself carries.
+    assert "last_sync" in detail
+    assert detail["last_sync"] is None
+
+
+def test_synced_but_empty_mapping_table_returns_a_non_null_last_sync(mapping_workspace):
+    """finding 2 (PR #2023 review): unlike `user_access` above, `user_access3`
+    DID sync -- a real `sync_state` row exists, it is just empty -- so the
+    error's `last_sync` must be a real timestamp, not `None`."""
+    c = mapping_workspace["client"]
+    r = c.post(
+        "/api/query",
+        json={"sql": "SELECT * FROM returns"},
+        headers=_auth(mapping_workspace["team_a_token"]),
+    )
+    assert r.status_code == 500, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "policy_mapping_empty"
+    assert detail["mapping_table"] == "user_access3"
+    assert detail["last_sync"] is not None
 
 
 def test_mixed_case_mapping_table_reference_is_still_detected(mapping_workspace):

@@ -9,7 +9,8 @@ import os
 import re
 import threading
 import time
-from typing import Optional
+from datetime import UTC, datetime
+from typing import Any, Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -1700,8 +1701,30 @@ def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
                     "table": table_id,
                     "mapping_table": exc.mapping_table,
                     "note": str(exc),
+                    "last_sync": _jsonable_last_sync(exc.last_sync),
                 },
             )
+
+
+def _jsonable_last_sync(last_sync: Any) -> str | None:
+    """Serialize ``PolicyMappingEmpty.last_sync`` for an ``HTTPException``
+    detail (PR #2023 review, finding 2).
+
+    ``fastapi.exception_handlers.http_exception_handler`` builds a plain
+    Starlette ``JSONResponse`` from ``exc.detail`` -- unlike a
+    ``response_model`` return value, it never runs through
+    ``jsonable_encoder``, so a raw ``datetime`` here would blow up
+    ``json.dumps`` inside the response instead of reaching the caller as
+    the structured error this whole check exists to produce. Naive inputs
+    are assumed UTC (DuckDB's ``SET GLOBAL TimeZone='UTC'`` pin, see
+    ``app/serialization.py``), matching how every other datetime this app
+    returns is labeled.
+    """
+    if not isinstance(last_sync, datetime):
+        return last_sync
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=UTC)
+    return last_sync.isoformat()
 
 
 @router.post("", response_model=QueryResponse)
