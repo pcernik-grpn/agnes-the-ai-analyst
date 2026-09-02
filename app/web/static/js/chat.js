@@ -2338,6 +2338,7 @@ function chatErrorCopy(raw, kind) {
     return "Too many conversations are running right now. Try again in a moment.";
   }
   // Agnes's OWN sender limits (enforce_sender_limits in app/chat/manager.py),
+  // delivered to the sender's own sockets only (so "you" is the reader),
   // matched on the frame's kind before the agent-budget family below: they
   // are not engine errors, so the fallback's "The engine reported:" would
   // send the reader — and whoever they ask — to the wrong place. The

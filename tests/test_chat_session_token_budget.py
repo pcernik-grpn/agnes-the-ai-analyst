@@ -114,6 +114,8 @@ def test_zero_disables_the_daily_spend_cap():
     cfg = ChatConfig(enabled=True, max_session_tokens=10**9, daily_anthropic_spend_usd=0)
     repo = _repo(daily=(10**9, 10**9))
     assert asyncio.run(_enforce(cfg, repo)) == []
+    # Disabled means not even read: no counter round trip, no DB re-seed.
+    repo.daily_anthropic_tokens.assert_not_called()
 
 
 def test_a_positive_budget_still_refuses_once_exhausted():
@@ -299,3 +301,76 @@ def test_a_refused_send_keeps_the_websocket_open():
     # Nothing was persisted for the refused sends.
     roles = [m.role for m in app.state.chat_repo.list_messages(chat_id)]
     assert roles == ["assistant"]
+
+
+# --- who sees the refusal ----------------------------------------------------
+
+
+def test_the_refusal_reaches_only_the_senders_own_sinks(tmp_path: Path):
+    """Co-drive: the owner and a guest each hold a socket on one live session.
+    The refusal used to be broadcast, so the guest read "you've reached your
+    daily spend cap" for a message they never sent (review finding on
+    #2050). It now goes to the sinks attributed to the sender — and is not
+    stamped or appended to the replay stream, so a reconnecting guest does
+    not replay it either."""
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    import duckdb
+
+    from app.chat.manager import ChatManager, LiveSession, SinkEntry
+    from app.chat.persistence import ChatRepository
+    from app.chat.types import SessionState
+    from app.chat.workdir import WorkdirManager
+    from src.db import _ensure_schema
+
+    conn = duckdb.connect(":memory:")
+    _ensure_schema(conn)
+    repo = ChatRepository(conn)
+    cfg = ChatConfig(enabled=True, max_session_tokens=10, daily_anthropic_spend_usd=10**6)
+    mgr = ChatManager(provider=MagicMock(), workdir_mgr=MagicMock(spec=WorkdirManager), repo=repo, config=cfg)
+    owner_ws, guest_ws = MagicMock(), MagicMock()
+    owner_ws.send_json, guest_ws.send_json = AsyncMock(), AsyncMock()
+    live = LiveSession(
+        chat_id="chat-1",
+        user_email="owner@x",
+        state=SessionState.ACTIVE,
+        handle=MagicMock(),
+        started_at=datetime.now(timezone.utc),
+        last_activity=datetime.now(timezone.utc),
+        sinks=[
+            SinkEntry(participant_email="owner@x", sink=owner_ws),
+            SinkEntry(participant_email="guest@x", sink=guest_ws),
+        ],
+    )
+    from app.chat.types import Surface
+
+    repo.create_session(user_email="owner@x", surface=Surface.WEB, session_id="chat-1")
+    repo.append_message(session_id="chat-1", role="assistant", content="x", tokens_in=50, tokens_out=0, model="fake")
+    with pytest.raises(RuntimeError, match="max_session_tokens_exhausted"):
+        asyncio.run(mgr._enforce_sender_limits("guest@x", "chat-1", live))
+    owner_ws.send_json.assert_not_awaited()
+    guest_ws.send_json.assert_awaited_once()
+    frame = guest_ws.send_json.await_args.args[0]
+    assert frame["kind"] == "max_session_tokens"
+    assert "seq" not in frame  # not a turn frame — never stamped, never replayed
+
+
+def test_an_explicit_context_window_sized_budget_warns_at_load(tmp_path: Path, caplog):
+    """Deployments that copied ``max_session_tokens: 200000`` from the old
+    example keep refusing long conversations — the default change cannot
+    reach a key that is set. The loader says so, once, naming the fix."""
+    import logging
+
+    y = tmp_path / "instance.yaml"
+    y.write_text("chat:\n  max_session_tokens: 200000\n")
+    with caplog.at_level(logging.WARNING, logger="app.chat.config"):
+        cfg = load_chat_config(y)
+    assert cfg.max_session_tokens == 200_000  # honoured, not silently raised
+    warnings = [r.getMessage() for r in caplog.records if "max_session_tokens=200000" in r.getMessage()]
+    assert len(warnings) == 1 and "set 0 to disable" in warnings[0]
+    caplog.clear()
+    y.write_text("chat:\n  max_session_tokens: 0\n")
+    with caplog.at_level(logging.WARNING, logger="app.chat.config"):
+        load_chat_config(y)
+    assert not [r for r in caplog.records if "max_session_tokens=" in r.getMessage()], "0 (disabled) is not low"
