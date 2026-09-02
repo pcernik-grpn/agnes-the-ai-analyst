@@ -1344,13 +1344,13 @@ class TestRailBrandMark:
         # show the lockup AND the mark at once.
         peek_sel = (
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-logo-mark {"
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-mark {"
         )
         peek = css.split(peek_sel, 1)[1].split("}", 1)[0]
         assert "visibility: hidden" in peek
         assert (
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-logo-full," in css
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-full," in css
         )
 
     def test_the_swap_is_stepped_when_motion_is_reduced(self, web_client):
@@ -1470,7 +1470,7 @@ class TestRailChatsDestination:
         # A peeked rail is showing the lists, so the stand-in folds again.
         peek = css.split(
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-i--collapsed-only {",
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i--collapsed-only {",
             1,
         )[1].split("}", 1)[0]
         assert "height: 0" in peek

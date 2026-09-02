@@ -1652,6 +1652,41 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
  * they read the labels), so the click lands visibly and the next hover peeks
  * normally.
  *
+ * Every peek rule ALSO carries `:where(:not(.rail-strip-only))`, which turns
+ * the peek off outright on the pages that render the admin secondary nav
+ * (`_admin_nav.html`, a 200px column starting at the rail's own right edge).
+ * There the peek is a 240px overlay dropped on the navigation the caller is
+ * using, so opening it erased that column (#1956 item 6).
+ *
+ * It suppresses BOTH triggers, and the second one is the lesson. The first
+ * cut gated only `:hover` and kept `:focus-within`, on the reasoning that
+ * focus is deliberate where a pointer pass is not. That reasoning does not
+ * survive contact: the search box is focused BY CLICKING IT, so the mouse
+ * still reached the peek — one click on the magnifier and the admin column
+ * was gone, which is the reported bug arriving by a second route. "Deliberate"
+ * described how focus was acquired, not what the caller was asking for; nobody
+ * clicking a search field is asking for the navigation beside it to be
+ * replaced. Any trigger that can widen this rail in place is a way back to the
+ * same bug, so this rail does not widen in place at all.
+ *
+ * What replaces it is one idea applied three times — the strip stays 56px and
+ * whatever needs width comes out BESIDE it:
+ *
+ *   - a hovered or focused row unfurls its own label as a chip;
+ *   - the onboarding launcher's panel opens sideways at its full width;
+ *   - the search field flies out as a floating box, its results under it.
+ *
+ * The caller who wants the whole column still has the toggle, which pins it
+ * open for real (and remembers) rather than peeking. See `.rail-strip-only`.
+ *
+ * `:where()` and not a bare `:not()`, and that is load-bearing rather than
+ * stylistic: `:is()` takes the specificity of its most specific argument, and
+ * a plain `:not(.rail-strip-only)` on the compound would add a class to every
+ * peek rule — silently outranking the `:focus-within`-only rule that follows
+ * them (the one that drops the reveal delay for keyboard callers, and which
+ * wins today on source order alone). `:where()` contributes zero, so every
+ * peek rule keeps exactly the specificity it had.
+ *
  * Gated to `min-width: 1025px`, deliberately never touching anything
  * inside the `max-width: 1024px` query below: that query already turns the
  * rail into a wrapping top bar with its own collapse story, and letting
@@ -1803,13 +1838,13 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        duration — the mirror of the hide rule, where it steps at the end), so the
        content is present for every frame of its own reveal and for none before
        it. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-full,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i-label,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-getstarted-body,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-user-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-search,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-history {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-full,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-user-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-search,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-history {
         opacity: 1;
         visibility: visible;
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
@@ -1862,7 +1897,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     /* Peeked or focused open: the lockup is back, so the mark goes. Same
        specificity dance as every other peek rule — `:is()` counts its most
        specific argument, so this must stay AFTER the icon-mode rule. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-mark {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-mark {
         opacity: 0;
         visibility: hidden;
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay),
@@ -1929,7 +1964,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        lists are on screen, so the stand-in folds. Same specificity dance as the
        reveal rules above — `:is()` counts its most specific argument, so this
        must stay AFTER the icon-mode rule to win. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i--collapsed-only {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i--collapsed-only {
         height: 0;
         min-height: 0;
         /* Same gap cancellation as the folded default — without it the peek
@@ -1958,7 +1993,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     @media (prefers-reduced-motion: reduce) {
         html[data-ui-layout="rail"] .rail .rail-i--collapsed-only,
         html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-i--collapsed-only,
-        html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i--collapsed-only {
+        html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i--collapsed-only {
             transition: visibility 0s linear 0s;
         }
     }
@@ -2037,7 +2072,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        page instead of pushing it — whatever sits behind it keeps the
        position/size it got from the 56px `body` clearance above, so
        nothing reflows on an accidental hover. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) {
         width: 240px;
         /* Above the bottom-docked bars for the duration of the peek. They are
            `position: fixed` at z-index 55 (`.fbar-dock` + its veil on /library,
@@ -2071,60 +2106,22 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
                     z-index 0s linear 0s;
     }
 
-    /* ── On an admin page the peek wants more intent ──────────────────────
-       The 120ms above is an anti-pass-through delay sized for a rail with a
-       PAGE beside it. An admin page puts a second navigation column there
-       instead, and `.admin-split` starts at x=56 — flush against the strip,
-       by design (see admin-nav.css) — so there is no buffer between the two
-       and the 184px of overlay lands squarely on the column the admin is
-       reading. A few pixels of pointer drift while scanning that list made
-       it disappear, which is what "the two nav layers fight for the same
-       space" describes (#1956 item 6).
+    /* NOTE — where the admin peek's 400ms anti-pass-through delay went (#1989).
+       A block here used to raise the peek's opening delay from 120ms to 400ms
+       on `[data-rail-context="admin"]`, and hold the contents back with it, so
+       a pointer drifting across the admin nav had to mean it before the overlay
+       landed. It is gone because it is now unreachable, not because it was
+       wrong: on those pages the peek does not fire at all (`.rail-strip-only`,
+       see the section header), and a delay on an animation that never starts
+       is dead weight that reads as live tuning.
 
-       So: ask for more of the same intent. Nothing changes about what a
-       deliberate hover does or how the peek looks once it is open, and
-       closing stays immediate — only a pointer that means to stay gets it.
-       A page tolerates being covered in a way a navigation column does not.
-
-       The full `transition` is restated rather than a bare `transition-delay`
-       because that shorthand would delay the z-index raise too, and that one
-       must stay at 0s for the reason the rule above gives.
-
-       Nested in `not (prefers-reduced-motion: reduce)` rather than added to
-       the `transition: none` list further down this file. Both would work
-       today, but these selectors are one class MORE specific than that list's
-       (`[data-rail-context]` on top of the same chain), so a rule that merely
-       joined the list would be outranked by them and the reduced-motion
-       caller would get a 400ms animated peek where they used to get an
-       instant one — worse than before the delay existed. Declaring them only
-       where motion is allowed cannot lose that contest, because for a
-       reduced-motion caller they are not in the cascade at all. */
-    @media not (prefers-reduced-motion: reduce) {
-        html[data-ui-layout="rail"] .rail[data-rail-context="admin"].rail-icon-mode:not(.rail-no-peek):hover {
-            transition: width var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
-                        box-shadow var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
-                        z-index 0s linear 0s;
-            /* The descendants wait with the rail. Every label, row and icon
-               reads `--rail-peek-text-delay` (defined once near the top of
-               this file at .14s), so without this line the admin rail's
-               CONTENTS rearrange on the ordinary beat while the panel itself
-               is still waiting out its anti-pass-through delay — a pointer
-               passing through scrambles the column it was reading and the
-               peek never opens (Devin Review on #1989). Redefined here rather
-               than at each descendant: they already share the variable, which
-               is what makes one line enough. */
-            --rail-peek-text-delay: .4s;
-        }
-
-        /* Keyboard focus is unambiguous — there is no such thing as tabbing
-           into the rail by accident — so it keeps the ordinary opening beat.
-           Placed after the hover rule so it wins for a caller who is both. */
-        html[data-ui-layout="rail"] .rail[data-rail-context="admin"].rail-icon-mode:not(.rail-no-peek):focus-within {
-            transition: width var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .12s,
-                        box-shadow var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .12s,
-                        z-index 0s linear 0s;
-        }
-    }
+       It also could not close the case that retired it. The delay bought
+       intent from the POINTER; the peek's other trigger is `:focus-within`,
+       and that rule deliberately kept the ordinary 120ms beat ("there is no
+       such thing as tabbing into the rail by accident"). Clicking the search
+       box focuses it — so the click path still put a 240px overlay on the
+       admin column, just 120ms after the click instead of on a stray pass.
+       Removing the peek there covers both triggers; delaying one covers one. */
 
     /* The peeked layout — the rows' expanded padding and gaps, which the
        collapsed rules above override with the centring values and which they
@@ -2133,22 +2130,178 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        to: the rows are `flex-start` in both states and the icons travel by
        padding alone. (The label reveal is the single shared rule near the top of
        this section, not three rules down here — see the note there.) */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo {
         gap: 9px;
         padding-left: 8px;
         padding-right: 8px;
     }
 
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i {
         gap: 11px;
         padding-left: 11px;
         padding-right: 11px;
     }
 
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-user {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-user {
         gap: 10px;
         padding-left: 8px;
         padding-right: 8px;
+    }
+
+    /* ── The strip's labels stay READABLE, just not visible ─────────────────
+       The shared collapse rule parks every label at `visibility: hidden`,
+       which takes it out of the accessibility tree as well as off the screen.
+       That was survivable while the peek existed — `:focus-within` put every
+       label back the moment a caller reached the rail, so a screen reader got
+       names as soon as it needed them. This rail has no peek, so without this
+       the strip is a column of links a screen reader can only call "link":
+       verified in the accessibility tree, where New chat, Chats, Library,
+       Agents, Admin and the profile button all came back unnamed.
+
+       So on THIS rail the labels are screen-reader-only rather than hidden:
+       off-screen at 1px, clipped, taking no space in the 40px row — and still
+       in the accessibility tree, so every row is named at rest. No `aria-label`
+       anywhere, deliberately: the row already contains its name, and a copy in
+       an attribute is a second source for one string that drifts the first time
+       a row is renamed.
+
+       It can only be done here BECAUSE there is no peek: `visibility` is
+       load-bearing in the peek's choreography (it is what keeps the boxes in
+       flow so hover changes nothing but the rail's width, and what makes the
+       hidden conversation list refuse clicks). Nothing here animates, so
+       nothing here needs it. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-user-txt {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        opacity: 1;
+        visibility: visible;
+        transition: none;
+    }
+
+    /* ── The label chip — what names a row where the column can't open ──────
+       On a page carrying the admin secondary nav the hover peek is off
+       (`.rail-strip-only`, see the gate in this section's header), so the
+       pointer has no way left to read a 56px strip of glyphs. This gives it
+       one: hovering a row unfurls THAT row's own label beside its icon and
+       leaves every other pixel of the page alone. 34px of chip over the
+       neighbouring column for as long as the pointer rests on one row, against
+       240px of overlay erasing the whole of it on the way past — which is the
+       trade the whole change is about (#1956 item 6).
+
+       It reuses `.rail-i-label`, the element that is already in the row with
+       exactly the right text, rather than a `data-label` copy on every row and
+       a `::after` to print it: two sources for one string is how a renamed row
+       ends up named twice.
+
+       `:focus-visible` as well as `:hover`, because nothing else names a row
+       for a keyboard caller any more: this rail has no focus peek to fall back
+       on (see the section header). `:focus-visible` rather than `:focus`, so a
+       row clicked with the mouse does not leave a chip pinned behind the
+       pointer after it moves away. The two triggers can never disagree — one
+       row is hovered, one row is focused, and if they are the same row the
+       same rule paints one chip.
+
+       Not `title`: a native tooltip waits out the UA's own ~1s delay, opens an
+       OS box that ignores the theme, and never shows for the keyboard at all —
+       the same reasons the onboarding step rows dropped theirs (see the note in
+       the journey section). This is instant, themed, and inert
+       (`pointer-events: none`), so it cannot eat the click it is annotating. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible {
+        /* The chip's containing block, applied on hover only so no row is
+           left positioned when nothing is anchored to it.
+           `overflow: visible` is for ONE row and it is not defensive: the
+           collapsed-only Chats stand-in clips itself (`overflow: hidden`, up
+           with the fold rules) so its glyph can't spill mid-fold, and that clip
+           would have taken the chip's left half with it. Nothing folds while
+           the hover peek is off, so there is no clip left to want here. */
+        position: relative;
+        overflow: visible;
+    }
+
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label,
+    /* The Setup row IS a `.rail-i`, but its label is `.rail-getstarted-body`
+       (title + "N of 5 steps"), not `.rail-i-label` — so it was the one row in
+       the strip whose glyph named nothing on hover (Devin Review on #2074).
+       Same chip, same trigger. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-getstarted-body {
+        position: absolute;
+        /* Off the row's own right edge (40px of content inside the 56px strip),
+           so the chip clears the rail's hairline by the same 6px the rows are
+           inset by on the left. */
+        left: calc(100% + 6px);
+        top: 50%;
+        transform: translateY(-50%);
+        /* The peek's own value — the chip has the same job of floating over
+           whatever the page has docked beside the rail (`.fbar-dock` /
+           `.ch-bulk` at 55), and no reason to outrank it differently. */
+        z-index: 56;
+        /* Sized by its text, not by the 40px flex track the in-row label uses.
+           Capped so a long label can't run into the content column; it still
+           ellipsises past the cap, exactly as it does in the row. */
+        flex: 0 0 auto;
+        width: max-content;
+        max-width: 180px;
+        /* Undo the screen-reader-only clip this overrides (see the rule above),
+           or the chip paints at 1px with its text sliced out of the middle. */
+        height: auto;
+        clip-path: none;
+        overflow: visible;
+        padding: 5px 9px;
+        border-radius: var(--ds-radius-btn, 9px);
+        /* Inverted ink — a chip has to read as a layer above the column rather
+           than another row in it, and both tokens flip together under dark, so
+           it stays a solid-on-contrast pill in either theme. */
+        background: var(--ds-text-primary);
+        color: var(--ds-text-inverse);
+        box-shadow: var(--ds-shadow-md);
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1.25;
+        pointer-events: none;
+        /* Overrides the collapsed hide rule at the top of this section, which
+           parks every label at `opacity: 0; visibility: hidden`. Both flip at
+           once with no delay: a tooltip that waits is a tooltip nobody sees,
+           and there is no column growing around this one to sequence it
+           against. */
+        opacity: 1;
+        visibility: visible;
+        transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) 0s,
+                    visibility 0s linear 0s;
+    }
+
+    /* ── The onboarding panel, flown out beside the strip ───────────────────
+       The launcher's dropdown is `left: 0; right: 0` — it takes the width of
+       the row it hangs off, which is the whole point while the rail is 240px
+       wide or peeking. With the hover peek off it had no such column to hang
+       in: it opened at the launcher's collapsed width and rendered as a ~40px
+       ribbon of orphaned arrows and ticks stacked over the icon strip, its step
+       labels clipped to "Skip setu…". The panel was written on the assumption
+       that hovering ALWAYS widens the rail first, and that assumption is what
+       `.rail-strip-only` retires.
+
+       So it opens sideways instead of upward-in-place: pinned to the strip's
+       right edge at the width it was designed for, bottom-aligned with its own
+       launcher so it still reads as belonging to that row. Same idiom as the
+       label chip above — the strip stays 56px and the content comes out beside
+       it rather than crushing itself into it.
+
+       Hover only (`:not(:focus-within)`), like the chip: a keyboard caller
+       peeks the column open and gets the panel in its designed place. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-getstarted-panel {
+        left: calc(100% + 6px);
+        right: auto;
+        bottom: 0;
+        width: 248px;
     }
 
     /* The logo row shrinks to a single ~40px slot when collapsed — position
@@ -2212,8 +2365,15 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay);
     }
 
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:hover .rail-logo,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-logo {
+    /* `:not(:focus-within)` on the logo itself, because the row-level
+       `:focus-within` above matches when the focused element IS the logo:
+       tabbing to Home hid Home, leaving focus on something invisible and
+       unclickable, and the next visible control only reachable by tabbing
+       past it (Devin Review on #2074). The orb gives way to the toggle when
+       the pointer or the keyboard is somewhere else in the row — never when
+       the keyboard is on the orb. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:hover .rail-logo:not(:focus-within),
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-logo:not(:focus-within) {
         opacity: 0;
         pointer-events: none;
     }
@@ -2228,17 +2388,18 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
 
        Selectors carry `.rail-logo-row` so they match the specificity of the
        swap rules they override and win on order rather than on a `!important`.
-       `:is(:hover, :focus-within)` on the rail (not the row) is deliberate:
-       peeking is triggered by hovering ANY part of the rail, so the row must
-       take its expanded shape even when the pointer is nowhere near it. */
+       The peek trigger (`:is(:hover…, :focus-within)`) sits on the rail, not
+       the row, and that is deliberate: peeking is triggered by hovering ANY
+       part of the rail, so the row must take its expanded shape even when the
+       pointer is nowhere near it. */
     /* 8px matches the base `.rail-logo-row` padding at the top of this file —
        icon mode zeroes it to centre the orb in 56px, and peeking restores it. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-row {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-row {
         padding-left: 8px;
         padding-right: 8px;
     }
 
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-row .rail-logo {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-row .rail-logo {
         opacity: 1;
         pointer-events: auto;
     }
@@ -2247,7 +2408,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        longer switches to `position: static` here. `right` matches the row's own
        padding, which lands it exactly where the static child sat, and animates
        with it rather than jumping to it. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-row .rail-toggle {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-row .rail-toggle {
         right: 8px;
         opacity: 1;
         pointer-events: auto;
@@ -2276,10 +2437,87 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-input {
         display: none;
     }
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-input,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-input {
+    /* Revealed by the PEEK, on the shared trigger — not by a hand-rolled
+       `:hover, :focus-within` pair, which is what this was and what broke.
+       A 42px input only makes sense once the column is 240px wide, so the two
+       have to be the same event: with the hover peek off (`.rail-strip-only`,
+       the pages carrying the admin secondary nav) the pair still fired, and the
+       input reappeared inside the 40px strip — an empty pill with the magnifier
+       shoved against its left edge. The pair also predated `.rail-no-peek`, so a
+       pointer-driven collapse popped the box open on the way down. One trigger,
+       one answer to "is the column open". */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-search-input {
         display: block;
     }
+    /* ── Search, as a box that flies out of the strip ───────────────────────
+       `display: none` above is right while the peek exists: the magnifier says
+       "search", opening the column hands back the real box, and nothing has to
+       be clickable in between. This rail has no peek, so there is no in
+       between — and the first cut of that left the box a control that looked
+       live and did nothing, because the only thing to click was a
+       `pointer-events: none` icon over an input that was not rendered.
+
+       AT REST the input is rendered after all, stretched invisibly across the
+       whole 40px box so it takes the click. `opacity`, not `visibility:
+       hidden` — a hidden input takes no clicks, which is the entire job. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-search-input {
+        display: block;
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        /* `height: 100%`, and it is not redundant beside `inset: 0`: the base
+           rule pins the input to `var(--rail-row-h)`, which wins over the height
+           `inset` implies. The container hugs its 18px magnifier, so the target
+           hung 16px below its own box and swallowed the top 6px of the New chat
+           row beneath it — measured, `elementFromPoint` at y+6 returned the
+           search. An invisible target must be exactly the visible affordance. */
+        height: 100%;
+        padding: 0;
+        border: 0;
+        background: none;
+        opacity: 0;
+        cursor: pointer;
+    }
+
+    /* FOCUSED, the box flies out to the right at a width worth typing into,
+       and the strip stays 56px behind it. This is the case that taught the
+       section header its lesson: the field is focused BY CLICKING IT, so
+       leaving the focus peek in place meant one click on the magnifier still
+       replaced the admin column with a 240px rail. Now the field is the only
+       thing that moves.
+
+       280px, wider than the 240px rail it used to expand into: freed from the
+       column, the box has no reason to inherit the column's width, and search
+       queries are longer than nav labels. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-search:focus-within .rail-search-input {
+        left: calc(100% + 6px);
+        right: auto;
+        top: 50%;
+        bottom: auto;
+        transform: translateY(-50%);
+        width: 280px;
+        height: var(--rail-row-h);
+        /* No left inset for a magnifier: the glyph stays behind in the strip,
+           which is what anchors the flyout to the row it came from. */
+        padding: 0 10px;
+        border: 1px solid var(--ds-primary);
+        border-radius: var(--ds-radius-sm, 8px);
+        background: var(--ds-surface);
+        box-shadow: var(--ds-shadow-md);
+        opacity: 1;
+        cursor: text;
+        /* Same value the peek used, and for the same reason — it floats over
+           whatever the page has docked beside the rail (`.fbar-dock` /
+           `.ch-bulk` at 55). */
+        z-index: 56;
+    }
+
+    /* …and the results list follows the box rather than the strip, or it would
+       open 6px to the left of the field it belongs to. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-search-panel {
+        left: calc(100% + 6px);
+    }
+
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-icon {
         position: static;
         left: auto;
@@ -2295,9 +2533,11 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         color: var(--ds-text-secondary);
         transition: opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease);
     }
-    /* Peeked open, the full box comes back and the icon returns to its slot. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-icon,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-icon {
+    /* Peeked open, the full box comes back and the icon returns to its slot —
+       same shared trigger as the input above, and for the same reason: the icon
+       moving to `left: 9px` is only right once there is a box for it to sit in.
+       Off the trigger it clipped against the strip's edge. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-search-icon {
         position: absolute;
         left: 9px;
         width: 15px;
@@ -2315,7 +2555,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail,
     html[data-ui-layout="rail"] body:has(.rail),
     html[data-ui-layout="rail"] .rail.rail-icon-mode,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within),
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within),
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-toggle,
     /* The rows whose padding now carries the icons to their expanded position,
@@ -2337,16 +2577,23 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        reduced the two exchange places on one frame rather than cross-fading. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-full,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-mark,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-full,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-mark,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-history,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-i-label,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-getstarted-body,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-user-txt,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover, :focus-within) .rail-logo-row .rail-toggle,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-full,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-mark,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-history,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-user-txt,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-row .rail-toggle,
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:hover .rail-toggle,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-toggle {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-toggle,
+    /* The label chip, listed in full rather than relying on the plain
+       `.rail-i-label` entry above: the chip rule carries an extra class and a
+       `:hover`, so it outranks that one and would keep fading on its own. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-getstarted-body {
         transition: none;
     }
 }
