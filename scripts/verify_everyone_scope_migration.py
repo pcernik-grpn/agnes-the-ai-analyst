@@ -208,9 +208,13 @@ def _pg_has_run_0098(url: str) -> bool:
 
 
 def _duckdb_rows(path: str, sql: str) -> List[tuple]:
-    import duckdb
+    # Through `_open_duckdb`, not `duckdb.connect`: it pins the session
+    # timezone to UTC. This script only reads ids and flags, so the pinning
+    # changes nothing here — but a guard ratchets every call site, and
+    # exempting a one-off is how the next one gets exempted too.
+    from src.duckdb_conn import _open_duckdb
 
-    conn = duckdb.connect(path, read_only=True)
+    conn = _open_duckdb(path, read_only=True)
     try:
         return [tuple(r) for r in conn.execute(sql).fetchall()]
     finally:

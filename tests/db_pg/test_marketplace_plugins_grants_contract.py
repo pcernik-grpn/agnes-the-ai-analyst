@@ -573,6 +573,30 @@ class TestAdminDisabled:
         assert bool(row.get("admin_disabled")) is True
 
 
+def _set_legacy_flag(repos: dict, slug: str, name: str, value: bool) -> None:
+    """Set the legacy `is_system` flag directly.
+
+    No repo method writes it — the endpoints that did are gone (0098) and the
+    reconciler only ever CLEARS it — so the contract test seeds the
+    pre-migration state via backend-aware raw SQL. The column itself survives
+    on both backends until the contract half of the expand/contract pair
+    drops it a release later.
+    """
+    if repos["backend"] == "duckdb":
+        repos["conn"].execute(
+            "UPDATE marketplace_plugins SET is_system = ? WHERE marketplace_id = ? AND name = ?",
+            [value, slug, name],
+        )
+    else:
+        import sqlalchemy as sa
+
+        with repos["engine"].begin() as conn:
+            conn.execute(
+                sa.text("UPDATE marketplace_plugins SET is_system = :v WHERE marketplace_id = :m AND name = :n"),
+                {"v": value, "m": slug, "n": name},
+            )
+
+
 # ---------------------------------------------------------------------------
 # `list_system_keys` and `set_system` lived here.
 #
@@ -738,3 +762,43 @@ class TestClearSyncError:
             "clear_sync_error must not stamp a sync that never ran"
         )
         assert row["last_commit_sha"] is None
+
+
+class TestLegacySystemFlag:
+    """`list_legacy_system_keys` / `clear_legacy_system_flags`.
+
+    They exist for exactly one caller: `src.system_plugin_reconcile`, the
+    frozen DuckDB ladder's stand-in for migration 0098's step 4. Alembic
+    runs on Postgres only, so a DuckDB instance has no other way to convert
+    a flagged plugin into the grant that replaced the flag — and no other
+    way to READ the flag, since the serve paths that used to
+    (`list_granted_for_groups`, the deleted `list_system_keys`) stopped,
+    which is the point of 0098.
+
+    Named *legacy* rather than restoring the old name so nothing mistakes
+    them for live reads. Identical on both backends: on Postgres 0098 clears
+    the flag, so the read returns nothing there once it has run.
+    """
+
+    def test_empty_on_a_clean_instance(self, repos):
+        assert repos["plugins"].list_legacy_system_keys() == []
+        assert repos["plugins"].clear_legacy_system_flags() == 0
+
+    def test_reads_only_flagged_and_enabled_then_clears(self, repos):
+        _seed_registry(repos, "mp-legacy", datetime(2026, 1, 1, tzinfo=timezone.utc))
+        _seed_plugins(repos, "mp-legacy", ["flagged", "plain", "flagged-but-off"])
+        _set_legacy_flag(repos, "mp-legacy", "flagged", True)
+        _set_legacy_flag(repos, "mp-legacy", "flagged-but-off", True)
+        repos["plugins"].set_admin_disabled("mp-legacy", "flagged-but-off", True)
+
+        keys = set(repos["plugins"].list_legacy_system_keys())
+        assert keys == {("mp-legacy", "flagged")}, (
+            "a disabled-and-flagged plugin reached NOBODY, so converting it would "
+            "widen access by one plugin"
+        )
+
+        cleared = repos["plugins"].clear_legacy_system_flags()
+        assert cleared == 2, "both flags clear, including the disabled one"
+        assert repos["plugins"].list_legacy_system_keys() == []
+        # Idempotent: this is what makes the reconciler's second boot cheap.
+        assert repos["plugins"].clear_legacy_system_flags() == 0

@@ -719,3 +719,94 @@ def test_an_everyone_scope_survives_the_authorization_path_for_a_groupless_accou
     finally:
         importlib.reload(repositories)
         db_pg.dispose()
+
+
+def test_repoint_group_moves_grants_except_the_marker_types(rbac_repos):
+    """`repoint_group` is the frozen DuckDB ladder's half of 0098's step 2 —
+    an instance that pointed `Everyone` at a Workspace group gives that
+    subset its own group, and the grants move with the members.
+
+    Three behaviours, and the middle one is the reason the parameter exists:
+
+    - audience grants move;
+    - `exclude_types` rows stay put. A `slack_channel` grant on the seeded
+      group is not an audience grant — it marks a channel open, and the
+      allowlist check reads it off THAT group id — so moving it switches
+      Agnes off in every channel an admin enabled;
+    - a collision keeps the STRONGER tier. Where the target already holds
+      the resource, the source row is dropped, but Required wins first — or
+      a Required grant silently becomes Optional and stops landing in those
+      people's workspaces.
+    """
+    repos, _, _ = rbac_repos
+    groups, grants = repos["groups"], repos["grants"]
+
+    src = groups.create(name="mirrored-subset", created_by="test")
+    tgt = groups.create(name="real-group", created_by="test")
+
+    grants.create(group_id=src["id"], resource_type="chat", resource_id="chat")
+    grants.create(group_id=src["id"], resource_type="slack_channel", resource_id="C0MARKER")
+    grants.create(
+        group_id=src["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/collides",
+        requirement="required",
+    )
+    # The collision: the target already holds it, at the weaker tier.
+    grants.create(
+        group_id=tgt["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/collides",
+        requirement="available",
+    )
+
+    moved = grants.repoint_group(src["id"], tgt["id"], exclude_types=["slack_channel"])
+    assert moved == 1, "only the chat grant had anywhere to move to"
+
+    left = {g["resource_type"] for g in grants.list_all(group_id=src["id"])}
+    assert left == {"slack_channel"}, f"marker did not stay behind: {left}"
+
+    on_target = {g["resource_type"]: g for g in grants.list_all(group_id=tgt["id"])}
+    assert "chat" in on_target
+    assert on_target["marketplace_plugin"]["requirement"] == "required", (
+        "the collision downgraded a Required grant to Optional"
+    )
+
+
+def test_move_all_members_preserves_source_and_add_all_users_backfills(rbac_repos):
+    """The membership half of the same step.
+
+    `source` survives the move, which is what leaves the nightly sync owning
+    its own rows. `add_all_users` then makes the emptied group mean every
+    account — the only way the frozen backend can say "everyone", since it
+    has no `scope` column.
+    """
+    repos, _, _ = rbac_repos
+    groups, members, users = repos["groups"], repos["members"], repos["users"]
+
+    src = groups.create(name="mirrored-members", created_by="test")
+    tgt = groups.create(name="named-after-the-email", created_by="test")
+    for uid in ("m1", "m2", "m3"):
+        users.create(id=uid, email=f"{uid}@example.com", name=uid)
+    members.add_member("m1", src["id"], source="google_sync", added_by="sync")
+    members.add_member("m2", src["id"], source="admin", added_by="admin@x")
+    # m3 is in neither — the account a backfill has to reach.
+
+    moved = members.move_all_members(src["id"], tgt["id"])
+    assert moved == 2
+    assert members.list_members_for_group(src["id"]) == []
+
+    by_user = {
+        r["group_id"]: r
+        for r in members.list_groups_with_meta_for_user("m1")
+    }
+    assert tgt["id"] in by_user
+    assert by_user[tgt["id"]]["source"] == "google_sync", (
+        "the move rewrote `source`, so the sync no longer owns its own row"
+    )
+
+    added = members.add_all_users(src["id"], source="system_seed", added_by="test")
+    assert added == 3, "every account should now be in the emptied group"
+    assert added == len(users.list_all())
+    # Idempotent — a second pass adds nobody.
+    assert members.add_all_users(src["id"], source="system_seed", added_by="test") == 0

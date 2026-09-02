@@ -408,6 +408,44 @@ class MarketplacePluginsRepository:
         ).fetchall()
         return len(updated) > 0
 
+    def list_legacy_system_keys(self) -> List[Tuple[str, str]]:
+        """The legacy ``is_system`` flag, for the one caller that still needs it.
+
+        ``src.system_plugin_reconcile`` is the frozen DuckDB ladder's
+        stand-in for migration 0098's step 4 — Alembic runs on Postgres only
+        — and it cannot read this column any other way: the serve paths that
+        used to (``list_granted_for_groups``, ``list_system_keys``) stopped,
+        which is the whole point of 0098.
+
+        Named *legacy* rather than restoring ``list_system_keys`` so nothing
+        mistakes it for a live read. Both backends implement it identically:
+        on Postgres 0098 clears the flag, so this returns nothing there after
+        the migration has run, which is exactly the right answer.
+
+        ``admin_disabled = FALSE`` is part of the match, not tidiness: both
+        readers of the flag filtered on it, so a disabled plugin marked
+        system reached NOBODY and must not be granted one.
+        """
+        rows = self.conn.execute(
+            "SELECT marketplace_id, name FROM marketplace_plugins "
+            "WHERE is_system = TRUE AND admin_disabled = FALSE"
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def clear_legacy_system_flags(self) -> int:
+        """Clear every legacy ``is_system`` flag. Returns rows affected.
+
+        The last act of the DuckDB reconciliation, and what makes it
+        idempotent: with the flag gone the next boot has nothing to convert.
+        Also stops the column contradicting the grants for as long as it
+        survives — the drop is the contract half of an expand/contract pair
+        and ships a release later.
+        """
+        rows = self.conn.execute(
+            "UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system = TRUE RETURNING name"
+        ).fetchall()
+        return len(rows)
+
     def list_admin_disabled(self, marketplace_id: str) -> List[str]:
         """Return the names of plugins that have admin_disabled=TRUE for a marketplace."""
         rows = self.conn.execute(

@@ -392,6 +392,72 @@ class ResourceGrantsPgRepository:
             pass
         return True
 
+    def repoint_group(
+        self,
+        from_group_id: str,
+        to_group_id: str,
+        exclude_types: Optional[List[str]] = None,
+    ) -> int:
+        """Move every grant from one group to another, except ``exclude_types``.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2: an
+        instance that pointed ``Everyone`` at a Workspace group gets that
+        subset its own group, and the grants written against the pseudo-group
+        move with the members.
+
+        ``exclude_types`` is not a convenience. A ``slack_channel`` grant on
+        the seeded group is not an audience grant — it marks a channel open,
+        and ``services.slack_bot.binding`` reads it off that exact group id —
+        so repointing it switches Agnes off in every channel an admin
+        enabled.
+
+        Collisions: where the target already holds the same
+        (resource_type, resource_id), the source row is dropped rather than
+        moved, but the survivor is first upgraded to ``required`` if either
+        side was — or a Required grant would silently become Optional and
+        stop landing in those people's workspaces. Returns rows moved.
+        """
+        excl = list(exclude_types or [])
+        params: Dict[str, Any] = {"src": from_group_id, "tgt": to_group_id}
+        keys = []
+        for i, t in enumerate(excl):
+            k = f"x_{i}"
+            keys.append(f":{k}")
+            params[k] = t
+        notin = f"resource_type NOT IN ({','.join(keys) or 'NULL'})"
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    f"UPDATE resource_grants t SET requirement = 'required' "
+                    f"WHERE t.group_id = :tgt AND t.{notin} AND EXISTS ("
+                    f"  SELECT 1 FROM resource_grants s "
+                    f"  WHERE s.group_id = :src "
+                    f"    AND s.resource_type = t.resource_type "
+                    f"    AND s.resource_id = t.resource_id "
+                    f"    AND s.requirement = 'required')"
+                ),
+                params,
+            )
+            conn.execute(
+                sa.text(
+                    f"DELETE FROM resource_grants s "
+                    f"WHERE s.group_id = :src AND s.{notin} AND EXISTS ("
+                    f"  SELECT 1 FROM resource_grants t "
+                    f"  WHERE t.group_id = :tgt "
+                    f"    AND t.resource_type = s.resource_type "
+                    f"    AND t.resource_id = s.resource_id)"
+                ),
+                params,
+            )
+            res = conn.execute(
+                sa.text(
+                    f"UPDATE resource_grants SET group_id = :tgt "
+                    f"WHERE group_id = :src AND {notin}"
+                ),
+                params,
+            )
+        return int(res.rowcount or 0)
+
     def delete(self, grant_id: str) -> bool:
         with self._engine.begin() as conn:
             row = conn.execute(

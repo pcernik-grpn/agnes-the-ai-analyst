@@ -47,13 +47,23 @@ The flag is CLEARED as the last act, which is what makes this idempotent
 and what makes the second boot cheap. The column itself survives — see
 ``src/models/store.py``; dropping it is the contract half of an
 expand/contract pair and ships in a later release.
+
+EVERY read and write here goes through ``src.repositories``. An earlier
+draft opened the system DuckDB connection directly and ran raw SQL on the
+state tables, and two static guards caught it: ``tests/test_backend_split_guard.py`` ratchets
+both (a raw connection reads the WRONG BACKEND on a Postgres instance, which
+is the bug class that guard exists for), and A3 forbids answering it with a
+new DuckDB-only repository. The operations it needs are methods on the
+EXISTING repositories instead, each with a real Postgres sibling —
+``list_legacy_system_keys`` / ``clear_legacy_system_flags``,
+``repoint_group``, ``move_all_members`` / ``add_all_users``. Widening an
+allow-list would have turned a guard into decoration.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import uuid
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -71,100 +81,59 @@ SYNC_CREATED_BY = "system:google-sync"
 MARKER_TYPES = ("slack_channel",)
 
 
-def _column_exists(conn, table: str, column: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
-        [table, column],
-    ).fetchone()
-    return row is not None
-
-
-def _everyone_group_id(conn) -> Optional[str]:
+def _everyone_group_id() -> Optional[str]:
     from src.db import SYSTEM_EVERYONE_GROUP
+    from src.repositories import user_groups_repo
 
-    row = conn.execute(
-        "SELECT id FROM user_groups WHERE name = ? AND is_system",
-        [SYSTEM_EVERYONE_GROUP],
-    ).fetchone()
-    return row[0] if row else None
+    row = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+    return row["id"] if row else None
 
 
-def _convert_workspace_narrowing(conn, everyone_id: str) -> bool:
+def _convert_workspace_narrowing(everyone_id: str) -> bool:
     """0098's step 2. Returns True iff a conversion happened.
 
     The return value is load-bearing: it is the ONLY thing that authorizes
-    step 2's membership backfill, because it is the only evidence that the
+    the membership backfill below, because it is the only evidence the
     seeded group has been emptied of grants that were never everyone's.
     """
+    from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo
+
     everyone_email = os.environ.get(ENV_EVERYONE_EMAIL, "").strip().lower()
     if not everyone_email:
         return False
 
-    row = conn.execute("SELECT id FROM user_groups WHERE name = ?", [everyone_email]).fetchone()
-    if row:
-        target_id = row[0]
+    groups = user_groups_repo()
+    existing = groups.get_by_name(everyone_email)
+    if existing:
+        target_id = existing["id"]
     else:
-        target_id = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO user_groups (id, name, description, is_system, created_by) VALUES (?, ?, ?, FALSE, ?)",
-            [
-                target_id,
-                everyone_email,
-                (
-                    f"Was mapped to the Everyone system group by {ENV_EVERYONE_EMAIL}. "
-                    "Converted to an ordinary Workspace-synced group; membership still "
-                    "comes from the same Workspace group."
-                ),
-                SYNC_CREATED_BY,
-            ],
-        )
+        target_id = groups.create(
+            name=everyone_email,
+            description=(
+                f"Was mapped to the Everyone system group by {ENV_EVERYONE_EMAIL}. "
+                "Converted to an ordinary Workspace-synced group; membership still "
+                "comes from the same Workspace group."
+            ),
+            created_by=SYNC_CREATED_BY,
+        )["id"]
 
-    # Members move with their `source` intact, so the sync keeps owning the
-    # rows it owns. ALL of them move: the grants move too, so a row left
-    # behind would lose them.
-    conn.execute(
-        "INSERT OR IGNORE INTO user_group_members (user_id, group_id, source, added_at, added_by) "
-        "SELECT user_id, ?, source, added_at, added_by "
-        "FROM user_group_members WHERE group_id = ?",
-        [target_id, everyone_id],
-    )
-    conn.execute("DELETE FROM user_group_members WHERE group_id = ?", [everyone_id])
-
-    markers = ",".join(["?"] * len(MARKER_TYPES))
-    # Stronger tier survives a collision, or a Required grant silently
-    # becomes Optional and stops landing in those people's workspaces.
-    conn.execute(
-        f"""UPDATE resource_grants SET requirement = 'required'
-            WHERE group_id = ? AND resource_type NOT IN ({markers}) AND EXISTS (
-                SELECT 1 FROM resource_grants s
-                WHERE s.group_id = ?
-                  AND s.resource_type = resource_grants.resource_type
-                  AND s.resource_id = resource_grants.resource_id
-                  AND s.requirement = 'required')""",
-        [target_id, *MARKER_TYPES, everyone_id],
-    )
-    conn.execute(
-        f"""DELETE FROM resource_grants
-            WHERE group_id = ? AND resource_type NOT IN ({markers}) AND EXISTS (
-                SELECT 1 FROM resource_grants t
-                WHERE t.group_id = ?
-                  AND t.resource_type = resource_grants.resource_type
-                  AND t.resource_id = resource_grants.resource_id)""",
-        [everyone_id, *MARKER_TYPES, target_id],
-    )
-    conn.execute(
-        f"UPDATE resource_grants SET group_id = ? WHERE group_id = ? AND resource_type NOT IN ({markers})",
-        [target_id, everyone_id, *MARKER_TYPES],
+    moved_members = user_group_members_repo().move_all_members(everyone_id, target_id)
+    moved_grants = resource_grants_repo().repoint_group(
+        everyone_id, target_id, exclude_types=list(MARKER_TYPES)
     )
     logger.info(
-        "system-plugin reconcile: converted the %s narrowing into the ordinary group %r",
+        "system-plugin reconcile: converted the %s narrowing into the ordinary group "
+        "%r — %d membership(s) and %d grant(s) moved; %s left on the seeded group",
         ENV_EVERYONE_EMAIL,
         everyone_email,
+        moved_members,
+        moved_grants,
+        "/".join(MARKER_TYPES),
     )
     return True
 
 
-def _make_everyone_universal(conn, everyone_id: str) -> int:
+def _make_everyone_universal(everyone_id: str) -> int:
     """0098 has no counterpart to this, and does not need one.
 
     On Postgres "every account" is a SCOPE, so the seeded group's membership
@@ -172,92 +141,74 @@ def _make_everyone_universal(conn, everyone_id: str) -> int:
     way to say "everyone" there is a group that really does hold everyone —
     which this makes true.
 
-    Called ONLY after :func:`_convert_workspace_narrowing` returned True. On
-    any other instance the group still holds grants, and adding an account
-    to it would hand that account those grants.
+    Called ONLY after :func:`_convert_workspace_narrowing` returned True.
     """
-    rows = conn.execute(
-        """INSERT INTO user_group_members (user_id, group_id, source, added_by)
-           SELECT u.id, ?, 'system_seed', 'system:everyone-scope-reconcile'
-           FROM users u
-           WHERE NOT EXISTS (
-               SELECT 1 FROM user_group_members m
-               WHERE m.user_id = u.id AND m.group_id = ?)
-           RETURNING 1""",
-        [everyone_id, everyone_id],
-    ).fetchall()
-    if rows:
+    from src.repositories import user_group_members_repo
+
+    added = user_group_members_repo().add_all_users(
+        everyone_id, source="system_seed", added_by="system:everyone-scope-reconcile"
+    )
+    if added:
         logger.info(
             "system-plugin reconcile: added %d account(s) to the Everyone group, "
             "which now means every account on this instance",
-            len(rows),
+            added,
         )
-    return len(rows)
+    return added
 
 
-def _flags_become_grants(conn, everyone_id: str) -> int:
-    """0098's step 4, minus the scope column this backend does not have.
-
-    ``admin_disabled = FALSE`` is part of the match, not tidiness: both
-    readers of the flag filtered on it, so a disabled plugin marked system
-    reached NOBODY. Writing it a grant would be this reconciliation widening
-    access by one plugin.
-    """
+def _flags_become_grants(everyone_id: str) -> int:
+    """0098's step 4, minus the scope column this backend does not have."""
     from src.grant_sources import SYSTEM_PLUGIN_MIGRATION
+    from src.repositories import marketplace_plugins_repo, resource_grants_repo
 
-    system_rows = conn.execute(
-        "SELECT marketplace_id, name FROM marketplace_plugins WHERE is_system = TRUE AND admin_disabled = FALSE"
-    ).fetchall()
+    plugins = marketplace_plugins_repo()
+    grants = resource_grants_repo()
+    keys = plugins.list_legacy_system_keys()
 
-    for marketplace_id, plugin_name in system_rows:
+    for marketplace_id, plugin_name in keys:
         resource_id = f"{marketplace_id}/{plugin_name}"
-        existing = conn.execute(
-            "SELECT id, requirement FROM resource_grants "
-            "WHERE group_id = ? AND resource_type = 'marketplace_plugin' AND resource_id = ?",
-            [everyone_id, resource_id],
-        ).fetchone()
-        if existing is None:
-            conn.execute(
-                "INSERT INTO resource_grants "
-                "(id, group_id, resource_type, resource_id, requirement, assigned_by) "
-                "VALUES (?, ?, 'marketplace_plugin', ?, 'required', ?)",
-                [str(uuid.uuid4()), everyone_id, resource_id, SYSTEM_PLUGIN_MIGRATION],
+        held = [
+            g
+            for g in grants.list_all(resource_type="marketplace_plugin", group_id=everyone_id)
+            if g["resource_id"] == resource_id
+        ]
+        if not held:
+            grants.create(
+                group_id=everyone_id,
+                resource_type="marketplace_plugin",
+                resource_id=resource_id,
+                assigned_by=SYSTEM_PLUGIN_MIGRATION,
+                requirement="required",
             )
-        elif (existing[1] or "available") != "required":
+        elif (held[0].get("requirement") or "available") != "required":
             # A hand-set grant on the carrier for a plugin the flag ALREADY
             # made mandatory for everyone. Upgrading the tier preserves reach
             # rather than changing it; leaving it Optional would let a member
             # drop a plugin they could not drop yesterday.
-            conn.execute(
-                "UPDATE resource_grants SET requirement = 'required' WHERE id = ?",
-                [existing[0]],
-            )
+            grants.update_requirement(held[0]["id"], "required")
 
-    # Clear the flag LAST. This is what makes the next boot cheap and stops
-    # the column contradicting the grants. `assigned_by` carries the
-    # provenance instead, because this backend has no `source` column either.
-    if system_rows:
-        conn.execute("UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system = TRUE")
+    # Clear the flag LAST — idempotence, and it stops the surviving column
+    # contradicting the grants. Unconditional, so a disabled-and-flagged row
+    # (never granted, correctly) does not keep the column disagreeing forever.
+    cleared = plugins.clear_legacy_system_flags()
+    if cleared:
         logger.info(
             "system-plugin reconcile: %d plugin(s) that were 'system' now reach "
-            "everyone through a required grant instead",
-            len(system_rows),
+            "everyone through a required grant instead (%d flag(s) cleared)",
+            len(keys),
+            cleared,
         )
-    else:
-        # Nothing to convert, but a disabled-and-flagged row would keep the
-        # column disagreeing with the grants forever. Clear those too.
-        conn.execute("UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system = TRUE")
-    return len(system_rows)
+    return len(keys)
 
 
 def reconcile_system_plugin_flags() -> bool:
-    """Run the DuckDB half of 0098. Idempotent; returns True iff it changed
-    anything.
+    """Run the DuckDB half of 0098. Idempotent; True iff anything changed.
 
     Fail-soft by design, like every other boot-time seeder: an instance that
     cannot reconcile should still start and serve, loudly logged, rather than
-    refuse to boot. The cost of the soft failure is bounded — the flag is
-    still set, so the next boot retries.
+    refuse to boot. The cost is bounded — the flag is still set, so the next
+    boot retries.
     """
     from src.repositories import use_pg
 
@@ -266,14 +217,8 @@ def reconcile_system_plugin_flags() -> bool:
         # the time anything calls us.
         return False
 
-    from src.db import get_system_db
-
-    conn = None
     try:
-        conn = get_system_db()
-        if not _column_exists(conn, "marketplace_plugins", "is_system"):
-            return False
-        everyone_id = _everyone_group_id(conn)
+        everyone_id = _everyone_group_id()
         if not everyone_id:
             logger.warning(
                 "system-plugin reconcile: the Everyone system group is missing; "
@@ -281,10 +226,10 @@ def reconcile_system_plugin_flags() -> bool:
             )
             return False
 
-        converted = _convert_workspace_narrowing(conn, everyone_id)
+        converted = _convert_workspace_narrowing(everyone_id)
         if converted:
-            _make_everyone_universal(conn, everyone_id)
-        changed = _flags_become_grants(conn, everyone_id)
+            _make_everyone_universal(everyone_id)
+        changed = _flags_become_grants(everyone_id)
         return converted or bool(changed)
     except Exception:
         logger.exception(
@@ -292,9 +237,3 @@ def reconcile_system_plugin_flags() -> bool:
             "not reach everyone until this succeeds. Retried on the next boot."
         )
         return False
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001 - closing must not mask the above
-                pass

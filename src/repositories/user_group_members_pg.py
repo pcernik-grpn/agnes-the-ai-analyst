@@ -68,6 +68,58 @@ class UserGroupMembersPgRepository:
             ).first()
         return row is not None
 
+    def move_all_members(self, from_group_id: str, to_group_id: str) -> int:
+        """Move every membership from one group to another, ``source`` intact.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2. Keeping
+        ``source`` is what leaves the nightly sync owning the rows it owns
+        and an admin-added member admin-added. Idempotent on the target — a
+        user already in it is left alone. Returns rows moved.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO user_group_members "
+                    "(user_id, group_id, source, added_at, added_by) "
+                    "SELECT user_id, :tgt, source, added_at, added_by "
+                    "FROM user_group_members WHERE group_id = :src "
+                    "ON CONFLICT (user_id, group_id) DO NOTHING"
+                ),
+                {"tgt": to_group_id, "src": from_group_id},
+            )
+            res = conn.execute(
+                sa.text("DELETE FROM user_group_members WHERE group_id = :src"),
+                {"src": from_group_id},
+            )
+        return int(res.rowcount or 0)
+
+    def add_all_users(self, group_id: str, source: str, added_by: str) -> int:
+        """Put every existing user in ``group_id``. Returns rows written.
+
+        Only safe on a group that grants NOTHING. Its one caller
+        (``src.system_plugin_reconcile``) runs it immediately after moving
+        the seeded group's grants out, and only then — on a group that still
+        holds grants this hands every account those grants, which is a
+        widening rather than a backfill.
+        """
+        with self._engine.begin() as conn:
+            res = conn.execute(
+                sa.text(
+                    # Casts, because the same bind is a SELECT-list value AND
+                    # a comparison operand below: Postgres deduces `text` from
+                    # one and `character varying` from the other and refuses
+                    # with AmbiguousParameter.
+                    "INSERT INTO user_group_members (user_id, group_id, source, added_by) "
+                    "SELECT u.id, CAST(:g AS varchar), CAST(:s AS varchar), "
+                    "       CAST(:ab AS varchar) FROM users u "
+                    "WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM user_group_members m "
+                    "  WHERE m.user_id = u.id AND m.group_id = CAST(:g AS varchar))"
+                ),
+                {"g": group_id, "s": source, "ab": added_by},
+            )
+        return int(res.rowcount or 0)
+
     def add_member(
         self,
         user_id: str,

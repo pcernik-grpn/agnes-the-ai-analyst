@@ -93,6 +93,48 @@ class UserGroupMembersRepository:
         ).fetchone()
         return row is not None
 
+    def move_all_members(self, from_group_id: str, to_group_id: str) -> int:
+        """Move every membership from one group to another, ``source`` intact.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2. Keeping
+        ``source`` is what leaves the nightly sync owning the rows it owns
+        and an admin-added member admin-added. Idempotent on the target — a
+        user already in it is left alone. Returns rows moved.
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO user_group_members "
+            "(user_id, group_id, source, added_at, added_by) "
+            "SELECT user_id, ?, source, added_at, added_by "
+            "FROM user_group_members WHERE group_id = ?",
+            [to_group_id, from_group_id],
+        )
+        rows = self.conn.execute(
+            "DELETE FROM user_group_members WHERE group_id = ? RETURNING 1",
+            [from_group_id],
+        ).fetchall()
+        return len(rows)
+
+    def add_all_users(self, group_id: str, source: str, added_by: str) -> int:
+        """Put every existing user in ``group_id``. Returns rows written.
+
+        Only safe on a group that grants NOTHING. Its one caller
+        (``src.system_plugin_reconcile``) runs it immediately after moving
+        the seeded group's grants out, and only then — on a group that still
+        holds grants this hands every account those grants, which is a
+        widening rather than a backfill.
+        """
+        rows = self.conn.execute(
+            """INSERT INTO user_group_members (user_id, group_id, source, added_by)
+               SELECT u.id, ?, ?, ?
+               FROM users u
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM user_group_members m
+                   WHERE m.user_id = u.id AND m.group_id = ?)
+               RETURNING 1""",
+            [group_id, source, added_by, group_id],
+        ).fetchall()
+        return len(rows)
+
     def add_member(
         self,
         user_id: str,

@@ -338,6 +338,60 @@ class ResourceGrantsRepository:
         ).fetchone()
         return row is not None
 
+    def repoint_group(
+        self,
+        from_group_id: str,
+        to_group_id: str,
+        exclude_types: Optional[List[str]] = None,
+    ) -> int:
+        """Move every grant from one group to another, except ``exclude_types``.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2: an
+        instance that pointed ``Everyone`` at a Workspace group gets that
+        subset its own group, and the grants written against the pseudo-group
+        move with the members.
+
+        ``exclude_types`` is not a convenience. A ``slack_channel`` grant on
+        the seeded group is not an audience grant — it marks a channel open,
+        and ``services.slack_bot.binding`` reads it off that exact group id —
+        so repointing it switches Agnes off in every channel an admin
+        enabled.
+
+        Collisions: where the target already holds the same
+        (resource_type, resource_id), the source row is dropped rather than
+        moved, but the survivor is first upgraded to ``required`` if either
+        side was — or a Required grant would silently become Optional and
+        stop landing in those people's workspaces. Returns rows moved.
+        """
+        excl = list(exclude_types or [])
+        ph = ",".join(["?"] * len(excl)) if excl else "NULL"
+        self.conn.execute(
+            f"""UPDATE resource_grants SET requirement = 'required'
+                WHERE group_id = ? AND resource_type NOT IN ({ph}) AND EXISTS (
+                    SELECT 1 FROM resource_grants s
+                    WHERE s.group_id = ?
+                      AND s.resource_type = resource_grants.resource_type
+                      AND s.resource_id = resource_grants.resource_id
+                      AND s.requirement = 'required')""",
+            [to_group_id, *excl, from_group_id],
+        )
+        self.conn.execute(
+            f"""DELETE FROM resource_grants
+                WHERE group_id = ? AND resource_type NOT IN ({ph}) AND EXISTS (
+                    SELECT 1 FROM resource_grants t
+                    WHERE t.group_id = ?
+                      AND t.resource_type = resource_grants.resource_type
+                      AND t.resource_id = resource_grants.resource_id)""",
+            [from_group_id, *excl, to_group_id],
+        )
+        rows = self.conn.execute(
+            f"""UPDATE resource_grants SET group_id = ?
+                WHERE group_id = ? AND resource_type NOT IN ({ph})
+                RETURNING 1""",
+            [to_group_id, from_group_id, *excl],
+        ).fetchall()
+        return len(rows)
+
     def delete(self, grant_id: str) -> bool:
         """Remove a grant by id. Returns True iff a row was removed."""
         res = self.conn.execute(
