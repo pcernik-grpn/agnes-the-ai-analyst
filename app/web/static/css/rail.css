@@ -2171,6 +2171,7 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        hidden conversation list refuse clicks). Nothing here animates, so
        nothing here needs it. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-getstarted-body,
     html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-user-txt {
         position: absolute;
         width: 1px;
@@ -2226,7 +2227,13 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     }
 
     html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-i-label,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label,
+    /* The Setup row IS a `.rail-i`, but its label is `.rail-getstarted-body`
+       (title + "N of 5 steps"), not `.rail-i-label` — so it was the one row in
+       the strip whose glyph named nothing on hover (Devin Review on #2074).
+       Same chip, same trigger. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-getstarted-body {
         position: absolute;
         /* Off the row's own right edge (40px of content inside the 56px strip),
            so the chip clears the rail's hairline by the same 6px the rows are
@@ -2358,8 +2365,15 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         transition: opacity var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) var(--rail-peek-text-delay);
     }
 
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:hover .rail-logo,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-logo {
+    /* `:not(:focus-within)` on the logo itself, because the row-level
+       `:focus-within` above matches when the focused element IS the logo:
+       tabbing to Home hid Home, leaving focus on something invisible and
+       unclickable, and the next visible control only reachable by tabbing
+       past it (Devin Review on #2074). The orb gives way to the toggle when
+       the pointer or the keyboard is somewhere else in the row — never when
+       the keyboard is on the orb. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:hover .rail-logo:not(:focus-within),
+    html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-logo-row:focus-within .rail-logo:not(:focus-within) {
         opacity: 0;
         pointer-events: none;
     }
@@ -2577,7 +2591,9 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
        `.rail-i-label` entry above: the chip rule carries an extra class and a
        `:hover`, so it outranks that one and would keep fading on its own. */
     html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-i-label,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label {
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-i-label,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:hover .rail-getstarted-body,
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-strip-only .rail-i:focus-visible .rail-getstarted-body {
         transition: none;
     }
 }
