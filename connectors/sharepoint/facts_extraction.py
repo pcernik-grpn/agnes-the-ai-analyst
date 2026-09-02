@@ -1550,6 +1550,109 @@ class _DocResult:
         self.seconds = seconds
 
 
+def _plan_documents(
+    *,
+    connection: Dict[str, Any],
+    docs_state: Dict[str, Any],
+    report: "_Report",
+    files_repo: Any,
+    sources_repo: Any,
+    wanted_doc_ids: Optional[set],
+    model: str,
+    fingerprint: str,
+    max_doc_chars: int,
+) -> Any:
+    """Yield the documents that actually need a model call — the SAME walk
+    for BOTH transports (:func:`run_facts_extraction`'s sync loop and
+    :func:`_run_batch_pass`), taking every input as an explicit parameter
+    rather than closing over one function's locals, so a document's
+    eligibility can never drift between them. Module-level rather than a
+    per-call nested closure for exactly that reason.
+
+    Every cheap decision — not a source document, tabular, not indexed,
+    unchanged, no text, still mid-flight in an unfinished batch — is made
+    HERE, on the caller's thread, before anything is submitted: those
+    documents cost nothing and must not occupy a worker slot (or a batch
+    request) to find that out.
+    """
+    for collection_id in collection_ids_for(connection):
+        for file_row in files_repo.list_for_corpus(collection_id):
+            file_id = str(file_row["id"])
+            mapping = sources_repo.get(file_id) or {}
+            doc_id = mapping.get("source_doc_id")
+            if not doc_id:
+                # Not a source-anchored document (a hand upload); it has
+                # no producer doc_id to cite, so ingest could not resolve
+                # its evidence anyway.
+                continue
+            doc_id = str(doc_id)
+            if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
+                continue
+
+            entry = docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") == "batch-submitted":
+                # Still mid-flight in a batch this pass's resume step
+                # either just collected (rewriting `entry`) or is still
+                # polling — either way it must not be submitted again.
+                continue
+
+            report.docs_seen += 1
+            # `path`/`filename` here are exactly what `corpus_files`
+            # stores — for an anonymize-marked collection that is the
+            # ANONYMIZED value (``connectors.sharepoint.crawler
+            # ._anonymize_identity`` writes it there at ingest time, the
+            # same as the document body), never the real SharePoint name
+            # or folder. This module deliberately has no anonymize gate
+            # of its own: there is no raw text left to gate by the time
+            # it gets here, so `build_user_message` and
+            # `quote_is_verbatim` below can only ever see/cite the
+            # already-redacted identity, same as the chunk text.
+            path = file_row.get("path")
+            filename = file_row.get("filename")
+            if _is_tabular(path, filename):
+                report.docs_skipped_tabular += 1
+                docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
+                continue
+            if file_row.get("processing_status") != "indexed":
+                # The gate defers a claim on a non-indexed document, so
+                # extracting it now would spend a call on claims the
+                # ingest cannot accept yet.
+                report.docs_skipped_not_indexed += 1
+                continue
+
+            sha256 = str(file_row.get("sha256") or "")
+            if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
+                report.docs_unchanged += 1
+                continue
+
+            chunk_texts, text = _document_text(file_id)
+            if not text.strip():
+                report.docs_skipped_no_text += 1
+                docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
+                continue
+            if len(text) > max_doc_chars:
+                text = text[:max_doc_chars]
+                report.docs_truncated += 1
+
+            metadata = {
+                "doc_id": doc_id,
+                "name": filename,
+                "path": path,
+                "collection_id": collection_id,
+            }
+            yield _Work(
+                file_id=file_id,
+                doc_id=doc_id,
+                collection_id=collection_id,
+                filename=filename,
+                path=path,
+                sha256=sha256,
+                mapping=mapping,
+                chunk_texts=chunk_texts,
+                user_message=build_user_message(metadata, text),
+            )
+
+
 def extract_one(extractor: Any, work: _Work) -> _DocResult:
     """The whole per-document LLM half: call, verbatim-check, deterministic
     repair, ONE corrective retry, drop-and-count.
@@ -1770,84 +1873,6 @@ def run_facts_extraction(
             shipped_usage.update({k: int(v) for k, v in snapshot.items() if isinstance(v, (int, float))})
             save_state(connection_id, state)
 
-    def _plan() -> Any:
-        """Yield the documents that actually need a model call.
-
-        Every cheap decision — not a source document, tabular, not
-        indexed, unchanged, no text — is made HERE, on the main thread,
-        before anything is submitted: those documents cost nothing and
-        must not occupy a worker slot to find that out.
-        """
-        for collection_id in collection_ids_for(connection):
-            for file_row in files_repo.list_for_corpus(collection_id):
-                file_id = str(file_row["id"])
-                mapping = sources_repo.get(file_id) or {}
-                doc_id = mapping.get("source_doc_id")
-                if not doc_id:
-                    # Not a source-anchored document (a hand upload); it has
-                    # no producer doc_id to cite, so ingest could not resolve
-                    # its evidence anyway.
-                    continue
-                doc_id = str(doc_id)
-                if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
-                    continue
-
-                report.docs_seen += 1
-                # `path`/`filename` here are exactly what `corpus_files`
-                # stores — for an anonymize-marked collection that is the
-                # ANONYMIZED value (``connectors.sharepoint.crawler
-                # ._anonymize_identity`` writes it there at ingest time, the
-                # same as the document body), never the real SharePoint name
-                # or folder. This module deliberately has no anonymize gate
-                # of its own: there is no raw text left to gate by the time
-                # it gets here, so `build_user_message` and
-                # `quote_is_verbatim` below can only ever see/cite the
-                # already-redacted identity, same as the chunk text.
-                path = file_row.get("path")
-                filename = file_row.get("filename")
-                if _is_tabular(path, filename):
-                    report.docs_skipped_tabular += 1
-                    docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
-                    continue
-                if file_row.get("processing_status") != "indexed":
-                    # The gate defers a claim on a non-indexed document, so
-                    # extracting it now would spend a call on claims the
-                    # ingest cannot accept yet.
-                    report.docs_skipped_not_indexed += 1
-                    continue
-
-                sha256 = str(file_row.get("sha256") or "")
-                if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
-                    report.docs_unchanged += 1
-                    continue
-
-                chunk_texts, text = _document_text(file_id)
-                if not text.strip():
-                    report.docs_skipped_no_text += 1
-                    docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
-                    continue
-                if len(text) > max_doc_chars:
-                    text = text[:max_doc_chars]
-                    report.docs_truncated += 1
-
-                metadata = {
-                    "doc_id": doc_id,
-                    "name": filename,
-                    "path": path,
-                    "collection_id": collection_id,
-                }
-                yield _Work(
-                    file_id=file_id,
-                    doc_id=doc_id,
-                    collection_id=collection_id,
-                    filename=filename,
-                    path=path,
-                    sha256=sha256,
-                    mapping=mapping,
-                    chunk_texts=chunk_texts,
-                    user_message=build_user_message(metadata, text),
-                )
-
     def _accept(result: _DocResult) -> None:
         """Fold one finished document into the report, the batch and the
         state file. Main thread only — which is what makes the report
@@ -1933,7 +1958,17 @@ def run_facts_extraction(
         # immediately, rather than only once the (possibly slow) first
         # document finishes.
         _report_progress(docs_done=0)
-        for work in _plan():
+        for work in _plan_documents(
+            connection=connection,
+            docs_state=docs_state,
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=wanted_doc_ids,
+            model=model,
+            fingerprint=fingerprint,
+            max_doc_chars=max_doc_chars,
+        ):
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
             # paid for whether or not this process waits for them.
