@@ -14,6 +14,8 @@ WHERE list_contains($user_groups, cost_center)
 
 The policy is *data* — stored on the table, versioned via the audit log, one per table (there is no per-audience list; branch inside the SQL with `CASE` or `list_contains($user_groups, …)` instead). No policy means no behavior change: every path here short-circuits when a table's `access_policy_sql` is `NULL`.
 
+**Attachment downloads are a row read too.** `GET /api/attachments/{source}/{id}/download` serves one row's file, so it first checks that the row is visible in the caller's policied view — through the policy's *projection*, exactly as any other read. A policy that masks or excludes the attachment identifier column therefore makes those rows unaddressable for that caller (404, indistinguishable from a missing row): a caller who cannot see an identifier through any policied surface has no legitimate way to hold it, and checking identity against the raw table instead would turn the download route into an oracle for confirming which hidden identifiers exist.
+
 ## Scope: only tables that never leave the server
 
 A policy is only enforceable where Agnes evaluates the read. Once a parquet is on an analyst's laptop, the analyst holds unfiltered bytes with no server in the loop — so a policy may only be attached to a table that is **not distributed**:
