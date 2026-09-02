@@ -4260,7 +4260,12 @@ class ChatManager:
                     logger.debug("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
             if not title:
                 return
-            self._repo.set_title(live.chat_id, title)
+            # Conditional write: the user may have renamed the chat while we
+            # were awaiting the model, and their name wins. No broadcast
+            # then either — the rename endpoint already announced theirs.
+            if not self._repo.set_title_if_unset(live.chat_id, title):
+                logger.debug("auto-title: %s was titled meanwhile (user rename); keeping it", live.chat_id)
+                return
             # Push the new title to the live WS so the sidebar +
             # thread header update without a refresh. _broadcast may
             # raise if the socket has dropped — swallow it; the

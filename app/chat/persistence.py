@@ -303,6 +303,29 @@ class ChatRepository:
             return
         self._conn.execute("UPDATE chat_sessions SET title = ? WHERE id = ?", [title, chat_id])
 
+    def set_title_if_unset(self, chat_id: str, title: str) -> bool:
+        """Set ``title`` only while the session still has none. Returns
+        ``True`` if this call wrote it, ``False`` if a title was already there
+        (or the session is gone).
+
+        The auto-title task's write: it checks for a title before scheduling,
+        then awaits the model for up to several seconds — during which the
+        user may rename the chat (``PUT /api/chat/sessions/{id}/title``). A
+        plain ``set_title`` afterwards would replace the user's choice with
+        the model's; the conditional UPDATE makes "fill only if still empty"
+        atomic on both backends."""
+        if self._sessions_pg is not None:
+            return self._sessions_pg.set_title_if_unset(chat_id, title)
+        # No RETURNING: on DuckDB 1.5.x an UPDATE ... RETURNING on a row that
+        # chat_messages already references trips the FK+index limitation the
+        # docstring of set_title describes (the plain UPDATE does not). DuckDB
+        # answers a bare UPDATE with one row holding the affected-row count.
+        row = self._conn.execute(
+            "UPDATE chat_sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
+            [title, chat_id],
+        ).fetchone()
+        return bool(row and row[0])
+
     def set_pinned(self, chat_id: str, pinned: bool) -> None:
         """Pin (or unpin) a conversation so the history panel keeps it on top.
 

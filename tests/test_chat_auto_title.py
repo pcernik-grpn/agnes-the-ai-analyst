@@ -475,6 +475,22 @@ def test_set_title_survives_existing_messages(repo: ChatRepository):
     assert again is not None and again.title == "Greetings"
 
 
+def test_set_title_if_unset_fills_only_an_empty_title(repo: ChatRepository):
+    s = repo.create_session(user_email="u@x", surface=Surface.WEB)
+    # With a chat_messages row referencing the session — the real-world state
+    # at auto-title time, and the one DuckDB's FK+index limitation bites on.
+    repo.append_message(session_id=s.id, role="user", content="q?")
+    assert repo.set_title_if_unset(s.id, "Model title") is True
+    assert repo.get_session(s.id).title == "Model title"
+    # A second writer loses: the existing title stays.
+    assert repo.set_title_if_unset(s.id, "Later model title") is False
+    assert repo.get_session(s.id).title == "Model title"
+    # An empty string counts as unset, a missing session as "nothing written".
+    repo.set_title(s.id, "")
+    assert repo.set_title_if_unset(s.id, "Filled") is True
+    assert repo.set_title_if_unset("chat_does_not_exist", "x") is False
+
+
 def test_get_first_user_message(repo: ChatRepository):
     s = repo.create_session(user_email="u@x", surface=Surface.WEB)
     repo.append_message(session_id=s.id, role="user", content="What tables do I have?")
@@ -920,6 +936,46 @@ def test_scheduling_failure_neither_fails_the_send_nor_burns_the_flag(tmp_path: 
     flag, first = asyncio.run(_run())
     assert first == "q?"
     assert flag is False
+
+
+def test_manual_rename_during_title_generation_is_not_overwritten(tmp_path: Path, monkeypatch):
+    """The task checks for a title before scheduling, then awaits the model
+    for up to several seconds. A rename that lands in that window (the
+    ``PUT /api/chat/sessions/{id}/title`` path calls ``set_title``) must
+    survive, and the model's title must not be broadcast either."""
+    release = asyncio.Event()
+
+    async def slow_gen(_msg: str, **_kwargs):
+        await release.wait()
+        return "Model title"
+
+    monkeypatch.setattr("app.chat.auto_title.generate_title", slow_gen)
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_ws_seated(manager, s.id, ws)
+        await manager.send_user_message(s.id, "q?")
+        await asyncio.sleep(0.1)  # the title task is now parked in slow_gen
+        manager._repo.set_title(s.id, "My own name")  # what the rename endpoint does
+        release.set()
+        await asyncio.sleep(0.3)  # let the task finish
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return manager, s.id, ws
+
+    manager, chat_id, ws = asyncio.run(_run())
+    persisted = manager._repo.get_session(chat_id)
+    assert persisted is not None and persisted.title == "My own name"
+    assert not [m for m in ws.sent if m.get("type") == "session_renamed"], ws.sent
 
 
 def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, monkeypatch):
