@@ -35,7 +35,6 @@ from src.repositories import (
     marketplace_registry_repo,
     resource_grants_repo,
     user_curated_subscriptions_repo,
-    user_groups_repo,
 )
 
 #: What this module is, to `resource_grants.source` (src/grant_sources.py).
@@ -749,11 +748,19 @@ def mark_plugin_system(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Mark a plugin as system (mandatory for every user).
+    """Mark a plugin Automatic for everyone.
 
-    Idempotent — re-running a mark on an already-system plugin still
-    runs the fanout (cheap; ON CONFLICT DO NOTHING) so any user/group
-    that slipped past the creation hooks gets caught up.
+    Records ONE decision — the ``is_system`` flag — and writes nothing else.
+    The serve path resolves the flag at read time
+    (``marketplace_plugins.list_granted_for_groups`` for visibility,
+    ``marketplace_filter.required_plugin_keys`` for the tier), so there is no
+    grant per group and no subscription per user to keep in step.
+
+    That is what makes the DELETE below exact. The previous implementation
+    fanned the flag out into a real grant for every group and a subscription
+    for every user; those rows were then indistinguishable from ones an admin
+    set by hand, so unmarking could not retract its own work and had to leave
+    everything behind. Idempotent, trivially — flipping a set flag is a no-op.
     """
 
     # Existence check + is_system flip routed through the factory so they hit
@@ -778,37 +785,10 @@ def mark_plugin_system(
     if not plugins_repo.set_system(marketplace_id, plugin_name, True):
         raise HTTPException(status_code=404, detail="plugin not found")
 
-    resource_id = f"{marketplace_id}/{plugin_name}"
+    # No fanout. `affected_*` stay in the response for wire compatibility and
+    # now report what the change actually touched: nothing but the flag.
     affected_groups = 0
     affected_users = 0
-
-    # Pivot fanout: this plugin × every group / every user, through the repo
-    # factory. user_groups lives in the active backend, so the raw
-    # "SELECT id FROM user_groups" on the DuckDB conn read the wrong (frozen)
-    # group set on Postgres. ensure_grant is INSERT-OR-IGNORE / ON-CONFLICT-DO-
-    # NOTHING on both engines, so an idempotent re-run is cheap and never raises
-    # on a duplicate (the old code caught DuckDB's ConstraintException, which a
-    # Postgres IntegrityError would have slipped past). has_grant before the
-    # ensure keeps affected_groups meaning "newly granted"; user_groups is small.
-    grants_repo = resource_grants_repo()
-    actor_email = user.get("email") or user.get("id")
-    for group in user_groups_repo().list_all():
-        group_id = group["id"]
-        already = grants_repo.has_grant([group_id], ResourceType.MARKETPLACE_PLUGIN.value, resource_id)
-        grants_repo.ensure_grant(
-            group_id,
-            ResourceType.MARKETPLACE_PLUGIN.value,
-            resource_id,
-            actor_email,
-            source=GRANT_SOURCE,
-        )
-        if not already:
-            affected_groups += 1
-
-    affected_users = user_curated_subscriptions_repo().fanout_system_for_plugin(
-        marketplace_id,
-        plugin_name,
-    )
 
     _audit(
         conn,

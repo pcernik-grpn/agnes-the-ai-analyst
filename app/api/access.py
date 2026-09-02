@@ -330,6 +330,48 @@ async def access_overview(
         for r in grants_repo.list_all()
     ]
 
+    # Plugins that are Automatic for everyone reach every group WITHOUT a
+    # grant row: /admin/marketplaces records one flag and the serve path
+    # resolves it, rather than writing a permission into each group.
+    #
+    # This page is built entirely from `grants`, so left alone it would show a
+    # plugin every user has as held by nobody — not a missing row but the
+    # opposite of the truth, stated confidently, on the page whose whole job
+    # is answering "who can reach what". So the rows are synthesized here,
+    # once, server-side: every view (by group, by resource, by person) reads
+    # this same list, and a client-side fix would have had to be repeated in
+    # each of them.
+    #
+    # They carry the same `managed_by` the real rows get, so they render
+    # through the existing manage cell — named, not revocable here, pointing
+    # at the surface that owns them. `id` is None because there is nothing to
+    # revoke; nothing offers a control for a managed row.
+    if _system_plugin_ids:
+        _held = {(g["group_id"], g["resource_id"]) for g in grants
+                 if g["resource_type"] == ResourceType.MARKETPLACE_PLUGIN.value}
+        _managed = describe_grant_source("marketplace_required")
+        for _g in groups_rows:
+            for _rid in sorted(_system_plugin_ids):
+                if (_g["id"], _rid) in _held:
+                    # A hand-set grant already covers this pair. It is real and
+                    # revocable, so it keeps its own row rather than being
+                    # replaced by a derived one — and it already resolves the
+                    # same `managed_by` through `_managed_by` above.
+                    continue
+                grants.append(
+                    {
+                        "id": None,
+                        "group_id": _g["id"],
+                        "resource_type": ResourceType.MARKETPLACE_PLUGIN.value,
+                        "resource_id": _rid,
+                        # It IS the Automatic tier — that is what the flag means.
+                        "requirement": "required",
+                        "assigned_by": None,
+                        "source": "marketplace_required",
+                        "managed_by": _managed,
+                    }
+                )
+
     # Per-resource-type hierarchies. Driven by the registry in
     # app.resource_types — adding a new type there is the one place that
     # surfaces here, no extra wiring. Disabled types (none as of v19 — see
@@ -1114,27 +1156,19 @@ async def delete_grant(
     if not existing:
         raise HTTPException(status_code=404, detail="Grant not found")
 
-    # v39: refuse to revoke a grant whose underlying plugin is system-marked.
-    # The mark_system endpoint materializes per-group rows precisely so the
-    # plugin reaches every user; allowing per-group revoke here would punch
-    # a hole in the mandatory tier silently. Admin must unmark on
-    # /admin/marketplaces first, then revoke individual groups.
-    if existing["resource_type"] == "marketplace_plugin":
-        rid = existing["resource_id"] or ""
-        if "/" in rid:
-            mp_id, plugin_name = rid.split("/", 1)
-            from src.repositories import marketplace_plugins_repo
-
-            plugin_rows = marketplace_plugins_repo().list_for_marketplace(mp_id)
-            sys_plugin = next(
-                (p for p in plugin_rows if p["name"] == plugin_name and p.get("is_system")),
-                None,
-            )
-            if sys_plugin is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="cannot_revoke_system_grant",
-                )
+    # The v39 guard that refused this delete for an Automatic-for-everyone
+    # plugin is gone, with the fanout that made it necessary. Marking a plugin
+    # Automatic used to WRITE a grant into every group; revoking one of those
+    # punched a silent hole in the mandatory tier, so the endpoint refused with
+    # 409 cannot_revoke_system_grant.
+    #
+    # Nothing writes those rows now — the flag is resolved at read time — so a
+    # marketplace_plugin grant on an Automatic plugin is, by construction, one
+    # an admin set BY HAND. Refusing here would trap the admin's own row and
+    # make it unrevocable for as long as the flag is on. It is also no longer
+    # load-bearing: deleting it cannot remove the plugin from anyone, because
+    # the flag serves it regardless. Turning the plugin Optional again is the
+    # one control that changes that, and it lives on /admin/marketplaces.
 
     grants.delete(grant_id)
 

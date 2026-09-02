@@ -197,51 +197,10 @@
      only by tonal fill (outlined ↔ tinted). Off state reads as "click to
      enable", on state reads as "currently on, click to revert". The
      amber palette is shared with the SYSTEM pill + Required badge so
-     the org-policy semantic stays visually consistent across surfaces. */
-  .plugin-system-btn {
-    display: inline-flex; align-items: center; gap: 5px;
-    background: var(--ds-surface); border: 1px solid var(--ds-accent-warn-line);
-    /* #1956 item 14c: every other labelled button in the app wears
-       --ds-radius-btn — this one hardcoded a bespoke 6px, which is part of
-       why it read as a different species of control than the toggle beside
-       it. */
-    border-radius: var(--ds-radius-btn); padding: 5px 11px; font-size: 11px;
-    font-weight: 600; cursor: pointer;
-    color: var(--ds-accent-warn-ink); white-space: nowrap;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-  }
-  .plugin-system-btn svg { display: block; flex-shrink: 0; }
-  .plugin-system-btn:hover {
-    background: color-mix(in srgb, var(--ds-accent-warn-bg) 60%, transparent); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn.is-system {
-    background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn.is-system:hover {
-    background: color-mix(in srgb, var(--ds-accent-warn-bg) 80%, var(--ds-accent-warn-ink)); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn[disabled] { opacity: 0.5; cursor: wait; }
-  /* v78: when a plugin is admin-disabled the system button is locked so a
-     hidden plugin can't be marked mandatory. `is-locked` is a persistent
-     greyed state (distinct from the transient `[disabled]` "Working…"
-     spinner state above). */
-  .plugin-system-btn.is-locked {
-    opacity: 0.45; cursor: not-allowed;
-    background: var(--surface, #fff); border-color: var(--border, #e5e7eb); color: var(--text-secondary, #9ca3af);
-  }
-  .plugin-system-btn.is-locked:hover {
-    background: var(--surface, #fff); border-color: var(--border, #e5e7eb); color: var(--text-secondary, #9ca3af);
-  }
-
-  /* v78: DISABLED pill — replaces the amber SYSTEM pill for admin-disabled
-     plugins. Neutral grey so it reads as "hidden / inert" rather than a
-     policy state. */
-  .plugin-disabled-pill {
-    display: inline-block; padding: 1px 7px; border-radius: 999px;
-    background: var(--border-light, #f3f4f6); color: var(--text-secondary, #6b7280);
-    font-size: 10px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.4px;
-  }
+  /* The bespoke `.plugin-system-btn` styling is gone with the button it
+     dressed: Automatic-for-everyone is a switch now, so it reuses the
+     shared `.toggle` widget below and cannot drift from the Enabled
+     switch beside it the way a separately-styled control did. */
 
   /* v78: on/off toggle switch — copied from admin_users.html so the widget
      itself reads identically across the admin surface. #1956 item 14b: the
@@ -252,9 +211,10 @@
      writes (admin_disabled) is unchanged, only the presentation flipped. */
   .plugin-enabled-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
   .plugin-enabled-toggle .toggle-label { font-size: 11px; font-weight: 600; color: var(--text-secondary, #6b7280); }
-  /* #1956 item 14c: shared wrapper so the Enabled toggle and the system-mark
-     button (still a button — see the JS comment above sysBtnIcon for why)
-     read as one matched row of controls instead of two unrelated widgets. */
+  /* #1956 item 14c: the two controls are now the SAME widget, not merely
+     aligned — "Enabled" and "Automatic for everyone" are both switches, and
+     the complaint that two on/off states wore two different widgets is
+     answered rather than argued with. */
   .plugin-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .plugin-system-control { display: inline-flex; align-items: center; gap: 6px; }
   /* Small, always-visible help affordance — a bare `title` on the button
@@ -864,7 +824,7 @@ async function openDetails(id, name) {
       const sysPill = isDisabled
         ? `<span class="plugin-disabled-pill" title="Admin-disabled — hidden from every user across all served surfaces. If the marketplace's metadata marks this plugin deprecated, sync re-disables it automatically on every run.">DISABLED</span>`
         : (p.is_system
-          ? `<span class="plugin-system-pill" title="Mandatory for every user — managed below">SYSTEM</span>`
+          ? `<span class="plugin-system-pill" title="Every user gets this plugin without asking — the switch below turns it off">AUTOMATIC</span>`
           : "");
       // Curator-side lifecycle: marketplace-metadata.json marks the plugin
       // deprecated. Sync auto-disables it; the pill explains WHY it is (or
@@ -877,41 +837,25 @@ async function openDetails(id, name) {
       const depPill = p.deprecated === true
         ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
         : "";
-      const sysBtnLabel = p.is_system ? "Unmark system" : "Mark as system";
-      // #1956 item 14a: every branch now restates what "system" fundamentally
-      // means (mandatory for every user), not just the next click's specific
-      // side effect — "Unmark system" previously explained only the unmark
-      // consequence, never the concept itself.
-      const sysBtnTitle = isDisabled
-        ? "System means mandatory for every user. Plugin is disabled, so it can't be marked as system — re-enable it first."
+      // #1956 item 14: "system" is gone from the UI. It was never a third
+      // concept — /admin/access has said Optional / Automatic about a grant
+      // since v49, and marking a plugin system meant exactly "Automatic, for
+      // every group". One word for one idea; the column keeps its name.
+      const autoTitle = isDisabled
+        ? "Automatic for everyone means every user gets this plugin without asking. The plugin is disabled, so it cannot be set — re-enable it first."
         : (p.is_system
-          ? "System means mandatory for every user. Unmark removes that going forward, but existing per-group grants and per-user subscriptions remain — admin can clean them up on each group's Access tab."
-          : "Mark as system to make this plugin mandatory for every user: adds an RBAC grant for every group and a subscription for every user.");
-      // Shield icon on both states — it's the semantic anchor for
-      // "org policy / system" and dropping it on unmark broke visual
-      // parity between the two toggle states.
-      const sysBtnIcon =
-        `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-           <path d="M12 2 4 6v6c0 5 3.4 9.5 8 10 4.6-.5 8-5 8-10V6l-8-4z"/>
-         </svg>`;
-      // #1956 item 14a: a small always-visible help affordance beside the
-      // system control — a bare `title` on the button text was already there
-      // and was evidently not discoverable enough (this is exactly what
-      // #1913's reporter misread). This one carries a constant explanation of
-      // the *concept*, independent of is_system/admin_disabled, so it reads
-      // the same in every state.
-      const sysHelpIcon =
+          ? "Every user gets this plugin without asking. Switch off to make it Optional again — grants you set by hand on Access are untouched either way."
+          : "Switch on to give every user this plugin without asking. It writes nothing per group or per user, so switching off later reverses it exactly.");
+      // No literal double quotes — esc() round-trips through textContent /
+      // innerHTML, which escapes &/</> but not ", so one would break out of
+      // the surrounding title="…" attribute.
+      const autoHelpText =
+        "Automatic for everyone gives this plugin to every user without asking, and they cannot remove it. It is the same Automatic tier the Access page offers per group, with the scope set to everyone. Switching it off is exact: nothing was written per group or per user, so nothing is left behind.";
+      const autoHelpIcon =
         `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
            <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="11.5"/><line x1="12" y1="8" x2="12" y2="8"/>
          </svg>`;
-      // No literal double quotes here — esc() round-trips through
-      // textContent/innerHTML, which (correctly, per the HTML text-node
-      // serialization algorithm) escapes &/</> but not ", so a literal "
-      // would break out of the surrounding title="…" attribute.
-      const sysHelpText =
-        "System marks a plugin mandatory for every user: it grants every existing group, subscribes every existing user, and new users/groups inherit it automatically from then on. Users can't remove it themselves. Unmarking stops that going forward but does not undo grants or subscriptions already made — clean those up on each group's Access tab.";
       return `<div class="plugin-item">
         <div class="plugin-item-head">
           <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
@@ -932,23 +876,36 @@ async function openDetails(id, name) {
               </span>
             </label>
             <span class="plugin-system-control">
-              <button class="plugin-system-btn ${p.is_system ? "is-system" : ""} ${isDisabled ? "is-locked" : ""}"
-                      data-action="toggle-system"
-                      data-marketplace="${esc(id)}"
-                      data-plugin="${esc(p.name)}"
-                      data-is-system="${p.is_system ? "1" : "0"}"
-                      ${isDisabled ? "disabled" : ""}
-                      title="${esc(sysBtnTitle)}">${sysBtnIcon}${esc(sysBtnLabel)}</button>
+              <label class="plugin-enabled-toggle plugin-auto-toggle" title="${esc(autoTitle)}">
+                <span class="toggle-label">Automatic for everyone</span>
+                <span class="toggle">
+                  <input type="checkbox"
+                         data-action="toggle-system"
+                         data-marketplace="${esc(id)}"
+                         data-plugin="${esc(p.name)}"
+                         data-is-system="${p.is_system ? "1" : "0"}"
+                         ${isDisabled ? "disabled" : ""}
+                         ${p.is_system ? "checked" : ""}>
+                  <span class="toggle-slider"></span>
+                </span>
+              </label>
               <span class="plugin-help-icon" tabindex="0" role="img"
-                    aria-label="What does marking a plugin as system do?"
-                    title="${esc(sysHelpText)}">${sysHelpIcon}</span>
+                    aria-label="What does Automatic for everyone do?"
+                    title="${esc(autoHelpText)}">${autoHelpIcon}</span>
             </span>
           </span>
         </div>${desc}${metaHtml}
       </div>`;
     }).join("");
+    // `click` with preventDefault, NOT `change`: the switch must not move
+    // until the server has agreed. A confirm modal can be dismissed three
+    // ways (Cancel, backdrop, Escape) and only one of them runs our code, so
+    // a switch that flipped optimistically would be left lying by the other
+    // two. preventDefault holds it still; the re-fetch after a successful
+    // call is what moves it. Still keyboard-operable — Space on a checkbox
+    // dispatches a click.
     body.querySelectorAll('[data-action="toggle-system"]').forEach(btn =>
-      btn.addEventListener("click", () => toggleSystem(btn, id, name)));
+      btn.addEventListener("click", (ev) => { ev.preventDefault(); toggleSystem(btn, id, name); }));
     body.querySelectorAll('[data-action="toggle-disabled"]').forEach(el =>
       el.addEventListener("change", () => toggleDisabled(el, id, name)));
   } catch (e) {
@@ -958,8 +915,9 @@ async function openDetails(id, name) {
 
 function toggleSystem(btn, marketplaceId, marketplaceName) {
   // Two-step: render a populated confirm modal, then on OK perform the
-  // PUT/DELETE. The native confirm() lost the operator's eye in a tiny
-  // OS popup that didn't make the fanout consequences obvious.
+  // POST/DELETE. Switching ON still deserves a confirm — it hands the plugin
+  // to every user — but switching OFF is now exact, so its copy says so
+  // instead of warning about rows left behind.
   const pluginName = btn.dataset.plugin;
   const isSystem = btn.dataset.isSystem === "1";
   const titleEl = document.getElementById("system-confirm-title");
@@ -968,38 +926,39 @@ function toggleSystem(btn, marketplaceId, marketplaceName) {
   const okBtn = document.getElementById("system-confirm-ok-btn");
 
   if (isSystem) {
-    titleEl.textContent = "Unmark system plugin?";
+    // Switching OFF needs no warning any more. It is exact: the flag was
+    // never fanned out into rows, so there is nothing left behind and
+    // nothing of the admin's own is touched. Say that, and get out of
+    // the way.
+    titleEl.textContent = "Make this plugin Optional?";
     pluginEl.textContent = pluginName;
     bodyEl.innerHTML = `
-      <p style="margin: 0 0 10px;">This removes the <strong>system</strong> flag.
-        The plugin is no longer required.</p>
+      <p style="margin: 0 0 10px;">Users stop getting this plugin automatically.
+        They can still add it themselves if a group of theirs is granted it.</p>
       <ul style="margin: 0; padding-left: 20px;">
-        <li>Existing per-group RBAC grants <strong>stay</strong>.</li>
-        <li>Existing per-user subscriptions <strong>stay</strong>.</li>
-        <li>Operators can revoke either via a group's <a href="/admin/access" style="color: var(--ds-primary, #6366f1);">Access workspace</a> or by uninstalling on each user's stack.</li>
+        <li>Nothing was written per group or per user, so nothing is left behind.</li>
+        <li>Grants you set by hand on <a href="/admin/access" style="color: var(--ds-primary, #6366f1);">Access</a> are untouched.</li>
       </ul>`;
-    okBtn.textContent = "Unmark system";
+    okBtn.textContent = "Make Optional";
     okBtn.classList.remove("btn-danger");
     okBtn.classList.add("btn-primary");
   } else {
-    titleEl.textContent = "Mark as system plugin?";
+    titleEl.textContent = "Give this plugin to everyone?";
     pluginEl.textContent = pluginName;
     bodyEl.innerHTML = `
-      <p style="margin: 0 0 10px;">After confirming, <strong>every Agnes user</strong> will
-        receive this plugin as <strong>required</strong>:</p>
+      <p style="margin: 0 0 10px;"><strong>Every user</strong> gets this plugin
+        without asking, including everyone who joins later.</p>
       <ul style="margin: 0 0 10px; padding-left: 20px;">
-        <li>RBAC grants are added for <strong>every existing group</strong>.</li>
-        <li>Subscriptions are created for <strong>every existing user</strong>.</li>
-        <li>Every <strong>new user</strong> and <strong>new group</strong> inherits it automatically.</li>
-        <li>Users see it as <strong>Automatic</strong> — in their stack with no way to uninstall it.</li>
-        <li>Admins cannot revoke it from a group's Access tab while the system flag is on.</li>
+        <li>It appears in their stack as <strong>Automatic</strong>, and they cannot remove it.</li>
+        <li>It is the same Automatic tier <a href="/admin/access" style="color: var(--ds-primary, #6366f1);">Access</a> offers per group — with the scope set to everyone.</li>
       </ul>
       <p style="margin: 0; font-size: 12px; color: var(--text-secondary, #6b7280);">
-        Unmarking later does not auto-clean the materialized grants — they stay until manually removed.
+        Reversible at any time, exactly: this records one setting rather than
+        writing a permission per group and per user.
       </p>`;
-    okBtn.textContent = "Mark as system";
-    okBtn.classList.remove("btn-primary");
-    okBtn.classList.add("btn-danger");
+    okBtn.textContent = "Give to everyone";
+    okBtn.classList.remove("btn-danger");
+    okBtn.classList.add("btn-primary");
   }
 
   // Single assignment (NOT addEventListener) so re-opening for a different
@@ -1021,9 +980,10 @@ function toggleSystem(btn, marketplaceId, marketplaceName) {
 async function performToggleSystem(btn, marketplaceId, marketplaceName, isSystem) {
   const pluginName = btn.dataset.plugin;
   const method = isSystem ? "DELETE" : "POST";
+  // The control is a checkbox now, not a button with a label to overwrite.
+  // Disable it for the round-trip and leave the rendered state alone — the
+  // re-fetch below is what re-renders it from the server's answer.
   btn.disabled = true;
-  const prevHtml = btn.innerHTML;
-  btn.textContent = "Working…";
   try {
     const url = `${API}/${encodeURIComponent(marketplaceId)}/plugins/${encodeURIComponent(pluginName)}/system`;
     const r = await fetch(url, { method, credentials: "include" });
@@ -1031,14 +991,14 @@ async function performToggleSystem(btn, marketplaceId, marketplaceName, isSystem
       const err = await r.json().catch(() => ({}));
       toast(`Toggle failed: ${err.detail || r.status}`, "error");
       btn.disabled = false;
-      btn.innerHTML = prevHtml;
+      // No revert needed: preventDefault kept the switch where it was.
       return;
     }
     if (!isSystem) {
-      const result = await r.json();
-      toast(`Marked ${pluginName} as system (${result.affected_groups} groups, ${result.affected_users} users)`, "success");
+      // No counts to report: the change writes one flag, not N grants.
+      toast(`${pluginName} is now Automatic for everyone`, "success");
     } else {
-      toast(`Unmarked ${pluginName} from system`, "success");
+      toast(`${pluginName} is now Optional`, "success");
     }
     // Reload the modal so the pill + button label refresh from a fresh fetch.
     openDetails(marketplaceId, marketplaceName);

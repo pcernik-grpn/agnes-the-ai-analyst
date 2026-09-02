@@ -13685,7 +13685,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.95.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -46174,7 +46174,7 @@
         ]
       },
       "post": {
-        "description": "Mark a plugin as system (mandatory for every user).\n\nIdempotent \u2014 re-running a mark on an already-system plugin still\nruns the fanout (cheap; ON CONFLICT DO NOTHING) so any user/group\nthat slipped past the creation hooks gets caught up.",
+        "description": "Mark a plugin Automatic for everyone.\n\nRecords ONE decision \u2014 the ``is_system`` flag \u2014 and writes nothing else.\nThe serve path resolves the flag at read time\n(``marketplace_plugins.list_granted_for_groups`` for visibility,\n``marketplace_filter.required_plugin_keys`` for the tier), so there is no\ngrant per group and no subscription per user to keep in step.\n\nThat is what makes the DELETE below exact. The previous implementation\nfanned the flag out into a real grant for every group and a subscription\nfor every user; those rows were then indistinguishable from ones an admin\nset by hand, so unmarking could not retract its own work and had to leave\neverything behind. Idempotent, trivially \u2014 flipping a set flag is a no-op.",
         "operationId": "mark_plugin_system_api_marketplaces__marketplace_id__plugins__plugin_name__system_post",
         "parameters": [
           {

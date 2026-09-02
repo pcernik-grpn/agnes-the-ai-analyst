@@ -88,9 +88,16 @@ class MarketplacePluginsRepository:
         self,
         group_ids: Iterable[str],
     ) -> List[Dict[str, Any]]:
-        """Distinct plugins granted to any of ``group_ids`` via
-        ``resource_grants``, ordered by parent marketplace registration
-        time then plugin name.
+        """Plugins visible to any of ``group_ids`` — granted via
+        ``resource_grants``, OR flagged ``is_system`` (Automatic for
+        everyone), ordered by parent marketplace registration time then
+        plugin name.
+
+        ``is_system`` is honoured HERE rather than materialized into a
+        grant per group. It used to be fanned out on mark, which made the
+        rows indistinguishable from ones an admin set by hand and left
+        unmark unable to retract its own work. Resolving it at read time
+        is what lets the flag be turned off exactly.
 
         Used by ``src.marketplace_filter.resolve_allowed_plugins`` —
         the resolver behind the served Claude Code marketplace
@@ -105,24 +112,28 @@ class MarketplacePluginsRepository:
         long as the underlying content is unchanged.
         """
         gids = list(group_ids)
-        if not gids:
-            return []
-        placeholders = ",".join(["?"] * len(gids))
-        # Postgres strict-standard SQL requires every ``ORDER BY``
-        # expression to appear in the ``SELECT DISTINCT`` list — DuckDB
-        # accepts the loose form too. Pulling ``mr.registered_at`` into
-        # the projection keeps both engines happy; the column is dropped
-        # from the returned dict.
+        # NOT an early return on an empty group list. "Automatic for everyone"
+        # is global — a user who happens to belong to no group at all still
+        # gets it — so the query runs with the grants branch simply matching
+        # nothing. `IN ()` is a syntax error on both engines, hence the FALSE.
+        placeholders = ",".join(["?"] * len(gids)) if gids else "NULL"
+        # Driven off ``marketplace_plugins`` with a semi-join, not a JOIN
+        # against ``resource_grants``: a system plugin has no grant rows to
+        # join to, and EXISTS also drops the DISTINCT the old join needed to
+        # collapse one row per granting group. ``mr.registered_at`` rides the
+        # projection for the ORDER BY (PG requires it) and is dropped below.
         rows = self.conn.execute(
-            "SELECT DISTINCT mp.marketplace_id, mp.name, mp.version, mp.raw, "
+            "SELECT mp.marketplace_id, mp.name, mp.version, mp.raw, "
             "       mr.registered_at "
-            "FROM resource_grants rg "
-            "JOIN marketplace_plugins mp "
-            "  ON mp.marketplace_id || '/' || mp.name = rg.resource_id "
+            "FROM marketplace_plugins mp "
             "JOIN marketplace_registry mr ON mr.id = mp.marketplace_id "
-            f"WHERE rg.group_id IN ({placeholders}) "
-            "  AND rg.resource_type = 'marketplace_plugin' "
-            "  AND mp.admin_disabled = FALSE "
+            "WHERE mp.admin_disabled = FALSE "
+            "  AND (mp.is_system = TRUE OR EXISTS ("
+            "        SELECT 1 FROM resource_grants rg "
+            "        WHERE rg.resource_id = mp.marketplace_id || '/' || mp.name "
+            "          AND rg.resource_type = 'marketplace_plugin' "
+            f"          AND rg.group_id IN ({placeholders})"
+            "      )) "
             "ORDER BY mr.registered_at, mp.name",
             list(gids),
         ).fetchall()

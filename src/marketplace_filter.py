@@ -205,8 +205,8 @@ def granted_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: s
 
 
 def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | None) -> set[tuple[str, str]]:
-    """``(marketplace_id, plugin_name)`` keys held at the ``required`` tier
-    by any of the user's groups.
+    """``(marketplace_id, plugin_name)`` keys at the Automatic tier for this
+    user — held by any of their groups, or Automatic for everyone.
 
     v49 gave ``resource_grants`` a ``requirement`` enum
     (``available`` | ``required``) where required is the always-in-stack
@@ -227,11 +227,18 @@ def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | 
     raw SQL on ``conn``) for the same PG-backend reason documented in
     ``resolve_allowed_plugins``.
     """
+    # Automatic for everyone — the ``is_system`` flag. Read here rather than
+    # materialized into a per-group grant on mark: the fanout wrote rows an
+    # admin could not tell from their own, so turning the flag back off could
+    # not retract them. One flag, resolved at read time, is exactly reversible.
+    # Global by definition, so it does not depend on group membership and is
+    # answered before the group lookup below.
+    keys: set[tuple[str, str]] = set(marketplace_plugins_repo().list_system_keys())
+
     group_ids = _user_group_ids(user_id, conn) if user_id else set()
     if not group_ids:
-        return set()
+        return keys
     rows = resource_grants_repo().list_for_groups(list(group_ids), "marketplace_plugin")
-    keys: set[tuple[str, str]] = set()
     for r in rows:
         if (r.get("requirement") or "available") != "required":
             continue
