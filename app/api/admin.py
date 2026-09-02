@@ -7212,12 +7212,31 @@ async def preview_table_policy(
             )
         transpiled = {"dialect": preview_dialect, "relation_sql": transpiled_sql}
 
-    # P2.6 -- checked BEFORE persona resolution/execution, not just added to
-    # the response: a mapping table that never synced at all has no view in
-    # the analytics connection, so the live queries below would crash on
-    # "table does not exist" instead of explaining why. Mirrors
-    # GET /api/me/effective-access's mapping_empty short-circuit (§15.1) for
-    # the same condition.
+    # Persona resolution -- exactly one of as_user / as_groups was required
+    # above, so exactly one branch below runs. This MUST run before the
+    # mapping-empty short-circuit below: an `as_user` that does not resolve
+    # to a real user is a 404 regardless of the table's mapping state, and
+    # the previous ordering let an empty mapping table mask that 404 behind
+    # a 200 `mapping_warning` response for a persona that was never valid.
+    if request.as_user:
+        from src.repositories import user_group_members_repo, users_repo
+
+        target = users_repo().get_by_id(request.as_user) or users_repo().get_by_email(request.as_user)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"user_not_found: no such user {request.as_user!r}")
+        persona_user_id, persona_user_email = target["id"], target["email"]
+        persona_groups = user_group_members_repo().list_group_names_for_user(persona_user_id)
+    else:
+        persona_user_id, persona_user_email = None, None
+        persona_groups = list(request.as_groups)
+
+    # P2.6 -- checked BEFORE execution, not just added to the response: a
+    # mapping table that never synced at all has no view in the analytics
+    # connection, so the live queries below would crash on "table does not
+    # exist" instead of explaining why. Mirrors GET /api/me/effective-access's
+    # mapping_empty short-circuit (§15.1) for the same condition. Persona
+    # resolution above already ran, so this is only reached for a persona
+    # that resolves cleanly (an existing `as_user`, or any `as_groups`).
     mapping_warning = _policy_preview_mapping_warning(policy_sql)
     if mapping_warning:
         # Finding B (follow-up review of PR #2023) -- this early return skips
@@ -7249,20 +7268,6 @@ async def preview_table_policy(
             "transpiled": transpiled,
             "mapping_warning": mapping_warning,
         }
-
-    # Persona resolution -- exactly one of as_user / as_groups was required
-    # above, so exactly one branch below runs.
-    if request.as_user:
-        from src.repositories import user_group_members_repo, users_repo
-
-        target = users_repo().get_by_id(request.as_user) or users_repo().get_by_email(request.as_user)
-        if not target:
-            raise HTTPException(status_code=404, detail=f"user_not_found: no such user {request.as_user!r}")
-        persona_user_id, persona_user_email = target["id"], target["email"]
-        persona_groups = user_group_members_repo().list_group_names_for_user(persona_user_id)
-    else:
-        persona_user_id, persona_user_email = None, None
-        persona_groups = list(request.as_groups)
 
     from src.access_policy_validate import PolicyValidationError, probe_policy
     from src.db import get_analytics_db_readonly

@@ -1164,6 +1164,32 @@ class TestPolicyPreviewMappingWarning:
         assert params.get("mapping_warning") is True
         assert "SELECT" not in json.dumps(params).upper()
 
+    def test_an_unknown_as_user_is_404_even_with_an_empty_mapping_table(
+        self, policied_invoices_with_empty_mapping
+    ):
+        """Follow-up finding on PR #2023's review: the mapping_warning
+        short-circuit used to run BEFORE persona resolution, so an unknown
+        ``as_user`` got a 200 ``mapping_warning`` response instead of the
+        endpoint's documented 404 ``user_not_found``. Persona validity must
+        be checked first -- the mapping table's own state is irrelevant to
+        whether the requested persona exists at all."""
+        c = policied_invoices_with_empty_mapping["client"]
+        token = policied_invoices_with_empty_mapping["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/mapped_invoices/policy/preview",
+            json={"as_user": "no-such-user@test.com"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 404, resp.text
+        assert "user_not_found" in resp.json()["detail"]
+
+        # A 404 on an invalid persona is not a preview that ran -- it must
+        # not write the mapping_warning audit row the valid-persona early
+        # return above does.
+        rows = _audit_rows(action="access_policy.preview", resource="mapped_invoices")
+        assert not rows, "a 404'd persona should not leave a preview audit row"
+
 
 @pytest.fixture
 def policied_wide_table_for_preview(seeded_app, mock_extract_factory, monkeypatch):
