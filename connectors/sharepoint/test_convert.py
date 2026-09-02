@@ -365,6 +365,196 @@ def test_html_routes_to_markitdown(tmp_path):
     assert "EMEA grew." in result.markdown
 
 
+# ------------------------------------------------------- legacy office (LibreOffice)
+
+
+#: Legacy suffix → the OOXML target format LibreOffice must produce, per the
+#: mapping in :mod:`connectors.sharepoint.convert`.
+_LEGACY_OFFICE_CASES = [
+    (".doc", "docx"),
+    (".rtf", "docx"),
+    (".odt", "docx"),
+    (".ppt", "pptx"),
+    (".odp", "pptx"),
+    (".xls", "xlsx"),
+    (".ods", "xlsx"),
+]
+
+
+def _stub_soffice(monkeypatch, convert_module, *, returncode=0, produce_output=True, side_effect=None):
+    """Replace ``soffice`` with a fake that never shells out for real.
+
+    Records every invocation's argv and the temp ``--outdir`` it was given
+    (so a test can assert the dir is gone afterwards), and — unless told
+    otherwise — drops a placeholder output file at the path LibreOffice
+    itself would have written, so the caller's glob for the converted file
+    succeeds without a real LibreOffice on the machine.
+    """
+    calls: list[dict] = []
+
+    def _which(cmd):
+        return "/usr/bin/soffice" if cmd == "soffice" else None
+
+    def _run(argv, **kwargs):
+        if side_effect is not None:
+            raise side_effect
+        outdir = Path(argv[argv.index("--outdir") + 1])
+        target_format = argv[argv.index("--convert-to") + 1]
+        source = Path(argv[-1])
+        calls.append({"argv": argv, "outdir": outdir, "kwargs": kwargs})
+        if produce_output:
+            (outdir / f"{source.stem}.{target_format}").write_bytes(b"fake converted bytes")
+        import subprocess
+
+        return subprocess.CompletedProcess(argv, returncode, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(convert_module.shutil, "which", _which)
+    monkeypatch.setattr(convert_module.subprocess, "run", _run)
+    return calls
+
+
+@pytest.mark.parametrize("suffix, target_format", _LEGACY_OFFICE_CASES)
+def test_legacy_office_suffix_is_preconverted_then_handed_to_markitdown(tmp_path, monkeypatch, suffix, target_format):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / f"legacy{suffix}"
+    path.write_bytes(b"legacy office bytes")
+    calls = _stub_soffice(monkeypatch, convert_module)
+
+    markitdown_calls = []
+
+    def _fake_markitdown(converted_path, filename):
+        markitdown_calls.append((converted_path, filename))
+        return "converted text from libreoffice output"
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _fake_markitdown)
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "libreoffice+markitdown"
+    assert result.markdown == "converted text from libreoffice output"
+
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    assert argv[0] == "soffice"
+    assert "--headless" in argv
+    assert "--norestore" in argv
+    assert argv[argv.index("--convert-to") + 1] == target_format
+    assert argv[-1] == str(path)
+
+    # markitdown ran against the LibreOffice OUTPUT, not the original file,
+    # and the reported filename is still the original (source) name.
+    assert len(markitdown_calls) == 1
+    converted_path, filename = markitdown_calls[0]
+    assert converted_path.suffix == f".{target_format}"
+    assert filename == path.name
+
+    # the temp outdir is always cleaned up
+    assert not calls[0]["outdir"].exists()
+
+
+def test_legacy_office_temp_dir_is_removed_even_on_failure(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "legacy.doc"
+    path.write_bytes(b"legacy office bytes")
+    calls = _stub_soffice(monkeypatch, convert_module, returncode=1)
+
+    with pytest.raises(ConversionError):
+        convert_to_markdown(path, "application/msword")
+
+    assert len(calls) == 1
+    assert not calls[0]["outdir"].exists()
+
+
+def test_missing_soffice_raises_missing_conversion_dependency(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "legacy.doc"
+    path.write_bytes(b"legacy office bytes")
+    monkeypatch.setattr(convert_module.shutil, "which", lambda cmd: None)
+
+    with pytest.raises(MissingConversionDependency) as excinfo:
+        convert_to_markdown(path, "application/msword")
+
+    assert excinfo.value.filename == "legacy.doc"
+    assert excinfo.value.package == "libreoffice"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+    assert isinstance(excinfo.value, ConversionError)
+
+
+def test_libreoffice_non_zero_exit_raises_conversion_error(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "legacy.doc"
+    path.write_bytes(b"legacy office bytes")
+    _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/msword")
+
+    assert excinfo.value.filename == "legacy.doc"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+    assert not isinstance(excinfo.value, MissingConversionDependency)
+
+
+def test_libreoffice_timeout_raises_conversion_error(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+    import subprocess
+
+    path = tmp_path / "legacy.ppt"
+    path.write_bytes(b"legacy office bytes")
+    _stub_soffice(
+        monkeypatch,
+        convert_module,
+        side_effect=subprocess.TimeoutExpired(cmd="soffice", timeout=120),
+    )
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.ms-powerpoint")
+
+    assert excinfo.value.filename == "legacy.ppt"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+    assert "timed out" in str(excinfo.value)
+
+
+def test_libreoffice_success_with_no_output_file_raises_conversion_error(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "legacy.xls"
+    path.write_bytes(b"legacy office bytes")
+    _stub_soffice(monkeypatch, convert_module, returncode=0, produce_output=False)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.ms-excel")
+
+    assert excinfo.value.filename == "legacy.xls"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+
+
+def test_legacy_office_suffixes_are_exported_and_exact(monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    assert convert_module.LEGACY_OFFICE_SUFFIXES == frozenset({".doc", ".rtf", ".odt", ".ppt", ".odp", ".xls", ".ods"})
+    # never overlaps with the routes that already have their own engine
+    assert not convert_module.LEGACY_OFFICE_SUFFIXES & convert_module.PASSTHROUGH_SUFFIXES
+    assert ".pdf" not in convert_module.LEGACY_OFFICE_SUFFIXES
+
+
+def test_other_suffixes_are_untouched_by_the_legacy_office_route(tmp_path):
+    """.docx (the modern, already-supported sibling) must keep going straight
+    to markitdown — the legacy pre-conversion step is additive, never a
+    detour for a format markitdown already reads natively."""
+    path = _write_docx(tmp_path / "modern.docx")
+
+    result = convert_to_markdown(
+        path,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    assert result.engine == "markitdown"
+
+
 # ------------------------------------------------------------------ failures
 
 
@@ -512,3 +702,43 @@ def test_structure_pass_failure_raises_conversion_error(tmp_path, monkeypatch):
 
     assert excinfo.value.filename == "fallback.pdf"
     assert excinfo.value.engine == "pypdfium2"
+
+
+def test_legacy_office_runs_on_a_per_process_profile_and_serializes(tmp_path, monkeypatch):
+    """Two headless LibreOffice instances on the SAME user profile do not
+    coexist — the second exits 1 (measured live: 3 of 6 concurrent
+    conversions failed). Every soffice call must therefore carry a
+    ``-env:UserInstallation=`` pointing at a directory private to this
+    process, reused across calls (a fresh profile costs seconds on first
+    start), and calls within one process are serialized by a lock."""
+    import os
+
+    import connectors.sharepoint.convert as convert_module
+
+    monkeypatch.setattr(convert_module, "_LIBREOFFICE_PROFILES", {})
+    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f: "text")
+    calls = _stub_soffice(monkeypatch, convert_module)
+
+    for name in ("a.doc", "b.xls"):
+        path = tmp_path / name
+        path.write_bytes(b"legacy")
+        convert_to_markdown(path, "application/octet-stream")
+
+    profiles = []
+    for call in calls:
+        env = [a for a in call["argv"] if a.startswith("-env:UserInstallation=file://")]
+        assert len(env) == 1, call["argv"]
+        profiles.append(env[0].split("file://", 1)[1])
+    # same private profile for both calls of this process, and it exists
+    assert profiles[0] == profiles[1]
+    assert os.path.isdir(profiles[0])
+    assert str(os.getpid()) in profiles[0]
+    # the profile the calls used is exactly the one the helper hands out for
+    # this pid (module identity resolved through the function that ran, so a
+    # second import path of the same file cannot fool the check)
+    import sys
+
+    live = sys.modules[convert_to_markdown.__module__]
+    assert profiles[0] == live._libreoffice_profile_dir()
+    assert os.getpid() in live._LIBREOFFICE_PROFILES
+    assert live._LIBREOFFICE_LOCK is not None

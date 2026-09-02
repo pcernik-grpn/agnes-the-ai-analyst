@@ -13,14 +13,16 @@
   `app/api/admin.py::_EXTRACTION_ENV_LOCKS` is deliberately empty now.
 
 What remains admin-editable here: `schedule` (the instance-wide crawl
-cadence) and `timeout_s` (the per-run ceiling the crawl enforces itself).
+cadence), `timeout_s` (the per-run ceiling the crawl enforces itself) and,
+since the extraction pilot, `crawler.concurrency` (files in flight per run —
+the extraction worker's memory lever; see the bottom of this file).
 Precedence is unchanged: env (Terraform-rendered) > admin server-config
 overlay > static instance.yaml.
 
 Behaviour contract:
   - GET exposes `extraction` in `editable_sections`/`sections`/`known_fields`
-    with exactly `schedule` and `timeout_s` — no `enabled` leaf, no
-    `producer` object.
+    with `schedule`, `timeout_s`, the `crawler` object and the `facts`
+    object — no `enabled` leaf, no `producer` object.
   - POST with valid values persists; GET reflects them; the save is `live`
     (never `restart_required`).
   - Field-level validation: `schedule` must parse via
@@ -40,6 +42,8 @@ DATA_DIR/cache plumbing needed here.
 
 from __future__ import annotations
 
+import pytest
+
 import yaml
 
 
@@ -49,6 +53,13 @@ def _auth(token: str) -> dict:
 
 def _clear_extraction_env(monkeypatch):
     monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+
+def _client(seeded_app, monkeypatch):
+    """(client, admin token) with the extraction env cleared — the shape the
+    run-knob tests below share."""
+    _clear_extraction_env(monkeypatch)
+    return seeded_app["client"], seeded_app["admin_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -343,3 +354,227 @@ def test_extraction_trigger_endpoint_picks_up_web_saved_switch(seeded_app, monke
         headers=headers,
     )
     assert trigger_resp.status_code == 202, trigger_resp.text
+
+
+# ---------------------------------------------------------------------------
+# extraction.crawler.concurrency — the worker's memory lever, admin-editable
+# ---------------------------------------------------------------------------
+#
+# `extraction.crawler.concurrency` decides how many files ONE crawl holds in
+# flight (download → convert → anonymize → ingest), which is what decides the
+# extraction worker's peak memory. It was readable by the crawler from the
+# overlay all along, but the panel did not render it, so lowering it on a
+# live instance meant editing the file on the data disk by hand.
+
+
+def test_crawler_concurrency_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    fields = resp.json()["known_fields"]["extraction"]
+    crawler = fields["crawler"]
+    assert crawler["kind"] == "object"
+    spec = crawler["fields"]["concurrency"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONCURRENCY
+
+    assert spec["default"] == _DEFAULT_CONCURRENCY == 6
+    # The hint must say what the knob actually governs: it is the memory
+    # lever, not a throughput dial.
+    assert "memory" in spec["hint"].lower()
+
+
+def test_crawler_concurrency_bounds_match_the_crawlers_clamp():
+    """The panel refuses what the crawler would silently re-clamp — so the
+    two bounds must be the same number, pinned here rather than trusted."""
+    from app.api.admin import _CRAWLER_CONCURRENCY_MAX, _CRAWLER_CONCURRENCY_MIN
+    from connectors.sharepoint.crawler import _MAX_CONCURRENCY
+
+    assert _CRAWLER_CONCURRENCY_MIN == 1
+    assert _CRAWLER_CONCURRENCY_MAX == _MAX_CONCURRENCY == 64
+
+
+def test_post_crawler_concurrency_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"concurrency": 2}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sections_effect"]["extraction"] == "live"
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["concurrency"] == 2
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["concurrency"] == 2
+
+
+def test_post_crawler_concurrency_keeps_sibling_crawler_keys(seeded_app, monkeypatch):
+    """A save of the one rendered leaf must not wipe the crawler keys the
+    panel does NOT render yet (max_file_mb, item_timeout_s, ...) — the
+    overlay is deep-merged, never replaced per object."""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    first = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"max_file_mb": 20}}}},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"concurrency": 3}}}},
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"] == {"max_file_mb": 20, "concurrency": 3}
+
+
+def test_crawler_concurrency_out_of_range_is_refused_not_reclamped(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (0, 65, -1):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"concurrency": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.concurrency" in resp.text
+
+
+def test_crawler_concurrency_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("6", 6.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"concurrency": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_crawler_concurrency_boundaries_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (1, 32):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"concurrency": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, (value, resp.text)
+
+
+def test_crawler_object_that_is_not_a_mapping_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": 4}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_saved_crawler_concurrency_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    """End to end through the real save path: what the panel stores is
+    exactly what the crawler resolves as its configured cap on the next
+    run — no restart, no monkeypatch of get_value. (The cross-process
+    half — the extraction worker noticing the app container's save — is
+    `tests/test_instance_config_hot_reload.py`.)"""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _crawl_concurrency, _resolve_concurrency
+
+    assert _crawl_concurrency() == 6  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"concurrency": 2}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert _crawl_concurrency() == 2
+    # A run with no per-run override uses the configured value, and says so.
+    assert _resolve_concurrency(None) == (2, 2, "config")
+
+
+# ---------------------------------------------------------------------------
+# Run knobs an admin needs without server access (2026-09-02): lane
+# concurrency, and the facts stage's stream_every / run_timeout_s / transport /
+# retry_mode instance defaults — declared, validated, persisted.
+# ---------------------------------------------------------------------------
+
+
+def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    fields = client.get("/api/admin/server-config", headers=_auth(token)).json()["known_fields"]["extraction"]
+    from app.worker.runtime import _DEFAULT_EXTRACTION_CONCURRENCY
+    from connectors.sharepoint.facts_extraction import DEFAULT_STANDALONE_TIMEOUT_S
+
+    assert fields["concurrency"]["kind"] == "int"
+    assert fields["concurrency"]["default"] == _DEFAULT_EXTRACTION_CONCURRENCY
+    facts = fields["facts"]["fields"]
+    assert facts["stream_every"] == {**facts["stream_every"], "kind": "int", "default": 0}
+    assert facts["run_timeout_s"]["default"] == DEFAULT_STANDALONE_TIMEOUT_S
+    assert facts["transport"]["default"] == "sync"
+    assert facts["retry_mode"]["default"] == "on_gate_fail"
+
+
+def test_caps_match_the_stages_own_clamps():
+    from app.api.admin import _FACTS_CONCURRENCY_MAX, _LANE_CONCURRENCY_MAX
+    from connectors.sharepoint.facts_extraction import MAX_CONCURRENCY
+
+    assert _FACTS_CONCURRENCY_MAX == MAX_CONCURRENCY == 64
+    assert _LANE_CONCURRENCY_MAX == 64
+
+
+def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"concurrency": 12, "facts": {"stream_every": 300, "transport": "batch", "retry_mode": "off", "run_timeout_s": 7200}}}},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
+    assert got["concurrency"] == 12
+    assert got["facts"]["stream_every"] == 300
+    assert got["facts"]["transport"] == "batch"
+    assert got["facts"]["retry_mode"] == "off"
+    assert got["facts"]["run_timeout_s"] == 7200
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"concurrency": 0},
+        {"concurrency": 65},
+        {"facts": {"concurrency": 65}},
+        {"facts": {"stream_every": -1}},
+        {"facts": {"run_timeout_s": 5}},
+        {"facts": {"transport": "carrier-pigeon"}},
+        {"facts": {"retry_mode": "sometimes"}},
+        {"facts": {"stream_every": "300"}},
+    ],
+)
+def test_run_knobs_out_of_range_or_wrong_type_are_refused(seeded_app, monkeypatch, patch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post("/api/admin/server-config", json={"sections": {"extraction": patch}}, headers=_auth(token))
+    assert resp.status_code == 422, resp.text

@@ -2293,6 +2293,23 @@
         "title": "CoverageTagCreate",
         "type": "object"
       },
+      "CrawlConfigPatch": {
+        "properties": {
+          "min_modified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Modified"
+          }
+        },
+        "title": "CrawlConfigPatch",
+        "type": "object"
+      },
       "CreateAgentRequest": {
         "properties": {
           "description": {
@@ -32302,7 +32319,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": {
       "get": {
-        "description": "A5 \u2014 the read-only effective configuration for this connection's\nextraction, with an origin and a lock state on every row.\n\nCataloged rather than exempt (``sharepoint_connection.extraction_config_read``):\nit discloses credential env-var NAMES and the per-scope audience-class\nmapping \u2014 the same disclosure class as its ``scopes_read`` /\n``certificate_read`` siblings.\n\nAnswers on BOTH backends: nothing here reads ``extraction_runs``, and\nan admin locked out of the configuration read-out because their instance\nis on DuckDB would be a degradation with no cause.",
+        "description": "A5 \u2014 the read-only effective configuration for this connection's\nextraction, with an origin and a lock state on every row.\n\nCataloged rather than exempt (``sharepoint_connection.extraction_config_read``):\nit discloses credential env-var NAMES and the per-scope audience-class\nmapping \u2014 the same disclosure class as its ``scopes_read`` /\n``certificate_read`` siblings.\n\nAnswers on BOTH backends: nothing here reads ``extraction_runs``, and\nan admin locked out of the configuration read-out because their instance\nis on DuckDB would be a degradation with no cause.\n\n``min_modified`` carries the resolved crawl age filter (the SAME\n``{value, source}`` shape the ``\u2026/extraction/crawl-config`` PATCH\nresponse returns) \u2014 the drawer's Crawl filter panel needs the CURRENT\noverride to pre-fill its date input, not just a place to write a new one.",
         "operationId": "extraction_config_api_admin_sharepoint_connections__connection_id__extraction_config_get",
         "parameters": [
           {
@@ -32358,6 +32375,79 @@
           }
         },
         "summary": "Extraction Config",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": {
+      "patch": {
+        "description": "Per-connection age filter for the crawl (a backfill lever): a\nconnection can crawl only files modified on/after a cutoff date instead\nof re-walking a whole multi-year corpus.\n\nWrites ``config.extraction.crawl.min_modified`` on the connection row \u2014\na sibling of ``config.extraction.facts.retry_mode`` (the facts-config\nendpoint above) and ``config.extraction.stop_requested_at`` (the Stop\ncontrol): the established home for per-connection extraction state,\ncarried forward on every generic connection edit. ``min_modified: null``\n(or the field simply omitted) CLEARS the override \u2014 there is no\ninstance-level fallback to fall back to (see\n:func:`connectors.sharepoint.crawler.resolve_min_modified`'s own\ndocstring for why). A value that is not a parseable ISO ``YYYY-MM-DD``\ndate is refused with a plain ``400`` (``invalid_min_modified``) rather\nthan silently ignored \u2014 a caller setting a value expects it to take\neffect.\n\nWorks on BOTH app-state backends, like its siblings above: this touches\nonly ``source_connections``, never a PG-only table.",
+        "operationId": "patch_extraction_crawl_config_api_admin_sharepoint_connections__connection_id__extraction_crawl_config_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CrawlConfigPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Extraction Crawl Config",
         "tags": [
           "admin"
         ]
@@ -32585,7 +32675,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/status": {
       "get": {
-        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.",
+        "description": "A1 \u2014 the source card's live crawl cell and `Run` row.\n\n``running`` is the newest un-finalized run WITH its liveness derived\n(see :func:`_derived_outcome`); ``last_completed`` is the newest run\nthat actually ended. Both may be null, and null is rendered as \"never\nrun\", never as zeros.\n\n``as_of`` is this response's own read time \u2014 distinct from each run's\n``checkpoint_at``, which is when its numbers were last true. The card\nprints the run's, not this one, wherever it shows a counter.\n\n``facts_job`` is the queued/running standalone facts pass for this\nconnection (:func:`_facts_job_in_flight`) or ``null`` \u2014 a job, never a\nrun: it is what lets the card say \"a facts pass is running\" and lock\nits own \"Extract facts now\" button while one is, since that pass never\nappears in ``running``/``last_completed``.",
         "operationId": "extraction_status_api_admin_sharepoint_connections__connection_id__extraction_status_get",
         "parameters": [
           {
@@ -33208,7 +33298,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/split-plan": {
       "get": {
-        "description": "Read-only preview of splitting this connection's site into ``n``\nsibling connections (see the module docstring's \"split a large site\"\nentry) \u2014 greedy-packs the drive root's top-level folders into ``n``\ngroups of roughly equal document count, WITHOUT creating anything.\n\n``drive_id`` is optional \u2014 same inference as ``POST \u2026/scopes/bulk``:\nreused from this connection's first existing scope when omitted, ``400\ndrive_id_required`` when neither is available (a split only makes sense\non a connection that already resolves a drive). ``min_modified``\n(``YYYY-MM-DD``, ``422 invalid_min_modified`` otherwise) narrows each\nfolder's document count to files modified on/after that date, via the\nsame Graph Search filter :func:`connectors.sharepoint.graph_client.\nsearch_document_count` builds.\n\nDrive-root items that are FILES, not folders, are reported under\n``loose_root_files`` \u2014 they are in no folder, so a folder-based split\n(this one, and the manual ``clone`` + ``scopes/bulk`` workflow it\nautomates) can never cover them; an admin sees exactly what would be\nleft behind rather than discovering it after the fact.\n\nResponse: ``{drive_id, folders: [{name, documents}], loose_root_files:\n[names], groups: [{name, folders: [{name, documents}], documents}],\ntotal_documents}`` \u2014 ``groups[].name`` is the EXACT name ``POST \u2026/splits``\nwill give the corresponding clone (:func:`connectors.sharepoint.\nsite_split.format_group_name`), so an admin previewing this can see\nahead of time what will collide with ``409 split_exists`` on a repeat\napply.\n\n``404`` for an unknown/non-SharePoint connection id. A Graph failure\nwhile listing the root (not a per-folder count failure \u2014 those degrade\nto ``documents: 0``, never fail the whole preview) is a typed ``502\nsharepoint_graph_error``.",
+        "description": "Read-only preview of splitting this connection's site into ``n``\nsibling connections (see the module docstring's \"split a large site\"\nentry) \u2014 greedy-packs the drive root's top-level folders into ``n``\ngroups of roughly equal document count, WITHOUT creating anything.\n\n``drive_id`` is optional \u2014 same inference as ``POST \u2026/scopes/bulk``:\nreused from this connection's first existing scope when omitted, ``400\ndrive_id_required`` when neither is available (a split only makes sense\non a connection that already resolves a drive). ``min_modified``\n(``YYYY-MM-DD``, ``400 invalid_min_modified`` otherwise) narrows each\nfolder's document count to files modified on/after that date, via the\nsame Graph Search filter :func:`connectors.sharepoint.graph_client.\nsearch_document_count` builds.\n\nDrive-root items that are FILES, not folders, are reported under\n``loose_root_files`` \u2014 they are in no folder, so a folder-based split\n(this one, and the manual ``clone`` + ``scopes/bulk`` workflow it\nautomates) can never cover them; an admin sees exactly what would be\nleft behind rather than discovering it after the fact.\n\nResponse: ``{drive_id, folders: [{name, documents}], loose_root_files:\n[names], groups: [{name, folders: [{name, documents}], documents}],\ntotal_documents}`` \u2014 ``groups[].name`` is the EXACT name ``POST \u2026/splits``\nwill give the corresponding clone (:func:`connectors.sharepoint.\nsite_split.format_group_name`), so an admin previewing this can see\nahead of time what will collide with ``409 split_exists`` on a repeat\napply.\n\n``404`` for an unknown/non-SharePoint connection id. A Graph failure\nwhile listing the root (not a per-folder count failure \u2014 those degrade\nto ``documents: 0``, never fail the whole preview) is a typed ``502\nsharepoint_graph_error``.",
         "operationId": "split_plan_api_admin_sharepoint_connections__connection_id__split_plan_get",
         "parameters": [
           {

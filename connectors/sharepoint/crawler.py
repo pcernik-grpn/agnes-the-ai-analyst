@@ -101,7 +101,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -150,8 +150,10 @@ _DEFAULT_MAX_FILE_MB = 50
 #: ``1`` is the pre-parallel behaviour, exactly (see :func:`_process_page`).
 _DEFAULT_CONCURRENCY = 6
 #: Hard ceiling on the configured value. Past this the extra parallelism buys
-#: 429s, temp-file pressure and RAM, never throughput.
-_MAX_CONCURRENCY = 32
+#: 429s, temp-file pressure and RAM, never throughput. Sized for a large
+#: conversion box (one core per in-flight file; the crawl parent holds
+#: roughly 2 GB per in-flight file) — a small VM should stay well under it.
+_MAX_CONCURRENCY = 64
 #: Ceiling on a PER-RUN ``payload["concurrency"]`` override. Lower than the
 #: configured ceiling on purpose: an ad-hoc run (an admin pressing "run now")
 #: is the wrong place to go looking for a tenant's throttling limit.
@@ -879,6 +881,7 @@ def _skip_total(stats: "CrawlStats") -> int:
         + stats.anonymize_failed
         + stats.excluded_subtree_skips
         + stats.permission_skips
+        + stats.filtered_by_age
     )
 
 
@@ -937,8 +940,8 @@ def _ingested_nothing_despite_errors(stats: "CrawlStats") -> bool:
     Deliberately narrow. `errors` only counts a fault the crawl could not
     recover from (download/convert/ingest failure, or a whole scope it could
     not read) — the routine skip reasons (`permission_skips`,
-    `excluded_subtree_skips`, oversize, `anonymize_failed`) are deliberate
-    decisions, not failures, and never count here, so a normal run that
+    `excluded_subtree_skips`, `filtered_by_age`, oversize, `anonymize_failed`)
+    are deliberate decisions, not failures, and never count here, so a normal run that
     politely skipped a great many documents is not mistaken for a broken
     one. `new`/`changed` are zero-checked rather than compared to `errors`
     as a ratio: with both at zero, everything this run attempted to land
@@ -1013,6 +1016,12 @@ class CrawlStats:
     anonymize_failed: int = 0
     excluded_subtree_skips: int = 0
     permission_skips: int = 0
+    #: Files skipped by the ``extraction.crawl.min_modified`` age filter
+    #: (strictly before the connection's cutoff) / kept because this crawl
+    #: could not determine their age at all — see `resolve_min_modified`
+    #: and the gate in `_process_item`. Both zero when no cutoff is set.
+    filtered_by_age: int = 0
+    age_unknown: int = 0
     oversize_files: int = 0
     oversize_bytes: int = 0
     oversize_largest: List[Dict[str, Any]] = field(default_factory=list)
@@ -1251,6 +1260,8 @@ class CrawlStats:
             "anonymize_failed": self.anonymize_failed,
             "excluded_subtree_skips": self.excluded_subtree_skips,
             "permission_skips": self.permission_skips,
+            "filtered_by_age": self.filtered_by_age,
+            "age_unknown": self.age_unknown,
             "files_per_s": round(processed / elapsed, 3),
             "requests": self.requests,
             "retries": self.retries,
@@ -1903,6 +1914,69 @@ def _under_prefix(path: str, prefixes: Sequence[str]) -> bool:
     return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
 
 
+#: Sibling of ``connectors.sharepoint.facts_extraction``'s ``retry_mode``
+#: override and :data:`STOP_REQUESTED_AT_KEY` above: another per-connection
+#: extraction lever living on ``connection.config.extraction.<leaf>``,
+#: carried forward on every generic connection edit. Unlike ``retry_mode``
+#: this one has no instance-level fallback — a "changed on/after this date"
+#: cutoff is inherently connection-specific (a fresh site vs. a decade-old
+#: archive), so there is nothing sensible to fall back TO; absent or
+#: invalid simply means "no filter", i.e. the crawl behaves exactly as it
+#: always has.
+MIN_MODIFIED_KEY = "min_modified"
+
+
+def resolve_min_modified(connection: Optional[Dict[str, Any]] = None) -> Tuple[Optional[date], str]:
+    """``(cutoff, source)`` for this connection's age filter —
+    ``connection.config.extraction.crawl.min_modified``, an ISO
+    ``YYYY-MM-DD`` string, or absent for no filter.
+
+    ``source`` is ``"connection"`` when a valid cutoff is set, ``"none"``
+    when it is absent OR present but not a parseable ISO date (logged and
+    ignored — never a crash: a malformed override must not abort a crawl,
+    it just runs unfiltered, exactly as if nothing were set at all).
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("crawl") or {}).get(MIN_MODIFIED_KEY)
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip()
+            try:
+                return date.fromisoformat(candidate), "connection"
+            except ValueError:
+                logger.warning(
+                    "sharepoint crawl: connection %s config.extraction.crawl.min_modified=%r is not an "
+                    "ISO YYYY-MM-DD date — ignoring, crawl runs unfiltered",
+                    connection.get("id"),
+                    raw,
+                )
+    return None, "none"
+
+
+def _item_modified_at(item: Dict[str, Any]) -> Optional[datetime]:
+    """This item's last-modified timestamp for the ``min_modified`` gate —
+    Graph's own ``lastModifiedDateTime`` first, the ``fileSystemInfo``
+    mirror (present when the tenant's sync client stamped a local mtime)
+    second. ``None`` when neither is present or parseable — the gate below
+    treats that as "keep it": an item whose age cannot be determined must
+    never be silently dropped.
+
+    Graph writes ``...Z``; normalized to ``...+00:00`` the same way
+    :func:`connectors.sharepoint.subscriptions._parse_iso` does, so both
+    modules read the identical timestamp shape identically.
+    """
+    raw = item.get("lastModifiedDateTime") or (item.get("fileSystemInfo") or {}).get("lastModifiedDateTime")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 def _zone_routes_for_scope(connection: Dict[str, Any], source_scope_id: str) -> Dict[str, List[Tuple[str, str]]]:
     """This scope's ACTIVE permission zones (2026-08-31 plan, Task 3/4;
     TCRD-284 wires them into the builtin crawler's own routing), grouped by
@@ -1946,6 +2020,11 @@ class _ScopeContext:
     anonymize: bool
     exclusions: _ExclusionIndex
     zone_routes_by_drive: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+    #: This connection's resolved :func:`resolve_min_modified` cutoff, or
+    #: ``None`` for no filter. Connection-wide, not per-scope, but carried
+    #: on the scope context because that is what every per-item pipeline
+    #: already has in hand.
+    min_modified: Optional[date] = None
 
     def candidate_collection_ids(self, drive_id: str) -> List[str]:
         """This scope's own collection, then every zone collection this
@@ -2701,11 +2780,8 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
 
     The returned ``path``'s leaf segment keeps the SOURCE file's extension
     (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
-    mirroring the exact relationship the un-anonymized values already have
-    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
-    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
-    converted markdown's own name). Only the identity-bearing STEM changes,
-    never the suffix a downstream reader keys extension logic on.
+    mirroring the exact relationship the un-anonymized values already have.
+    Only the identity-bearing STEM changes, never the suffix.
 
     Routing decisions (which collection, which exclusion rule) are made
     EARLIER in the pipeline against the RAW path — those decisions come from
@@ -2755,11 +2831,8 @@ def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> T
 
     The returned ``path``'s leaf segment keeps the SOURCE file's extension
     (only its stem is anonymized) and ``filename`` is always ``<stem>.md`` —
-    mirroring the exact relationship the un-anonymized values already have
-    (``connectors.sharepoint.facts_extraction._is_tabular`` keys off
-    ``path``'s real suffix to skip spreadsheets; ``filename`` is always the
-    converted markdown's own name). Only the identity-bearing STEM changes,
-    never the suffix a downstream reader keys extension logic on.
+    mirroring the exact relationship the un-anonymized values already have.
+    Only the identity-bearing STEM changes, never the suffix.
 
     Routing decisions (which collection, which exclusion rule) are made
     EARLIER in the pipeline against the RAW path — those decisions come from
@@ -3047,6 +3120,28 @@ async def _process_item(
     if ctx.exclusions.folder_prefixes and _under_prefix(path, ctx.exclusions.folder_prefixes):
         stats.add(excluded_subtree_skips=1)
         return
+
+    if ctx.min_modified is not None:
+        # `extraction.crawl.min_modified` (per-connection age filter, see
+        # `resolve_min_modified`). Boundary rule: a cutoff of 2023-12-31
+        # KEEPS an item modified on 2023-12-31T00:00:00Z or later — only
+        # strictly-before is filtered. An item this crawl cannot date is
+        # always kept (`age_unknown`), never silently dropped, and counted
+        # separately from the ones actually filtered by age
+        # (`filtered_by_age`) so an operator can tell the two apart.
+        # Returning here — before the cTag check and `_route_collection` —
+        # means a filtered item leaves no cTag behind and never touches
+        # `ctags`/the delta cursor beyond the delta page itself simply
+        # having been walked; a later run only re-offers it if it changes
+        # again, exactly the same as any other item this crawl never saw.
+        modified_at = _item_modified_at(item)
+        if modified_at is None:
+            stats.add(age_unknown=1)
+        else:
+            cutoff = datetime(ctx.min_modified.year, ctx.min_modified.month, ctx.min_modified.day, tzinfo=timezone.utc)
+            if modified_at.astimezone(timezone.utc) < cutoff:
+                stats.add(filtered_by_age=1)
+                return
 
     collection_id = _route_collection(path, target.drive_id, ctx)
 
@@ -4279,6 +4374,9 @@ async def _run_crawl_async(
         )
 
     settings = resolve_sharepoint_settings(connection)
+    # Resolved ONCE for the whole run — a connection-wide lever, not a
+    # per-scope one (see `resolve_min_modified`'s own docstring).
+    min_modified, _min_modified_source = resolve_min_modified(connection)
     anonymization_key = _resolve_anonymization_key(scopes)
     # Built once per run, and only when something in this run will actually
     # anonymize — an instance on the regex tier never imports the LLM stack,
@@ -4365,6 +4463,7 @@ async def _run_crawl_async(
                     anonymize=bool(scope.get("anonymize")),
                     exclusions=exclusions,
                     zone_routes_by_drive=_zone_routes_for_scope(connection, source_scope_id),
+                    min_modified=min_modified,
                 )
                 stats.add(scopes=1)
                 # Drives stay SEQUENTIAL, deliberately. Parallelising them is the

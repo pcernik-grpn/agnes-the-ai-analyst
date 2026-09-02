@@ -1413,7 +1413,11 @@ never gets a job that fails 30+ minutes later in a worker; `409
 facts_extraction_already_running` when one is already queued/running for
 this connection (its own idempotency key, distinct from every other kind's
 — a facts-extraction trigger never dedups against a crawl, an ACL sync or a
-subtree sweep). CLI: `agnes admin sharepoint facts-extract <connection_id>`.
+subtree sweep). The `facts_extraction_disabled` body also names the config
+key that is off in `switch` (`extraction.facts.enabled` or `facts.enabled`).
+CLI: `agnes admin sharepoint facts-extract <connection_id>`; UI: the source
+card's **Extract facts now** button (next to **Run extraction now**), which
+renders disabled with that same reason while either switch is off.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
@@ -1598,6 +1602,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/stop
 - /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1617,7 +1622,14 @@ currently being downloaded/converted/ingested (any of several under
 concurrency) and `recent` is the last up to 5 completed items
 (`{path, outcome}`) — so the card can show what the crawl is touching right
 now instead of only aggregate counters. `activity` is `null`/absent on older
-rows and on a finished run (nothing left in flight).
+rows and on a finished run (nothing left in flight). `facts_job` is the
+queued/running standalone facts pass for this connection
+(`{id, status, created_at, started_at}`) or `null` — a job, never a run: the
+`sharepoint-facts-extraction` pass opens no `extraction_runs` row, so it is
+read off the job queue (matched on the same idempotency key the trigger
+dedups on) and never appears in `running`/`last_completed`. The card shows
+it as a "facts pass queued/running" line in the Run row and locks its own
+"Extract facts now" button while one is in flight.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1639,7 +1651,12 @@ environment overrides. The whole `extraction` section stays out of
 section name and then deep-merges, so one editable key would make the section
 that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
-`sharepoint_connection.extraction_config_read`.
+`sharepoint_connection.extraction_config_read`. The response also carries
+`min_modified: {value, source}` — the SAME resolved shape `…/extraction/
+crawl-config`'s own PATCH response returns — so the drawer's Crawl filter
+panel (a date input plus Save/Clear) opens pre-filled with whatever cutoff
+is already set on the connection, rather than a blank field with no way to
+tell what is active.
 
 `POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
 connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
@@ -1697,14 +1714,37 @@ Works on both app-state backends, same as `…/extraction/stop`. Audited as
 `extraction.facts_retry_mode_set` — the handler writes its own row (more than
 the fallback middleware could say: the requested value, the resolved value
 and its source). CLI: `agnes admin sharepoint facts-config <connection_id>
---retry-mode <mode>` / `--clear`.
+--retry-mode <mode>` / `--clear`. The same two overrides (retry mode and
+transport) are also settable from the SharePoint source card on
+`/admin/data-sources`, for an admin with no server or CLI access.
+
+`PATCH …/extraction/crawl-config` sets or clears a per-connection age filter
+for the crawl — `config.extraction.crawl.min_modified`, another sibling on
+the same JSON column. A backfill run can crawl only files modified on/after
+a cutoff date instead of re-walking a whole multi-year corpus. Body:
+`{"min_modified": "YYYY-MM-DD" | null}` — `null` (or the field omitted)
+clears the override; there is no instance-level fallback (the cutoff is
+inherently connection-specific). Returns `{connection_id, min_modified:
+{value, source}}`, `source` being `"connection"` or `"none"`. `400
+invalid_min_modified` for a value that is not a parseable ISO date; `404`
+for an unknown or non-SharePoint connection. Works on both app-state
+backends, same as `…/extraction/stop`. Audited as `extraction.
+min_modified_set` — the handler writes its own row, same shape as
+`facts-config`'s above. CLI: `agnes admin sharepoint crawl-config
+<connection_id> --min-modified <date>` / `--clear`. The crawler gate itself
+keeps items on/after 00:00:00 UTC of the cutoff date, skips strictly-before
+ones (counted as `filtered_by_age` in the run report), and always keeps an
+item whose modified timestamp cannot be read at all (counted separately as
+`age_unknown`) — an unfilterable item is never silently dropped. A deleted
+item is still processed for deletion regardless of the filter.
 
 The four `GET`/stop routes above are admin-only display primitives with no
-analyst CLI/MCP analogue. The fleet endpoint and `facts-config` are both
-CLI-reachable — an operator watching the fleet, or scripting a
-per-connection cost/recall tradeoff — but deliberately not MCP-exposed: a
-fleet-wide operational status read and a connection's retry policy are both
-operator decisions, not query surfaces any agent needs.
+analyst CLI/MCP analogue. The fleet endpoint, `facts-config` and
+`crawl-config` are all CLI-reachable — an operator watching the fleet, or
+scripting a per-connection cost/recall/scope tradeoff — but deliberately not
+MCP-exposed: a fleet-wide operational status read and a connection's
+retry/crawl policy are all operator decisions, not query surfaces any agent
+needs.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

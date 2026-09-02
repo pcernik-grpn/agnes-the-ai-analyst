@@ -139,7 +139,7 @@ import hashlib
 import logging
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
@@ -374,21 +374,28 @@ _CLONE_EXCLUDED_CONFIG_KEYS = ("scopes", "extraction")
 #: query param — see :class:`SplitApplyBody`'s own docstring for why.
 _SPLIT_MAX_N = 50
 
-#: An admin-supplied ``min_modified`` filter (``GET …/split-plan?min_modified=``
-#: and ``SplitApplyBody.min_modified``) is a plain ``YYYY-MM-DD`` — the exact
-#: shape :func:`connectors.sharepoint.graph_client.search_document_count`
-#: splices into its KQL ``LastModifiedTime>=`` clause unescaped, so this is a
-#: structural gate, not cosmetic validation (same "never build a request from
-#: an unchecked value" rule as :func:`_validate_graph_id`).
-_MIN_MODIFIED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
 
 def _validate_min_modified(value: Optional[str]) -> None:
-    if value is not None and not _MIN_MODIFIED_RE.match(value):
-        raise HTTPException(
-            status_code=422,
-            detail={"error": "invalid_min_modified", "message": "min_modified must be YYYY-MM-DD"},
-        )
+    """An admin-supplied ``min_modified`` filter (``GET …/split-plan?
+    min_modified=`` and ``SplitApplyBody.min_modified``) is the exact shape
+    :func:`connectors.sharepoint.graph_client.search_document_count` splices
+    into its KQL ``LastModifiedTime>=`` clause unescaped, so this is a
+    structural gate, not cosmetic validation (same "never build a request
+    from an unchecked value" rule as :func:`_validate_graph_id`) — and the
+    SAME check ``PATCH …/extraction/crawl-config`` runs on the identical
+    ``config.extraction.crawl.min_modified`` value
+    (``app/api/admin_extraction.py``), so a caller sees one validation rule
+    for this key regardless of which endpoint sets it: ``date.fromisoformat``
+    (catches a structurally YYYY-MM-DD-shaped but calendar-invalid date, e.g.
+    month 13, that a bare regex would let through), ``400
+    invalid_min_modified`` on failure.
+    """
+    if value is None:
+        return
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"error": "invalid_min_modified"}) from None
 
 
 def _cloned_base_config(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1954,7 +1961,7 @@ async def split_plan(
     reused from this connection's first existing scope when omitted, ``400
     drive_id_required`` when neither is available (a split only makes sense
     on a connection that already resolves a drive). ``min_modified``
-    (``YYYY-MM-DD``, ``422 invalid_min_modified`` otherwise) narrows each
+    (``YYYY-MM-DD``, ``400 invalid_min_modified`` otherwise) narrows each
     folder's document count to files modified on/after that date, via the
     same Graph Search filter :func:`connectors.sharepoint.graph_client.
     search_document_count` builds.
@@ -2691,12 +2698,19 @@ def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     probe (facts extraction never touches ``markitdown``/``pypdfium2`` — it
     reads already-converted markdown out of ``corpus_files``, not raw
     documents).
+
+    The refusal names the config key that is off in ``switch`` (additive to
+    ``error``/``message``): the source card's "Extract facts now" button
+    reads the same verdict through ``app/web/router.py``'s pipeline cell and
+    renders that key as its disabled reason, so the UI and the 409 can never
+    disagree about what an admin has to flip.
     """
     from connectors.sharepoint.facts_extraction import facts_extraction_enabled, facts_surface_enabled
 
     if not facts_extraction_enabled():
         return False, {
             "error": "facts_extraction_disabled",
+            "switch": "extraction.facts.enabled",
             "message": (
                 "extraction.facts.enabled is off — turn it on in /admin/server-config "
                 "before running a facts-extraction pass (it is the cost gate: this stage "
@@ -2706,6 +2720,7 @@ def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     if not facts_surface_enabled():
         return False, {
             "error": "facts_extraction_disabled",
+            "switch": "facts.enabled",
             "message": (
                 "facts.enabled is off — turn it on before running a facts-extraction pass "
                 "(writing claims into a surface nothing can read is never useful)."

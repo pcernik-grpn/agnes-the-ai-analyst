@@ -20,10 +20,16 @@ Routing
 ``.md/.txt/.csv/.json/.yaml/.yml`` pass through verbatim (UTF-8,
 ``errors="replace"``) — matching the crawler's historical ``TEXT_SUFFIXES``
 behaviour, so a re-crawl produces byte-identical extractions. ``.pdf`` goes to
-pypdfium2. Everything else goes to markitdown. The declared ``mime`` is only
-consulted when the filename carries no suffix we recognise; it is untrusted
-metadata from a remote drive and is never used for anything but choosing a
-route.
+pypdfium2. The legacy Office / OpenDocument suffixes markitdown cannot read
+directly — ``.doc/.rtf/.odt``, ``.ppt/.odp``, ``.xls/.ods`` — are first
+re-saved by headless LibreOffice into the OOXML sibling markitdown already
+handles (docx/pptx/xlsx respectively), then routed through the same
+markitdown call as everything else; the run is reported as
+``"libreoffice+markitdown"`` so a downstream reader can tell it from a direct
+markitdown conversion. Everything else goes to markitdown directly. The
+declared ``mime`` is only consulted when the filename carries no suffix we
+recognise; it is untrusted metadata from a remote drive and is never used for
+anything but choosing a route.
 
 Failure model
 -------------
@@ -55,6 +61,11 @@ never a silently empty document.
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -94,10 +105,40 @@ DEFAULT_MAX_CHARS = 5_000_000
 #: PDFium finds in the margins of a scanned page.
 MIN_PDF_TEXT_CHARS = 16
 
+#: Legacy Office / OpenDocument suffixes markitdown's Office backends
+#: (mammoth, python-pptx, openpyxl) do not read: the pre-2007 OLE2 binary
+#: formats and the OpenDocument formats alike. Mapped to the OOXML target
+#: format headless LibreOffice must produce so markitdown can take over —
+#: never a second, competing reader, just a re-save into the format the
+#: existing route already handles.
+LEGACY_OFFICE_TARGETS: dict[str, str] = {
+    ".doc": "docx",
+    ".rtf": "docx",
+    ".odt": "docx",
+    ".ppt": "pptx",
+    ".odp": "pptx",
+    ".xls": "xlsx",
+    ".ods": "xlsx",
+}
+LEGACY_OFFICE_SUFFIXES = frozenset(LEGACY_OFFICE_TARGETS)
+
+#: Ceiling on one LibreOffice ``--convert-to`` invocation. A module constant
+#: rather than an ``instance.yaml`` knob (no speculative config surface for a
+#: value nobody has needed to tune) — generous enough for a large legacy
+#: spreadsheet or deck, short enough that one pathological file cannot stall
+#: a crawl's conversion pool.
+LIBREOFFICE_TIMEOUT_SECONDS = 120
+
 ENGINE_MARKITDOWN = "markitdown"
 ENGINE_PYPDFIUM2 = "pypdfium2"
 ENGINE_PASSTHROUGH = "passthrough"
 ENGINE_EMPTY = "empty"
+#: Legacy Office / OpenDocument file pre-converted by headless LibreOffice
+#: and then read through the ordinary markitdown route. Its own engine name,
+#: never plain ``"markitdown"``: a downstream reader must be able to tell a
+#: file that went through the LibreOffice re-save from one markitdown read
+#: natively.
+ENGINE_LIBREOFFICE_MARKITDOWN = "libreoffice+markitdown"
 #: A PDF with no text layer, transcribed by the vision model
 #: (:mod:`connectors.sharepoint.scan_ocr`). Its own engine name, never
 #: ``"pypdfium2"``: a downstream reader must be able to tell text that was read
@@ -143,9 +184,10 @@ class MissingConversionDependency(ConversionError):
 class ConvertResult:
     """The converted document and which engine produced it.
 
-    ``engine`` is one of ``"markitdown"``, ``"pypdfium2"``, ``"passthrough"``
-    or ``"empty"``. ``"empty"`` means conversion succeeded and found no text —
-    a scanned PDF, a blank document — and ``markdown`` is then ``""``.
+    ``engine`` is one of ``"markitdown"``, ``"pypdfium2"``, ``"passthrough"``,
+    ``"libreoffice+markitdown"`` or ``"empty"``. ``"empty"`` means conversion
+    succeeded and found no text — a scanned PDF, a blank document — and
+    ``markdown`` is then ``""``.
     """
 
     markdown: str
@@ -198,6 +240,9 @@ def convert_to_markdown(
         engine = ENGINE_PASSTHROUGH
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
         text, engine = _convert_pdf(path, filename)
+    elif suffix in LEGACY_OFFICE_SUFFIXES:
+        text = _convert_legacy_office(path, filename, suffix)
+        engine = ENGINE_LIBREOFFICE_MARKITDOWN
     else:
         text = _convert_markitdown(path, filename)
         engine = ENGINE_MARKITDOWN
@@ -264,6 +309,103 @@ def _convert_markitdown(path: Path, filename: str) -> str:
     if text is None:
         text = getattr(result, "markdown", None)
     return _normalize_newlines(text or "")
+
+
+# ---------------------------------------------------------------- legacy office
+
+#: Serializes soffice invocations within ONE process (see _convert_legacy_office).
+_LIBREOFFICE_LOCK = threading.Lock()
+#: pid → this process's own LibreOffice user profile directory. Keyed by pid,
+#: not cached once: a worker child forked after the parent's first conversion
+#: must not inherit (and race on) the parent's profile.
+_LIBREOFFICE_PROFILES: dict[int, str] = {}
+
+
+def _libreoffice_profile_dir() -> str:
+    """A LibreOffice ``UserInstallation`` directory private to this process,
+    created on first use and reused for every later conversion in the same
+    process (the first headless start on a fresh profile costs seconds; the
+    ones after it do not)."""
+    pid = os.getpid()
+    profile = _LIBREOFFICE_PROFILES.get(pid)
+    if profile is None or not os.path.isdir(profile):
+        profile = tempfile.mkdtemp(prefix=f"agnes-libreoffice-profile-{pid}-")
+        _LIBREOFFICE_PROFILES[pid] = profile
+    return profile
+
+
+def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
+    """Legacy Office / OpenDocument formats markitdown cannot read directly.
+
+    Shells out to headless LibreOffice (``soffice --headless --convert-to
+    <target> --outdir <tmpdir> <file>``) to re-save the file into the OOXML
+    sibling markitdown already handles — ``.doc/.rtf/.odt`` → docx,
+    ``.ppt/.odp`` → pptx, ``.xls/.ods`` → xlsx — in a throwaway temp dir that
+    is ALWAYS removed, success or failure. ``soffice`` missing from ``PATH``
+    raises the same typed :class:`MissingConversionDependency` a missing
+    Python backend would, naming ``"libreoffice"``, so the file is COUNTED as
+    a named conversion failure exactly like a missing markitdown today —
+    never silently skipped. A non-zero exit or a timeout raises
+    :class:`ConversionError`, the same class :func:`_convert_markitdown`
+    raises for a backend failure.
+    """
+    target_format = LEGACY_OFFICE_TARGETS[suffix]
+
+    if shutil.which("soffice") is None:
+        raise MissingConversionDependency(filename, "libreoffice", engine=ENGINE_LIBREOFFICE_MARKITDOWN)
+
+    tmpdir = tempfile.mkdtemp(prefix="agnes-libreoffice-")
+    try:
+        try:
+            # One soffice at a time PER PROCESS, on a profile that is this
+            # process's own: LibreOffice keeps a lock in its user profile and
+            # a second headless instance on the same profile exits 1 (measured
+            # live: 3 of 6 concurrent conversions failed). The crawl's
+            # parallelism is across worker child processes, so a per-process
+            # profile + lock costs nothing there and makes an in-process
+            # caller (threads) serialize instead of fail.
+            with _LIBREOFFICE_LOCK:
+                completed = subprocess.run(
+                    [
+                        "soffice",
+                        f"-env:UserInstallation=file://{_libreoffice_profile_dir()}",
+                        "--headless",
+                        "--norestore",
+                        "--convert-to",
+                        target_format,
+                        "--outdir",
+                        tmpdir,
+                        str(path),
+                    ],
+                    capture_output=True,
+                    timeout=LIBREOFFICE_TIMEOUT_SECONDS,
+                    check=False,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise ConversionError(
+                filename,
+                f"libreoffice conversion timed out after {LIBREOFFICE_TIMEOUT_SECONDS}s",
+                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
+            ) from exc
+
+        if completed.returncode != 0:
+            raise ConversionError(
+                filename,
+                f"libreoffice exited with status {completed.returncode}",
+                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
+            )
+
+        converted = sorted(Path(tmpdir).glob(f"*.{target_format}"))
+        if not converted:
+            raise ConversionError(
+                filename,
+                "libreoffice produced no output file",
+                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
+            )
+
+        return _convert_markitdown(converted[0], filename)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------- pdf
@@ -360,4 +502,7 @@ __all__ = [
     "DEFAULT_MAX_CHARS",
     "PAGE_BREAK",
     "PASSTHROUGH_SUFFIXES",
+    "LEGACY_OFFICE_SUFFIXES",
+    "LEGACY_OFFICE_TARGETS",
+    "LIBREOFFICE_TIMEOUT_SECONDS",
 ]

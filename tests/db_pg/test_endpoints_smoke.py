@@ -3524,6 +3524,13 @@ KNOWN_UNTESTED = {
     # the 202 shape, the connection-row write, and the audit row are covered
     # by tests/test_extraction_stop.py.
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop",
+    # Per-connection crawl age filter (extraction.crawl.min_modified) — same
+    # reasoning as `extraction/stop` and `extraction/facts-config` right
+    # above/below: writes to `source_connections`/`config_patch`, a frozen
+    # pre-A3 pair present on BOTH backends, so its per-backend behaviour is
+    # not the point of a PG-only smoke sweep. RBAC, the write, validation,
+    # and the audit row are covered by tests/test_extraction_crawl_config.py.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config",
     # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
     # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
     # "enqueues into the EXISTING jobs table, no new schema surface"
@@ -3540,6 +3547,28 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestFactsExtractionTrigger; not
     # duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/facts-extract",
+    # Split-a-large-site pair (bulk scope-add from folder paths + connection
+    # clone): both write only `source_connections` (config_patch / insert), a
+    # frozen pre-A3 pair present on BOTH backends, and both need a body — not
+    # parameter-free shaped. Auth matrix, path validation, drive_id reuse,
+    # the clone's config-key carry-over/exclusions and idempotency are
+    # covered by tests/test_admin_sharepoint.py (bulk-scopes + clone classes);
+    # not duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
+    "POST /api/admin/sharepoint/connections/{connection_id}/clone",
+    # Per-connection facts policy override (retry_mode + transport) — writes
+    # `source_connections.config`, the same frozen pair, needs a body; 200/
+    # 422/clear semantics and the audit row are covered by
+    # tests/test_extraction_facts_config.py (both backends by construction).
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
+    # Extraction fleet view (page + its JSON feed) reads `extraction_runs`,
+    # a PG-only table: the DuckDB side answers the typed 501 the A3 ratchet
+    # requires (asserted by assert_pg_only_exemptions_fail_clean in the
+    # GET-status parity sweep); the page/feed behaviour is covered by
+    # tests/test_admin_extraction.py and tests/test_admin_extraction_page.py.
+    # Not duplicated here.
+    "GET /admin/extraction",
+    "GET /api/admin/sharepoint/extraction/runs",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

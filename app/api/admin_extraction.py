@@ -80,7 +80,7 @@ import logging
 import os
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -609,6 +609,62 @@ async def fleet_extraction_runs(
         "as_of": now.isoformat(),
     }
 
+#: The standalone facts pass's job kind and the statuses that mean "in
+#: flight" — the same pair `POST …/facts-extract`'s idempotency dedup
+#: reasons about (`app/api/admin_sharepoint.py::_facts_extraction_idempotency_key`).
+_FACTS_JOB_KIND = "sharepoint-facts-extraction"
+_FACTS_JOB_LIVE_STATUSES = ("running", "queued")
+
+
+def _iso_or_none(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
+    """The queued-or-running ``sharepoint-facts-extraction`` job for this
+    connection, projected to ``{id, status, created_at, started_at}`` — or
+    ``None`` when there is none.
+
+    The standalone facts pass is a JOB, not a crawl run: it opens no
+    ``extraction_runs`` row (``connectors.sharepoint.facts_extraction
+    .run_standalone_facts_extraction`` reads already-indexed documents and
+    checkpoints nothing here), so the card's poll would otherwise be blind
+    to it. Read off the job queue instead, matched on the SAME stable
+    idempotency key the trigger dedups on — so "in flight" here means
+    exactly what a second click's ``409 facts_extraction_already_running``
+    means. ``running`` is checked before ``queued`` only for the projection;
+    the dedup key guarantees at most one of the two exists. Backend-agnostic
+    (the jobs table lives on both app-state backends), unlike the
+    ``extraction_runs`` reads around it.
+    """
+    from app.api.admin_sharepoint import _facts_extraction_idempotency_key
+    from src.repositories import jobs_repo
+
+    # Ask the PRODUCER for the key rather than rebuilding its shape here:
+    # `POST …/facts-extract` is the only thing that mints these jobs, so a
+    # second copy of the format in this module is a silent-drift hazard —
+    # the reader would return `None` forever and the card would go blind
+    # with no symptom and no failing test. Pinned by
+    # `tests/test_admin_extraction.py::TestFactsJobInFlight
+    # ::test_the_lookup_follows_the_triggers_own_key_and_kind`.
+    key = _facts_extraction_idempotency_key(connection_id)
+    repo = jobs_repo()
+    for status in _FACTS_JOB_LIVE_STATUSES:
+        for job in repo.list(status=status, kind=_FACTS_JOB_KIND, limit=200):
+            if job.get("idempotency_key") != key:
+                continue
+            return {
+                "id": job["id"],
+                "status": job["status"],
+                "created_at": _iso_or_none(job.get("created_at")),
+                "started_at": _iso_or_none(job.get("started_at")),
+            }
+    return None
+
 
 @router.get("/connections/{connection_id}/extraction/status")
 async def extraction_status(
@@ -625,6 +681,12 @@ async def extraction_status(
     ``as_of`` is this response's own read time — distinct from each run's
     ``checkpoint_at``, which is when its numbers were last true. The card
     prints the run's, not this one, wherever it shows a counter.
+
+    ``facts_job`` is the queued/running standalone facts pass for this
+    connection (:func:`_facts_job_in_flight`) or ``null`` — a job, never a
+    run: it is what lets the card say "a facts pass is running" and lock
+    its own "Extract facts now" button while one is, since that pass never
+    appears in ``running``/``last_completed``.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
@@ -638,6 +700,7 @@ async def extraction_status(
         "running": _run_out(running, now=now) if running else None,
         "last_completed": _run_out(last_completed, now=now) if last_completed else None,
         "runs_total": repo.count_for_connection(connection_id),
+        "facts_job": _facts_job_in_flight(connection_id),
         # `POST …/extraction/stop` (below) always exists and always works —
         # the flag lives on `source_connections`, not on this PG-only table
         # — so there is now an honest Stop control to draw whenever a run is
@@ -827,6 +890,84 @@ async def patch_extraction_facts_config(
         "connection_id": connection_id,
         "retry_mode": {"value": mode, "source": source},
         "transport": {"value": transport_value, "source": transport_source},
+    }
+
+
+class CrawlConfigPatch(BaseModel):
+    #: `None` means BOTH "not provided" and "clear the override" — same
+    #: reading as `FactsConfigPatch.retry_mode` above. An ISO `YYYY-MM-DD`
+    #: string, validated below; anything else is a 400.
+    min_modified: Optional[str] = None
+
+
+@router.patch("/connections/{connection_id}/extraction/crawl-config")
+async def patch_extraction_crawl_config(
+    connection_id: str,
+    body: CrawlConfigPatch,
+    _user: dict = Depends(require_admin),
+):
+    """Per-connection age filter for the crawl (a backfill lever): a
+    connection can crawl only files modified on/after a cutoff date instead
+    of re-walking a whole multi-year corpus.
+
+    Writes ``config.extraction.crawl.min_modified`` on the connection row —
+    a sibling of ``config.extraction.facts.retry_mode`` (the facts-config
+    endpoint above) and ``config.extraction.stop_requested_at`` (the Stop
+    control): the established home for per-connection extraction state,
+    carried forward on every generic connection edit. ``min_modified: null``
+    (or the field simply omitted) CLEARS the override — there is no
+    instance-level fallback to fall back to (see
+    :func:`connectors.sharepoint.crawler.resolve_min_modified`'s own
+    docstring for why). A value that is not a parseable ISO ``YYYY-MM-DD``
+    date is refused with a plain ``400`` (``invalid_min_modified``) rather
+    than silently ignored — a caller setting a value expects it to take
+    effect.
+
+    Works on BOTH app-state backends, like its siblings above: this touches
+    only ``source_connections``, never a PG-only table.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    if body.min_modified is not None:
+        try:
+            date.fromisoformat(body.min_modified)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_min_modified") from None
+
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    extraction = dict((connection.get("config") or {}).get("extraction") or {})
+    crawl_cfg = dict(extraction.get("crawl") or {})
+    if body.min_modified is None:
+        crawl_cfg.pop("min_modified", None)
+    else:
+        crawl_cfg["min_modified"] = body.min_modified
+    if crawl_cfg:
+        extraction["crawl"] = crawl_cfg
+    else:
+        extraction.pop("crawl", None)
+    updated = repo.config_patch(connection_id, {"extraction": extraction})
+
+    cutoff, source = resolve_min_modified(updated)
+
+    # More than the fallback middleware can say (it never sees the body) —
+    # same reasoning as the facts-config endpoint's own log_safe above.
+    log_safe(
+        user_id=_user.get("id"),
+        action="extraction.min_modified_set",
+        resource=f"sharepoint_connection:{connection_id}",
+        params={
+            "min_modified": body.min_modified,
+            "resolved": cutoff.isoformat() if cutoff else None,
+            "source": source,
+        },
+    )
+
+    return {
+        "connection_id": connection_id,
+        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": source},
     }
 
 
@@ -1222,8 +1363,17 @@ async def extraction_config(
     Answers on BOTH backends: nothing here reads ``extraction_runs``, and
     an admin locked out of the configuration read-out because their instance
     is on DuckDB would be a degradation with no cause.
+
+    ``min_modified`` carries the resolved crawl age filter (the SAME
+    ``{value, source}`` shape the ``…/extraction/crawl-config`` PATCH
+    response returns) — the drawer's Crawl filter panel needs the CURRENT
+    override to pre-fill its date input, not just a place to write a new one.
     """
     connection = _sharepoint_connection_or_404(connection_id)
+
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    cutoff, min_modified_source = resolve_min_modified(connection)
 
     scopes: List[Dict[str, Any]] = []
     try:
@@ -1253,6 +1403,7 @@ async def extraction_config(
         "section_lock_reason": None
         if section_editable
         else "The `extraction` section is not admin-writable on this instance.",
+        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": min_modified_source},
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 

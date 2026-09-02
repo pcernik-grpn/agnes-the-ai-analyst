@@ -520,6 +520,18 @@ _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+# `extraction.crawler.concurrency` bounds — the SAME clamp the crawler applies
+# (`connectors.sharepoint.crawler._MAX_CONCURRENCY`), pinned by
+# `tests/test_admin_server_config_extraction_section.py` rather than imported:
+# this module must not carry an import-time dependency on the crawler stack.
+_CRAWLER_CONCURRENCY_MIN = 1
+# Same posture for the worker's extraction LANE slots and the facts stage's
+# per-pass document concurrency — the cap each stage clamps to itself, pinned
+# by tests rather than imported (no import-time dependency on the worker/
+# connector stacks from this module).
+_LANE_CONCURRENCY_MAX = 64
+_FACTS_CONCURRENCY_MAX = 64
+_CRAWLER_CONCURRENCY_MAX = 64
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -599,6 +611,61 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     f"{_EXTRACTION_TIMEOUT_MAX} (got {timeout_s})"
                 ),
             )
+
+    lane = patch.get("concurrency")
+    if lane is not None:
+        if not isinstance(lane, int) or isinstance(lane, bool):
+            raise HTTPException(status_code=422, detail="extraction.concurrency must be an integer")
+        if lane < 1 or lane > _LANE_CONCURRENCY_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"extraction.concurrency must be between 1 and {_LANE_CONCURRENCY_MAX} (got {lane})",
+            )
+
+    facts = patch.get("facts")
+    if facts is not None:
+        if not isinstance(facts, dict):
+            raise HTTPException(status_code=422, detail="extraction.facts must be a mapping")
+        for key, lo, hi in (
+            ("concurrency", 1, _FACTS_CONCURRENCY_MAX),
+            ("stream_every", 0, 1_000_000),
+            ("run_timeout_s", _EXTRACTION_TIMEOUT_MIN, _EXTRACTION_TIMEOUT_MAX),
+        ):
+            value = facts.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"extraction.facts.{key} must be an integer")
+            if value < lo or value > hi:
+                raise HTTPException(
+                    status_code=422, detail=f"extraction.facts.{key} must be between {lo} and {hi} (got {value})"
+                )
+        for key, allowed in (("transport", ("sync", "batch")), ("retry_mode", ("off", "on_gate_fail", "always"))):
+            value = facts.get(key)
+            if value is not None and value not in allowed:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"extraction.facts.{key} must be one of {list(allowed)} (got {value!r})",
+                )
+
+    crawler = patch.get("crawler")
+    if crawler is not None:
+        if not isinstance(crawler, dict):
+            raise HTTPException(status_code=422, detail="extraction.crawler must be a mapping")
+        concurrency = crawler.get("concurrency")
+        if concurrency is not None:
+            if not isinstance(concurrency, int) or isinstance(concurrency, bool):
+                raise HTTPException(status_code=422, detail="extraction.crawler.concurrency must be an integer")
+            if concurrency < _CRAWLER_CONCURRENCY_MIN or concurrency > _CRAWLER_CONCURRENCY_MAX:
+                # The crawler would clamp this silently; refuse it here,
+                # where the admin can see why the run is not what they set.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"extraction.crawler.concurrency must be between {_CRAWLER_CONCURRENCY_MIN} and "
+                        f"{_CRAWLER_CONCURRENCY_MAX} (got {concurrency})"
+                    ),
+                )
 
 
 def _apply_extraction_env_overrides(sections: Dict[str, Any]) -> None:
@@ -1100,6 +1167,16 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "than accepted and silently disabling the sweep later."
             ),
         },
+        "concurrency": {
+            "kind": "int",
+            "default": 1,
+            "hint": (
+                "Extraction LANE slots on the worker — how many extraction jobs (crawls and "
+                "fact passes, across all connections) run at the same time. 1 serialises "
+                "everything; raise it so a streamed facts pass can overlap a crawl still "
+                "running, or so several connections crawl in parallel. Clamped to [1, 64]."
+            ),
+        },
         "timeout_s": {
             "kind": "int",
             "default": 3600,
@@ -1109,6 +1186,31 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
             ),
+        },
+        "crawler": {
+            "kind": "object",
+            "hint": (
+                "Built-in crawler tuning — how one crawl run behaves inside the extraction "
+                "worker (connectors/sharepoint/crawler.py)."
+            ),
+            "fields": {
+                "concurrency": {
+                    "kind": "int",
+                    "default": 6,
+                    "hint": (
+                        "How many files of one delta page a crawl holds in flight at once "
+                        "(download → convert → anonymize → ingest); clamped to [1, 64]. This is "
+                        "the extraction worker's MEMORY lever: every file in flight is a converter "
+                        "child process holding that document, so the worker's peak memory scales "
+                        "with it — six in flight has exceeded a 12 GiB container on large decks "
+                        "and PDFs, two held it under 4 GiB. Lower it when the worker is killed by "
+                        "its memory limit; raise it only with container and tenant headroom. "
+                        "Multiplies with extraction.concurrency (crawls at once). A per-run "
+                        "override lives in the source card's Run-now options. Read by the worker "
+                        "at the start of each run — effective on the next run, no restart."
+                    ),
+                },
+            },
         },
         "facts": {
             "kind": "object",
@@ -1136,7 +1238,7 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "kind": "int",
                     "default": 3,
                     "hint": (
-                        "How many documents are extracted in parallel; clamped to [1, 16]. "
+                        "How many documents are extracted in parallel; clamped to [1, 64]. "
                         "1 is exactly sequential — the knob buys wall clock, never a different "
                         "result. Raise it to spend a large corpus's time budget on more "
                         "concurrent calls; lower it when the model account's rate limit is the "
@@ -1150,6 +1252,48 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Optional model override for this stage only — a tier name "
                         "(haiku/sonnet/opus) or a concrete model id. Empty falls back to "
                         "extraction.model, then Haiku."
+                    ),
+                },
+                "stream_every": {
+                    "kind": "int",
+                    "default": 0,
+                    "hint": (
+                        "Run a facts pass WHILE a crawl is still going: after every N "
+                        "successfully ingested files the crawler enqueues a standalone pass "
+                        "for the connection (and one more when it finishes). 0 = off, only "
+                        "the tail pass after the crawl. Needs extraction.concurrency ≥ 2 to "
+                        "actually overlap."
+                    ),
+                },
+                "run_timeout_s": {
+                    "kind": "int",
+                    "default": 3600,
+                    "hint": (
+                        "Time budget of ONE standalone facts pass, seconds. A pass that hits "
+                        "it stops between documents, keeps everything already shipped, and "
+                        "the next pass resumes — a small budget just means more passes."
+                    ),
+                },
+                "transport": {
+                    "kind": "string",
+                    "default": "sync",
+                    "hint": (
+                        "Instance default for which API carries the extraction calls: 'sync' "
+                        "(immediate, bound by the model account's per-minute token limit) or "
+                        "'batch' (Anthropic Batches API: no per-minute ceiling, half the price, "
+                        "hours of latency — the right choice for a bulk pass over a large "
+                        "corpus). A connection can override it on its source card."
+                    ),
+                },
+                "retry_mode": {
+                    "kind": "string",
+                    "default": "on_gate_fail",
+                    "hint": (
+                        "Instance default for the ONE corrective retry after the verbatim gate: "
+                        "'on_gate_fail' (retry only when a quote still fails after the free "
+                        "deterministic repair), 'off' (never retry — cheapest, lowest recall), "
+                        "'always' (retry whenever the first pass had any failure). A connection "
+                        "can override it on its source card."
                     ),
                 },
             },

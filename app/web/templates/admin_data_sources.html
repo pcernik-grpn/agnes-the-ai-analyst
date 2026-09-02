@@ -2415,6 +2415,46 @@ function _sharepointIdentityLine(config) {
   return bits.join(" · ");
 }
 
+/* Per-connection facts-extraction policy override (retry_mode / transport) —
+   `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Its own
+   render helper, its own save function (`saveSpFactsPolicy` below), so this
+   control never entangles with the run-options row or the "Extract facts
+   now" button it sits next to. The two selects read the CONNECTION-level
+   override straight off `row.config.extraction.facts` — the same rows
+   payload `loadConnections()` already fetched, no extra round trip — and an
+   empty selection ("Instance default") means "no override", exactly what
+   the PATCH body's `null` clears. The resolved value and its source
+   ("connection"/"instance") are shown only after Save, from the endpoint's
+   own response — there is no resolver on this side to guess it beforehand. */
+function _extRenderFactsPolicy(row) {
+  const facts = ((row.config || {}).extraction || {}).facts || {};
+  const retryMode = typeof facts.retry_mode === "string" ? facts.retry_mode : "";
+  const transport = typeof facts.transport === "string" ? facts.transport : "";
+  const opt = (current, value, label) =>
+    `<option value="${_esc(value)}"${current === value ? " selected" : ""}>${_esc(label)}</option>`;
+  const label = _esc(row.name || row.id || "");
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy and API transport (cost levers). Leave both on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
+    <span class="ds-src__fact-v">
+      <select id="ds-sp-factspolicy-retry-${row.id}" class="ds-dropdown-native" aria-label="Facts retry mode for ${label}">
+        ${opt(retryMode, "", "Instance default")}
+        ${opt(retryMode, "off", "Off")}
+        ${opt(retryMode, "on_gate_fail", "On gate fail")}
+        ${opt(retryMode, "always", "Always")}
+      </select>
+      <select id="ds-sp-factspolicy-transport-${row.id}" class="ds-dropdown-native" aria-label="Facts transport for ${label}">
+        ${opt(transport, "", "Instance default")}
+        ${opt(transport, "sync", "Sync")}
+        ${opt(transport, "batch", "Batch")}
+      </select>
+      <span class="field-hint" id="ds-sp-factspolicy-status-${row.id}"></span>
+    </span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="saveSpFactsPolicy('${row.id}')">Save</button></span>
+  </div>`;
+}
+
 /* File-source card body (spec §13.2 "Source card"): schedule (static text —
    the crawl runs externally), certificate (origin + set-date, NEVER the
    value), identity matching (fail-closed grant coverage), and error badges
@@ -2603,6 +2643,21 @@ function _sharepointFactsHtml(row) {
       `document${forceDocs === 1 ? "" : "s"} — not just what changed.`
     : "Re-downloads, re-converts, and (if fact extraction is on) re-runs the LLM pass over every document — not just what changed.";
 
+  // "Extract facts now" — the standalone `sharepoint-facts-extraction`
+  // pass: the fact graph over what this connection has ALREADY indexed,
+  // no crawl. Its own honest-UI gate (`facts_extraction_ready` /
+  // `facts_extraction_unready_switch`, the SAME two switches the job
+  // honours, behind the connector switch) — never a button whose click can
+  // only 409. Fail closed on an older/degraded cell shape, like the Run
+  // button above.
+  const factsReady = inAgnes.facts_extraction_ready === true;
+  const factsUnreadyText = factsReady ? "" : _factsExtractionUnreadyText(inAgnes.facts_extraction_unready_switch);
+  const factsParts = [];
+  if (!factsReady) {
+    factsParts.push(`<span class="ds-badge badge-unset">${_esc(factsUnreadyText)}</span>`);
+  }
+  factsParts.push(`<span style="color:var(--ds-text-muted)">Runs over documents indexed so far; safe to repeat.</span>`);
+
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Static label — the built-in crawl's live state is the extraction row below.">Schedule</span>
@@ -2625,9 +2680,20 @@ function _sharepointFactsHtml(row) {
       Re-process everything (ignore the delta cursor)
     </label>
     <span class="field-hint" style="flex-basis:100%;">${_esc(forceReprocessHelp)}</span>
+    <label class="field-hint" for="ds-sp-runopts-resync-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-resync-${row.id}">
+      Re-enumerate from scratch (drop the change cursor, keep already-ingested files)
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">Use after widening a crawl filter or when the change cursor ran past files it never ingested: every folder is listed again, but a file whose content is unchanged is not re-downloaded.</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The standalone facts pass (sharepoint-facts-extraction): builds the fact graph over documents this connection has already indexed, without a crawl — its own time budget (extraction.facts.run_timeout_s), and it runs alongside a crawl.">Fact graph</span>
+    <span class="ds-src__fact-v">${factsParts.join(" · ")}</span>
+    <span class="ds-src__fact-a"><button type="button" id="ext-facts-btn-${row.id}" class="btn btn-secondary" data-facts-ready="${factsReady ? "1" : "0"}" ${factsReady ? "" : "disabled"} title="${_esc(factsUnreadyText)}" onclick="runSpFactsExtraction('${row.id}')">Extract facts now</button></span>
+  </div>
+  ${_extRenderFactsPolicy(row)}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
@@ -2744,6 +2810,24 @@ const EXTRACTION_UNREADY_REASON_TEXT = {
 };
 function _extractionUnreadyReasonText(reason) {
   return EXTRACTION_UNREADY_REASON_TEXT[reason] || "Extraction is not ready on this instance.";
+}
+
+/* "Extract facts now" honest-UI gate — `facts_extraction_unready_switch`
+   names the first config key the standalone facts pass needs and does not
+   have (`app/web/router.py`'s pipeline cell, reading the SAME
+   `_facts_extraction_readiness` verdict the trigger's own 409 carries as
+   `switch`). Rendered as the button's disabled reason, so a click can never
+   409 on a switch the page already knew about. */
+const FACTS_EXTRACTION_UNREADY_TEXT = {
+  "sharepoint.enabled":
+    "The SharePoint connector is disabled on this instance — set sharepoint.enabled: true in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
+  "extraction.facts.enabled":
+    "Fact extraction is off — turn on extraction.facts.enabled in /admin/server-config (the cost switch: this pass spends model tokens per document).",
+  "facts.enabled":
+    "The fact graph is off — turn on facts.enabled in /admin/server-config first.",
+};
+function _factsExtractionUnreadyText(switchKey) {
+  return FACTS_EXTRACTION_UNREADY_TEXT[switchKey] || "Fact extraction is not ready on this instance.";
 }
 
 /* Duplicate (doc_id, reason) pairs collapse into one row with a "2×" count
@@ -3265,10 +3349,13 @@ async function runSpExtraction(id) {
   }
   const forceEl = document.getElementById(`ds-sp-runopts-force-${id}`);
   const forceReprocess = !!(forceEl && forceEl.checked);
+  const resyncEl = document.getElementById(`ds-sp-runopts-resync-${id}`);
+  const resync = !!(resyncEl && resyncEl.checked);
   const overrides = {};
   if (conc !== null) overrides.concurrency = conc;
   if (timeout !== null) overrides.timeout_s = timeout;
   if (forceReprocess) overrides.force_reprocess = true;
+  if (resync) overrides.resync = true;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
@@ -3304,6 +3391,106 @@ async function runSpExtraction(id) {
   } catch (e) {
     resultEl.className = "ds-conn-test-result show fail";
     resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* "Extract facts now" — `POST .../connections/{id}/facts-extract` enqueues
+   the `sharepoint-facts-extraction` job (app/api/admin_sharepoint.py): the
+   fact graph over whatever this connection has ALREADY indexed, no crawl.
+   Its plan is incremental (indexed documents without up-to-date facts), so
+   repeating it is safe, and it never dedups against a crawl — the two run
+   side by side. Fire-and-forget from the card's point of view, same as
+   runSpExtraction: the visible result here is "queued" or a typed refusal
+   (a switch off, a pass already running), never the pass's own outcome —
+   that arrives through the status poll's `facts_job` line. */
+async function runSpFactsExtraction(id) {
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  setSourceOpen(id, true);
+  resultEl.className = "ds-conn-test-result show";
+  resultEl.textContent = "Queuing facts pass…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/facts-extract`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const body = await r.json().catch(() => ({}));
+    const detail = body && typeof body.detail === "object" ? body.detail : null;
+    if (r.ok) {
+      resultEl.className = "ds-conn-test-result show ok";
+      resultEl.textContent = `✓ Facts pass queued (job ${body.job_id}) — runs over documents indexed so far.`;
+      showToast("Facts pass queued.", true);
+    } else if (r.status === 409 && detail && detail.error === "facts_extraction_already_running") {
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = `✗ A facts pass is already running for this connection (job ${detail.job_id}).`;
+      showToast("A facts pass is already running.", false);
+    } else {
+      const msg = detailMessage(body, "failed to queue the facts pass");
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + msg;
+      showToast(msg, false);
+    }
+    // The status poll owns the live "facts pass queued/running" line and
+    // the button's in-flight lock — ask it now rather than waiting for its
+    // next tick.
+    if (typeof _extTick === "function") _extTick();
+  } catch (e) {
+    resultEl.className = "ds-conn-test-result show fail";
+    resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
+   `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Both
+   selects are always sent — the empty "Instance default" option maps to
+   `null`, which the endpoint reads as "clear the override", the same
+   least-surprise reading the endpoint's own docstring describes. The
+   response carries the RESOLVED value and its source ("connection" once an
+   override is set, "instance" once cleared) — shown here rather than
+   guessed, since this page has no copy of the instance-level default to
+   resolve against itself. */
+async function saveSpFactsPolicy(id) {
+  const retrySel = document.getElementById(`ds-sp-factspolicy-retry-${id}`);
+  const transportSel = document.getElementById(`ds-sp-factspolicy-transport-${id}`);
+  const statusEl = document.getElementById(`ds-sp-factspolicy-status-${id}`);
+  if (!retrySel || !transportSel) return;
+  const body = {
+    retry_mode: retrySel.value || null,
+    transport: transportSel.value || null,
+  };
+  if (statusEl) statusEl.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/facts-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const rm = respBody.retry_mode || {};
+      const tr = respBody.transport || {};
+      if (statusEl) statusEl.textContent = `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source})`;
+      showToast("Facts policy saved.", true);
+      // Keep the in-memory row current — a later `renderConnList()` (e.g.
+      // after `loadConnections()`) must redraw the just-saved override, not
+      // the value the page loaded with.
+      const conn = _connections.find((c) => c.id === id);
+      if (conn) {
+        conn.config = conn.config || {};
+        conn.config.extraction = conn.config.extraction || {};
+        const facts = { ...(conn.config.extraction.facts || {}) };
+        if (body.retry_mode === null) delete facts.retry_mode; else facts.retry_mode = body.retry_mode;
+        if (body.transport === null) delete facts.transport; else facts.transport = body.transport;
+        conn.config.extraction.facts = facts;
+      }
+    } else {
+      if (statusEl) statusEl.textContent = "";
+      showToast(detailMessage(respBody, "failed to save the facts policy"), false);
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast("Request failed", false);
   }
 }
 
@@ -6091,6 +6278,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); openSpWizardForConnection('${id}')">Manage scopes…</button>
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
@@ -7779,6 +7967,19 @@ function _extRenderInAgnesButton(connId, status) {
     : "";
 }
 
+/* The standalone facts pass is a JOB (`sharepoint-facts-extraction`), not
+   a crawl run — it opens no `extraction_runs` row — so the status endpoint
+   carries it as `facts_job` off the job queue. One line in the Run row
+   while it is queued or running; nothing at all otherwise (`null` means
+   "no pass in flight", never a stale or guessed one). */
+function _extFactsJobLine(job) {
+  if (!job) return "";
+  const running = job.status === "running";
+  const since = running && job.started_at ? job.started_at : job.created_at;
+  const sinceText = since ? ` · since ${_extEsc(_extTime(since))}` : "";
+  return `<div class="ext-sub">${_extDot(running ? "running" : "idle")}facts pass <strong>${running ? "running" : "queued"}</strong> · job ${_extEsc(job.id)}${sinceText}</div>`;
+}
+
 function _extRunLine(run) {
   const bits = [];
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
@@ -7975,6 +8176,8 @@ function _extRunRowHtml(connId, st) {
     sub = `<div class="ext-sub">No extraction run has been recorded for this connection yet.</div>`;
   }
 
+  sub += _extFactsJobLine(status.facts_job);
+
   if (st.error) {
     sub += `<div class="ext-sub ext-danger"><span class="ext-stale">stale</span> couldn't refresh — last read ${_extEsc(_extTime(st.lastOk))}</div>`;
   }
@@ -8045,6 +8248,25 @@ function _extPanelHtml(tone, title, body, connId, retry) {
   </div>`;
 }
 
+/* "Extract facts now" mirrors `_extRenderInAgnesButton` above: never keep
+   offering the verb while a facts pass is already queued/running for this
+   connection (the server can only answer with `409
+   facts_extraction_already_running`), and never re-enable a button the
+   server gated off — `data-facts-ready` remembers the switch verdict, and
+   its server-rendered `title` (the reason) is left alone in that case. */
+function _extRenderFactsButton(connId, status) {
+  const btn = document.getElementById(`ext-facts-btn-${connId}`);
+  if (!btn) return;
+  const ready = btn.dataset.factsReady === "1";
+  const inFlight = !!(status && status.facts_job);
+  btn.disabled = !ready || inFlight;
+  if (inFlight) {
+    btn.title = "A facts pass is already queued or running for this connection — see the Run row above.";
+  } else if (ready) {
+    btn.title = "";
+  }
+}
+
 function _extRender(connId) {
   const block = document.getElementById(`ext-block-${connId}`);
   if (!block) return;
@@ -8061,6 +8283,7 @@ function _extRender(connId) {
     );
     _extRenderCrawlCell(connId, null);
     _extRenderInAgnesButton(connId, null);
+    _extRenderFactsButton(connId, null);
     return;
   }
 
@@ -8082,6 +8305,7 @@ function _extRender(connId) {
   block.innerHTML = _extRunRowHtml(connId, st);
   _extRenderCrawlCell(connId, st.data);
   _extRenderInAgnesButton(connId, st.data);
+  _extRenderFactsButton(connId, st.data);
 }
 
 async function _extFetchOne(connId) {
@@ -8571,6 +8795,118 @@ if (typeof _extConfigHtml === "function") {
   const _anonPrevBaseConfigHtml = _extConfigHtml;
   _extConfigHtml = function (body) {
     return _anonPrevBaseConfigHtml(body) + _anonPrevPanel();
+  };
+}
+</script>
+
+{#- ── Crawl filter (backfill lever) ──────────────────────────────────────
+     Same additive-wrap contract as the redaction preview block above:
+     `_extConfigHtml` is a global function this block re-wraps, so this is
+     purely additive and does not touch the drawer's own renderer. It
+     reads `body.connection_id` — already on every `…/extraction/config`
+     response — rather than needing a new parameter threaded through
+     `toggleExtractionDrawer`.
+
+     Sets `extraction.crawl.min_modified` via `PATCH …/extraction/
+     crawl-config`, the same `/api/**` JSON endpoint the Stop button above
+     calls: cookie-session authed, protected by the app-wide
+     `CsrfOriginMiddleware` origin check (not the separate `web_csrf`
+     double-submit token, which covers only the HTML <form> handlers) —
+     `credentials: "include"`, no token field, exactly like `extStopRun`. -#}
+<style>
+  .crawlfilter { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ds-border-light); }
+  .crawlfilter__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .crawlfilter__title { font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); }
+  .crawlfilter__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .crawlfilter__input {
+    font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .crawlfilter__input:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+</style>
+<script>
+/* Every field here is either server-trusted (the connection id, the
+   resolved date this same endpoint just wrote) or set via `textContent`
+   (never `innerHTML`) — `_extEsc` is still applied defensively, same
+   discipline the drawer's own rows already follow. */
+function _crawlFilterPanel(body) {
+  const connId = body.connection_id;
+  const mm = body.min_modified || {};
+  const value = mm.value || "";
+  const statusText = value
+    ? `Currently: files modified on/after ${value} (${mm.source}).`
+    : "Currently: no filter — every file is crawled.";
+  return `
+    <div class="crawlfilter">
+      <div class="crawlfilter__head">
+        <span class="crawlfilter__title">Crawl filter</span>
+        <span class="ext-sub">Crawl only files modified on or after a date, instead of the whole corpus — useful for a backfill.</span>
+      </div>
+      <div class="crawlfilter__row">
+        <input type="date" class="crawlfilter__input" id="crawlfilter-${_extEsc(connId)}-date"
+          value="${_extEsc(value)}" aria-label="Crawl only files modified on/after this date">
+        <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${connId}')">Save</button>
+        <button type="button" class="btn btn-secondary" onclick="crawlFilterClear('${connId}')">Clear</button>
+      </div>
+      <div class="ext-sub" id="crawlfilter-${_extEsc(connId)}-status">${_extEsc(statusText)}</div>
+    </div>`;
+}
+
+async function _crawlFilterPatch(connId, minModified) {
+  const status = document.getElementById(`crawlfilter-${connId}-status`);
+  if (status) status.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/crawl-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_modified: minModified }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't save the crawl filter") : "couldn't save the crawl filter";
+      if (status) status.textContent = "Save failed — see the notification above.";
+      if (typeof showToast === "function") showToast(`Crawl filter: ${msg}`, false);
+      return;
+    }
+    const mm = body.min_modified || {};
+    if (status) {
+      status.textContent = mm.value
+        ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
+        : "Currently: no filter — every file is crawled.";
+    }
+    if (typeof showToast === "function") {
+      showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+    }
+  } catch (e) {
+    if (status) status.textContent = "Request failed.";
+    if (typeof showToast === "function") showToast("Request failed.", false);
+  }
+}
+
+function crawlFilterSave(connId) {
+  const input = document.getElementById(`crawlfilter-${connId}-date`);
+  const value = (input && input.value || "").trim();
+  if (!value) {
+    if (typeof showToast === "function") showToast("Pick a date first, or use Clear to remove the filter.", false);
+    return;
+  }
+  _crawlFilterPatch(connId, value);
+}
+
+function crawlFilterClear(connId) {
+  const input = document.getElementById(`crawlfilter-${connId}-date`);
+  if (input) input.value = "";
+  _crawlFilterPatch(connId, null);
+}
+
+/* Append the panel to the config drawer without touching its renderer —
+   the SAME wrap contract the redaction-preview block above uses, applied
+   again on top of it, so both additions compose. */
+if (typeof _extConfigHtml === "function") {
+  const _crawlFilterBaseConfigHtml = _extConfigHtml;
+  _extConfigHtml = function (body) {
+    return _crawlFilterBaseConfigHtml(body) + _crawlFilterPanel(body);
   };
 }
 </script>

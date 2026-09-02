@@ -24,7 +24,13 @@ into collections → (optional) facts extraction into the knowledge graph
   converter backends (`extraction` extra). Bare-metal pip installs need
   `pip install 'agnes[extraction]'`; a missing extra is refused up front
   with `409 extraction_dependencies_missing`, never a crawl that fails on
-  every file.
+  every file. Legacy Office/OpenDocument files (`.doc`/`.rtf`/`.odt`,
+  `.ppt`/`.odp`, `.xls`/`.ods`) are pre-converted through headless
+  LibreOffice before the markitdown route — the standard image bundles
+  `libreoffice-core`/`-writer`/`-calc`/`-impress`; a bare-metal install
+  additionally needs the `soffice` binary on `PATH`, or those specific
+  suffixes fail conversion (`MissingConversionDependency`) while every other
+  format keeps working.
 - **An Entra app registration** for the tenant: certificate (default) or
   client secret, with admin consent granted. This is the one step Agnes
   cannot do for you.
@@ -99,6 +105,12 @@ spot-check shows pseudonyms, not names.
      all-or-nothing.
   3. Repeat 1-2 per clone, splitting the site's top-level folders across
      however many connections the crawl needs to parallelize over.
+- `extraction.crawl.min_modified` — a per-connection age filter for a
+  backfill run: crawl only files modified on/after a cutoff date instead of
+  re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
+  (`agnes admin sharepoint crawl-config <connection_id> --min-modified
+  YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
+  timestamp is always kept.
 - **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
   /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
   (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
@@ -118,13 +130,12 @@ spot-check shows pseudonyms, not names.
   scopes in one call — the same `clone` + `scopes/bulk` primitives above,
   run automatically — named `"<source name> — part i/n"`; `409 split_exists`
   if a split under those names already exists, so a repeat call never
-  double-creates. `--min-modified` lands on each clone's
-  `config.extraction.crawl.min_modified` (bookkeeping today — no admin-facing
-  crawl date filter reads that key yet); `--transport`/`--retry-mode` land on
-  each clone's `config.extraction.facts`, the same keys `facts-config`
-  writes. `--start` enqueues each clone's crawl immediately after creating
-  it, in creation order, skipped silently (never a failed apply) when
-  extraction readiness is not currently satisfied.
+  double-creates. `--min-modified` lands on each clone's own
+  `config.extraction.crawl.min_modified` above; `--transport`/`--retry-mode`
+  land on each clone's `config.extraction.facts`, the same keys
+  `facts-config` writes. `--start` enqueues each clone's crawl immediately
+  after creating it, in creation order, skipped silently (never a failed
+  apply) when extraction readiness is not currently satisfied.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
@@ -151,10 +162,15 @@ indexed — after turning `extraction.facts.enabled` on for the first time
 over an existing connection, or after a prompt/ontology change — trigger it
 on its own, with its own wall-clock budget
 (`extraction.facts.run_timeout_s`, independent of the crawl's own
-`extraction.timeout_s`): `POST /api/admin/sharepoint/connections/{id}
-/facts-extract` or `agnes admin sharepoint facts-extract <connection_id>`
-(`--doc-id` narrows it to one document, e.g. to test a prompt change
-cheaply; `--timeout-s` overrides the budget for that one run).
+`extraction.timeout_s`): source card → **Extract facts now** (next to
+**Run extraction now**; disabled, with the reason, while either switch is
+off), `POST /api/admin/sharepoint/connections/{id}/facts-extract`, or
+`agnes admin sharepoint facts-extract <connection_id>` (`--doc-id` narrows
+it to one document, e.g. to test a prompt change cheaply; `--timeout-s`
+overrides the budget for that one run). The pass is incremental — indexed
+documents without up-to-date facts — so it is safe to repeat, and it runs
+alongside a crawl; while one is queued or running the card's Run row says
+so and the button is locked.
 
 ## Watching several connections at once
 

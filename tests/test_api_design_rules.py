@@ -131,6 +131,15 @@ _VERB_PATH_ALLOWLIST = frozenset(
         "/api/admin/mcp-sources/{source_id}/oauth/register",
         "/api/admin/metadata/{table_id}/push",
         "/api/admin/metrics/import",
+        # `clone` is the action of creating a sibling connection from this one (same
+        # credential material, zero scopes) — an action on a sub-resource, the same
+        # shape as the allowlisted marketplace /sync; there is no noun that names it.
+        "/api/admin/sharepoint/connections/{connection_id}/clone",
+        # `bulk` = one-shot scope creation from a list of folder paths — the same
+        # action-on-a-sub-resource shape as /clone above; the noun form (`POST …/scopes`
+        # with a list body) is the interactive wizard's single-scope confirm and has a
+        # different contract.
+        "/api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
         # Ontology builder draft state machine (spec §13.2): the draft is
         # filled by two RPC actions with no idiomatic REST noun — `import`
         # translates a pasted/uploaded ontology into the unsaved draft (mirrors

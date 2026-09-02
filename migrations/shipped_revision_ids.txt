@@ -141,3 +141,5 @@
 0094_usage_turns
 0094_extraction_runs
 0095_memory_detection_runs
+0096_sharepoint_connection_state
+0097_facts_llm_cache

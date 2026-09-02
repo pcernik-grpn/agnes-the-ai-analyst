@@ -153,6 +153,10 @@ POSTURE: dict[str, str] = {
     "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": (
         "extraction.facts_retry_mode_set"
     ),
+    # Per-connection age filter for a crawl backfill — same shape/reasoning
+    # as the facts-config entry directly above: the handler writes its OWN
+    # row carrying the requested value, the resolved cutoff and its source.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": ("extraction.min_modified_set"),
     # A POST that mutates NOTHING — it runs the anonymizer over a pasted
     # sample and returns the result. Cataloged rather than `exempt:` all the
     # same, on the `access_policy.preview` precedent: an admin pastes real

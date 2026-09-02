@@ -11,9 +11,12 @@ have POSTed to.
 What one pass does, per connection:
 
 1. Walk the documents ingested for the connection's confirmed scopes'
-   collections. Skip TABULAR sources (spreadsheets, CSV) — deterministic
-   converters own structured data, and an LLM reading a pivot table is the
-   most expensive way to get a worse answer.
+   collections — including spreadsheets and CSV/TSV files. There is no
+   tabular skip: by the time a document reaches this stage the crawl+
+   convert pipeline has already turned it into markdown (tables rendered
+   as markdown tables) and indexed it as chunks exactly like any prose
+   document, so a spreadsheet's rows and cells are read, and can carry
+   facts, the same way a sentence does.
 2. Skip any document whose facts are already up to date: the per-document
    state file records the document's content hash, the model, and a
    fingerprint of the effective system prompt (prompt + ontology). Change
@@ -95,12 +98,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: Original-source extensions whose content belongs to a deterministic
-#: converter, not to a reader. Matched on the document's stored ``path``,
-#: which keeps the SOURCE file's extension (the crawler stores the markdown
-#: under ``<stem>.md`` but the path is the drive-relative original).
-_TABULAR_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".xls", ".csv", ".tsv"})
-
 #: Characters of document text sent in one call. Above this the tail is
 #: truncated and the document is COUNTED as truncated in the report — never
 #: silently shortened, because a claim's absence would otherwise look like
@@ -126,7 +123,7 @@ DEFAULT_BATCH_CLAIMS = 1_000
 #: and retry backoff instead of throughput.
 DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 16
+MAX_CONCURRENCY = 64
 
 #: ``extraction.facts.transport``. The synchronous Messages API is bound by
 #: the model account's tokens-per-minute limit — measured on a live
@@ -267,7 +264,7 @@ def resolve_concurrency() -> Tuple[int, str]:
     """``(workers, source)`` for ``extraction.facts.concurrency``.
 
     ``source`` is ``config``, ``clamped`` (a configured value outside
-    ``[1, 16]``, corrected rather than obeyed), ``invalid`` (unparseable —
+    ``[1, 64]``, corrected rather than obeyed), ``invalid`` (unparseable —
     the default, loudly named rather than silently assumed), or ``default``.
     Both halves travel into the run report: an operator comparing two runs'
     wall clock must be able to see what parallelism each actually used, and
@@ -1309,15 +1306,6 @@ def _retry_message(base_user_message: str, failures: Sequence[Tuple[dict, str]])
 # --------------------------------------------------------------------------
 
 
-def _is_tabular(path: Optional[str], filename: Optional[str]) -> bool:
-    for candidate in (path, filename):
-        if not candidate:
-            continue
-        if Path(str(candidate)).suffix.lower() in _TABULAR_EXTENSIONS:
-            return True
-    return False
-
-
 def collection_ids_for(connection: Dict[str, Any]) -> List[str]:
     """The collections this connection's confirmed scopes route into.
 
@@ -1393,6 +1381,13 @@ class _Report:
         self.docs_seen = 0
         self.docs_extracted = 0
         self.docs_unchanged = 0
+        #: Always 0. Spreadsheets and CSV/TSV files are no longer skipped —
+        #: they go through the same walk as any other document (see the
+        #: module docstring). Kept, rather than removed, purely for the
+        #: run report's backward compatibility (fleet view, `agnes admin
+        #: sharepoint runs`); a pre-existing `"skipped-tabular"` state
+        #: entry from before this change is treated as stale and
+        #: re-extracted, never counted here again.
         self.docs_skipped_tabular = 0
         self.docs_skipped_no_text = 0
         self.docs_skipped_not_indexed = 0
@@ -1813,11 +1808,11 @@ def _plan_documents(
     eligibility can never drift between them. Module-level rather than a
     per-call nested closure for exactly that reason.
 
-    Every cheap decision — not a source document, tabular, not indexed,
-    unchanged, no text, still mid-flight in an unfinished batch — is made
-    HERE, on the caller's thread, before anything is submitted: those
-    documents cost nothing and must not occupy a worker slot (or a batch
-    request) to find that out.
+    Every cheap decision — not a source document, not indexed, unchanged,
+    no text, still mid-flight in an unfinished batch — is made HERE, on the
+    caller's thread, before anything is submitted: those documents cost
+    nothing and must not occupy a worker slot (or a batch request) to find
+    that out.
     """
     for collection_id in collection_ids_for(connection):
         for file_row in files_repo.list_for_corpus(collection_id):
@@ -1853,10 +1848,6 @@ def _plan_documents(
             # already-redacted identity, same as the chunk text.
             path = file_row.get("path")
             filename = file_row.get("filename")
-            if _is_tabular(path, filename):
-                report.docs_skipped_tabular += 1
-                docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
-                continue
             if file_row.get("processing_status") != "indexed":
                 # The gate defers a claim on a non-indexed document, so
                 # extracting it now would spend a call on claims the
@@ -2442,7 +2433,7 @@ def run_facts_extraction(
     -> str`` method and a ``usage`` dict.
 
     Documents are extracted through a bounded pool
-    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 16]``).
+    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 64]``).
     Only the model half runs in a worker (:func:`extract_one`); the walk,
     every database read, the ingest and the state file stay on this
     thread, and results are consumed in SUBMISSION order — so a run at
@@ -2744,12 +2735,10 @@ def run_facts_extraction(
         usage=usage,
     )
     logger.info(
-        "facts extraction: connection %s — %d extracted, %d unchanged, %d tabular, %d failed, "
-        "%d quotes dropped, %d claims written",
+        "facts extraction: connection %s — %d extracted, %d unchanged, %d failed, %d quotes dropped, %d claims written",
         connection_id,
         rendered["docs_extracted"],
         rendered["docs_unchanged"],
-        rendered["docs_skipped_tabular"],
         rendered["facts_failed"],
         rendered["facts_quotes_dropped"],
         rendered["claims_written"],

@@ -74,6 +74,7 @@ MigrationTask = GenericCopyTask
 # map for tables whose PK is NOT a single column named "id".
 _PK_COLUMNS: Dict[str, List[str]] = {
     "chat_broker_tickets": ["token"],
+    "facts_llm_cache": ["cache_key"],  # 0097: content-hash LLM response cache (PG-only, but keep the map honest)
     "user_group_members": ["user_id", "group_id"],
     "sync_state": ["table_id"],
     "instance_templates": ["key"],
