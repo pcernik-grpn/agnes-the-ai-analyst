@@ -318,6 +318,53 @@ def test_helper_matches_mapping_table_name_case_insensitively(e2e_env):
     assert exc_info.value.mapping_table == "cost_centres"
 
 
+def test_helper_cte_exclusion_is_scope_aware(e2e_env):
+    """The CTE exclusion must not hide a PHYSICAL read of a same-named
+    mapping table (PR #2023 review, second round on this guard): a
+    qualified reference, a reference inside the CTE's own non-recursive
+    body, and a reference in an EARLIER CTE all resolve to the table, not
+    the alias -- so an empty mapping table is still refused there -- while
+    a reference after the declaration (final query or a later CTE) resolves
+    to the alias and is not."""
+    from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(id="cost_centres", name="cost_centres", source_type="keboola", query_mode="local")
+        registry.set_policy_mapping("cost_centres", True)
+    finally:
+        conn.close()
+
+    physical_shapes = [
+        # qualified inside the same-named CTE body
+        "WITH cost_centres AS (SELECT * FROM main.cost_centres) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM cost_centres)",
+        # unqualified inside its own (non-recursive) body
+        "WITH cost_centres AS (SELECT * FROM cost_centres WHERE email = $user_email) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM cost_centres)",
+        # read in an EARLIER CTE, before the alias is declared
+        "WITH a AS (SELECT unit FROM cost_centres WHERE email = $user_email), cost_centres AS (SELECT 1 AS unit) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM a)",
+    ]
+    for sql in physical_shapes:
+        with pytest.raises(PolicyMappingEmpty, match="cost_centres"):
+            raise_if_policy_mapping_empty(sql)
+
+    alias_shapes = [
+        # final query reads the alias
+        "WITH cost_centres AS (SELECT $user_email AS email, 'A' AS unit) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM cost_centres)",
+        # a LATER CTE reads the alias
+        "WITH cost_centres AS (SELECT $user_email AS email, 'A' AS unit), b AS (SELECT unit FROM cost_centres) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM b)",
+    ]
+    for sql in alias_shapes:
+        raise_if_policy_mapping_empty(sql)
+
+
 def test_helper_ignores_cte_aliases_that_shadow_a_mapping_table_name(e2e_env):
     """A CTE alias is not a physical dependency (PR #2023 review follow-up):
     a body whose CTE happens to be named like an empty ``policy_mapping``

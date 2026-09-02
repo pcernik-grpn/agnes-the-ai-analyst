@@ -1185,6 +1185,47 @@ def _protected_table_self_names(*, table_name: str | None, table_id: str | None)
     return names
 
 
+def _table_resolves_to_cte(table: exp.Table) -> bool:
+    """Whether this ``Table`` node names a CTE that is VISIBLE at its
+    position, mirroring how DuckDB resolves the identifier.
+
+    A qualified reference (``main.cost_centres``) is always physical. An
+    unqualified one resolves to a CTE only if some enclosing query's
+    ``WITH`` declares that alias AND the alias is in scope there: for a
+    non-recursive ``WITH``, a CTE is visible to the CTEs declared after it
+    and to the query body, never to its own body nor to earlier CTEs; a
+    ``WITH RECURSIVE`` additionally sees itself. Enclosing queries are
+    walked innermost-first, so a nested query's alias shadows an outer one.
+    (sqlglot attaches ``With`` as the query node's ``with`` arg, not as an
+    ancestor of the FROM tables -- hence the walk over ancestors' args.)
+    """
+    if table.args.get("db") or table.args.get("catalog"):
+        return False
+    name = table.name.lower()
+    chain: list[exp.Expression] = []
+    anc: exp.Expression | None = table.parent
+    while anc is not None:
+        chain.append(anc)
+        anc = anc.parent
+    chain_ids = {id(a) for a in chain}
+    for query in chain:
+        # sqlglot 30 stores the clause under `with_`; older releases used `with`.
+        with_ = query.args.get("with_") or query.args.get("with")
+        if not isinstance(with_, exp.With):
+            continue
+        ctes = [c for c in with_.expressions if isinstance(c, exp.CTE)]
+        containing_idx = next((i for i, c in enumerate(ctes) if id(c) in chain_ids), None)
+        if containing_idx is None:
+            visible = ctes
+        else:
+            visible = ctes[:containing_idx]
+            if with_.args.get("recursive"):
+                visible = visible + [ctes[containing_idx]]
+        if any((c.alias_or_name or "").lower() == name for c in visible):
+            return True
+    return False
+
+
 def raise_if_policy_mapping_empty(
     policy_sql: str,
     *,
@@ -1241,11 +1282,16 @@ def raise_if_policy_mapping_empty(
     # (PR #2023 review, finding 1).
     # A CTE alias is not a physical dependency: `WITH cost_centres AS (...)
     # SELECT ... FROM cost_centres` reads the CTE, never the registry row
-    # that happens to share its name, so counting it would refuse a valid
-    # policy body over an empty (or unrelated) mapping table of that name
-    # (PR #2023 review follow-up).
-    cte_names = {c.alias_or_name.lower() for c in statement.find_all(exp.CTE) if c.alias_or_name}
-    referenced_names = {t.name.lower() for t in statement.find_all(exp.Table) if t.name} - cte_names
+    # that happens to share its name. But the exclusion must be SCOPED, not
+    # a global name subtraction: `WITH cost_centres AS (SELECT * FROM
+    # main.cost_centres) ...` and `WITH a AS (SELECT * FROM cost_centres),
+    # cost_centres AS (...) ...` both still read the physical table -- a
+    # qualified reference, a reference inside the CTE's own (non-recursive)
+    # body, or one made before the alias is declared never resolves to the
+    # CTE (PR #2023 review follow-up, two rounds).
+    referenced_names = {
+        t.name.lower() for t in statement.find_all(exp.Table) if t.name and not _table_resolves_to_cte(t)
+    }
     referenced_names -= _protected_table_self_names(table_name=table_name, table_id=table_id)
     if not referenced_names:
         return
