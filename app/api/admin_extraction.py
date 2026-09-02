@@ -721,6 +721,81 @@ async def request_extraction_stop(
     }
 
 
+class FactsConfigPatch(BaseModel):
+    #: `None` means BOTH "not provided" and "clear the override" — a PATCH
+    #: body that omits the field entirely and one that sends `null` do the
+    #: same thing (fall back to the instance-level default), which is the
+    #: least surprising reading of "unset this".
+    retry_mode: Optional[str] = None
+
+
+@router.patch("/connections/{connection_id}/extraction/facts-config")
+async def patch_extraction_facts_config(
+    connection_id: str,
+    body: FactsConfigPatch,
+    _user: dict = Depends(require_admin),
+):
+    """Per-connection override for the facts-extraction retry policy
+    (cost-levers task, lever A) — a single high-value connection (curated,
+    high-stakes folders) can keep the corrective retry ON, since a dropped
+    quote there is a lost citation on stage, while a long-tail connection
+    runs with it OFF, without an instance.yaml edit that would flip every
+    connection at once.
+
+    Writes ``config.extraction.facts.retry_mode`` on the connection row —
+    a sibling of ``config.extraction.stop_requested_at`` (the Stop
+    control's own field, above): the established home for per-connection
+    extraction state, carried forward on every generic connection edit.
+    ``retry_mode: null`` (or the field simply omitted) CLEARS the override
+    and falls back to the instance-level ``extraction.facts.retry_mode``
+    (see :func:`connectors.sharepoint.facts_extraction.resolve_retry_mode`).
+    A value outside ``{"off", "on_gate_fail", "always"}`` is refused with a
+    plain ``422`` rather than silently ignored — a caller setting a value
+    expects it to take effect.
+
+    Works on BOTH app-state backends, like the Stop control above: this
+    touches only ``source_connections``, never a PG-only table.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    from connectors.sharepoint.facts_extraction import _VALID_RETRY_MODES, resolve_retry_mode
+
+    if body.retry_mode is not None and body.retry_mode not in _VALID_RETRY_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"retry_mode must be one of {sorted(_VALID_RETRY_MODES)} or null (to clear the override)",
+        )
+
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    extraction = dict((connection.get("config") or {}).get("extraction") or {})
+    facts_cfg = dict(extraction.get("facts") or {})
+    if body.retry_mode is None:
+        facts_cfg.pop("retry_mode", None)
+    else:
+        facts_cfg["retry_mode"] = body.retry_mode
+    if facts_cfg:
+        extraction["facts"] = facts_cfg
+    else:
+        extraction.pop("facts", None)
+    updated = repo.config_patch(connection_id, {"extraction": extraction})
+
+    mode, source = resolve_retry_mode(updated)
+
+    # More than the fallback middleware can say (it sees only path params
+    # and the response status, never the body) — the VALUE an admin set or
+    # cleared, and what it resolved to, is exactly the audit trail's job
+    # here. Not secret, not document content: a five-word enum choice.
+    log_safe(
+        user_id=_user.get("id"),
+        action="extraction.facts_retry_mode_set",
+        resource=f"sharepoint_connection:{connection_id}",
+        params={"retry_mode": body.retry_mode, "resolved": mode, "source": source},
+    )
+
+    return {"connection_id": connection_id, "retry_mode": {"value": mode, "source": source}}
+
+
 @router.get("/connections/{connection_id}/extraction/runs")
 async def extraction_runs(
     connection_id: str,

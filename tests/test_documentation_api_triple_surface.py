@@ -1356,6 +1356,18 @@ _EXEMPT: dict[str, str] = {
         "admin 'stop this run' control for the source card's Run row — admin display "
         "primitive, no analyst CLI/MCP analogue"
     ),
+    # Per-connection override for extraction.facts.retry_mode (cost-levers
+    # task, lever A) — same class as the facts-extract trigger above:
+    # CLI-reachable (`agnes admin sharepoint facts-config`) for an operator
+    # scripting a per-connection cost/recall tradeoff, but deliberately not
+    # MCP-exposed — a connection's retry policy is a deploy-time cost
+    # decision, not a query surface any analyst tool needs.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": (
+        "per-connection extraction.facts.retry_mode override — CLI-reachable "
+        "(agnes admin sharepoint facts-config) but deliberately not MCP-exposed: a "
+        "connection's retry/cost policy is an operator decision, not something an "
+        "agent should be able to flip on a whim"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
         "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
         "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "

@@ -270,6 +270,215 @@ def _model() -> str:
     return resolve_model_tier(raw)
 
 
+#: ``extraction.facts.retry_mode`` values (cost-levers task, retry lever).
+#: ``on_gate_fail`` is the DEFAULT and reproduces today's unmodified
+#: trigger: :func:`extract_one`'s ONE corrective retry fires exactly when
+#: the verbatim gate (:func:`verbatim_failures`) still rejects part of a
+#: document's output AFTER the zero-token deterministic repair pass
+#: (cost-levers spec 2026-09-02 §2.2, already shipped) has had its chance
+#: to fix it for free — this is the sole trigger the retry has ever had, so
+#: the default changes nothing observable. ``off`` disables the retry
+#: outright: whatever still fails the gate after repair is dropped and
+#: counted immediately, the cheapest and lowest-recall setting. ``always``
+#: retries whenever the FIRST-PASS output had ANY verbatim failure, even
+#: one the deterministic repair already fixed for free — the model is asked
+#: to re-confirm its own original mistake instead of trusting the
+#: byte-level snap. That is the most expensive setting, and (rarely) risks
+#: losing an already-good, already-repaired fact if the retry's reply does
+#: not reproduce it — a documented trade an operator opts into, not a
+#: silent regression.
+DEFAULT_RETRY_MODE = "on_gate_fail"
+_VALID_RETRY_MODES = ("always", "on_gate_fail", "off")
+
+
+def _retry_mode() -> str:
+    """``extraction.facts.retry_mode`` — see :data:`DEFAULT_RETRY_MODE`."""
+    from app.instance_config import get_value
+
+    raw = ""
+    try:
+        value = get_value("extraction", "facts", "retry_mode", default="")
+        if isinstance(value, str):
+            raw = value.strip().lower()
+    except Exception:  # noqa: BLE001 — no config package/instance.yaml is fine
+        raw = ""
+    if not raw:
+        return DEFAULT_RETRY_MODE
+    if raw not in _VALID_RETRY_MODES:
+        logger.warning(
+            "facts extraction: extraction.facts.retry_mode=%r is not one of %s — using %r",
+            raw,
+            _VALID_RETRY_MODES,
+            DEFAULT_RETRY_MODE,
+        )
+        return DEFAULT_RETRY_MODE
+    return raw
+
+
+def resolve_retry_mode(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(mode, source)`` for a PASS's retry policy — a per-connection
+    override first, the instance-level :func:`_retry_mode` otherwise.
+
+    A single high-value connection (curated, high-stakes folders — a
+    dropped quote there is a lost citation on stage) can keep the
+    corrective retry ON while the long-tail connection runs with it OFF,
+    without an instance.yaml edit that would flip every connection at
+    once. The override lives at ``connection.config.extraction.facts.
+    retry_mode`` — a sibling of ``config.extraction.stop_requested_at``
+    (:data:`connectors.sharepoint.crawler.STOP_REQUESTED_AT_KEY`), the
+    established home for per-connection extraction state on the
+    connection row, carried forward on every generic connection edit.
+
+    ``source`` mirrors :func:`resolve_concurrency`'s ``(value, source)``
+    shape: ``"connection"`` (the override won), ``"instance"`` (no
+    override set, or the connection has none — the instance-level setting
+    won), or ``"invalid"`` (a connection value was set but is not one of
+    :data:`_VALID_RETRY_MODES` — ignored and logged, same fallback as an
+    invalid instance-level value).
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("retry_mode")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_RETRY_MODES:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.retry_mode=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                _VALID_RETRY_MODES,
+            )
+    return _retry_mode(), "instance"
+
+
+def _retry_should_fire(
+    retry_mode: str,
+    *,
+    pre_repair_failures: Sequence[Tuple[dict, str]],
+    post_repair_failures: Sequence[Tuple[dict, str]],
+) -> bool:
+    """Whether :func:`extract_one` spends its ONE corrective retry, per
+    :data:`DEFAULT_RETRY_MODE`'s three modes.
+
+    ``pre_repair_failures`` and ``post_repair_failures`` are almost always
+    the SAME list (repair only recomputes the latter when it actually fixed
+    something) — they diverge in exactly the case ``always`` exists to
+    reach: repair fixed every failure, so the gate is clean, but the
+    first-pass output was not."""
+    if retry_mode == "off":
+        return False
+    if retry_mode == "always":
+        return bool(pre_repair_failures)
+    return bool(post_repair_failures)
+
+
+def _facts_llm_cache_enabled() -> bool:
+    """``extraction.facts.llm_cache`` — on by default. The cache table is
+    Postgres-only (see :func:`_resolve_llm_cache`); this flag is *in
+    addition* to that, for an operator who wants the pass to always call
+    the model fresh (e.g. auditing whether the model's output is stable)
+    even on a Postgres-backed instance.
+    """
+    from app.instance_config import feature_enabled
+
+    return bool(
+        feature_enabled("extraction", "facts", "llm_cache", env_var="AGNES_EXTRACTION_FACTS_LLM_CACHE", default=True)
+    )
+
+
+def _resolve_llm_cache() -> Any | None:
+    """This pass's content-hash LLM-response cache, or ``None``.
+
+    ``None`` is the ordinary "no cache" state, not an error — every
+    caller in this module treats it that way. Two independent reasons
+    produce it: :func:`_facts_llm_cache_enabled` is off, or the active
+    backend is DuckDB (the cache table is Postgres-only, A3 ratchet — see
+    ``docs/migrations.md`` -> "Adding a PG-only feature"). The DuckDB case
+    logs once, here, at the START of the pass — never per document, and
+    never a crash.
+    """
+    if not _facts_llm_cache_enabled():
+        return None
+    from src.repositories import RequiresPostgresBackend, facts_llm_cache_repo
+
+    try:
+        return facts_llm_cache_repo()
+    except RequiresPostgresBackend:
+        logger.info(
+            "facts extraction: the LLM response cache is Postgres-only — running this pass without it "
+            "(extraction.facts.llm_cache has no effect on a DuckDB-backed instance)"
+        )
+        return None
+
+
+def _facts_cache_key(*, sha256: str, model: str, fingerprint: str, suffix: str = "") -> str:
+    """content + model + prompt/ontology fingerprint (+ an optional
+    call-kind suffix) -> cache key.
+
+    The same three-way identity :func:`is_up_to_date` already uses to
+    decide whether a document needs re-extraction at all — a cache hit is
+    "the model already answered this exact question", a state-file hit is
+    "we already shipped this exact answer". ``suffix`` keeps the ONE
+    corrective retry's response in its own row: it is a reply to a
+    DIFFERENT prompt (the base message plus a listing of what failed), so
+    conflating the two keys would serve a first-pass reply to a retry
+    lookup or vice versa.
+    """
+    import hashlib
+
+    raw = "|".join((sha256 or "", model or "", fingerprint or "", suffix or "")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_lookup(cache: Any, *, sha256: str, model: str, fingerprint: str, suffix: str = "") -> Optional[str]:
+    """A previously-successful LLM reply for this exact
+    (document content, model, effective prompt[, call kind]) — a zero-token
+    substitute for the model call about to follow. ``None`` on a miss OR
+    when ``cache`` is ``None`` (caching disabled/unavailable — see
+    :func:`_resolve_llm_cache`); a lookup failure is swallowed the same way,
+    because a broken cache read must degrade to "call the model", never
+    fail the document."""
+    if cache is None:
+        return None
+    key = _facts_cache_key(sha256=sha256, model=model, fingerprint=fingerprint, suffix=suffix)
+    try:
+        row = cache.get(key)
+    except Exception as exc:  # noqa: BLE001 — a cache read must never fail the document
+        logger.warning("facts extraction: cache lookup failed (%s) — calling the model", type(exc).__name__)
+        return None
+    if not row:
+        return None
+    response = row.get("response")
+    return response.get("text") if isinstance(response, dict) else None
+
+
+def _cache_store(
+    cache: Any,
+    *,
+    sha256: str,
+    model: str,
+    fingerprint: str,
+    suffix: str,
+    reply: str,
+    usage: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Store a successful reply so the next document with the SAME content
+    hash, model and fingerprint (a duplicate file, or a re-run) never pays
+    for this call again. Best-effort: a failed write is logged and
+    swallowed — a document whose facts already shipped must never fail
+    because caching them for NEXT time did not work."""
+    if cache is None:
+        return
+    key = _facts_cache_key(sha256=sha256, model=model, fingerprint=fingerprint, suffix=suffix)
+    try:
+        cache.put(key, sha256=sha256, model=model, fingerprint=fingerprint, response={"text": reply}, usage=usage)
+    except Exception as exc:  # noqa: BLE001 — a failed cache write must never fail the document
+        logger.warning(
+            "facts extraction: cache store failed (%s) — continuing without caching this reply", type(exc).__name__
+        )
+
+
 # --------------------------------------------------------------------------
 # Per-document state (idempotent re-runs)
 # --------------------------------------------------------------------------
@@ -1019,6 +1228,12 @@ class _Report:
         self.facts_quotes_dropped = 0
         self.facts_quotes_repaired = 0
         self.facts_retries = 0
+        #: Documents (or retries) served from the content-hash LLM
+        #: response cache instead of a model call — cost-levers spec
+        #: 2026-09-02, lever B. A first-pass hit and a retry hit on the
+        #: SAME document both count, since each replaces a call that would
+        #: otherwise have been made.
+        self.facts_cache_hits = 0
         self.parse_errors = 0
         self.nodes_emitted = 0
         self.edges_emitted = 0
@@ -1074,6 +1289,7 @@ class _Report:
             "facts_quotes_dropped": self.facts_quotes_dropped,
             "facts_quotes_repaired": self.facts_quotes_repaired,
             "facts_retries": self.facts_retries,
+            "facts_cache_hits": self.facts_cache_hits,
             "parse_errors": self.parse_errors,
             "nodes_emitted": self.nodes_emitted,
             "edges_emitted": self.edges_emitted,
@@ -1289,6 +1505,7 @@ class _DocResult:
         repaired: int,
         parse_errors: int,
         seconds: float,
+        cache_hits: int = 0,
     ) -> None:
         self.work = work
         self.nodes = nodes
@@ -1298,25 +1515,46 @@ class _DocResult:
         self.repaired = repaired
         self.parse_errors = parse_errors
         self.seconds = seconds
+        self.cache_hits = cache_hits
 
 
-def extract_one(extractor: Any, work: _Work) -> _DocResult:
-    """The whole per-document LLM half: call, verbatim-check, deterministic
-    repair, ONE corrective retry, drop-and-count.
+def extract_one(
+    extractor: Any,
+    work: _Work,
+    *,
+    retry_mode: str = DEFAULT_RETRY_MODE,
+    fingerprint: str = "",
+    cache: Any | None = None,
+) -> _DocResult:
+    """The whole per-document LLM half: cache lookup, call, verbatim-check,
+    deterministic repair, ONE corrective retry (policy: ``retry_mode``),
+    drop-and-count.
 
-    Pure with respect to this process's shared state — it reads nothing but
-    its ``work`` and returns a result — which is exactly why it can run in
-    a worker thread while the main thread keeps sole ownership of the
-    report counters, the state file and every database call. Raised
-    exceptions travel back through the future; the caller decides which
-    are per-document and which stop the pass.
+    Reads nothing but its ``work`` and the shared, read-only ``extractor``/
+    ``cache`` objects, and touches no MUTABLE shared state — which is what
+    lets it run in a worker thread while the main thread keeps sole
+    ownership of the report counters, the state file and every database
+    call that ISN'T the cache. The cache repo is the one exception: each of
+    its methods opens and closes its own pooled connection per call (see
+    ``src/db_pg.py::get_engine`` — a fresh checkout per call is exactly what
+    a connection pool is for), so concurrent workers calling it is ordinary
+    SQLAlchemy usage, not a new thread-safety hazard. Raised exceptions
+    travel back through the future; the caller decides which are
+    per-document and which stop the pass.
     """
     started = time.time()
-    reply = extractor.call(work.user_message)
+    cache_hits = 0
+    reply = _cache_lookup(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint)
+    if reply is not None:
+        cache_hits += 1
+    else:
+        reply = extractor.call(work.user_message)
+        _cache_store(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="", reply=reply)
     nodes, edges, parse_errors = parse_streams(reply)
 
     kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
-    failures = verbatim_failures([*nodes, *edges], **kwargs)
+    pre_repair_failures = verbatim_failures([*nodes, *edges], **kwargs)
+    failures = pre_repair_failures
     repaired = 0
     if failures:
         from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
@@ -1332,12 +1570,33 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
             failures = verbatim_failures([*nodes, *edges], **kwargs)
     retried = False
     dropped = 0
-    if failures:
+    if _retry_should_fire(retry_mode, pre_repair_failures=pre_repair_failures, post_repair_failures=failures):
+        # `always` can reach this with `failures` (post-repair) empty —
+        # repair already fixed everything the gate would have complained
+        # about. There is nothing left to correct, so the retry falls back
+        # to the PRE-repair listing: the model is shown its own original
+        # mistake and asked to re-confirm it, even though the system has
+        # already patched the shipped evidence deterministically.
+        retry_failures = failures if failures else pre_repair_failures
         retried = True
-        retry_reply = extractor.call(_retry_message(work.user_message, failures))
+        retry_reply = _cache_lookup(
+            cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="retry"
+        )
+        if retry_reply is not None:
+            cache_hits += 1
+        else:
+            retry_reply = extractor.call(_retry_message(work.user_message, retry_failures))
+            _cache_store(
+                cache,
+                sha256=work.sha256,
+                model=extractor.model,
+                fingerprint=fingerprint,
+                suffix="retry",
+                reply=retry_reply,
+            )
         retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply)
         parse_errors += retry_parse_errors
-        failed_keys = {_fact_key(fact) for fact, _ in failures}
+        failed_keys = {_fact_key(fact) for fact, _ in retry_failures}
         nodes = [n for n in nodes if _fact_key(n) not in failed_keys]
         edges = [e for e in edges if _fact_key(e) not in failed_keys]
         recovered = 0
@@ -1372,6 +1631,7 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
         repaired=repaired,
         parse_errors=parse_errors,
         seconds=round(time.time() - started, 1),
+        cache_hits=cache_hits,
     )
 
 
@@ -1398,6 +1658,7 @@ def run_facts_extraction(
     extractor: Any | None = None,
     max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
     concurrency: Optional[int] = None,
+    retry_mode: Optional[str] = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
@@ -1421,7 +1682,10 @@ def run_facts_extraction(
     concurrency 1 does exactly what a sequential run did, batch
     composition included, and a run at 8 differs only in wall clock.
     ``concurrency`` overrides the configured value (the test seam for
-    that).
+    that). ``retry_mode`` overrides the resolved retry policy the same way
+    (the test seam); absent, the connection's own ``config.extraction.
+    facts.retry_mode`` wins over the instance-level ``extraction.facts.
+    retry_mode`` — see :func:`resolve_retry_mode`.
 
     ``on_progress`` is the liveness seam (owner-frustration fix,
     2026-09-02: a healthy multi-hour pass over this phase alone read as
@@ -1473,6 +1737,12 @@ def run_facts_extraction(
     if concurrency is not None:
         workers = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(concurrency)))
         concurrency_source = "caller"
+
+    # Explicit param (the test seam, same precedence as `concurrency` above)
+    # wins outright; otherwise the connection's own override wins over the
+    # instance-level default (`resolve_retry_mode`).
+    resolved_retry_mode = retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0]
+    llm_cache = _resolve_llm_cache()
 
     report = _Report()
     state = load_state(connection_id)
@@ -1608,6 +1878,7 @@ def run_facts_extraction(
         report.facts_retries += 1 if result.retried else 0
         report.facts_quotes_dropped += result.dropped
         report.facts_quotes_repaired += result.repaired
+        report.facts_cache_hits += result.cache_hits
         claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
         shipper.add(
             document={
@@ -1723,7 +1994,19 @@ def run_facts_extraction(
             if hard_stop is not None:
                 break
             docs_planned += 1
-            inflight.append((executor.submit(extract_one, extractor, work), work))
+            inflight.append(
+                (
+                    executor.submit(
+                        extract_one,
+                        extractor,
+                        work,
+                        retry_mode=resolved_retry_mode,
+                        fingerprint=fingerprint,
+                        cache=llm_cache,
+                    ),
+                    work,
+                )
+            )
             while len(inflight) >= workers:
                 _drain_one()
                 if hard_stop is not None:
@@ -1745,6 +2028,9 @@ def run_facts_extraction(
     usage["documents"] = report.docs_extracted
     usage["concurrency"] = workers
     usage["concurrency_source"] = concurrency_source
+    # 0 API tokens for every cache-served reply (see extract_one) — this is
+    # what makes a cache hit genuinely free rather than merely un-metered.
+    usage["cache_hits"] = report.facts_cache_hits
     rendered = report.render(
         model=model,
         prompt_origin=prompt_origin,
@@ -1821,6 +2107,7 @@ def maybe_run_after_crawl(
             exc,
         )
         return None
+
 
 
 def run_standalone_facts_extraction(

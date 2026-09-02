@@ -199,6 +199,8 @@ __all__ = [
     "memory_detection_runs_repo",
     # SharePoint crawl/facts per-connection state — Postgres-only
     "sharepoint_state_repo",
+    # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B) — Postgres-only
+    "facts_llm_cache_repo",
 ]
 
 
@@ -699,6 +701,9 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "sharepoint_state": {
         PG: ("src.repositories.sharepoint_state_pg", "SharepointStatePgRepository"),
     },
+    "facts_llm_cache": {
+        PG: ("src.repositories.facts_llm_cache_pg", "FactsLlmCachePgRepository"),
+    },
 }
 
 
@@ -1157,3 +1162,12 @@ def memory_detection_runs_repo() -> Any:
 # a crawl in flight on a DuckDB-backed instance.
 def sharepoint_state_repo() -> Any:
     return _build("sharepoint_state")
+
+
+# Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B)
+# — POSTGRES-ONLY. Raises RequiresPostgresBackend on a DuckDB-backed
+# instance; the sole caller, connectors.sharepoint.facts_extraction
+# ._resolve_llm_cache, catches that and runs the pass with caching off
+# (one log line) rather than letting a missing cache table fail extraction.
+def facts_llm_cache_repo() -> Any:
+    return _build("facts_llm_cache")

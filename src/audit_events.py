@@ -1165,6 +1165,12 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin requested a running (or about-to-run) extraction crawl stop at its next quiescent point.",
     ),
+    # -- Per-connection retry-policy override (cost-levers task, lever A) ----
+    "extraction.facts_retry_mode_set": AuditEvent(
+        "extraction.facts_retry_mode_set",
+        "mutation",
+        "An admin set (or cleared) a SharePoint connection's per-connection extraction.facts.retry_mode override.",
+    ),
     "run_sharepoint_extraction": AuditEvent(
         "run_sharepoint_extraction",
         "system",

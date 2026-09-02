@@ -92,9 +92,19 @@ def _seed_document(
     text: str,
     filename: str | None = None,
     path: str | None = None,
-    sha256: str = "sha-md-1",
+    sha256: str | None = None,
     status: str = "indexed",
 ) -> None:
+    """``sha256`` defaults to a value DERIVED from ``file_id`` — distinct
+    files get distinct content hashes unless a caller deliberately passes
+    the SAME literal ``sha256`` for two files (the LLM-cache tests do
+    exactly that, to seed byte-identical documents). A single shared
+    literal default here would silently collide two unrelated documents
+    under the content-hash cache — a real regression this default exists
+    to keep the rest of this file's fixtures from tripping over."""
+    if sha256 is None:
+        sha256 = "sha-md-" + file_id
+
     from src.db_pg import get_engine
     from src.repositories import corpus_file_sources_repo
 
@@ -314,6 +324,67 @@ def test_a_fabricated_quote_never_reaches_the_server(pg_env):
     assert report["facts_quotes_dropped"] == 1
     assert report["claims_written"] == 0
     assert report["claims_rejected"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-connection retry policy override — connection.config.extraction.
+# facts.retry_mode wins over the instance-level extraction.facts.retry_mode.
+# One high-value connection can keep the corrective retry ON (a dropped
+# quote there is a lost citation) while a long-tail connection runs with it
+# OFF, without an instance.yaml edit that would flip every connection at
+# once.
+# ---------------------------------------------------------------------------
+
+
+def test_a_connections_retry_mode_off_beats_the_instance_default(pg_env):
+    """No instance-level `extraction.facts.retry_mode` is set in this test
+    env, so the instance default is `on_gate_fail` (retries on a genuine
+    failure) — the connection's own `off` override must still win."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().config_patch(CONNECTION_ID, {"extraction": {"facts": {"retry_mode": "off"}}})
+
+    bad = {
+        "id": "engagement:x",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "This sentence was never in the document."}],
+    }
+    # Only ONE reply scripted: a retry call reusing the last reply would
+    # not error, but the call COUNT below still proves whether it happened.
+    extractor = StubExtractor([_stream(bad)])
+    report = _run(extractor)
+
+    assert len(extractor.seen) == 1, "the connection's `off` override must suppress the retry entirely"
+    assert report["facts_retries"] == 0
+    assert report["facts_quotes_dropped"] == 1
+
+
+def test_a_connection_with_no_override_falls_back_to_the_instance_default(pg_env):
+    """The complement of the test above: a connection whose config sets
+    nothing under `extraction.facts` behaves exactly like today (the
+    instance default, `on_gate_fail` — one retry on a genuine failure)."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    bad = {
+        "id": "engagement:x",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "This sentence was never in the document."}],
+    }
+    extractor = StubExtractor([_stream(bad), _stream(bad)])
+    report = _run(extractor)
+
+    assert len(extractor.seen) == 2, "no connection override — the instance default (on_gate_fail) retries"
+    assert report["facts_retries"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +729,104 @@ def test_the_run_reports_what_it_spent(pg_env):
 
     runs = facts_ingest_runs_repo().list_recent(limit=5)
     assert runs[0]["llm_usage"]["input_tokens"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# Content-hash LLM response cache (cost-levers spec 2026-09-02, lever B) —
+# end to end against the REAL `facts_llm_cache` table.
+# ---------------------------------------------------------------------------
+
+
+def test_facts_llm_cache_pg_repository_round_trips(pg_env):
+    from src.repositories import facts_llm_cache_repo
+
+    repo = facts_llm_cache_repo()
+    assert repo.get("missing-key") is None
+
+    repo.put(
+        "key1",
+        sha256="sha-1",
+        model="claude-haiku-4-5",
+        fingerprint="fp1",
+        response={"text": "NODES\nEDGES\n"},
+        usage={"input_tokens": 1000, "output_tokens": 100},
+    )
+    row = repo.get("key1")
+    assert row["response"] == {"text": "NODES\nEDGES\n"}
+    assert row["usage"] == {"input_tokens": 1000, "output_tokens": 100}
+    assert row["sha256"] == "sha-1"
+    assert row["model"] == "claude-haiku-4-5"
+    assert row["fingerprint"] == "fp1"
+
+    stats = repo.stats()
+    assert stats == {"rows": 1, "distinct_documents": 1}
+
+    # Upsert: the SAME key overwrites its own row rather than erroring.
+    repo.put(
+        "key1", sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp1", response={"text": "NODES\nEDGES\nmore"}
+    )
+    assert repo.get("key1")["response"] == {"text": "NODES\nEDGES\nmore"}
+    assert repo.stats()["rows"] == 1
+
+    assert repo.clear() == 1
+    assert repo.get("key1") is None
+    assert repo.stats() == {"rows": 0, "distinct_documents": 0}
+
+
+def test_a_byte_identical_document_is_served_from_cache_not_a_second_model_call(pg_env):
+    """The lever's own scenario: a consultancy keeps several copies of the
+    same document (v1/v2/final in different folders) — two different
+    files, same content hash, cost ONE model call between them."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    text = "The Northwind rollout began in March."
+    _seed_document(file_id="cf_1", doc_id="doc1", text=text, sha256="sha-dup-1")
+    _seed_document(file_id="cf_2", doc_id="doc2", text=text, sha256="sha-dup-1")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    # Only ONE reply scripted — a second real call would reuse it (the stub
+    # clamps its index), so the call COUNT below is what actually proves
+    # the cache, not merely "the pass didn't crash".
+    extractor = StubExtractor([_stream(node)])
+    report = _run(extractor)
+
+    assert report["docs_extracted"] == 2
+    assert len(extractor.seen) == 1, "the second, byte-identical document must cost zero model calls"
+    assert report["facts_usage"]["cache_hits"] == 1
+
+    from src.repositories import facts_llm_cache_repo
+
+    assert facts_llm_cache_repo().stats()["rows"] == 1
+
+
+def test_llm_cache_can_be_disabled_even_on_postgres(pg_env, monkeypatch):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    text = "The Northwind rollout began in March."
+    _seed_document(file_id="cf_1", doc_id="doc1", text=text, sha256="sha-dup-2")
+    _seed_document(file_id="cf_2", doc_id="doc2", text=text, sha256="sha-dup-2")
+
+    monkeypatch.setenv("AGNES_EXTRACTION_FACTS_LLM_CACHE", "0")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    extractor = StubExtractor([_stream(node), _stream(node)])
+    report = _run(extractor)
+
+    assert report["docs_extracted"] == 2
+    assert len(extractor.seen) == 2, "the cache is off — both documents call the model"
+    assert report["facts_usage"]["cache_hits"] == 0
 
 
 @pytest.mark.parametrize("workers", [1, 4])

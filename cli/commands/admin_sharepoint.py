@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Three surfaces:
+Four surfaces:
 
   - ``facts-extract`` — the standalone fact-graph trigger.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
@@ -16,6 +16,12 @@ Three surfaces:
     every SharePoint connection at once. CLI counterpart to
     ``GET /api/admin/sharepoint/extraction/runs`` — the same endpoint
     ``/admin/extraction`` polls.
+  - ``facts-config`` — a per-connection retry-policy override (cost-levers
+    task, lever A): one high-value connection keeps the corrective retry ON
+    while a long-tail connection runs with it OFF, set without an
+    instance.yaml edit. CLI counterpart to
+    ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
+    facts-config``.
 
 The crawl / ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
@@ -39,7 +45,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from cli.client import api_get, api_post
+from cli.client import api_get, api_patch, api_post
 
 admin_sharepoint_app = typer.Typer(help="Admin: SharePoint connector maintenance triggers")
 scope_app = typer.Typer(help="SharePoint connect wizard scope management")
@@ -52,6 +58,8 @@ admin_sharepoint_app.add_typer(connection_app, name="connection")
 # stdout isn't a real tty (piped output, the test runner) — a fixed, wide
 # console keeps the fleet table readable regardless of where it's printed.
 _console = Console(width=200)
+
+_RETRY_MODES = ("off", "on_gate_fail", "always")
 
 
 def _fail(resp) -> None:
@@ -369,3 +377,54 @@ def runs(
             time.sleep(10)
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
+
+
+@admin_sharepoint_app.command("facts-config")
+def facts_config(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    retry_mode: Optional[str] = typer.Option(
+        None,
+        "--retry-mode",
+        help=f"Per-connection override for the corrective-retry policy: one of {', '.join(_RETRY_MODES)}. "
+        "off = never retry a failing quote (cheapest, lowest recall); on_gate_fail = retry only when the "
+        "verbatim gate still rejects part of the output (the instance default); always = retry even a "
+        "document the deterministic repair already fixed, for maximum recall at maximum cost.",
+    ),
+    clear: bool = typer.Option(
+        False, "--clear", help="Remove the override — this connection falls back to the instance-level default."
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Set (or clear) this connection's own ``extraction.facts.retry_mode``,
+    overriding the instance-level default (cost-levers task, lever A) — a
+    curated, high-stakes connection can keep the corrective retry ON (a
+    dropped quote there is a lost citation) while a long-tail connection
+    runs with it OFF, without an instance.yaml edit that would flip every
+    connection at once.
+
+    Exactly one of ``--retry-mode`` / ``--clear`` is required. Prints the
+    RESOLVED value and where it came from (``connection`` or ``instance``)
+    — the same shape the admin config drawer would show.
+    """
+    if clear and retry_mode is not None:
+        typer.echo("Error: pass either --retry-mode or --clear, not both", err=True)
+        raise typer.Exit(1)
+    if not clear and retry_mode is None:
+        typer.echo("Error: one of --retry-mode or --clear is required", err=True)
+        raise typer.Exit(1)
+    if retry_mode is not None and retry_mode not in _RETRY_MODES:
+        typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
+        raise typer.Exit(1)
+
+    resp = api_patch(
+        f"/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
+        json={"retry_mode": retry_mode},
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    resolved = body.get("retry_mode") or {}
+    typer.echo(f"retry_mode: {resolved.get('value')} (source: {resolved.get('source')})")

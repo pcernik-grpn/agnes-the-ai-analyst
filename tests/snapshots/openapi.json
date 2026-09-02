@@ -4598,6 +4598,23 @@
         "title": "ExtractionRunOptions",
         "type": "object"
       },
+      "FactsConfigPatch": {
+        "properties": {
+          "retry_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Mode"
+          }
+        },
+        "title": "FactsConfigPatch",
+        "type": "object"
+      },
       "FactsCorrectionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -32222,6 +32239,79 @@
           }
         },
         "summary": "Extraction Config",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": {
+      "patch": {
+        "description": "Per-connection override for the facts-extraction retry policy\n(cost-levers task, lever A) \u2014 a single high-value connection (curated,\nhigh-stakes folders) can keep the corrective retry ON, since a dropped\nquote there is a lost citation on stage, while a long-tail connection\nruns with it OFF, without an instance.yaml edit that would flip every\nconnection at once.\n\nWrites ``config.extraction.facts.retry_mode`` on the connection row \u2014\na sibling of ``config.extraction.stop_requested_at`` (the Stop\ncontrol's own field, above): the established home for per-connection\nextraction state, carried forward on every generic connection edit.\n``retry_mode: null`` (or the field simply omitted) CLEARS the override\nand falls back to the instance-level ``extraction.facts.retry_mode``\n(see :func:`connectors.sharepoint.facts_extraction.resolve_retry_mode`).\nA value outside ``{\"off\", \"on_gate_fail\", \"always\"}`` is refused with a\nplain ``422`` rather than silently ignored \u2014 a caller setting a value\nexpects it to take effect.\n\nWorks on BOTH app-state backends, like the Stop control above: this\ntouches only ``source_connections``, never a PG-only table.",
+        "operationId": "patch_extraction_facts_config_api_admin_sharepoint_connections__connection_id__extraction_facts_config_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsConfigPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Extraction Facts Config",
         "tags": [
           "admin"
         ]

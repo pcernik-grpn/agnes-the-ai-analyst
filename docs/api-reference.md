@@ -1557,6 +1557,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}
 - /api/admin/sharepoint/connections/{connection_id}/extraction/config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/stop
+- /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1640,10 +1641,30 @@ counters, read off the SAME run row (crawl and facts are literally one row;
 `agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
 refreshes every 10s).
 
-Admin-only display primitives; the per-connection routes above have no
-analyst CLI/MCP analogue, and the fleet endpoint is CLI-reachable but
-deliberately not MCP-exposed (a fleet-wide operational status read, not a
-bounded analyst query).
+`PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears a
+per-connection override for the corrective-retry policy —
+`config.extraction.facts.retry_mode`, a sibling of `config.extraction.
+stop_requested_at` above on the same JSON column. A single high-value
+connection can keep the retry ON (a dropped quote there is a lost citation on
+stage) while a long-tail connection runs with it OFF, without an
+`instance.yaml` edit that would flip every connection at once. Body:
+`{"retry_mode": "off" | "on_gate_fail" | "always" | null}` — `null` (or the
+field omitted) clears the override and falls back to the instance-level
+`extraction.facts.retry_mode`. Returns `{connection_id, retry_mode: {value,
+source}}`, `source` being `"connection"` or `"instance"`. `422` for a value
+outside the three above; `404` for an unknown or non-SharePoint connection.
+Works on both app-state backends, same as `…/extraction/stop`. Audited as
+`extraction.facts_retry_mode_set` — the handler writes its own row (more than
+the fallback middleware could say: the requested value, the resolved value
+and its source). CLI: `agnes admin sharepoint facts-config <connection_id>
+--retry-mode <mode>` / `--clear`.
+
+The four `GET`/stop routes above are admin-only display primitives with no
+analyst CLI/MCP analogue. The fleet endpoint and `facts-config` are both
+CLI-reachable — an operator watching the fleet, or scripting a
+per-connection cost/recall tradeoff — but deliberately not MCP-exposed: a
+fleet-wide operational status read and a connection's retry policy are both
+operator decisions, not query surfaces any agent needs.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
