@@ -1669,6 +1669,35 @@ def test_a_cut_edge_fades_and_an_uncut_one_does_not() -> None:
     )
 
 
+_CUE_BAND_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-right \.data-table--pinned-actions[^{]*::before[^{]*\{"
+    r"[^}]*right:\s*100%[^}]*\}",
+    re.DOTALL,
+)
+
+
+def test_the_pinned_column_shows_content_dissolving_under_it() -> None:
+    """The shadow says "raised", which a reader can take for chrome. What says
+    "the table continues beneath this" is the neighbouring column's text
+    fading into the pinned column's own background — a band on the pinned
+    cell (not a mask on the wrap, which would take the button with it), so it
+    travels down every row at any scroll offset. That travelling is the whole
+    point: the scrollbar can be a screen and a half below the reader."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _CUE_BAND_RE.search(css), (
+        "no `is-cue-right` ::before band left of the pinned column — the only cue "
+        "left is a shadow, which measured as too quiet to read on screen"
+    )
+    # The band fades to the cell's ACTUAL colour, which differs in `thead`, at
+    # rest and on hover — a guessed colour shows as a seam the moment a row is
+    # hovered. So the variable is declared beside each background it tracks.
+    assert css.count("--dtw-pin-bg: var(") >= 3, (
+        "--dtw-pin-bg is not declared beside all three pinned-cell background "
+        "declarations (thead, rest, hover) — the slide-under band would fade to "
+        "the wrong colour in at least one state"
+    )
+
+
 def test_a_pinned_actions_column_is_shadowed_and_never_faded() -> None:
     """The mask applies to sticky children too, so fading the right edge of a
     table with pinned actions would fade out precisely the button the pin
