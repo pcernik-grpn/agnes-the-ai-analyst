@@ -100,17 +100,22 @@ _DUCKLAKE_INGEST_BATCH_SIZE = 100_000
 
 
 def _capture_orchestrator_exception(exc: BaseException, **props) -> None:
-    """Best-effort PostHog forward for rebuild failures. No-op when disabled."""
-    try:
-        from src.observability import get_posthog
+    """Record a rebuild failure as one structured log line.
 
-        get_posthog().capture_exception(
-            exc,
-            distinct_id="system",
-            properties={"component": "orchestrator", **props},
+    Best-effort by construction: a caller's keyword can collide with a
+    reserved ``LogRecord`` attribute, which stdlib turns into a ``KeyError``
+    at record creation — and a failure to describe a failure must not become
+    a second one.
+    """
+    try:
+        logger.error(
+            "orchestrator %s failed",
+            props.get("op", "operation"),
+            exc_info=exc,
+            extra={"event": "component_error", "component": "orchestrator", **props},
         )
     except Exception:
-        logger.debug("PostHog capture_exception failed in orchestrator", exc_info=True)
+        logger.debug("orchestrator: could not emit the failure record", exc_info=True)
 
 
 # Identifier validation lives in src/identifier_validation.py so the

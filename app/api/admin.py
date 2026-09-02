@@ -1284,8 +1284,8 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Operator-injected HTML/JS blocks rendered into base.html. "
                 "Each entry: {name: str, enabled: bool, placement: "
                 "head_start|head_end|body_end, html: str}. Used for feedback "
-                "widgets (Marker.io), analytics (GTM, PostHog), error capture "
-                "(Sentry). Rendered with | safe — admin trust boundary. Review "
+                "widgets, analytics tags, and error-capture snippets. Rendered with "
+                "| safe — admin trust boundary. Review "
                 "third-party widget privacy posture before enabling (most "
                 "capture session data). Restart required after save."
             ),
@@ -1843,7 +1843,8 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
             "hint": (
                 "How often approved/mandatory items are flagged for "
                 "re-review (months). Not yet wired (#1971) — no scheduled "
-                "job reads this value or moves items to an expired state yet."
+                "job reads this value or moves items to an expired state "
+                "yet; real item expiry is a standalone future feature."
             ),
         },
         "notify_on_new_items": {
@@ -1858,18 +1859,18 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "claude_local_md": {
                     "kind": "object",
                     "hint": (
-                        "Not yet wired (#1971): the nightly collector "
-                        "(services/corporate_memory/collector.py) always runs "
-                        "regardless of enabled, and always scores items from "
+                        "Live (#1971): read fresh on every scheduled/manual "
+                        "collector run — false skips the whole run (no LLM "
+                        "call). confidence_base was removed (#1971) — it was "
+                        "never read; items are always scored from "
                         "corporate_memory.confidence.base['claude_local_md'] "
-                        "below, not confidence_base here."
+                        "below."
                     ),
                     "fields": {
-                        "enabled": {"kind": "bool", "default": True},
-                        "confidence_base": {
-                            "kind": "float",
-                            "default": 0.50,
-                            "hint": "Confidence assigned to extractions from CLAUDE.local.md (0-1).",
+                        "enabled": {
+                            "kind": "bool",
+                            "default": True,
+                            "hint": "Live (#1971) — false disables the nightly CLAUDE.local.md collection run entirely.",
                         },
                     },
                 },
@@ -1886,24 +1887,14 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                                 "run. No restart needed."
                             ),
                         },
-                        "confidence_base": {
-                            "kind": "float",
-                            "default": 0.60,
-                            "hint": (
-                                "Not yet wired (#1971): extracted items are scored "
-                                "from corporate_memory.confidence.base"
-                                "['user_verification.<detection_type>'] below, "
-                                "not this value."
-                            ),
-                        },
                         "max_turns_per_session": {
                             "kind": "int",
                             "default": 100,
                             "hint": (
-                                "Not yet wired (#1971): the transcript truncation "
-                                "window is the hardcoded MAX_TURNS_PER_SESSION "
-                                "constant in services/verification_detector/"
-                                "detector.py (100), not this value."
+                                "Live (#1971): the per-session transcript "
+                                "truncation window, read fresh on every run. "
+                                "Falls back to the built-in default (100) when "
+                                "unset or not a positive integer."
                             ),
                         },
                         "detection_types": {
@@ -1928,19 +1919,45 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         "extraction": {
             "kind": "object",
             "hint": (
-                "Not yet wired (#1971): the collector and verification "
-                "processor both build their LLM extractor from the top-level "
-                "ai.* section, and both call their sensitivity/contradiction "
-                "checks unconditionally — none of these three fields is read."
+                "Mixed status (#1971): model and sensitivity_check are live; "
+                "contradiction_check is still not wired (see its own hint)."
             ),
             "fields": {
                 "model": {
                     "kind": "string",
                     "default": "claude-haiku-4-5-20251001",
-                    "hint": "LLM used to extract knowledge. Override for cost or quality.",
+                    "hint": (
+                        "Live (#1971) — overrides the top-level ai.model for "
+                        "BOTH extraction paths (collector + verification "
+                        "processor), same pattern as extraction.facts.model "
+                        "elsewhere in this schema. Unset falls back to "
+                        "whichever model the ai: block configures; only the "
+                        "model changes, credentials/provider stay shared."
+                    ),
                 },
-                "sensitivity_check": {"kind": "bool", "default": True},
-                "contradiction_check": {"kind": "bool", "default": True},
+                "sensitivity_check": {
+                    "kind": "bool",
+                    "default": True,
+                    "hint": (
+                        "Live (#1971), collector path only — false skips the "
+                        "per-item LLM safety check (a cost switch; the item "
+                        "is still added, just not LLM-vetted). The "
+                        "session-transcript path has no equivalent check to "
+                        "gate."
+                    ),
+                },
+                "contradiction_check": {
+                    "kind": "bool",
+                    "default": True,
+                    "hint": (
+                        "Not yet wired (#1971) — contradiction_module."
+                        "detect_and_record() runs unconditionally on the "
+                        "session-transcript path today; the collector runs "
+                        "no contradiction check at all. Tracked together "
+                        "with contradiction_detection.enabled/max_candidates "
+                        "below — one future pass, not two."
+                    ),
+                },
             },
         },
         "confidence": {
@@ -2017,6 +2034,10 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
         },
         "contradiction_detection": {
             "kind": "object",
+            "hint": (
+                "Not yet wired (#1971) — see extraction.contradiction_check's "
+                "hint above; this is the other half of the same unwired knob."
+            ),
             "fields": {
                 "enabled": {"kind": "bool", "default": True},
                 "max_candidates": {

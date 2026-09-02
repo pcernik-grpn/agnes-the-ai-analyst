@@ -76,6 +76,32 @@ _PAT_LIKE_TYPES = ("pat", "agent_pat")
 PARENT_TOKEN_ID_CLAIM = "parent_token_id"
 
 
+
+def pat_is_expired(record: dict) -> bool:
+    """Whether a personal-access-token row has passed its ``expires_at``.
+
+    Extracted so the resolver and every "does this user hold a live token"
+    caller ask ONE question. The three normalizations are the reason it is
+    worth a function rather than an inline check: ``expires_at`` reaches
+    callers as a `datetime` from Postgres and as an ISO string from DuckDB,
+    and a stored value can be naive where the comparison is aware. A caller
+    that reimplements this gets one of those wrong and silently treats an
+    expired token as live — which is what `/library` did, telling a user
+    with nothing usable that they were already connected and withholding
+    the invitation they needed (Devin Review on #1998).
+
+    ``expires_at`` of ``None`` means "never expires", not "expired".
+    """
+    exp_at = record.get("expires_at")
+    if exp_at is None:
+        return False
+    if isinstance(exp_at, str):
+        exp_at = datetime.fromisoformat(exp_at)
+    if exp_at.tzinfo is None:
+        exp_at = exp_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) > exp_at
+
+
 def _stash_payload(request: Optional[Request], payload: dict) -> None:
     """Stash the verified JWT payload on ``request.state.token_payload`` so
     `agent_id_from_request` can read claims off the request without
@@ -476,14 +502,8 @@ def resolve_token_to_user(
         if not parent or parent.get("revoked_at") is not None:
             return None, "pat_parent_revoked"
 
-    exp_at = record.get("expires_at")
-    if exp_at is not None:
-        if isinstance(exp_at, str):
-            exp_at = datetime.fromisoformat(exp_at)
-        if exp_at.tzinfo is None:
-            exp_at = exp_at.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) > exp_at:
-            return None, "pat_expired"
+    if pat_is_expired(record):
+        return None, "pat_expired"
 
     # Defense-in-depth: stored token_hash must match sha256(bearer JWT).
     # Protects against a forged-but-unrevoked JWT using a stolen signing key.

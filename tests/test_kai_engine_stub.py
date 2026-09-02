@@ -289,6 +289,32 @@ def test_every_non_blocking_scenario_completes_a_turn(stub_env):
         assert frames and frames[-1]["type"] == "done", f"scenario {keyword!r} never finished"
 
 
+def test_tabular_scenario_streams_the_table_head_across_deltas(stub_env):
+    """The `tabular` scenario exists to show a MODEL-written table arriving the
+    way a model streams it (TCRD-288): the header row and the delimiter row
+    each split across several text deltas, so the client's withhold-then-style
+    window is actually open for a while. A refactor that collapsed the head
+    into one delta would keep the turn green and silently lose the scenario's
+    only reason to exist."""
+    deltas = [e["delta"] for e in stub_env.SCENARIOS["tabular"] if e.get("type") == "text-delta"]
+    joined = "".join(deltas)
+    assert "| Client | Sponsor | Signed | Price |\n|---|---|---|---|\n" in joined, "a complete GFM head"
+    head_end = joined.index("|---|---|---|---|\n") + len("|---|---|---|---|\n")
+    # Count the deltas that carry a piece of the head (header + delimiter).
+    pos, in_head = 0, 0
+    for d in deltas:
+        if pos < head_end and pos + len(d) > joined.index("| Client"):
+            in_head += 1
+        pos += len(d)
+    assert in_head >= 4, f"the head must stream across several deltas, got {in_head}"
+    assert all(len(d) <= 40 for d in deltas[1:-1]), "a few characters per delta, like a model"
+    # `_pick_scenario` takes the FIRST registered key found in the message, so
+    # the streamed-table shape must sit ahead of `table` or a message naming
+    # both ("a tabular table") silently gets the tool-result shape instead.
+    assert stub_env._pick_scenario("show me a tabular table please") is stub_env.SCENARIOS["tabular"]
+    assert stub_env._pick_scenario("table") is stub_env.SCENARIOS["table"]
+
+
 def test_stub_is_not_reachable_without_the_dev_profile():
     """The stub answers every turn with a canned script, so it must never be
     something a default `docker compose up` can start."""
