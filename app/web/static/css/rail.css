@@ -2104,6 +2104,16 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
             transition: width var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
                         box-shadow var(--ds-motion-fast, .16s) var(--ds-ease-standard, ease) .4s,
                         z-index 0s linear 0s;
+            /* The descendants wait with the rail. Every label, row and icon
+               reads `--rail-peek-text-delay` (defined once near the top of
+               this file at .14s), so without this line the admin rail's
+               CONTENTS rearrange on the ordinary beat while the panel itself
+               is still waiting out its anti-pass-through delay — a pointer
+               passing through scrambles the column it was reading and the
+               peek never opens (Devin Review on #1989). Redefined here rather
+               than at each descendant: they already share the variable, which
+               is what makes one line enough. */
+            --rail-peek-text-delay: .4s;
         }
 
         /* Keyboard focus is unambiguous — there is no such thing as tabbing

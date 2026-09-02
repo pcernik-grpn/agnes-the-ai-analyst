@@ -5706,6 +5706,26 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     border-radius: 4px;
 }
 .data-table-wrap::-webkit-scrollbar-thumb:hover { background: var(--ds-text-disabled); }
+
+/* Firefox gets the same affordance through the STANDARD properties, gated so
+   Chrome never sees them. The note above is right that pairing the two
+   unconditionally is a regression — Chrome honours one model or the other and
+   `scrollbar-width` makes it drop the `::-webkit-*` rules for an overlay bar.
+   It is wrong that Firefox falls through to an always-visible default: on
+   macOS Firefox follows the OS "show scroll bars automatically" setting, so
+   on a trackpad it paints an overlay bar too, and a table without pinned
+   actions hides columns with nothing on screen to say so (Devin Review on
+   #1989).
+
+   `@supports not selector(::-webkit-scrollbar)` is the discriminator: engines
+   that implement the pseudo-element skip this block entirely and keep the
+   rules above, and the ones that do not — Firefox — get the standard pair. */
+@supports not selector(::-webkit-scrollbar) {
+    .data-table-wrap {
+        scrollbar-width: thin;
+        scrollbar-color: var(--ds-border) transparent;
+    }
+}
 .data-table-wrap thead th {
     position: static;
 }
