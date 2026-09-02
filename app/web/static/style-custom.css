@@ -389,6 +389,35 @@ html[data-ui-layout="rail"] body.detail-page footer {
     box-shadow: 0 4px 12px color-mix(in srgb, var(--ds-primary) 25%, transparent);
     transition: background 0.15s, transform 0.1s;
 }
+/* The close button on a dismissible card. Quiet at rest — this is a way out
+   of an invitation, not a second action competing with the CTA beside it —
+   and it only exists where the call site passed a `dismiss_key`. Positioned
+   in the flow rather than absolutely, so it cannot land on top of the copy
+   when the bar wraps on a narrow column. */
+.cbn-dismiss {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    margin-left: 4px;
+    padding: 0;
+    border: none;
+    border-radius: var(--ds-radius-pill, 999px);
+    background: none;
+    color: var(--ds-text-muted);
+    cursor: pointer;
+}
+.cbn-dismiss:hover {
+    background: color-mix(in srgb, var(--ds-text-primary) 8%, transparent);
+    color: var(--ds-text-primary);
+}
+.cbn-dismiss:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+}
 .cbn-cta:hover { background: var(--ds-primary-dark); }
 .cbn-cta:active { transform: translateY(1px); }
 
