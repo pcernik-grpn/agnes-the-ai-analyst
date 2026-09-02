@@ -1185,12 +1185,6 @@ def _protected_table_self_names(*, table_name: str | None, table_id: str | None)
     return names
 
 
-#: The phrase `src/orchestrator.py` writes into `sync_state.error` when a
-#: connector's own `_meta.rows` came back NULL (#1364) -- the published
-#: `rows=0` next to it is a placeholder, not a verified empty table.
-_COUNT_UNAVAILABLE_MARKER = "Row count unavailable"
-
-
 def _table_resolves_to_cte(table: exp.Table) -> bool:
     """Whether this ``Table`` node names a CTE that is VISIBLE at its
     position, mirroring how DuckDB resolves the identifier.
@@ -1276,6 +1270,7 @@ def raise_if_policy_mapping_empty(
     and must stay a no-op.
     """
     from src.repositories import sync_state_repo, table_registry_repo
+    from src.sync_state_key import COUNT_UNAVAILABLE_MARKER
 
     try:
         statement = sqlglot.parse_one(policy_sql, read="duckdb")
@@ -1346,7 +1341,7 @@ def raise_if_policy_mapping_empty(
         # disk and still served. Treat that as "unknown", not "empty": the
         # operator-facing signal is the sync error, and refusing every read
         # here would turn a counting hiccup into an outage.
-        if state and rows == 0 and _COUNT_UNAVAILABLE_MARKER in str(state.get("error") or ""):
+        if state and rows == 0 and COUNT_UNAVAILABLE_MARKER in str(state.get("error") or ""):
             continue
         if not rows:
             raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)

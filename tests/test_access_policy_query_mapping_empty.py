@@ -385,6 +385,48 @@ def test_helper_treats_count_unavailable_as_unknown_not_empty(e2e_env):
         )
 
 
+def test_orchestrator_error_messages_keep_the_count_marker_when_combined():
+    """#1364 x PR #2023 review: `set_error` replaces the row's error and the
+    corrupt-parts message is written AFTER the count-unavailable one, so
+    when both fire on one pass the corrupt-parts text must itself carry
+    the marker the guard keys on."""
+    from src.orchestrator import _corrupt_parts_message, _count_unavailable_message
+    from src.sync_state_key import COUNT_UNAVAILABLE_MARKER
+
+    assert _count_unavailable_message("t", "s").startswith(COUNT_UNAVAILABLE_MARKER)
+    alone = _corrupt_parts_message("t", "s", {"p1.parquet"}, count_unavailable=False)
+    assert COUNT_UNAVAILABLE_MARKER not in alone and "p1.parquet" in alone
+    combined = _corrupt_parts_message("t", "s", {"p1.parquet"}, count_unavailable=True)
+    assert COUNT_UNAVAILABLE_MARKER in combined and "p1.parquet" in combined
+
+
+def test_helper_treats_combined_corrupt_parts_and_uncounted_as_unknown(e2e_env):
+    """The combined message (corrupt parts + count unavailable) still reads
+    as "unknown", so a frozen-but-served mapping table is not refused."""
+    from src.access_policy import raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.orchestrator import _corrupt_parts_message
+    from src.repositories.sync_state import SyncStateRepository
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(id="frozen_map", name="frozen_map", source_type="keboola", query_mode="local")
+        registry.set_policy_mapping("frozen_map", True)
+        state_repo = SyncStateRepository(conn)
+        state_repo.update_sync("frozen_map", rows=0, file_size_bytes=10, hash="abc")
+        state_repo.set_error(
+            "frozen_map", _corrupt_parts_message("frozen_map", "x", {"part-0.parquet"}, count_unavailable=True)
+        )
+    finally:
+        conn.close()
+
+    raise_if_policy_mapping_empty(
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM frozen_map WHERE email = $user_email)"
+    )
+
+
 def test_helper_cte_exclusion_is_scope_aware(e2e_env):
     """The CTE exclusion must not hide a PHYSICAL read of a same-named
     mapping table (PR #2023 review, second round on this guard): a
