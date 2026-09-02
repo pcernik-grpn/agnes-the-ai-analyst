@@ -912,6 +912,30 @@
             margin-bottom: 14px;
         }
 
+        /* #1979 follow-up (admin setup-flow review, item 4): the register-
+           table wizard's "Filter tables…" box (_register_table_form.html
+           #rtfSearch), generalized to the column picker — a flat
+           alphabetical list becomes unusable by hand-scrolling once a table
+           has 100+ columns. */
+        .ap-col-filter,
+        .ap-rr-col-filter {
+            padding: 6px 10px;
+            border: 1px solid var(--ds-border);
+            border-radius: var(--ds-radius-btn);
+            background: var(--ds-surface);
+            color: var(--ds-text-primary);
+            font: inherit;
+            font-size: 12px;
+        }
+
+        .ap-col-filter-row {
+            margin-bottom: 8px;
+        }
+
+        .ap-col-filter {
+            width: 100%;
+        }
+
         .ap-col-list {
             border: 1px solid var(--ds-border);
             border-radius: 8px;
@@ -1020,6 +1044,19 @@
             margin-bottom: 8px;
             align-items: center;
             flex-wrap: wrap;
+        }
+
+        .ap-rr-col-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            flex: 1 1 26%;
+            min-width: 130px;
+        }
+
+        .ap-rr-col-filter {
+            font-size: 11px;
+            padding: 4px 8px;
         }
 
         .ap-rr-col {
@@ -3786,6 +3823,11 @@
                         Pick a mask for any column that needs to change for some callers — everything
                         else passes through unchanged.
                     </div>
+                    <div class="ap-col-filter-row">
+                        <input type="text" class="ap-col-filter" id="apColFilter"
+                               placeholder="Filter columns…" aria-label="Filter columns"
+                               oninput="_apRenderColList()">
+                    </div>
                     <div id="apColList" class="ap-col-list">
                         <div class="form-hint" style="margin:0; padding:10px;">Loading columns…</div>
                     </div>
@@ -5802,6 +5844,11 @@
         document.getElementById('apNote').value = table.access_policy_note || '';
         document.getElementById('apPreviewUser').value = '';
         document.getElementById('apPreviewGroups').value = '';
+        // #1979 follow-up: the column-filter box is a static element, not
+        // rebuilt per open like #apColList itself — clear it so a filter
+        // typed for the previous table doesn't hide columns on this one.
+        var colFilterEl = document.getElementById('apColFilter');
+        if (colFilterEl) colFilterEl.value = '';
         var previewEl = document.getElementById('apPreviewResult');
         previewEl.style.display = 'none';
         previewEl.innerHTML = '';
@@ -6034,6 +6081,22 @@
         }
     }
 
+    /* #1979 follow-up: case-insensitive substring match on column name and
+       (when known) type — the same predicate shape as the register-table
+       wizard's `_matchesSearch` (register_table_form.js), reused here for
+       the column-mask list and the row-rule column picker below. */
+    function _apMatchesColumnFilter(name, type, search) {
+        if (!search) return true;
+        var n = (name || '').toLowerCase();
+        var t = (type || '').toLowerCase();
+        return n.indexOf(search) !== -1 || (!!t && t.indexOf(search) !== -1);
+    }
+
+    function _apColumnFilterValue() {
+        var el = document.getElementById('apColFilter');
+        return ((el && el.value) || '').trim().toLowerCase();
+    }
+
     function _apRenderColList() {
         var list = document.getElementById('apColList');
         if (!_apColumns.length) {
@@ -6045,8 +6108,16 @@
                   + 'one, once it has been synced. Write the policy on the Advanced SQL tab instead.</div>';
             return;
         }
+        var search = _apColumnFilterValue();
+        var visibleColumns = _apColumns.filter(function(col) {
+            return _apMatchesColumnFilter(col.name, col.type, search);
+        });
+        if (!visibleColumns.length) {
+            list.innerHTML = '<div class="form-hint" style="margin:0; padding:10px;">No columns match your filter.</div>';
+            return;
+        }
         var disabled = !_apTable || !_apIsEligible(_apTable);
-        list.innerHTML = _apColumns.map(function(col, i) {
+        list.innerHTML = visibleColumns.map(function(col, i) {
             var maskEntry = _apMaskState[col.name];
             var maskChoice = (maskEntry && typeof maskEntry === 'object') ? maskEntry.choice : (maskEntry || 'show');
             var samples = (col.samples || []).slice(0, 3).map(function(s) {
@@ -6176,6 +6247,13 @@
                 return ''
                     + '<div class="ap-rr-row">'
                     +   '<span class="ap-rr-col-wrap">'
+                    // #1979 follow-up: type-to-filter for the column dropdown's
+                    // menu items, matching the register-table wizard's "Filter
+                    // tables…" box. Skipped alongside the dropdown itself when
+                    // disabled — same reasoning as the comment above.
+                    +     (disabled ? '' : '<input type="text" class="ap-rr-col-filter" id="' + colId + '-filter" '
+                          + 'placeholder="Filter columns…" aria-label="Filter columns for rule ' + (i + 1) + '" '
+                          + 'oninput="_apFilterRowRuleColumnMenu(this)">')
                     +     '<select id="' + colId + '" class="form-input ap-rr-col' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
                     +       'onchange="_apOnRowRuleColumnChange(' + i + ', this.value)">' + colOptions + '</select>'
                     +     (disabled ? '' : _dropdownMarkupHtml(colId + '-dd', colId, 'Column', colDropdownOptions, rule.column))
@@ -6284,6 +6362,40 @@
     function _apOnRowRuleColumnChange(index, value) {
         if (_apRowRules[index]) _apRowRules[index].column = value;
         _apScheduleCompile();
+    }
+
+    /* #1979 follow-up: the type-to-filter box above the column dropdown only
+       ever hides/shows `.ds-dropdown-menu-item`s in place — it never touches
+       `_apRowRules`, `_apColumns`, or the paired `<select>`'s value, so the
+       rule's compiled-SQL contract is unaffected by whatever the admin
+       happened to type while picking a column. */
+    function _apFilterRowRuleColumnMenu(inputEl) {
+        var wrap = inputEl.closest('.ap-rr-col-wrap');
+        if (!wrap) return;
+        var menu = wrap.querySelector('.ds-dropdown-menu');
+        if (!menu) return;
+        var search = inputEl.value.trim().toLowerCase();
+        var items = Array.prototype.slice.call(menu.querySelectorAll('.ds-dropdown-menu-item'));
+        var anyVisible = false;
+        items.forEach(function (item) {
+            var name = item.getAttribute('data-value') || item.textContent || '';
+            var match = _apMatchesColumnFilter(name, '', search);
+            item.hidden = !match;
+            if (match) anyVisible = true;
+        });
+        var empty = menu.querySelector('.ap-rr-col-filter-empty');
+        if (!anyVisible) {
+            if (!empty) {
+                empty = document.createElement('li');
+                empty.className = 'ap-rr-col-filter-empty';
+                empty.setAttribute('role', 'presentation');
+                empty.textContent = 'No columns match your filter.';
+                menu.appendChild(empty);
+            }
+            empty.hidden = false;
+        } else if (empty) {
+            empty.hidden = true;
+        }
     }
 
     function _apOnRowRuleOpChange(index, value) {

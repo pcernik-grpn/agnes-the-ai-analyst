@@ -396,6 +396,84 @@ def test_row_rule_controls_respect_the_eligibility_interlock(seeded_app):
     assert body.count("!_apIsEligible(_apTable)") >= 2
 
 
+def test_row_rule_column_picker_has_a_filter_input(seeded_app):
+    """#1979 follow-up (admin setup-flow review, item 4): the row rule's
+    column dropdown is a flat alphabetical list with no type-to-filter — on
+    a table with 100+ columns the admin scrolls by hand. Matches the
+    register-table wizard's "Filter tables…" box (``_register_table_form.
+    html`` / ``register_table_form.js``): a text input, filtered live, that
+    never changes the picker's selected value."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'class="ap-rr-col-filter"' in body
+    assert "Filter columns…" in body
+    assert 'oninput="_apFilterRowRuleColumnMenu(this)"' in body
+    assert "function _apFilterRowRuleColumnMenu" in body
+    # Skipped alongside the paired custom dropdown for a disabled (ineligible)
+    # row — same interlock the column/operator dropdowns already respect.
+    assert "(disabled ? '' : '<input type=\"text\" class=\"ap-rr-col-filter\"" in body
+
+
+def test_row_rule_column_filter_matches_case_insensitively_and_never_writes_state(seeded_app):
+    """The filter function only toggles ``.ds-dropdown-menu-item`` visibility
+    — it must never touch ``_apRowRules``, ``_apColumns``, or set a
+    ``<select>``'s value, or the picker's value contract with the compiler
+    would drift out from under a keystroke."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    start = body.index("function _apFilterRowRuleColumnMenu")
+    end = body.index("\n    }\n", start)
+    fn = body[start : end + len("\n    }\n")]
+    assert ".toLowerCase()" in fn
+    assert "_apMatchesColumnFilter" in fn
+    assert "_apRowRules" not in fn
+    assert ".value =" not in fn
+    assert "hidden" in fn  # hides/shows menu items and the empty-state message
+
+
+def test_column_mask_list_has_a_matching_filter_input(seeded_app):
+    """The mask/column list below the row rules is sourced from the same
+    ``_apColumns`` fetch — give it the same "Filter columns…" box rather
+    than leaving one of the two column pickers unfiltered."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apColFilter"' in body
+    assert 'class="ap-col-filter"' in body
+    assert "Filter columns…" in body
+    assert 'oninput="_apRenderColList()"' in body
+    assert "function _apMatchesColumnFilter" in body
+    # Case-insensitive substring on name and (when known) type.
+    fn = body[body.index("function _apMatchesColumnFilter") : body.index("function _apColumnFilterValue")]
+    assert ".toLowerCase()" in fn
+    assert "indexOf(search)" in fn
+    # An empty result set says so instead of silently rendering nothing.
+    assert "No columns match your filter." in body
+
+
+def test_column_filter_never_reaches_the_compiled_policy_spec(seeded_app):
+    """Filtering only narrows what ``_apRenderColList``/the row-rule menu
+    render — the compile request still walks the full, unfiltered state
+    (``_apMaskState`` and ``_apRowRules``), so a column hidden by an active
+    filter is never silently dropped from a saved policy."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    compile_start = body.index("async function _apCompileNow")
+    compile_end = body.index("\n    }\n", compile_start)
+    compile_fn = body[compile_start:compile_end]
+    assert "row_rules: _apAssembleRowRules()" in compile_fn
+    assert "column_masks: _apMaskState" in compile_fn
+    assert "apColFilter" not in compile_fn
+    assert "_apFilterRowRuleColumnMenu" not in compile_fn
+
+
 def test_preview_shows_before_after_on_the_raw_sample(seeded_app):
     """access-policy-builder-ux Slice 2, Task B: the preview renders every
     ``base_sample_rows`` row — struck-through when the policy drops it,
