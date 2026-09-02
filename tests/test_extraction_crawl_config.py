@@ -14,11 +14,51 @@ sibling of ``tests/test_extraction_facts_config.py``.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+
+import pytest
+
 BASE = "/api/admin/sharepoint/connections"
+TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _extract_block(text: str, opener: str) -> str:
+    """The brace-balanced body of one declaration, from its signature —
+    same helper `test_admin_data_sources_extraction.py` uses."""
+    start = text.index(opener)
+    depth = 0
+    started = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+            started = True
+        elif ch == "}":
+            depth -= 1
+            if started and depth == 0:
+                return text[start : i + 1]
+    raise AssertionError(f"unbalanced braces extracting {opener!r}")
+
+
+def _run_node(script: str) -> dict:
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    if proc.returncode == 127:
+        pytest.skip("node unavailable")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
 
 
 def _create_connection(client, token, *, name="corp-sharepoint-crawl-config"):
@@ -214,3 +254,189 @@ class TestAdminUiWiring:
         # origin check, not a form-embedded csrf token — same as the
         # sibling Stop button's own fetch call.
         assert 'credentials: "include"' in body
+
+    def test_the_crawl_filter_lives_on_the_card_not_only_the_drawer(self, seeded_app):
+        """Gap 2 (2026-09 live walkthrough): buried behind "View
+        configuration" with nothing on the card hinting it exists. Moved,
+        not duplicated — the drawer's own additive wrap onto
+        `_extConfigHtml` (`_crawlFilterBaseConfigHtml`) is gone, so there is
+        exactly one place this value can be set from, and it can never
+        drift from a second copy."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        resp = client.get("/admin/data-sources", headers=_auth(token))
+        body = resp.text
+        assert "_extRenderCrawlFilter" in body
+        assert "_crawlFilterBaseConfigHtml" not in body
+
+
+class TestCrawlFilterCardRendering:
+    """The Crawl filter control (`_extRenderCrawlFilter`), rendered on the
+    card next to "Facts policy" — same pattern
+    `TestFactsPolicyControlRendering` uses in
+    `test_admin_data_sources_extraction.py` for its sibling control."""
+
+    def _run(self, body_js: str, *, row=None) -> dict:
+        tpl = TEMPLATE.read_text(encoding="utf-8")
+        fns = "\n".join(
+            _extract_block(tpl, sig) for sig in ("function _esc(s) {", "function _extRenderCrawlFilter(row) {")
+        )
+        row = row if row is not None else {"id": "sp1", "config": {}}
+        script = f"""
+{fns}
+const row = {json.dumps(row)};
+{body_js}
+"""
+        return _run_node(script)
+
+    def test_prefills_the_date_input_from_the_connection_override(self):
+        out = self._run(
+            "console.log(JSON.stringify({ html: _extRenderCrawlFilter(row) }));",
+            row={"id": "sp1", "config": {"extraction": {"crawl": {"min_modified": "2026-01-15"}}}},
+        )
+        html = out["html"]
+        assert 'id="ds-sp-crawlfilter-date-sp1"' in html
+        assert 'value="2026-01-15"' in html
+        assert "Currently: files modified on/after 2026-01-15" in html
+
+    def test_no_override_leaves_the_input_blank_and_says_no_filter(self):
+        out = self._run("console.log(JSON.stringify({ html: _extRenderCrawlFilter(row) }));")
+        html = out["html"]
+        assert 'value=""' in html
+        assert "no filter — every file is crawled" in html
+
+    def test_save_and_clear_are_wired_to_this_connection(self):
+        out = self._run(
+            "console.log(JSON.stringify({ html: _extRenderCrawlFilter(row) }));",
+            row={"id": "sp7", "config": {}},
+        )
+        html = out["html"]
+        assert "crawlFilterSave('sp7')" in html
+        assert "crawlFilterClear('sp7')" in html
+
+    def test_an_untrusted_name_is_escaped_not_injected(self):
+        out = self._run(
+            "console.log(JSON.stringify({ html: _extRenderCrawlFilter(row) }));",
+            row={"id": "sp1", "name": "<img src=x onerror=alert(1)>", "config": {}},
+        )
+        html = out["html"]
+        assert "<img" not in html
+        assert "&lt;img" in html
+
+
+class TestCrawlFilterCardSave:
+    """`crawlFilterSave`/`crawlFilterClear` — moved from the drawer's own
+    copy onto the card, same PATCH endpoint, same "show the resolved value
+    only after the server answers" discipline `saveSpFactsPolicy` uses for
+    its sibling control (`TestFactsPolicySave`)."""
+
+    def _run(self, *, action, input_value="", response_status=200, response_body=None, prior_config=None):
+        tpl = TEMPLATE.read_text(encoding="utf-8")
+        fns = "\n".join(
+            _extract_block(tpl, sig)
+            for sig in (
+                "async function _crawlFilterPatch(id, minModified) {",
+                "function crawlFilterSave(id) {",
+                "function crawlFilterClear(id) {",
+            )
+        )
+        response_body = response_body if response_body is not None else {}
+        call = "crawlFilterSave('sp1');" if action == "save" else "crawlFilterClear('sp1');"
+        script = f"""
+const _elements = {{
+  "ds-sp-crawlfilter-date-sp1": {{ value: {json.dumps(input_value)} }},
+  "ds-sp-crawlfilter-status-sp1": {{ textContent: "" }},
+}};
+const document = {{ getElementById: (id) => _elements[id] || null }};
+let _connections = [{{ id: "sp1", config: {json.dumps(prior_config or {})} }}];
+const requests = [];
+const toasts = [];
+function encodeURIComponent(s) {{ return s; }}
+function showToast(msg, ok) {{ toasts.push({{ msg, ok }}); }}
+function detailMessage(body, fallback) {{ return (body && body.detail) || fallback; }}
+async function fetch(url, opts) {{
+  requests.push({{ url, method: opts.method, body: JSON.parse(opts.body) }});
+  return {{
+    ok: {str(response_status < 400).lower()},
+    status: {response_status},
+    json: async () => ({json.dumps(response_body)}),
+  }};
+}}
+
+{fns}
+
+(async () => {{
+  {call}
+  await new Promise((r) => setTimeout(r, 0));
+  console.log(JSON.stringify({{
+    requests,
+    toasts,
+    status: _elements["ds-sp-crawlfilter-status-sp1"].textContent,
+    inputValue: _elements["ds-sp-crawlfilter-date-sp1"].value,
+    conn: _connections[0],
+  }}));
+}})();
+"""
+        return _run_node(script)
+
+    def test_save_with_no_date_sends_nothing_and_says_so(self):
+        out = self._run(action="save", input_value="")
+        assert out["requests"] == []
+        assert out["toasts"][0]["ok"] is False
+        assert "Pick a date first" in out["toasts"][0]["msg"]
+
+    def test_save_sends_the_chosen_date_to_the_crawl_config_endpoint(self):
+        out = self._run(action="save", input_value="2026-02-01")
+        assert out["requests"][0]["url"] == "/api/admin/sharepoint/connections/sp1/extraction/crawl-config"
+        assert out["requests"][0]["method"] == "PATCH"
+        assert out["requests"][0]["body"] == {"min_modified": "2026-02-01"}
+
+    def test_clear_blanks_the_input_and_sends_null(self):
+        out = self._run(action="clear", input_value="2026-02-01")
+        assert out["requests"][0]["body"] == {"min_modified": None}
+        assert out["inputValue"] == ""
+
+    def test_the_resolved_value_and_source_are_shown_after_save(self):
+        out = self._run(
+            action="save",
+            input_value="2026-02-01",
+            response_body={"min_modified": {"value": "2026-02-01", "source": "connection"}},
+        )
+        assert "2026-02-01" in out["status"]
+        assert "connection" in out["status"]
+
+    def test_a_cleared_filter_reads_as_no_filter(self):
+        out = self._run(
+            action="clear",
+            input_value="2026-02-01",
+            response_body={"min_modified": {"value": None, "source": "none"}},
+        )
+        assert out["status"] == "Currently: no filter — every file is crawled."
+
+    def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
+        out = self._run(
+            action="save",
+            input_value="not-really-a-date",
+            response_status=400,
+            response_body={"detail": "invalid_min_modified"},
+        )
+        assert out["status"] == ""
+        assert out["toasts"][0]["ok"] is False
+        assert "invalid_min_modified" in out["toasts"][0]["msg"]
+
+    def test_a_successful_save_updates_the_in_memory_row_for_the_next_repaint(self):
+        out = self._run(
+            action="save",
+            input_value="2026-03-01",
+            prior_config={"extraction": {"crawl": {"min_modified": "2025-01-01"}}},
+            response_body={"min_modified": {"value": "2026-03-01", "source": "connection"}},
+        )
+        assert out["conn"]["config"]["extraction"]["crawl"]["min_modified"] == "2026-03-01"
+
+    def test_a_successful_clear_removes_the_override_from_the_in_memory_row(self):
+        out = self._run(
+            action="clear",
+            input_value="2026-03-01",
+            prior_config={"extraction": {"crawl": {"min_modified": "2026-03-01"}}},
+            response_body={"min_modified": {"value": None, "source": "none"}},
+        )
+        assert "min_modified" not in out["conn"]["config"]["extraction"]["crawl"]

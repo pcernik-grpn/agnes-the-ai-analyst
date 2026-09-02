@@ -2440,6 +2440,44 @@ function _extRenderFactsPolicy(row) {
   </div>`;
 }
 
+/* Crawl filter (backfill lever) — `extraction.crawl.min_modified`,
+   `PATCH .../extraction/crawl-config`
+   (`app/api/admin_extraction.py::patch_extraction_crawl_config`). Lived only
+   inside the "View configuration" drawer until a live walkthrough found
+   nothing on the collapsed card hinting it existed (2026-09 gap 2) — moved
+   here, next to its sibling "Facts policy" override, rather than
+   duplicated: one place to set it from is what keeps the drawer's old
+   read-out and the card from ever disagreeing. Pre-filled straight off
+   `row.config.extraction.crawl.min_modified` — the SAME string
+   `resolve_min_modified` reads server-side, and (per its own docstring)
+   there is no instance-level default it could resolve against instead, so
+   the raw stored value already IS the resolved one; no extra round trip
+   needed just to prefill this input. The PATCH response's `{value,
+   source}` — the same shape `GET …/extraction/config` returns — is shown
+   after Save/Clear, never guessed beforehand, same discipline
+   `_extRenderFactsPolicy` above uses for its own resolved read-out. */
+function _extRenderCrawlFilter(row) {
+  const crawl = ((row.config || {}).extraction || {}).crawl || {};
+  const value = typeof crawl.min_modified === "string" ? crawl.min_modified : "";
+  const statusText = value
+    ? `Currently: files modified on/after ${value} (connection).`
+    : "Currently: no filter — every file is crawled.";
+  const label = _esc(row.name || row.id || "");
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Crawl only files modified on or after a date instead of the whole corpus — useful for a backfill. Sets extraction.crawl.min_modified for this connection; clearing it removes the filter, there is no instance-level default to fall back to.">Crawl filter</span>
+    <span class="ds-src__fact-v">
+      <input type="date" class="ds-dropdown-native" id="ds-sp-crawlfilter-date-${row.id}"
+             value="${_esc(value)}" aria-label="Crawl only files modified on/after this date for ${label}">
+      <span class="field-hint" id="ds-sp-crawlfilter-status-${row.id}">${_esc(statusText)}</span>
+    </span>
+    <span class="ds-src__fact-a">
+      <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${row.id}')">Save</button>
+      <button type="button" class="btn btn-secondary" onclick="crawlFilterClear('${row.id}')">Clear</button>
+    </span>
+  </div>`;
+}
+
 /* File-source card body (spec §13.2 "Source card"): schedule (static text —
    the crawl runs externally), certificate (origin + set-date, NEVER the
    value), identity matching (fail-closed grant coverage), and error badges
@@ -2679,6 +2717,7 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-a"><button type="button" id="ext-facts-btn-${row.id}" class="btn btn-secondary" data-facts-ready="${factsReady ? "1" : "0"}" ${factsReady ? "" : "disabled"} title="${_esc(factsUnreadyText)}" onclick="runSpFactsExtraction('${row.id}')">Extract facts now</button></span>
   </div>
   ${_extRenderFactsPolicy(row)}
+  ${_extRenderCrawlFilter(row)}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
@@ -3450,6 +3489,71 @@ async function saveSpFactsPolicy(id) {
     if (statusEl) statusEl.textContent = "";
     showToast("Request failed", false);
   }
+}
+
+/* Saves/clears the "Crawl filter" control (`_extRenderCrawlFilter` above)
+   via `PATCH .../extraction/crawl-config`
+   (`app/api/admin_extraction.py::patch_extraction_crawl_config`). Moved
+   here from the "View configuration" drawer, not duplicated — same
+   endpoint, same request shape, only the DOM ids changed to match this
+   control's own home on the card. An empty Save is refused client-side
+   (Clear is the explicit way to remove a filter, never an implicit blank
+   Save); the response's resolved `{value, source}` lands in the status
+   line, never guessed beforehand, mirroring `saveSpFactsPolicy` above. */
+async function _crawlFilterPatch(id, minModified) {
+  const statusEl = document.getElementById(`ds-sp-crawlfilter-status-${id}`);
+  if (statusEl) statusEl.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/crawl-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_modified: minModified }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const mm = body.min_modified || {};
+      if (statusEl) {
+        statusEl.textContent = mm.value
+          ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
+          : "Currently: no filter — every file is crawled.";
+      }
+      showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+      // Keep the in-memory row current — a later `renderConnList()` (e.g.
+      // after `loadConnections()`) must redraw the just-saved override, not
+      // the value the page loaded with.
+      const conn = _connections.find((c) => c.id === id);
+      if (conn) {
+        conn.config = conn.config || {};
+        conn.config.extraction = conn.config.extraction || {};
+        const crawl = { ...(conn.config.extraction.crawl || {}) };
+        if (minModified === null) delete crawl.min_modified; else crawl.min_modified = minModified;
+        conn.config.extraction.crawl = crawl;
+      }
+    } else {
+      if (statusEl) statusEl.textContent = "";
+      showToast(detailMessage(body, "couldn't save the crawl filter"), false);
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast("Request failed.", false);
+  }
+}
+
+function crawlFilterSave(id) {
+  const input = document.getElementById(`ds-sp-crawlfilter-date-${id}`);
+  const value = (input && input.value || "").trim();
+  if (!value) {
+    showToast("Pick a date first, or use Clear to remove the filter.", false);
+    return;
+  }
+  _crawlFilterPatch(id, value);
+}
+
+function crawlFilterClear(id) {
+  const input = document.getElementById(`ds-sp-crawlfilter-date-${id}`);
+  if (input) input.value = "";
+  _crawlFilterPatch(id, null);
 }
 
 function toggleSpCertRow(id) {
@@ -8458,6 +8562,33 @@ function _extConfigHtml(body) {
     ${scopeBlock}`;
 }
 
+/* Expanding a card must show its extraction status immediately — not wait
+   for the next poll tick, up to `EXT_POLL_IDLE_MS` (30s) away on a fresh
+   page (2026-09 live walkthrough, design gap 1: the block stayed empty
+   behind "Run extraction now" / "View configuration" until then).
+   `setSourceOpen` is the ONE function every expand path already calls — the
+   caret, a click on the card head, and every "open this card and show me a
+   row" helper elsewhere on the page — so wrapping it here reaches all of
+   them with no second listener to keep in sync. Only for a SharePoint card
+   (an `ext-block-` anchor exists) with nothing live cached yet: an
+   already-fetched card, a 501-stopped one, or a repeat open/close costs
+   nothing extra. `_extFetchOne` is the poll's own single fetch-and-render
+   for one connection — reused, never reimplemented. */
+function _extMaybeFetchOnExpand(connId) {
+  if (!document.getElementById(`ext-block-${connId}`)) return;
+  const st = _extS(connId);
+  if (st.stopped || st.data) return;
+  _extFetchOne(connId);
+}
+
+if (typeof setSourceOpen === "function") {
+  const _extPrevSetSourceOpen = setSourceOpen;
+  setSourceOpen = function (id, open) {
+    _extPrevSetSourceOpen(id, open);
+    if (open) _extMaybeFetchOnExpand(id);
+  };
+}
+
 _extTick();
 _extSchedule();
 </script>
@@ -8642,118 +8773,6 @@ if (typeof _extConfigHtml === "function") {
   const _anonPrevBaseConfigHtml = _extConfigHtml;
   _extConfigHtml = function (body) {
     return _anonPrevBaseConfigHtml(body) + _anonPrevPanel();
-  };
-}
-</script>
-
-{#- ── Crawl filter (backfill lever) ──────────────────────────────────────
-     Same additive-wrap contract as the redaction preview block above:
-     `_extConfigHtml` is a global function this block re-wraps, so this is
-     purely additive and does not touch the drawer's own renderer. It
-     reads `body.connection_id` — already on every `…/extraction/config`
-     response — rather than needing a new parameter threaded through
-     `toggleExtractionDrawer`.
-
-     Sets `extraction.crawl.min_modified` via `PATCH …/extraction/
-     crawl-config`, the same `/api/**` JSON endpoint the Stop button above
-     calls: cookie-session authed, protected by the app-wide
-     `CsrfOriginMiddleware` origin check (not the separate `web_csrf`
-     double-submit token, which covers only the HTML <form> handlers) —
-     `credentials: "include"`, no token field, exactly like `extStopRun`. -#}
-<style>
-  .crawlfilter { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ds-border-light); }
-  .crawlfilter__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
-  .crawlfilter__title { font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); }
-  .crawlfilter__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .crawlfilter__input {
-    font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
-    background: var(--ds-surface); color: var(--ds-text-primary);
-  }
-  .crawlfilter__input:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
-</style>
-<script>
-/* Every field here is either server-trusted (the connection id, the
-   resolved date this same endpoint just wrote) or set via `textContent`
-   (never `innerHTML`) — `_extEsc` is still applied defensively, same
-   discipline the drawer's own rows already follow. */
-function _crawlFilterPanel(body) {
-  const connId = body.connection_id;
-  const mm = body.min_modified || {};
-  const value = mm.value || "";
-  const statusText = value
-    ? `Currently: files modified on/after ${value} (${mm.source}).`
-    : "Currently: no filter — every file is crawled.";
-  return `
-    <div class="crawlfilter">
-      <div class="crawlfilter__head">
-        <span class="crawlfilter__title">Crawl filter</span>
-        <span class="ext-sub">Crawl only files modified on or after a date, instead of the whole corpus — useful for a backfill.</span>
-      </div>
-      <div class="crawlfilter__row">
-        <input type="date" class="crawlfilter__input" id="crawlfilter-${_extEsc(connId)}-date"
-          value="${_extEsc(value)}" aria-label="Crawl only files modified on/after this date">
-        <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${connId}')">Save</button>
-        <button type="button" class="btn btn-secondary" onclick="crawlFilterClear('${connId}')">Clear</button>
-      </div>
-      <div class="ext-sub" id="crawlfilter-${_extEsc(connId)}-status">${_extEsc(statusText)}</div>
-    </div>`;
-}
-
-async function _crawlFilterPatch(connId, minModified) {
-  const status = document.getElementById(`crawlfilter-${connId}-status`);
-  if (status) status.textContent = "Saving…";
-  try {
-    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/crawl-config`, {
-      method: "PATCH",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ min_modified: minModified }),
-    });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't save the crawl filter") : "couldn't save the crawl filter";
-      if (status) status.textContent = "Save failed — see the notification above.";
-      if (typeof showToast === "function") showToast(`Crawl filter: ${msg}`, false);
-      return;
-    }
-    const mm = body.min_modified || {};
-    if (status) {
-      status.textContent = mm.value
-        ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
-        : "Currently: no filter — every file is crawled.";
-    }
-    if (typeof showToast === "function") {
-      showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
-    }
-  } catch (e) {
-    if (status) status.textContent = "Request failed.";
-    if (typeof showToast === "function") showToast("Request failed.", false);
-  }
-}
-
-function crawlFilterSave(connId) {
-  const input = document.getElementById(`crawlfilter-${connId}-date`);
-  const value = (input && input.value || "").trim();
-  if (!value) {
-    if (typeof showToast === "function") showToast("Pick a date first, or use Clear to remove the filter.", false);
-    return;
-  }
-  _crawlFilterPatch(connId, value);
-}
-
-function crawlFilterClear(connId) {
-  const input = document.getElementById(`crawlfilter-${connId}-date`);
-  if (input) input.value = "";
-  _crawlFilterPatch(connId, null);
-}
-
-/* Append the panel to the config drawer without touching its renderer —
-   the SAME wrap contract the redaction-preview block above uses, applied
-   again on top of it, so both additions compose. */
-if (typeof _extConfigHtml === "function") {
-  const _crawlFilterBaseConfigHtml = _extConfigHtml;
-  _extConfigHtml = function (body) {
-    return _crawlFilterBaseConfigHtml(body) + _crawlFilterPanel(body);
   };
 }
 </script>
