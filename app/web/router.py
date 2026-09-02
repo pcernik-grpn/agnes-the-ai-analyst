@@ -2394,6 +2394,8 @@ def _has_connected_tools(user) -> bool:
     True when the connect page has been reached (``user_journey_state.
     use_anywhere``) OR the caller holds a live personal access token — the
     credential `agnes init` writes, so its existence is the connection.
+    "Live" means unrevoked AND unexpired: the repository filters only the
+    first, so expiry is asked separately through the resolver's own helper.
     Best-effort: a bookkeeping read must never fail the Library, and a false
     here only means the invitation is shown one more time.
     """
@@ -2411,9 +2413,15 @@ def _has_connected_tools(user) -> bool:
     except Exception as e:
         logger.warning("/library: could not read journey state: %s", e)
     try:
+        from app.auth.pat_resolver import pat_is_expired
         from src.repositories import access_token_repo
 
-        return bool(access_token_repo().list_for_user(uid, include_revoked=False))
+        # `include_revoked=False` filters revoked_at only — the repository has
+        # no expiry predicate — so an expired token would otherwise read as a
+        # connection and withhold the invitation from a user who has nothing
+        # usable (Devin Review on #1998). Expiry is asked through the same
+        # helper the PAT resolver uses, so "live" means one thing.
+        return any(not pat_is_expired(row) for row in access_token_repo().list_for_user(uid, include_revoked=False))
     except Exception as e:
         logger.warning("/library: could not read access tokens: %s", e)
         return False
