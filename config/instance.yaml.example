@@ -1465,6 +1465,28 @@ extraction:
     # the ceiling a single heavy document can still reach. 0 disables the
     # cap; not enforceable on every platform (notably macOS).
     convert_child_memory_limit_mb: 1536
+    # Ceiling on the CONVERTED MARKDOWN a conversion worker is allowed to
+    # send back to the crawl's main process, in MiB. A THIRD, separate
+    # guard from the two above: recycling and the RLIMIT_AS cap both hold
+    # the WORKER's own memory down, but neither bounds how big the
+    # converted TEXT itself gets before it crosses back into the crawl's
+    # main process -- where anonymize, storage and chunking each hold their
+    # own copy, on top of every OTHER document in flight at the same time.
+    # A spreadsheet's markdown table can stay comfortably under the
+    # worker's own memory ceiling the whole time while still being large
+    # enough, multiplied across `concurrency` documents at once, to exhaust
+    # the crawl's main process instead. Over the cap is counted
+    # `convert_failed` for that one file, exactly like any other
+    # unconvertible document -- never a crash, never collateral damage to a
+    # sibling. 0 disables the cap.
+    #
+    # 8, not something larger, because the converter already caps a
+    # conversion at 5,000,000 CHARACTERS: the biggest reply that can exist
+    # is ~4.8 MiB of ASCII and ~19 MiB at the four-bytes-per-character
+    # worst case. A threshold above that is unreachable and guards nothing.
+    # At 8 MiB an ordinary document passes untouched and the multi-byte
+    # ones that really do reach double-digit megabytes are refused.
+    max_converted_mb: 8
     # How long (seconds) a single item's CONVERSION may run before its
     # worker is killed and the file counted an ordinary, attributable
     # `convert_failed` -- the per-item TIME bound. Without it, nothing

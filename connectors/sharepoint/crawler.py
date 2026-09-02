@@ -215,6 +215,40 @@ _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: 0 disables the cap. Not enforceable on every platform (notably macOS,
 #: where this repo's tests run) — see ``_install_memory_limit``.
 _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
+#: Ceiling on the CONVERTED MARKDOWN a child is allowed to send back across
+#: the pipe, in MiB (0 disables). A THIRD, separate live-deployment finding
+#: from the two above: recycling and `RLIMIT_AS` both hold the CHILD's own
+#: memory down, but neither one bounds how big the converted TEXT itself is
+#: allowed to get before it crosses back into the parent — where
+#: `_prepare_document` (anonymize), `_Ingestor.ingest` (encode, store) and
+#: `ingest_file` (re-read, chunk) each hold their own copy, on a PARENT
+#: thread, entirely unisolated. On a live deployment a full run OOM-killed
+#: the PARENT (uvicorn) at 12.3 GiB while every one of ten conversion
+#: children sat idle at 0.0% CPU and ~240 MB — a spreadsheet's converted
+#: markdown table can stay comfortably under the child's own `RLIMIT_AS`
+#: ceiling the whole time (nothing there ever fires) while still being
+#: large enough, multiplied across the documents concurrency lets run at
+#: once, to exhaust the parent. This cap refuses the oversized result
+#: (counted `convert_failed`, exactly like any other unconvertible
+#: document — see `_convert_worker_main`) INSIDE the child, before
+#: `_ConvertReply` is ever built, so the giant string never crosses the
+#: pipe at all. Configurable (``extraction.crawler.max_converted_mb``).
+#:
+#: The number has to sit under what the converter can actually emit, or the
+#: guard is decorative. ``convert.DEFAULT_MAX_CHARS`` caps a conversion at
+#: 5,000,000 CHARACTERS, so the largest reply that can exist is that many
+#: characters encoded as UTF-8: ~4.8 MiB of ASCII, ~14 MiB of CJK, ~19 MiB
+#: at the 4-bytes-per-character worst case. A 200 MiB threshold was therefore
+#: unreachable by construction and left the parent OOM it was written for
+#: completely unaddressed (Devin Review on #2078). 8 MiB is chosen against
+#: those numbers: an ordinary document — even a 5M-character one in a
+#: single-byte script — passes untouched, while the multi-byte documents that
+#: can actually reach double-digit megabytes are refused, which is exactly
+#: the set that multiplies across concurrent slots into the parent's memory.
+#: ``tests/test_sharepoint_convert_child.py`` pins the two ceilings together
+#: so a future change to either cannot silently make this one decorative
+#: again.
+_DEFAULT_MAX_CONVERTED_MB = 8
 #: How long a single item's CONVERSION may run before its worker is killed
 #: and the file counted an ordinary, attributable ``convert_failed`` — the
 #: per-item TIME bound. Nothing previously bounded how long one document
@@ -1989,8 +2023,12 @@ class _Ingestor:
             # Inline, not a background task: this runs inside the worker's
             # own EXTRACTION lane slot, which is exactly where chunking is
             # supposed to happen, and finishing each document before fetching
-            # the next keeps the crawl's memory flat.
-            ingest_file(file_id)
+            # the next keeps the crawl's memory flat. `preloaded_text=markdown`
+            # skips `ingest_file`'s own disk re-read of the SAME content
+            # `store_corpus_bytes` just wrote — a redundant full-size copy of
+            # the converted markdown, on a parent thread, that this crawl's
+            # own memory-pressure finding named as a contributor.
+            ingest_file(file_id, preloaded_text=markdown)
         return file_id, not existed
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
@@ -2192,7 +2230,7 @@ def _install_memory_limit(limit_bytes: int) -> None:
         pass
 
 
-def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0) -> None:
+def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_output_bytes: int = 0) -> None:
     """Entry point for a dedicated conversion child process — runs ONLY
     inside a forked child, never called directly.
 
@@ -2212,6 +2250,13 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0) -> None:
     function's `try/except` entirely by definition; the parent notices this
     worker is gone via the pipe closing (``EOFError`` on its next
     ``recv``), not via anything sent from here.
+
+    A conversion that SUCCEEDS but produces markdown over
+    ``max_output_bytes`` (see :data:`_DEFAULT_MAX_CONVERTED_MB`) is turned
+    into the same kind of ``ok=False`` reply as an ordinary exception —
+    ``detail_type="ConvertedTooLarge"`` — built WITHOUT the oversized
+    ``markdown`` ever touching a :class:`_ConvertOutcome`, so it never
+    crosses ``conn.send`` at all.
     """
     _install_memory_limit(memory_limit_bytes)
     while True:
@@ -2232,6 +2277,21 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0) -> None:
             except OSError:
                 return
             continue
+        if max_output_bytes > 0:
+            size = len(markdown.encode("utf-8"))
+            if size > max_output_bytes:
+                outcome = _ConvertOutcome(
+                    ok=False,
+                    detail_type="ConvertedTooLarge",
+                    detail_message=(
+                        f"converted output ({human_bytes(size)}) exceeds the {human_bytes(max_output_bytes)} cap"
+                    ),
+                )
+                try:
+                    conn.send(_ConvertReply(outcome=outcome, rss_bytes=_peak_rss_bytes()))
+                except OSError:
+                    return
+                continue
         try:
             conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_peak_rss_bytes()))
         except OSError:
@@ -2342,7 +2402,12 @@ class _ConvertProcessPool:
     :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for the full reasoning),
     so a single pathological document raises an ATTRIBUTABLE
     ``MemoryError`` for the file that caused it instead of pressuring the
-    whole container and getting an arbitrary sibling SIGKILLed.
+    whole container and getting an arbitrary sibling SIGKILLed. A SEPARATE
+    ceiling, ``max_output_bytes`` (see :data:`_DEFAULT_MAX_CONVERTED_MB`),
+    bounds the CONVERTED TEXT a worker is allowed to send back across the
+    pipe — the two are independent: a document can convert well within its
+    own RLIMIT_AS the whole time and still produce more markdown than the
+    parent should ever be handed at once.
     """
 
     def __init__(
@@ -2353,6 +2418,7 @@ class _ConvertProcessPool:
         recycle_after_docs: int = _DEFAULT_CONVERT_RECYCLE_AFTER_DOCS,
         recycle_rss_bytes: int = _DEFAULT_CONVERT_RECYCLE_RSS_MB * 1024 * 1024,
         memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
+        max_output_bytes: int = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024,
         timeout_s: float = 0.0,
     ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
@@ -2360,6 +2426,7 @@ class _ConvertProcessPool:
         self._recycle_after_docs = max(0, int(recycle_after_docs))
         self._recycle_rss_bytes = max(0, int(recycle_rss_bytes))
         self._memory_limit_bytes = max(0, int(memory_limit_bytes))
+        self._max_output_bytes = max(0, int(max_output_bytes))
         #: Per-item CONVERSION bound — see :data:`_DEFAULT_ITEM_TIMEOUT_S`.
         #: 0 disables it (block on ``conn.recv()`` exactly as before this
         #: existed).
@@ -2386,7 +2453,7 @@ class _ConvertProcessPool:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
         proc = self._ctx.Process(
             target=_convert_worker_main,
-            args=(child_conn, self._memory_limit_bytes),
+            args=(child_conn, self._memory_limit_bytes, self._max_output_bytes),
             daemon=True,
             name=f"sp-convert-{slot}",
         )
@@ -2400,7 +2467,7 @@ class _ConvertProcessPool:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)
         proc = self._ctx.Process(
             target=_convert_worker_main,
-            args=(child_conn, self._memory_limit_bytes),
+            args=(child_conn, self._memory_limit_bytes, self._max_output_bytes),
             daemon=True,
             name=f"sp-convert-{slot}-spare",
         )
@@ -2772,6 +2839,13 @@ def _prepare_document(
     allocating at the wrong moment — an operator reading a bare
     ``SIGKILL`` cannot tell those apart, so :func:`_convert_crash_detail`
     says so explicitly.
+
+    A ``"ConvertedTooLarge"`` outcome (live deployment #3, 2026-09-02: see
+    :data:`_DEFAULT_MAX_CONVERTED_MB`) is worded the SAME way regardless of
+    ``anonymize``, same as ``MemoryError`` above: its ``detail_message`` is
+    built by :func:`_convert_worker_main` from byte counts alone, never
+    document content, so there is nothing for an anonymize-marked scope to
+    gate.
     """
     source_sha256 = _sha256_file(tmp_path)
     try:
@@ -2780,6 +2854,8 @@ def _prepare_document(
             if not outcome.ok:
                 if outcome.detail_type == "MemoryError":
                     detail = "exceeded its own memory limit"
+                elif outcome.detail_type == "ConvertedTooLarge":
+                    detail = outcome.detail_message
                 else:
                     detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
                 logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
@@ -3753,6 +3829,19 @@ def _convert_child_memory_limit_bytes() -> int:
     return mb * 1024 * 1024
 
 
+def _max_converted_output_bytes() -> int:
+    """``extraction.crawler.max_converted_mb``, resolved to bytes — see
+    :data:`_DEFAULT_MAX_CONVERTED_MB`. 0 disables the cap."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "max_converted_mb", default=_DEFAULT_MAX_CONVERTED_MB)
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_MAX_CONVERTED_MB
+    return mb * 1024 * 1024
+
+
 def _item_timeout_seconds() -> int:
     """``extraction.crawler.item_timeout_s`` — see
     :data:`_DEFAULT_ITEM_TIMEOUT_S`. 0 (or negative, or unparseable)
@@ -4053,6 +4142,7 @@ async def _run_crawl_async(
         recycle_after_docs=_convert_recycle_after_docs(),
         recycle_rss_bytes=_convert_recycle_rss_bytes(),
         memory_limit_bytes=_convert_child_memory_limit_bytes(),
+        max_output_bytes=_max_converted_output_bytes(),
         timeout_s=_item_timeout_seconds(),
     )
     convert_pool.start()
