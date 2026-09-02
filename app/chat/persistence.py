@@ -245,10 +245,29 @@ class ChatRepository:
         return _row_to_session(row) if row else None
 
     def archive_session(self, chat_id: str) -> None:
+        """Put a conversation away — and UNPIN it, because the two states
+        contradict each other.
+
+        A pin means "keep this at the top of my list"; archiving means "this is
+        not in my list". A row that is both is a state nothing can act on
+        coherently: the rail (the only surface a pin positions anything on) lists
+        no archived rows, so the pin has no effect there, while /chats would show
+        a pinned row wearing an ARCHIVED badge and offer a "Pinned only" filter
+        that returns it. Clearing the pin here is what keeps the invariant true
+        at the source rather than papering over it per surface.
+
+        `restore_session` deliberately does NOT put the pin back: the pin is
+        gone, and re-pinning a restored conversation is one click for whoever
+        wants it — guessing on their behalf would resurrect a position they may
+        have long stopped wanting.
+        """
         if self._sessions_pg is not None:
             self._sessions_pg.archive_session(chat_id)
             return
-        self._conn.execute("UPDATE chat_sessions SET archived = TRUE WHERE id = ?", [chat_id])
+        self._conn.execute(
+            "UPDATE chat_sessions SET archived = TRUE, pinned_at = NULL WHERE id = ?",
+            [chat_id],
+        )
 
     def restore_session(self, chat_id: str) -> None:
         """Un-archive a session — the way back from the Chats page's Archived

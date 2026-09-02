@@ -17,29 +17,50 @@
      FilterToolbar.init({
        rows: '#af-tbody tr',
        search:  { el: '#af-search', attr: 'data-search' },
-       segments:{ container: '#af-own', attr: 'data-ownership',
+       // `segments` is a SCOPE, not a filter: exactly one is on at a time,
+       // there is no "none selected" state, and it grows no chip. Reach for
+       // it only where the options really are alternatives — /library's
+       // top-level tabs (`#lib-tabs`). Anything a reader might want two of
+       // at once is a FACET; /chats' All/Pinned/Shared/Archived were segments
+       // and had to move, because a scope cannot combine, cannot be chipped
+       // and cannot be cleared.
+       segments:{ container: '#lib-tabs', attr: 'data-tab',
                   expand: { mine: ['mine', 'shared_by_me'] } },
-       // …or, when the segments are NOT mutually exclusive (a chat can be
-       // both pinned and shared), `multi: true` reads the attribute as a
-       // pipe-separated SET and keeps a row whose set contains the selected
-       // segment — the same shape `facets[].multi` uses. `all` then stops
-       // being a wildcard and becomes an ordinary token every row that
-       // belongs in the default view carries, which is what lets a bucket
-       // (archived) be excluded from it without a special case:
-       //   segments:{ container: '#ch-seg', attr: 'data-buckets', multi: true }
-       //   <tr data-buckets="all|pinned">  <tr data-buckets="archived">
-       //   `searchSpansSegments: true` then makes an ACTIVE SEARCH ignore the
-       //   segment entirely. With `multi`, a bucket left out of the default
-       //   view is unreachable by search too — you cannot find what the view
-       //   already excluded — so searching a term from an archived chat
-       //   returned nothing at all and the conversation was simply lost
-       //   (#1974). Searching is a request for a specific thing, not a way of
-       //   browsing the current view, so it looks everywhere; the facets still
-       //   apply, because those the user set on purpose.
-       segments:{ container: '#ch-seg', attr: 'data-buckets', multi: true,
-                  searchSpansSegments: true },
+       // `multi: true` reads the row's attribute as a pipe-separated SET
+       // rather than one value, and keeps a row whose set contains the
+       // selected segment — the same shape `facets[].multi` uses.
        facets:  [ { key: 'type', attr: 'data-type', label: 'Type' },
                   { key: 'origin', attr: 'data-origin', label: 'Source' },
+                  // ONE OF N. `exclusive` renders the options as radios and
+                  // makes selecting REPLACE rather than add — for a dimension
+                  // whose values are genuinely alternatives (a conversation is
+                  // live or archived, never both), where an OR-group would
+                  // offer combinations that mean nothing.
+                  //
+                  // `whenEmpty` is the resting value: what the list shows
+                  // before anything is chosen, and what Clear returns to. It
+                  // is a CONDITION, not the absence of one — /chats keeps
+                  // archived conversations out until asked — and a selection
+                  // REPLACES it rather than narrowing within it. A facet
+                  // resting on that value is not an applied filter: no chip,
+                  // no badge count, however it got there.
+                  //
+                  // `spansSearch` lets an ACTIVE SEARCH ignore this facet
+                  // entirely: a value it excludes would otherwise be
+                  // unfindable as well as unlisted — searching a term from an
+                  // archived chat returned nothing at all and the conversation
+                  // was simply lost (#1974). Searching is a request for a
+                  // specific thing, not a way of browsing the current view.
+                  { key: 'status', attr: 'data-status', label: 'Show',
+                    multi: true, exclusive: true,
+                    whenEmpty: ['active'], spansSearch: true },
+                  // Independent conditions over that state, ANDed with it and
+                  // with each other — a flag is not an alternative to a
+                  // lifecycle state, and cramming the two dimensions into one
+                  // OR-group is what made "All + Shared" a combination with no
+                  // meaning.
+                  { key: 'pinned', attr: 'data-pinned', label: 'Pinned only',
+                    toggle: true },
                   // A binary condition, not a category: on = keep only rows
                   // whose `attr` equals the facet's value, off = keep
                   // everything. Rendered either as one checkbox sitting
@@ -153,20 +174,28 @@
     // Non-exclusive segments: the row's attribute is a pipe-separated SET
     // rather than one value (see the usage block above).
     var segMulti = !!(cfg.segments && cfg.segments.multi);
-    //: Opt-in: an active search looks in every segment, not just the current
-    //: view (see segMatch). Off by default — a page whose segments are a real
-    //: scope ("mine" vs "everyone's") means them, search included.
-    var segSpansOnSearch = !!(cfg.segments && cfg.segments.searchSpansSegments);
     var facetState = {};                 // key -> Set(values)
-    facets.forEach(function (f) { facetState[f.key] = new Set(); });
+    var facetsByKey = {};                // key -> the facet's own config
+    facets.forEach(function (f) { facetState[f.key] = new Set(); facetsByKey[f.key] = f; });
+
+    //: A facet is RESTING when it is not narrowing anything — nothing selected,
+    //: or (with `whenEmpty`) exactly the resting value selected. An `exclusive`
+    //: facet always has one option chosen, so "nothing selected" is not a state
+    //: it can be in; without this, picking its default explicitly would grow a
+    //: chip saying "Status: Active" over an unfiltered list.
+    function facetResting(f) {
+      var sel = facetState[f.key];
+      if (!f.whenEmpty) return sel.size === 0;
+      if (sel.size === 0) return true;
+      if (sel.size !== f.whenEmpty.length) return false;
+      var same = true;
+      sel.forEach(function (v) { if (f.whenEmpty.indexOf(v) === -1) same = false; });
+      return same;
+    }
 
     // ── matching ──
     function segMatch(row) {
       if (!cfg.segments) return true;
-      // An active search outranks the segment when the page asks for it: a
-      // search is a request for one named thing, and a view that hides it
-      // makes the thing unfindable rather than merely unlisted (#1974).
-      if (segSpansOnSearch && searchActive()) return true;
       // `all` is a wildcard only for exclusive segments. With `multi` it is a
       // real token, so a row that doesn't carry it (an archived chat) stays out
       // of the default view — which is the whole point of the mode.
@@ -185,7 +214,19 @@
       for (var i = 0; i < facets.length; i++) {
         var f = facets[i];
         var sel = facetState[f.key];
-        if (sel.size === 0) continue;
+        // An active search outranks this facet where the page asks for it: a
+        // search is a request for one named thing, and a filter that hides it
+        // makes the thing unfindable rather than merely unlisted (#1974).
+        if (f.spansSearch && searchActive()) continue;
+        // `whenEmpty` is what "nothing selected" means for this facet. Normally
+        // that is "don't filter", but a facet can have a resting condition that
+        // is not the absence of one: /chats hides ARCHIVED conversations until
+        // asked, so its bucket facet rests on the live ones. Anything the
+        // reader ticks — Archived included — replaces that resting value rather
+        // than narrowing within it.
+        var empty = sel.size === 0;
+        if (empty && !f.whenEmpty) continue;
+        var allowed = empty ? f.whenEmpty : sel;
         var raw = row.getAttribute(f.attr) || '';
         if (f.multi) {
           // Multi-valued attribute (e.g. data-tags="a|b"): match if ANY of the
@@ -193,10 +234,10 @@
           var vals = raw.split('|');
           var hit = false;
           for (var v = 0; v < vals.length; v++) {
-            if (vals[v] && sel.has(vals[v])) { hit = true; break; }
+            if (vals[v] && has(allowed, vals[v])) { hit = true; break; }
           }
           if (!hit) return false;
-        } else if (!sel.has(raw)) {
+        } else if (!has(allowed, raw)) {
           return false;
         }
       }
@@ -204,6 +245,10 @@
     }
     function searchActive() {
       return !!(searchEl && (searchEl.value || '').trim());
+    }
+    //: `allowed` above is a Set (the live selection) or the `whenEmpty` array.
+    function has(allowed, value) {
+      return allowed.has ? allowed.has(value) : allowed.indexOf(value) !== -1;
     }
     function searchMatch(row) {
       if (!searchEl) return true;
@@ -237,9 +282,27 @@
       });
     }
 
+    //: `exclusive` options are radios, and a radio group cannot be left in "no
+    //: choice" — so state is pushed back onto it rather than toggled in place:
+    //: an empty selection shows the resting option checked, which is what it
+    //: means. Driven from apply(), the funnel every mutation goes through.
+    function syncExclusiveInputs() {
+      if (!menuEl) return;
+      facets.forEach(function (f) {
+        if (!f.exclusive) return;
+        var sel = facetState[f.key];
+        var resting = (f.whenEmpty && f.whenEmpty[0]) || null;
+        qsa('input[data-facet="' + f.key + '"]', menuEl).forEach(function (i) {
+          i.checked = sel.size ? sel.has(i.value) : i.value === resting;
+        });
+      });
+    }
+
     function activeFacetCount() {
       return facets.reduce(function (n, f) {
-        return f.control ? n : n + facetState[f.key].size;
+        // A resting facet is not an applied filter — see facetResting().
+        if (f.control || facetResting(f)) return n;
+        return n + facetState[f.key].size;
       }, 0);
     }
 
@@ -255,7 +318,7 @@
       facets.forEach(function (f) {
         var el = qs('[data-cat-count="' + f.key + '"]', menuEl);
         if (!el) return;
-        var n = facetState[f.key].size;
+        var n = facetResting(f) ? 0 : facetState[f.key].size;
         el.textContent = n;
         el.hidden = n === 0;
       });
@@ -531,6 +594,13 @@
       facets.forEach(function (f) {
         // Its own toolbar button is the readout — see externalEl().
         if (f.control) return;
+        // A resting facet has nothing to say: an `exclusive` group always has
+        // one option chosen, so its default would otherwise chip as a filter.
+        if (facetResting(f)) {
+          var restingChip = chipEls[f.key];
+          if (restingChip) { restingChip.remove(); delete chipEls[f.key]; }
+          return;
+        }
         var labels = [];
         facetState[f.key].forEach(function (val) { labels.push(labelFor(f, val)); });
         var chip = chipEls[f.key];
@@ -568,11 +638,23 @@
 
     // ── mutations ──
     function setFacet(key, value, on) {
+      var f = facetsByKey[key];
       var sel = facetState[key];
-      if (on) sel.add(value); else sel.delete(value);
-      if (menuEl) {
-        var input = qs('input[data-facet="' + key + '"][value="' + value + '"]', menuEl);
-        if (input) input.checked = on;
+      if (f && f.exclusive) {
+        // One of N. Selecting replaces, and there is no unselecting: the
+        // resting condition is itself one of the options, so "off" is reached
+        // by choosing that one rather than by clearing this one. The inputs are
+        // re-synced from state in apply() (syncExclusiveInputs), which is what
+        // keeps the group right on every other path into it — a chip's ×,
+        // Clear, reset.
+        sel.clear();
+        if (on !== false) sel.add(value);
+      } else {
+        if (on) sel.add(value); else sel.delete(value);
+        if (menuEl) {
+          var input = qs('input[data-facet="' + key + '"][value="' + value + '"]', menuEl);
+          if (input) input.checked = on;
+        }
       }
       apply();
     }
@@ -695,6 +777,7 @@
       }
       renderChips();
       syncCatCounts();
+      syncExclusiveInputs();
       syncExternalControls();
       applyView();  // re-project the grid from the new visible set
       if (cfg.onApply) {
@@ -1005,10 +1088,11 @@
     apply();
     return {
       apply: apply, refresh: refresh, reset: resetAll,
-      // Exposed so a page can offer a second route into a segment beside the
-      // segmented control itself — /chats puts one next to the count, where
-      // the number that says rows are hidden actually appears.
       setSegment: setSegment,
+      // Exposed so a page can offer a second route to a facet value beside the
+      // Filter menu itself — /chats puts one next to the count, where the
+      // number that says rows are hidden actually appears.
+      setFacet: setFacet,
       setView: setView, renderGrid: renderGrid, setSort: setSort,
       destroy: destroy,
     };
