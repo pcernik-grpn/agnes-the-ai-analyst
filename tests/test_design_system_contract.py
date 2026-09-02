@@ -1703,9 +1703,21 @@ def test_a_pinned_actions_column_is_shadowed_and_never_faded() -> None:
     table with pinned actions would fade out precisely the button the pin
     exists to keep on screen. That side states the same fact with a shadow."""
     css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
-    assert _CUE_SHADOW_RE.search(css), (
+    shadow_rule = _CUE_SHADOW_RE.search(css)
+    assert shadow_rule, (
         "no `is-cue-right` box-shadow on `.data-table--pinned-actions` — a pinned "
         "column would sit flush over hidden table with nothing to say so"
+    )
+    # An INSET layer, which is the one that always works. The outer shadow and
+    # the slide-under band both paint over the NEIGHBOURING column, so both are
+    # only as visible as whatever happens to be in it — reported from a width
+    # where the neighbour was Category, holding "—" and one short word per row:
+    # white fading into white space, saying nothing. An inset shadow is drawn
+    # on the pinned column's own background, so it reads at every width and
+    # over every neighbour.
+    assert "inset" in shadow_rule.group(0), (
+        "the pinned column's cue has no inset layer — it paints only over the "
+        "neighbouring column, so it vanishes wherever that column is blank"
     )
     mask_rule = _CUE_MASK_RE.search(css)
     assert mask_rule and ":not(:has(.data-table--pinned-actions))" in mask_rule.group(0), (
