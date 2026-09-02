@@ -1521,6 +1521,39 @@ extraction:
     # crawl for time, so it gets a budget of its own. 0 disables the bound
     # (unbounded), same convention as `extraction.timeout_s`.
     run_timeout_s: 3600
+    # Cost-levers lever A (docs/superpowers/specs/2026-09-02-fact-
+    # extraction-cost-levers.md §2): when the corrective retry fires,
+    # after the zero-token deterministic quote repair has had its chance
+    # to fix a failure for free. `on_gate_fail` (the default, and TODAY'S
+    # unmodified behaviour) retries a document only when the verbatim gate
+    # still rejects part of the output after repair. `off` disables the
+    # retry outright — a still-failing quote is dropped and counted
+    # immediately, cheapest and lowest recall. `always` retries whenever
+    # the FIRST-pass output had any verbatim failure at all, even one the
+    # repair already fixed for free — the model re-confirms its own
+    # original mistake instead of the byte-level snap being trusted alone;
+    # the most expensive setting, and rarely risks losing an already-good
+    # fact if the retry does not reproduce it. A single connection can
+    # override this — see `config.extraction.facts.retry_mode` on the
+    # connection row, PATCH /api/admin/sharepoint/connections/{id}/
+    # extraction/facts-config or `agnes admin sharepoint facts-config` —
+    # for a high-value connection that should always keep the retry ON
+    # while the rest of the fleet runs cheaper.
+    retry_mode: on_gate_fail
+    # Cost-levers lever B: a content-hash cache of successful LLM
+    # responses, keyed on (document sha256, model, effective prompt/
+    # ontology fingerprint — the same three-way identity `is_up_to_date`
+    # already uses to decide whether a document needs re-extraction) plus
+    # a call-kind suffix that keeps the ONE corrective retry's reply in
+    # its own row. A byte-identical document — a consultancy's v1/v2/final
+    # copies scattered across several folders, or the SAME document synced
+    # into more than one connection — costs the model call exactly ONCE.
+    # A cache hit is accounted as 0 API tokens, with a `cache_hits` counter
+    # in `facts_usage` and the run report. On by default; the cache TABLE
+    # is Postgres-only (A3 ratchet) — a DuckDB-backed instance simply runs
+    # without one, with a one-time log line, never a crash.
+    # AGNES_EXTRACTION_FACTS_LLM_CACHE overrides this at the environment level.
+    llm_cache: true
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails

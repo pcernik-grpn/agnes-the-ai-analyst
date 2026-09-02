@@ -197,6 +197,8 @@ __all__ = [
     "semantic_health_mutes_repo",
     # Corporate-memory detection run logs (issue #1971 Part 3) — Postgres-only
     "memory_detection_runs_repo",
+    # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B) — Postgres-only
+    "facts_llm_cache_repo",
 ]
 
 
@@ -687,6 +689,9 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "memory_detection_runs": {
         PG: ("src.repositories.memory_detection_runs_pg", "MemoryDetectionRunsPgRepository"),
     },
+    "facts_llm_cache": {
+        PG: ("src.repositories.facts_llm_cache_pg", "FactsLlmCachePgRepository"),
+    },
 }
 
 
@@ -1137,3 +1142,12 @@ def semantic_health_mutes_repo() -> Any:
 # than letting a missing observability table fail detection itself.
 def memory_detection_runs_repo() -> Any:
     return _build("memory_detection_runs")
+
+
+# Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B)
+# — POSTGRES-ONLY. Raises RequiresPostgresBackend on a DuckDB-backed
+# instance; the sole caller, connectors.sharepoint.facts_extraction
+# ._resolve_llm_cache, catches that and runs the pass with caching off
+# (one log line) rather than letting a missing cache table fail extraction.
+def facts_llm_cache_repo() -> Any:
+    return _build("facts_llm_cache")

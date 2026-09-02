@@ -1,17 +1,22 @@
 """`agnes admin sharepoint` — admin/ops triggers for SharePoint connector
 maintenance jobs.
 
-Today this covers exactly one surface: the standalone fact-graph trigger.
 The crawl / ACL-sync / subtree-sweep triggers stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
-op" exemption class, `tests/test_documentation_api_triple_surface.py`) —
-this one earns a CLI counterpart because an operator asking "how do we get
-the fact graph populated with what we already have?" needs an answer that
-does not require opening a browser (a support runbook, a script run against
-a remote instance).
+op" exemption class, `tests/test_documentation_api_triple_surface.py`).
+Two surfaces earn a CLI counterpart on top of that default:
 
-CLI counterpart to
-``POST /api/admin/sharepoint/connections/{connection_id}/facts-extract``.
+* `facts-extract` — an operator asking "how do we get the fact graph
+  populated with what we already have?" needs an answer that does not
+  require opening a browser (a support runbook, a script run against a
+  remote instance). CLI counterpart to
+  ``POST /api/admin/sharepoint/connections/{connection_id}/facts-extract``.
+* `facts-config` — a per-connection retry-policy override (cost-levers
+  task, lever A): one high-value connection keeps the corrective retry ON
+  while a long-tail connection runs with it OFF, set without an
+  instance.yaml edit. CLI counterpart to
+  ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
+  facts-config``.
 """
 
 from __future__ import annotations
@@ -21,9 +26,11 @@ from typing import List, Optional
 
 import typer
 
-from cli.client import api_post
+from cli.client import api_patch, api_post
 
 admin_sharepoint_app = typer.Typer(help="Admin: SharePoint connector maintenance triggers")
+
+_RETRY_MODES = ("off", "on_gate_fail", "always")
 
 
 def _fail(resp) -> None:
@@ -95,3 +102,54 @@ def facts_extract(
         typer.echo(json.dumps(body, indent=2))
         return
     typer.echo(f"Enqueued sharepoint-facts-extraction job {body.get('job_id')} (status: {body.get('status')})")
+
+
+@admin_sharepoint_app.command("facts-config")
+def facts_config(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    retry_mode: Optional[str] = typer.Option(
+        None,
+        "--retry-mode",
+        help=f"Per-connection override for the corrective-retry policy: one of {', '.join(_RETRY_MODES)}. "
+        "off = never retry a failing quote (cheapest, lowest recall); on_gate_fail = retry only when the "
+        "verbatim gate still rejects part of the output (the instance default); always = retry even a "
+        "document the deterministic repair already fixed, for maximum recall at maximum cost.",
+    ),
+    clear: bool = typer.Option(
+        False, "--clear", help="Remove the override — this connection falls back to the instance-level default."
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Set (or clear) this connection's own ``extraction.facts.retry_mode``,
+    overriding the instance-level default (cost-levers task, lever A) — a
+    curated, high-stakes connection can keep the corrective retry ON (a
+    dropped quote there is a lost citation) while a long-tail connection
+    runs with it OFF, without an instance.yaml edit that would flip every
+    connection at once.
+
+    Exactly one of ``--retry-mode`` / ``--clear`` is required. Prints the
+    RESOLVED value and where it came from (``connection`` or ``instance``)
+    — the same shape the admin config drawer would show.
+    """
+    if clear and retry_mode is not None:
+        typer.echo("Error: pass either --retry-mode or --clear, not both", err=True)
+        raise typer.Exit(1)
+    if not clear and retry_mode is None:
+        typer.echo("Error: one of --retry-mode or --clear is required", err=True)
+        raise typer.Exit(1)
+    if retry_mode is not None and retry_mode not in _RETRY_MODES:
+        typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
+        raise typer.Exit(1)
+
+    resp = api_patch(
+        f"/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
+        json={"retry_mode": retry_mode},
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    resolved = body.get("retry_mode") or {}
+    typer.echo(f"retry_mode: {resolved.get('value')} (source: {resolved.get('source')})")

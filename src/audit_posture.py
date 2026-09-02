@@ -145,6 +145,14 @@ POSTURE: dict[str, str] = {
     # action, carrying `connection_id` only (no run content, no document
     # paths).
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop": "extraction.stop_requested",
+    # Per-connection override for extraction.facts.retry_mode (cost-levers
+    # task, lever A). The handler writes its OWN row (log_safe) carrying the
+    # requested value, the resolved value and its source — more than the
+    # fallback middleware could say (it never sees the body), so the
+    # middleware's own write is a no-op here.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": (
+        "extraction.facts_retry_mode_set"
+    ),
     # A POST that mutates NOTHING — it runs the anonymizer over a pasted
     # sample and returns the result. Cataloged rather than `exempt:` all the
     # same, on the `access_policy.preview` precedent: an admin pastes real

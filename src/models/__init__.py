@@ -30,6 +30,7 @@ from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
 from src.models.extraction import ExtractionRun
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
+from src.models.facts_llm_cache import FactsLlmCache
 from src.models.jobs import Job
 from src.models.knowledge import (
     KnowledgeContradiction,
@@ -142,6 +143,7 @@ __all__ = [
     "Fact",
     "FactAlias",
     "FactAliasSource",
+    "FactsLlmCache",
     "FileCorpus",
     "GlossaryTerm",
     "IdempotencyKey",

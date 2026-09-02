@@ -24,10 +24,15 @@ import pytest
 
 from connectors.sharepoint.facts_extraction import (
     DEFAULT_CONCURRENCY,
+    DEFAULT_RETRY_MODE,
     MAX_CONCURRENCY,
     FactsExtractionUnavailable,
     _Extractor,
+    _facts_cache_key,
+    _facts_llm_cache_enabled,
     _fact_key,
+    _resolve_llm_cache,
+    _retry_mode,
     build_system_prompt,
     build_user_message,
     extract_one,
@@ -37,6 +42,7 @@ from connectors.sharepoint.facts_extraction import (
     render_ontology,
     repair_verbatim_failures,
     resolve_concurrency,
+    resolve_retry_mode,
     snap_quote_to_source,
     verbatim_failures,
 )
@@ -542,6 +548,299 @@ def test_the_retry_keeps_the_facts_that_already_passed():
 
 
 # ---------------------------------------------------------------------------
+# Retry policy (`extraction.facts.retry_mode`) — cost-levers task, lever A
+# ---------------------------------------------------------------------------
+
+
+def test_retry_mode_defaults_to_on_gate_fail(monkeypatch):
+    _config(monkeypatch, {})
+    assert _retry_mode() == "on_gate_fail" == DEFAULT_RETRY_MODE
+
+
+@pytest.mark.parametrize("configured", ["off", "always", "on_gate_fail"])
+def test_retry_mode_reads_the_configured_value(monkeypatch, configured):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): configured})
+    assert _retry_mode() == configured
+
+
+def test_an_invalid_retry_mode_falls_back_to_the_default(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): "sometimes"})
+    assert _retry_mode() == DEFAULT_RETRY_MODE
+
+
+# --- per-connection override: connection.config.extraction.facts.retry_mode ---
+
+
+def test_resolve_retry_mode_with_no_connection_falls_back_to_instance(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): "off"})
+    assert resolve_retry_mode(None) == ("off", "instance")
+
+
+def test_resolve_retry_mode_with_a_connection_that_sets_nothing_falls_back_to_instance(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): "always"})
+    connection = {"id": "conn1", "config": {}}
+    assert resolve_retry_mode(connection) == ("always", "instance")
+
+
+def test_a_connection_override_beats_the_instance_setting(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): "off"})
+    connection = {"id": "conn1", "config": {"extraction": {"facts": {"retry_mode": "always"}}}}
+    assert resolve_retry_mode(connection) == ("always", "connection")
+
+
+def test_an_invalid_connection_override_falls_back_to_instance_and_is_logged(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "retry_mode"): "on_gate_fail"})
+    connection = {"id": "conn1", "config": {"extraction": {"facts": {"retry_mode": "sometimes"}}}}
+    assert resolve_retry_mode(connection) == ("on_gate_fail", "instance")
+
+
+#: `run_facts_extraction` itself needs `corpus_files_repo`/
+#: `corpus_file_sources_repo` (Postgres-only, A3) before it ever reaches
+#: `_plan()`, so a full-wiring proof ("the connection row it actually
+#: loaded reaches `extract_one`'s retry policy, end to end, with a real
+#: extra retry call") cannot run against this module's DuckDB-only fakes —
+#: it lives in `tests/db_pg/test_facts_extraction_pg.py`, which can seed a
+#: real document. `resolve_retry_mode` above, and `extract_one`'s reaction
+#: to each mode, are what that end-to-end test composes.
+
+
+def test_retry_mode_off_never_retries_even_on_a_genuine_failure():
+    """The cheapest, lowest-recall setting: a still-failing quote is
+    dropped and counted immediately, never given a second call."""
+    text = "The Northwind rollout began in March."
+    bad = _node("invented sentence")
+    extractor = StubExtractor([_stream(bad)])
+
+    result = extract_one(extractor, _work(text), retry_mode="off")
+
+    assert len(extractor.seen) == 1, "off means off — zero retry calls"
+    assert result.retried is False
+    assert result.dropped == 1
+    assert result.nodes == []
+
+
+def test_retry_mode_on_gate_fail_is_todays_unmodified_behaviour():
+    """Explicit `on_gate_fail` must match the module default exactly —
+    this is the mode that preserves today's shipped behaviour."""
+    text = "The Northwind rollout began in March."
+    bad = _node("the rollout was cancelled")
+    good = _node("rollout began in March")
+    extractor = StubExtractor([_stream(bad), _stream(good)])
+
+    result = extract_one(extractor, _work(text), retry_mode="on_gate_fail")
+
+    assert len(extractor.seen) == 2
+    assert result.retried is True
+    assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
+
+
+def test_retry_mode_always_still_costs_no_retry_when_the_first_pass_is_already_clean():
+    """`always` reacts to the FIRST-pass output, not to "was there ever a
+    retry" in the abstract — a document with nothing wrong on attempt one
+    has nothing to re-confirm."""
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([_stream(_node("rollout began in March"))])
+
+    result = extract_one(extractor, _work(text), retry_mode="always")
+
+    assert len(extractor.seen) == 1
+    assert result.retried is False
+
+
+def test_retry_mode_always_retries_even_after_a_free_repair_fixed_everything():
+    """The one case `always` and `on_gate_fail` diverge on: the
+    deterministic repair pass (§2.2) already made the gate happy, but the
+    FIRST-pass output was not clean — `always` asks the model to
+    re-confirm its own original mistake anyway, instead of trusting the
+    byte-level snap. Costs a call `on_gate_fail` would have skipped
+    entirely (see `test_a_repairable_quote_costs_no_retry`)."""
+    text = "The client’s rollout began in March."
+    bad = _node("client's rollout")  # straight apostrophe; the source has a curly one — repairable
+    fixed = _node("client’s rollout")  # what the retry is scripted to confirm
+    extractor = StubExtractor([_stream(bad), _stream(fixed)])
+
+    result = extract_one(extractor, _work(text), retry_mode="always")
+
+    assert len(extractor.seen) == 2, "always spends the retry even though repair alone already fixed the gate"
+    assert result.repaired == 1
+    assert result.retried is True
+    assert result.dropped == 0
+    assert [n["evidence"][0]["quote"] for n in result.nodes] == ["client’s rollout"]
+
+
+# ---------------------------------------------------------------------------
+# Content-hash LLM response cache (`extraction.facts.llm_cache`) — cost-
+# levers task, lever B
+# ---------------------------------------------------------------------------
+
+
+class FakeCache:
+    """In-memory stand-in for `FactsLlmCachePgRepository` — same `get`/
+    `put` surface, no database."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, dict] = {}
+        self.gets: list[str] = []
+        self.puts: list[str] = []
+
+    def get(self, cache_key: str):
+        self.gets.append(cache_key)
+        row = self.store.get(cache_key)
+        return dict(row) if row else None
+
+    def put(self, cache_key: str, *, sha256: str, model: str, fingerprint: str, response, usage=None) -> None:
+        self.puts.append(cache_key)
+        self.store[cache_key] = {
+            "sha256": sha256,
+            "model": model,
+            "fingerprint": fingerprint,
+            "response": response,
+            "usage": usage,
+        }
+
+
+def test_llm_cache_defaults_to_on(monkeypatch):
+    _config(monkeypatch, {})
+    assert _facts_llm_cache_enabled() is True
+
+
+def test_llm_cache_can_be_disabled(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "llm_cache"): False})
+    assert _facts_llm_cache_enabled() is False
+
+
+def test_llm_cache_degrades_to_off_on_a_duckdb_backend(monkeypatch):
+    """A missing Postgres backend must never crash the pass — see
+    `docs/migrations.md` -> "Adding a PG-only feature"."""
+    _config(monkeypatch, {})
+
+    def _raise():
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("facts_llm_cache")
+
+    monkeypatch.setattr("src.repositories.facts_llm_cache_repo", _raise)
+    assert _resolve_llm_cache() is None
+
+
+def test_facts_cache_key_changes_with_fingerprint():
+    """An ontology/prompt edit must be a miss, exactly like `is_up_to_date`
+    already treats it for the state file."""
+    key1 = _facts_cache_key(sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp1")
+    key2 = _facts_cache_key(sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp2")
+    assert key1 != key2
+
+
+def test_facts_cache_key_changes_with_model():
+    key1 = _facts_cache_key(sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp1")
+    key2 = _facts_cache_key(sha256="sha-1", model="claude-sonnet-4-5", fingerprint="fp1")
+    assert key1 != key2
+
+
+def test_facts_cache_key_distinguishes_the_retry_suffix():
+    base = _facts_cache_key(sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp1")
+    retry = _facts_cache_key(sha256="sha-1", model="claude-haiku-4-5", fingerprint="fp1", suffix="retry")
+    assert base != retry
+
+
+def test_a_cache_miss_calls_the_model_and_stores_the_reply():
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([_stream(_node("rollout began in March"))])
+    cache = FakeCache()
+
+    result = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+
+    assert len(extractor.seen) == 1, "a miss still calls the model"
+    assert result.cache_hits == 0
+    assert len(cache.puts) == 1, "a successful reply is stored"
+    key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1")
+    assert cache.puts == [key]
+    assert cache.store[key]["response"] == {"text": _stream(_node("rollout began in March"))}
+
+
+def test_a_cache_hit_skips_the_model_call_entirely():
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([RuntimeError("must not be called")])
+    cache = FakeCache()
+    key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1")
+    cache.store[key] = {"response": {"text": _stream(_node("rollout began in March"))}}
+
+    result = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+
+    assert extractor.seen == [], "a hit must never call the model"
+    assert result.cache_hits == 1
+    assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
+
+
+def test_a_different_fingerprint_is_a_cache_miss():
+    """Same document, same model, but the effective prompt/ontology
+    changed — `is_up_to_date`'s own three-way identity, reused here."""
+    text = "The Northwind rollout began in March."
+    good = _stream(_node("rollout began in March"))
+    extractor = StubExtractor([good, good])
+    cache = FakeCache()
+
+    extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+    assert len(extractor.seen) == 1
+
+    extract_one(extractor, _work(text), fingerprint="fp2", cache=cache)
+    assert len(extractor.seen) == 2, "a fingerprint change must not reuse fp1's cached reply"
+
+
+def test_the_same_fingerprint_is_a_cache_hit_on_a_second_call():
+    """The scenario the lever targets: a byte-identical document (or a
+    second pass over the same one) served from cache instead of a second
+    model call."""
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([_stream(_node("rollout began in March"))])
+    cache = FakeCache()
+
+    first = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+    second = extract_one(extractor, _work(text, file_id="cf_2", doc_id="doc2"), fingerprint="fp1", cache=cache)
+
+    assert len(extractor.seen) == 1, "the second (byte-identical) document must cost zero model calls"
+    assert first.cache_hits == 0
+    assert second.cache_hits == 1
+
+
+def test_the_retry_response_is_cached_under_its_own_key():
+    """The retry is a reply to a DIFFERENT prompt (base + failure listing)
+    — it must not collide with the first-pass cache row, and must not be
+    served BACK on a first-pass lookup either."""
+    text = "The Northwind rollout began in March."
+    bad = _node("invented sentence")
+    good = _node("rollout began in March")
+    extractor = StubExtractor([_stream(bad), _stream(good)])
+    cache = FakeCache()
+
+    result = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+
+    assert result.retried is True
+    base_key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1")
+    retry_key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1", suffix="retry")
+    assert set(cache.puts) == {base_key, retry_key}
+
+
+def test_a_cached_retry_response_is_served_without_a_second_call():
+    """A re-run of a document that needed a retry last time — both calls
+    are now cache hits, so the whole document costs zero model calls."""
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([RuntimeError("must not be called")])
+    cache = FakeCache()
+    base_key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1")
+    retry_key = _facts_cache_key(sha256="sha-1", model=extractor.model, fingerprint="fp1", suffix="retry")
+    cache.store[base_key] = {"response": {"text": _stream(_node("invented sentence"))}}
+    cache.store[retry_key] = {"response": {"text": _stream(_node("rollout began in March"))}}
+
+    result = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+
+    assert extractor.seen == []
+    assert result.retried is True
+    assert result.cache_hits == 2
+    assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
+
+
+# ---------------------------------------------------------------------------
 # Failure posture
 # ---------------------------------------------------------------------------
 
@@ -989,13 +1288,9 @@ def test_a_document_ended_by_an_unavailable_model_still_counts_as_drained():
     src = Path("connectors/sharepoint/facts_extraction.py").read_text(encoding="utf-8")
     branch = src.split("except FactsExtractionUnavailable as exc:", 1)[1].split("except Exception", 1)[0]
     assert "docs_unavailable += 1" in branch, (
-        "a document whose model was unavailable has still left the queue and "
-        "must count toward docs_done"
+        "a document whose model was unavailable has still left the queue and must count toward docs_done"
     )
     assert "report.facts_failed += 1" not in branch, (
-        "facts_failed is a reported metric about the DOCUMENT — an unavailable "
-        "model must not inflate it"
+        "facts_failed is a reported metric about the DOCUMENT — an unavailable model must not inflate it"
     )
-    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, (
-        "the progress count must include it"
-    )
+    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, "the progress count must include it"
