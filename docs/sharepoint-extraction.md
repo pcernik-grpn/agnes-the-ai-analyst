@@ -85,8 +85,12 @@ spot-check shows pseudonyms, not names.
   worth of concurrency working through the whole site sequentially:
   1. `POST /api/admin/sharepoint/connections/{id}/clone` or `agnes admin
      sharepoint connection clone <connection_id> --name <name>` — a sibling
-     connection wired to the SAME tenant/client identity and certificate/
-     client-secret reference (never a copied secret value), zero scopes.
+     connection wired to the SAME tenant/client identity, certificate/
+     client-secret reference (never a copied secret value) and site/host
+     discovery bookkeeping (notably `manual_sites` — required under
+     `Sites.Selected`, where `/sites` enumeration is 403-forbidden and a
+     bookmarked site is the only way to resolve it at all), with zero
+     scopes.
   2. `POST …/scopes/bulk` or `agnes admin sharepoint scope bulk-add
      <connection_id> --path "Folder A" --path "Folder B/Sub" [--drive-id
      <id>]` (or `--paths-file split.json`, a JSON list or `{"paths":

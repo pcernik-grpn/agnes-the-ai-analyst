@@ -1328,12 +1328,16 @@ the SAME credential material (`tenant_id`, `client_id`, `auth_method`,
 never a copied secret VALUE) with zero scopes and no extraction-dispatch
 history, so no scheduled crawl/ACL-sync/subtree-sweep/facts-extraction
 sweep touches it until an admin confirms scopes on it (e.g. via `POST
-…/scopes/bulk` above). When the source's certificate lives in a deployment
-env var, the clone resolves the identical value with no further action;
-when it was instead uploaded to the source's own vault slot, it is NOT
-duplicated into a second row — an admin re-uploads it to the clone
-separately. `409 connection_name_exists` if `name` is taken (same rule as
-`POST /api/admin/source-connections`). Returns `{"id", "name"}`.
+…/scopes/bulk` above). Every OTHER config key carries over, notably
+`manual_sites` — under `Sites.Selected` (`/sites` enumeration 403-forbidden)
+a bookmarked site is how the clone can resolve the site AT ALL, so leaving
+it behind would leave the clone unable to browse the very site it exists
+to split. When the source's certificate lives in a deployment env var, the
+clone resolves the identical value with no further action; when it was
+instead uploaded to the source's own vault slot, it is NOT duplicated into
+a second row — an admin re-uploads it to the clone separately. `409
+connection_name_exists` if `name` is taken (same rule as `POST
+/api/admin/source-connections`). Returns `{"id", "name"}`.
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

@@ -3347,6 +3347,56 @@ class TestConnectionClone:
         listed = c.get(f"{BASE}/{new_id}/scopes", headers=_auth(token)).json()["items"]
         assert listed == []
 
+    def test_clone_keeps_manual_sites_for_a_sites_selected_connection(self, seeded_app, monkeypatch):
+        """Under Sites.Selected, `/sites` enumeration 403s and the ONLY way to
+        reach a granted site is a bookmarked `manual_sites` entry
+        (get_site_by_path) — a clone that lost this could not resolve the
+        site it exists to split, at all. `extraction` (dispatch bookkeeping)
+        stays excluded: a fresh clone has never run."""
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-manual"})
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200, json={"id": "s-manual", "displayName": "Project Hub", "webUrl": "https://contoso/x"}
+            )
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-manual-sites-source")
+
+        add_site = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"},
+            headers=_auth(token),
+        )
+        assert add_site.status_code == 201, add_site.text
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-manual", "display_path": "Folder A"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-manual-sites-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+
+        detail = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+        assert detail["config"]["manual_sites"] == [
+            {"id": "s-manual", "name": "Project Hub", "web_url": "https://contoso/x"}
+        ]
+        assert "scopes" not in detail["config"]
+        assert "extraction" not in detail["config"]
+
     def test_clone_does_not_duplicate_a_vault_secret(self, seeded_app, monkeypatch):
         from cryptography.fernet import Fernet
 

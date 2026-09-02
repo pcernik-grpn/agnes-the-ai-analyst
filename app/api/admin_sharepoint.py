@@ -319,10 +319,26 @@ class BulkScopeBody(BaseModel):
 
 class CloneConnectionBody(BaseModel):
     """The new sibling connection's own name — everything else (identity,
-    credential references) is copied from the source (see
-    :func:`clone_connection`)."""
+    credential references, site/host discovery bookkeeping) is copied from
+    the source (see :func:`clone_connection`)."""
 
     name: str = Field(..., min_length=1)
+
+
+#: Config keys :func:`clone_connection` does NOT carry over into a clone —
+#: deliberately a SMALLER set than :data:`SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
+#: (which governs a DIFFERENT concern: what the generic connection editor
+#: must preserve across an ordinary edit). ``scopes`` is the confirmed-scope
+#: rows themselves — the whole point of a clone is to hold a DIFFERENT
+#: subset of them. ``extraction`` is the extraction schedule's own
+#: last-run/last-job dispatch bookkeeping — a clone has never run, so
+#: carrying it over would misreport its due-ness to the very first sweep
+#: that looks at it. Every OTHER server-written key (``manual_sites``,
+#: ``webhook_secret``, ``retired_scope_collections``) carries over: under
+#: ``Sites.Selected`` a bookmarked ``manual_sites`` entry is how the clone
+#: resolves the site AT ALL (``/sites`` enumeration 403s), and the other two
+#: are inert bookkeeping until the clone has scopes/subscriptions of its own.
+_CLONE_EXCLUDED_CONFIG_KEYS = ("scopes", "extraction")
 
 
 # ---------------------------------------------------------------------------
@@ -1702,14 +1718,19 @@ async def clone_connection(
     site across several connections (each with its own crawl and facts
     jobs, so they run in parallel; see :func:`bulk_add_scopes`).
 
-    Copies every config key EXCEPT :data:`SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
-    — i.e. the admin-authored identity/credential REFERENCES (``tenant_id``,
-    ``client_id``, ``auth_method``, ``cert_private_key_env``/
-    ``client_secret_env``), never the wizard's own bookkeeping (confirmed
-    scopes, extraction dispatch stamps, the webhook secret, manual sites,
-    retired-scope tombstones) — the clone starts with zero scopes and no
-    dispatch history, so no scheduled crawl/ACL-sync/subtree-sweep/
-    facts-extraction sweep touches it until an admin confirms scopes on it.
+    Copies every config key EXCEPT :data:`_CLONE_EXCLUDED_CONFIG_KEYS`
+    (``scopes``, the confirmed-scope rows, and ``extraction``, the
+    extraction schedule's own dispatch bookkeeping) — the clone starts with
+    zero scopes and no dispatch history, so no scheduled crawl/ACL-sync/
+    subtree-sweep/facts-extraction sweep touches it until an admin confirms
+    scopes on it. Everything else carries over, including ``manual_sites``
+    — under ``Sites.Selected`` (module docstring: that permission
+    403-forbids ``/sites`` enumeration), a bookmarked site added by URL is
+    how the clone can resolve anything at all, so leaving it behind would
+    make the clone unable to browse the very site it exists to split;
+    ``webhook_secret`` and ``retired_scope_collections`` carry over for the
+    same "same site/host settings" reason, and are inert until the clone
+    has scopes/subscriptions of its own.
 
     **The certificate/secret VALUE itself is never copied** — only its
     reference. When the source's certificate lives in a deployment env var
@@ -1731,7 +1752,7 @@ async def clone_connection(
         raise HTTPException(status_code=409, detail="connection_name_exists")
 
     cloned_config = {
-        k: v for k, v in (row.get("config") or {}).items() if k not in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS
+        k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS
     }
 
     new_id = str(uuid4())
