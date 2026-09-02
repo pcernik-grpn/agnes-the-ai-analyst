@@ -7299,7 +7299,12 @@ def _policy_preview_mapping_warning(
 
 
 @router.post("/registry/{table_id}/policy/preview")
-async def preview_table_policy(
+# Both preview handlers are plain `def` on purpose: they run synchronous
+# DuckDB (and, for a remote table, engine-attached) COUNT/sample queries --
+# the all-groups sweep once per group -- so as `async def` they would block
+# the event loop for every other request until the sweep finished. FastAPI
+# runs a sync route in its threadpool instead (#1979, review follow-up).
+def preview_table_policy(
     table_id: str,
     request: PolicyPreviewRequest,
     user: dict = Depends(require_admin),
@@ -7612,7 +7617,7 @@ class PolicyPreviewGroupsRequest(BaseModel):
 
 
 @router.post("/registry/{table_id}/policy/preview-groups")
-async def preview_table_policy_all_groups(
+def preview_table_policy_all_groups(
     table_id: str,
     request: PolicyPreviewGroupsRequest,
     user: dict = Depends(require_admin),
