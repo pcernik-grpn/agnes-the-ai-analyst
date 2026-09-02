@@ -206,6 +206,11 @@ POSTURE: dict[str, str] = {
     # subtrees now" trigger. Same "handler writes nothing itself; fallback
     # middleware emits" posture as the acl-sync trigger right above.
     "POST /api/admin/sharepoint/connections/{connection_id}/subtree-sweep": "sharepoint_acl.sweep_triggered",
+    # Standalone fact-graph trigger (build the graph over an already-indexed
+    # corpus, no crawl required) — admin "run facts extraction now" trigger.
+    # Same "handler writes nothing itself; fallback middleware emits"
+    # posture as the acl-sync/subtree-sweep triggers right above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/facts-extract": ("sharepoint_facts.extraction_triggered"),
     # -- app.api.admin_slack_secrets -------------------------------------------
     "DELETE /api/admin/slack-secrets/{name}": "slack.secret.clear",
     "PUT /api/admin/slack-secrets/{name}": "slack.secret.set",
@@ -1478,6 +1483,7 @@ JOB_POSTURE: dict[str, str] = {
     # declaration here.
     "sharepoint-acl-sync": "job.run",
     "sharepoint-subtree-sweep": "job.run",
+    "sharepoint-facts-extraction": "job.run",
     # Conditionally registered (only on a process hosting a live ChatManager
     # -- see register_all_kinds()'s docstring) but still a real, enumerable
     # kind name when it IS registered, so it still needs an entry here.
