@@ -529,9 +529,26 @@ _CRAWLER_CONCURRENCY_MIN = 1
 # per-pass document concurrency — the cap each stage clamps to itself, pinned
 # by tests rather than imported (no import-time dependency on the worker/
 # connector stacks from this module).
-_LANE_CONCURRENCY_MAX = 64
+# `_LANE_CONCURRENCY_MAX` MUST equal `app.worker.runtime._MAX_EXTRACTION_
+# CONCURRENCY` (currently 8) — a live run posted `extraction.concurrency=12`
+# through this endpoint (which accepted it, the cap here was 64), and the
+# worker runtime silently re-clamped it back down to 8 on its own, logging a
+# warning nobody saw until after the fact. Pinned equal by
+# `tests/test_admin_server_config_extraction_section.py::
+# test_caps_match_the_stages_own_clamps` rather than imported here.
+_LANE_CONCURRENCY_MAX = 8
 _FACTS_CONCURRENCY_MAX = 64
 _CRAWLER_CONCURRENCY_MAX = 64
+# `extraction.crawler.convert_child_memory_limit_mb` — the RLIMIT_AS
+# HEADROOM a conversion child gets above this worker's own memory
+# footprint at fork time (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB`/`_install_memory_limit`), 0 =
+# off. 65536 (64 GiB) is a sanity ceiling, not a tuned number — an
+# operator sizing for more should raise the container's own memory limit
+# well before approaching it. Min is 0 (not 1): unlike the concurrency
+# knobs above, 0 is a legitimate, meaningful value here.
+_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB = 0
+_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB = 65536
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -664,6 +681,21 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     detail=(
                         f"extraction.crawler.concurrency must be between {_CRAWLER_CONCURRENCY_MIN} and "
                         f"{_CRAWLER_CONCURRENCY_MAX} (got {concurrency})"
+                    ),
+                )
+        mem_limit_mb = crawler.get("convert_child_memory_limit_mb")
+        if mem_limit_mb is not None:
+            if not isinstance(mem_limit_mb, int) or isinstance(mem_limit_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_memory_limit_mb must be an integer"
+                )
+            if mem_limit_mb < _CONVERT_CHILD_MEMORY_LIMIT_MIN_MB or mem_limit_mb > _CONVERT_CHILD_MEMORY_LIMIT_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_memory_limit_mb must be between "
+                        f"{_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB} and {_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB} "
+                        f"(got {mem_limit_mb}); 0 disables the cap"
                     ),
                 )
 
@@ -1174,7 +1206,9 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "Extraction LANE slots on the worker — how many extraction jobs (crawls and "
                 "fact passes, across all connections) run at the same time. 1 serialises "
                 "everything; raise it so a streamed facts pass can overlap a crawl still "
-                "running, or so several connections crawl in parallel. Clamped to [1, 64]."
+                "running, or so several connections crawl in parallel. Clamped to [1, 8] — "
+                "same ceiling the worker runtime itself clamps to, so a value accepted here "
+                "is never silently re-clamped on the worker."
             ),
         },
         "timeout_s": {
@@ -1208,6 +1242,21 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Multiplies with extraction.concurrency (crawls at once). A per-run "
                         "override lives in the source card's Run-now options. Read by the worker "
                         "at the start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_memory_limit_mb": {
+                    "kind": "int",
+                    "default": 1536,
+                    "hint": (
+                        "Per-document HEADROOM above this worker process's own memory footprint "
+                        "at fork time (RLIMIT_AS on the conversion child), NOT an absolute ceiling — "
+                        "a live 64-vCPU worker's own footprint alone was already ~2.2 GB, so reading "
+                        "this knob as an absolute number capped every child before it converted a "
+                        "single document. Raise it for documents that legitimately need more headroom "
+                        "(a large spreadsheet openpyxl loads whole into memory, in one observed "
+                        "case); lower it to make a runaway document fail faster and more "
+                        "attributably. 0 disables the cap outright. Read by the worker at the start "
+                        "of each run — effective on the next run, no restart."
                     ),
                 },
             },

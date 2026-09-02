@@ -1111,6 +1111,26 @@ services:
     image: $${AGNES_EXTRACTION_WORKER_IMAGE}
 %{ endif ~}
     profiles: !reset []
+    # Live finding: numpy's OpenBLAS backend sizes its per-thread scratch
+    # buffers by the HOST's CPU count at import time, not by anything the
+    # process asks for. Document conversion runs each file inside a forked
+    # child capped at ~1.5 GiB of virtual address space
+    # (connectors/sharepoint/crawler.py's RLIMIT_AS) — on a 64-vCPU host,
+    # OpenBLAS tried to size 64 threads' worth of buffers inside that child
+    # and blew through it: `import markitdown` died with "OpenBLAS error:
+    # Memory allocation still failed after 10 retries", which read as
+    # "markitdown is not installed" before the error message learned to
+    # carry its cause. A single-document child never benefits from more
+    # than one BLAS thread on any host size. Additive merge with the base
+    # service's own `environment:` (compose merges this key by name, not by
+    # replacing the list) — mirrors the same `os.environ.setdefault` guard
+    # in app/worker/runtime.py, which covers every OTHER worker role that
+    # never runs through this overlay at all.
+    environment:
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
     # Additive merge on top of the base service's `app: service_healthy`.
     depends_on:
       redis:

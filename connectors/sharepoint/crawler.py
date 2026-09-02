@@ -213,7 +213,11 @@ _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: NOT a fix for this — it only moves the ceiling a single heavy document
 #: can still reach (observed at 4 GiB, then 12 GiB, then 20 GiB on the live
 #: instance). Configurable (``extraction.crawler.convert_child_memory_limit_mb``);
-#: 0 disables the cap. Not enforceable on every platform (notably macOS,
+#: 0 disables the cap. Interpreted as HEADROOM above whatever this worker
+#: process's OWN VmSize happens to be at fork time, not an absolute
+#: ceiling — see ``_install_memory_limit``'s docstring for the live
+#: finding (a 64-vCPU worker's own ~2.2 GB VmSize) that made the absolute
+#: reading unusable. Not enforceable on every platform (notably macOS,
 #: where this repo's tests run) — see ``_install_memory_limit``.
 _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
 #: How long a single item's CONVERSION may run before its worker is killed
@@ -846,6 +850,14 @@ def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
         "http_429": stats.http_429,
         "throttle_wait_s": round(stats.throttle_wait_s, 1),
         "oversize_files": stats.oversize_files,
+        # `extraction.crawl.min_modified` age filter — see `CrawlStats.
+        # filtered_by_age`/`age_unknown` and the gate in `_process_item`.
+        # Surfaced mid-run (not only in the finished `report()`) so an
+        # operator watching a live crawl can tell whether the cutoff is
+        # doing anything before the run finishes. Both zero when no cutoff
+        # is configured.
+        "filtered_by_age": stats.filtered_by_age,
+        "age_unknown": stats.age_unknown,
         "elapsed_s": round(max(time.monotonic() - stats.started, 0.0), 1),
         # What the crawl is touching RIGHT NOW (owner-frustration fix,
         # 2026-09-01: "I can't see what's happening in the extraction") —
@@ -2293,10 +2305,51 @@ def _peak_rss_bytes() -> int:
     return peak * 1024 if sys.platform == "linux" else peak
 
 
+def _own_vsize_bytes() -> int:
+    """This (calling) process's OWN current virtual memory size, in bytes —
+    read from ``/proc/self/status``'s ``VmSize`` line (kB). Best-effort and
+    silent: any read/parse failure, or ``/proc`` simply not existing
+    (notably macOS, where this repo's own tests run), returns ``0`` — the
+    caller's "unavailable" sentinel — never raises.
+
+    Called from two places for two different reasons that both need the
+    SAME number. Inside a freshly forked conversion child, right after
+    fork and before any allocation of its own, this IS the PARENT's VmSize
+    at the moment of fork: virtual address space is COPIED across
+    ``fork()``, not re-measured, and nothing has grown it yet — see
+    :func:`_install_memory_limit`. And in the parent, immediately before
+    :meth:`_ConvertProcessPool.start` forks anything, it is a close
+    estimate of what every child about to be forked will inherit — good
+    enough for the one INFO line reporting the ceiling an operator will
+    actually see enforced.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _effective_memory_limit_bytes(limit_bytes: int) -> int:
+    """``limit_bytes`` interpreted as HEADROOM above this process's own
+    current VmSize, not an absolute ceiling — see
+    :func:`_install_memory_limit` for the live-deployment finding that made
+    this necessary. Falls back to ``limit_bytes`` alone (the pre-fix
+    behaviour) when this process's own VmSize cannot be read (non-Linux,
+    or a malformed/inaccessible ``/proc/self/status``).
+    """
+    own_vsize = _own_vsize_bytes()
+    return own_vsize + limit_bytes if own_vsize > 0 else limit_bytes
+
+
 def _install_memory_limit(limit_bytes: int) -> None:
     """Cap THIS (child) process's own virtual address space at
-    ``limit_bytes`` — see :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for
-    why. Call ONCE, right after fork, before the first document — the
+    ``limit_bytes`` HEADROOM above its own inherited VmSize — see
+    :data:`_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB` for why a ceiling exists
+    at all. Call ONCE, right after fork, before the first document — the
     ceiling applies for the rest of this process's life.
 
     ``RLIMIT_AS`` (not ``RLIMIT_DATA``, which modern glibc's ``mmap``-backed
@@ -2308,6 +2361,21 @@ def _install_memory_limit(limit_bytes: int) -> None:
     own ``except Exception``, exactly like any other conversion failure,
     ATTRIBUTED to the file whose conversion was in progress.
 
+    ``limit_bytes`` used to be installed as an ABSOLUTE ceiling. Live-
+    deployment finding (2026-09, a 64-vCPU extraction worker): the forking
+    worker process's OWN VmSize was already ~2.2 GB — mostly interpreter
+    and library address space reserved at import time, not physically
+    resident, and scaling with host CPU count via numpy/OpenBLAS thread
+    buffers — well past the 1536 MB default before a single document was
+    ever converted. Every forked child inherits that same footprint at
+    fork, so it was born already "over" an absolute 1536 MB ceiling, and
+    ``import markitdown``/``import pypdfium2`` failed immediately with a
+    ``MemoryError`` that (before :class:`MissingConversionDependency`
+    learned to carry its cause) read as "not installed". ``limit_bytes`` is
+    now HEADROOM above whatever THIS process's own VmSize turns out to be
+    at fork time (:func:`_effective_memory_limit_bytes`), never an
+    absolute number guessed independently of it.
+
     Best-effort and silent: ``RLIMIT_AS`` is not settable on every
     platform — notably macOS, where this repo's own tests run, refuses to
     lower it at all — so a platform that cannot install this safety net
@@ -2317,10 +2385,11 @@ def _install_memory_limit(limit_bytes: int) -> None:
     """
     if limit_bytes <= 0:
         return
+    effective = _effective_memory_limit_bytes(limit_bytes)
     try:
         import resource
 
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        resource.setrlimit(resource.RLIMIT_AS, (effective, effective))
     except (ValueError, OSError, AttributeError):
         pass
 
@@ -2537,12 +2606,35 @@ class _ConvertProcessPool:
     def start(self) -> None:
         """Fork every slot's ACTIVE worker, and a SPARE standing by for the
         same slot, that are not already alive. Call only from a
-        single-threaded context — see the class docstring."""
+        single-threaded context — see the class docstring.
+
+        Logs ONE INFO line naming the effective absolute ceiling every
+        conversion child forked from here will get (this process's own
+        current VmSize plus the configured headroom — see
+        :func:`_effective_memory_limit_bytes`) whenever this call actually
+        forks something and the cap is not disabled (``memory_limit_bytes
+        <= 0``) — an operator reading the logs after this fix should see
+        the real number a child was actually capped at, not have to derive
+        it from the raw config value and their own guess at this worker's
+        footprint.
+        """
+        spawned_any = False
         for slot in range(self._size):
             if self._procs[slot] is None:
                 self._spawn(slot)
+                spawned_any = True
             if self._spare_procs[slot] is None:
                 self._spawn_spare(slot)
+                spawned_any = True
+        if spawned_any and self._memory_limit_bytes > 0:
+            effective = _effective_memory_limit_bytes(self._memory_limit_bytes)
+            logger.info(
+                "sharepoint crawl: conversion child RLIMIT_AS ceiling ~%.0f MiB "
+                "(%.0f MiB headroom above this worker's own ~%.0f MiB VmSize)",
+                effective / (1024 * 1024),
+                self._memory_limit_bytes / (1024 * 1024),
+                (effective - self._memory_limit_bytes) / (1024 * 1024),
+            )
 
     def _spawn(self, slot: int) -> None:
         parent_conn, child_conn = self._ctx.Pipe(duplex=True)

@@ -259,6 +259,37 @@ class TestExtractionConcurrency:
 
 
 # ---------------------------------------------------------------------------
+# BLAS/OpenMP thread-count guard (live finding: OpenBLAS sized per-thread
+# buffers by the 64-vCPU host, blew a conversion child's RLIMIT_AS, and
+# `import markitdown` died reading as "not installed")
+# ---------------------------------------------------------------------------
+
+
+def test_blas_env_vars_default_to_one_but_never_override_an_operator_value(monkeypatch):
+    """Module import must pin every BLAS/OpenMP thread-count var to "1" —
+    a single-document conversion child never benefits from more than one
+    thread, on any host size — but an operator's own explicit value must
+    always win (`setdefault`, not `[...] = "1"`)."""
+    import importlib
+
+    import app.worker.runtime as runtime_module
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.setenv("MKL_NUM_THREADS", "4")  # the operator's own explicit value
+    monkeypatch.delenv("NUMEXPR_NUM_THREADS", raising=False)
+
+    try:
+        importlib.reload(runtime_module)
+        assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+        assert os.environ["OMP_NUM_THREADS"] == "1"
+        assert os.environ["MKL_NUM_THREADS"] == "4"
+        assert os.environ["NUMEXPR_NUM_THREADS"] == "1"
+    finally:
+        importlib.reload(runtime_module)
+
+
+# ---------------------------------------------------------------------------
 # worker_loop
 # ---------------------------------------------------------------------------
 

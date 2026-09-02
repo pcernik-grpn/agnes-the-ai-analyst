@@ -150,6 +150,29 @@ from app.worker import wakeup
 from app.worker.kinds import dispatch_job
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
 
+#: Live finding (64-vCPU extraction-worker host, 2026-09): numpy's OpenBLAS
+#: backend sizes its per-thread scratch buffers by the HOST's CPU count at
+#: import time — not by anything this process asks for. Document conversion
+#: (``connectors/sharepoint/crawler.py``) runs each file inside a FORKED
+#: child capped at ~1.5 GiB of virtual address space
+#: (``_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB``); on 64 cores, OpenBLAS tried
+#: to size 64 threads' worth of buffers inside that child and blew through
+#: the RLIMIT_AS ceiling — ``import markitdown`` / ``import pypdfium2`` died
+#: with "OpenBLAS error: Memory allocation still failed after 10 retries",
+#: which (before ``MissingConversionDependency`` learned to carry its cause)
+#: surfaced as a plain "markitdown is not installed". A single-document
+#: child converts exactly one file at a time and never benefits from more
+#: than one BLAS thread, on any host size. ``setdefault`` so an operator's
+#: own explicit env value always wins; this module is the extraction
+#: worker's own process entry point (imported once, at worker startup, by
+#: ``app/main.py``'s ``Role.WORKER`` branch) — it runs long before a crawl
+#: forks its first conversion child, which is what actually matters: a
+#: forked child inherits the parent's ``os.environ`` as it stood at fork
+#: time, not at process-start time.
+for _blas_env_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_env_var, "1")
+del _blas_env_var
+
 logger = logging.getLogger(__name__)
 
 _HEAVY_CONCURRENCY = 1

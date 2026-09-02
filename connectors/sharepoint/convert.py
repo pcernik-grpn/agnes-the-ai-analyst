@@ -162,22 +162,45 @@ class ConversionError(RuntimeError):
 
 
 class MissingConversionDependency(ConversionError):
-    """An optional extraction dependency is not installed.
+    """An optional extraction dependency is not installed — or its lazy
+    import failed for some other reason (e.g. an out-of-memory error inside
+    a conversion child running under a tight ``RLIMIT_AS``).
 
     A subclass of :class:`ConversionError` so a crawl that catches the base
     class keeps running, but distinct so an operator-facing caller can catch it
     first and stop early: every document of that kind will fail identically
-    until someone installs the extra.
+    until someone installs the extra (or the underlying cause is fixed).
+
+    ``cause``, when given, is the exception the lazy ``import`` actually
+    raised — folded into the message as ``"<type>: <first 200 chars>"`` so a
+    live finding (a ``MemoryError`` under a memory-limited child reported as
+    a plain "not installed") carries its real cause instead of masking it.
+    Without ``cause`` (e.g. a missing binary on ``PATH``, never an import
+    failure) the message stays the plain "not installed" wording.
     """
 
-    def __init__(self, filename: str, package: str, *, engine: str | None = None) -> None:
+    def __init__(
+        self,
+        filename: str,
+        package: str,
+        *,
+        engine: str | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
         self.package = package
-        super().__init__(
-            filename,
-            f"{package} is not installed — install the extraction extra "
-            f"(pip install 'agnes[extraction]') to convert this file type",
-            engine=engine,
-        )
+        install_hint = "install the extraction extra (pip install 'agnes[extraction]') to convert this file type"
+        if cause is not None:
+            reason = type(cause).__name__
+            cause_text = str(cause)[:200]
+            if cause_text:
+                reason = f"{reason}: {cause_text}"
+            message = (
+                f"{package} could not be imported ({reason}) — {install_hint}, "
+                f"or check the conversion child's memory limit"
+            )
+        else:
+            message = f"{package} is not installed — {install_hint}"
+        super().__init__(filename, message, engine=engine)
 
 
 @dataclass
@@ -289,8 +312,14 @@ def _convert_markitdown(path: Path, filename: str) -> str:
     """
     try:
         from markitdown import MarkItDown
-    except ImportError as exc:
-        raise MissingConversionDependency(filename, "markitdown", engine=ENGINE_MARKITDOWN) from exc
+    except Exception as exc:
+        # Broader than ImportError on purpose: a live finding showed a
+        # MemoryError from deep inside numpy/OpenBLAS init (this import's
+        # transitive dependency chain, under a conversion child's RLIMIT_AS)
+        # propagating uncaught and reading as "markitdown is not installed"
+        # by the time anyone saw it — `cause=exc` keeps the real exception
+        # type and text in the message instead of losing it.
+        raise MissingConversionDependency(filename, "markitdown", engine=ENGINE_MARKITDOWN, cause=exc) from exc
 
     try:
         result = MarkItDown(enable_plugins=False).convert(str(path))
@@ -437,8 +466,12 @@ def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
         # MissingConversionDependency naming `agnes[extraction]`, never as a
         # bare ImportError from three frames down.
         import pypdfium2  # noqa: F401
-    except ImportError as exc:
-        raise MissingConversionDependency(filename, "pypdfium2", engine=ENGINE_PYPDFIUM2) from exc
+    except Exception as exc:
+        # See the matching comment in _convert_markitdown: broader than
+        # ImportError so a MemoryError from this import's own native
+        # dependency chain carries its cause instead of reading as a plain
+        # "not installed".
+        raise MissingConversionDependency(filename, "pypdfium2", engine=ENGINE_PYPDFIUM2, cause=exc) from exc
 
     from connectors.sharepoint.pdf_structure import reconstruct_pdf
 

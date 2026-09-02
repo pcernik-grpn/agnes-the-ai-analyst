@@ -320,6 +320,13 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         "http_429": live.get("http_429"),
         "throttle_wait_s": live.get("throttle_wait_s"),
         "errors": live.get("errors"),
+        # `extraction.crawl.min_modified` age filter — see `CrawlStats.
+        # filtered_by_age`/`age_unknown`. `live` already picks `report` (a
+        # finished run) or `progress` (a running one), so this reads the
+        # same counter an operator watching a LIVE run sees mid-crawl, not
+        # only once the run is done.
+        "filtered_by_age": live.get("filtered_by_age"),
+        "age_unknown": live.get("age_unknown"),
         "skips_total": skips.get("total"),
         "skips_listed": skips.get("listed"),
         "oversize_files": (report.get("skipped_oversize") or {}).get("files", progress.get("oversize_files")),
@@ -608,6 +615,7 @@ async def fleet_extraction_runs(
         "totals": totals,
         "as_of": now.isoformat(),
     }
+
 
 #: The standalone facts pass's job kind and the statuses that mean "in
 #: flight" — the same pair `POST …/facts-extract`'s idempotency dedup
