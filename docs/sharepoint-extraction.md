@@ -103,9 +103,26 @@ spot-check shows pseudonyms, not names.
      <id>]` (or `--paths-file split.json`, a JSON list or `{"paths":
      [...]}`) — confirms every path as a scope in one call, reporting
      created/skipped/already-failed paths independently rather than
-     all-or-nothing.
+     all-or-nothing. By default each path still mints its own collection —
+     add `--collection-id <id>` (an existing, live collection) or
+     `--collection-name <name>` (mint one) to route every scope THIS call
+     creates to ONE shared collection instead, so the split site still
+     reads, shares and selects in chat as a single collection rather than
+     one per scope.
   3. Repeat 1-2 per clone, splitting the site's top-level folders across
-     however many connections the crawl needs to parallelize over.
+     however many connections the crawl needs to parallelize over — reuse
+     the SAME `--collection-id` across connections to keep the whole site
+     in one collection.
+
+  **Already split without the shared-collection option?** `POST
+  …/connections/{id}/collections/consolidate` or `agnes admin sharepoint
+  collections consolidate <connection_id> --target-name <name> |
+  --target-collection-id <id> [--execute]` folds a connection's per-scope
+  collections into one target after the fact — a dry-run preview (the
+  default) lists what would be folded and how many files, `--execute`
+  performs the real merge (files/chunks/claims re-pointed, grants unioned,
+  emptied sources soft-deleted). Also reachable from the source card's
+  overflow menu (**Consolidate collections…**). PG-only (A3 ratchet).
 
   reports it. Per-run override in the Run-now options. Editable in
   `/admin/server-config` → *Extraction* → *crawler*; this is the extraction

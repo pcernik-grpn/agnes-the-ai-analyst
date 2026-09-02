@@ -1231,6 +1231,20 @@ _EXEMPT: dict[str, str] = {
         "the standing admin credential-provisioning exemption (CONTRIBUTING.md), same "
         "reasoning as POST /api/admin/source-connections' own credential-adjacent writes"
     ),
+    # Collection consolidation — folds several of a connection's per-scope
+    # collections into one target, re-pointing scopes/files/chunks/claims
+    # and merging resource grants. CLI-reachable (`agnes admin sharepoint
+    # collections consolidate`) for the same ops-scripting-a-large-site
+    # reason as clone/bulk-add above, but deliberately not MCP-exposed:
+    # reassigning which collection a scope's content (and its grants) lives
+    # under is the same visibility-shaping write bulk-add's own collection
+    # option is never agent-invokable for.
+    "/api/admin/sharepoint/connections/{connection_id}/collections/consolidate": (
+        "fold several per-scope SharePoint collections into one target (dry-run preview "
+        "or the real merge) — CLI-reachable (agnes admin sharepoint collections "
+        "consolidate) but deliberately not MCP-exposed: mirrors the connection-clone "
+        "credential/visibility-write exemption right above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "

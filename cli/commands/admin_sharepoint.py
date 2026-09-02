@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Six surfaces:
+Seven surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
@@ -16,6 +16,14 @@ Six surfaces:
     connections, each with its own crawl and facts jobs, so they run in
     parallel: clone the source connection (same credential material, zero
     scopes), then bulk-add the split's folder paths onto each clone.
+    ``scope bulk-add`` also takes ``--collection-id``/``--collection-name``
+    to route every path it confirms to ONE shared collection instead of
+    minting one per path.
+  - ``collections consolidate`` — the after-the-fact fix when a site
+    ALREADY ended up split across many per-scope collections: fold them
+    into one target (dry-run preview by default, ``--execute`` for the
+    real merge). CLI counterpart to ``POST /api/admin/sharepoint/
+    connections/{connection_id}/collections/consolidate``.
   - ``runs`` — the extraction fleet dashboard (2026-09-02), from the
     terminal: is it on pace, is anything stuck, what is it costing, across
     every SharePoint connection at once. CLI counterpart to
@@ -66,8 +74,10 @@ from cli.client import api_get, api_patch, api_post
 admin_sharepoint_app = typer.Typer(help="Admin: SharePoint connector maintenance triggers")
 scope_app = typer.Typer(help="SharePoint connect wizard scope management")
 connection_app = typer.Typer(help="SharePoint connection management")
+collections_app = typer.Typer(help="SharePoint per-scope collection management")
 admin_sharepoint_app.add_typer(scope_app, name="scope")
 admin_sharepoint_app.add_typer(connection_app, name="connection")
+admin_sharepoint_app.add_typer(collections_app, name="collections")
 
 # `runs` renders a nine-column table (connection through error). A default,
 # terminal-detected width truncates every cell to a few characters when
@@ -250,6 +260,22 @@ def scope_bulk_add(
         "--drive-id",
         help="Graph drive id — required unless this connection already has a scope with one set",
     ),
+    collection_id: Optional[str] = typer.Option(
+        None,
+        "--collection-id",
+        help=(
+            "Route every scope THIS call creates to an EXISTING, live collection instead of "
+            "minting one per path — mutually exclusive with --collection-name."
+        ),
+    ),
+    collection_name: Optional[str] = typer.Option(
+        None,
+        "--collection-name",
+        help=(
+            "Mint ONE new collection with this name and route every scope THIS call creates to "
+            "it — mutually exclusive with --collection-id."
+        ),
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Confirm many folder paths as scopes in one call — the fast path for
@@ -263,7 +289,18 @@ def scope_bulk_add(
     long as the call itself succeeded, even when some paths failed —
     inspect the per-path breakdown (``--json`` for the full detail) rather
     than the exit code.
+
+    A split site otherwise forks across as many collections as there are
+    confirmed scopes — one bulk-add call per connection, one collection per
+    path. ``--collection-id``/``--collection-name`` route every scope THIS
+    call creates to ONE shared collection instead; the SAME
+    ``--collection-id`` across several bulk-add calls (one per connection
+    in the split) grows one collection for the whole site.
     """
+    if collection_id and collection_name:
+        typer.echo("Error: --collection-id and --collection-name are mutually exclusive", err=True)
+        raise typer.Exit(1)
+
     paths: List[str] = list(path)
     if paths_file is not None:
         try:
@@ -285,6 +322,10 @@ def scope_bulk_add(
     body: dict = {"paths": paths}
     if drive_id:
         body["drive_id"] = drive_id
+    if collection_id:
+        body["collection_id"] = collection_id
+    if collection_name:
+        body["collection"] = {"name": collection_name}
 
     resp = api_post(f"/api/admin/sharepoint/connections/{connection_id}/scopes/bulk", json=body)
     if resp.status_code != 200:
@@ -328,6 +369,85 @@ def connection_clone(
         typer.echo("Vault secret copied — the clone is ready to crawl.")
     else:
         typer.echo("No vault secret to copy (source resolves its certificate from an env var).")
+
+
+@collections_app.command("consolidate")
+def collections_consolidate(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    target_collection_id: Optional[str] = typer.Option(
+        None,
+        "--target-collection-id",
+        help="Fold into this EXISTING, live collection — mutually exclusive with --target-name",
+    ),
+    target_name: Optional[str] = typer.Option(
+        None,
+        "--target-name",
+        help="Mint ONE new collection with this name as the fold target — mutually exclusive "
+        "with --target-collection-id",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        help="Actually perform the merge. Without this flag the call is a dry-run preview only.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Fold this connection's own per-scope collections into ONE target —
+    the after-the-fact fix for a large site split across many bulk-added
+    scopes that ended up one collection per scope (CLI counterpart to
+    ``POST /api/admin/sharepoint/connections/{connection_id}/collections/
+    consolidate``).
+
+    Defaults to a DRY RUN: lists the collections that would be folded and
+    their file counts, without touching anything. Pass ``--execute`` to
+    perform the real merge (files/chunks/claims re-pointed, resource grants
+    unioned, source collections soft-deleted).
+
+    ``409`` if a source collection is still routed to by a DIFFERENT
+    connection's own scope, or if the merge would collide on a duplicate
+    file path / source-document id across the collections being folded.
+    """
+    if bool(target_collection_id) == bool(target_name):
+        typer.echo("Error: pass exactly one of --target-collection-id or --target-name", err=True)
+        raise typer.Exit(1)
+
+    body: dict = {"dry_run": not execute}
+    if target_collection_id:
+        body["target_collection_id"] = target_collection_id
+    else:
+        body["target"] = {"name": target_name}
+
+    resp = api_post(
+        f"/api/admin/sharepoint/connections/{connection_id}/collections/consolidate",
+        json=body,
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    result = resp.json()
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+
+    target = result["target"]
+    sources = result["sources"]
+    if result["dry_run"]:
+        typer.echo(f"[dry run] would fold {len(sources)} collection(s) into '{target['name']}' ({target['id']}):")
+        for s in sources:
+            typer.echo(f"  {s['name']} ({s['id']}) — {s['file_count']} file(s)")
+        for b in result.get("blocking") or []:
+            typer.echo(
+                f"  BLOCKED: {b['collection_id']} is still referenced by connection {b['connection_id']} "
+                "— consolidating would refuse with 409",
+                err=True,
+            )
+    else:
+        typer.echo(f"Folded {len(sources)} collection(s) into '{target['name']}' ({target['id']}):")
+        typer.echo(
+            f"  files={result['files_moved']} chunks={result['chunks_moved']} "
+            f"sources={result['sources_moved']} events={result['events_moved']} "
+            f"claims={result['claims_moved']} grants={result['grants_merged']} "
+            f"scopes_repointed={result['scopes_repointed']}"
+        )
 
 
 # ---------------------------------------------------------------------------

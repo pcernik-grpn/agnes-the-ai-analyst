@@ -107,6 +107,15 @@ Surface:
                                                                 the job's own per-connection
                                                                 due-guard, so this is always a real,
                                                                 immediate sweep.
+  POST   /api/admin/sharepoint/connections/{id}/collections/    — fold several of this connection's
+         consolidate                                            per-scope collections into ONE
+                                                                target (dry-run preview by default,
+                                                                or the real merge with ``dry_run:
+                                                                false``) — the after-the-fact fix
+                                                                for a large site split across many
+                                                                bulk-added scopes that ended up one
+                                                                collection per scope. See
+                                                                :func:`consolidate_collections`.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -172,9 +181,11 @@ from src.repositories import (
     corpus_files_repo,
     file_corpora_repo,
     resource_grants_repo,
+    sharepoint_collection_consolidation_repo,
     source_connections_repo,
     user_groups_repo,
 )
+from src.repositories.sharepoint_collection_consolidation_pg import ConsolidationConflict
 
 logger = logging.getLogger(__name__)
 
@@ -306,16 +317,39 @@ class AddManualSiteBody(BaseModel):
     site_url: str = Field(..., min_length=1)
 
 
+class BulkScopeCollectionSpec(BaseModel):
+    """The ``collection`` half of ``BulkScopeBody``'s shared-collection
+    option — mint ONE brand-new collection, by name, and route every scope
+    this call creates into it (see :func:`bulk_add_scopes`)."""
+
+    name: str = Field(..., min_length=1)
+
+
 class BulkScopeBody(BaseModel):
     """One shot: turn a list of admin-typed folder paths into confirmed
     scopes, without the wizard's own click-through-the-tree flow (see
     :func:`bulk_add_scopes`). ``drive_id`` is optional — omit it to reuse
     the drive of an existing scope on this SAME connection; a brand-new
     connection with no scopes yet (the split-a-big-site workflow's typical
-    starting point, see :func:`clone_connection`) must supply it."""
+    starting point, see :func:`clone_connection`) must supply it.
+
+    A large site is routinely split across MANY bulk-add calls (one per
+    connection, spec's split-a-big-site workflow) — by default each call
+    still mints its OWN collection per path, forking the site across as
+    many collections as there are confirmed scopes. ``collection_id`` (an
+    existing, live collection) or ``collection`` (mint one new, named
+    collection) overrides that default: every scope THIS call creates
+    routes to the one shared target instead. Mutually exclusive
+    (``400 both_collection_id_and_collection``); an unknown/soft-deleted
+    ``collection_id`` is ``404 collection_not_found``. Paths already
+    present on the connection are still reported ``skipped`` and keep
+    whatever collection they already own — the shared target only ever
+    applies to scopes THIS call newly creates."""
 
     paths: List[str] = Field(..., min_length=1)
     drive_id: Optional[str] = None
+    collection_id: Optional[str] = None
+    collection: Optional[BulkScopeCollectionSpec] = None
 
 
 class CloneConnectionBody(BaseModel):
@@ -324,6 +358,27 @@ class CloneConnectionBody(BaseModel):
     the source (see :func:`clone_connection`)."""
 
     name: str = Field(..., min_length=1)
+
+
+class ConsolidateTargetSpec(BaseModel):
+    """The ``target`` half of ``ConsolidateCollectionsBody`` — mint ONE new
+    collection, by name, as the consolidation target."""
+
+    name: str = Field(..., min_length=1)
+
+
+class ConsolidateCollectionsBody(BaseModel):
+    """Fold this connection's own per-scope collections into ONE target
+    (see :func:`consolidate_collections`). Exactly one of
+    ``target_collection_id`` (an existing, live collection — any live
+    collection, not necessarily one of this connection's own) or ``target``
+    (mint a new one, by name) must be given. ``dry_run`` defaults to
+    ``True`` — a caller must explicitly opt into the real, data-moving
+    merge."""
+
+    target_collection_id: Optional[str] = None
+    target: Optional[ConsolidateTargetSpec] = None
+    dry_run: bool = True
 
 
 #: Config keys :func:`clone_connection` does NOT carry over into a clone —
@@ -548,6 +603,31 @@ def _group_ids_for_collection(collection_id: str) -> List[str]:
     return [g["group_id"] for g in grants if g.get("resource_id") == collection_id]
 
 
+def _collection_still_referenced(
+    collection_id: str, *, exclude_connection_id: str, exclude_source_scope_id: str
+) -> bool:
+    """Whether any OTHER live scope — on THIS connection or any other
+    SharePoint connection — still routes to ``collection_id``.
+
+    A collection used to be owned by exactly one scope, but the bulk-add
+    shared-collection option (``BulkScopeBody.collection_id``/``collection``)
+    and collection consolidation (``POST …/collections/consolidate``) both
+    make more than one scope route to the SAME collection on purpose.
+    :func:`remove_scope` must never soft-delete (or treat as solely-owned)
+    a collection another live scope still needs — the untick of ONE scope
+    sharing a site's collection must not blow away everyone else's crawl
+    target.
+    """
+    for connection in source_connections_repo().list(source_type="sharepoint"):
+        same_connection = connection.get("id") == exclude_connection_id
+        for scope in _scopes(connection):
+            if same_connection and scope.get("source_scope_id") == exclude_source_scope_id:
+                continue
+            if scope.get("collection_id") == collection_id:
+                return True
+    return False
+
+
 def _latest_run_anonymized_corpus_ids() -> set:
     """Which collection ids the LATEST persisted ``facts_ingest_runs`` row
     declares it anonymized (spec §9.2 — the producer's own declaration, see
@@ -745,6 +825,25 @@ def _create_scope_collection(*, connection_name: str, display_path: str, source_
             raise
         suffix = hashlib.sha256(source_scope_id.encode()).hexdigest()[:8]
         return repo.create(name=name, slug=f"{slug}-{suffix}", description=description, created_by=created_by)
+
+
+def _create_named_collection(*, name: str, created_by: str) -> str:
+    """Mint the ONE shared collection ``bulk_add_scopes`` routes every scope
+    it creates THIS call into (``BulkScopeBody.collection``) — same repo
+    call :func:`_create_scope_collection` makes, just keyed on an
+    admin-typed name instead of a folder path. A slug collision falls back
+    to a RANDOM (not deterministic) suffix: unlike a per-path scope
+    collection, there is no stable per-call id to derive one from, and this
+    is a one-shot mint, never retried against the same slug."""
+    repo = file_corpora_repo()
+    slug = _slugify(name)
+    try:
+        return repo.create(name=name, slug=slug, description=None, created_by=created_by)
+    except Exception as exc:  # noqa: BLE001 — DuckDB ConstraintException / PG IntegrityError, message-sniffed elsewhere too
+        err = str(exc).lower()
+        if "unique" not in err and "duplicate" not in err and "constraint" not in err:
+            raise
+        return repo.create(name=name, slug=f"{slug}-{secrets.token_hex(4)}", description=None, created_by=created_by)
 
 
 def _readopted_scope_collection_id(tombstone: Any) -> Optional[str]:
@@ -1496,6 +1595,12 @@ async def remove_scope(
     * **Has files** — kept, and the response says so (``collection_kept:
       true`` + the collection ref) so the wizard can tell the admin where to
       delete it deliberately (the Library).
+    * **Shared** — a collection more than one scope routes to (bulk-add's
+      ``collection_id``/``collection`` option, or a post-consolidation
+      re-point) is ALWAYS treated as kept, even with zero files, when
+      another live scope (on this connection or any other) still routes to
+      it (:func:`_collection_still_referenced`) — an empty collection is
+      only "orphaned" when nothing else needs it.
 
     Either way a tombstone (``config.retired_scope_collections``, keyed by
     ``source_scope_id``) records which collection this scope owned, so a
@@ -1513,7 +1618,10 @@ async def remove_scope(
     ``mirrored`` -> ``manual`` transition; an admin-assigned grant on the
     same collection is untouched either way (on the kept collection it keeps
     working; on the soft-deleted one it resurrects with it on re-tick, so
-    the share state round-trips the untick like everything else).
+    the share state round-trips the untick like everything else). A SHARED
+    collection's sentinel grants are likewise left alone — another live scope
+    may still be mirrored onto this same collection, and the sync will keep
+    reconciling it on its own schedule.
     """
     row = _sharepoint_connection_or_404(connection_id)
     scopes = _scopes(row)
@@ -1524,9 +1632,17 @@ async def remove_scope(
 
     collection_id = removed.get("collection_id")
     collection = file_corpora_repo().get(collection_id) if collection_id else None
+    # A shared collection (bulk-add's `collection_id`/`collection` option, or
+    # a post-consolidation re-point) may still be routed to by another live
+    # scope — on this connection or any other — even though THIS scope is
+    # being unticked. Untick must never soft-delete, or purge the ACL-sync
+    # sentinel grants of, a collection someone else still needs.
+    shared = bool(collection_id) and _collection_still_referenced(
+        collection_id, exclude_connection_id=connection_id, exclude_source_scope_id=source_scope_id
+    )
     kept = False
     if collection is not None:
-        if corpus_files_repo().list_for_corpus(collection_id):
+        if shared or corpus_files_repo().list_for_corpus(collection_id):
             kept = True
         else:
             file_corpora_repo().soft_delete(collection_id)
@@ -1540,7 +1656,7 @@ async def remove_scope(
         new_config["retired_scope_collections"] = retired
     source_connections_repo().update(connection_id, config=new_config)
 
-    if collection_id:
+    if collection_id and not shared:
         grants = resource_grants_repo()
         for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
             if grant.get("resource_id") == collection_id and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL:
@@ -1577,8 +1693,11 @@ async def bulk_add_scopes(
     [{"path", "reason"}]}`` —
 
     * **created** — a fresh scope, collection minted (or re-adopted from a
-      matching untick tombstone, same as :func:`confirm_scope`); each entry
-      is `{"path", **scope}` (the same projection ``GET …/scopes`` returns).
+      matching untick tombstone, same as :func:`confirm_scope`) — UNLESS
+      ``body.collection_id``/``body.collection`` names a shared target, in
+      which case every scope this call creates routes there instead (no
+      per-path mint, no tombstone re-adoption); each entry is `{"path",
+      **scope}` (the same projection ``GET …/scopes`` returns).
     * **skipped** — the path resolved to a ``source_scope_id`` ALREADY
       present among this connection's scopes (the idempotency key
       :func:`confirm_scope` itself uses) — ``{"path", "source_scope_id",
@@ -1604,8 +1723,28 @@ async def bulk_add_scopes(
     otherwise); a malformed one is a typed ``422`` (see
     :func:`_validate_graph_id`), same as ``POST …/scopes``'s own
     ``drive_id``.
+
+    ``collection_id``/``collection`` (mutually exclusive — ``400
+    both_collection_id_and_collection``) route every scope THIS call
+    creates to ONE shared collection instead of minting one per path — the
+    fix for a large site otherwise forking across as many collections as
+    there are confirmed scopes across the split's several connections.
+    ``collection_id`` must name an existing, live collection
+    (``404 collection_not_found`` otherwise); ``collection`` mints a new
+    one, by name. A path already ``skipped`` (already present) keeps
+    whatever collection it already owns — the shared target never moves an
+    existing scope.
     """
     row = _sharepoint_connection_or_404(connection_id)
+
+    if body.collection_id and body.collection:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "both_collection_id_and_collection",
+                "message": "collection_id and collection are mutually exclusive — pass at most one.",
+            },
+        )
 
     paths = [p.strip() for p in body.paths if p and p.strip()]
     if not paths:
@@ -1613,6 +1752,15 @@ async def bulk_add_scopes(
             status_code=422,
             detail={"error": "empty_paths", "message": "paths must contain at least one non-empty path"},
         )
+
+    target_collection_id: Optional[str] = None
+    if body.collection_id:
+        target = file_corpora_repo().get(body.collection_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail={"error": "collection_not_found"})
+        target_collection_id = body.collection_id
+    elif body.collection:
+        target_collection_id = _create_named_collection(name=body.collection.name, created_by=user.get("id"))
 
     if body.drive_id:
         _validate_graph_id(body.drive_id, "drive_id")
@@ -1676,14 +1824,22 @@ async def bulk_add_scopes(
             tombstone = retired.pop(source_scope_id, None)
             if tombstone is not None:
                 retired_changed = True
-            collection_id = _readopted_scope_collection_id(tombstone)
-            if collection_id is None:
-                collection_id = _create_scope_collection(
-                    connection_name=row.get("name") or connection_id,
-                    display_path=path,
-                    source_scope_id=source_scope_id,
-                    created_by=user.get("id"),
-                )
+            if target_collection_id is not None:
+                # Shared-collection call: every scope created THIS call
+                # routes to the one target, never a per-path mint or a
+                # tombstone re-adoption (the tombstone is still popped above
+                # so a later untargeted re-tick of this same folder doesn't
+                # find stale bookkeeping).
+                collection_id = target_collection_id
+            else:
+                collection_id = _readopted_scope_collection_id(tombstone)
+                if collection_id is None:
+                    collection_id = _create_scope_collection(
+                        connection_name=row.get("name") or connection_id,
+                        display_path=path,
+                        source_scope_id=source_scope_id,
+                        created_by=user.get("id"),
+                    )
             scope_row = {
                 "source_scope_id": source_scope_id,
                 "display_path": path,
@@ -1791,6 +1947,209 @@ async def clone_connection(
     )
 
     return {"id": new_id, "name": body.name, "secret_copied": secret_copied}
+
+
+def _collection_ref(collection: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": collection["id"], "name": collection["name"], "slug": collection["slug"]}
+
+
+def _foreign_connection_referencing(collection_id: str, *, this_connection_id: str) -> Optional[str]:
+    """The id of another SharePoint connection whose OWN scope still routes
+    to ``collection_id``, or ``None`` — the guard :func:`consolidate_collections`
+    uses to refuse folding away a collection a DIFFERENT connection's crawl
+    still depends on. A scope on THIS SAME connection routing to it is not
+    "foreign" — that is exactly the fold this endpoint performs."""
+    for connection in source_connections_repo().list(source_type="sharepoint"):
+        if connection.get("id") == this_connection_id:
+            continue
+        for scope in _scopes(connection):
+            if scope.get("collection_id") == collection_id:
+                return connection.get("id")
+    return None
+
+
+@router.post("/connections/{connection_id}/collections/consolidate")
+async def consolidate_collections(
+    connection_id: str,
+    body: ConsolidateCollectionsBody,
+    user: dict = Depends(require_admin),
+):
+    """Fold this connection's own per-scope collections into ONE target.
+
+    A site split across many bulk-added scopes (:func:`bulk_add_scopes`,
+    before it grew the shared-collection option) ends up with one
+    ``file_corpora`` collection PER scope — impossible to share, select in
+    chat, or reason about as a whole. This is the after-the-fact fix: pick
+    (or mint) a target, and every OTHER collection this connection's scopes
+    currently route to is folded into it.
+
+    ``target_collection_id`` XOR ``target`` is required (``400
+    both_target_collection_id_and_target`` / ``400
+    target_required``); an unknown/soft-deleted ``target_collection_id`` is
+    ``404 collection_not_found``. ``target_collection_id`` may name ANY
+    live collection — not necessarily one of this connection's own (the
+    same cross-connection sharing bulk-add's ``collection_id`` option
+    allows).
+
+    ``dry_run`` (default ``True``) only lists the collections that WOULD be
+    folded and their file counts — nothing is touched, and a NAMED
+    ``target`` is not even minted yet (the response's ``target.id`` is
+    ``null`` in that case — a preview must never create data). Set
+    ``dry_run: false`` to actually perform the merge:
+
+    * every row carrying a ``corpus_id`` for a source collection
+      (``corpus_files``, ``corpus_chunks``, ``corpus_file_sources``,
+      ``corpus_file_events``, ``claims``, ``fact_alias_sources``) is
+      re-pointed to the target, in ONE transaction
+      (:class:`src.repositories.sharepoint_collection_consolidation_pg.
+      SharePointCollectionConsolidationPgRepository`);
+    * every one of THIS connection's scopes that routed to a source now
+      routes to the target;
+    * the source collections' ``resource_grants`` are unioned onto the
+      target (a group already granted there keeps its existing grant);
+    * the emptied source collections are soft-deleted.
+
+    Refused with ``409 collection_referenced_by_other_connection`` (nothing
+    touched) when a source collection is still routed to by a DIFFERENT
+    connection's own scope — the same collection may be intentionally
+    shared cross-connection (bulk-add's ``collection_id`` option), and this
+    endpoint only ever folds away collections that belong to THIS
+    connection alone. ``409 consolidation_conflict`` (nothing touched, see
+    :class:`~src.repositories.sharepoint_collection_consolidation_pg.
+    ConsolidationConflict`) when the merge would collide on
+    ``corpus_files.path`` or ``corpus_file_sources.source_stable_id``.
+
+    Not included: ACL-mirroring permission ZONES (``config.acl_zones``) can
+    carry their own, separate per-zone collection id
+    (``connectors.sharepoint.acl_sync``) — this endpoint never touches
+    those, only scope-level collections. A zone routed to a now-consolidated
+    collection needs the ``sharepoint-acl-sync``/``sharepoint-subtree-sweep``
+    jobs' own reconciliation to catch up.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    if body.target_collection_id and body.target:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "both_target_collection_id_and_target",
+                "message": "target_collection_id and target are mutually exclusive — pass exactly one.",
+            },
+        )
+    if not body.target_collection_id and not body.target:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "target_required", "message": "pass exactly one of target_collection_id or target."},
+        )
+
+    corpora = file_corpora_repo()
+    scope_collection_ids = sorted({s["collection_id"] for s in _scopes(row) if s.get("collection_id")})
+
+    # Resolve — but never MINT — a target reference here. A `target:
+    # {"name": ...}` mint is a real write, so it is deferred until the call
+    # actually commits (`dry_run=false`, past every refusal below) — a
+    # preview must never create data. `target_ref["id"]` is `None` for a
+    # not-yet-minted named target; the dry-run response surfaces that
+    # honestly rather than inventing an id.
+    if body.target_collection_id:
+        target = corpora.get(body.target_collection_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail={"error": "collection_not_found"})
+        prospective_sources = [cid for cid in scope_collection_ids if cid != body.target_collection_id]
+        target_ref = _collection_ref(target)
+    else:
+        assert body.target is not None  # mutual-exclusivity check above
+        prospective_sources = scope_collection_ids
+        target_ref = {"id": None, "name": body.target.name, "slug": None}
+
+    if not prospective_sources:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "nothing_to_consolidate",
+                "message": "this connection has no OTHER scope collection to fold into the target.",
+            },
+        )
+
+    consolidation_repo = sharepoint_collection_consolidation_repo()
+    preview_rows = consolidation_repo.preview(prospective_sources)
+    sources_out = [
+        {"id": r["id"], "name": r["name"], "slug": r["slug"], "file_count": r["file_count"]} for r in preview_rows
+    ]
+    blocking = [
+        {"collection_id": cid, "connection_id": foreign_id}
+        for cid in prospective_sources
+        if (foreign_id := _foreign_connection_referencing(cid, this_connection_id=connection_id)) is not None
+    ]
+
+    if body.dry_run:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.collections_consolidate",
+            resource=f"source_connection:{connection_id}",
+            params={"dry_run": True, "target": target_ref, "source_collection_ids": prospective_sources},
+            result="success",
+        )
+        return {
+            "dry_run": True,
+            "target": target_ref,
+            "sources": sources_out,
+            "blocking": blocking,
+        }
+
+    if blocking:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "collection_referenced_by_other_connection", "blocking": blocking},
+        )
+
+    # Committing for real: mint the named target NOW (never during a dry
+    # run above) — an existing `target_collection_id` was already resolved.
+    if body.target_collection_id:
+        target_id = body.target_collection_id
+    else:
+        assert body.target is not None
+        target_id = _create_named_collection(name=body.target.name, created_by=user.get("id"))
+    target = corpora.get(target_id)
+    source_ids = prospective_sources
+
+    try:
+        summary = consolidation_repo.consolidate(source_ids=source_ids, target_id=target_id)
+    except ConsolidationConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "consolidation_conflict", "kind": exc.kind, "keys": exc.keys},
+        ) from exc
+
+    scopes = _scopes(row)
+    repointed = 0
+    for scope in scopes:
+        if scope.get("collection_id") in source_ids:
+            scope["collection_id"] = target_id
+            repointed += 1
+    source_connections_repo().update(connection_id, config={**(row.get("config") or {}), "scopes": scopes})
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.collections_consolidate",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "dry_run": False,
+            "target_collection_id": target_id,
+            "source_collection_ids": source_ids,
+            "scopes_repointed": repointed,
+            **summary,
+        },
+        result="success",
+    )
+
+    return {
+        "dry_run": False,
+        "target": _collection_ref(target),
+        "sources": sources_out,
+        "scopes_repointed": repointed,
+        **summary,
+    }
 
 
 @router.get("/connections/{connection_id}/certificate")
