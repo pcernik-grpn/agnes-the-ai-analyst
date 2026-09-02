@@ -1378,6 +1378,111 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
 
+class TestConvertProcessPoolRetirement:
+    """Retiring a slot (recycle, crash recovery, shutdown) must actually END
+    the retiree — see `crawler._CHILD_DEFAULT_SIGNALS` for the live finding:
+    under uvicorn every forked child inherited a Python SIGTERM handler that
+    is a no-op outside the server loop, so `terminate()` was ignored, the
+    join timed out, and each recycle leaked one ~0.8 GB process until the
+    worker was OOM-killed.
+    """
+
+    def test_a_recycled_child_dies_even_when_the_parent_traps_sigterm(self, tmp_path, monkeypatch):
+        # Reproduce the uvicorn situation: the FORKING process has a
+        # Python-level SIGTERM handler that does nothing useful in a child.
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0)
+        try:
+            pool.start()
+            retiree = pool._procs[0]
+            # Sibling forked AFTER the retiree — holds an inherited copy of
+            # the retiree's pipe fd, so closing the parent's end alone can
+            # never deliver EOF to the retiree (the second half of the leak).
+            assert pool._spare_procs[0] is not None and pool._spare_procs[0].is_alive()
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 -> recycles
+            assert pool._procs[0] is not retiree
+            deadline = time.monotonic() + 10
+            while retiree.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not retiree.is_alive(), "the retired conversion child must not outlive its slot"
+            assert retiree.exitcode is not None, "and it must be REAPED, not left a zombie"
+        finally:
+            pool.shutdown()
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_retire_escalates_to_sigkill_when_sigterm_is_ignored(self):
+        class _StubbornProc:
+            def __init__(self) -> None:
+                self.calls: List[str] = []
+                self._alive = True
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def terminate(self) -> None:
+                self.calls.append("terminate")  # ignored, like an inherited no-op handler
+
+            def kill(self) -> None:
+                self.calls.append("kill")
+                self._alive = False
+
+            def join(self, timeout: Optional[float] = None) -> None:
+                self.calls.append(f"join({timeout})")
+
+        proc = _StubbornProc()
+        crawler._retire_process(proc, grace_s=0.01)
+        assert proc.calls == ["terminate", "join(0.01)", "kill", "join(0.01)"]
+        assert not proc.is_alive()
+
+    def test_retire_stops_at_sigterm_for_a_cooperative_child(self):
+        class _PoliteProc:
+            def __init__(self) -> None:
+                self.calls: List[str] = []
+                self._alive = True
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def terminate(self) -> None:
+                self.calls.append("terminate")
+                self._alive = False
+
+            def kill(self) -> None:
+                self.calls.append("kill")
+
+            def join(self, timeout: Optional[float] = None) -> None:
+                self.calls.append("join")
+
+        proc = _PoliteProc()
+        crawler._retire_process(proc)
+        assert proc.calls == ["terminate", "join"], "no SIGKILL for a child that honoured SIGTERM"
+
+    def test_child_resets_inherited_sigterm_to_default(self):
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        try:
+            ctx = crawler.multiprocessing.get_context("fork")
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+
+            def _report(conn):
+                crawler._reset_inherited_signal_handlers()
+                conn.send(signal.getsignal(signal.SIGTERM) is signal.SIG_DFL)
+
+            proc = ctx.Process(target=_report, args=(child_conn,))
+            proc.start()
+            child_conn.close()
+            assert parent_conn.poll(5), "child never reported"
+            assert parent_conn.recv() is True
+            proc.join(5)
+            # ...while the PARENT keeps the handler it had (a child must never
+            # reach back and change the forking process's dispositions).
+            assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+
 class TestConvertProcessPoolItemTimeout:
     """`_ConvertProcessPool`'s per-item TIME bound — the fix for a real,
     observed gap: nothing previously bounded how long a single document's
