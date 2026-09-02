@@ -96,6 +96,21 @@ MAX_INGEST_CLAIMS = 5000
 # should be able to loosen. See `_is_meaningful_quote`.
 MIN_MEANINGFUL_QUOTE_LENGTH = 2
 
+# The separator `facts_extraction.py::_document_text` joins a document's
+# chunks with, to build the ONE string the model actually reads. Named here,
+# not re-literal'd, so the two representations can never drift (same
+# "imported rather than re-implemented" discipline as `_identity_candidates`/
+# `_is_meaningful_quote` below, just in the other direction). Used to widen
+# the verbatim gate's substring test to the document's FULL joined text, not
+# only one chunk at a time (cost-levers spec 2026-09-02 §2.1(b)/§2.2): a
+# quote is still required to be an EXACT substring of real, stored text —
+# this only fixes an incomplete definition of "the text the model saw", it
+# does not relax exactness. A quote landing entirely inside one chunk is
+# unaffected (`any(quote in t for t in texts)` already accepts it); this
+# only rescues a quote that genuinely spans what was, to the model, an
+# invisible internal split point.
+CHUNK_JOIN_SEPARATOR = "\n\n"
+
 # One statement-scoped guard against a runaway traversal on power-law data
 # (spec §12 — "the hub-node walk is the query that explodes"). Local to the
 # repo, not an operator switch — the caps above are the primary defense.
@@ -3088,6 +3103,24 @@ class FactsPgRepository:
                 chunk_cache[file_id] = [c["text"] for c in chunks_repo.list_for_file(file_id) if c.get("text")]
             return chunk_cache[file_id]
 
+        joined_cache: Dict[str, str] = {}
+
+        def _joined_text(file_id: str) -> str:
+            """The document rebuilt from its chunks, ONCE per file per batch.
+
+            The boundary-crossing check below joins the whole document, and it
+            runs per QUOTE. A batch where many quotes miss their individual
+            chunks — exactly the batch this repair path exists for — rebuilt
+            and rescanned the entire document once for each of them, so the
+            cost grew with quotes x document size (Devin Review on #2063).
+            Lazy on purpose: a batch whose quotes all land inside a single
+            chunk never joins anything, which is the common case the per-chunk
+            check above is ordered first to serve.
+            """
+            if file_id not in joined_cache:
+                joined_cache[file_id] = CHUNK_JOIN_SEPARATOR.join(_chunk_texts(file_id))
+            return joined_cache[file_id]
+
         claims_written = 0
         claims_accepted_via_identity = 0
         claims_rejected: List[Dict[str, Any]] = []
@@ -3171,7 +3204,13 @@ class FactsPgRepository:
                         continue
                     texts = _chunk_texts(file_id)
                     accepted_via_identity = False
-                    if not any(quote in t for t in texts):
+                    # Per-chunk first (the common case, and the cheaper
+                    # check); only join the whole document when no single
+                    # chunk contains it, so a boundary-crossing quote still
+                    # gets a fair look before falling through to identity
+                    # (cost-levers spec §2.1(b)/§2.2 — see
+                    # `CHUNK_JOIN_SEPARATOR`'s docstring above).
+                    if not any(quote in t for t in texts) and quote not in _joined_text(file_id):
                         # Widened gate: the document's own SERVER-STORED
                         # identity (`corpus_files.filename`/`path`) counts as
                         # verbatim evidence too — the extraction ontology
@@ -3319,7 +3358,17 @@ class FactsPgRepository:
             for endpoint_id, res in ((src_id, src_res), (dst_id, dst_res)):
                 if res.get("created"):
                     subjects_created += 1
+                    # Keep `node_fact_ids`/`node_types` parallel (see the
+                    # comment where they're declared, above) — omitting
+                    # `node_types` here left `_endpoint()`'s "already
+                    # resolved this batch" fast path indexing a key that
+                    # was never written, raising `KeyError` the moment a
+                    # SECOND edge in the same batch referenced this same
+                    # resolved-not-emitted endpoint (issue: an edge
+                    # endpoint minted here, rather than via the nodes[]
+                    # loop above, never got a `node_types` entry at all).
                     node_fact_ids[endpoint_id] = res["fact_id"]
+                    node_types[endpoint_id] = res["type"]
                     if res.get("reattached"):
                         corrections_active.append(res["reattached"])
 

@@ -53,13 +53,17 @@ _SIGNATURES = (
     "function _extTime(iso) {",
     "function _extDuration(seconds) {",
     "function _extNum(n) {",
+    "function _extTruncMiddle(path, max) {",
     "const EXT_DOT = {",
     "function _extDot(outcome) {",
+    "function _extIsFactsPhase(run) {",
+    "function _extPhaseCountText(run) {",
     "function _extRenderCrawlCell(connId, status) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
+    "function _extActivityHtml(activity) {",
     "function _extErrorsSummaryHtml(connId, runId, errorCount) {",
     "async function _extLoadErrorDetail(details) {",
     "function _extErrorItemsHtml(runDetail) {",
@@ -392,6 +396,76 @@ class TestDegradation:
         assert out["hidden"] is False
         assert "crawling" in out["html"]
         assert "812 files" in out["html"]
+
+
+# --------------------------------------------------------------------------
+# The facts (LLM graph-extraction) phase — owner-frustration fix, 2026-09-02:
+# a healthy multi-hour facts pass never checkpointed at all, so the SAME
+# `files_done` the crawl froze at kept being shown next to a "stalled" chip
+# for the whole run. Once `_RunRecorder.checkpoint_facts` starts writing
+# again, the card must say WHICH phase is live and how far it has gotten,
+# not just keep repeating the crawl's own numbers.
+# --------------------------------------------------------------------------
+
+
+_FACTS_RUNNING = json.loads(json.dumps(_RUNNING))
+_FACTS_RUNNING["running"]["activity"] = {
+    "phase": "facts",
+    "current_path": "Engagements/northwind-rollout.docx",
+    "current_started_at": "2026-08-31T14:08:30+00:00",
+    "recent": [],
+}
+_FACTS_RUNNING["running"]["facts_progress"] = {"docs_done": 340, "docs_total": 1200}
+
+
+class TestFactsPhaseRendering:
+    def test_the_run_row_shows_document_progress_not_the_frozen_file_count(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_FACTS_RUNNING),
+        )
+        html = out["html"]
+        assert "extracting facts" in html
+        assert "340/1,200 documents processed" in html or "340/1200 documents processed" in html
+        assert "812 files processed" not in html
+
+    def test_the_pipeline_strip_cell_also_reflects_the_facts_phase(self):
+        out = _run_js(
+            f"_extRenderCrawlCell('sp1', {json.dumps(_FACTS_RUNNING)});"
+            'console.log(JSON.stringify({html: _elements["ext-crawl-live-sp1"].innerHTML}));'
+        )
+        html = out["html"]
+        assert "extracting facts" in html
+        assert "documents" in html
+        assert "files" not in html
+
+    def test_a_stalled_facts_run_still_says_stalled_first(self):
+        """Outcome takes precedence over phase wording — `stalled` must
+        never be softened into "extracting facts" just because the phase
+        happens to be facts when the checkpoint went quiet."""
+        stalled = json.loads(json.dumps(_FACTS_RUNNING))
+        stalled["running"]["outcome"] = "stalled"
+        stalled["running"]["liveness_note"] = "no checkpoint for 4595s"
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=stalled),
+        )
+        html = out["html"]
+        assert "no longer reporting" in html
+        assert "extracting facts" not in html
+
+    def test_a_facts_phase_run_with_no_progress_recorded_yet_falls_back_to_files(self):
+        """Defensive: `activity.phase` and `facts_progress` are written
+        together by `checkpoint_facts`, but a row missing one must not
+        crash the card or invent a document count from nothing."""
+        no_progress = json.loads(json.dumps(_FACTS_RUNNING))
+        no_progress["running"]["facts_progress"] = None
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=no_progress),
+        )
+        html = out["html"]
+        assert "812 files processed" in html
 
 
 class TestRunsDrawer:
