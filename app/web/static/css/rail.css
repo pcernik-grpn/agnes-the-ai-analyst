@@ -2196,6 +2196,31 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
                     visibility 0s linear 0s;
     }
 
+    /* ── The onboarding panel, flown out beside the strip ───────────────────
+       The launcher's dropdown is `left: 0; right: 0` — it takes the width of
+       the row it hangs off, which is the whole point while the rail is 240px
+       wide or peeking. With the hover peek off it had no such column to hang
+       in: it opened at the launcher's collapsed width and rendered as a ~40px
+       ribbon of orphaned arrows and ticks stacked over the icon strip, its step
+       labels clipped to "Skip setu…". The panel was written on the assumption
+       that hovering ALWAYS widens the rail first, and that assumption is what
+       `.rail-no-hover-peek` retires.
+
+       So it opens sideways instead of upward-in-place: pinned to the strip's
+       right edge at the width it was designed for, bottom-aligned with its own
+       launcher so it still reads as belonging to that row. Same idiom as the
+       label chip above — the strip stays 56px and the content comes out beside
+       it rather than crushing itself into it.
+
+       Hover only (`:not(:focus-within)`), like the chip: a keyboard caller
+       peeks the column open and gets the panel in its designed place. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-no-hover-peek:not(:focus-within) .rail-getstarted-panel {
+        left: calc(100% + 6px);
+        right: auto;
+        bottom: 0;
+        width: 248px;
+    }
+
     /* The logo row shrinks to a single ~40px slot when collapsed — position
        the anchor for the toggle below. Its padding animates with every other
        row's. */
@@ -2322,10 +2347,56 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-input {
         display: none;
     }
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-input,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-input {
+    /* Revealed by the PEEK, on the shared trigger — not by a hand-rolled
+       `:hover, :focus-within` pair, which is what this was and what broke.
+       A 42px input only makes sense once the column is 240px wide, so the two
+       have to be the same event: with the hover peek off (`.rail-no-hover-peek`,
+       the pages carrying the admin secondary nav) the pair still fired, and the
+       input reappeared inside the 40px strip — an empty pill with the magnifier
+       shoved against its left edge. The pair also predated `.rail-no-peek`, so a
+       pointer-driven collapse popped the box open on the way down. One trigger,
+       one answer to "is the column open". */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover:where(:not(.rail-no-hover-peek)), :focus-within) .rail-search-input {
         display: block;
     }
+    /* ── Reaching search from a strip that cannot hover-peek ────────────────
+       `display: none` above is right while hovering opens the column: the
+       magnifier says "search", the peek hands back the real box, and nothing
+       has to be clickable in between. With the hover peek off there IS no in
+       between — the box became a control that looked live and did nothing,
+       because the only thing you could click was a `pointer-events: none`
+       icon over an input that was not rendered at all.
+
+       So on this rail the input is rendered after all, stretched invisibly
+       over the whole 40px box: it takes the click, and FOCUS is already the
+       other half of the peek (`:focus-within`), which restores the real box
+       and the caret in one step. Zero-width would have been enough to make it
+       focusable but not to make it a target; `inset: 0` is what makes the
+       whole box the target.
+
+       `opacity`, not `visibility: hidden` — a `visibility: hidden` input takes
+       no clicks, which is the entire job here. It cannot be read either way:
+       the peek rule below wins the moment focus lands, so nothing is ever both
+       transparent and typed into. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode.rail-no-hover-peek:not(:focus-within) .rail-search-input {
+        display: block;
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        /* `height: 100%`, and it is not redundant beside `inset: 0`: the base
+           rule pins the input to `var(--rail-row-h)`, which wins over the height
+           `inset` implies. The container hugs its 18px magnifier, so the target
+           hung 16px below its own box and swallowed the top 6px of the New chat
+           row beneath it — measured, `elementFromPoint` at y+6 returned the
+           search. An invisible target must be exactly the visible affordance. */
+        height: 100%;
+        padding: 0;
+        border: 0;
+        background: none;
+        opacity: 0;
+        cursor: pointer;
+    }
+
     html[data-ui-layout="rail"] .rail.rail-icon-mode .rail-search-icon {
         position: static;
         left: auto;
@@ -2341,9 +2412,11 @@ html[data-ui-layout="rail"] .cloud-chat-journey-finish:focus-visible {
         color: var(--ds-text-secondary);
         transition: opacity var(--rail-peek-text-out) var(--ds-ease-standard, ease);
     }
-    /* Peeked open, the full box comes back and the icon returns to its slot. */
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:hover .rail-search-icon,
-    html[data-ui-layout="rail"] .rail.rail-icon-mode:focus-within .rail-search-icon {
+    /* Peeked open, the full box comes back and the icon returns to its slot —
+       same shared trigger as the input above, and for the same reason: the icon
+       moving to `left: 9px` is only right once there is a box for it to sit in.
+       Off the trigger it clipped against the strip's edge. */
+    html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek):is(:hover:where(:not(.rail-no-hover-peek)), :focus-within) .rail-search-icon {
         position: absolute;
         left: 9px;
         width: 15px;

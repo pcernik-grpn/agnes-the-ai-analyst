@@ -1301,9 +1301,25 @@ class TestRailCollapseCss:
         # peek's z-index note quotes the toolbar's `position: fixed`), and
         # matching prose is not matching CSS.
         block = re.sub(r"/\*.*?\*/", "", self._desktop_block(), flags=re.S)
-        peek_rules = re.findall(r":is\(:hover\S*, :focus-within\)[^{]*\{([^}]*)\}", block)
+        peek_rules = re.findall(r":is\(:hover\S*, :focus-within\)([^{]*)\{([^}]*)\}", block)
         assert peek_rules
-        for body in peek_rules:
+        # The two SEARCH rules are the documented exception, and this guard only
+        # began to see them when they joined the shared peek trigger — they used
+        # to hand-roll `:hover, :focus-within`, which no regex here matched, so
+        # the flip was invisible rather than absent. Both are deliberate and the
+        # reason is written at the rules: an invisible 42px input still claims its
+        # width, which squeezed the magnifier to `left: -2px` and clipped it
+        # against the strip's edge, so the input leaves the flow (`display`) and
+        # the icon changes positioning scheme with it. Exempted by SELECTOR, one
+        # entry each with its reason, so a new discrete flip cannot arrive under
+        # cover of these.
+        exempt = {
+            ".rail-search-input": "leaves the flow entirely; an invisible input still claims 42px",
+            ".rail-search-icon": "changes positioning scheme with the input it sits in",
+        }
+        for selector, body in peek_rules:
+            if any(target in selector for target in exempt):
+                continue
             for prop in ("justify-content:", "position:", "display:", "inset:"):
                 assert prop not in body, f"discrete property {prop} flips on peek: {body!r}"
 

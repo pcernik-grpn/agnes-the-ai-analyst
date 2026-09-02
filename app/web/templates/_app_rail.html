@@ -753,8 +753,12 @@
                 id="rail-setupchain-toggle"
                 aria-expanded="false"
                 aria-controls="rail-setupchain-panel"
-                aria-label="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete"
-                title="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete">
+                {# `aria-label` only, no `title`. The two carried the identical
+                   sentence, and the native tooltip was pure duplication of a
+                   panel that already opens on the same hover and says more —
+                   an unthemed OS box laid over the top of it, a beat later.
+                   The accessible name is unchanged. #}
+                aria-label="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete">
             <span class="rail-getstarted-ring" aria-hidden="true">
                 <svg viewBox="0 0 36 36" class="rail-getstarted-ring-svg">
                     <circle class="rail-getstarted-ring-track" cx="18" cy="18" r="15"></circle>
