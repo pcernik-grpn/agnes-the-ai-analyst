@@ -643,6 +643,32 @@
             border-style: dashed;
         }
 
+        /* Eligible, no policy yet. Muted, but LABELLED: the state used to
+           render as a bare "—" that was clickable and looked inert, so the
+           one row where an admin can still act read as the one row with
+           nothing to do. Same weight as the ineligible chip, one shade
+           closer to the foreground because this one leads somewhere. */
+        .access-chip--none {
+            color: var(--ds-text-secondary);
+            border-style: dashed;
+        }
+
+        /* Secondary hint under the "+ Add policy" chip — a link, not a second
+           banner: a policy on a table no package carries guards data nobody
+           can reach. */
+        .access-chip-hint {
+            display: block;
+            margin-top: 2px;
+            font-size: 10px;
+            font-weight: 500;
+            color: var(--ds-text-link);
+            text-decoration: none;
+        }
+
+        .access-chip-hint:hover {
+            text-decoration: underline;
+        }
+
         .access-chip--active {
             color: var(--ds-accent-success-ink);
             background: var(--ds-accent-success-bg);
@@ -5664,8 +5690,14 @@
     //       (internal tables already row-scope via
     //       connectors/internal/access.py — layering a second SQL policy
     //       on top is out of scope here and would be actively confusing).
-    //   (2) no policy on an eligible table -> a plain "—" button that
-    //       opens the editor to attach one.
+    //   (2) no policy on an eligible table -> a muted, dashed
+    //       "+ Add policy" button that opens the editor to attach one.
+    //       Labelled, not a bare "—": the affordance an admin is most
+    //       likely to want next must not be the one glyph on the row that
+    //       reads as "nothing here". When no data package carries the
+    //       table it also trails a quiet "not in any package yet →" link
+    //       into the same assign flow /admin/data-packages offers — a
+    //       policy over data nobody can reach protects nothing.
     //   (3) no policy on a table that is still distributed -> a muted
     //       "not available — distributed" button; still opens the SAME
     //       modal, which explains the fix inline (§13: "visible but
@@ -5702,9 +5734,26 @@
                  + 'title="Only a server_only or query_mode=&#39;remote&#39; table can carry an access policy — click to see the fix." '
                  + "onclick='" + openCall + "'>not available — distributed</button>";
         }
+        // Package membership is already on the page: TABLE_DELIVERY is
+        // server-rendered as {table_id: {packages, people}} for exactly this
+        // kind of "does it reach anyone" question, so the hint needs no new
+        // field and no new endpoint. The fold matches the unpackaged tray on
+        // /admin/data-packages (app/web/router.py): `remote` rows answer
+        // server-side without a package and are not part of that flow, so
+        // only distributable rows can honestly be told they are in none.
+        var apDelivery = (typeof TABLE_DELIVERY === 'object' && TABLE_DELIVERY)
+            ? TABLE_DELIVERY[String(t.id || '')] : null;
+        var apPkgs = (apDelivery && apDelivery.packages) || [];
+        var apMode = String(t.query_mode || '').toLowerCase();
+        var apDistributable = (apMode === '' || apMode === 'local' || apMode === 'materialized');
+        var apHint = (!apPkgs.length && apDistributable)
+            ? '<a class="access-chip-hint" href="/admin/tables?unpackaged=1" '
+              + 'title="A policy filters what a reader sees — but no data package carries this table, so nobody reads it yet. Assign it to one.">'
+              + 'not in any package yet &rarr;</a>'
+            : '';
         return '<button type="button" class="access-chip access-chip--none" '
-             + 'title="No access policy — click to add one" '
-             + "onclick='" + openCall + "'>—</button>";
+             + 'title="This table is eligible for a row-level access policy — click to add one" '
+             + "onclick='" + openCall + "'>+ Add policy</button>" + apHint;
     }
 
     // Deep-link from a table row into the grant editor, scoped to this

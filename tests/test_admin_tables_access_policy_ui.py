@@ -45,10 +45,11 @@ def test_access_column_header_present(seeded_app):
 
 
 def test_access_column_renders_three_states(seeded_app):
-    """``renderAccessPolicyChip`` emits: (1) a plain "—" for a table that
-    could carry a policy but doesn't, (2) a muted "not available —
-    distributed" for a table that isn't eligible (not remote/server_only),
-    and (3) a tinted "Policy" chip for a table that carries one."""
+    """``renderAccessPolicyChip`` emits: (1) a muted "+ Add policy" chip for
+    a table that could carry a policy but doesn't, (2) a muted "not
+    available — distributed" for a table that isn't eligible (not
+    remote/server_only), and (3) a tinted "Policy" chip for a table that
+    carries one."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/admin/tables", headers=_auth(token))
@@ -59,6 +60,51 @@ def test_access_column_renders_three_states(seeded_app):
     assert "access-chip--active" in body
     assert "not available — distributed" in body
     assert ">Policy</button>" in body
+
+
+def test_eligible_table_without_a_policy_gets_a_labelled_affordance(seeded_app):
+    """Item 1 of the #1979 setup-flow review: the eligible-but-no-policy
+    state used to render as a bare, unlabelled "—" that was clickable and
+    looked inert. It now carries a label and an explanatory title, and it
+    still opens the SAME editor (``openAccessPolicyModal``)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert ">+ Add policy</button>" in body
+    assert "This table is eligible for a row-level access policy — click to add one" in body
+    # The bare dash is gone as a BUTTON label (the internal-table "—" stays
+    # a non-interactive <span>, which is a different, correct state).
+    assert ">—</button>" not in body
+    # Still the one modal all four states open.
+    assert "openAccessPolicyModal" in body
+
+
+def test_eligible_no_policy_chip_hints_at_an_unpackaged_table(seeded_app):
+    """Item 6: a policy on a table no data package carries guards data
+    nobody can reach, so the chip trails a quiet link into the same
+    ``?unpackaged=1`` assign flow the /admin/data-packages banner opens."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "access-chip-hint" in body
+    assert "not in any package yet" in body
+    assert "/admin/tables?unpackaged=1" in body
+    # Membership comes from the already-server-rendered delivery map — no
+    # new field and no new endpoint.
+    assert "TABLE_DELIVERY[String(t.id || '')]" in body
+
+
+def test_ineligible_access_chip_label_is_unchanged(seeded_app):
+    """The labelled eligible state must not have disturbed the ineligible
+    one: same label, same explanatory title, same modal."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert ">not available — distributed</button>" in body
+    assert "table can carry an access policy — click to see the fix." in body
 
 
 def test_access_column_omits_the_unwired_mapping_warn_state(seeded_app):
