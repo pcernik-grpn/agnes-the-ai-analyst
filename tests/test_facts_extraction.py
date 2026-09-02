@@ -717,6 +717,35 @@ def test_state_path_refuses_a_traversing_connection_id(tmp_path, monkeypatch):
         state_path("../../etc/passwd")
 
 
+def test_facts_state_round_trips_through_the_file_store(tmp_path, monkeypatch):
+    from connectors.sharepoint.facts_extraction import load_state, save_state
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    save_state("conn1", {"version": 1, "docs": {"doc1": {"status": "done"}}})
+    assert load_state("conn1")["docs"] == {"doc1": {"status": "done"}}
+
+
+def test_load_state_and_save_state_go_through_the_shared_state_store(tmp_path, monkeypatch):
+    """Sibling of the crawler's own delegation test — same seam, ``kind=
+    "facts"`` — see ``connectors.sharepoint.state_store``'s module
+    docstring for why a corrupt facts state must never share a row with
+    the crawl's own deltaLinks."""
+    from connectors.sharepoint import state_store
+    from connectors.sharepoint.facts_extraction import load_state, save_state
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
+    monkeypatch.setattr(state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload)))
+
+    state = load_state("conn1")
+    assert ("get", "facts", "conn1") in calls
+    assert state == {"version": 1, "docs": {}}
+
+    save_state("conn1", {"version": 1, "docs": {"doc1": {"status": "done"}}})
+    assert ("put", "facts", "conn1", {"version": 1, "docs": {"doc1": {"status": "done"}}}) in calls
+
+
 # ---------------------------------------------------------------------------
 # The editable prompt — default vs admin override, and its origin
 # ---------------------------------------------------------------------------
@@ -808,6 +837,48 @@ def test_the_seam_refuses_to_spend_tokens_when_the_facts_surface_is_off(monkeypa
     assert called == []
 
 
+def test_the_crawl_seam_skips_quietly_when_a_facts_pass_already_holds_the_lock(monkeypatch, caplog):
+    """The standalone pass and the chained tail share one per-connection
+    lock (issue: horizontal-scale extraction workers). When the lock is
+    already held, the chained tail SKIPS — logged, never raised — because
+    the pass holding it already covers this connection's corpus."""
+    from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
+    from connectors.sharepoint.state_store import facts_pass_lock
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    called = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: called.append(1),
+    )
+    with caplog.at_level("INFO"):
+        with facts_pass_lock("conn-locked"):
+            assert maybe_run_after_crawl({"id": "conn-locked"}) is None
+    assert called == []
+    assert any("skipping the crawl's chained facts pass" in r.message for r in caplog.records)
+
+
+def test_the_crawl_seam_still_runs_for_a_different_connection_while_one_is_locked(monkeypatch):
+    """The lock is per-connection — one connection's standalone pass must
+    never block another connection's chained tail."""
+    from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
+    from connectors.sharepoint.state_store import facts_pass_lock
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    called = []
+
+    def _fake_run(connection_id, **kwargs):
+        called.append(connection_id)
+        return {"ran_for": connection_id}
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_facts_extraction", _fake_run)
+    with facts_pass_lock("conn-a"):
+        assert maybe_run_after_crawl({"id": "conn-b"}) == {"ran_for": "conn-b"}
+    assert called == ["conn-b"]
+
+
 # ---------------------------------------------------------------------------
 # Standalone trigger — run a pass without a crawl, over an already-indexed
 # corpus (`run_standalone_facts_extraction`, the seam
@@ -846,6 +917,62 @@ def test_standalone_run_refuses_when_the_facts_surface_is_off(monkeypatch):
     with pytest.raises(FactsExtractionDisabled, match="facts.enabled"):
         run_standalone_facts_extraction("conn1")
     assert called == []
+
+
+def test_standalone_run_refuses_loudly_when_a_pass_already_holds_the_lock(monkeypatch):
+    """Unlike the chained tail (skips quietly), the standalone trigger only
+    ever runs because an operator explicitly asked for it — a silent no-op
+    would look like a hang, so a lock already held is LOUD, same posture as
+    the two feature-flag gates above."""
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    called = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: called.append(1),
+    )
+    with facts_pass_lock("conn-locked"):
+        with pytest.raises(FactsPassLocked, match="conn-locked"):
+            run_standalone_facts_extraction("conn-locked")
+    assert called == []
+
+
+def test_the_lock_releases_after_a_pass_so_the_next_run_can_acquire_it(monkeypatch):
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: {"ok": True},
+    )
+    assert run_standalone_facts_extraction("conn-seq") == {"ok": True}
+    # Sequential, not concurrent — but if the first run's lock leaked, this
+    # second call would raise FactsPassLocked instead.
+    assert run_standalone_facts_extraction("conn-seq") == {"ok": True}
+
+
+def test_the_lock_releases_even_when_the_pass_raises(monkeypatch):
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_facts_extraction", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        run_standalone_facts_extraction("conn-boom")
+
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: {"ok": True},
+    )
+    assert run_standalone_facts_extraction("conn-boom") == {"ok": True}
 
 
 def test_standalone_run_delegates_with_doc_ids_and_a_deadline_from_timeout_s(monkeypatch):
@@ -989,13 +1116,9 @@ def test_a_document_ended_by_an_unavailable_model_still_counts_as_drained():
     src = Path("connectors/sharepoint/facts_extraction.py").read_text(encoding="utf-8")
     branch = src.split("except FactsExtractionUnavailable as exc:", 1)[1].split("except Exception", 1)[0]
     assert "docs_unavailable += 1" in branch, (
-        "a document whose model was unavailable has still left the queue and "
-        "must count toward docs_done"
+        "a document whose model was unavailable has still left the queue and must count toward docs_done"
     )
     assert "report.facts_failed += 1" not in branch, (
-        "facts_failed is a reported metric about the DOCUMENT — an unavailable "
-        "model must not inflate it"
+        "facts_failed is a reported metric about the DOCUMENT — an unavailable model must not inflate it"
     )
-    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, (
-        "the progress count must include it"
-    )
+    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, "the progress count must include it"

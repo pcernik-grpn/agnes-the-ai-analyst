@@ -197,6 +197,8 @@ __all__ = [
     "semantic_health_mutes_repo",
     # Corporate-memory detection run logs (issue #1971 Part 3) — Postgres-only
     "memory_detection_runs_repo",
+    # SharePoint crawl/facts per-connection state — Postgres-only
+    "sharepoint_state_repo",
 ]
 
 
@@ -687,6 +689,16 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "memory_detection_runs": {
         PG: ("src.repositories.memory_detection_runs_pg", "MemoryDetectionRunsPgRepository"),
     },
+    # SharePoint crawl/facts per-connection state (horizontal-scale
+    # extraction workers) — POSTGRES-ONLY, A3 ratchet: no DuckDB backend.
+    # Never resolved directly on a DuckDB-backed instance — the caller
+    # (``connectors.sharepoint.state_store``) checks ``use_pg()`` itself and
+    # falls back to the pre-existing per-connection JSON file instead, so a
+    # crawl in flight keeps working unchanged rather than hitting the typed
+    # 501 a route would get.
+    "sharepoint_state": {
+        PG: ("src.repositories.sharepoint_state_pg", "SharepointStatePgRepository"),
+    },
 }
 
 
@@ -1137,3 +1149,11 @@ def semantic_health_mutes_repo() -> Any:
 # than letting a missing observability table fail detection itself.
 def memory_detection_runs_repo() -> Any:
     return _build("memory_detection_runs")
+
+
+# SharePoint crawl/facts per-connection state — POSTGRES-ONLY. Callers go
+# through connectors.sharepoint.state_store, which checks use_pg() itself
+# before ever calling this factory, so RequiresPostgresBackend never reaches
+# a crawl in flight on a DuckDB-backed instance.
+def sharepoint_state_repo() -> Any:
+    return _build("sharepoint_state")

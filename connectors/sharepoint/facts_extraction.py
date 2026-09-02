@@ -68,7 +68,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import secrets
 import threading
@@ -81,16 +80,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
-
-#: Sub-directory of the state dir holding one JSON file per connection —
-#: sibling of the crawler's own ``sharepoint_crawl`` state, deliberately
-#: NOT the same file: a corrupt facts state must never cost the crawl its
-#: deltaLinks (which would re-download an entire estate), and vice versa.
-_STATE_SUBDIR = "sharepoint_facts"
-
-#: Same validation the crawler applies to a connection id before it becomes
-#: a path segment (security playbook §6 — validate AND contain).
-_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 #: Original-source extensions whose content belongs to a deterministic
 #: converter, not to a reader. Matched on the document's stored ``path``,
@@ -287,56 +276,45 @@ def _model() -> str:
 
 
 def state_path(connection_id: str) -> Path:
-    """``<state dir>/sharepoint_facts/<connection_id>.json``.
+    """``<state dir>/sharepoint_facts/<connection_id>.json`` — the DuckDB
+    fallback (and, until imported, the Postgres path's own source of truth)
+    location. See ``connectors.sharepoint.state_store.file_state_path``.
 
-    Validates ``connection_id`` as a single safe segment AND contains the
-    resolved path inside the state directory — both layers, exactly as
-    ``connectors.sharepoint.crawler.state_path`` does for the crawl state.
+    Sibling of the crawler's own ``sharepoint_crawl`` state, deliberately
+    NOT the same store: a corrupt facts state must never cost the crawl its
+    deltaLinks (which would re-download an entire estate), and vice versa —
+    see ``connectors.sharepoint.state_store``'s module docstring.
     """
-    if not _SAFE_SEGMENT_RE.match(connection_id or "") or connection_id in (".", ".."):
-        raise FactsExtractionUnavailable(f"unsafe connection id for a state file: {connection_id!r}")
-    from src.db import _get_state_dir
+    from connectors.sharepoint.state_store import StateStoreError, file_state_path
 
-    base = (_get_state_dir() / _STATE_SUBDIR).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    resolved = (base / f"{connection_id}.json").resolve()
-    resolved.relative_to(base)  # containment assertion; raises ValueError if escaped
-    return resolved
+    try:
+        return file_state_path("facts", connection_id)
+    except StateStoreError as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
 
 
 def load_state(connection_id: str) -> Dict[str, Any]:
     """This connection's per-document extraction state, tolerating a torn
-    or absent file.
+    or absent file, or a never-before-seen connection.
 
-    An unreadable state file means "re-extract everything", which costs
+    Unreadable/missing state means "re-extract everything", which costs
     money but is correct; refusing to run would be a permanent outage, and
     replace-mode ingest means the re-extraction cannot duplicate anything.
     """
-    path = state_path(connection_id)
-    state: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state = loaded
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "facts extraction: state for connection %s unreadable (%s) — re-extracting from scratch",
-                connection_id,
-                exc,
-            )
+    from connectors.sharepoint.state_store import get as _state_get
+
+    state: Dict[str, Any] = _state_get("facts", connection_id) or {}
     state.setdefault("version", 1)
     state.setdefault("docs", {})
     return state
 
 
 def save_state(connection_id: str, state: Dict[str, Any]) -> None:
-    """Atomically replace this connection's facts state (tmp + ``os.replace``)."""
+    """Persist this connection's facts state — a Postgres upsert, or an
+    atomic file replace (tmp + ``os.replace``) on the DuckDB fallback."""
+    from connectors.sharepoint.state_store import put as _state_put
 
-    path = state_path(connection_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    _state_put("facts", connection_id, state)
 
 
 def is_up_to_date(entry: Optional[Dict[str, Any]], *, sha256: str, model: str, fingerprint: str) -> bool:
@@ -1802,12 +1780,21 @@ def maybe_run_after_crawl(
     deadline: Any | None = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """The crawl's chaining seam — returns ``None`` when this pass is off.
+    """The crawl's chaining seam — returns ``None`` when this pass is off,
+    OR when a facts-extraction pass is already running for this connection.
 
     Two switches, both of which must be on: ``extraction.facts.enabled``
     (the cost gate for this stage) and ``facts.enabled`` (the fact graph
     itself — writing claims into an instance whose ``/api/facts*`` surface
     answers 404 would spend money producing data nobody can read).
+
+    Takes ``connectors.sharepoint.state_store.facts_pass_lock`` for the
+    duration of the pass — the SAME per-connection lock
+    :func:`run_standalone_facts_extraction` takes, so the two can never run
+    over one connection at once. Unlike that function this one is a
+    background continuation of the crawl, not something an operator is
+    waiting on, so a lock already held SKIPS quietly (logged, not raised):
+    the standalone pass already covers this connection's corpus this run.
 
     ``on_progress`` is passed straight through to :func:`run_facts_extraction`
     — see its docstring for the liveness contract.
@@ -1820,7 +1807,21 @@ def maybe_run_after_crawl(
             "skipping the pass rather than writing claims no surface can serve"
         )
         return None
-    return run_facts_extraction(str(connection["id"]), deadline=deadline, on_progress=on_progress)
+    connection_id = str(connection["id"])
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    try:
+        with facts_pass_lock(connection_id):
+            return run_facts_extraction(connection_id, deadline=deadline, on_progress=on_progress)
+    except FactsPassLocked as exc:
+        logger.info(
+            "facts extraction: connection %s — %s; skipping the crawl's chained facts pass this run "
+            "(a standalone pass already covers this connection's corpus)",
+            connection_id,
+            exc,
+        )
+        return None
+
 
 def run_standalone_facts_extraction(
     connection_id: str,
@@ -1857,7 +1858,11 @@ def run_standalone_facts_extraction(
     enabled()``, :func:`facts_surface_enabled`) — both must be on — but LOUD
     (raises :class:`FactsExtractionDisabled`) rather than returning ``None``:
     this only ever runs because something explicitly asked for it, so a
-    silent no-op would look like a hang, not a refusal.
+    silent no-op would look like a hang, not a refusal. A THIRD gate is the
+    same posture: ``connectors.sharepoint.state_store.facts_pass_lock``
+    raises :class:`~connectors.sharepoint.state_store.FactsPassLocked`
+    (propagated, not caught) when a pass — chained or standalone — is
+    already running for this connection, rather than queuing behind it.
 
     ``deadline`` reuses ``connectors.sharepoint.crawler._Deadline`` — the
     exact type :func:`run_facts_extraction` already accepts from the crawl
@@ -1877,7 +1882,9 @@ def run_standalone_facts_extraction(
         )
 
     from connectors.sharepoint.crawler import _Deadline
+    from connectors.sharepoint.state_store import facts_pass_lock
 
     resolved_timeout = _standalone_timeout_seconds() if timeout_s is None else timeout_s
     deadline = _Deadline(resolved_timeout)
-    return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)
+    with facts_pass_lock(connection_id):
+        return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)

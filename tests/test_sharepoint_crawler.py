@@ -2309,6 +2309,28 @@ class TestState:
         crawler.save_state("conn1", {"delta_links": {"d": "u"}, "ctags": {"graph:1": "c"}})
         assert crawler.load_state("conn1")["ctags"] == {"graph:1": "c"}
 
+    def test_load_state_and_save_state_go_through_the_shared_state_store(self, crawl_env, monkeypatch):
+        """The crawler no longer owns state I/O directly — it delegates
+        through ``connectors.sharepoint.state_store``, which is what makes
+        ANY extraction worker resolvable to a connection's Postgres row
+        (horizontal-scale extraction workers). Proven here at the dispatch
+        level (kind="crawl", exact payload) rather than the filesystem
+        level the other tests in this class already cover."""
+        from connectors.sharepoint import state_store
+
+        calls = []
+        monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
+        monkeypatch.setattr(
+            state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload))
+        )
+
+        state = crawler.load_state("conn1")
+        assert ("get", "crawl", "conn1") in calls
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
+
+        crawler.save_state("conn1", {"delta_links": {"d": "u"}})
+        assert ("put", "crawl", "conn1", {"delta_links": {"d": "u"}}) in calls
+
 
 # --------------------------------------------------------------------------
 # Entry point / detector choice / run deadline
