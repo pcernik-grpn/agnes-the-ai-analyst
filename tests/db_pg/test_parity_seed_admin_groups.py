@@ -117,8 +117,13 @@ def test_ensure_everyone_membership_grants_on_both_backends(_env, monkeypatch):
     assert matching[0]["source"] == "system_seed"
 
 
-def test_ensure_everyone_membership_env_set_noop_on_both_backends(_env, monkeypatch):
-    """Dual-mode: env set → no local grant written on either backend."""
+def test_ensure_everyone_membership_ignores_the_legacy_env_on_both_backends(_env, monkeypatch):
+    """Single-mode, on both backends. It was dual-mode until 0098: setting
+    ``AGNES_GROUP_EVERYONE_EMAIL`` mirrored the seeded row from a Workspace
+    group, so writing a local membership would have fought the
+    Workspace-authoritative set. That mapping is an ordinary synced group
+    now, and the variable is inert — a stale value in an operator's env must
+    not change who ends up in ``Everyone``."""
     monkeypatch.setenv("AGNES_GROUP_EVERYONE_EMAIL", "everyone@workspace.test")
     from src.repositories import user_group_members_repo, users_repo
     from app.auth.group_sync import ensure_everyone_membership
@@ -127,10 +132,10 @@ def test_ensure_everyone_membership_env_set_noop_on_both_backends(_env, monkeypa
     users_repo().create(id="grant-check-mapped", email="grant-check-mapped@example.com", name="U")
 
     result = ensure_everyone_membership("grant-check-mapped", added_by="test:parity")
-    assert result is False, f"[{_env}] must no-op when AGNES_GROUP_EVERYONE_EMAIL is set"
+    assert result is True, f"[{_env}] the legacy env var must no longer suppress the auto-grant"
 
     rows = user_group_members_repo().list_groups_with_meta_for_user("grant-check-mapped")
-    assert rows == [], f"[{_env}] no membership rows expected, got {rows}"
+    assert [r["name"] for r in rows] == ["Everyone"], f"[{_env}] got {rows}"
 
 
 def test_per_connect_duckdb_seed_respects_backend_selection(_env):

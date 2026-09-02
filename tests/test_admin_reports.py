@@ -81,8 +81,7 @@ def _seed(conn):
 
     def plug(mid, name):
         conn.execute(
-            """INSERT INTO marketplace_plugins (marketplace_id, name, is_system)
-               VALUES (?, ?, FALSE)""",
+            "INSERT INTO marketplace_plugins (marketplace_id, name) VALUES (?, ?)",
             [mid, name],
         )
 
@@ -90,13 +89,23 @@ def _seed(conn):
     plug("curated-product", "unused-skill")       # zero usage → listed
     plug("agnes-builtin", "welcome")              # built-in → excluded from zero_usage
     conn.execute(                                  # admin-disabled → excluded
-        "INSERT INTO marketplace_plugins (marketplace_id, name, is_system, admin_disabled) "
-        "VALUES ('curated-product', 'disabled-skill', FALSE, TRUE)"
+        "INSERT INTO marketplace_plugins (marketplace_id, name, admin_disabled) "
+        "VALUES ('curated-product', 'disabled-skill', TRUE)"
     )
 
-    conn.execute(                                  # system plugin → provisioning
-        "INSERT INTO marketplace_plugins (marketplace_id, name, is_system) "
-        "VALUES ('curated-product', 'platform-core', TRUE)"
+    # Reaches every account automatically → its installs are provisioning,
+    # not adoption. `marketplace_plugins.is_system` said this until 0098;
+    # it is now a required grant held by the carrier group, which is the one
+    # spelling both backends share (see `reports._NOT_SYSTEM`).
+    plug("curated-product", "platform-core")
+    everyone_id = conn.execute(
+        "SELECT id FROM user_groups WHERE name = 'Everyone' AND is_system"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO resource_grants (id, group_id, resource_type, resource_id, requirement) "
+        "VALUES ('rg-platform-core', ?, 'marketplace_plugin', "
+        "        'curated-product/platform-core', 'required')",
+        [everyone_id],
     )
 
     # --- installs (anchor day) ----------------------------------------------
@@ -174,9 +183,13 @@ def test_daily_movers_failures_and_zero_usage(seeded_app, admin_user):
 
     data = _get(seeded_app["client"], admin_user, "daily").json()
 
-    # a system plugin is provisioning, not content that failed to land, so it
-    # must not surface in zero_usage either
-    assert "platform-core" not in [z["name"] for z in data["zero_usage"]]
+    # A plugin everyone gets automatically DOES surface in zero_usage now.
+    # It used to be excluded, on the grounds that a mandatory plugin cannot
+    # be "not landing" — but that exclusion rode `is_system`, and a granted
+    # plugin nobody invokes is a report-worthy finding rather than a
+    # false positive. Its INSTALL rows are still classified as provisioning
+    # (`_NOT_SYSTEM`), which is the part that kept the KPI row honest.
+    assert "platform-core" in [z["name"] for z in data["zero_usage"]]
 
     # top_items ranked, product-analyzer leads with 8 invocations
     assert data["top_items"][0]["name"] == "product-analyzer"
@@ -255,8 +268,9 @@ def test_zero_usage_parent_plugin_attribution(seeded_app, admin_user):
     # `child-skill` is an UNRELATED plugin that merely shares the child's name.
     for name in ("parent-only-plugin", "child-skill"):
         conn.execute(
-            "INSERT INTO marketplace_plugins (marketplace_id, name, is_system) "
-            "VALUES ('curated-pp', ?, FALSE)", [name])
+            "INSERT INTO marketplace_plugins (marketplace_id, name) VALUES ('curated-pp', ?)",
+            [name],
+        )
     # One curated child-skill invocation on the anchor day, parent_plugin set,
     # type='skill' (NOT 'plugin').
     conn.execute(

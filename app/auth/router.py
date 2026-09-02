@@ -287,8 +287,7 @@ async def bootstrap(
             added_by="auth.bootstrap",
         )
 
-    # Issue #748: also grant Everyone (unless AGNES_GROUP_EVERYONE_EMAIL maps
-    # it to a Workspace group). Bootstrap is a first-install flow that runs
+    # Issue #748: also grant Everyone. Bootstrap is a first-install flow that runs
     # for both the create and activate-existing-seed branches above, so this
     # sits at the same shared point as the Admin grant rather than inside
     # either branch — opt-out is not meaningful here (there's no "later" to

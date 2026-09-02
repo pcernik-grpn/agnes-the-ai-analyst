@@ -59,8 +59,9 @@ class MarketplacePluginsRepository:
     def get(self, marketplace_id: str, name: str) -> Optional[Dict[str, Any]]:
         """Fetch a single plugin row by (marketplace_id, name), or None.
 
-        Used by the curated install/uninstall existence + is_system checks so
-        they go through the backend-aware factory instead of a raw DuckDB read.
+        Used by the curated install/uninstall existence and admin-disabled
+        checks so they go through the backend-aware factory instead of a raw
+        DuckDB read.
         """
         row = self.conn.execute(
             "SELECT * FROM marketplace_plugins WHERE marketplace_id = ? AND name = ?",
@@ -88,16 +89,16 @@ class MarketplacePluginsRepository:
         self,
         group_ids: Iterable[str],
     ) -> List[Dict[str, Any]]:
-        """Plugins visible to any of ``group_ids`` — granted via
-        ``resource_grants``, OR flagged ``is_system`` (Automatic for
-        everyone), ordered by parent marketplace registration time then
-        plugin name.
+        """Plugins visible to any of ``group_ids``, granted via
+        ``resource_grants``, ordered by parent marketplace registration
+        time then plugin name.
 
-        ``is_system`` is honoured HERE rather than materialized into a
-        grant per group. It used to be fanned out on mark, which made the
-        rows indistinguishable from ones an admin set by hand and left
-        unmark unable to retract its own work. Resolving it at read time
-        is what lets the flag be turned off exactly.
+        One path, since 0098. ``is_system`` used to be a second one, read
+        here in an OR beside the grants — a plugin every account got
+        without any grant row saying so. It is now an ordinary
+        everyone-scoped grant, which this backend sees as a grant on the
+        carrier group (see ``src/repositories/resource_grants.py``); the
+        Postgres sibling matches the scope directly.
 
         Used by ``src.marketplace_filter.resolve_allowed_plugins`` —
         the resolver behind the served Claude Code marketplace
@@ -112,28 +113,28 @@ class MarketplacePluginsRepository:
         long as the underlying content is unchanged.
         """
         gids = list(group_ids)
-        # NOT an early return on an empty group list. "Automatic for everyone"
-        # is global — a user who happens to belong to no group at all still
-        # gets it — so the query runs with the grants branch simply matching
-        # nothing. `IN ()` is a syntax error on both engines, hence the FALSE.
+        # `NULL` rather than an empty `IN ()`, which is a syntax error on both
+        # engines. A caller in no group now matches nothing here — on this
+        # backend that is the honest answer, because an everyone-grant is a
+        # grant on the carrier group and reaching it requires membership.
         placeholders = ",".join(["?"] * len(gids)) if gids else "NULL"
-        # Driven off ``marketplace_plugins`` with a semi-join, not a JOIN
-        # against ``resource_grants``: a system plugin has no grant rows to
-        # join to, and EXISTS also drops the DISTINCT the old join needed to
-        # collapse one row per granting group. ``mr.registered_at`` rides the
-        # projection for the ORDER BY (PG requires it) and is dropped below.
+        # Driven off ``marketplace_plugins`` with a semi-join rather than a
+        # JOIN against ``resource_grants``: EXISTS drops the DISTINCT the old
+        # join needed to collapse one row per granting group.
+        # ``mr.registered_at`` rides the projection for the ORDER BY (PG
+        # requires it) and is dropped below.
         rows = self.conn.execute(
             "SELECT mp.marketplace_id, mp.name, mp.version, mp.raw, "
             "       mr.registered_at "
             "FROM marketplace_plugins mp "
             "JOIN marketplace_registry mr ON mr.id = mp.marketplace_id "
             "WHERE mp.admin_disabled = FALSE "
-            "  AND (mp.is_system = TRUE OR EXISTS ("
+            "  AND EXISTS ("
             "        SELECT 1 FROM resource_grants rg "
             "        WHERE rg.resource_id = mp.marketplace_id || '/' || mp.name "
             "          AND rg.resource_type = 'marketplace_plugin' "
             f"          AND rg.group_id IN ({placeholders})"
-            "      )) "
+            "      ) "
             "ORDER BY mr.registered_at, mp.name",
             list(gids),
         ).fetchall()
@@ -220,7 +221,7 @@ class MarketplacePluginsRepository:
             f"SELECT DISTINCT mp.marketplace_id, mp.name, mp.description, mp.version, "
             f"       mp.author_name, mp.homepage, mp.category, mp.source_type, "
             f"       mp.source_spec, mp.raw, mp.cover_photo_url, mp.video_url, "
-            f"       mp.doc_links, mp.created_at, mp.updated_at, mp.is_system "
+            f"       mp.doc_links, mp.created_at, mp.updated_at "
             f"FROM marketplace_plugins mp "
             f"JOIN resource_grants rg ON 1=1 "
             f"WHERE {where_sql} "
@@ -334,12 +335,6 @@ class MarketplacePluginsRepository:
                 # Upsert: ON CONFLICT keeps the existing created_at and
                 # refreshes only the mutable fields. New rows get
                 # CURRENT_TIMESTAMP via the column's DEFAULT.
-                # ``is_system`` is INTENTIONALLY excluded from both INSERT
-                # and UPDATE SET — its only writer is the admin
-                # mark/unmark_system endpoint. New rows default to FALSE
-                # via the column DEFAULT; existing rows keep whatever the
-                # admin set. Re-syncing the upstream marketplace must
-                # never reset the system flag.
                 self.conn.execute(
                     """INSERT INTO marketplace_plugins
                         (marketplace_id, name, description, version, author_name,
@@ -396,43 +391,20 @@ class MarketplacePluginsRepository:
         Disabled plugins are filtered from the served feed for all callers
         regardless of their RBAC grants — distinct from per-user opt-outs.
 
-        Disabling also clears `is_system`: a hidden plugin must not keep
-        fanning out as a system default. Re-enabling does NOT restore the
-        system flag (matching `unmark_system` semantics) — an admin must
-        re-mark it explicitly.
+        Disabling used to clear ``is_system`` in the same UPDATE, and
+        re-enabling deliberately did not restore it. That contract has no
+        home now the flag is a grant (0098): a grant is not touched by
+        disabling, so re-enabling a plugin restores exactly the reach it had.
+        Availability and distribution are separate switches on separate
+        pages, which is the point.
         """
         # DuckDB does not populate cursor.rowcount for UPDATE (it stays -1/0),
         # so we can't trust it to detect whether a row matched. RETURNING is
         # deterministic on both engines: one row per updated row.
-        if disabled:
-            sql = (
-                "UPDATE marketplace_plugins SET admin_disabled = TRUE, is_system = FALSE "
-                "WHERE marketplace_id = ? AND name = ? RETURNING name"
-            )
-            params = [marketplace_id, plugin_name]
-        else:
-            sql = (
-                "UPDATE marketplace_plugins SET admin_disabled = FALSE "
-                "WHERE marketplace_id = ? AND name = ? RETURNING name"
-            )
-            params = [marketplace_id, plugin_name]
-        updated = self.conn.execute(sql, params).fetchall()
-        return len(updated) > 0
-
-    def set_system(self, marketplace_id: str, plugin_name: str, system: bool) -> bool:
-        """Toggle the per-plugin ``is_system`` flag.
-
-        Returns True when the row existed and was updated, False when the
-        (marketplace_id, plugin_name) pair is not in the table (no-op) — the
-        handler surfaces the False as a 404. RETURNING makes the match
-        detection deterministic on both engines (DuckDB does not populate
-        ``cursor.rowcount`` for UPDATE). Independent of ``admin_disabled``;
-        the grant/subscription fan-out is owned by the API layer.
-        """
         updated = self.conn.execute(
-            "UPDATE marketplace_plugins SET is_system = ? "
+            "UPDATE marketplace_plugins SET admin_disabled = ? "
             "WHERE marketplace_id = ? AND name = ? RETURNING name",
-            [system, marketplace_id, plugin_name],
+            [bool(disabled), marketplace_id, plugin_name],
         ).fetchall()
         return len(updated) > 0
 
@@ -444,20 +416,6 @@ class MarketplacePluginsRepository:
         ).fetchall()
         return [r[0] for r in rows]
 
-    def list_system_keys(self) -> List[Tuple[str, str]]:
-        """Return ``(marketplace_id, name)`` for every system plugin that is
-        not admin-disabled.
-
-        Backs ``app/api/my_stack.py:get_my_stack`` — the my-stack view
-        intersects this set in Python to lock the subscribe toggle on
-        system plugins. Admin-disabled plugins are excluded because they
-        never surface in the served feed regardless of their system flag.
-        """
-        rows = self.conn.execute(
-            "SELECT marketplace_id, name FROM marketplace_plugins "
-            "WHERE is_system = TRUE AND admin_disabled = FALSE"
-        ).fetchall()
-        return [(r[0], r[1]) for r in rows]
 
 
 def _classify_source(source: Optional[Any]) -> Optional[str]:

@@ -1,16 +1,25 @@
-"""End-to-end coverage for the v39 system plugin tier.
+"""End-to-end coverage for how far a marketplace plugin reaches.
 
-The feature reuses the existing RBAC + subscription tables — marking a
-plugin as "system" simply materializes resource_grants + user_plugin_optouts
-rows for every existing user_groups + users row, then locks the
-corresponding admin/user controls. The resolver itself is unchanged.
+Two questions, two owners, and keeping them apart is what this module is
+about. ``/admin/marketplaces`` answers whether a plugin is AVAILABLE on the
+instance at all (Off / Available); ``/admin/access`` answers WHO gets an
+available one, and at which tier. There used to be a third answer —
+``marketplace_plugins.is_system``, set from the marketplaces page, meaning
+"every account, automatically" — which made that page a second writer of
+distribution with its own vocabulary for a tier Access already had. Migration
+0098 deleted it; the state is now an ordinary grant carrying
+``scope='everyone'`` and ``requirement='required'``.
 
 Tests in this module exercise:
 
-* mark/unmark endpoints — happy path, idempotency, audit row, fanout count
-* refusal of the bypass paths — DELETE grant, unsubscribe, uninstall
-* creation hooks — new user / new group inherit the mandatory tier
-* sync preservation — a re-sync of the marketplace doesn't reset is_system
+* the everyone-scoped grant as the one way to reach every account, and the
+  422s that keep it coherent
+* refusal of the bypass paths — unsubscribe, uninstall
+* no catch-up needed — a group or user created afterwards is reached with no
+  row written for it
+* availability is not distribution — disabling hides a plugin without
+  touching its grants, and re-enabling restores exactly its old reach
+* sync preservation — a re-sync of the marketplace doesn't disturb grants
 
 Mirrors the helper pattern in ``test_marketplace_api.py``.
 """
@@ -42,7 +51,16 @@ def web_client(tmp_path, monkeypatch, shared_app):
 def _create_user(client, email, password="UserPass1!", admin: bool = False):
     """Create a user and return (user_id, cookies). When ``admin=True``
     the user is added to the seeded Admin system group so
-    ``require_admin`` passes."""
+    ``require_admin`` passes.
+
+    Also joins the seeded ``Everyone`` group, which every real creation path
+    does (``app.auth.group_sync.ensure_everyone_membership``, called from
+    OAuth first sign-in, bootstrap, admin create and the import stubs). This
+    inserts through the repo rather than the API, so without it the accounts
+    here would be memberless — a state no live instance produces, and one
+    that hides whether an everyone-scoped grant reaches an ordinary user on
+    the DuckDB backend, where the scope is carried by that group.
+    """
     from argon2 import PasswordHasher
     from src.db import get_system_db
     from src.repositories.users import UserRepository
@@ -55,7 +73,10 @@ def _create_user(client, email, password="UserPass1!", admin: bool = False):
     if admin:
         from tests.helpers.auth import grant_admin
         grant_admin(conn, user_id)
+    from app.auth.group_sync import ensure_everyone_membership
+
     conn.close()
+    ensure_everyone_membership(user_id, added_by="test")
     r = client.post("/auth/token", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
     return user_id, {"access_token": r.json()["access_token"]}
@@ -108,157 +129,133 @@ def _add_group(name: str = "engineers") -> str:
         conn.close()
 
 
+def _carrier_group_id() -> str:
+    """The group an everyone-scoped grant is stored against.
+
+    ``resource_grants.group_id`` is NOT NULL, so the scope needs a row to
+    live on; every everyone-grant using the same carrier is what leaves the
+    UNIQUE index enforcing one per resource. See
+    ``src.grant_scopes.carrier_group_id``.
+    """
+    from src.grant_scopes import carrier_group_id
+
+    gid = carrier_group_id()
+    assert gid, "the seeded Everyone group is missing — no carrier to write onto"
+    return gid
+
+
+def _grant_to_everyone(
+    client,
+    cookies,
+    *,
+    resource_id: str = "mkt-x/alpha",
+    requirement: str = "required",
+):
+    """Give a plugin to every account, through the one writer of grants.
+
+    This replaces ``POST .../plugins/{name}/system``. Same reach, same tier,
+    one page — and now expressible for every grantable type rather than for
+    plugins alone.
+    """
+    return client.post(
+        "/api/admin/grants",
+        json={
+            "group_id": _carrier_group_id(),
+            "resource_type": "marketplace_plugin",
+            "resource_id": resource_id,
+            "requirement": requirement,
+            "scope": "everyone",
+        },
+        cookies=cookies,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Mark / Unmark endpoint behavior
+# The everyone-scoped grant
 # ---------------------------------------------------------------------------
 
 
-class TestMarkUnmark:
-    def test_mark_404_when_plugin_missing(self, web_client):
-        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
-        r = web_client.post(
-            "/api/marketplaces/missing/plugins/ghost/system",
-            cookies=cookies,
-        )
-        assert r.status_code == 404
-
-    def test_mark_requires_admin(self, web_client):
+class TestGrantingToEveryone:
+    def test_requires_admin(self, web_client):
         _seed_marketplace_with_plugin()
         _, cookies = _create_user(web_client, "user@x.com", admin=False)
-        r = web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=cookies,
-        )
-        # require_admin returns 403 on non-admins
+        r = _grant_to_everyone(web_client, cookies)
         assert r.status_code in (401, 403)
 
-    def test_mark_flips_the_flag_and_writes_nothing_else(self, web_client):
-        """Marking records ONE decision. It used to fan a grant out to every
-        group and a subscription out to every user; those rows were then
-        indistinguishable from an admin's own, which is what made unmark
-        unable to retract its own work."""
-        _seed_marketplace_with_plugin()
-        admin_id, admin_cookies = _create_user(
-            web_client, "admin@x.com", admin=True,
-        )
-        regular_id, _ = _create_user(web_client, "regular@x.com")
-        gid = _add_group("engineers")
+    def test_creates_exactly_one_row(self, web_client):
+        """One row, whichever backend is under it.
 
-        r = web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
-        assert r.status_code == 200, r.text
+        ``scope`` comes back NULL here: these tests run on the DuckDB
+        app-state backend, whose ladder is frozen (A3), so the column is
+        accepted and dropped and the row is an ordinary grant on the carrier
+        group — which holds every account, so it reaches the same people. The
+        column round-tripping is asserted where it exists, in
+        ``tests/db_pg/test_rbac_contract.py``.
+        """
+        _seed_marketplace_with_plugin()
+        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+
+        r = _grant_to_everyone(web_client, cookies)
+        assert r.status_code == 201, r.text
         body = r.json()
-        assert body["is_system"] is True
-        # Nothing was materialized, so nothing was "affected".
-        assert body["affected_users"] == 0
-        assert body["affected_groups"] == 0
+        assert body["requirement"] == "required"
+        assert body["scope"] is None, (
+            "the frozen DuckDB ladder has no `scope` column; a value here "
+            "would mean the accept-and-drop contract had changed"
+        )
 
         from src.db import get_system_db
+
         conn = get_system_db()
         try:
-            row = conn.execute(
-                "SELECT is_system FROM marketplace_plugins "
-                "WHERE marketplace_id = 'mkt-x' AND name = 'alpha'"
-            ).fetchone()
-            assert row[0] is True
-
-            for uid in (admin_id, regular_id):
-                sub = conn.execute(
-                    "SELECT 1 FROM user_plugin_optouts "
-                    "WHERE user_id = ? AND marketplace_id = 'mkt-x' "
-                    "AND plugin_name = 'alpha'",
-                    [uid],
-                ).fetchone()
-                assert sub is None, f"no subscription should be written for {uid}"
-
-            grant_groups = {
-                r[0] for r in conn.execute(
-                    "SELECT group_id FROM resource_grants "
-                    "WHERE resource_type = 'marketplace_plugin' "
-                    "AND resource_id = 'mkt-x/alpha'",
-                ).fetchall()
-            }
-            assert grant_groups == set(), "no grant should be fanned out"
-            assert gid not in grant_groups
-        finally:
-            conn.close()
-
-    def test_mark_is_idempotent(self, web_client):
-        _seed_marketplace_with_plugin()
-        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
-        first = web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system", cookies=cookies,
-        )
-        assert first.status_code == 200
-        # Second call must succeed and report 0 newly affected — every
-        # row was already in place.
-        second = web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system", cookies=cookies,
-        )
-        assert second.status_code == 200
-        assert second.json()["affected_users"] == 0
-        assert second.json()["affected_groups"] == 0
-
-    def test_unmark_flips_the_flag_and_is_exact(self, web_client):
-        """Unmark is now exact rather than apologetic. There is nothing
-        machine-written to retract, and a grant the admin set by hand for one
-        group survives untouched — the old semantic ("everything persists")
-        existed only because the two were indistinguishable."""
-        _seed_marketplace_with_plugin()
-        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
-        _, _ = _create_user(web_client, "regular@x.com")
-        gid = _add_group("engineers")
-
-        from src.repositories import resource_grants_repo
-        resource_grants_repo().create(
-            group_id=gid,
-            resource_type="marketplace_plugin",
-            resource_id="mkt-x/alpha",
-            assigned_by="admin@x.com",
-        )
-
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system", cookies=cookies,
-        )
-        r = web_client.delete(
-            "/api/marketplaces/mkt-x/plugins/alpha/system", cookies=cookies,
-        )
-        assert r.status_code == 204
-
-        from src.db import get_system_db
-        conn = get_system_db()
-        try:
-            row = conn.execute(
-                "SELECT is_system FROM marketplace_plugins "
-                "WHERE marketplace_id = 'mkt-x' AND name = 'alpha'"
-            ).fetchone()
-            assert row[0] is False
-
-            # No machine-written subscriptions ever existed.
             count = conn.execute(
-                "SELECT COUNT(*) FROM user_plugin_optouts "
-                "WHERE marketplace_id = 'mkt-x' AND plugin_name = 'alpha'",
+                "SELECT COUNT(*) FROM resource_grants "
+                "WHERE resource_type = 'marketplace_plugin' AND resource_id = 'mkt-x/alpha'"
             ).fetchone()[0]
-            assert count == 0
-
-            # The admin's own grant is exactly what remains.
-            groups = [
-                r[0] for r in conn.execute(
-                    "SELECT group_id FROM resource_grants "
-                    "WHERE resource_type = 'marketplace_plugin' "
-                    "AND resource_id = 'mkt-x/alpha'",
-                ).fetchall()
-            ]
-            assert groups == [gid]
         finally:
             conn.close()
+        assert count == 1, "reaching everyone is ONE row, not one per group"
 
+    def test_second_grant_on_the_same_resource_is_a_409(self, web_client):
+        """The UNIQUE index is what keeps "everyone" single-valued, and it
+        works because every everyone-grant shares one carrier."""
+        _seed_marketplace_with_plugin()
+        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+        assert _grant_to_everyone(web_client, cookies).status_code == 201
+        assert _grant_to_everyone(web_client, cookies).status_code == 409
 
-# ---------------------------------------------------------------------------
-# Bypass-path guards
-# ---------------------------------------------------------------------------
+    def test_a_withheld_type_refuses_the_scope(self, web_client):
+        """Absent, not disabled. ``slack_channel``'s grantee is a CHANNEL,
+        not an audience, so "give it to everyone" answers a question nobody
+        asked — and storing it would be a claim no read path honours."""
+        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+        r = web_client.post(
+            "/api/admin/grants",
+            json={
+                "group_id": _carrier_group_id(),
+                "resource_type": "slack_channel",
+                "resource_id": "C0123ABCD",
+                "scope": "everyone",
+            },
+            cookies=cookies,
+        )
+        assert r.status_code == 422, r.text
+        assert "everyone scope" in r.json()["detail"]
+
+    def test_an_unknown_scope_is_a_422_not_a_500(self, web_client):
+        _seed_marketplace_with_plugin()
+        _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+        r = web_client.post(
+            "/api/admin/grants",
+            json={
+                "group_id": _carrier_group_id(),
+                "resource_type": "marketplace_plugin",
+                "resource_id": "mkt-x/alpha",
+                "scope": "everybody",
+            },
+            cookies=cookies,
+        )
+        assert r.status_code == 422, r.text
 
 
 class TestGuards:
@@ -267,10 +264,7 @@ class TestGuards:
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
         # require_admin grants the admin access via the Admin group seed,
         # so they'll see the plugin in their stack and can attempt the
         # toggle. The guard should refuse.
@@ -279,31 +273,36 @@ class TestGuards:
             json={"enabled": False}, cookies=admin_cookies,
         )
         assert r.status_code == 409
-        assert r.json()["detail"] == "cannot_unsubscribe_system_plugin"
+        # ONE refusal code, not two. `cannot_unsubscribe_system_plugin` and
+        # `cannot_unsubscribe_required_plugin` were the same refusal for the
+        # same reason, split only by which of two mechanisms had made the
+        # plugin mandatory.
+        assert r.json()["detail"] == "cannot_unsubscribe_required_plugin"
 
     def test_uninstall_via_marketplace_refused(self, web_client):
         _seed_marketplace_with_plugin()
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
         r = web_client.delete(
             "/api/marketplace/curated/mkt-x/alpha/install",
             cookies=admin_cookies,
         )
         assert r.status_code == 409
-        assert r.json()["detail"] == "cannot_uninstall_system_plugin"
+        assert r.json()["detail"] == "cannot_uninstall_required_plugin"
 
-    def test_hand_set_grant_on_an_automatic_plugin_is_revocable(self, web_client):
-        """The v39 guard refused this with 409 cannot_revoke_system_grant,
-        because the row it was protecting had been machine-written by the
-        fanout. Nothing writes those rows now, so the only grant that can
-        exist here is one the admin made — and trapping it would be wrong.
-        Revoking cannot remove the plugin from anyone either: the flag serves
-        it regardless, and Marketplaces is where that is turned off."""
+    def test_hand_set_group_grant_beside_an_everyone_grant_is_revocable(self, web_client):
+        """A group grant and an everyone grant on the same plugin are two
+        independent rows, and revoking the narrower one is honest.
+
+        The v39 guard refused this with 409 ``cannot_revoke_system_grant``,
+        protecting rows a fanout had machine-written. Nothing fans out now:
+        the only group grant that can exist here is one an admin made, and
+        trapping it would trap the admin's own work. Revoking it also removes
+        the plugin from nobody — the everyone-scoped grant beside it still
+        reaches them.
+        """
         _seed_marketplace_with_plugin()
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
@@ -317,40 +316,33 @@ class TestGuards:
             resource_id="mkt-x/alpha",
             assigned_by="admin@x.com",
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
 
         r = web_client.delete(
             f"/api/admin/grants/{grant_id}", cookies=admin_cookies,
         )
         assert r.status_code in (200, 204), r.text
 
-        # Still served — the flag, not the grant, is what carries it.
-        from src.repositories import marketplace_plugins_repo
-        assert ("mkt-x", "alpha") in set(
-            marketplace_plugins_repo().list_system_keys()
-        )
+        # Still reaching everyone — the OTHER row carries that, and it was
+        # not the one revoked.
+        from src.marketplace_filter import everyone_required_plugin_keys
 
-    def test_group_delete_with_a_grant_on_an_automatic_plugin_is_not_500(
+        assert ("mkt-x", "alpha") in everyone_required_plugin_keys()
+
+    def test_group_delete_with_a_grant_on_a_plugin_everyone_has_is_not_500(
         self, web_client,
     ):
         """Regression cover, kept but re-premised. The original bug was an
         operator stuck with an undeletable group, because marking a plugin
         Automatic had auto-materialized a grant into that group that the
         delete cascade then tripped over. Nothing auto-materializes now, so
-        the remaining way to reach the same shape is a HAND-SET grant on an
-        Automatic plugin — which is exactly the row the old revoke guard used
-        to trap. It must still delete cleanly."""
+        the remaining way to reach the same shape is a HAND-SET grant on a
+        plugin that everyone also has. It must still delete cleanly."""
         _seed_marketplace_with_plugin()
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
         gid = _add_group("doomed-by-hand-set-grant")
 
         from src.repositories import resource_grants_repo
@@ -376,10 +368,7 @@ class TestGuards:
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
         r = web_client.put(
             "/api/my-stack/curated/mkt-x/alpha",
             json={"enabled": True}, cookies=admin_cookies,
@@ -395,23 +384,20 @@ class TestGuards:
 class TestNoCreationHooksNeeded:
     """The creation hooks are gone with the fanout they existed to run.
 
-    A group or user created AFTER the mark used to need a hook to catch it up
-    — five call sites across user-create and one in group-create, each
-    soft-failing so a hiccup never blocked provisioning. Resolving the flag at
-    read time makes "catching up" meaningless: there is nothing to inherit.
+    A group or user created AFTER the decision used to need a hook to catch
+    it up — five call sites across user-create and one in group-create, each
+    soft-failing so a hiccup never blocked provisioning. An everyone-scoped
+    grant makes "catching up" meaningless: there is nothing to inherit.
     These tests assert the OUTCOME the hooks were chasing, which is the part
     that actually mattered.
     """
 
-    def test_group_created_after_mark_needs_no_grant_row(self, web_client):
+    def test_group_created_afterwards_gets_no_catch_up_row(self, web_client):
         _seed_marketplace_with_plugin()
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
 
         r = web_client.post(
             "/api/admin/groups",
@@ -435,10 +421,23 @@ class TestNoCreationHooksNeeded:
             conn.close()
         assert grant is None, "no grant should be written for a new group"
 
-        # And the plugin is still visible to that group, with no row at all.
+        # And a MEMBER of that new group is still reached — through the
+        # everyone-scoped grant, not through the group. Asserting the group
+        # itself is served would be asserting the old flag's shape: `is_system`
+        # bypassed groups entirely, so `list_granted_for_groups([new_gid])`
+        # returned the plugin for a group that had been granted nothing. A
+        # scope belongs to the AUDIENCE, and the audience is every account.
+        member_id, _ = _create_user(web_client, "joiner@example.com")
+        web_client.post(
+            f"/api/admin/groups/{new_gid}/members",
+            json={"user_id": member_id},
+            cookies=admin_cookies,
+        )
         served = {
             (r["marketplace_id"], r["name"])
-            for r in marketplace_plugins_repo().list_granted_for_groups([new_gid])
+            for r in marketplace_plugins_repo().list_granted_for_groups(
+                _group_ids_for(member_id),
+            )
         }
         assert ("mkt-x", "alpha") in served
 
@@ -447,10 +446,7 @@ class TestNoCreationHooksNeeded:
         _, admin_cookies = _create_user(
             web_client, "admin@x.com", admin=True,
         )
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            cookies=admin_cookies,
-        )
+        _grant_to_everyone(web_client, admin_cookies)
 
         r = web_client.post(
             "/api/users",
@@ -487,16 +483,21 @@ class TestNoCreationHooksNeeded:
 # ---------------------------------------------------------------------------
 
 
-def test_resync_preserves_is_system(tmp_path, monkeypatch):
-    """``replace_for_marketplace`` re-runs every sync. The is_system
-    flag MUST survive — it's not in the ON CONFLICT DO UPDATE SET list
-    and not in the INSERT VALUES list. Test by faking a sync via the
-    repo with the same plugin name.
+def test_resync_leaves_a_plugins_grants_alone(tmp_path, monkeypatch):
+    """``replace_for_marketplace`` re-runs on every sync and must not touch
+    who has the plugin.
+
+    This used to assert that the ``is_system`` FLAG survived a re-sync — the
+    upsert deliberately excluded it from both the INSERT and the UPDATE SET.
+    The flag is gone and reach lives in ``resource_grants`` now, which the
+    plugin upsert cannot reach at all. That makes the invariant structural
+    rather than a column the next contributor could add to a SET list, and
+    this test pins the outcome either way.
 
     Uses ``tmp_path`` directly (no web_client) because the test only
-    exercises the repo, not any API surface — but we still need a
-    fresh DATA_DIR so we don't inherit state from a sibling test that
-    populated ``store_entities`` etc. through the migration ladder.
+    exercises the repo, not any API surface — but we still need a fresh
+    DATA_DIR so we don't inherit state from a sibling test that populated
+    ``store_entities`` etc. through the migration ladder.
     """
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("TESTING", "1")
@@ -505,15 +506,16 @@ def test_resync_preserves_is_system(tmp_path, monkeypatch):
     (tmp_path / "extracts").mkdir(exist_ok=True)
     from src.db import close_system_db, get_system_db
     from src.repositories.marketplace_plugins import MarketplacePluginsRepository
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
     close_system_db()
     conn = get_system_db()
     try:
-        # Set up registry + initial plugin.
         conn.execute(
             "INSERT INTO marketplace_registry (id, name, url, registered_at) "
             "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
-            ["resync-test", "Resync", "https://example.test/r.git",
-             datetime.now(timezone.utc)],
+            ["resync-test", "Resync", "https://example.test/r.git", datetime.now(timezone.utc)],
         )
         repo = MarketplacePluginsRepository(conn)
         repo.replace_for_marketplace(
@@ -521,25 +523,29 @@ def test_resync_preserves_is_system(tmp_path, monkeypatch):
             [{"name": "alpha", "version": "1.0", "description": "v1"}],
         )
 
-        # Mark as system.
-        conn.execute(
-            "UPDATE marketplace_plugins SET is_system = TRUE "
-            "WHERE marketplace_id = 'resync-test' AND name = 'alpha'"
+        gid = UserGroupsRepository(conn).create(name="resync-audience")["id"]
+        grant_id = ResourceGrantsRepository(conn).create(
+            group_id=gid,
+            resource_type="marketplace_plugin",
+            resource_id="resync-test/alpha",
+            requirement="required",
         )
 
-        # Re-sync with updated description.
         repo.replace_for_marketplace(
             "resync-test",
             [{"name": "alpha", "version": "2.0", "description": "v2-updated"}],
         )
 
         row = conn.execute(
-            "SELECT is_system, version, description FROM marketplace_plugins "
+            "SELECT version, description FROM marketplace_plugins "
             "WHERE marketplace_id = 'resync-test' AND name = 'alpha'"
         ).fetchone()
-        assert row[0] is True, "is_system was reset by resync"
-        assert row[1] == "2.0"
-        assert row[2] == "v2-updated"
+        assert row[0] == "2.0"
+        assert row[1] == "v2-updated"
+
+        grant = ResourceGrantsRepository(conn).get(grant_id)
+        assert grant is not None, "a re-sync dropped a grant on the plugin"
+        assert grant["requirement"] == "required", "a re-sync downgraded the tier"
     finally:
         conn.close()
         close_system_db()
@@ -550,35 +556,48 @@ def test_resync_preserves_is_system(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_mark_system_rejected_when_disabled(web_client):
-    """A disabled plugin cannot be marked system (409). Disabling clears
-    is_system and re-enabling does not restore it, so the backend must reject
-    a mark on a disabled plugin — otherwise re-enable would resurrect it as a
-    mandatory default. The UI greys the button out, but this endpoint is the
-    real state boundary (direct API call / stale-modal race)."""
-    _seed_marketplace_with_plugin()
-    _, cookies = _create_user(web_client, "admin@x.com", admin=True)
+def test_a_disabled_plugin_can_still_be_granted_and_is_served_to_nobody(web_client):
+    """Availability and distribution are separate switches, and this is the
+    case that proves it.
 
-    dis = web_client.post(
-        "/api/marketplaces/mkt-x/plugins/alpha/disable", cookies=cookies,
-    )
+    A disabled plugin used to REFUSE the mark with 409, because disabling
+    cleared ``is_system`` in the same UPDATE and re-enabling deliberately did
+    not restore it — so marking a disabled plugin would have resurrected it
+    as a mandatory default on the next enable. That whole contract existed
+    because one write did two jobs.
+
+    Now: granting a disabled plugin is accepted (Access decides who gets it),
+    and the plugin is served to nobody while it is off (Marketplaces decides
+    whether it exists). Turning it back on restores exactly the reach the
+    grant describes, with nothing to re-set by hand.
+    """
+    _seed_marketplace_with_plugin()
+    user_id, cookies = _create_user(web_client, "admin@x.com", admin=True)
+
+    dis = web_client.post("/api/marketplaces/mkt-x/plugins/alpha/disable", cookies=cookies)
     assert dis.status_code == 200, dis.text
 
-    r = web_client.post(
-        "/api/marketplaces/mkt-x/plugins/alpha/system", cookies=cookies,
-    )
-    assert r.status_code == 409, r.text
+    assert _grant_to_everyone(web_client, cookies).status_code == 201
 
-    from src.db import get_system_db
-    conn = get_system_db()
-    try:
-        row = conn.execute(
-            "SELECT is_system FROM marketplace_plugins "
-            "WHERE marketplace_id = 'mkt-x' AND name = 'alpha'"
-        ).fetchone()
-        assert not row[0], "is_system must stay false on a rejected mark"
-    finally:
-        conn.close()
+    from src.repositories import marketplace_plugins_repo
+
+    served = {
+        (r["marketplace_id"], r["name"])
+        for r in marketplace_plugins_repo().list_granted_for_groups(_group_ids_for(user_id))
+    }
+    assert ("mkt-x", "alpha") not in served, "a disabled plugin was served to a grantee"
+
+    en = web_client.post("/api/marketplaces/mkt-x/plugins/alpha/enable", cookies=cookies)
+    assert en.status_code == 200, en.text
+
+    served = {
+        (r["marketplace_id"], r["name"])
+        for r in marketplace_plugins_repo().list_granted_for_groups(_group_ids_for(user_id))
+    }
+    assert ("mkt-x", "alpha") in served, (
+        "re-enabling did not restore the reach the grant describes — the grant "
+        "was never touched by the disable, so nothing should need re-setting"
+    )
 
 
 def test_get_plugins_exposes_admin_disabled(web_client):
@@ -814,33 +833,33 @@ def test_disable_audit_distinguishes_retirement_from_plain_disable(web_client):
 
 
 # ---------------------------------------------------------------------------
-# Automatic-for-everyone resolves at read time (no materialized rows)
+# Reaching everyone is one row, and it does not fan out
 # ---------------------------------------------------------------------------
 
 
-class TestAutomaticForEveryoneIsResolvedNotMaterialized:
-    """Marking a plugin Automatic-for-everyone records a decision; it does
-    not write a grant per group and a subscription per user.
+class TestReachingEveryoneDoesNotMaterialize:
+    """An everyone-scoped grant is ONE row. It writes no grant per group and
+    no subscription per user.
 
-    The read paths honour the flag directly, which is what makes turning it
-    off exact: there is nothing left behind to retract, and a grant an admin
-    set by hand for one group is never touched.
+    That is what makes revoking it exact — there is nothing left behind to
+    retract — and it is what a grant an admin set by hand for one group is
+    protected by: the two rows are independent. Marking a plugin "system"
+    once fanned out into both tables, which is why unmarking could not
+    retract its own work; a read-time resolution of the flag fixed the fanout
+    but left two names for one idea. The scope removes the second name.
     """
 
-    def test_mark_writes_no_grant_and_no_subscription_rows(self, web_client):
+    def test_one_row_and_no_subscriptions(self, web_client):
         _seed_marketplace_with_plugin()
         _add_group("engineers")
         _create_user(web_client, "member@example.com")
         _, admin = _create_user(web_client, "admin@example.com", admin=True)
 
-        r = web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            headers={"Authorization": f"Bearer {admin['access_token']}"},
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["is_system"] is True
+        r = _grant_to_everyone(web_client, {"access_token": admin["access_token"]})
+        assert r.status_code == 201, r.text
 
         from src.db import get_system_db
+
         conn = get_system_db()
         try:
             grants = conn.execute(
@@ -855,23 +874,21 @@ class TestAutomaticForEveryoneIsResolvedNotMaterialized:
             ).fetchone()[0]
         finally:
             conn.close()
-        assert grants == 0, "marking must not fan a grant out to every group"
-        assert subs == 0, "marking must not fan a subscription out to every user"
+        assert grants == 1, "reaching everyone must not fan a grant out per group"
+        assert subs == 0, "reaching everyone must not fan a subscription out per user"
 
-    def test_served_set_includes_it_with_zero_grant_rows(self, web_client):
-        """The point of the read-time union: no rows, still served."""
+    def test_served_and_required_without_a_subscription(self, web_client):
+        """No subscription row, still served, still at the Automatic tier."""
         _seed_marketplace_with_plugin()
         _add_group("engineers")
         user_id, _ = _create_user(web_client, "reader@example.com")
         _, admin = _create_user(web_client, "admin2@example.com", admin=True)
-        web_client.post(
-            "/api/marketplaces/mkt-x/plugins/alpha/system",
-            headers={"Authorization": f"Bearer {admin['access_token']}"},
-        )
+        _grant_to_everyone(web_client, {"access_token": admin["access_token"]})
 
         from src.db import get_system_db
         from src.marketplace_filter import required_plugin_keys
         from src.repositories import marketplace_plugins_repo
+
         conn = get_system_db()
         try:
             granted = {
@@ -883,28 +900,31 @@ class TestAutomaticForEveryoneIsResolvedNotMaterialized:
             required = required_plugin_keys(conn, user_id)
         finally:
             conn.close()
-        assert ("mkt-x", "alpha") in granted, "visible to a user with no grant row"
+        assert ("mkt-x", "alpha") in granted, "visible without a per-group grant"
         assert ("mkt-x", "alpha") in required, "and at the Automatic tier"
 
-    def test_unmark_leaves_a_hand_set_group_grant_alone(self, web_client):
-        """The bug this whole change exists for: unmark used to be unable to
-        retract its own rows, so it retracted nothing and said so."""
+    def test_revoking_the_everyone_grant_leaves_a_group_grant_alone(self, web_client):
+        """The bug this whole effort started from: turning "everyone" off used
+        to be unable to retract its own rows, so it retracted nothing and said
+        so. Two independent rows make it exact in both directions."""
         _seed_marketplace_with_plugin()
         gid = _add_group("engineers")
         _, admin = _create_user(web_client, "admin3@example.com", admin=True)
-        auth = {"Authorization": f"Bearer {admin['access_token']}"}
+        cookies = {"access_token": admin["access_token"]}
 
         from src.db import get_system_db
         from src.repositories import resource_grants_repo
+
         resource_grants_repo().create(
             group_id=gid,
             resource_type="marketplace_plugin",
             resource_id="mkt-x/alpha",
             assigned_by="admin3",
         )
+        everyone_grant_id = _grant_to_everyone(web_client, cookies).json()["id"]
 
-        web_client.post("/api/marketplaces/mkt-x/plugins/alpha/system", headers=auth)
-        web_client.delete("/api/marketplaces/mkt-x/plugins/alpha/system", headers=auth)
+        r = web_client.delete(f"/api/admin/grants/{everyone_grant_id}", cookies=cookies)
+        assert r.status_code in (200, 204), r.text
 
         conn = get_system_db()
         try:
@@ -916,7 +936,7 @@ class TestAutomaticForEveryoneIsResolvedNotMaterialized:
         finally:
             conn.close()
         assert [r[0] for r in rows] == [gid], (
-            "the admin's own grant must survive mark+unmark untouched"
+            "the admin's own group grant must survive revoking the everyone grant"
         )
 
 

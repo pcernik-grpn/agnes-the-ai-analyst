@@ -3013,6 +3013,17 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
           }
         },
         "required": [
@@ -3920,11 +3931,6 @@
           "is_required": {
             "default": false,
             "title": "Is Required",
-            "type": "boolean"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
             "type": "boolean"
           },
           "manifest_name": {
@@ -5097,6 +5103,17 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
           }
         },
         "required": [
@@ -6334,11 +6351,6 @@
           "is_required": {
             "default": false,
             "title": "Is Required",
-            "type": "boolean"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
             "type": "boolean"
           },
           "is_viewer_owner": {
@@ -7995,11 +8007,6 @@
             "title": "Is Required",
             "type": "boolean"
           },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
-            "type": "boolean"
-          },
           "manifest_name": {
             "title": "Manifest Name",
             "type": "string"
@@ -8262,11 +8269,6 @@
               }
             ],
             "title": "Homepage"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
-            "type": "boolean"
           },
           "name": {
             "title": "Name",
@@ -10224,7 +10226,7 @@
       "SetSharesRequest": {
         "properties": {
           "group_ids": {
-            "description": "Desired end state: the groups this item should be shared with. Empty = private.",
+            "description": "Desired end state: the audiences this item should be shared with. Group ids, plus the literal \"everyone\" for the whole workspace. Empty = private.",
             "items": {
               "type": "string"
             },
@@ -11041,40 +11043,6 @@
           "datasets"
         ],
         "title": "SyncSettingsUpdate",
-        "type": "object"
-      },
-      "SystemFlagResponse": {
-        "description": "Return shape of the mark/unmark_system endpoints.",
-        "properties": {
-          "affected_groups": {
-            "default": 0,
-            "title": "Affected Groups",
-            "type": "integer"
-          },
-          "affected_users": {
-            "default": 0,
-            "title": "Affected Users",
-            "type": "integer"
-          },
-          "is_system": {
-            "title": "Is System",
-            "type": "boolean"
-          },
-          "marketplace_id": {
-            "title": "Marketplace Id",
-            "type": "string"
-          },
-          "plugin_name": {
-            "title": "Plugin Name",
-            "type": "string"
-          }
-        },
-        "required": [
-          "marketplace_id",
-          "plugin_name",
-          "is_system"
-        ],
-        "title": "SystemFlagResponse",
         "type": "object"
       },
       "TableAccessDiagnosis": {
@@ -13721,7 +13689,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.89.1"
+    "version": "0.96.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -46060,7 +46028,7 @@
     },
     "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable": {
       "post": {
-        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
+        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants \u2014 including an everyone-scoped grant,\nwhich is what makes this an availability switch rather than a\ndistribution one. Distinct from per-user opt-outs. Primarily intended\nfor built-in plugins (is_builtin=TRUE registry row), but works on any\nregistered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
         "operationId": "disable_plugin_api_marketplaces__marketplace_id__plugins__plugin_name__disable_post",
         "parameters": [
           {
@@ -46218,145 +46186,6 @@
           }
         },
         "summary": "Enable Plugin",
-        "tags": [
-          "marketplaces"
-        ]
-      }
-    },
-    "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system": {
-      "delete": {
-        "description": "Flip ``is_system`` to FALSE. Materialized grants/subscriptions\nsurvive \u2014 admin curates cleanup via the standard /admin/access UI\n(which immediately unlocks the checkboxes for this plugin) and\nusers can unsubscribe normally on /marketplace?tab=my.",
-        "operationId": "unmark_plugin_system_api_marketplaces__marketplace_id__plugins__plugin_name__system_delete",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "marketplace_id",
-            "required": true,
-            "schema": {
-              "title": "Marketplace Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "plugin_name",
-            "required": true,
-            "schema": {
-              "title": "Plugin Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Unmark Plugin System",
-        "tags": [
-          "marketplaces"
-        ]
-      },
-      "post": {
-        "description": "Mark a plugin Automatic for everyone.\n\nRecords ONE decision \u2014 the ``is_system`` flag \u2014 and writes nothing else.\nThe serve path resolves the flag at read time\n(``marketplace_plugins.list_granted_for_groups`` for visibility,\n``marketplace_filter.required_plugin_keys`` for the tier), so there is no\ngrant per group and no subscription per user to keep in step.\n\nThat is what makes the DELETE below exact. The previous implementation\nfanned the flag out into a real grant for every group and a subscription\nfor every user; those rows were then indistinguishable from ones an admin\nset by hand, so unmarking could not retract its own work and had to leave\neverything behind. Idempotent, trivially \u2014 flipping a set flag is a no-op.",
-        "operationId": "mark_plugin_system_api_marketplaces__marketplace_id__plugins__plugin_name__system_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "marketplace_id",
-            "required": true,
-            "schema": {
-              "title": "Marketplace Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "plugin_name",
-            "required": true,
-            "schema": {
-              "title": "Plugin Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SystemFlagResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Mark Plugin System",
         "tags": [
           "marketplaces"
         ]
@@ -52256,7 +52085,7 @@
     },
     "/api/sharing/groups": {
       "get": {
-        "description": "Groups the caller may share into \u2014 their own memberships + Everyone.\n\nDrives the Library's Share dialog. An admin sees every group.",
+        "description": "Audiences the caller may share into \u2014 their own memberships, plus\neveryone (the ``\"everyone\"`` sentinel, flagged ``is_everyone``).\n\nDrives the Library's Share dialog. An admin sees every group.",
         "operationId": "list_share_targets_api_sharing_groups_get",
         "parameters": [
           {

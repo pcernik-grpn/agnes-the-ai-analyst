@@ -204,9 +204,47 @@ def granted_store_entity_keys(conn: duckdb.DuckDBPyConnection | None, user_id: s
     return {r["resource_id"] for r in rows if r.get("resource_id")}
 
 
+def everyone_required_plugin_keys() -> set[tuple[str, str]]:
+    """``(marketplace_id, plugin_name)`` for plugins EVERY account gets
+    automatically — the instance-wide question, asked without a user.
+
+    Its per-user sibling below answers "what must THIS person carry"; this
+    one backs the two places that need the population rather than the
+    person: the stack-count overlay on the marketplace listing (a plugin
+    everyone has must not report the subscription tally, because nothing
+    writes subscription rows for it) and the Access overview.
+
+    Two matches, one meaning. ``scope='everyone'`` is the answer on
+    Postgres. On the frozen DuckDB ladder there is no such column, and an
+    everyone-grant is stored against the carrier group — so a required
+    grant held by the carrier is the same statement, spelled the only way
+    that backend can spell it. See
+    ``src/repositories/resource_grants.py``'s module docstring.
+
+    Deliberately not ``list_everyone_scoped()``: that read is ABOUT the
+    column and raises ``RequiresPostgresBackend``, which would take a page
+    down on a DuckDB instance rather than answer it.
+    """
+    from src.grant_scopes import carrier_group_id, reaches_everyone
+
+    carrier = carrier_group_id()
+    keys: set[tuple[str, str]] = set()
+    for r in resource_grants_repo().list_all(resource_type="marketplace_plugin"):
+        if (r.get("requirement") or "available") != "required":
+            continue
+        if not reaches_everyone(r, carrier):
+            continue
+        resource_id = r.get("resource_id") or ""
+        if "/" not in resource_id:
+            continue
+        slug, _, name = resource_id.partition("/")
+        keys.add((slug, name))
+    return keys
+
+
 def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | None) -> set[tuple[str, str]]:
     """``(marketplace_id, plugin_name)`` keys at the Automatic tier for this
-    user — held by any of their groups, or Automatic for everyone.
+    user — held by any of their groups, or granted to everyone.
 
     v49 gave ``resource_grants`` a ``requirement`` enum
     (``available`` | ``required``) where required is the always-in-stack
@@ -219,7 +257,9 @@ def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | 
     scope-filtered — see ``_resolve_principal_marketplace``). Before this
     helper existed, flipping a marketplace_plugin grant to ``required``
     was a silent no-op for the served set (the separate global
-    ``is_system`` flag was the only mandatory path).
+    ``is_system`` flag was the only mandatory path — deleted in 0098, where
+    it became a required grant at ``scope='everyone'`` and stopped being a
+    second mandatory path this function had to union in by hand).
 
     ``resource_id`` format is ``<marketplace_slug>/<plugin_name>``; rows
     without a slash are skipped defensively so a hand-written grant can
@@ -227,17 +267,15 @@ def required_plugin_keys(conn: duckdb.DuckDBPyConnection | None, user_id: str | 
     raw SQL on ``conn``) for the same PG-backend reason documented in
     ``resolve_allowed_plugins``.
     """
-    # Automatic for everyone — the ``is_system`` flag. Read here rather than
-    # materialized into a per-group grant on mark: the fanout wrote rows an
-    # admin could not tell from their own, so turning the flag back off could
-    # not retract them. One flag, resolved at read time, is exactly reversible.
-    # Global by definition, so it does not depend on group membership and is
-    # answered before the group lookup below.
-    keys: set[tuple[str, str]] = set(marketplace_plugins_repo().list_system_keys())
+    # One read, not two. "Automatic for everyone" used to live in a flag on
+    # the plugin row and had to be unioned in here before the group lookup;
+    # it is now a required grant carrying ``scope='everyone'``, which
+    # ``list_for_groups`` returns for any caller — including one who belongs
+    # to no group, which is why there is no early return on an empty group
+    # set any more.
+    keys: set[tuple[str, str]] = set()
 
     group_ids = _user_group_ids(user_id, conn) if user_id else set()
-    if not group_ids:
-        return keys
     rows = resource_grants_repo().list_for_groups(list(group_ids), "marketplace_plugin")
     for r in rows:
         if (r.get("requirement") or "available") != "required":

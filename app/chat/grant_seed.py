@@ -113,12 +113,19 @@ def seed_everyone_chat_grant(*, chat_enabled: bool) -> bool:
         _write_marker(marker, "pre-existing chat grant found; nothing seeded")
         return False
 
+    from src.grant_scopes import EVERYONE as SCOPE_EVERYONE
+
+    # `scope`, not the group's membership. The group is only the carrier —
+    # seeding "everyone can use chat" as a grant ON the Everyone group meant
+    # a subset could use chat wherever that group was narrowed to a
+    # Workspace group, which is not what a default is for.
     resource_grants_repo().ensure_grant(
         group_id=everyone_group["id"],
         resource_type=ResourceType.CHAT.value,
         resource_id="chat",
         assigned_by="app.main:seed_chat_grant",
         source=GRANT_SOURCE,
+        scope=SCOPE_EVERYONE,
     )
 
     _write_marker(marker, "seeded by app.main:seed_chat_grant")

@@ -3135,7 +3135,6 @@ KNOWN_UNTESTED = {
     # Marketplace detail / asset endpoints
     "DELETE /api/marketplace/curated/{marketplace_id}/{plugin_name}/install",
     "DELETE /api/marketplaces/{marketplace_id}",
-    "DELETE /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/enable",
     "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}",
@@ -3150,7 +3149,6 @@ KNOWN_UNTESTED = {
     "PATCH /api/marketplaces/{marketplace_id}",
     "POST /api/marketplace/curated/{marketplace_id}/{plugin_name}/install",
     "POST /api/marketplaces/sync-all",
-    "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system",
     "POST /api/marketplaces/{marketplace_id}/sync",
     # MCP passthrough / user secrets
     "DELETE /api/mcp/sources/{source_id}/my-secret",

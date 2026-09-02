@@ -37,9 +37,6 @@ from src.repositories import (
     user_curated_subscriptions_repo,
 )
 
-#: What this module is, to `resource_grants.source` (src/grant_sources.py).
-GRANT_SOURCE = "marketplace_required"
-
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/marketplaces", tags=["marketplaces"])
 
@@ -255,11 +252,13 @@ class PluginResponse(BaseModel):
     category: Optional[str] = None
     source_type: Optional[str] = None
     source_spec: Optional[Any] = None
-    # v39: surfaced so the admin Details modal renders the SYSTEM pill
-    # + flips the "Mark as system" / "Unmark system" toggle button.
-    is_system: bool = False
     # v78: surfaced so the admin Details modal renders the "Disable plugin"
-    # toggle + greys out the system button for admin-disabled plugins.
+    # toggle.
+    #
+    # ``is_system`` used to ride beside it, driving a SYSTEM pill and a
+    # "Mark as system" button on the same modal. Both are gone: this page
+    # says what EXISTS on the instance, /admin/access says who gets it, and
+    # one writer of grants is what keeps the two from drifting apart.
     admin_disabled: bool = False
     # Curator-side lifecycle, read on demand from the cloned repo's
     # marketplace-metadata.json (not persisted): the Details modal renders a
@@ -268,16 +267,6 @@ class PluginResponse(BaseModel):
     deprecated: bool = False
     deprecation_note: Optional[str] = None
     replacement: Optional[str] = None
-
-
-class SystemFlagResponse(BaseModel):
-    """Return shape of the mark/unmark_system endpoints."""
-
-    marketplace_id: str
-    plugin_name: str
-    is_system: bool
-    affected_groups: int = 0
-    affected_users: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +347,6 @@ async def list_plugins(
             category=r.get("category"),
             source_type=r.get("source_type"),
             source_spec=r.get("source_spec"),
-            is_system=bool(r.get("is_system")),
             admin_disabled=bool(r.get("admin_disabled")),
             **plugin_deprecation(metadata, r["name"]),
         )
@@ -712,130 +700,29 @@ def trigger_sync_all(
 
 
 # ---------------------------------------------------------------------------
-# v39: system plugin mark / unmark
+# Served-marketplace cache
 #
-# A plugin marked as "system" is materialized into:
-#   * resource_grants — one row per existing user_groups row
-#   * user_plugin_optouts — one row per existing users row
-# so the resolver's existing (rbac ∩ subscriptions) computation naturally
-# includes it for every user. The UI then locks the corresponding controls
-# (admin can't revoke per-group, user can't unsubscribe). Unmark flips the
-# flag only — materialized rows survive so unmark cannot accidentally rip
-# the plugin out of every user's stack mid-day; admin curates the cleanup
-# afterwards via the standard resource_grants UI.
+# `POST`/`DELETE /{marketplace_id}/plugins/{plugin_name}/system` lived here.
+# They wrote `marketplace_plugins.is_system` — "every account gets this
+# plugin, automatically" — which made this page a second writer of
+# distribution alongside /admin/access, with its own vocabulary for the tier
+# Access already called Automatic. The flag is now an ordinary grant
+# (`scope='everyone'`, `requirement='required'`), written where every other
+# grant is written. This page keeps the one decision that is genuinely its
+# own: whether the plugin is available on this instance at all.
 # ---------------------------------------------------------------------------
 
 
 def _invalidate_marketplace_etag() -> None:
     """Drop the served-marketplace ETag cache so the next ZIP / git fetch
-    rehashes against the post-mark/post-unmark RBAC view. Best-effort —
-    the cache layer survives an import error during early startup."""
+    rehashes against the current RBAC view. Best-effort — the cache layer
+    survives an import error during early startup."""
     try:
         from app.marketplace_server import packager
 
         packager.invalidate_etag_cache()
     except Exception:
         logger.exception("failed to invalidate marketplace etag cache")
-
-
-@router.post(
-    "/{marketplace_id}/plugins/{plugin_name}/system",
-    response_model=SystemFlagResponse,
-)
-def mark_plugin_system(
-    marketplace_id: str,
-    plugin_name: str,
-    user: dict = Depends(require_admin),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """Mark a plugin Automatic for everyone.
-
-    Records ONE decision — the ``is_system`` flag — and writes nothing else.
-    The serve path resolves the flag at read time
-    (``marketplace_plugins.list_granted_for_groups`` for visibility,
-    ``marketplace_filter.required_plugin_keys`` for the tier), so there is no
-    grant per group and no subscription per user to keep in step.
-
-    That is what makes the DELETE below exact. The previous implementation
-    fanned the flag out into a real grant for every group and a subscription
-    for every user; those rows were then indistinguishable from ones an admin
-    set by hand, so unmarking could not retract its own work and had to leave
-    everything behind. Idempotent, trivially — flipping a set flag is a no-op.
-    """
-
-    # Existence check + is_system flip routed through the factory so they hit
-    # the ACTIVE backend (PG / DuckDB). A raw conn.execute on the
-    # Depends(_get_db) connection runs against the always-DuckDB system file and
-    # silently no-ops on a Postgres instance (#518 backend-split): the SELECT
-    # would 404 a plugin that only exists in PG, and the UPDATE would never
-    # persist is_system.
-    plugins_repo = marketplace_plugins_repo()
-    plugin = plugins_repo.get(marketplace_id, plugin_name)
-    if not plugin:
-        raise HTTPException(status_code=404, detail="plugin not found")
-    # A disabled plugin must not regain system status. Disabling clears
-    # is_system and re-enabling does NOT restore it; marking a disabled plugin
-    # system here would resurrect it as a mandatory default on re-enable,
-    # breaking that contract. The UI greys the button out, but this endpoint is
-    # the real state boundary (direct API call / stale-modal race).
-    if plugin.get("admin_disabled"):
-        raise HTTPException(status_code=409, detail="plugin is disabled")
-    # set_system returns False only on a concurrent delete between the fetch
-    # above and the flip — surface it as a 404 rather than fanning out a ghost.
-    if not plugins_repo.set_system(marketplace_id, plugin_name, True):
-        raise HTTPException(status_code=404, detail="plugin not found")
-
-    # No fanout. `affected_*` stay in the response for wire compatibility and
-    # now report what the change actually touched: nothing but the flag.
-    affected_groups = 0
-    affected_users = 0
-
-    _audit(
-        conn,
-        user["id"],
-        "marketplace.plugin.mark_system",
-        f"{marketplace_id}/{plugin_name}",
-        {"affected_groups": affected_groups, "affected_users": affected_users},
-    )
-    _invalidate_marketplace_etag()
-
-    return SystemFlagResponse(
-        marketplace_id=marketplace_id,
-        plugin_name=plugin_name,
-        is_system=True,
-        affected_groups=affected_groups,
-        affected_users=affected_users,
-    )
-
-
-@router.delete(
-    "/{marketplace_id}/plugins/{plugin_name}/system",
-    status_code=204,
-)
-def unmark_plugin_system(
-    marketplace_id: str,
-    plugin_name: str,
-    user: dict = Depends(require_admin),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """Flip ``is_system`` to FALSE. Materialized grants/subscriptions
-    survive — admin curates cleanup via the standard /admin/access UI
-    (which immediately unlocks the checkboxes for this plugin) and
-    users can unsubscribe normally on /marketplace?tab=my.
-    """
-    # Routed through the factory so the flip lands on the active backend — a
-    # raw UPDATE on the Depends(_get_db) DuckDB conn no-ops on Postgres
-    # (#518 backend-split). set_system returns False when no row matched.
-    if not marketplace_plugins_repo().set_system(marketplace_id, plugin_name, False):
-        raise HTTPException(status_code=404, detail="plugin not found")
-    _audit(
-        conn,
-        user["id"],
-        "marketplace.plugin.unmark_system",
-        f"{marketplace_id}/{plugin_name}",
-        None,
-    )
-    _invalidate_marketplace_etag()
 
 
 # ---------------------------------------------------------------------------
@@ -881,9 +768,11 @@ async def disable_plugin(
     """Admin-disable a plugin instance-wide.
 
     Disabled plugins are filtered from the served feed for all callers
-    regardless of their RBAC grants. Distinct from per-user opt-outs.
-    Primarily intended for built-in plugins (is_builtin=TRUE registry row),
-    but works on any registered plugin.
+    regardless of their RBAC grants — including an everyone-scoped grant,
+    which is what makes this an availability switch rather than a
+    distribution one. Distinct from per-user opt-outs. Primarily intended
+    for built-in plugins (is_builtin=TRUE registry row), but works on any
+    registered plugin.
 
     Optional JSON body ``{"revoke_grants": true}`` additionally deletes every
     group grant on the plugin (one-action retirement) — without it the grants
@@ -892,13 +781,6 @@ async def disable_plugin(
     """
     if not marketplace_registry_repo().get(marketplace_id):
         raise HTTPException(status_code=404, detail="marketplace not found")
-    # ORDER MATTERS: set_admin_disabled clears is_system in the same UPDATE.
-    # `DELETE /api/access/grants/{id}` refuses to revoke a grant on a
-    # still-system plugin (409 cannot_revoke_system_grant) so nobody punches a
-    # hole in a mandatory-tier plugin; the bulk delete below does not consult
-    # that guard, and is only safe because is_system is already FALSE by the
-    # time it runs — the same state a manual unmark-system → revoke sequence
-    # would reach. Keep the disable flip strictly before the grant deletion.
     found = marketplace_plugins_repo().set_admin_disabled(marketplace_id, plugin_name, True)
     if not found:
         raise HTTPException(status_code=404, detail="plugin not found")

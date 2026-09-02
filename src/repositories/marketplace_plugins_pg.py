@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from src.grant_scopes import EVERYONE as SCOPE_EVERYONE
 from src.repositories.marketplace_plugins import _classify_source
 
 
@@ -52,7 +53,7 @@ class MarketplacePluginsPgRepository:
         """Fetch a single plugin row by (marketplace_id, name), or None.
 
         Parity with the DuckDB repo — backs the curated install/uninstall
-        existence + is_system checks through the factory.
+        existence and admin-disabled checks through the factory.
         """
         with self._engine.connect() as conn:
             row = (
@@ -87,19 +88,25 @@ class MarketplacePluginsPgRepository:
     ) -> List[Dict[str, Any]]:
         """PG mirror of ``MarketplacePluginsRepository.list_granted_for_groups``."""
         gids = list(group_ids)
-        # See the DuckDB sibling: an empty group list is not an early return,
-        # because an Automatic-for-everyone plugin does not depend on groups.
+        # An empty group list is deliberately NOT an early return: an
+        # everyone-scoped grant reaches an account regardless of membership,
+        # so the query still has work to do.
         gid_keys: List[str] = []
-        params: Dict[str, Any] = {}
+        params: Dict[str, Any] = {"everyone_scope": SCOPE_EVERYONE}
         for i, gid in enumerate(gids):
             k = f"g_{i}"
             gid_keys.append(f":{k}")
             params[k] = gid
-        # Semi-join off ``marketplace_plugins`` — same shape as the DuckDB
-        # sibling. A system plugin (Automatic for everyone) has no grant rows
-        # to join to, so the visibility test is "granted to one of my groups
-        # OR flagged system", and EXISTS removes the DISTINCT the old join
-        # needed. ``mr.registered_at`` rides the projection for the ORDER BY.
+        # Semi-join off ``marketplace_plugins``, EXISTS rather than a JOIN so
+        # a plugin granted by several of the caller's groups yields one row
+        # without a DISTINCT. ``mr.registered_at`` rides the projection for
+        # the ORDER BY.
+        #
+        # The scope term is where this diverges from the DuckDB sibling: an
+        # everyone-scoped grant (0098) reaches an account with NO group
+        # memberships at all, so it cannot be folded into the group IN-list.
+        # It replaces the `mp.is_system = TRUE` branch that used to sit here,
+        # and reaches strictly the same people the flag did.
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
@@ -108,12 +115,13 @@ class MarketplacePluginsPgRepository:
                     "FROM marketplace_plugins mp "
                     "JOIN marketplace_registry mr ON mr.id = mp.marketplace_id "
                     "WHERE mp.admin_disabled = FALSE "
-                    "  AND (mp.is_system = TRUE OR EXISTS ("
+                    "  AND EXISTS ("
                     "        SELECT 1 FROM resource_grants rg "
                     "        WHERE rg.resource_id = mp.marketplace_id || '/' || mp.name "
                     "          AND rg.resource_type = 'marketplace_plugin' "
-                    f"          AND rg.group_id IN ({','.join(gid_keys) or 'NULL'})"
-                    "      )) "
+                    "          AND (rg.scope = :everyone_scope "
+                    f"               OR rg.group_id IN ({','.join(gid_keys) or 'NULL'}))"
+                    "      ) "
                     "ORDER BY mr.registered_at, mp.name"
                 ),
                 params,
@@ -201,7 +209,7 @@ class MarketplacePluginsPgRepository:
                         f"SELECT DISTINCT mp.marketplace_id, mp.name, mp.description, mp.version, "
                         f"       mp.author_name, mp.homepage, mp.category, mp.source_type, "
                         f"       mp.source_spec, mp.raw, mp.cover_photo_url, mp.video_url, "
-                        f"       mp.doc_links, mp.created_at, mp.updated_at, mp.is_system "
+                        f"       mp.doc_links, mp.created_at, mp.updated_at "
                         f"FROM marketplace_plugins mp "
                         f"JOIN resource_grants rg ON TRUE "
                         f"WHERE {where_sql} "
@@ -342,30 +350,17 @@ class MarketplacePluginsPgRepository:
         Returns True when the row existed and was updated, False when the
         (marketplace_id, plugin_name) pair is not in the table (no-op).
 
-        Disabling also clears `is_system`: a hidden plugin must not keep
-        fanning out as a system default. Re-enabling does NOT restore the
-        system flag (matching `unmark_system` semantics) — an admin must
-        re-mark it explicitly.
+        See the DuckDB sibling for why disabling no longer clears a
+        distribution flag: there is no flag, and a grant survives a
+        disable/re-enable cycle unchanged.
         """
-        if disabled:
-            sql = "UPDATE marketplace_plugins SET admin_disabled = TRUE, is_system = FALSE WHERE marketplace_id = :m AND name = :n"
-        else:
-            sql = "UPDATE marketplace_plugins SET admin_disabled = FALSE WHERE marketplace_id = :m AND name = :n"
-        with self._engine.begin() as conn:
-            result = conn.execute(sa.text(sql), {"m": marketplace_id, "n": plugin_name})
-        return result.rowcount > 0
-
-    def set_system(self, marketplace_id: str, plugin_name: str, system: bool) -> bool:
-        """PG sibling of the DuckDB ``set_system`` — toggle the per-plugin
-        ``is_system`` flag. Returns True when the row existed and was updated,
-        False when the (marketplace_id, plugin_name) pair is not present."""
         with self._engine.begin() as conn:
             result = conn.execute(
                 sa.text(
-                    "UPDATE marketplace_plugins SET is_system = :s "
+                    "UPDATE marketplace_plugins SET admin_disabled = :d "
                     "WHERE marketplace_id = :m AND name = :n"
                 ),
-                {"s": system, "m": marketplace_id, "n": plugin_name},
+                {"d": bool(disabled), "m": marketplace_id, "n": plugin_name},
             )
         return result.rowcount > 0
 
@@ -378,13 +373,4 @@ class MarketplacePluginsPgRepository:
             ).all()
         return [r[0] for r in rows]
 
-    def list_system_keys(self) -> List[Tuple[str, str]]:
-        """PG mirror of ``MarketplacePluginsRepository.list_system_keys``."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.text(
-                    "SELECT marketplace_id, name FROM marketplace_plugins "
-                    "WHERE is_system = TRUE AND admin_disabled = FALSE"
-                )
-            ).all()
-        return [(r[0], r[1]) for r in rows]
+

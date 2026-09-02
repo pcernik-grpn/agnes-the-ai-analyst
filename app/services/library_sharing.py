@@ -59,6 +59,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.resource_types import ResourceType
+from src.grant_scopes import EVERYONE as SCOPE_EVERYONE
+from src.grant_scopes import EVERYONE_TARGET_ID, EVERYONE_TARGET_LABEL, carrier_group_id
 
 #: What this module is, to `resource_grants.source` (src/grant_sources.py).
 GRANT_SOURCE = "library_share"
@@ -159,7 +161,15 @@ SHAREABLE_TYPES: Dict[str, str] = {
 
 @dataclass(frozen=True)
 class ShareTarget:
-    """A group the caller may share into."""
+    """An audience the caller may share into.
+
+    Not always a group. ``id`` is a real ``user_groups.id`` for every
+    ordinary audience and the sentinel ``grant_scopes.EVERYONE_TARGET_ID``
+    for the whole workspace — which is what ``is_everyone`` has always
+    flagged. Before 0098 the sentinel was the seeded ``Everyone`` group's
+    uuid, and the boolean existed to tell the reader that this one entry in
+    a list of groups was not really one of them.
+    """
 
     id: str
     name: str
@@ -181,25 +191,30 @@ def resolve_owner(resource_type: str, resource_id: str) -> Optional[str]:
 
 
 def share_targets(user_id: str, *, is_admin: bool = False) -> List[ShareTarget]:
-    """Groups ``user_id`` may share into.
+    """Audiences ``user_id`` may share into.
 
-    The caller's own group memberships plus ``Everyone`` (workspace-wide).
-    ``Everyone`` is listed first — it is the "publish to the whole workspace"
-    choice and is auto-membership, so every caller is legitimately in it.
-    An admin may share into any group, matching their god-mode elsewhere.
+    The caller's own group memberships plus everyone (workspace-wide).
+    Everyone is listed first — it is the "publish to the whole workspace"
+    choice, and it is always offerable because it is a scope rather than a
+    group anyone has to be a member of. An admin may share into any group,
+    matching their god-mode elsewhere.
+
+    The everyone entry no longer depends on the seeded ``Everyone`` group
+    existing, or on that group actually holding every account — which it did
+    not, on an instance where ``AGNES_GROUP_EVERYONE_EMAIL`` narrowed it.
+    Its carrier is resolved only at WRITE time (:func:`set_shares`).
+
+    The seeded group is still filtered out of the ordinary list: it survives
+    0098 as the carrier, so an admin listing every group would otherwise be
+    offered "everyone" twice — once as the scope and once as a group that
+    grants the same thing.
     """
     from src.db import SYSTEM_EVERYONE_GROUP
     from src.repositories import user_group_members_repo, user_groups_repo
 
-    everyone_id: Optional[str] = None
-    targets: List[ShareTarget] = []
-    try:
-        everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-        if everyone:
-            everyone_id = everyone["id"]
-            targets.append(ShareTarget(id=everyone["id"], name="Everyone (workspace)", is_everyone=True))
-    except Exception:
-        pass
+    targets: List[ShareTarget] = [
+        ShareTarget(id=EVERYONE_TARGET_ID, name=EVERYONE_TARGET_LABEL, is_everyone=True)
+    ]
 
     try:
         if is_admin:
@@ -211,27 +226,41 @@ def share_targets(user_id: str, *, is_admin: bool = False) -> List[ShareTarget]:
 
     for g in groups:
         gid = g.get("id") or g.get("group_id")
-        if not gid or gid == everyone_id:
-            continue  # Everyone already leads the list
+        if not gid or g.get("name") == SYSTEM_EVERYONE_GROUP:
+            continue
         targets.append(ShareTarget(id=gid, name=g.get("name") or gid, is_everyone=False))
     return targets
 
 
 def shareable_group_ids(user_id: str, *, is_admin: bool = False) -> Set[str]:
-    """Id set of :func:`share_targets` — the containment check for writes."""
+    """Id set of :func:`share_targets` — the containment check for writes.
+
+    Contains the everyone SENTINEL, not a group id, when the caller may
+    publish workspace-wide.
+    """
     return {t.id for t in share_targets(user_id, is_admin=is_admin)}
 
 
 def current_share_group_ids(resource_type: str, resource_id: str) -> Set[str]:
-    """Group ids currently granted this resource (any writer)."""
+    """Audience ids currently granted this resource (any writer).
+
+    An everyone-scoped grant reports the SENTINEL rather than the carrier
+    group it is stored against — so it round-trips through
+    :func:`set_shares` as the same choice the caller made, and the carrier
+    never shows up in the dialog as a group that happens to grant
+    everything.
+    """
+    from src.grant_scopes import carrier_group_id, reaches_everyone
     from src.repositories import resource_grants_repo
 
     try:
-        return {
-            g["group_id"]
-            for g in resource_grants_repo().list_all(resource_type=resource_type)
-            if g["resource_id"] == resource_id
-        }
+        carrier = carrier_group_id()
+        out: Set[str] = set()
+        for g in resource_grants_repo().list_all(resource_type=resource_type):
+            if g["resource_id"] != resource_id:
+                continue
+            out.add(EVERYONE_TARGET_ID if reaches_everyone(g, carrier) else g["group_id"])
+        return out
     except Exception:
         return set()
 
@@ -240,21 +269,16 @@ def visibility_for(resource_type: str, resource_id: str) -> str:
     """``private`` | ``shared`` | ``workspace`` for one resource.
 
     Mirrors ``app/services/artefact_access.py::collection_visibility`` — an
-    ``Everyone`` grant means workspace-wide, any other grant means shared with
-    a specific group, no grant at all means private.
+    everyone-scoped grant means workspace-wide, any other grant means shared
+    with a specific group, no grant at all means private. One set membership
+    test now, because :func:`current_share_group_ids` has already collapsed
+    the two spellings of "everyone" into the sentinel.
     """
-    from src.db import SYSTEM_EVERYONE_GROUP
-    from src.repositories import user_groups_repo
-
     granted = current_share_group_ids(resource_type, resource_id)
     if not granted:
         return "private"
-    try:
-        everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-        if everyone and everyone["id"] in granted:
-            return "workspace"
-    except Exception:
-        pass
+    if EVERYONE_TARGET_ID in granted:
+        return "workspace"
     return "shared"
 
 
@@ -302,6 +326,13 @@ def set_shares(
     ``group_ids`` is the desired end state *within the caller's shareable
     set*. Grants to groups outside that set (e.g. one an admin made) are left
     alone — an owner can neither revoke nor forge them.
+
+    One member of that set is not a group: ``grant_scopes.EVERYONE_TARGET_ID``
+    means the whole workspace, and writing it produces a grant carrying
+    ``scope='everyone'`` rather than a membership-dependent one. That is the
+    difference the sentinel exists to make — the old everyone target was the
+    seeded group's uuid, so "share with everyone" reached whoever that group
+    happened to hold.
 
     For an approval-gated type (``agent``) shared by a non-admin actor, a
     newly-requested group is NOT granted immediately — it is queued as a
@@ -367,10 +398,33 @@ def set_shares(
         queued = set(to_add)
         to_add = set()  # nothing granted yet — queued for admin decision
 
+    carrier = carrier_group_id()
     for gid in sorted(to_add):
+        if gid == EVERYONE_TARGET_ID:
+            # The scope needs a row to live on, and `group_id` is NOT NULL.
+            # No carrier means no everyone-grant can be written — skip rather
+            # than substitute a group of our own, which would share the item
+            # with whoever happens to be in it.
+            if carrier is None:
+                continue
+            grants_repo.ensure_grant(
+                carrier,
+                resource_type,
+                resource_id,
+                assigned_by=actor_id,
+                source=GRANT_SOURCE,
+                scope=SCOPE_EVERYONE,
+            )
+            continue
         grants_repo.ensure_grant(gid, resource_type, resource_id, assigned_by=actor_id, source=GRANT_SOURCE)
     for gid in sorted(to_remove):
-        for g in grants_repo.list_all(resource_type=resource_type, group_id=gid):
+        # Un-sharing from everyone deletes the row the scope lives on, which
+        # is the carrier's. `list_all(group_id=...)` is still the lookup —
+        # only the id it takes differs from the one the caller named.
+        lookup_gid = carrier if gid == EVERYONE_TARGET_ID else gid
+        if lookup_gid is None:
+            continue
+        for g in grants_repo.list_all(resource_type=resource_type, group_id=lookup_gid):
             if g["resource_id"] == resource_id:
                 grants_repo.delete(g["id"])
 

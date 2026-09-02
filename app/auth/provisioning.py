@@ -55,10 +55,9 @@ def ensure_user(email: str, name: str, *, source: str) -> dict:
         user_id = str(uuid.uuid4())
         email = normalized or email
         repo.create(id=user_id, email=email, name=name)
-        # Issue #748: auto-grant Everyone at creation (source='system_seed')
-        # unless AGNES_GROUP_EVERYONE_EMAIL maps Everyone to a Workspace
-        # group. Creation-time only: never called again for a returning
-        # user, so an admin's manual removal later sticks.
+        # Issue #748: auto-grant Everyone at creation (source='system_seed').
+        # Creation-time only: never called again for a returning user, so an
+        # admin's manual removal later sticks.
         try:
             from app.auth.group_sync import ensure_everyone_membership
 

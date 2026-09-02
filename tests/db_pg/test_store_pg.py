@@ -101,22 +101,31 @@ def test_marketplace_plugins_replace_for_marketplace(store_engine):
 # resource_grants fanout (now that marketplace_plugins is migrated)
 # ---------------------------------------------------------------------------
 
-def test_disabled_system_plugin_is_not_visible_on_pg(store_engine):
-    """PG-side parity for the invariant the deleted group fan-out used to
-    carry: a plugin that is is_system AND admin_disabled reaches nobody.
+def test_an_everyone_scoped_grant_is_served_and_a_disabled_plugin_is_not(store_engine):
+    """PG-side parity for two invariants that meet on the same query.
 
-    A PG-only drop of the ``admin_disabled = FALSE`` clause would otherwise
-    serve a disabled plugin to every user, which is exactly the divergence
-    the cross-engine contract exists to catch.
+    An everyone-scoped grant reaches a caller whose groups were granted
+    NOTHING — it is matched by scope, not by the group IN-list, which is the
+    one thing this backend can express and the frozen DuckDB ladder cannot.
+    And ``admin_disabled`` still wins over any grant: a PG-only drop of that
+    clause would serve a hidden plugin to every account, which is exactly the
+    divergence the cross-engine contract exists to catch.
+
+    This used to assert the same shape for ``is_system``, whose reach was the
+    same and whose spelling was a second one (0098).
     """
     from src.repositories.marketplace_plugins_pg import MarketplacePluginsPgRepository
+    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
     from src.repositories.user_groups_pg import UserGroupsPgRepository
 
     groups = UserGroupsPgRepository(store_engine)
     plugins = MarketplacePluginsPgRepository(store_engine)
+    grants = ResourceGrantsPgRepository(store_engine)
     g = groups.create(name="g1")
+    carrier = groups.create(name="Everyone")
 
     import sqlalchemy as sa
+
     with store_engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -126,18 +135,26 @@ def test_disabled_system_plugin_is_not_visible_on_pg(store_engine):
         )
         conn.execute(
             sa.text(
-                "INSERT INTO marketplace_plugins (marketplace_id, name, is_system, admin_disabled) "
-                "VALUES ('m1', 'p1', TRUE, FALSE), ('m1', 'p2', TRUE, TRUE)"
+                "INSERT INTO marketplace_plugins (marketplace_id, name, admin_disabled) "
+                "VALUES ('m1', 'p1', FALSE), ('m1', 'p2', TRUE)"
             )
         )
+    for name in ("p1", "p2"):
+        grants.create(
+            group_id=carrier["id"],
+            resource_type="marketplace_plugin",
+            resource_id=f"m1/{name}",
+            requirement="required",
+            scope="everyone",
+        )
 
-    served = {(r["marketplace_id"], r["name"])
-              for r in plugins.list_granted_for_groups([g["id"]])}
-    # p1 is served with NO grant row for this group — that is the read-time
-    # resolution the fan-out used to fake by writing one.
+    served = {(r["marketplace_id"], r["name"]) for r in plugins.list_granted_for_groups([g["id"]])}
+    # p1 reaches this caller with NO grant on any group they belong to.
     assert ("m1", "p1") in served
-    assert ("m1", "p2") not in served
-    assert set(plugins.list_system_keys()) == {("m1", "p1")}
+    assert ("m1", "p2") not in served, "a disabled plugin was served to an everyone-grantee"
+
+    # And with no groups at all — the case the group model could not express.
+    assert ("m1", "p1") in {(r["marketplace_id"], r["name"]) for r in plugins.list_granted_for_groups([])}
 
 
 # ---------------------------------------------------------------------------

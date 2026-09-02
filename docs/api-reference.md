@@ -2724,7 +2724,6 @@ metered server-side.
 - /api/marketplaces/sync-all
 - /api/marketplaces/{marketplace_id}
 - /api/marketplaces/{marketplace_id}/plugins
-- /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system
 - /api/marketplaces/{marketplace_id}/sync
 
 ### `/api/mcp` — MCP passthrough and per-table query

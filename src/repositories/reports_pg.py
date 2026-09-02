@@ -415,25 +415,40 @@ class ReportsPgRepository:
     # historically-named curated-subscription ledger: since v28 row presence
     # means SUBSCRIBED and `opted_out_at` is effectively `subscribed_at`.
     #
-    # A plugin flagged `marketplace_plugins.is_system` reaches a stack by
-    # platform action, so its rows are provisioning, not adoption. NOT EXISTS
-    # rather than a join so an install whose plugin row is missing entirely
-    # still counts as a real install instead of silently vanishing.
+    # A row whose plugin reaches EVERY account automatically got there by
+    # platform action rather than by anyone choosing it, so it is
+    # provisioning rather than adoption. That used to be the
+    # `marketplace_plugins.is_system` flag; since 0098 it is a required grant
+    # reaching everyone. NOT EXISTS rather than a join so an install whose
+    # plugin row is missing entirely still counts as a real install instead
+    # of silently vanishing.
     #
-    # Caveat: classification uses the plugin's CURRENT `is_system` flag, so it
-    # describes what a plugin is now, not what it was when the row was written.
-    # Clearing the flag (admin-disabling a plugin does this) or deleting the
-    # registry row moves historical rollout rows back into the opt-in figures.
-    # Fixing that properly needs provenance stamped on the subscription row at
-    # subscribe time — a migration, deliberately not taken here. Blast radius is
-    # limited: published reports are static HTML, so only a re-generated report
-    # for a past window can shift.
+    # Matched by CARRIER group, not by `rg.scope`, so this string is
+    # byte-identical to the DuckDB sibling's and the drift guard in
+    # `tests/db_pg/test_reports_contract.py` can keep pinning them equal.
+    # Correct on both: every everyone-scoped row is written against that one
+    # group (the writer forces it — see `app/api/access.py::create_grant`),
+    # and a plain required grant on the group reaches every account too,
+    # because membership in it is automatic. The frozen DuckDB ladder has no
+    # `scope` column at all, which is why the column cannot be the shared
+    # spelling.
+    #
+    # Caveat: classification uses the grant as it stands NOW, so it describes
+    # what a plugin is today, not what it was when the row was written.
+    # Revoking the grant moves historical rollout rows back into the opt-in
+    # figures. Fixing that properly needs provenance stamped on the
+    # subscription row at subscribe time — a migration, deliberately not taken
+    # here. Blast radius is limited: published reports are static HTML, so only
+    # a re-generated report for a past window can shift.
     _NOT_SYSTEM = """
         NOT EXISTS (
-            SELECT 1 FROM marketplace_plugins mp
-            WHERE mp.marketplace_id = o.marketplace_id
-              AND mp.name = o.plugin_name
-              AND mp.is_system = TRUE
+            SELECT 1 FROM resource_grants rg
+            WHERE rg.resource_type = 'marketplace_plugin'
+              AND rg.resource_id = o.marketplace_id || '/' || o.plugin_name
+              AND rg.requirement = 'required'
+              AND rg.group_id IN (
+                  SELECT id FROM user_groups WHERE name = 'Everyone' AND is_system
+              )
         )
     """
 

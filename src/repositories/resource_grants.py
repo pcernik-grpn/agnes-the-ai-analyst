@@ -7,6 +7,19 @@ owned by the module that registered the resource type (see
 
 The resolver in ``app.auth.access`` reads this table on every authorization
 check that isn't satisfied by Admin short-circuit.
+
+Two columns the Postgres sibling has and this one does not, because the
+DuckDB app-state ladder is frozen (A3): ``source`` (0096) and ``scope``
+(0097). Both are ACCEPTED and DROPPED by the write methods, so a caller
+never has to ask which backend is active. For ``scope`` that is not a
+silent loss of meaning: an everyone-grant is written against the carrier
+group (``src.grant_scopes.carrier_group_id`` — the seeded ``Everyone``),
+every account is auto-joined to it at creation, and the per-group reads
+below therefore already reach everyone. The one case the two backends
+answer differently is an account an admin has REMOVED from ``Everyone``:
+on Postgres the scope still reaches them, here it does not. Reads that are
+ABOUT the column rather than merely carrying it raise
+``RequiresPostgresBackend`` instead of guessing.
 """
 
 from __future__ import annotations
@@ -15,6 +28,8 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import duckdb
+
+from src.repository_errors import RequiresPostgresBackend
 
 
 # Maps resource_type string to the per-type column name (schema v60 / PG
@@ -67,12 +82,19 @@ class ResourceGrantsRepository:
         self,
         group_ids: List[str],
         resource_type: Optional[str] = None,
+        include_everyone: bool = True,
     ) -> List[Dict[str, Any]]:
         """All grants held by any of the given groups, optionally type-scoped.
 
         Used by the marketplace filter to materialize a user's allowed plugins
         in one round trip — caller passes the user's full group set.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect here: with no ``scope`` column an everyone-grant is a grant on
+        the carrier group, so it is already in the answer whenever the caller
+        is a member of it. See the module docstring.
         """
+        del include_everyone
         if not group_ids:
             return []
         placeholders = ",".join(["?"] * len(group_ids))
@@ -94,6 +116,7 @@ class ResourceGrantsRepository:
         self,
         user_id: str,
         resource_type: str,
+        include_everyone: bool = True,
     ) -> List[str]:
         """Distinct ``resource_id`` values of ``resource_type`` granted to
         any group the user belongs to.
@@ -103,7 +126,11 @@ class ResourceGrantsRepository:
         user's group ids) — the caller-granted-domains helper in
         ``app.api.memory`` used to run this as a raw ``conn.execute`` on the
         always-DuckDB connection; this is its repo-routed equivalent.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect — see :meth:`list_for_groups`.
         """
+        del include_everyone
         rows = self.conn.execute(
             """SELECT DISTINCT rg.resource_id
                FROM resource_grants rg
@@ -129,13 +156,18 @@ class ResourceGrantsRepository:
         group_ids: List[str],
         resource_type: str,
         resource_id: str,
+        include_everyone: bool = True,
     ) -> bool:
         """Single-purpose existence check used by ``can_access``.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect — see :meth:`list_for_groups`.
 
         Returns True iff any of the given groups has a grant for the
         (resource_type, resource_id) pair. One DB hit, indexed on the
         UNIQUE (group_id, resource_type, resource_id) constraint.
         """
+        del include_everyone
         if not group_ids:
             return False
         placeholders = ",".join(["?"] * len(group_ids))
@@ -157,6 +189,7 @@ class ResourceGrantsRepository:
         assigned_by: Optional[str] = None,
         requirement: Optional[str] = None,
         source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> str:
         """Insert a new grant. Returns the assigned id.
 
@@ -173,9 +206,15 @@ class ResourceGrantsRepository:
         grant in a single round-trip. Rejected by the column CHECK if
         the string is anything other than the two enum values.
 
+        ``scope`` names WHO the grant reaches (``src.grant_scopes``).
+        Accepted and DROPPED for the same frozen-ladder reason as ``source``
+        — see the module docstring for why an everyone-grant still reaches
+        everyone here, and for the one account it does not.
+
         Raises ``duckdb.ConstraintException`` on duplicate
         (group_id, resource_type, resource_id) — caller surfaces as 409.
         """
+        del scope  # accepted and dropped — see docstring
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
         if requirement is None:
@@ -246,6 +285,7 @@ class ResourceGrantsRepository:
         resource_id: str,
         assigned_by: Optional[str] = None,
         source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Create a grant if it does not already exist. Returns True iff the
         grant row exists after the call (whether newly inserted or already
@@ -262,8 +302,10 @@ class ResourceGrantsRepository:
         (A3), so this backend simply does not gain provenance and the API
         reports ``None`` — which the Access page already renders as an
         ordinary grant. The parameter exists so every caller can pass it
-        without asking which backend is active.
+        without asking which backend is active. ``scope`` is accepted and
+        dropped for the same reason — see the module docstring.
         """
+        del scope  # accepted and dropped — see docstring
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
         if per_type_col:
@@ -345,9 +387,27 @@ class ResourceGrantsRepository:
         return len(rows)
 
     def count_for_group(self, group_id: str) -> int:
+        """Grants this group confers. No ``scope`` column here, so every row
+        for the group is one it confers — the Postgres sibling has to exclude
+        everyone-scoped rows explicitly."""
         row = self.conn.execute(
             "SELECT COUNT(*) FROM resource_grants WHERE group_id = ?",
             [group_id],
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def count_everyone_scoped(self) -> int:
+        """Postgres-only. ``scope`` does not exist on this ladder, and
+        answering ``0`` would state that no grant reaches everyone on an
+        instance where several do (as carrier-group rows)."""
+        raise RequiresPostgresBackend("resource_grants.scope")
+
+    def list_everyone_scoped(
+        self,
+        resource_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Postgres-only, for the same reason as
+        :meth:`count_everyone_scoped`."""
+        del resource_type
+        raise RequiresPostgresBackend("resource_grants.scope")
 

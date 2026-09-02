@@ -154,8 +154,8 @@ class UserCuratedSubscriptionsRepository:
         every curated plugin with at least one subscriber.
 
         Post-v28, row PRESENCE in ``user_plugin_optouts`` means the user is
-        subscribed. An Automatic-for-everyone (``is_system``) plugin has NO
-        rows here — the flag is resolved at read time rather than fanned out —
+        subscribed. A plugin granted to everyone at the
+        required tier has NO rows here — nothing subscribes anyone to it —
         so it counts 0 and the caller overlays the total user count (see
         ``app.api.marketplace._load_curated_stack_counts``). Backs the marketplace
         listing/detail pages' subscriber-count badge

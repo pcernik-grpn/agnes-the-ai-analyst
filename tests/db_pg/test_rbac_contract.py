@@ -327,6 +327,122 @@ def test_grant_source_accepted_by_both_backends_and_surfaced_by_pg(rbac_repos):
         assert by_rid["acme/from-sync"]["source"] == "marketplace_sync"
 
 
+def test_grant_scope_accepted_by_both_backends_and_surfaced_by_pg(rbac_repos):
+    """``scope`` says WHO a grant reaches — the members of its group, or every
+    account. The asymmetry is deliberate and both halves are pinned here.
+
+    ``Everyone`` used to be a group that normally held every account but was
+    mirrored from a Workspace group when ``AGNES_GROUP_EVERYONE_EMAIL`` was
+    set, so the word named two different sets of people on two instances. A
+    scope always means every account.
+
+    Postgres-only (migration 0097), like ``source``, because the DuckDB
+    app-state ladder is frozen under A3. So:
+
+      - every backend ACCEPTS ``scope=`` on ``create`` and ``ensure_grant``
+        without raising, so a writer is portable;
+      - Postgres READS it back through ``list_all`` AND ``get`` — two column
+        lists, both of which have to carry it;
+      - DuckDB drops it, and the grant is an ordinary one on the carrier
+        group. That is not a silent loss of reach: every account is
+        auto-joined to that group at creation, so the same people are
+        reached. The one case the two answer differently is an account an
+        admin has REMOVED from it.
+
+    Reads that are ABOUT the column rather than merely carrying it raise
+    ``RequiresPostgresBackend`` on DuckDB instead of answering ``0`` — see
+    the last assertion.
+    """
+    from src.repository_errors import RequiresPostgresBackend
+
+    repos, _, backend = rbac_repos
+    groups = repos["groups"]
+    grants = repos["grants"]
+
+    carrier = groups.get_by_name("Everyone")
+    assert carrier, "the seeded carrier group is missing from the fixture baseline"
+    narrow = groups.create(name="one-team", created_by="admin@x.com")
+
+    everyone_id = grants.create(
+        group_id=carrier["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/for-everyone",
+        requirement="required",
+        scope="everyone",
+    )
+    grants.create(
+        group_id=narrow["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/for-one-team",
+    )
+    assert (
+        grants.ensure_grant(
+            carrier["id"],
+            "marketplace_plugin",
+            "acme/seeded-for-everyone",
+            "system",
+            scope="everyone",
+        )
+        is True
+    )
+
+    by_rid = {g["resource_id"]: g for g in grants.list_all(resource_type="marketplace_plugin")}
+    assert {"acme/for-everyone", "acme/for-one-team", "acme/seeded-for-everyone"} <= set(by_rid)
+    fetched = grants.get(everyone_id)
+    assert fetched is not None
+
+    if backend == "duckdb":
+        # Frozen backend: accepted and dropped, never stored.
+        assert by_rid["acme/for-everyone"].get("scope") is None
+        assert by_rid["acme/seeded-for-everyone"].get("scope") is None
+        assert fetched.get("scope") is None
+        # And a read ABOUT the column refuses rather than answering wrongly.
+        with pytest.raises(RequiresPostgresBackend):
+            grants.count_everyone_scoped()
+        with pytest.raises(RequiresPostgresBackend):
+            grants.list_everyone_scoped()
+        return
+
+    assert by_rid["acme/for-everyone"]["scope"] == "everyone"
+    assert by_rid["acme/seeded-for-everyone"]["scope"] == "everyone"
+    assert by_rid["acme/for-one-team"]["scope"] is None
+    assert fetched["scope"] == "everyone"
+
+    # An everyone-grant reaches an account in NO group — the case the group
+    # model could not express, and the reason this cannot be an extra id in
+    # the group IN-list.
+    assert grants.has_grant([], "marketplace_plugin", "acme/for-everyone") is True
+    assert grants.has_grant([], "marketplace_plugin", "acme/for-one-team") is False
+    reached = {r["resource_id"] for r in grants.list_for_groups([])}
+    assert {"acme/for-everyone", "acme/seeded-for-everyone"} == reached
+
+    # And a caller CAN ask the narrower question, for the admin surfaces that
+    # attribute a row to a group.
+    assert grants.has_grant(
+        [carrier["id"]],
+        "marketplace_plugin",
+        "acme/for-everyone",
+        include_everyone=False,
+    ) is True
+    assert grants.has_grant(
+        [narrow["id"]],
+        "marketplace_plugin",
+        "acme/for-everyone",
+        include_everyone=False,
+    ) is False
+
+    # The carrier does not OWN what it carries: revoking one of these must
+    # not read as revoking one of the group's own grants, so they are not
+    # counted as such.
+    assert grants.count_for_group(carrier["id"]) == 0
+    assert grants.count_for_group(narrow["id"]) == 1
+    assert grants.count_everyone_scoped() == 2
+    assert {r["resource_id"] for r in grants.list_everyone_scoped()} == {
+        "acme/for-everyone",
+        "acme/seeded-for-everyone",
+    }
+
+
 def test_list_groups_for_user_returns_joined_groups(rbac_repos):
     repos, _, _ = rbac_repos
     users = repos["users"]

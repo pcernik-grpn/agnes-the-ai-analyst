@@ -501,30 +501,34 @@ def test_next_nightly_sync_rolls_forward_on_the_boundary():
     assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
 
 
-def test_plugin_reach_is_one_control_with_three_positions():
-    """#1956 items 13 + 14. Two switches (Enabled + the system control) drew
-    FOUR combinations for three real states: disabling clears the automatic
-    flag in the same write, so "off and automatic" was never expressible and
-    the reader had to work out which corner was fake. They were also not the
-    same kind of question — one is a kill switch, the other a distribution
-    choice — while being rendered as two identical widgets side by side.
+def test_plugin_availability_is_one_control_with_two_positions():
+    """This page answers ONE question, and it is not "who gets it".
 
-    One control, three positions, ordered by increasing reach. The state is
-    DERIVED from the two stored flags in a single expression, which is what
-    makes the phantom fourth state undrawable rather than merely discouraged.
+    The control had three positions — Off / By group / Everyone — of which
+    two were not controls: "By group" set nothing (it was a signpost to
+    /admin/access) and "Everyone" wrote a distribution decision from the page
+    that owns availability. Two writers of reach is how the flag and the
+    grants drifted apart in the first place, so both are gone with
+    ``marketplace_plugins.is_system``; Off / Available is the honest name for
+    what the switch has always done.
+
+    Before that it was two switches drawing FOUR combinations for three real
+    states, which is the defect #1956 items 13 + 14 reported.
     """
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
 
     assert "plugin-reach" in template
-    for position in ('data-reach="off"', 'data-reach="group"', 'data-reach="all"'):
+    for position in ('data-reach="off"', 'data-reach="available"'):
         assert position in template, f"missing position: {position}"
-    assert ">Off<" in template and ">By group<" in template and ">Everyone<" in template
+    assert ">Off<" in template and ">Available<" in template
 
-    # ONE derivation, not two independent controls.
-    assert 'const reach = isDisabled ? "off" : (p.is_system ? "all" : "group");' in template, (
-        "the three positions must be derived from the two flags in one expression — "
-        "two independent bindings are what allowed the impossible fourth state"
-    )
+    # ONE derivation, off one flag.
+    assert 'const reach = isDisabled ? "off" : "available";' in template
+
+    # The retired positions and the flag behind them.
+    assert 'data-reach="group"' not in template, "the signpost position must not return"
+    assert 'data-reach="all"' not in template, "distribution is not decided on this page"
+    assert "p.is_system" not in template
 
     # The retired widgets and their inverted caption are gone.
     assert 'data-action="toggle-disabled"' not in template
@@ -551,19 +555,27 @@ def test_no_user_facing_control_says_system():
         assert banned not in visible, f"user-facing copy still says: {banned}"
 
 
-def test_plugin_system_control_carries_a_discoverable_explanation():
+def test_availability_control_carries_a_discoverable_explanation():
     """#1956 item 14a (reporter kbcMichal): the control had no explanation of
     what it actually does. A persistent, always-visible help affordance sits
     next to it, explaining the CONCEPT rather than the next click's side
-    effect, and reading the same regardless of the plugin's current state."""
+    effect, and reading the same regardless of the plugin's current state.
+
+    What it explains changed with the control. It must say what Off and
+    Available mean, say that Off wins over a grant (the one thing an admin
+    could otherwise be surprised by), and point at the page that decides who
+    gets an available plugin — without claiming to decide that here.
+    """
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
     assert "plugin-help-icon" in template
-    help_text = template.split("autoHelpText =")[1].split(";")[0]
-    assert "every user" in help_text
-    # It must name the tier the rest of the admin surface already uses, so an
-    # admin who learned Optional/Automatic on /admin/access meets one idea.
-    assert "Automatic" in help_text
-    # And it must NOT reintroduce the retired third word.
+    help_text = template.split("reachHelpText =")[1].split(";")[0]
+    assert "this instance" in help_text
+    assert "even from groups granted it" in help_text, (
+        "an admin must be told Off overrides a grant — it is the only way this "
+        "switch can surprise them"
+    )
+    assert "Access" in help_text, "it must name the page that decides who gets it"
+    # And it must NOT reintroduce the retired word.
     assert "system" not in help_text.lower()
 
 

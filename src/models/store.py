@@ -86,7 +86,11 @@ class MarketplacePlugin(Base):
     cover_photo_url: Mapped[str | None] = mapped_column(String, nullable=True)
     video_url: Mapped[str | None] = mapped_column(String, nullable=True)
     doc_links: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    is_system: Mapped[bool] = mapped_column(Boolean, server_default=text("FALSE"), nullable=False)
+    # `is_system` lived here until 0098. It said "every account gets this
+    # plugin, automatically" — one cell of a WHO x CHOICE grid, wearing a
+    # name that described neither axis, and a second implementation of an
+    # idea `resource_grants` already had. It is now an ordinary grant:
+    # scope='everyone', requirement='required'.
     # Admin per-plugin disable for built-in plugins — instance-wide, distinct
     # from per-user opt-outs. Disabled plugins are filtered from the served feed.
     admin_disabled: Mapped[bool] = mapped_column(Boolean, server_default=text("FALSE"), nullable=False)

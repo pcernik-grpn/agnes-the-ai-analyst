@@ -51,6 +51,12 @@ class GrantSource:
 #: The Access page itself. The default for anything an admin does by hand.
 ACCESS_PAGE = "access_page"
 
+#: Written once, by migration 0098, for each plugin that carried
+#: ``marketplace_plugins.is_system``. Not a surface — but an admin meeting a
+#: required everyone-grant nobody typed deserves to be told where it came
+#: from, and a source-less row could only shrug.
+SYSTEM_PLUGIN_MIGRATION = "system_plugin_migration"
+
 GRANT_SOURCES: Dict[str, GrantSource] = {
     ACCESS_PAGE: GrantSource(
         key=ACCESS_PAGE,
@@ -59,19 +65,22 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
         href="",
         revocable=True,
     ),
-    "marketplace_required": GrantSource(
-        key="marketplace_required",
-        # The same words the switch on /admin/marketplaces wears. An admin who
-        # met "Automatic" on this page and "system" on that one was learning
-        # two names for one idea, which is the defect (#1956 items 13 + 14);
-        # a third name here would have re-introduced it in the fix.
-        label="Automatic for everyone",
-        surface="Marketplaces",
-        href="/admin/marketplaces",
-        revocable=False,
+    # `marketplace_required` lived here until 0098. It named the grant a
+    # switch on /admin/marketplaces produced, and said "not revocable here,
+    # go there instead". Both halves are gone: Marketplaces controls whether
+    # a plugin EXISTS on the instance, Access controls who gets it, and there
+    # is one writer of grants again. A stale row carrying the old key
+    # degrades to no badge through `describe`'s unknown-key path.
+    SYSTEM_PLUGIN_MIGRATION: GrantSource(
+        key=SYSTEM_PLUGIN_MIGRATION,
+        label="Was a system plugin",
+        surface="Access",
+        href="",
+        revocable=True,
         reason=(
-            "Every user gets this plugin without asking. It is set by one "
-            "switch on Marketplaces, not by a grant here."
+            "Converted from the old system-plugin mark when Everyone became "
+            "a scope. It reaches every account automatically, and unlike the "
+            "mark it did replace, you can change it here."
         ),
     ),
     "marketplace_sync": GrantSource(

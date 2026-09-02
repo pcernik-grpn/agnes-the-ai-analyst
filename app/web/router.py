@@ -812,7 +812,6 @@ def _config_proxy() -> type:
         # operator can flip these via env without an image rebuild.
         AGNES_GOOGLE_GROUP_PREFIX = os.environ.get("AGNES_GOOGLE_GROUP_PREFIX", "")
         AGNES_GROUP_ADMIN_EMAIL = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "")
-        AGNES_GROUP_EVERYONE_EMAIL = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "")
 
         @staticmethod
         def theme_overrides():
@@ -2480,7 +2479,6 @@ async def library_page(
         collection_visibility,
     )
     from app.services.journey import mark_journey
-    from src.db import SYSTEM_EVERYONE_GROUP
 
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
@@ -2526,15 +2524,20 @@ async def library_page(
     # verdict — resolving that with a visibility_for() call per row would
     # re-read every resource_grants row once per file.
     cft = ResourceType.CORPUS_FILE.value
+    from src.grant_scopes import EVERYONE_TARGET_ID, carrier_group_id, reaches_everyone
+
     try:
-        _everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-        _everyone_id = _everyone["id"] if _everyone else None
+        _carrier = carrier_group_id()
     except Exception:
-        _everyone_id = None
+        _carrier = None
+    # An everyone-scoped grant is recorded under the SENTINEL, not under its
+    # carrier group — same collapse `library_sharing.current_share_group_ids`
+    # makes, so `file_visibility` below is one set-membership test.
     file_shared_groups: dict = {}
     try:
         for g in resource_grants_repo().list_all(resource_type=cft):
-            file_shared_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+            key = EVERYONE_TARGET_ID if reaches_everyone(g, _carrier) else g["group_id"]
+            file_shared_groups.setdefault(g["resource_id"], set()).add(key)
     except Exception as e:
         logger.warning("/library: could not resolve per-file grants: %s", e)
 
@@ -2542,7 +2545,7 @@ async def library_page(
         groups = file_shared_groups.get(file_id)
         if not groups:
             return "private"
-        if _everyone_id and _everyone_id in groups:
+        if EVERYONE_TARGET_ID in groups:
             return "workspace"
         return "shared"
 
@@ -3326,11 +3329,13 @@ async def library_page(
             # (`curated_install` / `curated_uninstall`). The Library's toggle
             # is kind-agnostic — it POSTs/DELETEs whatever the row names.
             row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-            # Droppable unless an admin pinned it globally (`is_system`) or
-            # required-tier-granted it to one of the caller's groups. Those
-            # are precisely the two cases `curated_uninstall` answers 409
-            # to, so the lock promises exactly what the API enforces.
-            locked = bool(pl.get("is_system")) or g.requirement == "required"
+            # Droppable unless an audience the caller is in holds it at
+            # the required tier — which now covers the case a separate
+            # `is_system` check used to catch, because "automatic for
+            # everyone" is a required grant at `scope='everyone'`. That is
+            # precisely the case `curated_uninstall` answers 409 to, so the
+            # lock promises exactly what the API enforces.
+            locked = g.requirement == "required"
             # Same verb as a store entity, and for the same reason.
             row["stack_action"] = _AGENT_ADD
             row["stack_undo"] = _AGENT_REMOVE
@@ -3445,7 +3450,8 @@ async def library_page(
             _app_shared_groups: dict = {}
             try:
                 for g in resource_grants_repo().list_all(resource_type=ResourceType.DATA_APP.value):
-                    _app_shared_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+                    _key = EVERYONE_TARGET_ID if reaches_everyone(g, _carrier) else g["group_id"]
+                    _app_shared_groups.setdefault(g["resource_id"], set()).add(_key)
             except Exception as e:
                 logger.warning("/library: could not resolve data-app grants: %s", e)
 
@@ -3453,7 +3459,7 @@ async def library_page(
                 groups = _app_shared_groups.get(slug)
                 if not groups:
                     return "private", "Private"
-                if _everyone_id and _everyone_id in groups:
+                if EVERYONE_TARGET_ID in groups:
                     return "workspace", "Everyone"
                 return "shared", "Specific groups"
 

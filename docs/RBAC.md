@@ -100,9 +100,41 @@ Grants and agent scopes both answer "can this group/agent reach the table at all
 
 | Table | Purpose |
 |---|---|
-| `user_groups` | Named groups. Two rows seeded as `is_system=TRUE`: **Admin** (god mode) and **Everyone** (auto-membership at creation for every new user by default; Workspace-mirrored instead when `AGNES_GROUP_EVERYONE_EMAIL` is set — see [Group membership sources](#group-membership-sources)). |
+| `user_groups` | Named groups. Two rows seeded as `is_system=TRUE`: **Admin** (god mode) and **Everyone** (auto-membership at creation for every new user; it also carries every everyone-scoped grant — see `scope` below). |
 | `user_group_members` | `(user_id, group_id, source)`. `source ∈ {admin, google_sync, microsoft_sync, system_seed}` so each writer only manipulates its own rows — a sync's DELETE+INSERT never clobbers admin-added members or another provider's synced rows. `microsoft_sync` is config-gated and off by default — see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default). **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
-| `resource_grants` | `(group_id, resource_type, resource_id)`. The grant table the resolver hits when Admin short-circuit doesn't apply. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
+| `resource_grants` | `(group_id, resource_type, resource_id)`. The grant table the resolver hits when Admin short-circuit doesn't apply. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). **`0098`**: nullable `scope` — see below. |
+
+### `scope` — who a grant reaches (Postgres only, `0097`)
+
+- **NULL** — the members of `group_id`. Every grant written before `0098`.
+- **`'everyone'`** — every account on the instance, including one that
+  belongs to no group at all.
+
+An everyone-scoped row keeps a `group_id` (the column is NOT NULL) pointed at
+the **carrier**: the seeded `Everyone` group, resolved by
+`src.grant_scopes.carrier_group_id`. The carrier is forced by the writer, not
+chosen by the caller — `POST /api/admin/grants` overrides whatever `group_id`
+was sent when `scope` is given. Two reasons: `UNIQUE (group_id,
+resource_type, resource_id)` is what stops a resource collecting two
+everyone-grants, and identifying "reaches everyone" by the carrier is the one
+spelling that works on both backends.
+
+"Give this to everyone" is **withheld** — absent from the choice, and a 422
+if sent — for the four types where it is not a coherent audience
+(`grant_scopes.SCOPE_WITHHELD_TYPES`): `slack_channel`, `table`,
+`memory_domain`, `memory_item`. Each has its own reason; the constant
+documents them.
+
+**Postgres only**, like `resource_grants.source`. The DuckDB app-state ladder
+is frozen (A3), so that backend accepts `scope=` and drops it: the row is an
+ordinary grant on the carrier, which every account is auto-joined to at
+creation, so the same people are reached. The one case the backends answer
+differently is an account an admin has removed from that group. Reads that
+are ABOUT the column (`count_everyone_scoped`, `list_everyone_scoped`) raise
+`RequiresPostgresBackend` → 501 there rather than answering "nobody".
+
+`count_for_group` excludes everyone-scoped rows: the carrier holds them but
+does not decide their reach.
 
 `resource_type` is a string from the `app.resource_types.ResourceType` `StrEnum`. `resource_id` is a path string whose format is owned by the registering module — for `marketplace_plugin` it's `<marketplace_slug>/<plugin_name>`.
 
@@ -280,7 +312,7 @@ Members are added to groups by four sources, distinguished by the `source` colum
 - **`google_sync`** — written by the OAuth callback on every login. The previous Google-sync set is wholesale replaced (DELETE + INSERT) so a removed Workspace membership disappears immediately.
 - **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/memberOf` instead of the Workspace Admin SDK. Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
 - **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives either sync. Admin can only delete admin-source rows.
-- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
+- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs). Unconditional since `0098`: `AGNES_GROUP_EVERYONE_EMAIL` used to suppress it, and that mapping is now an ordinary group. The Everyone grant fires once, at creation time, and is never re-asserted afterward. Note that no admin path can undo it — `remove_member` takes `require_source='admin'`, so a `system_seed` row is not deletable through the UI/CLI/REST.
 
 Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a synced membership, the operator must change the upstream directory group instead (Workspace or Entra ID) — Agnes will pick up the change on the user's next login.
 

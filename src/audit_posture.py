@@ -403,13 +403,11 @@ POSTURE: dict[str, str] = {
     "POST /api/marketplace/curated/{marketplace_id}/{plugin_name}/install": "marketplace.curated.install",
     # -- app.api.marketplaces --------------------------------------------------
     "DELETE /api/marketplaces/{marketplace_id}": "marketplace.delete",
-    "DELETE /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system": "marketplace.plugin.unmark_system",
     "PATCH /api/marketplaces/{marketplace_id}": "marketplace.update",
     "POST /api/marketplaces": "marketplace.create",
     "POST /api/marketplaces/sync-all": "marketplace.sync_all",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable": "marketplace.plugin.disable",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/enable": "marketplace.plugin.enable",
-    "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system": "marketplace.plugin.mark_system",
     "POST /api/marketplaces/{marketplace_id}/sync": "marketplace.sync",
     # -- app.api.mcp_builder ---------------------------------------------------
     "POST /api/admin/mcp-sources/builder/turn": "mcp_source.builder_turn",

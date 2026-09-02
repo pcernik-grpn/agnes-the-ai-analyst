@@ -352,19 +352,35 @@ def test_shared_agent_becomes_readable_but_not_writable(seeded_app):
 
 
 def test_share_targets_include_everyone(seeded_app):
+    """Everyone is offered, and its ``id`` is the SENTINEL rather than a
+    group's uuid.
+
+    It used to be the seeded ``Everyone`` group's id, which is why "share
+    with everyone" reached whoever that group happened to hold. The
+    ``is_everyone`` flag was already here — the surfaces never treated it as
+    an ordinary group — so what changed is the id beside it, not the shape.
+    """
+    from src.grant_scopes import EVERYONE_TARGET_ID
+
     r = seeded_app["client"].get("/api/sharing/groups", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
     targets = r.json()
-    assert targets, "expected at least the Everyone group"
+    assert targets, "expected at least the everyone target"
     everyone = [t for t in targets if t["is_everyone"]]
     assert len(everyone) == 1
     assert "workspace" in everyone[0]["name"].lower()
+    assert everyone[0]["id"] == EVERYONE_TARGET_ID
+
+    # And the seeded group is NOT offered a second time as an ordinary
+    # audience: it survives as the carrier an everyone-grant is stored on,
+    # so listing it would offer the same reach twice under two names.
+    assert "Everyone" not in [t["name"] for t in targets if not t["is_everyone"]]
 
 
 def test_collection_share_cycles_private_shared_workspace(seeded_app):
     """The three visibility states are reachable and reversible through one
     idempotent PUT, for the artefact kind."""
-    from src.db import SYSTEM_EVERYONE_GROUP
+    from src.grant_scopes import EVERYONE_TARGET_ID
 
     c = seeded_app["client"]
     tok = seeded_app["admin_token"]
@@ -376,9 +392,17 @@ def test_collection_share_cycles_private_shared_workspace(seeded_app):
     r = c.put(f"/api/sharing/collection/{col['id']}", json={"group_ids": [gid]}, headers=_auth(tok))
     assert r.json()["visibility"] == "shared"
 
-    everyone = _bare_group(SYSTEM_EVERYONE_GROUP)
-    r = c.put(f"/api/sharing/collection/{col['id']}", json={"group_ids": [everyone]}, headers=_auth(tok))
+    # The sentinel, not a group id — sending the carrier group's uuid is
+    # refused as `group_not_shareable`, which is the point of the change.
+    r = c.put(
+        f"/api/sharing/collection/{col['id']}",
+        json={"group_ids": [EVERYONE_TARGET_ID]},
+        headers=_auth(tok),
+    )
     assert r.json()["visibility"] == "workspace"
+    assert r.json()["group_ids"] == [EVERYONE_TARGET_ID], (
+        "the sentinel must round-trip, not be reported back as its carrier group"
+    )
 
     # Empty list = private again.
     r = c.put(f"/api/sharing/collection/{col['id']}", json={"group_ids": []}, headers=_auth(tok))

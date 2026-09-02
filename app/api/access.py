@@ -27,6 +27,9 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType, list_resource_types
+from src.grant_scopes import carrier_group_id
+from src.grant_scopes import normalize as normalize_scope
+from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
 from src.repositories.user_groups import SystemGroupProtected
 
@@ -95,26 +98,28 @@ def _sync_managed_reason(g: dict) -> Optional[tuple]:
        callback for a prefix-matching Workspace group, ``name`` is the
        full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
        <scope>`` groups the ``sharepoint-acl-sync`` job creates).
-    2. Google only: ``is_system=TRUE`` AND the group's name matches the
-       env-configured admin/everyone Workspace email — the OAuth callback
-       routes memberships from those Workspace groups into the seeded
-       system row instead of creating a separate ``user_groups`` row, so
-       the system row effectively *becomes* a Google-synced row in this
-       deployment. Without the env mapping, system groups stay regular
-       admin-managed rows (renaming Admin is still blocked separately by
+    2. Google only: ``is_system=TRUE`` AND the group's name matches
+       ``AGNES_GROUP_ADMIN_EMAIL`` — the OAuth callback routes memberships
+       from that Workspace group into the seeded ``Admin`` row instead of
+       creating a separate ``user_groups`` row, so the system row
+       effectively *becomes* a Google-synced row in this deployment.
+       Without the env mapping, system groups stay regular admin-managed
+       rows (renaming Admin is still blocked separately by
        ``UserGroupsRepository`` for code-reference safety).
+
+       ``Everyone`` had the same branch until 0098, keyed on
+       ``AGNES_GROUP_EVERYONE_EMAIL``. That mapping is now an ordinary
+       synced group of its own, which reaches this function through path 1
+       like every other one.
     """
     created_by = g.get("created_by") or ""
     if created_by in _SYNC_MANAGED_SENTINELS:
         return _SYNC_MANAGED_SENTINELS[created_by]
     if g.get("is_system"):
-        from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+        from src.db import SYSTEM_ADMIN_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip().lower()
-        everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip().lower()
         if admin_email and g.get("name") == SYSTEM_ADMIN_GROUP:
-            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
-        if everyone_email and g.get("name") == SYSTEM_EVERYONE_GROUP:
             return _SYNC_MANAGED_SENTINELS["system:google-sync"]
     return None
 
@@ -262,43 +267,19 @@ async def access_overview(
         )
 
     # ── Grants this page did NOT make and cannot unmake ──────────────────
-    # `assigned_by` answers WHO, which is the half that was already here. It
-    # cannot answer WHERE: marking a plugin Required on /admin/marketplaces
-    # fans a grant out to every group, and each one records the admin who
-    # clicked as its author — so seven machine-written rows read exactly like
-    # seven rows an admin typed on this page, and the Revoke this page offers
-    # on them fails with 409 `cannot_revoke_system_grant`.
+    # `assigned_by` answers WHO wrote a grant; `source` (migration 0096)
+    # answers WHERE it was written, which is a different question whenever a
+    # machine writes rows on an admin's behalf.
     #
-    # One set lookup answers it for the case that exists today. This is
-    # deliberately NOT a general provenance column — that would need a schema
-    # change and would have to cover the other nine surfaces that write grants
-    # (see the design note in the companion PR). This is the one
-    # externally-owned grant kind the product currently has, named where the
-    # page can act on it.
-    try:
-        from src.repositories import marketplace_plugins_repo
-
-        _system_plugin_ids = {f"{mid}/{name}" for mid, name in marketplace_plugins_repo().list_system_keys()}
-    except Exception as e:  # a badge must never take the overview down
-        logger.warning("access-overview: could not resolve system plugins: %s", e)
-        _system_plugin_ids = set()
-
-    def _managed_by(resource_type: str, resource_id: str, source: str | None):
-        """The surface that owns this grant, when it is not this page.
-
-        Two paths, and the order matters. `source` is the RECORDED answer
-        (migration 0095) and wins when present. The plugin lookup below is the
-        DERIVED one, kept for the two cases the column cannot cover: a row
-        written before it existed, and any row on a DuckDB instance, where the
-        column does not exist at all. Both of those are real and neither is a
-        migration away — one is history, the other is the frozen ladder.
-        """
-        described = describe_grant_source(source)
-        if described is not None:
-            return described
-        if resource_type == ResourceType.MARKETPLACE_PLUGIN.value and resource_id in _system_plugin_ids:
-            return describe_grant_source("marketplace_required")
-        return None
+    # ONE path now. There used to be a second, derived one: a set of
+    # `is_system` plugin ids, consulted for rows that predated the column and
+    # for every row on a DuckDB instance. Both were only ever needed because
+    # a flag on the plugin decided reach without any grant row saying so.
+    # 0098 deleted the flag, so a marketplace_plugin grant is a grant, and
+    # what it says about itself is the whole answer.
+    def _managed_by(source: str | None):
+        """The surface that owns this grant, when it is not this page."""
+        return describe_grant_source(source)
 
     grants = [
         {
@@ -325,52 +306,24 @@ async def access_overview(
             # before. Non-null means: another surface owns this, do not offer a
             # control here that will fail.
             "source": r.get("source"),
-            "managed_by": _managed_by(r["resource_type"], r["resource_id"], r.get("source")),
+            "managed_by": _managed_by(r.get("source")),
+            # WHO the grant reaches. NULL/absent means the members of
+            # `group_id`; 'everyone' means every account, and `group_id` is
+            # then a carrier the page must not attribute the grant to.
+            "scope": r.get("scope"),
         }
         for r in grants_repo.list_all()
     ]
 
-    # Plugins that are Automatic for everyone reach every group WITHOUT a
-    # grant row: /admin/marketplaces records one flag and the serve path
-    # resolves it, rather than writing a permission into each group.
-    #
-    # This page is built entirely from `grants`, so left alone it would show a
-    # plugin every user has as held by nobody — not a missing row but the
-    # opposite of the truth, stated confidently, on the page whose whole job
-    # is answering "who can reach what". So the rows are synthesized here,
-    # once, server-side: every view (by group, by resource, by person) reads
-    # this same list, and a client-side fix would have had to be repeated in
-    # each of them.
-    #
-    # They carry the same `managed_by` the real rows get, so they render
-    # through the existing manage cell — named, not revocable here, pointing
-    # at the surface that owns them. `id` is None because there is nothing to
-    # revoke; nothing offers a control for a managed row.
-    if _system_plugin_ids:
-        _held = {(g["group_id"], g["resource_id"]) for g in grants
-                 if g["resource_type"] == ResourceType.MARKETPLACE_PLUGIN.value}
-        _managed = describe_grant_source("marketplace_required")
-        for _g in groups_rows:
-            for _rid in sorted(_system_plugin_ids):
-                if (_g["id"], _rid) in _held:
-                    # A hand-set grant already covers this pair. It is real and
-                    # revocable, so it keeps its own row rather than being
-                    # replaced by a derived one — and it already resolves the
-                    # same `managed_by` through `_managed_by` above.
-                    continue
-                grants.append(
-                    {
-                        "id": None,
-                        "group_id": _g["id"],
-                        "resource_type": ResourceType.MARKETPLACE_PLUGIN.value,
-                        "resource_id": _rid,
-                        # It IS the Automatic tier — that is what the flag means.
-                        "requirement": "required",
-                        "assigned_by": None,
-                        "source": "marketplace_required",
-                        "managed_by": _managed,
-                    }
-                )
+    # A block of SYNTHESIZED rows lived here — one per (group, system
+    # plugin) pair, because a plugin flagged `is_system` reached every group
+    # without any grant row saying so, and a page built entirely from grants
+    # would otherwise have shown a plugin every user has as held by nobody.
+    # 0098 removed the need: the flag is one real everyone-scoped grant, in
+    # the list like everything else. What the page owes the reader now is
+    # rendering `scope` as an audience instead of attributing the row to its
+    # carrier group — that is the Access page's own work, not this
+    # projection's.
 
     # Per-resource-type hierarchies. Driven by the registry in
     # app.resource_types — adding a new type there is the one place that
@@ -471,9 +424,10 @@ class UpdateGroupRequest(BaseModel):
 def _derive_origin(g: dict) -> str:
     """Project a 3-value origin tag from existing user_groups columns.
 
-    - mapped via ``AGNES_GROUP_{ADMIN,EVERYONE}_EMAIL`` → 'google_sync'
+    - ``Admin`` mapped via ``AGNES_GROUP_ADMIN_EMAIL`` → 'google_sync'
       (the seed badge is suppressed when the row is wired to Workspace —
-      Workspace is the authoritative source of membership)
+      Workspace is the authoritative source of membership). ``Everyone``
+      had the same mapping until 0098; it is now an ordinary synced group.
     - ``is_system=TRUE`` (otherwise)                   → 'system'
     - ``created_by`` starts with 'system:google'       → 'google_sync'
     - other ``system:`` prefixed creator               → 'system'
@@ -486,11 +440,10 @@ def _derive_origin(g: dict) -> str:
     cb = g.get("created_by") or ""
     name = g.get("name") or ""
     if is_system:
-        from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+        from src.db import SYSTEM_ADMIN_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip()
-        everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip()
-        if (admin_email and name == SYSTEM_ADMIN_GROUP) or (everyone_email and name == SYSTEM_EVERYONE_GROUP):
+        if admin_email and name == SYSTEM_ADMIN_GROUP:
             return "google_sync"
         return "system"
     if cb.startswith("system:google"):
@@ -503,21 +456,19 @@ def _derive_origin(g: dict) -> str:
 def _mapped_email(g: dict) -> Optional[str]:
     """The Workspace group email that funnels members into a system row.
 
-    Only returns a value when the row is the seeded ``Admin`` / ``Everyone``
-    system group AND the matching env var is configured. Null otherwise —
-    regular google_sync rows already carry the email in ``name``, and
-    unmapped system rows have nothing to show.
+    Only returns a value when the row is the seeded ``Admin`` system group
+    AND ``AGNES_GROUP_ADMIN_EMAIL`` is configured. Null otherwise — regular
+    google_sync rows already carry the email in ``name``, and unmapped
+    system rows have nothing to show. ``Everyone`` was the second case
+    until 0098, and is now an ordinary synced group whose ``name`` IS the
+    email.
     """
     if not g.get("is_system"):
         return None
-    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+    from src.db import SYSTEM_ADMIN_GROUP
 
-    name = g.get("name")
-    if name == SYSTEM_ADMIN_GROUP:
+    if g.get("name") == SYSTEM_ADMIN_GROUP:
         v = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip()
-        return v or None
-    if name == SYSTEM_EVERYONE_GROUP:
-        v = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip()
         return v or None
     return None
 
@@ -859,9 +810,17 @@ class GrantResponse(BaseModel):
     # v49: 'available' | 'required' — Required tier is in-stack by default
     # for every group member without an explicit subscription.
     requirement: str = "available"
+    # WHO the grant reaches: null for the members of `group_id`, 'everyone'
+    # for every account. When set, `group_id`/`group_name` name the CARRIER
+    # row the scope is stored on and must not be read as the audience.
+    scope: Optional[str] = None
 
 
 class CreateGrantRequest(BaseModel):
+    # The audience, when the audience is a group. An everyone-scoped grant
+    # still needs one — the column is NOT NULL — and a caller that does not
+    # care which may send the carrier id from `GET /api/admin/groups`; see
+    # `src.grant_scopes.carrier_group_id`.
     group_id: str
     resource_type: str
     resource_id: str
@@ -875,6 +834,14 @@ class CreateGrantRequest(BaseModel):
     # silently failed. Default kept at None so callers that don't
     # explicitly pass a value still land at DB's column default.
     requirement: Optional[str] = None
+    # ``'everyone'`` makes this grant reach every account rather than the
+    # members of ``group_id``. This is the ONE writer of that state — an
+    # admin used to reach it by marking a plugin "system" on
+    # /admin/marketplaces, which was a second writer of distribution with
+    # its own vocabulary, and applied to plugins only. Withheld for the four
+    # types where "everyone" is not a coherent audience
+    # (``grant_scopes.SCOPE_WITHHELD_TYPES``).
+    scope: Optional[str] = None
 
 
 def _grant_to_response(g: dict) -> GrantResponse:
@@ -887,6 +854,7 @@ def _grant_to_response(g: dict) -> GrantResponse:
         assigned_at=str(g["assigned_at"]) if g.get("assigned_at") else None,
         assigned_by=g.get("assigned_by"),
         requirement=g.get("requirement") or "available",
+        scope=g.get("scope"),
     )
 
 
@@ -943,17 +911,53 @@ async def create_grant(
         )
     if payload.requirement == "required":
         _reject_required_on_user_published(rt, payload.resource_id)
+    # Scope, validated here for the same reason as `requirement`: a 422 that
+    # matches the endpoint contract beats a ValueError leaking from the repo.
+    try:
+        scope = normalize_scope(payload.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if scope is not None and not takes_everyone_scope(rt.value):
+        # Absent, not disabled — the choice does not exist for these types,
+        # each for its own reason (see SCOPE_WITHHELD_TYPES). Accepting it
+        # would store a claim no read path can honour.
+        raise HTTPException(
+            status_code=422,
+            detail=f"resource_type {rt.value!r} does not take an everyone scope",
+        )
+    group_id = payload.group_id
+    if scope is not None:
+        # The CARRIER is an invariant, not the caller's choice. `group_id` is
+        # NOT NULL and means nothing on an everyone-scoped row, so whatever
+        # the caller sent is overridden with the one carrier every such row
+        # uses. Two reasons it has to be forced rather than trusted:
+        #
+        #   - UNIQUE (group_id, resource_type, resource_id) is what stops a
+        #     resource collecting two everyone-grants. Let callers pick the
+        #     group and the index guards nothing.
+        #   - `reports._NOT_SYSTEM` identifies "reaches every account" by the
+        #     carrier, which is the ONE spelling that works on both backends
+        #     (the frozen DuckDB ladder has no `scope` column). A row on some
+        #     other group would be invisible to it.
+        carrier = carrier_group_id()
+        if carrier is None:
+            raise HTTPException(
+                status_code=409,
+                detail="everyone_carrier_group_missing",
+            )
+        group_id = carrier
     try:
         grant_id = grants.create(
             # This page IS the source. Recorded rather than left NULL: "an
             # admin did this here" and "nobody wrote down where this came
             # from" are different facts, and only one of them is reassuring.
             source=ACCESS_PAGE,
-            group_id=payload.group_id,
+            group_id=group_id,
             resource_type=rt.value,
             resource_id=payload.resource_id,
             assigned_by=user.get("email"),
             requirement=payload.requirement,
+            scope=scope,
         )
     except (duckdb.ConstraintException, sa_exc.IntegrityError):
         # Both backends must surface a duplicate as the same 409 — on
@@ -966,16 +970,19 @@ async def create_grant(
             detail="Grant already exists for this group/resource_type/resource_id",
         )
     if payload.requirement == "required":
-        _fanout_required_store_entity(rt, payload.group_id, payload.resource_id)
+        _fanout_required_store_entity(rt, group_id, payload.resource_id)
     _audit(
         conn,
         user["id"],
         "resource_grant.created",
         f"grant:{grant_id}",
         {
-            "group_id": payload.group_id,
+            "group_id": group_id,
             "resource_type": rt.value,
             "resource_id": payload.resource_id,
+            # An instance-wide grant is exactly the audit row an operator
+            # goes looking for later, so the audience is part of it.
+            "scope": scope,
         },
     )
     # Re-read with the group name joined for the response.

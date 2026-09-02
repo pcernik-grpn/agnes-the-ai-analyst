@@ -15,7 +15,7 @@ from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db
 from app.auth.token_hash import hash_token
 from src.audit_helpers import log_safe
-from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+from src.db import SYSTEM_ADMIN_GROUP
 from src.user_identity import normalize_email
 
 from src.repositories import (
@@ -166,10 +166,12 @@ def _is_sso_user(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None)
          callback auto-created this group from a Workspace claim, OR
       2. the group is the seeded ``Admin`` system row AND
          ``AGNES_GROUP_ADMIN_EMAIL`` is set (env-mapped to a Workspace
-         admin group), OR
-      3. the group is the seeded ``Everyone`` system row AND
-         ``AGNES_GROUP_EVERYONE_EMAIL`` is set (env-mapped to a Workspace
-         everyone group).
+         admin group).
+
+    There was a third case for the seeded ``Everyone`` row under
+    ``AGNES_GROUP_EVERYONE_EMAIL``. 0098 converted that mapping into an
+    ordinary group whose ``created_by`` is ``'system:google-sync'``, so the
+    same users are still detected — through case 1, where they belonged.
 
     Users with no groups, or only admin-created custom groups, are NOT
     SSO users — local accounts are unaffected.
@@ -181,7 +183,6 @@ def _is_sso_user(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None)
     if not rows:
         return False
     admin_mapped = bool(os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip())
-    everyone_mapped = bool(os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip())
     for _row in rows:
         name = _row["name"]
         is_system = _row["is_system"]
@@ -192,20 +193,17 @@ def _is_sso_user(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None)
             # the individual membership was created — the group itself
             # only exists because of Google sync.
             return True
-        # System-group branches (Admin / Everyone): the group accepts
-        # memberships from MULTIPLE sources (system_seed for v13 backfill,
-        # admin for manual adds, google_sync from OAuth callback). The
-        # group being env-mapped to Workspace tells us SSO is *configured*,
-        # but only memberships whose source is 'google_sync' are actually
-        # owned by the upstream IdP. system_seed / admin memberships in
-        # the same group are local-only and must stay locally manageable.
-        # (Devin BUG_0002 on PR #142: without this check, the v13 migration's
-        # blanket Everyone backfill flips every local user to SSO the moment
-        # AGNES_GROUP_EVERYONE_EMAIL is set, locking admins out of password
-        # reset / delete on accounts the IdP doesn't actually own.)
+        # System-group branch (Admin): the group accepts memberships from
+        # MULTIPLE sources (system_seed for the seed admin, admin for manual
+        # adds, google_sync from the OAuth callback). The group being
+        # env-mapped to Workspace tells us SSO is *configured*, but only
+        # memberships whose source is 'google_sync' are actually owned by the
+        # upstream IdP. system_seed / admin memberships in the same group are
+        # local-only and must stay locally manageable. (Devin BUG_0002 on
+        # PR #142: without this check, a blanket backfill flips every local
+        # user to SSO the moment the mapping is set, locking admins out of
+        # password reset / delete on accounts the IdP doesn't actually own.)
         if is_system and name == SYSTEM_ADMIN_GROUP and admin_mapped and source == "google_sync":
-            return True
-        if is_system and name == SYSTEM_EVERYONE_GROUP and everyone_mapped and source == "google_sync":
             return True
     return False
 
@@ -362,9 +360,9 @@ async def create_user(
     user_id = str(uuid.uuid4())
     repo.create(id=user_id, email=email, name=payload.name)
     # New users are auto-granted the Everyone system group at creation
-    # (source='system_seed', issue #748) unless AGNES_GROUP_EVERYONE_EMAIL
-    # maps Everyone to a Workspace group instead. Admin promotion (Admin
-    # group) remains an explicit follow-up step (POST
+    # (source='system_seed', issue #748). Unconditional since 0098 — the
+    # Workspace mapping that used to suppress it is an ordinary group now.
+    # Admin promotion (Admin group) remains an explicit follow-up step (POST
     # /api/admin/users/{id}/memberships with the Admin group_id, or
     # POST /api/admin/groups/{admin_id}/members).
     try:

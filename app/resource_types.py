@@ -212,12 +212,11 @@ def _marketplace_plugin_blocks() -> list[Block]:
                 "category": p.get("category"),
                 "description": p.get("description"),
                 "source_type": p.get("source_type"),
-                # v39: drives the SYSTEM pill + disabled checkbox in
-                # /admin/access. The grant row exists for every group on a
-                # system plugin (materialized by mark_system) — we just
-                # prevent admins from revoking it via the UI to keep the
-                # mandatory-tier semantic honest.
-                "is_system": bool(p.get("is_system")),
+                # `is_system` rode this projection until 0098, driving a
+                # SYSTEM pill and a disabled checkbox on /admin/access. The
+                # flag is now an ordinary everyone-scoped required grant, so
+                # the page reads reach from the grant like it does for every
+                # other resource type instead of from a per-item flag.
             }
         )
     return list(blocks.values())

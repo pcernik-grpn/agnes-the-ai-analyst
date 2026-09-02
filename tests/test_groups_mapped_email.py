@@ -76,7 +76,18 @@ def test_admin_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatch):
     assert admin["is_google_managed"] is True
 
 
-def test_everyone_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatch):
+def test_everyone_row_stays_a_plain_system_row_with_the_legacy_env_set(fresh_db, monkeypatch):
+    """The seeded ``Everyone`` row no longer wears a Workspace address.
+
+    It reported ``origin='google_sync'`` and the configured
+    ``mapped_email`` while ``AGNES_GROUP_EVERYONE_EMAIL`` was set, because
+    the row genuinely WAS that Workspace group's membership — which is what
+    made "everyone" a subset. 0098 gave the Workspace group a group of its
+    own (whose ``name`` IS the email, so it needs no ``mapped_email``), and
+    ``Everyone`` went back to being an ordinary system row meaning every
+    account. ``AGNES_GROUP_ADMIN_EMAIL`` is untouched — ``Admin`` is a
+    capability, not an audience, and mapping it narrows nothing.
+    """
     monkeypatch.setenv("AGNES_GROUP_EVERYONE_EMAIL", "everyone@workspace.test")
     from app.main import app
 
@@ -85,9 +96,9 @@ def test_everyone_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatc
     groups = _groups_by_name(client, token)
     everyone = groups["Everyone"]
 
-    assert everyone["origin"] == "google_sync"
-    assert everyone["mapped_email"] == "everyone@workspace.test"
-    assert everyone["is_google_managed"] is True
+    assert everyone["origin"] == "system"
+    assert everyone["mapped_email"] is None
+    assert everyone["is_google_managed"] is False
 
 
 def test_admin_row_is_plain_system_without_env_mapping(fresh_db):

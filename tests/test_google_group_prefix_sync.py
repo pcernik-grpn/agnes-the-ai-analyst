@@ -297,7 +297,12 @@ class TestSystemMapping:
         finally:
             conn.close()
 
-    def test_everyone_email_routes_to_seeded_everyone_row(self, google_callback_env):
+    def test_the_everyone_email_becomes_an_ordinary_synced_group(self, google_callback_env):
+        """It used to be routed INTO the seeded ``Everyone`` row, which is what
+        made "everyone" mean a subset of the instance on a mirrored
+        deployment. Since 0098 the address takes the ordinary path: a group
+        named after the Workspace email, created by the sync like any other,
+        while ``Everyone`` keeps meaning every account."""
         env = google_callback_env
         env["monkeypatch"].setenv("AGNES_GOOGLE_GROUP_PREFIX", "grp_acme_")
         env["monkeypatch"].setenv("AGNES_GROUP_EVERYONE_EMAIL", "grp_acme_everyone@example.com")
@@ -319,32 +324,32 @@ class TestSystemMapping:
             )
 
             ug = UserGroupsRepository(conn)
-            assert ug.get_by_name("grp_acme_everyone@example.com") is None
-
-            everyone_row = ug.get_by_name("Everyone")
-            assert everyone_row is not None
-            assert everyone_row["is_system"] is True
+            mirrored = ug.get_by_name("grp_acme_everyone@example.com")
+            assert mirrored is not None, "the Workspace group got no group of its own"
+            assert mirrored["created_by"] == "system:google-sync"
+            assert not mirrored["is_system"], "it is an ordinary audience, not a system row"
 
             user = UserRepository(conn).get_by_email("tester@example.com")
             group_ids = UserGroupMembersRepository(conn).list_groups_for_user(user["id"])
-            assert everyone_row["id"] in group_ids
+            assert mirrored["id"] in group_ids, "the sync did not write the membership"
         finally:
             conn.close()
 
-    def test_everyone_email_set_first_signin_has_no_system_seed_row(self, google_callback_env):
-        """Issue #748 dual-mode, Workspace-controlled half: when
-        AGNES_GROUP_EVERYONE_EMAIL is set, a brand-new user's Everyone
-        membership must come ONLY from google_sync (the row asserted in
-        test_everyone_email_routes_to_seeded_everyone_row above) — the
-        auto-grant-at-creation helper (app.auth.group_sync.ensure_everyone_membership)
-        must no-op and NOT add a competing system_seed row.
+    def test_a_first_signin_joins_everyone_even_with_the_legacy_env_set(self, google_callback_env):
+        """The inverse of what issue #748 asserted, and deliberately so.
+
+        With ``AGNES_GROUP_EVERYONE_EMAIL`` set, the auto-grant used to no-op
+        so it would not write a ``system_seed`` row competing with the
+        Workspace-owned membership of the same seeded group. Nothing mirrors
+        ``Everyone`` any more, so there is no competition and no reason to
+        withhold the row — and withholding it on a stale env value would
+        leave the account outside the audience every default is written for.
         """
         env = google_callback_env
         env["monkeypatch"].setenv("AGNES_GROUP_EVERYONE_EMAIL", "grp_acme_everyone@example.com")
         # No prefix and no matching group in the fetch — isolates the
-        # creation-time helper from the google_sync write path entirely,
-        # so any Everyone row found afterward must have come from the
-        # (should-be-skipped) auto-grant helper.
+        # creation-time helper from the google_sync write path entirely, so
+        # any Everyone row found afterward must have come from the auto-grant.
         _set_fetch(env["monkeypatch"], ["unrelated@example.com"])
 
         env["client"].get("/auth/google/callback?code=x&state=y")
@@ -361,8 +366,8 @@ class TestSystemMapping:
             assert user is not None
             everyone_row = UserGroupsRepository(conn).get_by_name("Everyone")
             group_ids = UserGroupMembersRepository(conn).list_groups_for_user(user["id"])
-            assert everyone_row["id"] not in group_ids, (
-                "ensure_everyone_membership must no-op when AGNES_GROUP_EVERYONE_EMAIL is set"
+            assert everyone_row["id"] in group_ids, (
+                "the legacy env var must no longer suppress the Everyone auto-grant"
             )
         finally:
             conn.close()
