@@ -160,6 +160,13 @@ SEARCH_MAX_CHARS_ENV = "AGNES_MCP_SEARCH_MAX_CHARS"
 #: follow-up call depends on, and is never touched.
 SEARCH_TEXT_FIELDS: tuple[str, ...] = ("text", "snippet", "description", "definition", "content")
 
+#: Top-level prose the search endpoints echo back — the caller's own query
+#: (unbounded: a pasted paragraph is a legal query), and the empty-result
+#: ``hint`` / offline ``note``. Capped alongside the hit fields, or a long
+#: query alone could keep the response over budget after every hit was
+#: dropped (Devin Review on #2046).
+SEARCH_ENVELOPE_FIELDS: tuple[str, ...] = ("query", "hint", "note")
+
 #: A prose field is never cut below this. Once every field is at the floor and
 #: the response still does not fit, whole hits are dropped from the tail
 #: instead — ten unreadable stubs are worth less than five readable prefixes.
@@ -223,6 +230,15 @@ def _apply_cap(hits: list[Any], cap: int) -> list[Any]:
     return out
 
 
+def _cap_envelope(payload: dict, cap: int) -> dict:
+    """The payload with its own prose fields (:data:`SEARCH_ENVELOPE_FIELDS`)
+    cut to ``cap`` and listed in a top-level ``truncated_fields``."""
+    fields = [f for f in SEARCH_ENVELOPE_FIELDS if isinstance(payload.get(f), str) and len(payload[f]) > cap]
+    if not fields:
+        return payload
+    return {**payload, **{f: _shorten(payload[f], cap) for f in fields}, "truncated_fields": fields}
+
+
 def _with_results(payload: dict, tool_name: str, hits: list[Any], *, total: int, budget: int) -> dict:
     shortened = sum(1 for h in hits if isinstance(h, dict) and h.get("truncated_fields"))
     dropped = total - len(hits)
@@ -233,6 +249,8 @@ def _with_results(payload: dict, tool_name: str, hits: list[Any], *, total: int,
         )
     if dropped:
         what.append(f"{dropped} lower-ranked result(s) of {total} were dropped")
+    if payload.get("truncated_fields"):
+        what.append(f"the response's own {', '.join(payload['truncated_fields'])} field(s) were shortened")
     note = (
         f"{tool_name}: {'; '.join(what)} to fit the {budget:,}-character tool output budget. "
         "To read a shortened document chunk in full, call "
@@ -270,9 +288,17 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
     ``…``, and the payload carries ``truncated: true`` plus a
     ``truncated_note`` saying what was cut and how to read the rest.
 
-    Only ``payload["results"]`` (a list) is compacted; anything else — the
-    empty-result ``hint``, ``retrieval``, counts — is small by construction
-    and passes through. A ``budget`` of ``0`` disables the compaction.
+    Compacted: ``payload["results"]`` (a list) and the payload's own prose
+    fields (:data:`SEARCH_ENVELOPE_FIELDS` — the echoed query, the
+    empty-result ``hint``, the offline ``note``), which take part in the same
+    cap search so a paragraph-long query cannot keep the response over
+    budget on its own; anything else (``retrieval``, counts) is small by
+    construction and passes through. When even an empty result list with
+    every prose field at the floor does not fit, the budget is smaller than
+    the response envelope itself — a misconfiguration — and the return is a
+    minimal note saying so (naming the knob) rather than an oversized
+    payload the client would refuse. A ``budget`` of ``0`` disables the
+    compaction.
     """
     effective = search_max_chars() if budget is None else budget
     if effective <= 0 or not isinstance(payload, dict):
@@ -285,7 +311,9 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
     total = len(hits)
 
     def _candidate(kept: list[Any], cap: int) -> dict:
-        return _with_results(payload, tool_name, _apply_cap(kept, cap), total=total, budget=effective)
+        return _with_results(
+            _cap_envelope(payload, cap), tool_name, _apply_cap(kept, cap), total=total, budget=effective
+        )
 
     def _fits(candidate: dict) -> bool:
         return wire_size(candidate) <= effective
@@ -300,6 +328,7 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
     # longest field — is the untouched payload, already known not to fit.
     lengths = sorted(
         {len(h[f]) for h in hits if isinstance(h, dict) for f in SEARCH_TEXT_FIELDS if isinstance(h.get(f), str)}
+        | {len(payload[f]) for f in SEARCH_ENVELOPE_FIELDS if isinstance(payload.get(f), str)}
     )
     bounds = [SEARCH_TEXT_FLOOR] + [n for n in lengths if n > SEARCH_TEXT_FLOOR]
     for j in range(len(bounds) - 2, -1, -1):
@@ -322,9 +351,19 @@ def compact_search_results(payload: Any, tool_name: str, *, budget: int | None =
         candidate = _candidate(kept, SEARCH_TEXT_FLOOR)
         if _fits(candidate):
             return candidate
-    # Even an empty result list does not fit: the budget is smaller than the
-    # envelope itself. Return the honest shape anyway — the note says why.
-    return candidate
+    # Even an empty result list with every prose field at the floor does not
+    # fit: the budget is smaller than the response envelope itself. Returning
+    # the oversized shape would recreate the client's refusal this helper
+    # exists to prevent, so answer with the smallest honest thing — what
+    # happened and which knob fixes it (Devin Review on #2046).
+    return {
+        "results": [],
+        "truncated": True,
+        "truncated_note": (
+            f"{tool_name}: {total} result(s) withheld — the {effective:,}-character tool output budget "
+            f"({SEARCH_MAX_CHARS_ENV}) is smaller than the response envelope itself; raise it."
+        ),
+    }
 
 
 def summarize_docstring(doc: str | None) -> tuple[str, bool]:

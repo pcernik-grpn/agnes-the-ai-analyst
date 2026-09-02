@@ -389,6 +389,55 @@ class TestCompactSearchResults:
         payload = {"query": "q", "results": [], "retrieval": "hybrid", "searched_collections": 3, "hint": hint}
         assert compact_search_results(payload, "knowledge_search", budget=20_000) is payload
 
+    def test_a_paragraph_long_query_is_shortened_and_the_hits_survive(self):
+        """Devin Review on #2046: both endpoints echo the caller's query with
+        no maximum length, so a pasted paragraph could keep the response over
+        budget after every hit was dropped. The query takes part in the same
+        cap search as the hit text — and the hits, which are the answer, are
+        kept."""
+        payload = _incident_payload(3)
+        payload["query"] = "kůň " * 8_000  # 32k chars, on its own over the budget
+        out = compact_search_results(payload, "knowledge_search")
+        assert wire_size(out) <= DEFAULT_SEARCH_MAX_CHARS
+        assert len(out["results"]) == 3
+        assert out["truncated_fields"] == ["query"]
+        assert out["query"].endswith("…") and len(out["query"]) < 32_000
+        assert "response's own query field(s) were shortened" in out["truncated_note"]
+        # The hits were cut only as far as the shared cap required, not dropped.
+        assert all(h["corpus_id"] == "col_0123456789abcdef" for h in out["results"])
+
+    def test_empty_results_with_an_oversized_query_still_fit(self, monkeypatch):
+        """An empty result also echoes the query, plus the long empty-result
+        hint — both are envelope text and both come under the cap. Exercised
+        through the env-configured budget path."""
+        monkeypatch.setenv(SEARCH_MAX_CHARS_ENV, "3000")
+        hint = (
+            "Searched 3 collection(s) and 40 table(s), plus knowledge notes and the glossary, and found no match. " * 40
+        )
+        payload = {"query": "x" * 10_000, "results": [], "retrieval": "hybrid", "searched_collections": 3, "hint": hint}
+        out = compact_search_results(payload, "knowledge_search")
+        assert wire_size(out) <= 3000
+        assert out["results"] == []
+        assert set(out["truncated_fields"]) == {"query", "hint"}
+        assert out["hint"].startswith("Searched 3 collection(s)") and out["hint"].endswith("…")
+        assert out["retrieval"] == "hybrid" and out["searched_collections"] == 3
+
+    def test_a_budget_below_the_envelope_returns_a_small_actionable_note(self):
+        """Below the minimal envelope nothing can fit — a misconfiguration.
+        The answer is a tiny note naming the knob, never an oversized payload
+        the client would refuse (the failure mode this helper exists for)."""
+        payload = _incident_payload(4)
+        # 300 chars is below even "no results, query at the floor, the note".
+        out = compact_search_results(payload, "knowledge_search", budget=300)
+        assert wire_size(out) <= 300
+        assert out == {
+            "results": [],
+            "truncated": True,
+            "truncated_note": out["truncated_note"],
+        }
+        assert "4 result(s) withheld" in out["truncated_note"]
+        assert SEARCH_MAX_CHARS_ENV in out["truncated_note"]
+
     def test_deterministic(self):
         payload = _incident_payload()
         a = compact_search_results(payload, "knowledge_search", budget=6_000)
