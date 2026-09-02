@@ -969,6 +969,7 @@ class FakeBatchesAPI:
         self.outcomes = outcomes or {}
         self.usage = usage or {"input_tokens": 1000, "output_tokens": 100}
         self.created: list[list] = []
+        self.retrieved: list[str] = []
         self._next_id = 0
         self._held: set[str] = set()
         self._results: dict[str, list] = {}
@@ -1006,6 +1007,7 @@ class FakeBatchesAPI:
         self._held.discard(batch_id)
 
     def retrieve(self, batch_id: str):
+        self.retrieved.append(batch_id)
         status = "in_progress" if batch_id in self._held else "ended"
         return type("_FBatch", (), {"id": batch_id, "processing_status": status})()
 
@@ -1285,6 +1287,49 @@ def test_batch_deadline_mid_poll_leaves_state_resumable(pg_env):
 
     state2 = load_state(CONNECTION_ID)
     assert state2["docs"]["cf_1"]["status"] == "done"
+
+
+def test_batch_resume_treats_a_29_day_old_entry_as_expired_without_a_network_call(pg_env):
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    from datetime import datetime, timedelta, timezone
+
+    from connectors.sharepoint.facts_extraction import BATCH_RESULT_RETENTION_DAYS, load_state, save_state
+
+    stale_at = (datetime.now(timezone.utc) - timedelta(days=BATCH_RESULT_RETENTION_DAYS + 1)).isoformat(
+        timespec="seconds"
+    )
+    state = load_state(CONNECTION_ID)
+    state["docs"]["cf_1"] = {
+        "status": "batch-submitted",
+        "batch_id": "batch_ancient",
+        "custom_id": "cf_1",
+        "submitted_at": stale_at,
+        "phase": "initial",
+    }
+    save_state(CONNECTION_ID, state)
+
+    api = FakeBatchesAPI({})
+    first = _run_batch(FakeBatchClient(api))
+    assert first["docs_extracted"] == 0
+    assert api.created == [], "the stale entry never becomes a Phase 1 submission this pass"
+    assert "batch_ancient" not in api.retrieved, "expired-by-age is checked BEFORE any network call"
+
+    state_after = load_state(CONNECTION_ID)
+    assert "cf_1" not in state_after["docs"], "requeued back to plain pending for the NEXT pass to resubmit"
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    api2 = FakeBatchesAPI({"cf_1": ("succeeded", _stream(node))})
+    second = _run_batch(FakeBatchClient(api2))
+    assert second["docs_extracted"] == 1
 
 
 def test_batch_cost_uses_the_batch_price_multiplier(pg_env):
