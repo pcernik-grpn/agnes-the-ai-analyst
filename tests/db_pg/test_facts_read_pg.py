@@ -2576,3 +2576,72 @@ def test_an_unattributed_alias_falls_back_to_the_opaque_id(pg_env, repo):
     (row,) = repo.facet_values(_dict_user("uploader1"), types=["client"])["client"]
     assert row["label"] == fact_id, "no readable alias — must not leak the natural key"
     assert row["document_count"] == 1
+
+
+def test_edge_type_map_drops_an_edge_into_a_withheld_endpoint(pg_env, repo):
+    """The map is a primer for the `edge_types` filter, so its number has to
+    be what a traversal would actually yield. `neighbors` resolves the OTHER
+    endpoint per hop and skips the edge when that fact is withheld, but the
+    count applied only the EDGE's own visibility — so an edge into a `wrong`
+    or `restricted` fact was advertised while no traversal could produce it
+    (Devin Review on #2079). For a type that is empty once those are removed,
+    a nonzero count is exactly the existence oracle this method must not be.
+    """
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    good = repo.create_fact(type="industry")
+    withheld = repo.create_fact(type="sponsor")
+
+    for dst, edge_type, quote in (
+        (good, "in_industry", "Acme operates in manufacturing."),
+        (withheld, "owned_by", "Acme is owned by Summit Partners."),
+    ):
+        edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
+        repo.add_claim(
+            edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote
+        )
+
+    caller = _dict_user("uploader1")
+    assert repo.count_visible_edges_by_type(caller) == {"in_industry": 1, "owned_by": 1}
+
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=withheld,
+        natural_keys={"aliases": []},
+        verdict="restricted",
+        reason="named party asked to be withheld",
+        decided_by="admin1",
+    )
+
+    assert repo.count_visible_edges_by_type(caller) == {"in_industry": 1}, (
+        "the only edge of that type points at a withheld fact, so the type must "
+        "disappear rather than advertise a relationship no traversal returns"
+    )
+
+
+def test_a_revealed_endpoint_keeps_its_edge_in_the_map(pg_env, repo):
+    """`revealed` outranks `restricted` on the fact side everywhere else, and
+    it has to here too — otherwise the gate above would hide an edge the
+    caller is explicitly allowed to traverse."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    dst = repo.create_fact(type="sponsor")
+    edge_id = repo.create_edge(src=src, type="owned_by", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme is owned by Summit Partners.",
+    )
+    for verdict, reason in (("restricted", "withheld"), ("revealed", "publicly announced")):
+        repo.upsert_correction(
+            subject_kind="fact",
+            subject_id=dst,
+            natural_keys={"aliases": []},
+            verdict=verdict,
+            reason=reason,
+            decided_by="admin1",
+        )
+
+    assert repo.count_visible_edges_by_type(_dict_user("uploader1")) == {"owned_by": 1}
