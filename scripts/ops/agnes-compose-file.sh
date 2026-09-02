@@ -120,7 +120,20 @@ agnes_gcp_logging_probe() {
     fi
     if $_acf_timeout bash -c "exec 3<>/dev/tcp/127.0.0.1/$_acf_port" >/dev/null 2>&1 \
         || $_acf_timeout nc -z 127.0.0.1 "$_acf_port" >/dev/null 2>&1; then
-        touch "$_acf_cdir/.gcp-logging-ok"
+        # Stamp the marker with the overlay this verdict is ABOUT, rather
+        # than touching it empty. A verdict belongs to one pipeline: when
+        # the overlay's content changes the old verdict is stale, and the
+        # caller can only see that if the marker says what it was armed
+        # for. Detecting the change by comparing the file before and after
+        # a refresh cannot work on the rollout that introduces the check —
+        # the auto-upgrade script replaces ITSELF at the end of a tick, so
+        # the previous version does the refresh and the new one's first
+        # run already sees before == after (Devin Review on #2057).
+        # An empty marker written by an older image simply fails to match
+        # and costs one re-probe, which is the right answer for a verdict
+        # whose pipeline is unknown.
+        sha256sum "$_acf_cdir/docker-compose.gcp-logging.yml" 2>/dev/null | cut -d" " -f1 \
+            > "$_acf_cdir/.gcp-logging-ok" || touch "$_acf_cdir/.gcp-logging-ok"
         return 0
     fi
     rm -f "$_acf_cdir/.gcp-logging-ok"
