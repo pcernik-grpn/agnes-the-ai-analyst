@@ -4254,7 +4254,10 @@ class ChatManager:
             if not title:
                 title = fallback_title(first_user)
                 if title:
-                    logger.info("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
+                    # DEBUG, not INFO: on a keyless instance this is every
+                    # session, and the once-per-process WARNING in auto_title
+                    # already carries the operator-facing signal.
+                    logger.debug("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
             if not title:
                 return
             self._repo.set_title(live.chat_id, title)

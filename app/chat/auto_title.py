@@ -17,9 +17,9 @@ had restarted mid-turn — and every one of them sat in the sidebar as
 Design notes
 ------------
 - **Best-effort, never blocking.** Any failure (no key, network error,
-  rate limit, refusal, weird response) returns ``None``. The session
-  keeps its ``Untitled chat`` fallback — chats never break because
-  Haiku is down.
+  rate limit, refusal, weird response) returns ``None``, and the manager
+  titles the session from its first message instead (see the last bullet)
+  — chats never break because Haiku is down.
 - **Sync SDK in a thread.** The Anthropic SDK call is synchronous; we
   run it via ``asyncio.to_thread`` from the manager so the WS pump
   isn't blocked while Haiku is thinking. Mirrors the existing pattern
@@ -29,12 +29,14 @@ Design notes
   per call <500 input + ~16 output). Result is stripped, quote-trimmed,
   and capped at 60 chars before being persisted.
 - **Best-effort does not mean silent.** "No credential obtainable" used to
-  log at debug and vanish — a session just stayed ``Untitled chat`` forever
-  with no operator-visible signal (#1526). It now logs a WARNING (once per
-  process for "nothing configured"; every time for "configured but minting
-  failed", since that's an ongoing operational problem rather than expected
-  state) without changing the best-effort contract: the turn still never
-  fails because of this.
+  log at debug and vanish, with no operator-visible signal (#1526). It logs a
+  WARNING (once per process for "nothing configured"; every time for
+  "configured but minting failed", since that's an ongoing operational
+  problem rather than expected state) without changing the best-effort
+  contract: the turn still never fails because of this. Since TCRD-290 the
+  symptom of a missing credential is "model-written titles disabled" —
+  sessions get the first-message fallback — so that WARNING is the only
+  thing that tells an operator the model path is off.
 - **The message is data, not an instruction.** The first user message is
   handed to the model inside ``<first_message>`` tags, under a prompt that
   says it was written to a *different* assistant and must not be answered.
@@ -188,9 +190,9 @@ def _warn_no_credential(exc: Exception) -> None:
         "auto-title disabled: no Anthropic credential available (set "
         "ANTHROPIC_API_KEY, or the workload_identity vars "
         "ANTHROPIC_FEDERATION_RULE_ID / ANTHROPIC_ORGANIZATION_ID / "
-        "ANTHROPIC_SERVICE_ACCOUNT_ID plus an identity token) — sessions will "
-        "keep the 'Untitled chat' default until one is configured. Logged "
-        "once per process; cause: %s",
+        "ANTHROPIC_SERVICE_ACCOUNT_ID plus an identity token) — until one is "
+        "configured, sessions are titled from their first message instead of "
+        "by the model. Logged once per process; cause: %s",
         exc,
     )
 
