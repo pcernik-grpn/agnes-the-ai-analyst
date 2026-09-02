@@ -557,7 +557,21 @@ class TokenSet:
     scopes: Optional[str]
 
 
-async def _raise_as_error(resp: httpx.Response, *, action: str) -> None:
+async def _raise_as_error(
+    resp: httpx.Response, *, action: str, redact: Optional[str] = None
+) -> None:
+    """Turn a non-200 token response into an ``OAuthTokenError``.
+
+    ``redact`` is scrubbed from the message before it is raised. It matters
+    because this detail comes from the authorization server and ends up in
+    logs and in an admin-facing error: while the client secret only ever
+    travelled in the ``Authorization`` header, no response body could contain
+    it, but ``client_secret_post`` puts it in the POST body — and a server
+    that echoes the submitted parameters into its error page (or into
+    ``error_description``) would hand the secret straight back to us to log.
+    Scrubbed BEFORE the 500-character cut, so a truncation cannot leave half
+    of one behind.
+    """
     detail = ""
     try:
         body = resp.json()
@@ -568,8 +582,10 @@ async def _raise_as_error(resp: httpx.Response, *, action: str) -> None:
     except ValueError:
         pass
     if not detail:
-        detail = resp.text[:500]
-    raise OAuthTokenError(f"{action} failed (HTTP {resp.status_code}): {detail}")
+        detail = resp.text
+    if redact:
+        detail = detail.replace(redact, "***")
+    raise OAuthTokenError(f"{action} failed (HTTP {resp.status_code}): {detail[:500]}")
 
 
 def _coerce_expires_in(raw: Any) -> Optional[int]:
@@ -676,7 +692,7 @@ async def _post_token_request(
                 action,
             )
             continue
-        await _raise_as_error(resp, action=action)
+        await _raise_as_error(resp, action=action, redact=client_secret)
 
     assert resp is not None  # every loop path either breaks, continues or raises
     try:

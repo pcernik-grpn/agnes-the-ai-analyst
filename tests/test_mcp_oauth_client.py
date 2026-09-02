@@ -979,3 +979,74 @@ def test_register_dynamic_client_accepts_a_granted_client_secret_post():
             return await register_dynamic_client(meta, redirect_uri="https://agnes.example.com/cb", client=client)
 
     assert run(_impl()).client_secret == "s3cr3t"
+
+
+def test_a_token_error_never_carries_the_client_secret_back_into_the_log():
+    """The AS's own words go into the raised error, which reaches the logs and
+    an admin-facing message.
+
+    That was safe while the secret only ever travelled in the `Authorization`
+    header — no response body could contain it. `client_secret_post` puts it
+    in the POST body, and a server that echoes the submitted parameters into
+    its error page (plenty do) would hand the secret straight back to us to
+    log. Both detail paths are scrubbed: the JSON `error_description` and the
+    raw-text fallback.
+    """
+    secret = "s3cr3t-do-not-log"
+
+    def echoing_handler(request):
+        # First answer rejects Basic so the retry puts the secret in the body;
+        # the second echoes that body back, the way a chatty AS error page does.
+        if request.headers.get("Authorization", "").startswith("Basic "):
+            return httpx.Response(401, json={"error": "invalid_client"})
+        return httpx.Response(400, text=f"Bad request: {request.content.decode()}")
+
+    async def _impl():
+        async with _client(echoing_handler) as client:
+            return await exchange_code_for_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret=secret,
+                code="authcode",
+                redirect_uri="https://agnes.example.com/cb",
+                code_verifier="verifier",
+                client=client,
+            )
+
+    with pytest.raises(OAuthTokenError) as exc:
+        run(_impl())
+    assert secret not in str(exc.value), "the client secret reached the error message"
+    assert "***" in str(exc.value)
+
+
+def test_the_secret_is_scrubbed_from_a_json_error_description_too():
+    """The JSON path is the one a well-behaved AS uses, and it can echo the
+    parameter just as easily."""
+    secret = "s3cr3t-do-not-log"
+
+    def handler(request):
+        if request.headers.get("Authorization", "").startswith("Basic "):
+            return httpx.Response(401, json={"error": "invalid_client"})
+        return httpx.Response(
+            400,
+            json={
+                "error": "invalid_request",
+                "error_description": f"unexpected parameter client_secret={secret}",
+            },
+        )
+
+    async def _impl():
+        async with _client(handler) as client:
+            return await exchange_code_for_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret=secret,
+                code="authcode",
+                redirect_uri="https://agnes.example.com/cb",
+                code_verifier="verifier",
+                client=client,
+            )
+
+    with pytest.raises(OAuthTokenError) as exc:
+        run(_impl())
+    assert secret not in str(exc.value)
