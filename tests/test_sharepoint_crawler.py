@@ -1528,20 +1528,16 @@ class TestConvertChildMemoryLimit:
 
     @staticmethod
     def _current_vsz_bytes() -> int:
-        """This (the TEST) process's own current virtual memory size, from
-        /proc/self/status -- Linux only, which is fine since every caller
-        is itself gated to Linux. A freshly forked child's own baseline
-        starts at approximately this, so it calibrates the test below
-        against whatever THIS runner's actual baseline happens to be,
-        rather than a guessed constant that could be a false positive (too
-        tight, tripped by ordinary interpreter overhead on a heavier CI
-        image) or a false negative (too loose to ever exercise the
-        ceiling) on a machine this test has never seen."""
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmSize:"):
-                    return int(line.split()[1]) * 1024  # kB -> bytes
-        raise RuntimeError("VmSize not found in /proc/self/status")
+        """This (the TEST) process's own current virtual memory size —
+        delegates to the production reader (`_own_vsize_bytes`) rather than
+        re-parsing `/proc/self/status` a second time, so the test's own
+        calibration and the code path it is testing can never silently
+        drift apart. Linux only, which is fine since every caller is
+        itself gated to Linux."""
+        vsz = crawler._own_vsize_bytes()
+        if vsz <= 0:
+            raise RuntimeError("VmSize not found in /proc/self/status")
+        return vsz
 
     @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
     def test_a_runaway_allocation_is_capped_on_linux(self, tmp_path, monkeypatch):
@@ -1550,9 +1546,13 @@ class TestConvertChildMemoryLimit:
         memory pressure this guards against was observed. A conversion
         that tries to allocate well past a tight, real RLIMIT_AS ceiling
         gets a genuine MemoryError, attributed to the file that caused it,
-        not a SIGKILL that could be blamed on an innocent sibling."""
-        baseline = self._current_vsz_bytes()
-        limit = baseline + 100 * 1024 * 1024  # headroom over THIS runner's own baseline
+        not a SIGKILL that could be blamed on an innocent sibling.
+
+        `memory_limit_bytes` is HEADROOM above this (forked child's own,
+        inherited) process's VmSize now, not an absolute number — no need
+        to add this runner's own baseline by hand any more, the production
+        code does that."""
+        headroom = 100 * 1024 * 1024
         over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
 
         def _convert(path, mime):
@@ -1561,7 +1561,7 @@ class TestConvertChildMemoryLimit:
             return ConvertResult("# ok")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
-        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=limit)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=headroom)
         pool.start()
         try:
             f = tmp_path / "doc.txt"
@@ -1569,6 +1569,77 @@ class TestConvertChildMemoryLimit:
             outcome = pool.convert(0, f, "text/plain")
             assert not outcome.ok
             assert outcome.detail_type == "MemoryError"
+        finally:
+            pool.shutdown()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
+    def test_the_cap_is_headroom_above_this_workers_own_footprint_not_an_absolute_ceiling(self, tmp_path, monkeypatch):
+        """The exact live-deployment bug this fixes: on a 64-vCPU worker
+        whose OWN VmSize was already ~2.2 GB at fork time, the OLD
+        absolute-ceiling reading treated a 1536 MB
+        `convert_child_memory_limit_mb` as already exceeded before any
+        document was even touched — every child died on import, reading
+        as "not installed". HALF of this runner's own actual baseline is
+        by construction smaller than the baseline itself on any real
+        process — never a guessed absolute constant that could be a false
+        positive on a leaner CI image or a false negative on a heavier
+        one, the exact trap `_current_vsz_bytes` was written to avoid. A
+        modest, ordinary allocation must still succeed under it, proving
+        the cap is no longer read as absolute."""
+        own_baseline = self._current_vsz_bytes()
+        small_headroom = own_baseline // 2
+        modest_allocation = 1024 * 1024  # 1 MiB: far smaller than any real process's own footprint
+
+        def _convert(path, mime):
+            data = bytearray(modest_allocation)
+            data[0] = 1
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=small_headroom)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok, outcome.detail
+        finally:
+            pool.shutdown()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/self/status is Linux-only")
+    def test_effective_limit_adds_headroom_to_this_processs_own_vsize(self):
+        own_vsize = self._current_vsz_bytes()
+        headroom = 100 * 1024 * 1024
+        effective = crawler._effective_memory_limit_bytes(headroom)
+        # A small tolerance for whatever this process allocated between the
+        # two /proc reads (this method's own and the production call's).
+        assert own_vsize + headroom <= effective <= own_vsize + headroom + 8 * 1024 * 1024
+
+    def test_effective_limit_falls_back_to_the_bare_value_when_vsize_is_unreadable(self, monkeypatch):
+        """Non-Linux (no `/proc`), or a malformed/inaccessible
+        `/proc/self/status`: `_own_vsize_bytes` returns 0, and the
+        effective limit falls back to `limit_bytes` alone — the pre-fix
+        behaviour, never a crash."""
+        monkeypatch.setattr(crawler, "_own_vsize_bytes", lambda: 0)
+        assert crawler._effective_memory_limit_bytes(123) == 123
+
+    def test_pool_start_logs_the_effective_ceiling_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(crawler, "_effective_memory_limit_bytes", lambda limit_bytes: limit_bytes + 999)
+        pool = crawler._ConvertProcessPool(2, memory_limit_bytes=1024 * 1024)
+        with caplog.at_level(logging.INFO):
+            pool.start()
+        try:
+            info_records = [r for r in caplog.records if r.levelno == logging.INFO and "RLIMIT_AS ceiling" in r.message]
+            assert len(info_records) == 1, "expected exactly one ceiling log line, not one per slot"
+        finally:
+            pool.shutdown()
+
+    def test_pool_start_logs_nothing_when_the_cap_is_disabled(self, monkeypatch, caplog):
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=0)
+        with caplog.at_level(logging.INFO):
+            pool.start()
+        try:
+            assert not any("RLIMIT_AS ceiling" in r.message for r in caplog.records)
         finally:
             pool.shutdown()
 

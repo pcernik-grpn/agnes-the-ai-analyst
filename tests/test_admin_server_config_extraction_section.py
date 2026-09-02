@@ -516,6 +516,132 @@ def test_saved_crawler_concurrency_is_what_the_next_crawl_run_reads(seeded_app, 
 
 
 # ---------------------------------------------------------------------------
+# extraction.crawler.convert_child_memory_limit_mb — the conversion child's
+# RLIMIT_AS HEADROOM, admin-editable (2026-09-02 live-deployment follow-up).
+#
+# The key already existed and was already read by the crawler
+# (`_convert_child_memory_limit_bytes`) — only the server-config declaration
+# and its range validation are new here, matching how `concurrency` above
+# was surfaced.
+# ---------------------------------------------------------------------------
+
+
+def test_convert_child_memory_limit_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_child_memory_limit_mb"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+
+    assert spec["default"] == _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB == 1536
+    # The hint must say this is HEADROOM, not an absolute ceiling — the
+    # exact live-deployment bug this field's own validation follow-up fixed.
+    assert "headroom" in spec["hint"].lower()
+
+
+def test_post_convert_child_memory_limit_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 3072}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_child_memory_limit_mb"] == 3072
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_child_memory_limit_mb"] == 3072
+
+
+def test_convert_child_memory_limit_zero_disables_the_cap_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_child_memory_limit_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 65537):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_child_memory_limit_mb" in resp.text
+
+
+def test_convert_child_memory_limit_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("1536", 1536.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_post_convert_child_memory_limit_keeps_sibling_crawler_keys(seeded_app, monkeypatch):
+    """Same deep-merge contract `concurrency` already has — saving this one
+    leaf must not wipe the crawler keys the panel does not render yet."""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    first = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"concurrency": 2}}}},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 2048}}}},
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"] == {"concurrency": 2, "convert_child_memory_limit_mb": 2048}
+
+
+def test_saved_convert_child_memory_limit_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    """End to end through the real save path — no restart, no monkeypatch
+    of get_value."""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_child_memory_limit_bytes
+
+    assert _convert_child_memory_limit_bytes() == 1536 * 1024 * 1024  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 256}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_child_memory_limit_bytes() == 256 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
 # Run knobs an admin needs without server access (2026-09-02): lane
 # concurrency, and the facts stage's stream_every / run_timeout_s / transport /
 # retry_mode instance defaults — declared, validated, persisted.
