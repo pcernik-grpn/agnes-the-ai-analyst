@@ -102,22 +102,15 @@ def secret_status(chat_config: Any) -> dict:
     }
     missing = sorted(k for k, v in secrets.items() if v["required"] and not v["set"])
 
-    # Two cost caps read `chat_messages.tokens_in/out`, which only a frame
-    # carrying usage writes. The engine's stream carries none, so on this
-    # provider `daily_anthropic_spend_usd` and `max_session_tokens` are inert
-    # — and both ship LIVE defaults ($20/day, 200k/session), so flipping one
-    # YAML key silently removes two budgets instance-wide. Surfaced rather
-    # than left to be discovered from a bill: the operator can still cap
-    # spend per agent via `token_budget_monthly`, which the broker enforces
-    # on the engine's `llm` ticket.
-    unmetered = [
-        name
-        for name, live in (
-            ("daily_anthropic_spend_usd", getattr(chat_config, "daily_anthropic_spend_usd", None)),
-            ("max_session_tokens", getattr(chat_config, "max_session_tokens", None)),
-        )
-        if provider == "kai-agent" and live
-    ]
+    # `unmetered_caps` once named the two token-derived caps
+    # (`daily_anthropic_spend_usd`, `max_session_tokens`) as inert under the
+    # kai-agent provider, whose stream carries no usage. Since 0.95.0 the
+    # broker accumulates every engine LLM call's provider-reported usage and
+    # the manager folds it into the turn at persist (app/chat/turn_usage.py),
+    # so both caps meter every provider and the list is always empty. The key
+    # stays for API compatibility; a stale "not enforced" claim here is
+    # exactly what sends an operator chasing the engine when the cap fires.
+    unmetered: list[str] = []
 
     return {
         "enabled": enabled,
