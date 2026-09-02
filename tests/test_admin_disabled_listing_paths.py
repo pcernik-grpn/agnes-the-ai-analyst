@@ -118,9 +118,16 @@ def test_disabled_system_plugin_drops_from_resolver_and_my_stack(tmp_path, monke
     conn.close()
 
 
-def test_fanout_system_for_user_skips_disabled(tmp_path, monkeypatch):
-    """A new user's system fan-out must not subscribe them to a plugin that
-    is admin-disabled, even if its is_system flag were still set."""
+def test_disabled_plugin_is_not_automatic_for_anyone(tmp_path, monkeypatch):
+    """A plugin that is BOTH is_system and admin_disabled must reach nobody.
+
+    This invariant used to be enforced inside the two fan-out queries (a new
+    user's subscription sweep and a new group's grant sweep), each carrying
+    its own ``AND admin_disabled = FALSE``. Those sweeps are gone — the flag
+    is resolved at read time now — so the same invariant is asserted where it
+    actually lives: the visibility read and the Automatic-tier read, which
+    are also the only two places it can be got wrong.
+    """
     conn = _setup_conn(tmp_path)
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
@@ -128,9 +135,7 @@ def test_fanout_system_for_user_skips_disabled(tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     from src.repositories.marketplace_plugins import MarketplacePluginsRepository
-    from src.repositories.user_curated_subscriptions import (
-        UserCuratedSubscriptionsRepository,
-    )
+    from src.repositories.user_groups import UserGroupsRepository
     from src.repositories.users import UserRepository
 
     slug, plugin = "mkt-fan", "fan-plug"
@@ -141,8 +146,8 @@ def test_fanout_system_for_user_skips_disabled(tmp_path, monkeypatch):
     MarketplacePluginsRepository(conn).replace_for_marketplace(
         slug, [{"name": plugin, "version": "1.0", "description": "x"}]
     )
-    # Force both flags TRUE to prove the AND admin_disabled = FALSE filter bites
-    # independently of set_admin_disabled's is_system clearing.
+    # Force both flags TRUE so the `admin_disabled = FALSE` filter is proven to
+    # bite on its own, independently of set_admin_disabled clearing is_system.
     conn.execute(
         "UPDATE marketplace_plugins SET is_system = TRUE, admin_disabled = TRUE "
         "WHERE marketplace_id = ? AND name = ?",
@@ -150,53 +155,24 @@ def test_fanout_system_for_user_skips_disabled(tmp_path, monkeypatch):
     )
 
     UserRepository(conn).create(id="u2", email="u2@example.com", name="User Two")
-    subs = UserCuratedSubscriptionsRepository(conn)
-    subs.fanout_system_for_user("u2")
+    group = UserGroupsRepository(conn).create(name="grp-fan", created_by="test")
 
-    assert (slug, plugin) not in subs.subscribed_set("u2")
+    plugins = MarketplacePluginsRepository(conn)
+    # Visibility: not served to a group, and not served to "everyone" either.
+    served = {(r["marketplace_id"], r["name"])
+              for r in plugins.list_granted_for_groups([group["id"]])}
+    assert (slug, plugin) not in served
+    assert (slug, plugin) not in set(plugins.list_system_keys())
 
-    conn.close()
-
-
-def test_fanout_system_for_group_skips_disabled(tmp_path, monkeypatch):
-    """A newly-created group's system fan-out must not be granted a plugin that
-    is admin-disabled, even if its is_system flag is still set — symmetric with
-    the user fan-out filter so both paths agree on what a system plugin is."""
-    conn = _setup_conn(tmp_path)
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
-
-    from datetime import datetime, timezone
-
-    from src.repositories.marketplace_plugins import MarketplacePluginsRepository
-    from src.repositories.resource_grants import ResourceGrantsRepository
-    from src.repositories.user_groups import UserGroupsRepository
-
-    slug, plugin = "mkt-gfan", "gfan-plug"
-    conn.execute(
-        "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
-        [slug, slug, f"https://example.test/{slug}.git", datetime(2026, 1, 1, tzinfo=timezone.utc)],
-    )
-    MarketplacePluginsRepository(conn).replace_for_marketplace(
-        slug, [{"name": plugin, "version": "1.0", "description": "x"}]
-    )
-    # Force both flags TRUE so the AND admin_disabled = FALSE filter is what
-    # excludes the row (not set_admin_disabled's is_system clearing).
-    conn.execute(
-        "UPDATE marketplace_plugins SET is_system = TRUE, admin_disabled = TRUE "
-        "WHERE marketplace_id = ? AND name = ?",
-        [slug, plugin],
-    )
-
-    group = UserGroupsRepository(conn).create(name="grp-gfan", created_by="test")
-    grants = ResourceGrantsRepository(conn)
-    grants.fanout_system_for_group(group["id"], assigned_by="test")
-
-    assert not grants.has_grant(
-        [group["id"]], "marketplace_plugin", f"{slug}/{plugin}"
-    )
+    # Automatic tier: not required of anyone.
+    from src.marketplace_filter import required_plugin_keys
+    assert (slug, plugin) not in required_plugin_keys(conn, "u2")
 
     conn.close()
+
+
+
+
 
 
 def test_disabled_plugin_drops_from_rbac_projection(tmp_path, monkeypatch):
@@ -264,42 +240,3 @@ def test_disabled_plugin_drops_from_v2_skills_admin(tmp_path, monkeypatch):
     conn.close()
 
 
-def test_fanout_system_for_group_count_is_idempotent(tmp_path, monkeypatch):
-    """fanout_system_for_group returns the number of grants NEWLY inserted, so
-    a re-run over an already-granted group returns 0 — not the full system
-    plugin count. Pins the accurate-count contract both backends must share
-    (the PG sibling counts via rowcount under ON CONFLICT DO NOTHING; DuckDB
-    via a ConstraintException skip)."""
-    conn = _setup_conn(tmp_path)
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setattr("src.repositories.get_system_db", lambda: conn)
-
-    from datetime import datetime, timezone
-
-    from src.repositories.marketplace_plugins import MarketplacePluginsRepository
-    from src.repositories.resource_grants import ResourceGrantsRepository
-    from src.repositories.user_groups import UserGroupsRepository
-
-    slug = "mkt-cnt"
-    conn.execute(
-        "INSERT INTO marketplace_registry (id, name, url, registered_at) VALUES (?, ?, ?, ?)",
-        [slug, slug, f"https://example.test/{slug}.git", datetime(2026, 1, 1, tzinfo=timezone.utc)],
-    )
-    MarketplacePluginsRepository(conn).replace_for_marketplace(
-        slug, [{"name": "p1", "version": "1.0", "description": "x"}]
-    )
-    # Create the group BEFORE marking p1 system: UserGroupsRepository.create
-    # fans out the *currently* system plugins to the new group, so creating it
-    # first leaves the explicit fanout below as the sole grantor of p1.
-    group = UserGroupsRepository(conn).create(name="grp-cnt", created_by="test")
-    conn.execute(
-        "UPDATE marketplace_plugins SET is_system = TRUE WHERE marketplace_id = ?",
-        [slug],
-    )
-    grants = ResourceGrantsRepository(conn)
-    assert grants.fanout_system_for_group(group["id"], assigned_by="test") == 1
-    # Re-run: the grant already exists → nothing newly inserted (count is 0,
-    # not the full system-plugin count — the accurate-count contract).
-    assert grants.fanout_system_for_group(group["id"], assigned_by="test") == 0
-
-    conn.close()

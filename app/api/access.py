@@ -1065,27 +1065,19 @@ async def delete_grant(
     if not existing:
         raise HTTPException(status_code=404, detail="Grant not found")
 
-    # v39: refuse to revoke a grant whose underlying plugin is system-marked.
-    # The mark_system endpoint materializes per-group rows precisely so the
-    # plugin reaches every user; allowing per-group revoke here would punch
-    # a hole in the mandatory tier silently. Admin must unmark on
-    # /admin/marketplaces first, then revoke individual groups.
-    if existing["resource_type"] == "marketplace_plugin":
-        rid = existing["resource_id"] or ""
-        if "/" in rid:
-            mp_id, plugin_name = rid.split("/", 1)
-            from src.repositories import marketplace_plugins_repo
-
-            plugin_rows = marketplace_plugins_repo().list_for_marketplace(mp_id)
-            sys_plugin = next(
-                (p for p in plugin_rows if p["name"] == plugin_name and p.get("is_system")),
-                None,
-            )
-            if sys_plugin is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="cannot_revoke_system_grant",
-                )
+    # The v39 guard that refused this delete for an Automatic-for-everyone
+    # plugin is gone, with the fanout that made it necessary. Marking a plugin
+    # Automatic used to WRITE a grant into every group; revoking one of those
+    # punched a silent hole in the mandatory tier, so the endpoint refused with
+    # 409 cannot_revoke_system_grant.
+    #
+    # Nothing writes those rows now — the flag is resolved at read time — so a
+    # marketplace_plugin grant on an Automatic plugin is, by construction, one
+    # an admin set BY HAND. Refusing here would trap the admin's own row and
+    # make it unrevocable for as long as the flag is on. It is also no longer
+    # load-bearing: deleting it cannot remove the plugin from anyone, because
+    # the flag serves it regardless. Turning the plugin Optional again is the
+    # one control that changes that, and it lives on /admin/marketplaces.
 
     grants.delete(grant_id)
 

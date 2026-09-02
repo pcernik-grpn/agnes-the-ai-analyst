@@ -1,8 +1,6 @@
 """Postgres-backed resource-grants repository.
 
-Mirrors ``src/repositories/resource_grants.py``. ``fanout_system_for_group``
-is soft-failed when ``marketplace_plugins`` isn't migrated yet (Phase F
-in progress); once the table lands, the try/except becomes unnecessary.
+Mirrors ``src/repositories/resource_grants.py``.
 """
 
 from __future__ import annotations
@@ -317,60 +315,3 @@ class ResourceGrantsPgRepository:
             ).first()
         return int(row[0]) if row else 0
 
-    def fanout_system_for_group(
-        self,
-        group_id: str,
-        assigned_by: Optional[str] = None,
-    ) -> int:
-        """Grant every active system marketplace_plugin to ``group_id``.
-
-        Only plugins with ``is_system=TRUE`` and ``admin_disabled=FALSE`` are
-        granted — a disabled plugin stays hidden instance-wide, so a new group
-        must not inherit a grant that would activate on re-enable. Mirrors the
-        DuckDB sibling and ``fanout_system_for_user``.
-
-        Soft-fail if ``marketplace_plugins`` isn't migrated yet (Phase F
-        in progress). Once that port lands, drop the try/except.
-        """
-        try:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    sa.text(
-                        "SELECT marketplace_id, name FROM marketplace_plugins "
-                        "WHERE is_system = TRUE AND admin_disabled = FALSE"
-                    ),
-                ).all()
-        except Exception:
-            return 0
-
-        inserted = 0
-        for marketplace_id, plugin_name in rows:
-            resource_id = f"{marketplace_id}/{plugin_name}"
-            try:
-                with self._engine.begin() as conn:
-                    result = conn.execute(
-                        sa.text(
-                            """INSERT INTO resource_grants
-                               (id, group_id, resource_type, resource_id, assigned_by)
-                               VALUES (:id, :gid, 'marketplace_plugin', :rid, :ab)
-                               ON CONFLICT ON CONSTRAINT uq_resource_grants_group_type_id
-                                 DO NOTHING"""
-                        ),
-                        {
-                            "id": str(uuid4()),
-                            "gid": group_id,
-                            "rid": resource_id,
-                            "ab": assigned_by,
-                        },
-                    )
-                    # ON CONFLICT DO NOTHING suppresses the duplicate (no
-                    # exception raised), so a pre-existing grant yields
-                    # rowcount 0. Count only real inserts — otherwise the
-                    # diagnostic return value over-reports newly-granted groups
-                    # on every idempotent re-run. Matches the DuckDB sibling,
-                    # which relies on a ConstraintException to skip the bump.
-                    if result.rowcount:
-                        inserted += 1
-            except IntegrityError:
-                continue
-        return inserted

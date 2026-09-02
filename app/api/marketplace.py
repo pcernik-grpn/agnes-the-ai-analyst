@@ -145,9 +145,10 @@ class MarketplaceItem(BaseModel):
     publisher_name: Optional[str] = None
     verification_state: str = "none"
     # stack_count = how many users have this item in their stack.
-    # - Curated: COUNT(*) on user_plugin_optouts (post-v28 PRESENCE = subscribed).
-    #   System pluginy are fanned out to every user via
-    #   fanout_system_for_user, so the COUNT naturally includes them too.
+    # - Curated: COUNT(*) on user_plugin_optouts (post-v28 PRESENCE = subscribed),
+    #   overlaid with the total user count for an Automatic-for-everyone
+    #   plugin — it has no subscription rows to count (see
+    #   ``_load_curated_stack_counts``).
     # - Flea: store_entities.install_count (bumped on /install).
     # Frontend renders this alongside active_users_30d as a funnel:
     # "12 stacked → 5 active → 143 calls".
@@ -762,8 +763,21 @@ def _load_curated_stack_counts() -> Dict[Tuple[str, str], int]:
     Thin wrapper over ``UserCuratedSubscriptionsRepository.stack_counts`` /
     ``UserCuratedSubscriptionsPgRepository.stack_counts`` so callers stay
     backend-agnostic — one query per page render, avoids N+1.
+
+    An Automatic-for-everyone plugin is overlaid with the total user count.
+    It used to arrive in the subscription tally for free, because marking it
+    wrote a subscription row per user; nothing writes those rows now, so
+    without this overlay a plugin every user has would report a stack of 0.
+    The number the reader wants is unchanged — "how many people have this" —
+    only where it is read from.
     """
-    return user_curated_subscriptions_repo().stack_counts()
+    counts = dict(user_curated_subscriptions_repo().stack_counts())
+    system_keys = marketplace_plugins_repo().list_system_keys()
+    if system_keys:
+        total_users = users_repo().count_all()
+        for key in system_keys:
+            counts[key] = total_users
+    return counts
 
 
 def _available_sorts(stats_dicts: List[Dict[str, Dict]]) -> List[str]:

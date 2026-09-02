@@ -87,7 +87,6 @@ def ensure_scheduler_user(conn: Optional[duckdb.DuckDBPyConnection] = None) -> d
         users_repo,
         user_groups_repo,
         user_group_members_repo,
-        user_curated_subscriptions_repo,
     )
 
     users = users_repo()
@@ -100,14 +99,6 @@ def ensure_scheduler_user(conn: Optional[duckdb.DuckDBPyConnection] = None) -> d
             name=SCHEDULER_USER_NAME,
             password_hash=None,
         )
-        # v39: scheduler service user gets the same mandatory tier as
-        # human users. Soft-fail to mirror the original try/except.
-        try:
-            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
-        except Exception:
-            logger.exception(
-                "system-plugin fanout failed for scheduler user",
-            )
         user = users.get_by_email(SCHEDULER_USER_EMAIL)
         logger.info("Seeded scheduler service user: %s", SCHEDULER_USER_EMAIL)
 

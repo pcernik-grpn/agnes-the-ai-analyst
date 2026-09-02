@@ -87,29 +87,33 @@ class MarketplacePluginsPgRepository:
     ) -> List[Dict[str, Any]]:
         """PG mirror of ``MarketplacePluginsRepository.list_granted_for_groups``."""
         gids = list(group_ids)
-        if not gids:
-            return []
+        # See the DuckDB sibling: an empty group list is not an early return,
+        # because an Automatic-for-everyone plugin does not depend on groups.
         gid_keys: List[str] = []
         params: Dict[str, Any] = {}
         for i, gid in enumerate(gids):
             k = f"g_{i}"
             gid_keys.append(f":{k}")
             params[k] = gid
-        # Postgres strict-standard SQL requires every ``ORDER BY``
-        # expression to appear in the ``SELECT DISTINCT`` list — same
-        # shape as the DuckDB sibling for cross-engine parity.
+        # Semi-join off ``marketplace_plugins`` — same shape as the DuckDB
+        # sibling. A system plugin (Automatic for everyone) has no grant rows
+        # to join to, so the visibility test is "granted to one of my groups
+        # OR flagged system", and EXISTS removes the DISTINCT the old join
+        # needed. ``mr.registered_at`` rides the projection for the ORDER BY.
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
-                    "SELECT DISTINCT mp.marketplace_id, mp.name, mp.version, mp.raw, "
+                    "SELECT mp.marketplace_id, mp.name, mp.version, mp.raw, "
                     "       mr.registered_at "
-                    "FROM resource_grants rg "
-                    "JOIN marketplace_plugins mp "
-                    "  ON mp.marketplace_id || '/' || mp.name = rg.resource_id "
+                    "FROM marketplace_plugins mp "
                     "JOIN marketplace_registry mr ON mr.id = mp.marketplace_id "
-                    f"WHERE rg.group_id IN ({','.join(gid_keys)}) "
-                    "  AND rg.resource_type = 'marketplace_plugin' "
-                    "  AND mp.admin_disabled = FALSE "
+                    "WHERE mp.admin_disabled = FALSE "
+                    "  AND (mp.is_system = TRUE OR EXISTS ("
+                    "        SELECT 1 FROM resource_grants rg "
+                    "        WHERE rg.resource_id = mp.marketplace_id || '/' || mp.name "
+                    "          AND rg.resource_type = 'marketplace_plugin' "
+                    f"          AND rg.group_id IN ({','.join(gid_keys) or 'NULL'})"
+                    "      )) "
                     "ORDER BY mr.registered_at, mp.name"
                 ),
                 params,

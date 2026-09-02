@@ -54,7 +54,7 @@ def ensure_semantic_drafter_user(conn: Optional[object] = None) -> dict:
     in ``src.repositories``, so this works unchanged on either the DuckDB or
     Postgres backend.
     """
-    from src.repositories import user_curated_subscriptions_repo, users_repo
+    from src.repositories import users_repo
 
     users = users_repo()
     user = users.get_by_email(SEMANTIC_DRAFTER_USER_EMAIL)
@@ -66,14 +66,6 @@ def ensure_semantic_drafter_user(conn: Optional[object] = None) -> dict:
             name=SEMANTIC_DRAFTER_USER_NAME,
             password_hash=None,
         )
-        # Same mandatory-tier fanout every other user-create path gets
-        # (Google OAuth, magic-link, admin-create, scheduler token) — soft-
-        # fail, mirroring ensure_scheduler_user, so a fanout hiccup never
-        # blocks provisioning the identity itself.
-        try:
-            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
-        except Exception:
-            logger.exception("system-plugin fanout failed for semantic-drafter user")
         user = users.get_by_email(SEMANTIC_DRAFTER_USER_EMAIL)
         logger.info("Seeded semantic-drafter service user: %s", SEMANTIC_DRAFTER_USER_EMAIL)
 
@@ -98,7 +90,7 @@ def ensure_memory_curator_user(conn: Optional[object] = None) -> dict:
     the ``src.repositories`` factory and therefore works unchanged on either
     the DuckDB or Postgres backend.
     """
-    from src.repositories import user_curated_subscriptions_repo, users_repo
+    from src.repositories import users_repo
 
     users = users_repo()
     user = users.get_by_email(MEMORY_CURATOR_USER_EMAIL)
@@ -110,13 +102,6 @@ def ensure_memory_curator_user(conn: Optional[object] = None) -> dict:
             name=MEMORY_CURATOR_USER_NAME,
             password_hash=None,
         )
-        # Same mandatory-tier fanout every other user-create path gets —
-        # soft-fail so a fanout hiccup never blocks provisioning the
-        # identity itself.
-        try:
-            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
-        except Exception:
-            logger.exception("system-plugin fanout failed for memory-curator user")
         user = users.get_by_email(MEMORY_CURATOR_USER_EMAIL)
         logger.info("Seeded memory-curator service user: %s", MEMORY_CURATOR_USER_EMAIL)
 

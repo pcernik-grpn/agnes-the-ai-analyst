@@ -519,31 +519,42 @@ def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
     assert '${isDisabled ? "checked" : ""}' not in template, "the old inverted checked-binding must be gone"
 
 
-def test_plugin_controls_share_one_wrapper_for_visual_consistency():
-    """#1956 item 14c: the Enabled toggle and the system-mark control used to
-    sit loose in the row as two unrelated widgets (toggle vs. bare button).
-    They now share a common flex wrapper so they read as a matched pair of
-    controls rather than a random mix, and the system button wears the same
-    --ds-radius-btn every other labelled button in the app uses (it
-    previously hardcoded a bespoke 6px)."""
+def test_both_plugin_states_are_the_same_widget():
+    """#1956 item 14c, answered rather than argued with. The first pass put
+    the Enabled toggle and the system-mark BUTTON in a shared wrapper so they
+    at least aligned; the reporter's actual complaint was that two on/off
+    states wore two different widgets. They are now both switches — the
+    Automatic control reuses `.plugin-enabled-toggle`, so it cannot drift
+    from its neighbour the way a separately-styled control did."""
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
     assert "plugin-controls" in template
-    assert "border-radius: var(--ds-radius-btn)" in template.split(".plugin-system-btn {")[1].split("}")[0]
+    # Both controls are checkbox switches inside the shared toggle class.
+    assert 'data-action="toggle-disabled"' in template
+    assert 'data-action="toggle-system"' in template
+    assert "plugin-auto-toggle" in template
+    for action in ("toggle-disabled", "toggle-system"):
+        block = template.split(f'data-action="{action}"')[0]
+        assert block.rstrip().endswith('type="checkbox"'), (
+            f"{action} must be a checkbox switch, not a bespoke control"
+        )
+    # The bespoke button styling is gone with the button.
+    assert ".plugin-system-btn {" not in template
 
 
 def test_plugin_system_control_carries_a_discoverable_explanation():
-    """#1956 item 14a (reporter kbcMichal): "Unmark system" had no
-    explanation of what system-marking actually does. A hover-only `title`
-    on the button was already there and evidently was not enough — this adds
-    a persistent, always-visible help affordance next to the control whose
-    tooltip explains the *concept* (mandatory-for-everyone fanout) rather
-    than only the next click's side effect, and it reads the same regardless
-    of the plugin's current is_system value."""
+    """#1956 item 14a (reporter kbcMichal): the control had no explanation of
+    what it actually does. A persistent, always-visible help affordance sits
+    next to it, explaining the CONCEPT rather than the next click's side
+    effect, and reading the same regardless of the plugin's current state."""
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
     assert "plugin-help-icon" in template
-    help_text = template.split("sysHelpText =")[1].split(";")[0]
-    assert "mandatory" in help_text
-    assert "every" in help_text
+    help_text = template.split("autoHelpText =")[1].split(";")[0]
+    assert "every user" in help_text
+    # It must name the tier the rest of the admin surface already uses, so an
+    # admin who learned Optional/Automatic on /admin/access meets one idea.
+    assert "Automatic" in help_text
+    # And it must NOT reintroduce the retired third word.
+    assert "system" not in help_text.lower()
 
 
 def test_disabled_pill_tooltip_calls_out_deprecation_auto_hide():

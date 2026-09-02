@@ -101,45 +101,43 @@ def test_marketplace_plugins_replace_for_marketplace(store_engine):
 # resource_grants fanout (now that marketplace_plugins is migrated)
 # ---------------------------------------------------------------------------
 
-def test_resource_grants_fanout_uses_marketplace_plugins(store_engine):
-    """The soft-fail in resource_grants_pg.fanout_system_for_group should
-    now succeed because marketplace_plugins is migrated."""
+def test_disabled_system_plugin_is_not_visible_on_pg(store_engine):
+    """PG-side parity for the invariant the deleted group fan-out used to
+    carry: a plugin that is is_system AND admin_disabled reaches nobody.
+
+    A PG-only drop of the ``admin_disabled = FALSE`` clause would otherwise
+    serve a disabled plugin to every user, which is exactly the divergence
+    the cross-engine contract exists to catch.
+    """
     from src.repositories.marketplace_plugins_pg import MarketplacePluginsPgRepository
-    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
     from src.repositories.user_groups_pg import UserGroupsPgRepository
 
     groups = UserGroupsPgRepository(store_engine)
-    grants = ResourceGrantsPgRepository(store_engine)
     plugins = MarketplacePluginsPgRepository(store_engine)
-
-    # Create the group BEFORE seeding system plugins: UserGroupsPgRepository.create
-    # fans out the *currently* system plugins to the new group, so creating it
-    # first leaves the explicit fanout below as the sole grantor (parity with the
-    # DuckDB group-fanout test). Seeding first would let create() grant p1, and
-    # the explicit fanout would then correctly report 0 newly-inserted.
     g = groups.create(name="g1")
 
-    # Two system plugins: p1 active, p2 admin-disabled. The fan-out must grant
-    # only the active one — pins the PG-side admin_disabled filter in parity with
-    # the DuckDB group-fanout test (a PG-only drop of the clause would otherwise
-    # grant a disabled plugin that silently activates on re-enable).
     import sqlalchemy as sa
     with store_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO marketplace_registry (id, name, url, registered_at) "
+                "VALUES ('m1', 'm1', 'https://example.test/m1.git', CURRENT_TIMESTAMP)"
+            )
+        )
         conn.execute(
             sa.text(
                 "INSERT INTO marketplace_plugins (marketplace_id, name, is_system, admin_disabled) "
                 "VALUES ('m1', 'p1', TRUE, FALSE), ('m1', 'p2', TRUE, TRUE)"
             )
         )
-    n = grants.fanout_system_for_group(g["id"], assigned_by="admin")
-    assert n == 1
-    assert grants.has_grant([g["id"]], "marketplace_plugin", "m1/p1")
-    assert not grants.has_grant([g["id"]], "marketplace_plugin", "m1/p2")
-    # Idempotent re-run grants nothing new — the count must be 0, not 1. The
-    # ON CONFLICT DO NOTHING path must report via rowcount, not unconditionally,
-    # so the PG count stays accurate (parity with DuckDB's ConstraintException
-    # skip).
-    assert grants.fanout_system_for_group(g["id"], assigned_by="admin") == 0
+
+    served = {(r["marketplace_id"], r["name"])
+              for r in plugins.list_granted_for_groups([g["id"]])}
+    # p1 is served with NO grant row for this group — that is the read-time
+    # resolution the fan-out used to fake by writing one.
+    assert ("m1", "p1") in served
+    assert ("m1", "p2") not in served
+    assert set(plugins.list_system_keys()) == {("m1", "p1")}
 
 
 # ---------------------------------------------------------------------------
@@ -293,28 +291,6 @@ def test_curated_subscribe_unsubscribe(store_engine):
     assert repo.unsubscribe("u1", "m1", "p1") is True
 
 
-def test_curated_fanout_system_for_user(store_engine):
-    """A new user picks up every active system plugin: is_system=TRUE AND
-    admin_disabled=FALSE. A non-system plugin (p3) and an admin-disabled
-    system plugin (p4) are both excluded — pins the PG disabled-filter edge
-    in parity with the DuckDB test."""
-    from src.repositories.user_curated_subscriptions_pg import (
-        UserCuratedSubscriptionsPgRepository,
-    )
-
-    repo = UserCuratedSubscriptionsPgRepository(store_engine)
-    import sqlalchemy as sa
-    with store_engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                "INSERT INTO marketplace_plugins (marketplace_id, name, is_system, admin_disabled) "
-                "VALUES ('m1', 'p1', TRUE, FALSE), ('m1', 'p2', TRUE, FALSE), "
-                "('m1', 'p3', FALSE, FALSE), ('m1', 'p4', TRUE, TRUE)"
-            )
-        )
-    repo.fanout_system_for_user("u1")
-    subs = repo.subscribed_set("u1")
-    assert subs == {("m1", "p1"), ("m1", "p2")}
 
 
 def test_curated_stack_counts_groups_by_plugin(store_engine):
