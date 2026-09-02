@@ -1117,6 +1117,53 @@ class TestPolicyPreviewMappingWarning:
         assert resp.status_code == 200, resp.text
         assert resp.json()["mapping_warning"] is None
 
+    def test_single_persona_preview_still_writes_an_audit_row_on_the_mapping_warning_path(
+        self, policied_invoices_with_empty_mapping
+    ):
+        """finding B (follow-up review of PR #2023): the mapping_warning early
+        return must not bypass the §13.1 audit obligation -- it still shows
+        one persona's (attempted) slice."""
+        c = policied_invoices_with_empty_mapping["client"]
+        token = policied_invoices_with_empty_mapping["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/mapped_invoices/policy/preview",
+            json={"as_user": "admin@test.com"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["mapping_warning"]
+
+        rows = _audit_rows(action="access_policy.preview", resource="mapped_invoices")
+        assert rows, "the early mapping_warning return left no audit trail"
+        raw_params = rows[0]["params"]
+        params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert params.get("mapping_warning") is True
+        assert "SELECT" not in json.dumps(params).upper()
+
+    def test_preview_groups_still_writes_an_audit_row_on_the_mapping_warning_path(
+        self, policied_invoices_with_empty_mapping
+    ):
+        """finding B (follow-up review of PR #2023): same obligation for the
+        batch preview-groups early return."""
+        c = policied_invoices_with_empty_mapping["client"]
+        token = policied_invoices_with_empty_mapping["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/mapped_invoices/policy/preview-groups",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["mapping_warning"]
+
+        rows = _audit_rows(action="access_policy.preview_groups", resource="mapped_invoices")
+        assert rows, "the early mapping_warning return left no audit trail"
+        raw_params = rows[0]["params"]
+        params = json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert params.get("mapping_warning") is True
+        assert "SELECT" not in json.dumps(params).upper()
+
 
 @pytest.fixture
 def policied_wide_table_for_preview(seeded_app, mock_extract_factory, monkeypatch):
@@ -1552,9 +1599,7 @@ class TestPolicyPreviewTranspiled:
         assert resp.status_code == 422, resp.text
         assert "policy_preview_transpile_failed" in resp.text
 
-    def test_untranspilable_candidate_sql_surfaces_the_error_inline(
-        self, policied_bq_remote_for_preview, monkeypatch
-    ):
+    def test_untranspilable_candidate_sql_surfaces_the_error_inline(self, policied_bq_remote_for_preview, monkeypatch):
         from src.access_policy import PolicyError
 
         def _boom(sql, *, table_id, dialect):

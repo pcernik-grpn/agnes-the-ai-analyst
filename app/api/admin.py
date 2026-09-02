@@ -7220,6 +7220,25 @@ async def preview_table_policy(
     # the same condition.
     mapping_warning = _policy_preview_mapping_warning(policy_sql)
     if mapping_warning:
+        # Finding B (follow-up review of PR #2023) -- this early return skips
+        # every live query below, but it is still a preview that shows one
+        # persona's (attempted) slice, so it owes the same audit row the
+        # success path writes further down. `log_safe` (never raises) rather
+        # than `audit_repo().log` directly: an audit-write failure here must
+        # not turn an otherwise-clean 200 into a 500.
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview",
+            resource=table_id,
+            params=_sanitize_for_audit(
+                {
+                    "as_user": request.as_user,
+                    "as_groups": request.as_groups,
+                    "candidate_sql": request.sql,
+                    "mapping_warning": True,
+                }
+            ),
+        )
         return {
             "columns": [],
             "sample_rows": [],
@@ -7444,6 +7463,15 @@ async def preview_table_policy_all_groups(
     # instead of one explanation up front.
     mapping_warning = _policy_preview_mapping_warning(policy_sql)
     if mapping_warning:
+        # Finding B (follow-up review of PR #2023) -- same reasoning as the
+        # single-persona preview's early return above: still audited, just
+        # without the per-group results the live sweep below would produce.
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview_groups",
+            resource=table_id,
+            params=_sanitize_for_audit({"candidate_sql": request.sql, "mapping_warning": True}),
+        )
         return {"rows_total": None, "groups": [], "mapping_warning": mapping_warning}
 
     try:
