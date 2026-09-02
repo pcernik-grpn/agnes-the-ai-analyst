@@ -2217,6 +2217,9 @@
     font-size: 11px; font-weight: 400; letter-spacing: 0;
     text-transform: none; color: var(--ds-text-secondary);
   }
+  /* Third and last place the scope gets the accent rule: the group list's
+     band, the audience row, and the moment of choosing. One device. */
+  .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
@@ -2914,6 +2917,26 @@
     return (overview.groups || []).slice().sort(
       (a, b) => String(a.name).localeCompare(String(b.name)));
   }
+
+  /* The audience that is not a group. `id` is the sentinel the server
+     already speaks (`src/grant_scopes.py::EVERYONE_TARGET_ID`), and the
+     shape mimics a group only as far as the picker's own row renderer
+     needs — it deliberately has no `member_count`, so anything that tries
+     to count it gets `undefined` rather than a plausible wrong number. */
+  const EVERYONE_AUDIENCE = { id: "everyone", is_scope: true, name: "Everyone",
+                              description: "Every account, and anyone who joins." };
+
+  /* Mirrors `src.grant_scopes.SCOPE_WITHHELD_TYPES` (decision 07). Kept as a
+     literal rather than read off the payload because the server enforces it
+     with a 422 either way; this only stops the page offering the choice. */
+  const SCOPE_WITHHELD_TYPES = new Set(["slack_channel", "table", "memory_domain", "memory_item"]);
+
+  //: Does an everyone-wide grant on this resource already exist? Asked of the
+  //: carrier, since that is where such a row is stored on both backends.
+  const everyoneHeld = (type, rid) => {
+    const cid = everyoneGroupId();
+    return !!(cid && grantOf(cid, type, rid));
+  };
 
   // Group filtering is CLIENT-side, unlike the member search: groups are a
   // small, fully-loaded set (they arrive with the overview in one round trip),
@@ -3797,20 +3820,43 @@
     });
   }
 
-  async function writeGrant(type, resourceId, requirement, groupId) {
+  /* `scope` is the audience when the audience is not a group. Passing
+     `"everyone"` is what decision 04 turned into an explicit act: reaching
+     every account used to be a hidden membership fact (a group that happened
+     to hold everybody) or a flag on a plugin, and is now a choice made at
+     grant time and recorded on the row.
+
+     `group_id` is still sent and still required — the column is NOT NULL, and
+     the unique key on it is what keeps one everyone-grant per resource. The
+     server does not trust whatever we send for it on a scoped grant: the
+     repository's `_carrier_or` forces the seeded carrier, so the audience
+     cannot be smuggled in through the group field. We send the carrier
+     anyway, because a request that means what it says is easier to read in a
+     log than one that relies on being overridden. */
+  async function writeGrant(type, resourceId, requirement, groupId, scope) {
+    const gid = scope === "everyone" ? (everyoneGroupId() || groupId) : (groupId || selectedGroup);
     const r = await fetch(GRANTS_API, {
       method: "POST", credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ group_id: groupId || selectedGroup, resource_type: type, resource_id: resourceId, requirement }),
+      body: JSON.stringify({ group_id: gid, resource_type: type, resource_id: resourceId, requirement,
+                             ...(scope ? { scope } : {}) }),
     });
     if (!r.ok) {
       const b = await r.json().catch(() => ({}));
       throw new Error(typeof b.detail === "string" ? b.detail : `HTTP ${r.status}`);
     }
     const created = await r.json();
+    /* The optimistic row must carry `audience` too, or the renderers that
+       read it (the audience row, the collapsed reach line, the section
+       split) treat a freshly-written everyone grant as an ordinary group
+       grant until the next full repaint — which is the exact false claim
+       those renderers were fixed to stop making. */
     overview.grants.push({
-      id: created.id, group_id: groupId || selectedGroup,
+      id: created.id, group_id: gid,
       resource_type: type, resource_id: resourceId, requirement,
+      scope: scope || null,
+      audience: scope === "everyone" ? "everyone" : gid,
+      section: "change_here",
     });
   }
 
@@ -4706,6 +4752,13 @@
      the overview deliberately does not ship its roster (see the `member_ids`
      note in app/api/access.py). Everything else unions the real ids. */
   function reachOf(groupIds) {
+    /* The sentinel is not in `overview.groups` — by design, since it is not
+       a group — so it would be silently dropped here and the picker's
+       "N people" line would count only the real groups chosen alongside it.
+       That reads as everyone being FEWER people than a two-person team. */
+    if ((groupIds || []).includes(EVERYONE_AUDIENCE.id)) {
+      return overview.account_total ?? 0;
+    }
     const groups = (groupIds || [])
       .map((id) => (overview.groups || []).find((g) => g.id === id))
       .filter(Boolean);
@@ -5710,14 +5763,33 @@
   }
 
   //: The groups that do NOT already hold this bundle.
+  /* Who this resource can be given to. Decision 04: the list holds groups
+     someone actually made, and "give this to everyone" sits beside them as
+     an explicit choice rather than as a group that happens to hold
+     everybody.
+
+     The carrier is filtered OUT as a group and re-offered as the scope. It
+     is the same row in the database either way — an everyone grant is stored
+     against the seeded group because the column is NOT NULL — but offering
+     it twice would let an admin pick "everyone" and "the Everyone group" as
+     if they were different audiences, and then hit the unique key. */
   function pickerGroupCandidates() {
     const q = pickerState.q.trim().toLowerCase();
     const b = pickerState.bundle;
-    return (overview.groups || []).filter((g) => {
+    const groups = (overview.groups || []).filter((g) => {
+      if (g.is_everyone) return false;
       if (grantOf(g.id, b.type, b.id)) return false;
       const hay = `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`.toLowerCase();
       return !q || hay.includes(q);
     });
+    /* Withheld for the four types where a grant does not mean "this audience
+       gets the thing" (decision 07) — the same list the server refuses with
+       a 422, so the page cannot offer a choice the API would reject. */
+    const scopeOk = !SCOPE_WITHHELD_TYPES.has(b.type);
+    const held = everyoneHeld(b.type, b.id);
+    const offerScope = scopeOk && !held
+      && (!q || "everyone every account workspace".includes(q));
+    return offerScope ? [EVERYONE_AUDIENCE, ...groups] : groups;
   }
 
   //: Everything grantable the group does not already hold, by family.
@@ -5848,11 +5920,19 @@
         const key = g.id;
         const on = pickerState.chosen.has(key);
         const n = g.member_count ?? 0;
+        /* The scope carries no count. A roster number here would be the same
+           false claim the three renderers on the page were fixed to stop
+           making — worse in the picker, because it is read at the moment of
+           DECIDING, so a stale-looking "41 people" invites "that is fewer
+           than I meant" and the choice gets abandoned. */
+        const detail = g.is_scope
+          ? esc(g.description)
+          : `${n} ${n === 1 ? "person" : "people"}${g.description ? ` · ${esc(g.description)}` : ""}`;
         return `
-        <button type="button" class="ax-pk-r ax-pk-r--g ${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
+        <button type="button" class="ax-pk-r ax-pk-r--g ${g.is_scope ? "ax-pk-r--scope " : ""}${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
           <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
           <span class="ax-pk-r__nm">${AgnesKindGlyph.groupGlyph()} ${esc(titleOf(g))}
-            <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${g.description ? ` · ${esc(g.description)}` : ""}</span>
+            <span class="ax-r__d">${detail}</span>
           </span>
         </button>`;
       }).join("");
@@ -5935,12 +6015,18 @@
     for (const key of chosen) {
       const type = bundleMode ? pickerState.bundle.type : key.slice(0, key.indexOf(":"));
       const rid = bundleMode ? pickerState.bundle.id : key.slice(key.indexOf(":") + 1);
-      const gid = bundleMode ? key : pickerState.group;
+      // In bundle mode the key IS the audience, and one of them is not a
+      // group: the sentinel routes to `scope` instead of `group_id`.
+      const asScope = bundleMode && key === EVERYONE_AUDIENCE.id;
+      const gid = bundleMode ? (asScope ? everyoneGroupId() : key) : pickerState.group;
       try {
-        await writeGrant(type, rid, "available", gid);
+        await writeGrant(type, rid, "available", gid, asScope ? "everyone" : undefined);
         ok++;
       } catch (err) {
-        failed.push(bundleMode ? (titleOf((overview.groups || []).find((g) => g.id === key) || {}) || key) : rid);
+        failed.push(bundleMode
+          ? (asScope ? EVERYONE_AUDIENCE.name
+                     : (titleOf((overview.groups || []).find((g) => g.id === key) || {}) || key))
+          : rid);
       }
     }
     closePicker();

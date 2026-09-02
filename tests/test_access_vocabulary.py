@@ -421,3 +421,80 @@ class TestTheGrantListSplitsOnWhatCanBeActedOn:
         sources = Path("src/grant_sources.py").read_text(encoding="utf-8")
         assert "Yours to change" not in sources
         assert "Change it here." in sources
+
+
+class TestGivingSomethingToEveryoneIsAnExplicitChoice:
+    """Decision 04: reaching every account is an act, not a membership fact.
+
+    Before, an admin reached everybody two ways, neither of them a visible
+    decision: by granting to a group that happened to hold every account, or
+    by marking a plugin "system" on a different page. The audience picker now
+    offers the scope beside the groups, and picking it writes `scope` on the
+    row.
+
+    The carrier is filtered out as a GROUP in the same move. An everyone
+    grant is stored against the seeded group either way — the column is NOT
+    NULL, and the unique key on it is what keeps one everyone-grant per
+    resource — so offering both would let an admin pick "everyone" and "the
+    Everyone group" as if they were different audiences, and then collide on
+    that key.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_scope_is_offered_and_the_carrier_is_not(self):
+        src = self._source()
+        assert 'EVERYONE_AUDIENCE = { id: "everyone"' in src
+        # The candidate list drops the carrier as a group...
+        assert "if (g.is_everyone) return false;" in src
+        # ...and re-offers it as the scope.
+        assert "offerScope ? [EVERYONE_AUDIENCE, ...groups] : groups" in src
+
+    def test_the_scope_is_withheld_where_a_grant_does_not_mean_audience(self):
+        """Decision 07's four types, which the server also refuses with 422.
+
+        The page must not offer a choice the API would reject — an admin who
+        picks it and gets an error learns nothing about why.
+        """
+        src = self._source()
+        assert "SCOPE_WITHHELD_TYPES = new Set([" in src
+        for t in ("slack_channel", "table", "memory_domain", "memory_item"):
+            assert f'"{t}"' in src
+        assert "!SCOPE_WITHHELD_TYPES.has(b.type)" in src
+
+    def test_it_is_not_offered_twice_for_the_same_resource(self):
+        """The unique key allows one everyone-grant per resource."""
+        src = self._source()
+        assert "const held = everyoneHeld(b.type, b.id);" in src
+        assert "&& !held" in src
+
+    def test_picking_it_writes_a_scope_not_a_group(self):
+        src = self._source()
+        assert 'writeGrant(type, rid, "available", gid, asScope ? "everyone" : undefined)' in src
+        assert "...(scope ? { scope } : {})" in src
+
+    def test_the_optimistic_row_carries_its_audience(self):
+        """Or the renderers make the false claim again until the next repaint.
+
+        `overview.grants` is appended locally after a successful POST so the
+        page repaints without a refetch. A row missing `audience` is read as
+        an ordinary group grant by all three renderers that were fixed to
+        stop counting a scope as a roster.
+        """
+        src = self._source()
+        assert 'audience: scope === "everyone" ? "everyone" : gid,' in src
+
+    def test_the_sentinel_counts_as_every_account(self):
+        """It is not in `overview.groups`, so a lookup silently drops it.
+
+        Dropped, the picker's reach line counts only the real groups chosen
+        alongside it — reporting everyone as fewer people than a two-person
+        team.
+        """
+        src = self._source()
+        assert "if ((groupIds || []).includes(EVERYONE_AUDIENCE.id)) {" in src
