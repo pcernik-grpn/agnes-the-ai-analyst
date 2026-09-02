@@ -2021,7 +2021,7 @@ function _renderAgentSelectMenu(filter) {
       newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
         if (window.appToast) {
-          window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
+          window.appToast({ kind: "error", msg: _agentStartMessage(err) });
         }
       });
     };
@@ -2144,7 +2144,56 @@ async function _refreshAgents() {
 }
 
 
+/** What to say when starting a chat as an agent fails.
+ *
+ * The generic "Could not start a chat with that agent" blamed the agent for
+ * the one failure that is really about the reader's own open conversations:
+ * the per-user concurrency cap answers 429, and the fix is theirs to make. */
+function _agentStartMessage(err) {
+  const msg = String((err && err.message) || "");
+  if (msg.includes("429")) {
+    return "Too many conversations open. Close one from the sidebar, then try again.";
+  }
+  return "Could not start a chat with that agent.";
+}
+
+/** Let go of the conversation we are leaving, IF there is nothing in it.
+ *
+ * A session becomes live the moment the browser attaches to it, and the
+ * per-user concurrency cap counts live sessions — so three abandoned empty
+ * ones are enough to make the NEXT create fail with 429. That is not
+ * hypothetical: starting a chat with an agent, changing your mind, and
+ * starting one with a different agent is three sessions in about four seconds,
+ * and the third click was refused with "Could not start a chat with that
+ * agent" — a message that blames the agent for a slot the reader is holding
+ * themselves.
+ *
+ * `create_session` already soft-archives a user's prior EMPTY web sessions,
+ * for the same reason ("+ New chat" clicked ten times used to leave ten
+ * 'Untitled chat' rows) — but it does that AFTER the cap check and only in the
+ * database, so the live session keeping the slot survives it. Archiving
+ * through the endpoint is what actually releases one: it kills the sandbox
+ * (`_kill_quietly`) and drops the row from the manager's live registry.
+ *
+ * Only ever an EMPTY session, and only the one we are leaving: a conversation
+ * with a single turn in it is somebody's work. Best-effort — a failure here
+ * must never be the reason a new chat cannot start, so the create runs either
+ * way and the cap simply behaves as it did before. */
+async function _releaseEmptyCurrentSession() {
+  if (!currentChatId || _sessionHasTurns) return;
+  const leaving = currentChatId;
+  try {
+    await api(`/api/chat/sessions/${leaving}/archived`, {
+      method: "PUT",
+      body: JSON.stringify({ archived: true }),
+    });
+  } catch (err) {
+    console.warn("chat: could not release the empty session being left", err);
+  }
+}
+
 async function newChat(agentSlug) {
+  await _releaseEmptyCurrentSession();
   const body = { surface: "web" };
   if (agentSlug) body.agent_slug = agentSlug;
   const created = await api("/api/chat/sessions", {
@@ -8481,8 +8530,16 @@ const ChatAttachments = (() => {
     newChat(_agentSlug).catch((err) => {
       console.error("chat: could not start a session as agent", err);
       if (window.appToast) {
-        window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
+        window.appToast({ kind: "error", msg: _agentStartMessage(err) });
       }
+      // Put the page back. The dashboard was hidden one line up in anticipation
+      // of a conversation that never opened, and nothing else was going to
+      // restore it — so a stale link (a renamed or deleted agent, which answers
+      // 404, or the concurrency cap, which answers 429) left a BLANK chat page
+      // behind a toast that fades. Same posture as submitUserMessage's own
+      // failure path: nothing started, so hand back the state we came from.
+      showCapabilities();
+      _syncAgentIdentity();
     });
   }
   // Chat-driven onboarding — render the journey panel and prime the greeting/

@@ -576,6 +576,38 @@ class TestTheChatWindowSaysWhoYouAreTalkingTo:
         assert "cloud-chat-agent-select-ico" in html, "the selector carries no agent glyph"
         assert "Manage agents" in html, "no route to the page that lists them all"
 
+    def test_switching_agents_releases_the_session_it_leaves(self):
+        """A session goes live the moment the browser attaches, and the per-user
+        concurrency cap counts live sessions — so three abandoned empty ones make
+        the next create fail with 429. Starting a chat with one agent, changing
+        your mind and starting one with another is three sessions in four
+        seconds, and the third click was refused.
+
+        `create_session` soft-archives prior empty web sessions already, but
+        AFTER the cap check and only in the database — the live session holding
+        the slot survives it. Archiving through the endpoint is what releases
+        one: it kills the sandbox and drops the row from the live registry.
+        """
+        js = self._js()
+        block = js[js.index("async function _releaseEmptyCurrentSession()") :]
+        block = block[: block.index("\n}")]
+        assert "if (!currentChatId || _sessionHasTurns) return;" in block, (
+            "a conversation with turns in it is somebody's work; never archive it"
+        )
+        assert "/archived" in block and "archived: true" in block, (
+            "the empty session is not archived, so its live slot is never released"
+        )
+        # Every door into a new session goes through newChat, so releasing there
+        # covers the selector, the deep link and "+ New chat" at once.
+        assert "await _releaseEmptyCurrentSession();" in js[js.index("async function newChat(") :][:200]
+
+    def test_the_cap_failure_says_whose_problem_it_is(self):
+        """"Could not start a chat with that agent" blamed the agent for a slot
+        the reader is holding themselves."""
+        js = self._js()
+        assert "function _agentStartMessage" in js
+        assert "Too many conversations open" in js
+
     def test_an_agents_chat_withholds_the_instance_suggestions(self):
         """The suggested questions are computed from what this DEPLOYMENT holds
         and offered to everyone. Under a heading reading "You're chatting with
