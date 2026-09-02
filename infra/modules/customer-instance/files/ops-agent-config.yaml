@@ -16,12 +16,22 @@ logging:
   receivers:
     agnes_containers:
       type: fluent_forward
-      port: 24224
+      # `listen_host` / `listen_port`, not `port` — the agent refuses to
+      # start on an unknown field, and a refusal here means nothing is
+      # accepting the containers' logs at all. Verified on a live VM.
+      listen_host: 127.0.0.1
+      listen_port: 24224
   processors:
     # Docker's fluentd driver puts the container's line in `log`; Agnes
     # writes one JSON object per line (app/logging_config.py).
     agnes_json:
       type: parse_json
+      # `field: log` is load-bearing. The fluent_forward receiver hands the
+      # agent a record whose fields are Docker's (`log`, `container_id`,
+      # `container_name`, `source`); the app's own JSON is the STRING in
+      # `log`. Without this the record is already structured, parse_json
+      # finds nothing to do, and the line arrives as an opaque string at
+      # severity DEFAULT — the exact outcome this pipeline exists to avoid.
       field: log
       time_key: time
       time_format: "%Y-%m-%dT%H:%M:%S.%L%z"

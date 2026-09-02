@@ -3519,6 +3519,14 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestSubtreeSweepTrigger; not
     # duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/subtree-sweep",
+    # Standalone fact-graph trigger — build the graph over an already-indexed
+    # corpus, no crawl required. Same "enqueues into the EXISTING jobs table,
+    # no new schema surface" reasoning as its acl-sync/subtree-sweep siblings
+    # above; auth matrix, the facts-readiness 409, dedup, and the exact
+    # payload shape are covered by
+    # tests/test_admin_sharepoint.py::TestFactsExtractionTrigger; not
+    # duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/facts-extract",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

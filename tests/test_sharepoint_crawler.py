@@ -1217,6 +1217,63 @@ class TestConversionCrashIsolation:
         assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
 
 
+class TestItemProcessingTimeoutEndToEnd:
+    """The per-item time bound, exercised through a full crawl — the
+    end-to-end proof that a hung document fails as an ORDINARY, attributable
+    per-file failure (the same `convert_failed` path a crash already takes),
+    not as a crash and not silently, and that the run continues with its
+    siblings exactly like `TestConversionCrashIsolation` above."""
+
+    def test_a_hung_conversion_is_convert_failed_with_a_clear_reason_and_the_run_continues(
+        self, crawl_env, monkeypatch, caplog
+    ):
+        _at_concurrency(monkeypatch, 1)
+        monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 0.3)
+
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == b"HANG-ME":
+                time.sleep(30)
+            return ConvertResult("# converted fine")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                if "/items/hangs/content" in url:
+                    return httpx.Response(200, content=b"HANG-ME")
+                return httpx.Response(200, content=b"fine-bytes")
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item("hangs", name="bad.xlsx", ctag="c1"),
+                        _file_item("ok", name="ok.txt", ctag="c2"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        # The hung file is counted and moved past — never a crash, never a
+        # run that simply never finishes.
+        assert report["convert_failed"] == 1
+        assert report["new"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:ok"]
+
+        detail = report["errors_detail"]["items"][0]
+        assert detail["reason"] == "convert_failed"
+        assert detail["path"].endswith("bad.xlsx")
+        assert "0" in detail["detail"] and "budget" in detail["detail"].lower()
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("bad.xlsx" in m and "timed out" in m.lower() for m in messages), messages
+
+
 class TestConvertProcessPoolRecycling:
     """`_ConvertProcessPool` recycling — the OOM guard for a crash survivor
     that just keeps running: markitdown/pypdfium2 hold onto memory per
@@ -1312,6 +1369,94 @@ class TestConvertProcessPoolRecycling:
             # other crash.
             pool.repair()
             assert pool.convert(0, f_ok, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+
+class TestConvertProcessPoolItemTimeout:
+    """`_ConvertProcessPool`'s per-item TIME bound — the fix for a real,
+    observed gap: nothing previously bounded how long a single document's
+    CONVERSION could occupy a worker slot, so a worker stuck inside native
+    conversion code (the same class of failure crash-isolation already
+    guards against, just hanging instead of aborting) ran forever. Observed
+    on a live deployment: one file occupied a slot for over nine minutes
+    with no bound at all, during which neither the run-level deadline (only
+    checked BETWEEN items) nor a cooperative stop request (polled at the
+    same quiescent points) could fire — the kernel's OOM killer was the
+    only thing that eventually ended the run.
+
+    Killed with SIGKILL, never SIGTERM: a worker stuck in a genuine native
+    hang is exactly the kind of process that can freely ignore a
+    termination request, so this path must not itself risk hanging.
+    """
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_a_hung_worker_is_killed_after_the_timeout_and_counted_as_a_timeout(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            time.sleep(30)  # far longer than the pool's own timeout below
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, timeout_s=0.3)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "hangs.xlsx", b"anything")
+            started = time.monotonic()
+            with pytest.raises(crawler._ConvertTimedOut) as exc_info:
+                pool.convert(0, f, "application/octet-stream")
+            elapsed = time.monotonic() - started
+            # Bounded near the configured timeout, not near the 30s sleep —
+            # the whole point of killing rather than waiting it out.
+            assert elapsed < 5
+            assert exc_info.value.timeout_s == 0.3
+        finally:
+            pool.shutdown()
+        # The hung worker was actually killed (never left running past the
+        # test), which is what makes `elapsed < 5` meaningful rather than
+        # coincidental.
+        assert first_pid != pool._procs[0].pid if pool._procs[0] else True
+
+    def test_the_slot_recovers_via_the_pre_forked_spare_and_keeps_converting(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            # Keyed off the FILE's own content, not a shared counter: each
+            # forked child (the active worker AND its pre-forked spare) gets
+            # an independent copy of any closure state at fork time, so a
+            # call-count closure cannot tell "first call on this process"
+            # from "first call on the pool" — the same reason the crash
+            # tests above key off content too.
+            if Path(path).read_bytes() == b"HANG-ME":
+                time.sleep(30)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, timeout_s=0.3)
+        pool.start()
+        try:
+            f_hang = self._write(tmp_path, "hangs.xlsx", b"HANG-ME")
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            with pytest.raises(crawler._ConvertTimedOut):
+                pool.convert(0, f_hang, "application/octet-stream")
+            # The SAME slot, on the promoted spare, answers the next file —
+            # no crawl-level repair() needed, exactly like crash recovery.
+            outcome = pool.convert(0, f_ok, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_zero_disables_the_bound_the_pre_fix_behaviour_exactly(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, timeout_s=0)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
         finally:
             pool.shutdown()
 
@@ -2942,6 +3087,119 @@ class TestProgressCheckpointing:
         recorder.maybe_checkpoint(stats)  # must not raise
 
 
+class TestFactsProgressCheckpointing:
+    """`_RunRecorder.checkpoint_facts`/`maybe_checkpoint_facts` — the facts
+    phase's own liveness signal (owner-frustration fix, 2026-09-02). A
+    healthy multi-hour facts pass wrote NOTHING here before this, so the
+    status endpoint's staleness check declared it dead the longer (and
+    more expensive) it ran — exactly backwards."""
+
+    def _recorder(self, monkeypatch, clock):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start(clock=clock)
+        return recorder, runs
+
+    def test_checkpoint_facts_writes_the_facts_phase(self, monkeypatch):
+        recorder, runs = self._recorder(monkeypatch, lambda: 1000.0)
+        stats = crawler.CrawlStats()
+        stats.add(items_seen=24, items_done=24)
+
+        recorder.checkpoint_facts(stats, docs_done=5, docs_total=12, current_path="a.docx")
+
+        assert len(runs.checkpoints) == 1
+        cp = runs.checkpoints[0]
+        assert cp["phase"] == "facts"
+        assert cp["progress"]["facts"] == {"docs_done": 5, "docs_total": 12}
+        assert cp["progress"]["activity"]["phase"] == "facts"
+        assert cp["progress"]["activity"]["current_path"] == "a.docx"
+        assert cp["enumeration_done"] is True
+
+    def test_the_crawl_s_own_counters_survive_a_facts_checkpoint(self, monkeypatch):
+        """`files_seen`/`files_done` and the crawl's own `progress` fields
+        (`new`/`changed`/...) are the crawl phase's LAST true numbers —
+        still honest facts about this run — and a facts checkpoint must
+        not blast them to whatever the facts pass's own submission count
+        happens to be."""
+        recorder, runs = self._recorder(monkeypatch, lambda: 1000.0)
+        stats = crawler.CrawlStats()
+        stats.add(items_seen=24, items_done=24, new=20, changed=4)
+
+        recorder.checkpoint_facts(stats, docs_done=1, docs_total=200, current_path="a.docx")
+
+        cp = runs.checkpoints[0]
+        assert cp["files_seen"] == 24
+        assert cp["files_done"] == 24
+        assert cp["progress"]["new"] == 20
+        assert cp["progress"]["changed"] == 4
+
+    def test_a_facts_checkpoint_with_no_current_path_carries_none(self, monkeypatch):
+        """The eager "phase started" call fires before any document is in
+        flight — a real, honest `None`, never an invented placeholder."""
+        recorder, runs = self._recorder(monkeypatch, lambda: 1000.0)
+        stats = crawler.CrawlStats()
+
+        recorder.checkpoint_facts(stats, docs_done=0, docs_total=0)
+
+        cp = runs.checkpoints[0]
+        assert cp["progress"]["activity"]["current_path"] is None
+        assert cp["progress"]["activity"]["current_started_at"] is None
+
+    def test_the_first_call_after_a_crawl_is_always_due(self, monkeypatch):
+        """The crawl phase's own throttle bookkeeping must not carry over —
+        the first facts checkpoint after the hand-off must not wait out the
+        crawl's own rate limit."""
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+        stats.add(items_seen=24, items_done=24)
+        # The crawl phase just fired its own (unrelated) checkpoint.
+        recorder.maybe_checkpoint(stats, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+
+        recorder.maybe_checkpoint_facts(stats, docs_done=0, docs_total=0, clock=lambda: clock["t"])
+
+        assert len(runs.checkpoints) == 2
+        assert runs.checkpoints[1]["phase"] == "facts"
+
+    def test_it_stays_rate_limited_between_documents(self, monkeypatch):
+        clock = {"t": 1000.0}
+        recorder, runs = self._recorder(monkeypatch, lambda: clock["t"])
+        stats = crawler.CrawlStats()
+
+        recorder.maybe_checkpoint_facts(stats, docs_done=1, docs_total=50, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1
+
+        clock["t"] += 0.1  # well under both thresholds
+        recorder.maybe_checkpoint_facts(stats, docs_done=2, docs_total=50, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 1  # unchanged
+
+        clock["t"] += crawler._PROGRESS_CHECKPOINT_INTERVAL_S
+        recorder.maybe_checkpoint_facts(stats, docs_done=3, docs_total=50, clock=lambda: clock["t"])
+        assert len(runs.checkpoints) == 2
+
+    def test_never_fires_when_recording_is_unavailable(self, monkeypatch):
+        def _raise():
+            raise RuntimeError("no backend")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()  # swallows the failure; run_id stays None
+        stats = crawler.CrawlStats()
+        recorder.maybe_checkpoint_facts(stats, docs_done=1, docs_total=1)  # must not raise
+
+    def test_a_facts_checkpoint_write_failure_does_not_stop_the_pass(self, monkeypatch):
+        class Flaky(FakeRunsRepo):
+            def checkpoint(self, run_id, **kwargs):
+                raise RuntimeError("db hiccup")
+
+        _install_runs_repo(monkeypatch, Flaky())
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()
+        stats = crawler.CrawlStats()
+        recorder.checkpoint_facts(stats, docs_done=1, docs_total=1)  # must not raise
+
+
 class TestDetectorUsageRecording:
     """The LLM tier's token accounting must reach the run record (`usage`)
     and the crawl report (`ner_usage`) — and `{}`/absence must keep meaning
@@ -3137,6 +3395,58 @@ class TestConcurrencyResolution:
         assert report["concurrency"]["configured"] == 6
         assert report["concurrency"]["source"] == "payload"
         assert report["new"] == 3
+
+
+class TestItemTimeoutResolution:
+    """The knob itself — ``extraction.crawler.item_timeout_s``."""
+
+    def test_the_configured_value_is_read_and_clamped(self, monkeypatch):
+        values: Dict[str, Any] = {}
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: values.get("v", default))
+
+        values["v"] = 120
+        assert crawler._item_timeout_seconds() == 120
+        values["v"] = -5
+        assert crawler._item_timeout_seconds() == 0, "negative clamps to 0 (disabled), never a negative timeout"
+        values["v"] = "not-a-number"
+        assert crawler._item_timeout_seconds() == crawler._DEFAULT_ITEM_TIMEOUT_S
+
+    def test_an_unset_value_is_the_default_and_the_default_is_nonzero(self, monkeypatch):
+        # The default must actually protect a large crawl — 0 (disabled)
+        # would silently reintroduce the unbounded-item bug.
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        assert crawler._item_timeout_seconds() == crawler._DEFAULT_ITEM_TIMEOUT_S
+        assert crawler._DEFAULT_ITEM_TIMEOUT_S > 0
+
+    def test_the_configured_value_reaches_the_convert_pool(self, monkeypatch):
+        monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 42)
+        seen: Dict[str, Any] = {}
+        real_pool = crawler._ConvertProcessPool
+
+        class _Spy(real_pool):
+            def __init__(self, *args, **kwargs):
+                seen["timeout_s"] = kwargs.get("timeout_s")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(crawler, "_ConvertProcessPool", _Spy)
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+
+        async def _token(tenant_id: str, client_id: str, private_key: str) -> str:
+            return "tok"
+
+        monkeypatch.setattr(gc, "get_app_token", _token)
+        monkeypatch.setattr(crawler, "_Ingestor", FakeIngestor)
+        monkeypatch.setattr(crawler, "resolve_sharepoint_settings", lambda connection: _FakeSettings())
+        FakeIngestor.reset()
+        _install_graph(monkeypatch, _one_page([]))
+        monkeypatch.setattr(
+            "src.repositories.source_connections_repo",
+            lambda: type("R", (), {"get": staticmethod(lambda cid: _connection([_drive_scope()]))})(),
+        )
+
+        crawler.run_builtin_crawl({"connection_id": "conn1"})
+
+        assert seen["timeout_s"] == 42
 
 
 class TestConcurrencyGovernor:
@@ -3740,7 +4050,7 @@ class TestFactsExtractionSeam:
         facts_report = {"docs_extracted": 2, "claims_written": 5, "facts_usage": {"calls": 2, "input_tokens": 900}}
         seen: List[Any] = []
 
-        def fake_stage(connection, *, deadline=None):
+        def fake_stage(connection, *, deadline=None, **kwargs):
             seen.append((connection["id"], deadline))
             return facts_report
 
@@ -3758,7 +4068,9 @@ class TestFactsExtractionSeam:
     def test_the_crawls_own_counters_are_untouched_by_the_stage(self, crawl_env, monkeypatch):
         self._one_file_crawl(monkeypatch)
         monkeypatch.setattr(
-            crawler, "maybe_run_facts_extraction", lambda connection, *, deadline=None: {"docs_extracted": 1}
+            crawler,
+            "maybe_run_facts_extraction",
+            lambda connection, *, deadline=None, **kwargs: {"docs_extracted": 1},
         )
         report = _run(_connection([_drive_scope()]), monkeypatch)
         assert report["new"] == 1
@@ -3772,7 +4084,7 @@ class TestFactsExtractionSeam:
 
         from connectors.sharepoint.facts_extraction import FactsExtractionUnavailable
 
-        def boom(connection, *, deadline=None):
+        def boom(connection, *, deadline=None, **kwargs):
             raise FactsExtractionUnavailable("no credential")
 
         monkeypatch.setattr(crawler, "maybe_run_facts_extraction", boom)
@@ -3781,6 +4093,76 @@ class TestFactsExtractionSeam:
 
         assert runs.finished[0]["status"] == "failed"
         assert "FactsExtractionUnavailable" in runs.finished[0]["error"]
+
+    def test_the_stage_checkpoints_its_own_progress_as_the_facts_phase(self, crawl_env, monkeypatch):
+        """Owner-frustration fix, 2026-09-02: a healthy multi-hour facts
+        pass never checkpointed at all, so the status endpoint declared it
+        `stalled` — worse, with a note inviting the operator to discard it
+        — the longer (and more expensive) it ran. The seam must reach the
+        SAME run row the crawl phase already checkpointed."""
+        runs = _install_runs_repo(monkeypatch)
+        self._one_file_crawl(monkeypatch)
+
+        def fake_after_crawl(connection, *, deadline=None, on_progress=None):
+            if on_progress is not None:
+                # A SECOND call right on the first's heels is correctly
+                # throttled by `maybe_checkpoint_facts` (see
+                # `TestFactsProgressCheckpointing` for that rate-limit
+                # contract in isolation) — one call here is enough to prove
+                # the wiring reaches the recorder at all.
+                on_progress({"docs_done": 1, "docs_total": 3, "current_path": "a.docx"})
+            return {"docs_extracted": 2}
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_run_after_crawl", fake_after_crawl)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        facts_checkpoints = [c for c in runs.checkpoints if c.get("phase") == "facts"]
+        assert facts_checkpoints, "the facts phase must write at least one checkpoint of its own"
+        last = facts_checkpoints[-1]
+        assert last["progress"]["facts"] == {"docs_done": 1, "docs_total": 3}
+        assert last["progress"]["activity"]["phase"] == "facts"
+        assert last["progress"]["activity"]["current_path"] == "a.docx"
+        # The crawl's own file counters are LAYERED under, not blasted to
+        # zero by the facts checkpoint's own submission count.
+        assert last["files_done"] == 1
+
+    def test_the_seam_wires_no_progress_callback_without_a_stats_and_recorder(self, monkeypatch):
+        """A caller with no run row to attach to (e.g. a standalone facts
+        trigger with no crawl `stats`/`recorder`) must still run cleanly —
+        `on_progress` is simply `None`, never an error, when either is
+        missing."""
+        captured: List[Any] = []
+
+        def fake_after_crawl(connection, *, deadline=None, on_progress=None):
+            captured.append(on_progress)
+            return {"docs_extracted": 1}
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_run_after_crawl", fake_after_crawl)
+
+        crawler.maybe_run_facts_extraction({"id": "conn1"})
+        crawler.maybe_run_facts_extraction({"id": "conn1"}, stats=crawler.CrawlStats())
+        crawler.maybe_run_facts_extraction({"id": "conn1"}, recorder=crawler._RunRecorder("conn1"))
+
+        assert captured == [None, None, None]
+
+    def test_the_seam_s_callback_reaches_maybe_checkpoint_facts(self, monkeypatch):
+        """Direct unit proof of the closure `maybe_run_facts_extraction`
+        builds, independent of a full crawl run."""
+        calls: List[Dict[str, Any]] = []
+
+        class FakeRecorder:
+            def maybe_checkpoint_facts(self, stats, *, docs_done, docs_total, current_path):
+                calls.append({"stats": stats, "docs_done": docs_done, "docs_total": docs_total, "path": current_path})
+
+        def fake_after_crawl(connection, *, deadline=None, on_progress=None):
+            on_progress({"docs_done": 7, "docs_total": 9, "current_path": "c.docx"})
+            return {"docs_extracted": 7}
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_run_after_crawl", fake_after_crawl)
+        stats = crawler.CrawlStats()
+        crawler.maybe_run_facts_extraction({"id": "conn1"}, stats=stats, recorder=FakeRecorder())
+
+        assert calls == [{"stats": stats, "docs_done": 7, "docs_total": 9, "path": "c.docx"}]
 
 
 # --------------------------------------------------------------------------
@@ -4177,3 +4559,62 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
         f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} would refuse an ordinary "
         f"single-byte document at the character cap ({single_byte_bytes} bytes)"
     )
+
+
+class TestRetryUsesTheConversionPool:
+    """A retried item must convert in the child-process pool, like every other
+    item — not inline in the crawl process.
+
+    `_retry_failed_items` replays this drive's backlog before asking Graph
+    what changed, and the entries in it are by definition the files that
+    already failed once. Converting those inline is the worst place to lose
+    the isolation: the pool exists precisely so a pathological document raises
+    a MemoryError inside its own child rather than taking the crawl with it,
+    and a file that timed out is the likeliest to do exactly that. Inline, the
+    one bad file blocks every later crawl indefinitely — the failure the
+    backlog exists to end (Devin Review on #2058).
+
+    Source inspection rather than a live crawl: the property is that the pool
+    reaches this call path at all, which the signature and the call site say
+    outright."""
+
+    @staticmethod
+    def _retry_source() -> str:
+        src = Path("connectors/sharepoint/crawler.py").read_text(encoding="utf-8")
+        i = src.index("async def _retry_failed_items(")
+        return src[i : src.index("\nasync def ", i + 10)]
+
+    def test_the_retry_loop_is_handed_the_pool(self):
+        body = self._retry_source()
+        assert "convert_pool" in body.split(") -> None:", 1)[0], (
+            "_retry_failed_items must take convert_pool — without it every "
+            "replayed item converts inline, outside the child-process isolation"
+        )
+        assert "convert_pool=convert_pool" in body, "the pool must reach _process_item"
+        assert "convert_slot=0" in body, (
+            "the retry loop is sequential, so it owns slot 0 — the same slot "
+            "the sequential page path uses"
+        )
+
+    def test_the_retry_loop_repairs_the_pool_before_each_item(self):
+        """The sequential page path repairs before each item because a crashed
+        worker must not silently take the next file with it. The retry loop
+        has the same shape and needs the same repair; it is safe here for the
+        same reason — the loop never creates a thread pool, so no other thread
+        can hold a lock a fork would copy."""
+        body = self._retry_source()
+        assert "convert_pool.repair()" in body, (
+            "a crashed conversion worker would otherwise carry into the next "
+            "retried item"
+        )
+
+    def test_the_caller_threads_the_pool_in(self):
+        """A signature that accepts the pool proves nothing if `_crawl_drive`
+        never passes it — the default is None and everything would still
+        convert inline, silently."""
+        src = Path("connectors/sharepoint/crawler.py").read_text(encoding="utf-8")
+        i = src.index("await _retry_failed_items(")
+        call = src[i : src.index("\n    )", i)]
+        assert "convert_pool=convert_pool" in call, (
+            "_crawl_drive must pass its run's pool into the backlog replay"
+        )

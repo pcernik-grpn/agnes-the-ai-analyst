@@ -150,6 +150,7 @@ class TestRegistration:
             "corpus-extraction",
             "sharepoint-acl-sync",
             "sharepoint-subtree-sweep",
+            "sharepoint-facts-extraction",
         }
 
 

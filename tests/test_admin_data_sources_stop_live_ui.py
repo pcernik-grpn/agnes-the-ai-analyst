@@ -60,6 +60,8 @@ _SIGNATURES = (
     "function _extTruncMiddle(path, max) {",
     "const EXT_DOT = {",
     "function _extDot(outcome) {",
+    "function _extIsFactsPhase(run) {",
+    "function _extPhaseCountText(run) {",
     "function _extRenderCrawlCell(connId, status) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",

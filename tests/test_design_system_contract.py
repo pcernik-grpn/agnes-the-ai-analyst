@@ -1649,3 +1649,39 @@ def test_admin_templates_have_no_inline_text_align_on_table_header() -> None:
         "inline `style=\"text-align:...\"` found on a <th> — use the `.num` class "
         "instead (#1707 A6):\n" + "\n".join(f"  {name}: {vals}" for name, vals in offenders.items())
     )
+
+
+def test_a_table_wrap_gives_firefox_a_scrollbar_it_can_see():
+    """`.data-table-wrap` styles `::-webkit-scrollbar` so an overflowing table
+    shows a persistent bar instead of macOS's overlay one, which is painted
+    only while the pointer is already scrolling — on Marketplaces that hid the
+    row's own verbs past the right edge with nothing on screen to say so.
+
+    Firefox implements neither the pseudo-element nor that assumption: on
+    macOS it follows the OS "show scroll bars automatically" setting, so on a
+    trackpad it paints an overlay bar too (Devin Review on #1989).
+
+    The standard `scrollbar-width` / `scrollbar-color` pair cannot simply be
+    added alongside: Chrome honours one model or the other, and seeing
+    `scrollbar-width` makes it DROP the `::-webkit-*` rules and fall back to
+    the overlay bar — the very bug. So the pair must live behind
+    `@supports not selector(::-webkit-scrollbar)`, which engines implementing
+    the pseudo-element skip entirely. This pins both halves: the gate exists,
+    and the properties are inside it rather than loose."""
+    raw = (Path("app/web/static/style-custom.css")).read_text(encoding="utf-8")
+    # Strip comments BEFORE splitting on the gate: the note above the gate
+    # quotes the at-rule verbatim, so splitting the raw text lands inside the
+    # comment and leaves half of it looking like declarations.
+    css = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+    assert "::-webkit-scrollbar" in css, "the webkit affordance must stay"
+    gate = "@supports not selector(::-webkit-scrollbar)"
+    assert gate in css, (
+        "Firefox needs scrollbar-width/scrollbar-color, gated so Chrome never "
+        "sees them and keeps its ::-webkit-* rules"
+    )
+    body = css.split(gate, 1)[1].split("}\n}", 1)[0]
+    assert "scrollbar-width" in body and "scrollbar-color" in body, body[:200]
+    assert "scrollbar-width" not in css.split(gate, 1)[0], (
+        "scrollbar-width must not be declared ungated — Chrome would drop the "
+        "::-webkit-* rules and go back to an overlay bar"
+    )

@@ -1213,6 +1213,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/changes
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
+- /api/admin/sharepoint/connections/{connection_id}/facts-extract
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1310,6 +1311,26 @@ mechanics to `POST …/acl-sync` above (same enqueue/flag-gate/dedup shape,
 sweep_already_running`), except the explicit-connection payload also bypasses
 the job's own per-connection due-guard (`acl_sync.sweep_interval_days`), so
 this always triggers a real sweep rather than a same-day no-op.
+
+`POST …/facts-extract` is the admin/ops trigger for the
+`sharepoint-facts-extraction` job — build the fact graph over whatever this
+connection's collections ALREADY hold, without running a crawl first (the
+only way this pass ran before this route existed was chained onto a crawl's
+tail, `maybe_run_after_crawl`, sharing that crawl's own budget). Optional
+JSON body `{doc_ids?, timeout_s?}`: `doc_ids` narrows the pass to specific
+documents (`corpus_file_sources.source_doc_id`), `timeout_s` overrides this
+run's OWN wall-clock budget (`extraction.facts.run_timeout_s`, default 3600s,
+0 = unbounded — never the crawl's `extraction.timeout_s`). Enqueues
+`{"connection_id": connection_id, ["doc_ids"], ["timeout_s"]}` and returns
+`202 {"job_id", "status"}`; `409 feature_disabled` when the `sharepoint`
+switch is off (router-level gate); `409 facts_extraction_disabled` when
+either of the stage's own two switches (`extraction.facts.enabled`,
+`facts.enabled`) is off, checked BEFORE enqueue so a misconfigured instance
+never gets a job that fails 30+ minutes later in a worker; `409
+facts_extraction_already_running` when one is already queued/running for
+this connection (its own idempotency key, distinct from every other kind's
+— a facts-extraction trigger never dedups against a crawl, an ACL sync or a
+subtree sweep). CLI: `agnes admin sharepoint facts-extract <connection_id>`.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
