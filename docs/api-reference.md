@@ -2243,6 +2243,30 @@ a real member's id and filename in this same listing) could re-upload an
 unrelated file under a member's own anchor and have it silently resolve to
 (and overwrite) that member's row.
 
+**Listing files is paginated.** `GET .../files` answers
+`{files, total, limit, offset}` — `limit` defaults to **25** and clamps to
+`1..200`, `offset` clamps to `>= 0`, and neither is ever a `422`: the web
+page builds these query strings itself and a validation error would break its
+own pagination links. `total` is the count AFTER the filters below and BEFORE
+`limit`/`offset`, so a caller paging a search can trust it as the number of
+matches rather than the collection's size. `GET /api/collections/{collection_id}`
+applies the same cap to its inline `files` and reports `files_total` +
+`files_truncated`, so a reader can tell "this collection has 25 files" from
+"this is the first page of 3000". **This is breaking** for a caller that
+assumed either list was complete.
+
+`q` filters by **case-insensitive substring** over `filename` and `path`, with
+LIKE metacharacters escaped so `report_v2` does not also match `reportXv2`.
+Note the deliberate difference from `GET /api/collections/search`, which
+searches document *contents* whole-word with no wildcard: `q=smlou` finds
+`smlouva.pdf` here and finds nothing there. `status` filters on an exact
+`processing_status`. A blank `?q=` or `?status=` — what an HTML form sends for
+an unset optional — means "no filter", never "match nothing". `order` is one
+of `newest` (the default here) / `oldest` / `name` / `size`; an unrecognised
+value falls back to `oldest` rather than erroring. Every ordering carries an
+`id ASC` tie-break, because files uploaded in one batch share a `created_at`
+and without it a page boundary would repeat or skip rows.
+
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The
 gate is **owner-or-admin**, not every grant-holder: a group grant conveys
