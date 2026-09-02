@@ -2991,14 +2991,6 @@
     memory_domain: (id) => `/admin/corporate-memory?domain=${encodeURIComponent(id)}`,
   };
 
-  const readsFor = (typeKey, tier) => {
-    if (!tier) return `<span class="ax-reads__off">not granted</span>`;
-    const m = READS[typeKey];
-    if (!m) return "";
-    const text = m.any || m[tier] || "";
-    return text ? `<span class="${m.quiet ? "ax-reads__q" : ""}">${esc(text)}</span>` : "";
-  };
-
   /* The tier control, defined ONCE. Three surfaces render it — the group
      view's rows, the bundle view's rows, and Advanced — and three copies of
      the same two labels is exactly how a control ends up with three names.
@@ -3085,18 +3077,6 @@
     }
     return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
       m.href ? `<a class="ax-own__edit" href="${m.href}">where it lives ↗</a>` : ""}`;
-  };
-
-  /* The reads cell, as drawn: a small label saying WHERE the person meets
-     this, and under it the words they actually read there. The label is what
-     makes the column legible at a glance — without it a column of bare
-     sentences reads as a second description. */
-  const readsLabelled = (typeKey, tier) => {
-    const body = readsFor(typeKey, tier);
-    if (!body) return "";
-    const quiet = /ax-reads__q/.test(body);
-    const where = quiet ? "" : "In their Library";  // sentence case: it is a label, not a heading
-    return `${where ? `<b>${where}</b>` : ""}${body}`;
   };
 
   /* The type, as one word on the row. `display_name` is a plural section
@@ -4877,7 +4857,7 @@
         <span class="ax-r__d">${n} ${n === 1 ? "person" : "people"}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
         <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by })}</span>
-        <span class="ax-r__rd">${readsLabelled(r.t.type_key, tier)}</span>
+        <span class="ax-r__rd ax-r__manage">${manageCell({ managedBy: grant.managed_by })}</span>
       </div>`;
     };
 
@@ -4961,7 +4941,7 @@
                       ${share}
                       <div class="ax-colhd">
                         <span>Group</span><span>Who that reaches</span>
-                        <span>Admin control</span><span class="ax-colhd__u">What they will see</span>
+                        <span>Access tier</span><span class="ax-colhd__u">Manage</span>
                       </div>
                       ${r.held.map((grant) => groupRow(r, grant)).join("")}
                     </div>`;
