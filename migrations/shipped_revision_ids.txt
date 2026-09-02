@@ -1,0 +1,143 @@
+# Shipped Alembic revision ids — APPEND-ONLY (issue #2086).
+#
+# Every id that has ever reached a released image goes here, and once added
+# it NEVER moves or disappears — this file only grows. Landing an id here is
+# a promise: some database, somewhere, may already have exactly this string
+# stamped in its `alembic_version` table.
+#
+# Renumbering or deleting a shipped id breaks that promise. `ScriptDirectory`
+# stops recognizing the id an already-migrated database is sitting on, so
+# `src/db_pg.py::assert_pg_at_head`/`ensure_pg_at_head` can no longer tell a
+# genuinely stranded (renumbered-away) database from one that is merely AHEAD
+# (an app rollback after a newer image already migrated) — and no image, past
+# or future, knows how to move a stranded database forward. This happened for
+# real: `facts_ingest_runs` shipped as `0077_facts_ingest_runs`, then got
+# renumbered to `0078_facts_ingest_runs` when a parallel `0077_ontology_drafts`
+# migration merged first and claimed that number. Every database that had
+# already applied the old id was stranded — see
+# `RENUMBERED_REVISION_REPAIRS` in `src/db_pg.py` for the repair, and
+# `docs/migrations.md` → "A database stranded by a renumbered revision" for
+# the operator runbook. `0077_facts_ingest_runs` itself is NOT listed below —
+# it no longer resolves in the current chain by construction, so it cannot
+# pass rule (a) below; it lives only in the repair map.
+#
+# `tests/test_alembic_revision_ratchet.py` enforces this from both directions:
+#   (a) every id below must still resolve via `ScriptDirectory.get_revision` —
+#       a renumber or delete fails this test.
+#   (b) every id in the live migration chain (`ScriptDirectory.walk_revisions`)
+#       must be listed below — a new migration that forgets to append its id
+#       fails this test until the line is added.
+#
+# Insert new revisions at the HEAD of the chain — never renumber or reuse an
+# id that has already shipped, even if it never reached production; if two
+# branches collide on the same number, keep both authors' original ids and
+# rebase the down_revision (a merge revision if both are heads), as later
+# entries below (0045/0049/0051/0057/0059/0085/0086/0087/0088/0094 each have
+# more than one id sharing a numeric prefix) already do.
+#
+# Comment lines (like this one) and blank lines are ignored. One revision id
+# per line otherwise. Order is chain order (oldest first) for readability
+# only — the tests treat this as a set.
+
+0001_baseline
+0002_audit_log
+0003_rbac
+0004_ops_triad
+0005_config_and_pat
+0006_lookup
+0007_misc
+0008_telemetry
+0009_store
+0010_knowledge
+0011_data_packages
+0012_duckdb_v59_parity
+0013_resource_grants_per_type_fk
+0014_cowork_mcp_v63_v67
+0015_cloud_chat_v68
+0016_mcp_source_env_v69
+0017_cloud_chat_v70
+0018_slack_user_id_v71
+0019_system_secrets_v72
+0020_chat_sandbox_refs_v73
+0021_server_only_v74
+0022_prompt_source_mode_v75
+0023_store_entity_votes_v76
+0024_must_change_password_v77
+0025_builtin_marketplace_v78
+0026_source_connections_v79
+0027_authoring_suggestions_v80
+0028_memory_mining_consent_v81
+0029_collections_v82
+0030_oauth_clients_v83
+0031_oauth_refresh_resource_v84
+0032_vscode_mcp_client_v85
+0033_everyone_backfill_v86
+0034_marketplace_ref_pin_v87
+0035_parent_file_id_v88
+0036_knowledge_digests_v89
+0037_chat_broker_tickets_v90
+0038_store_lint_v91
+0039_mcp_connect_hint_v92
+0040_glossary_terms_v93
+0041_jobs_v94
+0042_usage_summary_idx_fix_v95
+0043_data_apps_v96
+0044_corpus_files_path_v97
+0045_chat_relay_proto_v98
+0046_data_apps_drafts_v99
+0047_sync_state_parts_v100
+0048_agents_v101
+0049_webhooks_artifacts_v102
+0050_agent_memories_v103
+0051_audit_id_backfill_v104
+0052_sessions_uploaded_v105
+0053_pat_surface_v106
+0054_semantic_source_ref_v107
+0055_dataapps_linked_v108
+0056_mcp_oauth_sources_v109
+0045_user_journey_state_v98
+0049_file_corpora_origin_v102
+0051_store_publisher_v104
+0057_agents_superset_v110
+0059_chat_pinned_v112
+0060_pkg_publisher_v113
+0061_agent_status_backfill_v115
+0062_knowledge_domains_backfill
+0063_access_policy_columns_v116
+0064_sem_models_v117
+0065_journey_agent_created_v118
+0066_metric_grain_nullable
+0067_tool_projection_map_v119
+0068_agent_schedules_v120
+0069_grant_allow_mutating_v121
+0070_builder_scope_v122
+0071_chat_message_parts_v123
+0072_sync_state_id_v124
+0073_agent_scope_granted_by
+0074_llm_usage_caller_user_id
+0075_corpus_file_sources
+0076_facts_tables
+0077_ontology_drafts
+0078_facts_ingest_runs
+0079_sso_login
+0080_share_requests
+0081_ingest_runs_anonymize
+0082_session_revoked_before
+0083_ingest_runs_source_urls
+0084_fact_alias_sources
+0085_alias_edge_backfill
+0086_claims_audience
+0085_column_meta_source_ref
+0086_semantic_draft_pending
+0087_resource_source_tags
+0088_semantic_feedback
+0089_semantic_health_mutes
+0090_semantic_models_detach
+0091_merge_semantic_facts
+0092_chat_messages_cache_tokens
+0087_corpus_file_events
+0088_ingest_runs_llm_usage
+0093_merge_train23_semantic
+0094_usage_turns
+0094_extraction_runs
+0095_memory_detection_runs
