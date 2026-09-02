@@ -349,9 +349,17 @@ class TestCatalogSemanticsLinkFromCatalog:
         from pathlib import Path
 
         library = Path("app/web/templates/library.html").read_text(encoding="utf-8")
-        assert "/semantic-layer?tab=all_metrics" in library, (
-            "library.html no longer links the metric registry — under the rail that "
-            "section is the page's entry point (see the IA note in _app_rail.html)"
+        router = Path("app/web/router.py").read_text(encoding="utf-8")
+        # The door is the Definitions row's CTA, and its TARGET is resolved
+        # server-side (`browse_href`) rather than written into the template —
+        # so the link is asserted in both halves, or a change to either could
+        # leave the page with a door to nowhere.
+        assert 'class="lib-defs__cta" href="{{ defs.browse_href }}"' in library, (
+            "library.html no longer carries the door — under the rail the Definitions "
+            "row is the page's entry point (see the IA note in _app_rail.html)"
+        )
+        assert '"browse_href": "/semantic-layer?tab=all_metrics"' in router, (
+            "the door's target is gone from the router"
         )
         assert "/catalog/semantics" not in library, (
             "library.html still emits the retired URL — the 308 is for links Agnes "
@@ -1663,7 +1671,10 @@ class TestTheToolbarsRemainingControls:
         """Three chips at 11ch each turned five counts into "2 datasets ·
         2 metrics · 2 constrai…" plus a "+2". Counts are prose and belong in
         the meta line; the dialect is a label and belongs in the chip."""
-        _seed_model()
+        # A model with actual objects: the local `_seed_model` declares an
+        # empty `datasets` list, so every count is zero and the meta line is
+        # correctly empty — which would pass this test for the wrong reason.
+        _seed_model(datasets=[{"name": "orders", "source": "db.public.orders"}])
         body = seeded_app["client"].get(
             "/semantic-layer", headers=_auth(seeded_app["admin_token"])
         ).text

@@ -220,14 +220,16 @@ class TestModelList:
         assert r.status_code == 200
         body = r.text
         assert "retail" in body
-        # Object counts per type: 2 datasets, 1 metric, 1 constraint,
-        # 1 relationship, 1 glossary term — rendered through fbar_card()'s
-        # `tags` slot, which (like every other tag list in the product)
-        # shows the first 3 and collapses the rest to "+N".
-        assert "2 datasets" in body
-        assert "1 metric<" in body or "1 metric " in body
-        assert "1 constraint" in body
-        assert "+2" in body  # relationships + glossary terms collapse
+        # Object counts per type — 2 datasets, 1 metric, 1 constraint,
+        # 1 relationship, 1 glossary term — in the card's META line, not its
+        # `tags` slot. The slot shows three chips at 11ch each, so five counts
+        # came out as "2 datasets · 2 metrics · 2 constrai…" with the rest
+        # behind a "+2": counts are prose, and the SQL dialect (one short
+        # label) is what belongs in a chip.
+        meta = body.split('class="fbar-card__meta"', 1)[1].split("</p>", 1)[0]
+        for expect in ("2 datasets", "1 metric", "1 constraint", "1 relationship", "1 glossary term"):
+            assert expect in meta, (expect, meta)
+        assert "fbar-card__tag--more" not in body, "nothing hidden behind a +N any more"
         # Native (source='manual') carries no "Imported from" badge.
         assert "Imported from" not in body
 
@@ -1342,13 +1344,15 @@ class TestFlatProjectionTabsFold:
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
         assert 'id="glossary-list"' in body
 
-    def test_all_glossary_tab_shows_a_source_filter_mirroring_the_metrics_ones(self, seeded_app):
-        """#1956 item 1: the metrics tab offers an "All / <bucket>" sidebar
-        filter (`sl-cat-nav`); the glossary tab had only the search box.
-        Glossary terms carry no per-model attribution the way a
-        document-projected metric's ``category`` does (see the router), so
-        this mirrors the SAME component bucketed by the term's own
-        ``source`` instead — real, stored provenance, not an invented one.
+    def test_the_glossary_source_sidebar_is_retired_for_the_shared_toolbar(self, seeded_app):
+        """#1956 item 1, second pass. #2003 shipped it as a sidebar bucketed by
+        the term's own `source`, and said so in its own comment: per-model
+        attribution was "a #1956 follow-up, not invented here".
+
+        This is that follow-up. The owning model is read from the DOCUMENT
+        (`model_glossary`) — the one place that knows — so `source` stops being
+        a stand-in for provenance and becomes one facet beside Model, in the
+        same toolbar the Library and /chats use. The sidebar goes with it.
         """
         from src.repositories import glossary_repo
 
@@ -1357,38 +1361,29 @@ class TestFlatProjectionTabsFold:
         glossary_repo().create(id="g3", term="NRR", definition="Net revenue retention.", source="ossie_git")
 
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
-        assert 'class="sl-cat-nav" aria-label="Glossary sources"' in body
+        assert 'aria-label="Glossary sources"' not in body, "the bespoke sidebar is gone"
+        assert "sl-cat-nav" not in body
+        # …and Source is a real facet in the shared menu, with both values.
+        assert 'data-cat="source"' in body
+        assert 'data-facet="source"' in body
+        assert 'value="manual"' in body and 'value="ossie_git"' in body
 
-        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
-        assert 'data-cat="__all__"' in nav
-        assert ">All<" in nav
-
-        # Every term counts under "All"...
-        assert ">3<" in nav.split('data-cat="__all__"', 1)[1].split("</button>", 1)[0]
-
-        # ...and each source is its OWN, narrower bucket — the property that
-        # makes clicking one actually narrow the list rather than just
-        # relabeling the same total.
-        git_bucket = nav.split('data-cat="ossie_git"', 1)[1].split("</button>", 1)[0]
-        assert ">Git<" in git_bucket
-        assert ">2<" in git_bucket
-        manual_bucket = nav.split('data-cat="manual"', 1)[1].split("</button>", 1)[0]
-        assert ">Native<" in manual_bucket
-        assert ">1<" in manual_bucket
-
-    def test_all_glossary_tab_source_filter_only_covers_present_sources(self, seeded_app):
-        """No bucket renders for a source no stored term carries — an empty
-        bucket a click could select but that would always narrow to nothing
-        is worse than no bucket at all."""
+    def test_a_source_facet_offers_only_the_sources_present(self, seeded_app):
+        """The sidebar's rule survives the move: no option for a source no
+        stored term carries. In the shared engine it is stronger — a facet with
+        fewer than two values does not render at all, because every row would
+        match it."""
         from src.repositories import glossary_repo
 
         glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
 
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
-        nav = body.split('aria-label="Glossary sources"', 1)[1].split("</nav>", 1)[0]
-        assert 'data-cat="manual"' in nav
-        assert 'data-cat="ossie_git"' not in nav
-        assert 'data-cat="keboola_metastore"' not in nav
+        assert 'value="ossie_git"' not in body
+        assert 'value="keboola_metastore"' not in body
+        assert 'id="sl-filter-btn"' not in body, (
+            "one source and one model: every facet has a single value, so the "
+            "Filter button has nothing to open"
+        )
 
     def test_the_metrics_tab_consumes_the_deep_links_q(self, seeded_app):
         _seed_metric("arr")
