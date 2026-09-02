@@ -177,6 +177,12 @@ POSTURE: dict[str, str] = {
     # a fallback-emitted action.
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": "sharepoint_connection.scope_bulk_add",
     "POST /api/admin/sharepoint/connections/{connection_id}/clone": "sharepoint_connection.clone",
+    # Split one large site into N sibling connections in one call — combines
+    # clone + scope_bulk_add's own primitives under one admin action, so the
+    # handler writes its own row (log_safe) with the created ids/n/
+    # min_modified, a cross-check on the fallback rather than a fallback
+    # emission (same reasoning as scope_bulk_add/clone right above).
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits": "sharepoint_connection.split_apply",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # Persistence for a site added by URL (2026-09-01 bug report): the
     # ``Sites.Selected`` escape hatch used to resolve a site without ever
@@ -812,6 +818,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",
+    # Read-only preview of a site split — live Graph reads (root children +
+    # per-folder search counts), nothing persisted. Cataloged (not exempt):
+    # discloses folder names and per-folder document counts, same
+    # disclosure class as tree_browse right above.
+    "GET /api/admin/sharepoint/connections/{connection_id}/split-plan": "sharepoint_connection.split_plan_read",
     # -- app.api.admin_slack_secrets --
     "GET /api/admin/slack-secrets": "slack.secret.read",
     # -- app.api.admin_source_connections --

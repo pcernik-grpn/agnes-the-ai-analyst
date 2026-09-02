@@ -1231,6 +1231,27 @@ _EXEMPT: dict[str, str] = {
         "the standing admin credential-provisioning exemption (CONTRIBUTING.md), same "
         "reasoning as POST /api/admin/source-connections' own credential-adjacent writes"
     ),
+    # Split-plan / splits — the AUTOMATED version of clone + scopes/bulk
+    # right above (greedy-pack the site's top-level folders into N groups,
+    # then create all N clones+scopes in one call). Same CLI-reachable /
+    # not-MCP-exposed shape as its two manual primitives: split-plan is a
+    # read-only preview (admin-only display primitive over live Graph
+    # data), and splits carries clone's own credential-provisioning +
+    # scopes/bulk's own collection-minting side effects, neither of which
+    # is agent-invokable today.
+    "/api/admin/sharepoint/connections/{connection_id}/split-plan": (
+        "read-only preview of a folder-based site split (greedy-packed groups + "
+        "per-folder Graph Search document counts) — CLI-reachable (agnes admin "
+        "sharepoint split-plan) but deliberately not MCP-exposed: an admin/ops "
+        "display primitive over live Graph data, not an analyst query surface"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/splits": (
+        "create N sibling SharePoint connections from a split plan, each with its "
+        "own confirmed scopes — CLI-reachable (agnes admin sharepoint split) but "
+        "deliberately not MCP-exposed: combines clone's credential-provisioning "
+        "exemption with scopes/bulk's collection-minting exemption, both already "
+        "carved out above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "

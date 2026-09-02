@@ -222,6 +222,159 @@ class TestConnectionClone:
         assert "connection_name_exists" in result.output
 
 
+class TestSplitPlanCmd:
+    """`agnes admin sharepoint split-plan` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/split-plan`."""
+
+    def _plan_body(self):
+        return {
+            "drive_id": "drv1",
+            "folders": [{"name": "Big", "documents": 100}, {"name": "Small", "documents": 10}],
+            "loose_root_files": ["readme.txt"],
+            "groups": [
+                {"name": "site — part 1/2", "folders": [{"name": "Big", "documents": 100}], "documents": 100},
+                {"name": "site — part 2/2", "folders": [{"name": "Small", "documents": 10}], "documents": 10},
+            ],
+            "total_documents": 110,
+        }
+
+    def test_happy_path_prints_a_table(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._plan_body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2"])
+        assert result.exit_code == 0, result.output
+        assert "site — part 1/2" in result.output
+        assert "site — part 2/2" in result.output
+        assert "readme.txt" in result.output
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/split-plan"
+        assert kwargs["params"] == {"n": 2}
+
+    def test_min_modified_and_drive_id_ride_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._plan_body())) as mock_get:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-plan",
+                    "conn1",
+                    "--n",
+                    "2",
+                    "--min-modified",
+                    "2023-12-31",
+                    "--drive-id",
+                    "drv-x",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"n": 2, "min_modified": "2023-12-31", "drive_id": "drv-x"}
+
+    def test_json_output(self):
+        body = self._plan_body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported(self):
+        detail = {"error": "drive_id_required", "message": "drive_id was not supplied"}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(400, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2"])
+        assert result.exit_code == 1
+        assert "drive_id was not supplied" in result.output
+
+
+class TestSplitCmd:
+    """`agnes admin sharepoint split` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/splits`."""
+
+    def _split_body(self):
+        return {
+            "connections": [
+                {
+                    "id": "c1",
+                    "name": "site — part 1/2",
+                    "folders": [{"name": "Big", "documents": 100}],
+                    "documents": 100,
+                },
+                {
+                    "id": "c2",
+                    "name": "site — part 2/2",
+                    "folders": [{"name": "Small", "documents": 10}],
+                    "documents": 10,
+                },
+            ]
+        }
+
+    def test_happy_path(self):
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, self._split_body())) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "split", "conn1", "--n", "2"])
+        assert result.exit_code == 0, result.output
+        assert "Created 2 connection(s)" in result.output
+        assert "c1" in result.output and "c2" in result.output
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/splits"
+        assert kwargs["json"] == {"n": 2, "start": False}
+
+    def test_all_options_ride_the_payload(self):
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, self._split_body())) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split",
+                    "conn1",
+                    "--n",
+                    "2",
+                    "--min-modified",
+                    "2023-12-31",
+                    "--transport",
+                    "batch",
+                    "--retry-mode",
+                    "off",
+                    "--start",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "enqueued" in result.output.lower()
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {
+            "n": 2,
+            "start": True,
+            "min_modified": "2023-12-31",
+            "transport": "batch",
+            "retry_mode": "off",
+        }
+
+    def test_json_output(self):
+        body = self._split_body()
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_invalid_transport_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--transport", "carrier-pigeon"]
+        )
+        assert result.exit_code == 1
+        assert "sync or batch" in result.output
+
+    def test_invalid_retry_mode_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--retry-mode", "nope"])
+        assert result.exit_code == 1
+        assert "must be one of" in result.output
+
+    def test_split_exists_is_reported(self):
+        detail = {"error": "split_exists", "message": "connections named like this split already exist"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "split", "conn1", "--n", "2"])
+        assert result.exit_code == 1
+        assert "already exist" in result.output
+
+
 class TestFactsConfig:
     """`agnes admin sharepoint facts-config` — CLI counterpart to
     `PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config`."""

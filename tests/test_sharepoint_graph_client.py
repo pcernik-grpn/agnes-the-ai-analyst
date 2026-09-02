@@ -943,3 +943,129 @@ class TestGetAppTokenClientSecret:
         _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"access_token": "x"}))
         with pytest.raises(gc.SharePointGraphError):
             asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret=""))
+
+
+class TestListRootChildrenWithUrl:
+    """``list_root_children_with_url`` — the site-split planner's own read of
+    the drive root, carrying each item's ``webUrl`` so the planner can
+    compose a Graph Search KQL ``path:`` filter per folder without a second
+    round trip (``list_root_children`` deliberately omits it — see that
+    function's own tests above, which pin an exact dict shape without it)."""
+
+    def test_maps_folders_and_files_with_web_url(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root/children"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "id": "f1",
+                            "name": "Contracts",
+                            "folder": {"childCount": 5},
+                            "webUrl": "https://example.sharepoint.com/sites/s/Shared Documents/Contracts",
+                        },
+                        {
+                            "id": "f2",
+                            "name": "notes.txt",
+                            "file": {},
+                            "webUrl": "https://example.sharepoint.com/sites/s/Shared Documents/notes.txt",
+                        },
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
+        assert items == [
+            {
+                "id": "f1",
+                "name": "Contracts",
+                "is_folder": True,
+                "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/Contracts",
+            },
+            {
+                "id": "f2",
+                "name": "notes.txt",
+                "is_folder": False,
+                "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/notes.txt",
+            },
+        ]
+
+    def test_pages_the_full_nextlink_chain(self, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            if "skip" not in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [{"id": "f1", "name": "A", "folder": {}, "webUrl": "https://x/A"}],
+                        "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv1/root/children?skip=1",
+                    },
+                )
+            return httpx.Response(200, json={"value": [{"id": "f2", "name": "B", "folder": {}, "webUrl": "https://x/B"}]})
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
+        assert [i["id"] for i in items] == ["f1", "f2"]
+        assert len(calls) == 2
+
+
+class TestSearchDocumentCount:
+    """``search_document_count`` — Graph Search-backed, best-effort document
+    count for one folder path (site-split planner). NEVER a delta walk; NEVER
+    raises."""
+
+    def test_returns_total_from_hits_containers(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/search/query"
+            body = json.loads(request.content)
+            req = body["requests"][0]
+            assert req["entityTypes"] == ["driveItem"]
+            assert req["region"] == "NAM"
+            assert 'path:"https://example.sharepoint.com/sites/s/Docs/A"' in req["query"]["queryString"]
+            assert "IsDocument:1" in req["query"]["queryString"]
+            return httpx.Response(
+                200,
+                json={"value": [{"hitsContainers": [{"total": 42, "hits": []}]}]},
+            )
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 42
+
+    def test_min_modified_narrows_the_query(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "LastModifiedTime>=2023-12-31" in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(
+            gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A", min_modified="2023-12-31")
+        )
+        assert total == 5
+
+    def test_never_raises_on_non_200(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(500, text="boom"))
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0
+
+    def test_never_raises_on_malformed_body(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"value": []}))
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0
+
+    def test_never_raises_on_transport_error(self, monkeypatch):
+        def _client() -> httpx.AsyncClient:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("boom", request=request)
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+
+        monkeypatch.setattr(gc, "_http_client", _client)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0

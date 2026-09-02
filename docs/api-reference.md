@@ -1204,6 +1204,8 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
 - /api/admin/sharepoint/connections/{connection_id}/clone
+- /api/admin/sharepoint/connections/{connection_id}/split-plan
+- /api/admin/sharepoint/connections/{connection_id}/splits
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1338,6 +1340,44 @@ instead uploaded to the source's own vault slot, it is NOT duplicated into
 a second row — an admin re-uploads it to the clone separately. `409
 connection_name_exists` if `name` is taken (same rule as `POST
 /api/admin/source-connections`). Returns `{"id", "name"}`.
+
+`GET …/split-plan` / `POST …/splits` — CLI: `agnes admin sharepoint
+split-plan <connection_id> --n <n>` / `agnes admin sharepoint split
+<connection_id> --n <n>` — the AUTOMATED version of the `clone` +
+`scopes/bulk` recipe above: greedy-packs (longest-processing-time-first) the
+drive root's top-level folders into `n` groups of roughly equal document
+count, using a live per-folder Graph Search count (`POST /search/query`,
+`entityTypes: ["driveItem"]`, `path:"<folder web url>" AND IsDocument:1`,
+optionally `AND LastModifiedTime>=<min_modified>`) — never a delta walk,
+which throttles under repetition and biases its own first pages. A folder
+whose count could not be read is still packed into a group at `documents:
+0`, never dropped from the plan.
+
+`GET …/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]` is
+read-only — no state written. `drive_id` is optional, same inference as
+`scopes/bulk` (reused from the connection's first existing scope; `400
+drive_id_required` if neither is available). Response: `{drive_id, folders:
+[{name, documents}], loose_root_files: [names], groups: [{name, folders:
+[{name, documents}], documents}], total_documents}` — `loose_root_files`
+lists drive-root items that are FILES, not folders, so a folder-based split
+can never cover them; `groups[].name` (`"<source name> — part i/n"`) is the
+exact name `POST …/splits` will give the corresponding clone.
+
+`POST …/splits` body `{"n", "min_modified"?, "transport"?: "sync"|"batch",
+"retry_mode"?, "start"?: bool}` creates all `n` clones AND their scopes in
+one call (the same `clone` + `scopes/bulk` primitives above, run
+automatically): `409 split_exists` if connections named like this split
+already exist, checked BEFORE creating anything — a repeat call never
+double-creates. `min_modified`, when given, is written onto EACH clone's
+`config.extraction.crawl.min_modified` (bookkeeping today — no admin-facing
+crawl date filter reads that key yet); `transport`/`retry_mode` land on each
+clone's `config.extraction.facts`, the same keys `PATCH …/extraction
+/facts-config` writes. `start: true` enqueues each clone's
+`corpus-extraction` job immediately after creating it, in creation order —
+skipped silently, never a failed apply, when extraction readiness
+(`sharepoint.enabled` / the `extraction` extra) is not currently satisfied.
+Returns `{"connections": [{id, name, folders: [{name, documents}],
+documents}]}`, one entry per created clone.
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

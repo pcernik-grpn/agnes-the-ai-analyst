@@ -99,6 +99,32 @@ spot-check shows pseudonyms, not names.
      all-or-nothing.
   3. Repeat 1-2 per clone, splitting the site's top-level folders across
      however many connections the crawl needs to parallelize over.
+- **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
+  /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
+  (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
+  YYYY-MM-DD] [--json]`) previews a greedy-packed split of the drive root's
+  top-level folders into `n` groups of roughly equal document count (a live
+  Graph Search count per folder — never a delta walk, which throttles under
+  repetition and biases its own first pages), and reports any file sitting
+  directly at the drive root (`loose_root_files`) that a folder-based split
+  — this one, and the manual clone + `scopes/bulk` recipe above — can never
+  cover. A folder whose count could not be read is still assigned to a
+  group, at `documents: 0`, never dropped from the plan. The SharePoint
+  connection card's own **Split this site…** control (Actions menu, or the
+  same-named button on the card body) previews and applies this from the
+  browser. `POST …/splits` (`agnes admin sharepoint split <connection_id>
+  --n <n> [--min-modified YYYY-MM-DD] [--transport sync|batch] [--retry-mode
+  off|on_gate_fail|always] [--start]`) then creates all `n` clones AND their
+  scopes in one call — the same `clone` + `scopes/bulk` primitives above,
+  run automatically — named `"<source name> — part i/n"`; `409 split_exists`
+  if a split under those names already exists, so a repeat call never
+  double-creates. `--min-modified` lands on each clone's
+  `config.extraction.crawl.min_modified` (bookkeeping today — no admin-facing
+  crawl date filter reads that key yet); `--transport`/`--retry-mode` land on
+  each clone's `config.extraction.facts`, the same keys `facts-config`
+  writes. `--start` enqueues each clone's crawl immediately after creating
+  it, in creation order, skipped silently (never a failed apply) when
+  extraction readiness is not currently satisfied.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals

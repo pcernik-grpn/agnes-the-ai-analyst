@@ -410,6 +410,93 @@ async def list_root_children(access_token: str, drive_id: str) -> List[Dict[str,
     return _map_child_rows(rows)
 
 
+async def list_root_children_with_url(access_token: str, drive_id: str) -> List[Dict[str, Any]]:
+    """Root-level items of one drive, carrying each item's ``webUrl`` — a
+    thin sibling of :func:`list_root_children` for the site-split planner
+    (``app.api.admin_sharepoint``'s ``GET …/split-plan`` / ``POST …/splits``):
+    a folder's ``webUrl`` is what lets :func:`search_document_count` scope a
+    Graph Search query to it via a KQL ``path:`` filter, without a second
+    round trip per folder to look the URL up.
+
+    Not folded into :func:`list_root_children` itself: that function's own
+    tests pin an exact ``{id, name, is_folder, child_count}`` dict, and nothing
+    else calls for ``webUrl`` there. Pages the full ``@odata.nextLink`` chain,
+    same as :func:`list_root_children`.
+    """
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/drives/{drive_id}/root/children",
+        params={"$select": "id,name,folder,file,webUrl", "$top": "200"},
+    )
+    return [
+        {
+            "id": item["id"],
+            "name": item.get("name") or item["id"],
+            "is_folder": "folder" in item,
+            "web_url": item.get("webUrl"),
+        }
+        for item in rows
+    ]
+
+
+async def search_document_count(access_token: str, web_url: str, *, min_modified: Optional[str] = None) -> int:
+    """Best-effort document count under one drive-item path, via Graph
+    Search (``POST /search/query``, ``entityTypes: ["driveItem"]``) — the
+    site-split planner's own balancing signal. Deliberately NEVER a delta
+    walk: a delta walk gets throttled under repetition and its first pages
+    are biased, which would skew which folders look "big" (module docstring
+    of ``app.api.admin_sharepoint``'s split-plan endpoint has the full
+    reasoning). ``region: "NAM"`` is required by Graph Search and pinned the
+    same way everywhere it is used in this codebase.
+
+    Query: ``path:"<web_url>" AND IsDocument:1``, optionally narrowed by
+    ``AND LastModifiedTime>=<min_modified>`` (an admin-supplied
+    ``YYYY-MM-DD``, validated by the caller before it ever reaches here).
+
+    **Never raises** — a failed count (network error, non-200, a malformed
+    or empty ``hitsContainers``) returns ``0``. A folder whose count could
+    not be read must still be assignable to a group; the caller (the
+    packing algorithm) treats ``0`` as "balances like an empty folder", not
+    as "drop this folder" — see :func:`connectors.sharepoint.site_split.
+    pack_folders_into_groups`.
+    """
+    query = f'path:"{web_url}" AND IsDocument:1'
+    if min_modified:
+        query += f" AND LastModifiedTime>={min_modified}"
+    request_body = {
+        "requests": [
+            {
+                "entityTypes": ["driveItem"],
+                "query": {"queryString": query},
+                "region": "NAM",
+                "from": 0,
+                "size": 1,
+            }
+        ]
+    }
+    try:
+        async with _http_client() as client:
+            resp = await client.post(
+                f"{GRAPH_BASE}/search/query",
+                json=request_body,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=_GRAPH_TIMEOUT_S,
+            )
+        if resp.status_code != 200:
+            logger.warning("sharepoint search document-count failed: HTTP %s %s", resp.status_code, resp.text[:500])
+            return 0
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — best-effort balancing signal, must never fail the planner
+        logger.warning("sharepoint search document-count raised", exc_info=True)
+        return 0
+    try:
+        containers = data["value"][0]["hitsContainers"]
+        total = containers[0].get("total")
+        return int(total) if isinstance(total, (int, float)) else 0
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0
+
+
 async def list_item_children(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
     """Children of an arbitrary folder within one drive (TCRD-240) — the same
     item shape as :func:`list_root_children`, generalized past the drive root

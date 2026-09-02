@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Four surfaces:
+Five surfaces:
 
   - ``facts-extract`` — the standalone fact-graph trigger.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
@@ -11,6 +11,13 @@ Four surfaces:
     connections, each with its own crawl and facts jobs, so they run in
     parallel: clone the source connection (same credential material, zero
     scopes), then bulk-add the split's folder paths onto each clone.
+  - ``split-plan`` / ``split`` — the AUTOMATED version of the manual
+    clone-then-bulk-add recipe right above: greedy-packs the site's
+    top-level folders into ``--n`` groups of roughly equal document count
+    (a live Graph Search count per folder, never a delta walk) and, on
+    ``split``, creates all ``--n`` clones with their scopes in one call.
+    CLI counterparts to ``GET …/split-plan`` (preview, read-only) and
+    ``POST …/splits`` (apply).
   - ``runs`` — the extraction fleet dashboard (2026-09-02), from the
     terminal: is it on pace, is anything stuck, what is it costing, across
     every SharePoint connection at once. CLI counterpart to
@@ -222,6 +229,145 @@ def connection_clone(
         typer.echo(json.dumps(body, indent=2))
         return
     typer.echo(f"Cloned {connection_id} -> {body.get('id')} ({body.get('name')})")
+
+
+# ---------------------------------------------------------------------------
+# `split-plan` / `split` — split one large site into N crawl connections in
+# one shot, instead of `connection clone` + `scope bulk-add` run by hand N
+# times. CLI counterparts to `GET …/split-plan` and `POST …/splits`.
+# ---------------------------------------------------------------------------
+
+
+def _split_plan_query(n: int, min_modified: Optional[str], drive_id: Optional[str]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"n": n}
+    if min_modified:
+        params["min_modified"] = min_modified
+    if drive_id:
+        params["drive_id"] = drive_id
+    return params
+
+
+def _print_split_plan(body: Dict[str, Any]) -> None:
+    table = Table(title=f"Split plan — drive {body.get('drive_id')}")
+    table.add_column("GROUP", style="bold")
+    table.add_column("FOLDERS", justify="right")
+    table.add_column("DOCUMENTS", justify="right")
+    for group in body.get("groups") or []:
+        table.add_row(group["name"], str(len(group.get("folders") or [])), str(group.get("documents", 0)))
+    _console.print(table)
+    _console.print(f"Total documents across all folders: {body.get('total_documents', 0)}")
+    loose = body.get("loose_root_files") or []
+    if loose:
+        _console.print(
+            f"[yellow]{len(loose)} file(s) sit directly at the drive root — no folder scope will cover them:[/yellow]"
+        )
+        for name in loose[:20]:
+            typer.echo(f"  {name}")
+        if len(loose) > 20:
+            typer.echo(f"  ... and {len(loose) - 20} more")
+
+
+@admin_sharepoint_app.command("split-plan")
+def split_plan_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    n: int = typer.Option(..., "--n", help="Number of sibling connections to divide the site's top-level folders into"),
+    min_modified: Optional[str] = typer.Option(
+        None, "--min-modified", help="Only count documents modified on/after this date (YYYY-MM-DD)"
+    ),
+    drive_id: Optional[str] = typer.Option(
+        None,
+        "--drive-id",
+        help="Graph drive id — required unless this connection already has a scope with one set",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Preview how ``agnes admin sharepoint split`` would divide this
+    connection's site — greedy-packs the drive root's top-level folders into
+    ``--n`` groups of roughly equal document count, WITHOUT creating
+    anything. CLI counterpart to
+    ``GET /api/admin/sharepoint/connections/{connection_id}/split-plan``.
+
+    Files sitting directly at the drive root (not inside any folder) are
+    reported separately — a folder-based split can never cover them.
+    """
+    resp = api_get(
+        f"/api/admin/sharepoint/connections/{connection_id}/split-plan",
+        params=_split_plan_query(n, min_modified, drive_id),
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    _print_split_plan(body)
+
+
+@admin_sharepoint_app.command("split")
+def split_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id to split"),
+    n: int = typer.Option(..., "--n", help="Number of sibling connections to create"),
+    min_modified: Optional[str] = typer.Option(
+        None,
+        "--min-modified",
+        help="Written onto each clone's config.extraction.crawl.min_modified (YYYY-MM-DD)",
+    ),
+    transport: Optional[str] = typer.Option(
+        None, "--transport", help="Per-connection extraction.facts.transport override for every clone: sync or batch"
+    ),
+    retry_mode: Optional[str] = typer.Option(
+        None,
+        "--retry-mode",
+        help=f"Per-connection extraction.facts.retry_mode override for every clone: one of {', '.join(_RETRY_MODES)}",
+    ),
+    start: bool = typer.Option(
+        False, "--start", help="Enqueue each clone's crawl (corpus-extraction) immediately after creating it"
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Create ``--n`` sibling SharePoint connections, each wired to the same
+    credential material as ``connection_id`` and given its own slice of the
+    site's top-level folders as confirmed scopes — the fast path this
+    automates being ``agnes admin sharepoint connection clone`` +
+    ``agnes admin sharepoint scope bulk-add`` run by hand ``n`` times. CLI
+    counterpart to ``POST /api/admin/sharepoint/connections/{connection_id}/
+    splits``.
+
+    ``409 split_exists`` if connections named like this split (``"<source
+    name> — part i/n"``) already exist — inspect with
+    ``agnes admin sharepoint split-plan`` first to see the exact names a
+    split would use.
+    """
+    if transport is not None and transport not in ("sync", "batch"):
+        typer.echo("Error: --transport must be sync or batch", err=True)
+        raise typer.Exit(1)
+    if retry_mode is not None and retry_mode not in _RETRY_MODES:
+        typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
+        raise typer.Exit(1)
+
+    payload: Dict[str, Any] = {"n": n, "start": start}
+    if min_modified:
+        payload["min_modified"] = min_modified
+    if transport:
+        payload["transport"] = transport
+    if retry_mode:
+        payload["retry_mode"] = retry_mode
+
+    resp = api_post(f"/api/admin/sharepoint/connections/{connection_id}/splits", json=payload)
+    if resp.status_code != 201:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    created = body.get("connections") or []
+    typer.echo(f"Created {len(created)} connection(s):")
+    for entry in created:
+        typer.echo(
+            f"  {entry['id']}  {entry['name']}  ({len(entry.get('folders') or [])} folders, {entry.get('documents', 0)} documents)"
+        )
+    if start:
+        typer.echo("Crawl enqueued for each connection (skipped silently if extraction is not currently usable).")
 
 
 # ---------------------------------------------------------------------------

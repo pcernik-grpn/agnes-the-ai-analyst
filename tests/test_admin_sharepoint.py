@@ -21,6 +21,8 @@ drives the flag through the mocked ``get_value`` config instead.
 from __future__ import annotations
 
 import datetime
+import json
+import re
 import sys
 
 import httpx
@@ -46,7 +48,6 @@ def _audit_params(row: dict) -> dict:
     """``audit_repo().query()`` returns ``params`` as the raw stored JSON
     string, not a parsed dict — decode it here so tests can assert on the
     structured fields (same helper as ``tests/test_agent_memory_write_api.py``)."""
-    import json
 
     v = row.get("params")
     return json.loads(v) if isinstance(v, str) else (v or {})
@@ -3453,3 +3454,316 @@ class TestConnectionClone:
         params = _audit_params(rows[0])
         assert params == {"source_connection_id": conn_id, "name": "clone-audit-target"}
         assert rows[0]["resource"] == f"source_connection:{new_id}"
+
+
+def _split_folder(item_id: str, name: str, web_url: str | None = None) -> dict:
+    return {
+        "id": item_id,
+        "name": name,
+        "folder": {"childCount": 0},
+        "webUrl": web_url or f"https://example.sharepoint.com/sites/s/Docs/{name}",
+    }
+
+
+def _split_file(item_id: str, name: str, web_url: str | None = None) -> dict:
+    return {
+        "id": item_id,
+        "name": name,
+        "file": {},
+        "webUrl": web_url or f"https://example.sharepoint.com/sites/s/Docs/{name}",
+    }
+
+
+def _install_split_mock(monkeypatch, *, drive_id: str = "drv1", root_children: list, counts: dict | None = None):
+    """Mock the Graph token exchange, drive-root children listing (with
+    ``webUrl``) and the Search-based document count for the site-split
+    planner (:func:`connectors.sharepoint.graph_client.
+    list_root_children_with_url` / :func:`search_document_count`).
+    ``counts`` maps a folder's ``webUrl`` to the total
+    :func:`search_document_count` should answer for it; an omitted url
+    answers 0 — the same "unreadable count still balances as 0" contract
+    the endpoint itself documents."""
+    from connectors.sharepoint import graph_client as gc
+
+    counts = counts or {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-split"})
+        if request.url.path == f"/v1.0/drives/{drive_id}/root/children":
+            return httpx.Response(200, json={"value": root_children})
+        if request.url.path == "/v1.0/search/query":
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            m = re.search(r'path:"([^"]+)"', query)
+            web_url = m.group(1) if m else None
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": counts.get(web_url, 0)}]}]})
+        raise AssertionError(f"unexpected sharepoint split mock path {request.url.path}")
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+def _confirm_scope_with_drive(client, token, conn_id, *, source_scope_id="seed", display_path="Seed", drive_id="drv1"):
+    r = client.post(
+        f"{BASE}/{conn_id}/scopes",
+        json={"source_scope_id": source_scope_id, "display_path": display_path, "drive_id": drive_id},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+
+
+class TestSplitPlan:
+    """``GET …/split-plan`` — read-only preview of splitting a connection's
+    site into N sibling connections."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/split-plan?n=2", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/split-plan?n=2")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/split-plan?n=2", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_drive_id_required_without_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-no-drive")
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2", headers=_auth(token))
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "drive_id_required"
+
+    def test_invalid_min_modified_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-bad-date")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2&min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_n_out_of_range_is_422(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        r = c.get(f"{BASE}/nope/split-plan?n=0", headers=_auth(token))
+        assert r.status_code == 422, r.text
+        r = c.get(f"{BASE}/nope/split-plan?n=51", headers=_auth(token))
+        assert r.status_code == 422, r.text
+
+    def test_packs_folders_and_reports_loose_files(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-happy")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [
+            _split_folder("f-big", "Big"),
+            _split_folder("f-small", "Small"),
+            _split_file("file-1", "readme.txt"),
+        ]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["drive_id"] == "drv1"
+        assert body["loose_root_files"] == ["readme.txt"]
+        assert sorted(body["folders"], key=lambda f: f["name"]) == [
+            {"name": "Big", "documents": 100},
+            {"name": "Small", "documents": 10},
+        ]
+        assert body["total_documents"] == 110
+        assert len(body["groups"]) == 2
+        # The bigger folder and the smaller one must not share a group —
+        # greedy-by-largest-first puts each in its own bucket here.
+        group_docs = sorted(g["documents"] for g in body["groups"])
+        assert group_docs == [10, 100]
+        assert body["groups"][0]["name"] == "split-plan-happy — part 1/2"
+        assert body["groups"][1]["name"] == "split-plan-happy — part 2/2"
+        # Public folder shape never leaks the Graph item id.
+        for group in body["groups"]:
+            for folder in group["folders"]:
+                assert set(folder.keys()) == {"name", "documents"}
+
+    def test_a_folder_whose_count_fails_is_still_assigned(self, seeded_app, monkeypatch):
+        """search_document_count() never raises — a 500 from Graph Search
+        degrades to documents=0, and the folder is still packed into a
+        group, never dropped from the plan."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-count-fails")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok"})
+            if request.url.path == "/v1.0/drives/drv1/root/children":
+                return httpx.Response(200, json={"value": [_split_folder("f1", "Flaky")]})
+            if request.url.path == "/v1.0/search/query":
+                return httpx.Response(500, text="boom")
+            raise AssertionError(request.url.path)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["folders"] == [{"name": "Flaky", "documents": 0}]
+        assert len(body["groups"][0]["folders"]) == 1
+
+
+class TestSplitApply:
+    """``POST …/splits`` — create N sibling connections from a split plan."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/splits", json={"n": 2}, headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/splits", json={"n": 2}, headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_invalid_retry_mode_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-bad-retry")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "retry_mode": "not-a-mode"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_retry_mode"
+
+    def test_creates_n_clones_with_scopes_and_config(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-happy", tenant_id="tenant-z", client_id="client-z")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed", display_path="Seed")
+
+        root_children = [
+            _split_folder("f-big", "Big"),
+            _split_folder("f-small", "Small"),
+            _split_file("file-1", "readme.txt"),
+        ]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "min_modified": "2023-12-31", "transport": "batch", "retry_mode": "off"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        created = body["connections"]
+        assert len(created) == 2
+        names = {c_["name"] for c_ in created}
+        assert names == {"split-apply-happy — part 1/2", "split-apply-happy — part 2/2"}
+
+        total_folders = sum(len(c_["folders"]) for c_ in created)
+        assert total_folders == 2  # Big + Small, split across the two clones
+
+        for entry in created:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert detail["config"]["tenant_id"] == "tenant-z"
+            assert detail["config"]["client_id"] == "client-z"
+            assert detail["config"]["extraction"]["crawl"]["min_modified"] == "2023-12-31"
+            assert detail["config"]["extraction"]["facts"] == {"transport": "batch", "retry_mode": "off"}
+            # Never the source's own seed scope — each clone gets ONLY its
+            # own group's folders.
+            scope_paths = {s["display_path"] for s in detail["config"]["scopes"]}
+            assert "Seed" not in scope_paths
+            assert scope_paths <= {"Big", "Small"}
+            for scope in detail["config"]["scopes"]:
+                assert scope["drive_id"] == "drv1"
+                assert scope["access_mode"] == "manual"
+
+    def test_refuses_when_a_repeat_split_would_collide(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-repeat")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "OnlyFolder")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        first = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert first.status_code == 201, first.text
+
+        second = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "split_exists"
+
+    def test_start_enqueues_a_crawl_per_clone(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-start")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2, "start": True}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created = r.json()["connections"]
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="corpus-extraction", limit=50)
+        for entry in created:
+            matching = [j for j in jobs if (j.get("payload_json") or {}).get("connection_id") == entry["id"]]
+            assert len(matching) == 1, f"expected a corpus-extraction job for {entry['id']}"
+
+    def test_writes_an_audit_row(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-audit")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created_ids = [entry["id"] for entry in r.json()["connections"]]
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.split_apply", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params["n"] == 1
+        assert params["created_ids"] == created_ids
+        assert rows[0]["resource"] == f"source_connection:{conn_id}"
