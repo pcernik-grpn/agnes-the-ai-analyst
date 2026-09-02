@@ -322,31 +322,44 @@ html[data-ui-layout="rail"] .admin-nav .admin-nav__group-hd {
     color: var(--ds-text-muted);
 }
 
-/* Content beside the column takes its own comfortable measure. The container is
-   `--full` on admin pages (see the note in base_admin.html) so this column can
-   hug the rail instead of drifting with the page's centring — without a cap
-   the page body would then sprawl to whatever width the monitor happens to be.
+/* ── The content column: the app's measure, centred in what chrome leaves ──
+   The container is `--full` on admin pages (see the note in base_admin.html)
+   so the nav column can hug the rail instead of drifting with the page's
+   centring. That removes the page's own measure too, hence a cap here — or the
+   body sprawls to whatever width the monitor happens to be.
 
-   `--width-wide`, not `--width-app` (#1956 item 7). 1400px is the token the
-   design system already keeps for this kind of surface — `.container--wide`,
-   whose own comment names "admin index lists" — so this is the system's
-   existing wide measure rather than a new number.
+   All three declarations are `.idx-head` in style-custom.css, verbatim: it is
+   `width: 100%; max-width: var(--width-wide); margin: 0 auto` and it is the
+   header zone of every index page (Library, My Stack, Catalog, Definitions).
+   Those centre 1400px inside the region the primary sidebar leaves; this
+   centres the same 1400px inside the region the primary sidebar AND this nav
+   leave, both being chrome. So admin joins the platform's pattern rather than
+   inventing one — which is what #1956 item 7's "every other page centers it"
+   actually asks for. It was previously `--width-app` (1280px) and left-pinned,
+   differing from those pages in both measure and axis.
 
-   Be precise about what it buys, because it is less than it looks. The column
-   is `viewport − 292` (56px collapsed rail + 16px gutter + 200px sidebar +
-   20px gap), so the cap only binds from a 1572px viewport up: at 1440 and
-   1536 the column is 1148px and 1244px and was never touching the old 1280
-   either. This closes the gap between roughly 1572 and 1692, and shrinks it
-   above that — 1920 still carries a 228px band, down from 348.
+   `width: 100%` is load-bearing, and `.idx-head` carries it for the same
+   reason: auto inline margins take a grid item out of `stretch` and size it
+   shrink-to-fit, so the cap alone left this column as wide as its content
+   happened to be — 834px of a 1628px cell on a 1920 monitor, NARROWER than
+   before and against the "use the available width" fix these tables had just
+   been given (#1989). 100% fills the cell, the cap trims it, the auto margins
+   split what is left. The nav never moves: auto margins can only absorb the
+   cell's own free space.
 
-   It does NOT centre the column, which is what item 7 literally asks for.
-   Centring would pull the content away from the sidebar it belongs to, and
-   that sidebar hugs the rail deliberately (see the note above). Left as a
-   width decision on purpose; if the dead band on very wide monitors is still
-   the complaint, the answer is a product decision about the whole
-   `.admin-split` block, not another number here. */
+   Be honest about the reach. The column is `viewport − 292` (56px collapsed
+   rail + 16px gutter + 200px nav + 20px gap), so the cap binds only from a
+   1572px viewport up — at 1440 and 1536 the column is 1148px and 1244px and
+   never touched even the old 1280. It closes the dead band between roughly
+   1572 and 1692, and above that splits the remainder instead of dropping it
+   all on the right (1920: 114px each side, not 228px on one). Below 1572px it
+   is a no-op by construction, and that is right rather than short — a content
+   column beside a 200px secondary nav is what an admin console looks like at
+   laptop widths. */
 .admin-main {
+    width: 100%;
     max-width: var(--width-wide, 1400px);
+    margin-inline: auto;
 }
 
 /* ── Section list ────────────────────────────────────────────────────── */
