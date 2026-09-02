@@ -142,3 +142,5 @@
 0094_extraction_runs
 0095_memory_detection_runs
 0096_resource_grants_source
+0097_resource_grants_scope
+0098_everyone_becomes_a_scope
