@@ -432,6 +432,38 @@ async def list_item_children(access_token: str, drive_id: str, item_id: str) -> 
     return _map_child_rows(rows)
 
 
+async def get_item_by_path(access_token: str, drive_id: str, item_path: str) -> Dict[str, Any]:
+    """Resolve one folder (or file) path within a drive straight to its
+    item metadata, via Graph's by-path addressing (``/drives/{drive_id}/
+    root:/{path}`` — bare ``/drives/{drive_id}/root`` for the drive root
+    itself when ``item_path`` is empty). The drive-item-level complement to
+    :func:`get_site_by_path`: the bulk scope-add endpoint (``POST
+    …/scopes/bulk``, admin_sharepoint.py) uses this to turn an admin-typed
+    folder path directly into a Graph item id, without an interactive
+    tree walk first. Same normalized shape as :func:`list_item_children`'s
+    rows, so a caller can splice a resolved item straight into a listing.
+
+    ``drive_id`` is sent as an opaque Graph path segment only — callers must
+    structurally validate it first (see
+    ``app.api.admin_sharepoint._validate_graph_id``), same rule as
+    :func:`list_item_children`. Each ``item_path`` segment is percent-encoded
+    before it reaches the Graph URL — the path is admin-typed, and quoting is
+    what makes it structurally inert regardless of what the caller validated
+    (security playbook: never build a request path from an unchecked value).
+
+    Raises :class:`SharePointGraphError` (``status_code=404``) when the path
+    does not exist in this drive — callers distinguish that from a genuine
+    outage the same way :func:`search_folders` already does.
+    """
+    segments = [seg for seg in item_path.split("/") if seg]
+    if segments:
+        path = f"/drives/{drive_id}/root:/" + "/".join(quote(seg, safe="") for seg in segments)
+    else:
+        path = f"/drives/{drive_id}/root"
+    body = await _graph_get(access_token, path, params={"$select": "id,name,folder,file"})
+    return _map_child_rows([body])[0]
+
+
 async def _list_children(access_token: str, drive_id: str, item_id: Optional[str]) -> List[Dict[str, Any]]:
     """One level of children, at the drive root (``item_id is None``) or of
     an arbitrary folder — the single seam :func:`search_folders` walks

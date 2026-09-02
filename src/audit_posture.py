@@ -162,6 +162,13 @@ POSTURE: dict[str, str] = {
     # liveness predicate, same reasoning as the other scheduler endpoints.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
+    # Bulk scope-add (split-a-large-site workflow) and connection clone both
+    # write their own row with richer params than the fallback could derive
+    # (per-path created/skipped/failed counts; the new connection id) —
+    # declared here as a cross-check on the handler's own log_safe call, not
+    # a fallback-emitted action.
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": "sharepoint_connection.scope_bulk_add",
+    "POST /api/admin/sharepoint/connections/{connection_id}/clone": "sharepoint_connection.clone",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # Persistence for a site added by URL (2026-09-01 bug report): the
     # ``Sites.Selected`` escape hatch used to resolve a site without ever

@@ -3014,3 +3014,392 @@ class TestAudienceClassMap:
 
         assert collection_id not in audience_class_map()
         assert collection_id not in tiered_collection_ids()
+
+
+def _install_item_resolver(monkeypatch, items: dict, *, drive_id: str = "drv1"):
+    """Mock the Graph token exchange plus ``/drives/{drive_id}/root:/{path}``
+    item-by-path lookups for :func:`connectors.sharepoint.graph_client.
+    get_item_by_path`. ``items`` maps a folder path (as the admin would type
+    it) to either an item dict (200) or an int HTTP status (403/404/500...);
+    a path absent from ``items`` answers 404."""
+    from connectors.sharepoint import graph_client as gc
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-bulk"})
+        prefix = f"/v1.0/drives/{drive_id}/root:/"
+        assert request.url.path.startswith(prefix), request.url.path
+        path = request.url.path[len(prefix) :]
+        entry = items.get(path)
+        if entry is None:
+            return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
+        if isinstance(entry, int):
+            return httpx.Response(entry, json={"error": {"code": "x"}})
+        return httpx.Response(200, json=entry)
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+def _folder_item(item_id: str, name: str) -> dict:
+    return {"id": item_id, "name": name, "folder": {"childCount": 0}}
+
+
+class TestBulkScopeAdd:
+    """``POST …/scopes/bulk`` — resolve many admin-typed folder paths to
+    Graph items and confirm one scope each, in a single call (the fast path
+    for splitting a large SharePoint site across several connections)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/scopes/bulk",
+            json={"paths": ["A"], "drive_id": "drv1"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/scopes/bulk",
+            json={"paths": ["A"], "drive_id": "drv1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_creates_a_scope_per_resolved_path(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B/Sub": _folder_item("item-b", "Sub")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-create")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B/Sub"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["skipped"] == []
+        assert body["failed"] == []
+        assert len(body["created"]) == 2
+        for entry in body["created"]:
+            assert entry["access_mode"] == "manual"
+            assert entry["drive_id"] == "drv1"
+            assert entry["include_excluded_subtrees"] is False
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["source_scope_id"] for i in listed} == {"item-a", "item-b"}
+        # each path minted its own collection
+        assert len({i["collection_id"] for i in listed}) == 2
+
+    def test_skips_a_path_already_present(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-skip")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["created"] == []
+        assert body["skipped"] == [{"path": "Folder A", "source_scope_id": "item-a", "reason": "already_present"}]
+        assert body["failed"] == []
+
+    def test_unknown_path_is_reported_failed_not_found(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-notfound")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Ghost Folder"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 1
+        assert body["failed"] == [{"path": "Ghost Folder", "reason": "not_found"}]
+
+    def test_forbidden_path_is_reported_failed_forbidden(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Locked Folder": 403})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-forbidden")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Locked Folder"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["failed"] == [{"path": "Locked Folder", "reason": "forbidden"}]
+
+    def test_upstream_outage_aborts_remaining_paths_but_keeps_already_created(self, seeded_app, monkeypatch):
+        """A non-403/404 Graph failure (network fault, 5xx, ...) is not a
+        per-path fact — it means the whole call is broken and aborts the
+        rest of the batch with a typed 502, but whatever was already
+        resolved and created before that point is still persisted."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": 500},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-outage")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B", "Folder C"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_graph_error"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert [i["source_scope_id"] for i in listed] == ["item-a"]
+
+    def test_drive_id_required_without_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-no-drive")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"]},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "drive_id_required"
+
+    def test_drive_id_inferred_from_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")}, drive_id="drive-known")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-infer-drive")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "prior", "display_path": "Prior", "drive_id": "drive-known"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"]},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(r.json()["created"]) == 1
+
+    def test_malformed_drive_id_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-bad-drive")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "not/a-valid-id"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_empty_paths_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-empty-paths")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["   "], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_writes_an_audit_row(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-audit")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.scope_bulk_add", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params == {"requested": 1, "created": 1, "skipped": 0, "failed": 0}
+
+    def test_readopts_a_tombstoned_collection_instead_of_minting_a_duplicate(self, seeded_app, monkeypatch):
+        """Tick -> untick -> bulk re-add of the same folder must re-adopt the
+        SAME collection (never fork a slug-suffixed duplicate) and clear the
+        tombstone — the same contract a singular re-confirm gets
+        (TestUntickRetickLifecycle)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-readopt")
+
+        first = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert first.status_code == 201, first.text
+        collection_id = first.json()["collection_id"]
+
+        untick = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert untick.status_code == 200, untick.text
+
+        detail = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert "item-a" in (detail["config"].get("retired_scope_collections") or {})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(r.json()["created"]) == 1
+        assert r.json()["created"][0]["collection_id"] == collection_id
+
+        detail = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert "item-a" not in (detail["config"].get("retired_scope_collections") or {})
+
+
+class TestConnectionClone:
+    """``POST …/clone`` — a sibling SharePoint connection wired to the same
+    credential material, no scopes, feeding the same split-a-large-site
+    workflow as bulk scope-add above."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/clone",
+            json={"name": "x"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/clone",
+            json={"name": "x"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_clone_copies_identity_and_starts_with_zero_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-source", tenant_id="tenant-x", client_id="client-y")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        assert new_id != conn_id
+
+        detail = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+        assert detail["source_type"] == "sharepoint"
+        assert detail["config"]["tenant_id"] == "tenant-x"
+        assert detail["config"]["client_id"] == "client-y"
+        assert "scopes" not in detail["config"]
+
+        listed = c.get(f"{BASE}/{new_id}/scopes", headers=_auth(token)).json()["items"]
+        assert listed == []
+
+    def test_clone_does_not_duplicate_a_vault_secret(self, seeded_app, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        try:
+            c = seeded_app["client"]
+            token = seeded_app["admin_token"]
+            conn_id = _create_connection(c, token, name="clone-vault-source")
+            secret_resp = c.put(
+                f"/api/admin/source-connections/{conn_id}/secret",
+                json={"value": PEM},
+                headers=_auth(token),
+            )
+            assert secret_resp.status_code == 204, secret_resp.text
+
+            r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-vault-target"}, headers=_auth(token))
+            assert r.status_code == 201, r.text
+            new_id = r.json()["id"]
+
+            from src.repositories import connection_secrets_repo
+
+            assert connection_secrets_repo().has(conn_id) is True
+            assert connection_secrets_repo().has(new_id) is False
+        finally:
+            _reset_ephemeral_key_for_tests()
+
+    def test_name_conflict_is_409(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-dup-source")
+        other = _create_connection(c, token, name="clone-dup-existing")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-dup-existing"}, headers=_auth(token))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == "connection_name_exists"
+        assert other  # keep the fixture referenced
+
+    def test_writes_an_audit_row(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-audit-source")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-audit-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.clone", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params == {"source_connection_id": conn_id, "name": "clone-audit-target"}
+        assert rows[0]["resource"] == f"source_connection:{new_id}"

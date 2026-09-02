@@ -80,6 +80,21 @@ spot-check shows pseudonyms, not names.
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
   reports it. Per-run override in the Run-now options.
+- **Split one large site across several connections**, each with its own
+  crawl and facts jobs so they run in parallel instead of one connection's
+  worth of concurrency working through the whole site sequentially:
+  1. `POST /api/admin/sharepoint/connections/{id}/clone` or `agnes admin
+     sharepoint connection clone <connection_id> --name <name>` — a sibling
+     connection wired to the SAME tenant/client identity and certificate/
+     client-secret reference (never a copied secret value), zero scopes.
+  2. `POST …/scopes/bulk` or `agnes admin sharepoint scope bulk-add
+     <connection_id> --path "Folder A" --path "Folder B/Sub" [--drive-id
+     <id>]` (or `--paths-file split.json`, a JSON list or `{"paths":
+     [...]}`) — confirms every path as a scope in one call, reporting
+     created/skipped/already-failed paths independently rather than
+     all-or-nothing.
+  3. Repeat 1-2 per clone, splitting the site's top-level folders across
+     however many connections the crawl needs to parallelize over.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals

@@ -708,6 +708,16 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin removed a SharePoint site previously added by URL.",
     ),
+    "sharepoint_connection.scope_bulk_add": AuditEvent(
+        "sharepoint_connection.scope_bulk_add",
+        "mutation",
+        "An admin confirmed many SharePoint folder paths as scopes in one bulk call.",
+    ),
+    "sharepoint_connection.clone": AuditEvent(
+        "sharepoint_connection.clone",
+        "mutation",
+        "An admin cloned a SharePoint connection into a sibling wired to the same credential material.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",

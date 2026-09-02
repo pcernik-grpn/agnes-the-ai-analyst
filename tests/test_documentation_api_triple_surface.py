@@ -1202,6 +1202,35 @@ _EXEMPT: dict[str, str] = {
         "confirm/list/unselect a scope (site/library/folder -> collection) for the "
         "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
     ),
+    # Bulk scope-add — same admin-only wizard-bookkeeping class as its
+    # singular sibling right above, EXCEPT this one IS CLI-reachable (`agnes
+    # admin sharepoint scope bulk-add`), same carve-out shape as
+    # facts-extract below: an ops engineer scripting a large-site split from
+    # a JSON file without opening the browser wizard. Deliberately still not
+    # MCP-exposed: it creates a collection (+ later, group grants) per
+    # admin-picked SharePoint path, the same collection/visibility side
+    # effects `.../scopes` itself is never agent-invokable for.
+    "/api/admin/sharepoint/connections/{connection_id}/scopes/bulk": (
+        "bulk-confirm many folder paths as scopes in one call — CLI-reachable "
+        "(agnes admin sharepoint scope bulk-add) but deliberately not MCP-exposed: "
+        "mirrors the facts-extract admin/ops exemption, an operator scripting a "
+        "large-site split, not an analyst query surface"
+    ),
+    # Connection clone — creates a new source_connections row wired to the
+    # SAME credential material as an existing one (never a copied secret
+    # value; see the endpoint's own docstring). CLI-reachable, but never
+    # MCP-exposed: the same "admin credential-provisioning writes" standing
+    # exemption (CONTRIBUTING.md) as the generic connection-create/secret
+    # routes — an agent-invokable tool that can mint a new connection
+    # inheriting an existing credential's trust is a privilege-escalation
+    # seam, not a convenience.
+    "/api/admin/sharepoint/connections/{connection_id}/clone": (
+        "clone a SharePoint connection (same tenant/client identity and "
+        "certificate/client-secret env-var reference, zero scopes) — CLI-reachable "
+        "(agnes admin sharepoint connection clone) but deliberately not MCP-exposed: "
+        "the standing admin credential-provisioning exemption (CONTRIBUTING.md), same "
+        "reasoning as POST /api/admin/source-connections' own credential-adjacent writes"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "

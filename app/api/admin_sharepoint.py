@@ -141,6 +141,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -155,6 +156,7 @@ from connectors.sharepoint.graph_client import (
     build_folder_matcher,
     certificate_metadata,
     get_app_token,
+    get_item_by_path,
     get_site_by_path,
     list_drives,
     list_item_children,
@@ -301,6 +303,26 @@ class AddManualSiteBody(BaseModel):
     result (see :func:`add_manual_site`)."""
 
     site_url: str = Field(..., min_length=1)
+
+
+class BulkScopeBody(BaseModel):
+    """One shot: turn a list of admin-typed folder paths into confirmed
+    scopes, without the wizard's own click-through-the-tree flow (see
+    :func:`bulk_add_scopes`). ``drive_id`` is optional — omit it to reuse
+    the drive of an existing scope on this SAME connection; a brand-new
+    connection with no scopes yet (the split-a-big-site workflow's typical
+    starting point, see :func:`clone_connection`) must supply it."""
+
+    paths: List[str] = Field(..., min_length=1)
+    drive_id: Optional[str] = None
+
+
+class CloneConnectionBody(BaseModel):
+    """The new sibling connection's own name — everything else (identity,
+    credential references) is copied from the source (see
+    :func:`clone_connection`)."""
+
+    name: str = Field(..., min_length=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1505,6 +1527,233 @@ async def remove_scope(
             {"id": collection["id"], "slug": collection["slug"], "name": collection["name"]} if kept else None
         ),
     }
+
+
+@router.post("/connections/{connection_id}/scopes/bulk")
+async def bulk_add_scopes(
+    connection_id: str,
+    body: BulkScopeBody,
+    user: dict = Depends(require_admin),
+):
+    """Confirm many site/library/folder paths as scopes in one call — the
+    fast path for splitting one large SharePoint site across several
+    connections (each with its own crawl and facts jobs, so they run in
+    parallel): resolve each admin-typed ``paths`` entry to a Graph drive
+    item (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and
+    write a scope row for it, same shape :func:`confirm_scope` writes
+    (``access_mode="manual"``, ``include_excluded_subtrees=False`` — the
+    same defaults a single manual confirm gets; #2032 made these round-trip
+    through list/confirm and this endpoint honours the same contract) —
+    minus the wizard's own group-grant step (``group_ids``), which stays a
+    separate, deliberate action on each created scope.
+
+    Never all-or-nothing: every path is resolved and reported independently
+    in the response, ``{"created": [...], "skipped": [...], "failed":
+    [{"path", "reason"}]}`` —
+
+    * **created** — a fresh scope, collection minted (or re-adopted from a
+      matching untick tombstone, same as :func:`confirm_scope`); each entry
+      is `{"path", **scope}` (the same projection ``GET …/scopes`` returns).
+    * **skipped** — the path resolved to a ``source_scope_id`` ALREADY
+      present among this connection's scopes (the idempotency key
+      :func:`confirm_scope` itself uses) — ``{"path", "source_scope_id",
+      "reason": "already_present"}``.
+    * **failed** — Graph could not resolve the path: ``{"path", "reason"}``
+      with ``reason`` one of ``"not_found"`` (404) or ``"forbidden"``
+      (403) — the same routine-permissions-fact classification
+      :func:`connectors.sharepoint.graph_client.search_folders` already
+      uses, never surfaced as a whole-request failure.
+
+    Any OTHER Graph failure (401/429/5xx, a network fault) is not a
+    per-path fact — it means the whole call is broken, same rule
+    :func:`connectors.sharepoint.graph_client.search_folders` documents —
+    and aborts the remaining, unprocessed paths with a typed ``502
+    sharepoint_graph_error``; whatever was already resolved and created
+    before that point is still persisted (already-report paths are not
+    rolled back by a later path's outage).
+
+    ``drive_id`` is required unless this connection already has at least
+    one scope with one set (reused from the first match) — a brand-new
+    connection with zero scopes (:func:`clone_connection`'s own starting
+    point) must supply it explicitly (``400 drive_id_required``
+    otherwise); a malformed one is a typed ``422`` (see
+    :func:`_validate_graph_id`), same as ``POST …/scopes``'s own
+    ``drive_id``.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    paths = [p.strip() for p in body.paths if p and p.strip()]
+    if not paths:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "empty_paths", "message": "paths must contain at least one non-empty path"},
+        )
+
+    if body.drive_id:
+        _validate_graph_id(body.drive_id, "drive_id")
+        drive_id = body.drive_id
+    else:
+        drive_id = next((s.get("drive_id") for s in _scopes(row) if s.get("drive_id")), None)
+        if not drive_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "drive_id_required",
+                    "message": (
+                        "drive_id was not supplied and this connection has no existing scope to infer "
+                        "one from — pass drive_id explicitly (GET …/tree finds one)."
+                    ),
+                },
+            )
+
+    token = await _resolved_token(row)
+
+    scopes = _scopes(row)
+    existing_by_id = {s.get("source_scope_id"): s for s in scopes}
+    declared_corpus_ids = _latest_run_anonymized_corpus_ids()  # one lookup for the whole batch, not per path
+    # Untick tombstones for this connection (see :func:`remove_scope`) —
+    # popped as each is re-adopted below, same "the scope row itself is the
+    # bookkeeping again" rule :func:`confirm_scope` applies to a single
+    # re-tick.
+    retired = dict((row.get("config") or {}).get("retired_scope_collections") or {})
+    retired_changed = False
+
+    created: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+
+    def _persist() -> None:
+        if not created:
+            return
+        # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you
+        # are adding a new key here rather than editing this one.
+        new_config = {**(row.get("config") or {}), "scopes": scopes}
+        if retired_changed:
+            new_config["retired_scope_collections"] = retired
+        source_connections_repo().update(connection_id, config=new_config)
+
+    try:
+        for path in paths:
+            try:
+                item = await get_item_by_path(token, drive_id, path)
+            except SharePointGraphError as exc:
+                if exc.status_code not in (403, 404):
+                    raise
+                reason = "forbidden" if exc.status_code == 403 else "not_found"
+                failed.append({"path": path, "reason": reason})
+                continue
+
+            source_scope_id = item["id"]
+            if source_scope_id in existing_by_id:
+                skipped.append({"path": path, "source_scope_id": source_scope_id, "reason": "already_present"})
+                continue
+
+            tombstone = retired.pop(source_scope_id, None)
+            if tombstone is not None:
+                retired_changed = True
+            collection_id = _readopted_scope_collection_id(tombstone)
+            if collection_id is None:
+                collection_id = _create_scope_collection(
+                    connection_name=row.get("name") or connection_id,
+                    display_path=path,
+                    source_scope_id=source_scope_id,
+                    created_by=user.get("id"),
+                )
+            scope_row = {
+                "source_scope_id": source_scope_id,
+                "display_path": path,
+                "anonymize": False,
+                "collection_id": collection_id,
+                "access_mode": "manual",
+                "drive_id": drive_id,
+                "include_excluded_subtrees": False,
+            }
+            scopes.append(scope_row)
+            existing_by_id[source_scope_id] = scope_row
+            created.append({"path": path, **_scope_out(scope_row, declared_corpus_ids, connection=row)})
+    except SharePointGraphError as exc:
+        _persist()
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "sharepoint_graph_error", "message": str(exc)},
+        ) from exc
+
+    _persist()
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.scope_bulk_add",
+        resource=f"source_connection:{connection_id}",
+        params={"requested": len(paths), "created": len(created), "skipped": len(skipped), "failed": len(failed)},
+        result="success",
+    )
+
+    return {"created": created, "skipped": skipped, "failed": failed}
+
+
+@router.post("/connections/{connection_id}/clone", status_code=201)
+async def clone_connection(
+    connection_id: str,
+    body: CloneConnectionBody,
+    user: dict = Depends(require_admin),
+):
+    """Create a sibling SharePoint connection wired to the SAME credential
+    material as ``connection_id`` — the other half of splitting one large
+    site across several connections (each with its own crawl and facts
+    jobs, so they run in parallel; see :func:`bulk_add_scopes`).
+
+    Copies every config key EXCEPT :data:`SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
+    — i.e. the admin-authored identity/credential REFERENCES (``tenant_id``,
+    ``client_id``, ``auth_method``, ``cert_private_key_env``/
+    ``client_secret_env``), never the wizard's own bookkeeping (confirmed
+    scopes, extraction dispatch stamps, the webhook secret, manual sites,
+    retired-scope tombstones) — the clone starts with zero scopes and no
+    dispatch history, so no scheduled crawl/ACL-sync/subtree-sweep/
+    facts-extraction sweep touches it until an admin confirms scopes on it.
+
+    **The certificate/secret VALUE itself is never copied** — only its
+    reference. When the source's certificate lives in a deployment env var
+    (``config.cert_private_key_env``/``client_secret_env``, the common
+    case), the clone resolves the exact same value on its own, no admin
+    action required (:func:`connectors.sharepoint.settings.
+    resolve_sharepoint_settings`). When it was instead uploaded to the
+    source's OWN vault slot (``connection_secrets`` — one row per
+    ``connection_id``, see that module's docstring), it is NOT duplicated
+    into a second row for the clone: an admin re-uploads it to the clone
+    separately. ``404`` for an unknown/non-SharePoint connection id; ``409
+    connection_name_exists`` if ``name`` is already taken (same rule as
+    ``POST /api/admin/source-connections``).
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    repo = source_connections_repo()
+    if repo.get_by_name(body.name) is not None:
+        raise HTTPException(status_code=409, detail="connection_name_exists")
+
+    cloned_config = {
+        k: v for k, v in (row.get("config") or {}).items() if k not in SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS
+    }
+
+    new_id = str(uuid4())
+    repo.create(
+        id=new_id,
+        name=body.name,
+        source_type="sharepoint",
+        config=cloned_config,
+        token_env=row.get("token_env"),
+        is_default=False,
+        created_by=user.get("id"),
+    )
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.clone",
+        resource=f"source_connection:{new_id}",
+        params={"source_connection_id": connection_id, "name": body.name},
+        result="success",
+    )
+
+    return {"id": new_id, "name": body.name}
 
 
 @router.get("/connections/{connection_id}/certificate")

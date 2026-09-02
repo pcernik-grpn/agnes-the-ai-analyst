@@ -248,6 +248,57 @@ class TestListItemChildren:
             asyncio.run(gc.list_item_children("tok", "drv1", "missing"))
 
 
+class TestGetItemByPath:
+    """`get_item_by_path` — the drive-item-level complement to
+    `get_site_by_path`: Graph's by-path addressing
+    (``/drives/{drive_id}/root:/{path}``) resolves an admin-typed folder
+    path directly to its item id, no interactive tree walk required."""
+
+    def test_resolves_folder_by_path(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root:/FolderA/Sub"
+            return httpx.Response(200, json={"id": "item123", "name": "Sub", "folder": {"childCount": 3}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "FolderA/Sub"))
+        assert item == {"id": "item123", "name": "Sub", "is_folder": True, "child_count": 3}
+
+    def test_empty_path_addresses_the_drive_root(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root"
+            return httpx.Response(200, json={"id": "root-item", "name": "root", "folder": {"childCount": 5}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", ""))
+        assert item["id"] == "root-item"
+
+    def test_path_segments_are_url_quoted(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert b"/drives/drv1/root:/Team%20Site/Contracts" in request.url.raw_path
+            return httpx.Response(200, json={"id": "item456", "name": "Contracts", "folder": {"childCount": 0}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "Team Site/Contracts"))
+        assert item["id"] == "item456"
+
+    def test_file_path_is_not_marked_a_folder(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "doc1", "name": "report.pdf", "file": {}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "report.pdf"))
+        assert item == {"id": "doc1", "name": "report.pdf", "is_folder": False, "child_count": None}
+
+    def test_non_200_error_carries_the_status_code(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
+
+        _install_transport(monkeypatch, handler)
+        with pytest.raises(gc.SharePointGraphError) as exc_info:
+            asyncio.run(gc.get_item_by_path("tok", "drv1", "NoSuchFolder"))
+        assert exc_info.value.status_code == 404
+
+
 class TestGetSiteByPath:
     """`get_site_by_path` — the discovery-free, `Sites.Selected`-compatible
     way to reach one site: Graph's by-path addressing
