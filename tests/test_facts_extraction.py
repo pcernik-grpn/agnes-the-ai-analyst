@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -550,7 +551,6 @@ def test_the_retry_keeps_the_facts_that_already_passed():
 
 
 def test_filter_kept_removes_facts_matching_a_failure_by_key():
-    text = "The Northwind rollout began in March."
     ok = _node("rollout began in March", node_id="engagement:northwind-rollout")
     bad = _node("never appeared", node_id="client:x")
     kept_nodes, kept_edges = fe._filter_kept([ok, bad], [], [(bad, "never appeared")])
@@ -639,6 +639,159 @@ def test_merge_retry_reply_counts_a_parse_error_from_the_retry_stream():
     )
     assert parse_errors == 1
     assert dropped == 1  # the one failure the retry never addressed
+
+
+# ---------------------------------------------------------------------------
+# Batches-API submission machinery
+# ---------------------------------------------------------------------------
+
+
+class FakeBatch:
+    def __init__(self, batch_id: str, *, processing_status: str = "in_progress") -> None:
+        self.id = batch_id
+        self.processing_status = processing_status
+
+
+def _fake_result(custom_id: str, *, kind: str, message: Any = None, error_type: str | None = None) -> Any:
+    """One custom_id's result row — ``kind`` in
+    succeeded/errored/canceled/expired, matching the SDK's own union."""
+    error = None
+    if error_type is not None:
+        error = type("_E", (), {"type": error_type, "message": error_type})()
+    result_obj = type("_Result", (), {"type": kind, "message": message, "error": error})()
+    return type("_Item", (), {"custom_id": custom_id, "result": result_obj})()
+
+
+class FakeBatchesEndpoint:
+    """No-network stand-in for ``client.messages.batches``."""
+
+    def __init__(self) -> None:
+        self.created: list[list] = []
+        self.retrieved: list[str] = []
+        self._status: dict[str, str] = {}
+        self._results: dict[str, list] = {}
+        self._next_id = 0
+
+    def create(self, *, requests):
+        self._next_id += 1
+        batch_id = f"batch_{self._next_id}"
+        self.created.append(list(requests))
+        self._status[batch_id] = "in_progress"
+        return FakeBatch(batch_id)
+
+    def retrieve(self, batch_id):
+        self.retrieved.append(batch_id)
+        return FakeBatch(batch_id, processing_status=self._status.get(batch_id, "in_progress"))
+
+    def results(self, batch_id):
+        return iter(self._results.get(batch_id, []))
+
+    def set_ended(self, batch_id: str, results: list) -> None:
+        self._status[batch_id] = "ended"
+        self._results[batch_id] = results
+
+
+def test_estimate_request_bytes_grows_with_the_document():
+    small = fe._estimate_request_bytes(system_prompt="sys", user_message="short", max_output_tokens=100)
+    large = fe._estimate_request_bytes(system_prompt="sys", user_message="x" * 10_000, max_output_tokens=100)
+    assert large > small
+
+
+def test_group_pending_into_batches_respects_the_request_count_cap():
+    works = [_work(file_id=f"cf_{i}") for i in range(5)]
+    groups = fe._group_pending_into_batches(works, system_prompt="sys", batch_size=2, max_output_tokens=100)
+    assert [len(g) for g in groups] == [2, 2, 1]
+
+
+def test_group_pending_into_batches_respects_the_byte_cap(monkeypatch):
+    works = [_work(file_id=f"cf_{i}") for i in range(3)]
+    # Force a byte estimate large enough that only 2 fit per group even
+    # though `batch_size` alone would allow all 3.
+    monkeypatch.setattr(fe, "MAX_BATCH_API_BYTES", 100)
+    monkeypatch.setattr(fe, "_estimate_request_bytes", lambda **kwargs: 40)
+    groups = fe._group_pending_into_batches(works, system_prompt="sys", batch_size=10, max_output_tokens=100)
+    assert [len(g) for g in groups] == [2, 1]
+
+
+def test_group_pending_into_batches_of_empty_input_is_empty():
+    assert fe._group_pending_into_batches([], system_prompt="sys", batch_size=10, max_output_tokens=100) == []
+
+
+def test_batch_is_expired_by_age_false_for_recent_and_missing():
+    assert fe._batch_is_expired_by_age(None) is False
+    assert fe._batch_is_expired_by_age(fe._now_iso()) is False
+
+
+def test_batch_is_expired_by_age_true_past_the_retention_window():
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=fe.BATCH_RESULT_RETENTION_DAYS + 1)).isoformat(
+        timespec="seconds"
+    )
+    assert fe._batch_is_expired_by_age(stale) is True
+
+
+def test_batch_is_expired_by_age_tolerates_garbage():
+    assert fe._batch_is_expired_by_age("not-a-timestamp") is False
+
+
+def test_ensure_batch_client_returns_the_injected_client_unchanged():
+    sentinel = object()
+    client, model = fe._ensure_batch_client("claude-haiku-4-5", client=sentinel)
+    assert client is sentinel
+    assert model == "claude-haiku-4-5"
+
+
+def test_submit_batch_sends_one_request_per_work_item():
+    endpoint = FakeBatchesEndpoint()
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    works = [_work(file_id="cf_1"), _work(file_id="cf_2")]
+    batch_id = fe._submit_batch(
+        client,
+        model="claude-haiku-4-5",
+        system_prompt="sys",
+        works=works,
+        messages_by_file={w.file_id: w.user_message for w in works},
+        max_output_tokens=100,
+    )
+    assert batch_id == "batch_1"
+    assert len(endpoint.created[0]) == 2
+    assert {r["custom_id"] for r in endpoint.created[0]} == {"cf_1", "cf_2"}
+
+
+def test_poll_batch_until_ended_stops_as_soon_as_ended():
+    endpoint = FakeBatchesEndpoint()
+    endpoint.set_ended("batch_1", [])
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    sleeps: list[float] = []
+    batch = fe._poll_batch_until_ended(client, "batch_1", poll_s=5, deadline=None, sleep=sleeps.append)
+    assert batch is not None
+    assert batch.processing_status == "ended"
+    assert sleeps == []
+
+
+def test_poll_batch_until_ended_returns_none_when_the_deadline_expires():
+    endpoint = FakeBatchesEndpoint()  # never ends
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+
+    class _ExpiredDeadline:
+        def expired(self):
+            return True
+
+    sleeps: list[float] = []
+    batch = fe._poll_batch_until_ended(client, "batch_1", poll_s=5, deadline=_ExpiredDeadline(), sleep=sleeps.append)
+    assert batch is None
+
+
+def test_collect_batch_results_keys_by_custom_id_in_any_order():
+    endpoint = FakeBatchesEndpoint()
+    endpoint.set_ended(
+        "batch_1",
+        [_fake_result("cf_2", kind="succeeded"), _fake_result("cf_1", kind="succeeded")],
+    )
+    client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
+    results = fe._collect_batch_results(client, "batch_1")
+    assert set(results.keys()) == {"cf_1", "cf_2"}
 
 
 # ---------------------------------------------------------------------------

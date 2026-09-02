@@ -1828,6 +1828,192 @@ def _finalize_gate(
     return final_nodes, final_edges, dropped, True, parse_errors2
 
 
+# --------------------------------------------------------------------------
+# Batches API client machinery — submit / poll / collect. No retry/backoff
+# of its own: a submit or retrieve failure means the model account is
+# unreachable, exactly the condition :class:`FactsExtractionUnavailable`
+# already names for the sync transport, so callers translate it the same
+# way rather than growing a second failure taxonomy.
+# --------------------------------------------------------------------------
+
+
+def _ensure_batch_client(
+    model: str, *, client: Any | None = None, timeout_s: float = DEFAULT_TIMEOUT_S
+) -> Tuple[Any, str]:
+    """Resolve a real Anthropic client + its resolved model id — the SAME
+    credential ladder :meth:`_Extractor._ensure_client` uses
+    (``build_client``), reused rather than duplicated so a batch-mode pass
+    can never disagree with a sync-mode one about which key/endpoint/model
+    resolution applies. The Anthropic client this returns is the ordinary
+    Messages client — ``client.messages.batches.*`` is the same object's
+    Batches API surface, not a second client. ``client`` is the test seam
+    (and doubles as the corrective retry's client when
+    ``extraction.facts.retry_transport: sync``).
+    """
+    if client is not None:
+        return client, model
+    from src.anonymization_ner import DetectionUnavailable, build_client
+
+    try:
+        return build_client(model, timeout_s)
+    except DetectionUnavailable as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
+
+
+def _estimate_request_bytes(*, system_prompt: str, user_message: str, max_output_tokens: int) -> int:
+    """A conservative OVER-estimate of one request's on-wire JSON size — a
+    guard rail against the Batches API's 256 MB per-batch cap
+    (:data:`MAX_BATCH_API_BYTES`), not a byte-exact accounting. Mirrors the
+    exact field shape :func:`_submit_batch` sends, padded with placeholder
+    ids/model strings so the estimate never UNDER-counts what the real
+    request will carry.
+    """
+    payload = {
+        "custom_id": "x" * 64,
+        "params": {
+            "model": "x" * 40,
+            "max_tokens": max_output_tokens,
+            "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": user_message}],
+        },
+    }
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _group_pending_into_batches(
+    works: Sequence["_Work"], *, system_prompt: str, batch_size: int, max_output_tokens: int
+) -> List[List["_Work"]]:
+    """Group planned documents into Batches-API-sized groups — at most
+    ``batch_size`` requests (already clamped to the API's own 100,000-
+    request ceiling by :func:`_batch_size`) and never over the API's
+    256 MB per-batch payload cap (:data:`MAX_BATCH_API_BYTES`), estimated
+    per request via :func:`_estimate_request_bytes`. A single oversized
+    document lands alone in its own group rather than blocking the ones
+    beside it — the API itself is the final judge of a truly-too-large
+    request.
+    """
+    groups: List[List["_Work"]] = []
+    current: List["_Work"] = []
+    current_bytes = 0
+    for work in works:
+        nbytes = _estimate_request_bytes(
+            system_prompt=system_prompt, user_message=work.user_message, max_output_tokens=max_output_tokens
+        )
+        if current and (len(current) >= batch_size or current_bytes + nbytes > MAX_BATCH_API_BYTES):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(work)
+        current_bytes += nbytes
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _submit_batch(
+    client: Any,
+    *,
+    model: str,
+    system_prompt: str,
+    works: Sequence["_Work"],
+    messages_by_file: Dict[str, str],
+    max_output_tokens: int,
+) -> str:
+    """Submit ONE Batches-API call for ``works`` and return the new batch's
+    id. ``messages_by_file`` lets a corrective-retry batch send the RETRY
+    prompt (not the document's original ``user_message``) for the same
+    work items — the initial submission passes ``{w.file_id: w.user_message
+    for w in works}``.
+    """
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    requests = [
+        Request(
+            custom_id=work.file_id,
+            params=MessageCreateParamsNonStreaming(
+                model=model,
+                max_tokens=max_output_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": messages_by_file[work.file_id]}],
+            ),
+        )
+        for work in works
+    ]
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except FactsExtractionUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable, not one document's failure
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch submission failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return batch.id
+
+
+def _poll_batch_until_ended(
+    client: Any, batch_id: str, *, poll_s: float, deadline: Any, sleep: Callable[[float], None] = time.sleep
+) -> Optional[Any]:
+    """Poll ``batch_id`` until its ``processing_status`` is ``"ended"``, or
+    the run's deadline elapses first — in which case this returns ``None``
+    and the caller leaves the batch's documents ``batch-submitted`` in
+    state for the next pass to resume. Checks status BEFORE sleeping, so an
+    already-ended batch (the common case on resume) returns immediately
+    with zero wait.
+    """
+    while True:
+        try:
+            batch = client.messages.batches.retrieve(batch_id)
+        except FactsExtractionUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+            raise FactsExtractionUnavailable(
+                f"facts extraction: batch status check failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if getattr(batch, "processing_status", None) == "ended":
+            return batch
+        if _deadline_expired(deadline):
+            return None
+        sleep(poll_s)
+
+
+def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
+    """``{custom_id: result}`` for an ENDED batch. The SDK's own iterator
+    arrives in ANY order (Anthropic's own contract), so callers key off
+    ``custom_id`` rather than position — never assume request N's result
+    is the Nth item returned.
+    """
+    try:
+        return {item.custom_id: item.result for item in client.messages.batches.results(batch_id)}
+    except FactsExtractionUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch result collection failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _batch_is_expired_by_age(submitted_at: Optional[str]) -> bool:
+    """Whether a ``batch-submitted`` state entry is older than Anthropic's
+    own :data:`BATCH_RESULT_RETENTION_DAYS`-day results-retention window —
+    checked BEFORE any network call, so a stale reference from a long-idle
+    instance is treated as expired without wasting a ``retrieve()`` call on
+    a batch the API has already forgotten. Tolerates a missing or
+    unparseable timestamp as "not expired" — the safer default when the
+    state file itself cannot say otherwise.
+    """
+    if not submitted_at:
+        return False
+    try:
+        submitted = datetime.fromisoformat(str(submitted_at))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - submitted).total_seconds()
+    return age_s > BATCH_RESULT_RETENTION_DAYS * 86400
+
+
 def _ingest_identity() -> Any:
     """The identity claims from this pass are attributed to.
 
