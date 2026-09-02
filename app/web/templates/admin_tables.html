@@ -2985,13 +2985,6 @@
           );
         }
       }
-      // Auto-derive a url-safe slug from a Name string. Mirrors the
-      // server-side normalisation used by the seed step in _v48_to_v49.
-      function _deriveSlug(name) {
-        return (name || '').toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '');
-      }
 
       // Hook: chip-input on this page fires `chip-create` when the user
       // selects the "+ Create new" tail row in the dropdown.
@@ -3205,9 +3198,12 @@
           return { id: p.id, name: p.name, member_table_ids: ids };
         });
         // Inline "+ Create new package…" as a sentinel value. The change
-        // handler below intercepts __create__ and runs a tiny prompt-based
-        // flow (name → POST → re-list → re-select) so the user can spawn
-        // a target without leaving the bulk-assign workflow.
+        // handler below intercepts __create__ and opens the SAME shared
+        // drawer (js/components/package_drawer.js) the chip-input's own
+        // "+ Create new" tail row uses — name/slug/description/color, not
+        // a single-field prompt — so the user can spawn a target without
+        // leaving the bulk-assign workflow and without a second, thinner
+        // copy of the create form.
         //
         // v55 — also annotate each option with "(N of M tables already in)"
         // so the admin sees the existing distribution before picking a
@@ -3229,44 +3225,31 @@
               return '<option value="' + escapeHtmlAttr(p.id) + '">'
                 + escapeHtml(p.name) + escapeHtml(distHint) + '</option>';
             }).join('');
-        sel.onchange = async function() {
+        sel.onchange = function() {
           if (sel.value !== '__create__') { refreshBulkAssignAvailability(); return; }
-          const name = await promptModal('Name for the new Data Package:');
-          if (!name || !name.trim()) { sel.value = ''; _syncDropdownRebuild(sel); return; }
-          const slug = _deriveSlug(name.trim());
-          const r = await fetch('/api/admin/data-packages', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: name.trim(),
-              slug,
-              description: null,
-              icon: null,
-              color: '#e0f2fe',
-            }),
-          });
-          if (!r.ok) {
-            const detail = await r.json().catch(function() { return {}; });
-            await alertModal('Create failed: ' + (detail.detail || r.statusText));
-            sel.value = '';
-            _syncDropdownRebuild(sel);
-            return;
-          }
-          const created = await r.json();
-          // Append to the in-memory list + the <select>; preserve any
-          // already-checked table rows by NOT re-rendering the list.
-          _bulkAssignPackages.push({
-            id: created.id, name: name.trim(),
-            member_table_ids: new Set(),
-          });
-          const opt = document.createElement('option');
-          opt.value = created.id;
-          opt.textContent = name.trim();
-          sel.appendChild(opt);
-          sel.value = created.id;
+          // The drawer has no cancel callback of its own to hook, so drop
+          // the sentinel back to "— Choose a package —" the moment it
+          // opens rather than leaving it stuck on __create__ if the admin
+          // backs out without creating anything.
+          sel.value = '';
           _syncDropdownRebuild(sel);
-          refreshBulkAssignAvailability();
+          window.AgnesPackageDrawer.open({
+            onCreated: function (pkg) {
+              // Append to the in-memory list + the <select>; preserve any
+              // already-checked table rows by NOT re-rendering the list.
+              _bulkAssignPackages.push({
+                id: pkg.id, name: pkg.name,
+                member_table_ids: new Set(),
+              });
+              const opt = document.createElement('option');
+              opt.value = pkg.id;
+              opt.textContent = pkg.name;
+              sel.appendChild(opt);
+              sel.value = pkg.id;
+              _syncDropdownRebuild(sel);
+              refreshBulkAssignAvailability();
+            },
+          });
         };
         if (preselectPkgId && _bulkAssignPackages.some(function(p) { return p.id === preselectPkgId; })) {
           sel.value = preselectPkgId;
