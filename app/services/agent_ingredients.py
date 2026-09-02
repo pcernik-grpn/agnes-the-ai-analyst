@@ -89,24 +89,37 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
     try:
         allowed = accessible_collection_ids(user)  # None => admin sees all
         cf_repo = corpus_files_repo()
-        # TODO: the per-collection file count below is an N+1 (one query per
-        # reachable collection, so per *every* collection for an admin). A bulk
-        # `counts_by_corpus()` on both corpus_files backends would collapse it
-        # into one query.
+        # One grouped count for every corpus at once. The per-collection
+        # `len(list_for_corpus(...))` this replaces was an N+1 that also read
+        # every ROW of every collection to arrive at a number — on an instance
+        # where each chat file-drop is its own one-file collection, that is the
+        # common case rather than the pathological one. A corpus with no files
+        # is simply absent from the mapping, hence the `.get(..., 0)`.
+        # `None` means "the count could not be read", which is NOT the same as
+        # zero. Swallowing the failure into an empty mapping labelled every
+        # reachable collection "0 files" — so one transient repository error
+        # made a populated Library look empty, and read as an access problem
+        # rather than a hiccup (Devin Review on #2062).
+        try:
+            file_counts = cf_repo.count_by_corpus()
+        except Exception as exc:  # noqa: BLE001 — a count is metadata, never the listing
+            logger.warning("agent ingredients: could not count collection files: %s", exc)
+            file_counts = None
         for col in file_corpora_repo().list_all():
             if allowed is not None and col["id"] not in allowed:
                 continue
-            try:
-                fcount = len(cf_repo.list_for_corpus(col["id"]))
-            except Exception:
-                fcount = 0
+            fcount = None if file_counts is None else file_counts.get(col["id"], 0)
             sources.append(
                 {
                     "id": col["id"],
                     "kind": "file",
                     "name": col.get("name") or col.get("slug"),
                     "description": col.get("description") or "",
-                    "meta": f"{fcount} file{'' if fcount == 1 else 's'}",
+                    "meta": (
+                        "file count unavailable"
+                        if fcount is None
+                        else f"{fcount} file{'' if fcount == 1 else 's'}"
+                    ),
                 }
             )
     except Exception as e:

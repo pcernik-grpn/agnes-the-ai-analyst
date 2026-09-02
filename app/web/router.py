@@ -270,6 +270,32 @@ templates.env.filters["cover_w"] = cover_variant_url
 templates.env.filters["has_cover_variant"] = has_cover_variant
 
 
+def _pager_href(qs: dict[str, Any], page_param: str, page: int) -> str:
+    """Query string for one pager link.
+
+    Copies every key in ``qs``, overrides ``page_param`` with ``page``, and
+    drops keys that carry the "not filtering" default (``None``/``""``, or
+    a page number of 1). Shared by every paginated section on a detail page
+    (``macros/_detail.html``'s ``pager()`` macro) so a section's own "Next"
+    link can never silently reset another section's active page or search
+    term — the exact bug a bare ``?facts_page={{ n }}`` link had before this
+    existed: it dropped every OTHER query param, which was latent only
+    because there were none yet.
+    """
+    merged = dict(qs)
+    merged[page_param] = page
+    kept: dict[str, Any] = {}
+    for k, v in merged.items():
+        if v is None or v == "":
+            continue
+        if k.endswith("_page") and v == 1:
+            continue
+        kept[k] = v
+    return "?" + urlencode(kept)
+
+
+templates.env.globals["pager_href"] = _pager_href
+
 # Stateless asset helper — register as a global so EVERY template resolves CSS/JS
 # URLs even on routes that build a minimal context (e.g. the studio pages).
 # Without this, base_ds.html emits <link href=""> and the page renders unstyled.
@@ -2588,15 +2614,31 @@ async def library_page(
             _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
         except Exception as e:
             logger.warning("/library: fact counts failed: %s", e)
+    # Same one-batch-call idea as `_fact_counts` just above: every card below
+    # still needs the FULL file list when a collection is non-empty (it is
+    # searched by every contained filename, its per-format facets, and the
+    # single "file_id" a one-file card links straight to) — only an empty
+    # collection can skip the per-collection query entirely, and this bulk
+    # `count_by_corpus()` is what tells us, in one query, which ones those
+    # are instead of finding out via a `list_for_corpus` call that returns
+    # nothing.
+    _file_counts: dict = {}
+    if cf_repo is not None:
+        try:
+            _file_counts = cf_repo.count_by_corpus()
+        except Exception as e:
+            logger.warning("/library: file counts failed: %s", e)
     try:
         for col in _all_cols:
             owned = col.get("created_by") == uid
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
-            try:
-                files = cf_repo.list_for_corpus(col["id"])
-            except Exception:
-                files = []
+            files: list = []
+            if _file_counts.get(col["id"], 0):
+                try:
+                    files = cf_repo.list_for_corpus(col["id"])
+                except Exception:
+                    files = []
             file_count = len(files)
             first_file = None
             if file_count == 1:
@@ -4066,6 +4108,8 @@ async def library_page(
         library_grantable_exists = bool(pkg_slugs) or bool(dom_counts)
         if not library_grantable_exists:
             try:
+                from src.repositories import marketplace_plugins_repo
+
                 library_grantable_exists = bool(marketplace_plugins_repo().count_by_marketplace())
             except Exception as e:  # noqa: BLE001 - a copy decision must never take the page down
                 logger.debug("/library: plugin existence check unavailable: %s", e)
@@ -5187,12 +5231,25 @@ async def library_file_detail(
 # page stays a state read-out, not a data dump.
 _FACTS_SECTION_PAGE_SIZE = 20
 
+# Files section page size. A collection with a bulk upload or a crawled
+# source can easily hold hundreds of rows; rendering (and animating) every
+# one of them made the page itself the slow part, not the query.
+_FILES_SECTION_PAGE_SIZE = 25
+
+# The five-state `processing_status` lifecycle (see `src/ingest/runner.py`),
+# in the order the status filter offers them — the order a file is most
+# likely to actually be in, not alphabetical.
+_CORPUS_FILE_STATUSES = ("indexed", "processing", "pending", "needs_review", "rejected")
+
 
 @router.get("/library/{slug}", response_class=HTMLResponse)
 async def library_detail(
     slug: str,
     request: Request,
     facts_page: int = 1,
+    files_page: int = 1,
+    q: str | None = None,
+    status: str | None = None,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -5212,7 +5269,53 @@ async def library_detail(
     # Owner-aware: the creator can open their private upload without a grant.
     if not is_admin and not can_access_collection(user["id"], col["id"], conn):
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(col["id"])
+
+    cf_repo = corpus_files_repo()
+    q_norm = (q or "").strip() or None
+    status_norm = (status or "").strip() or None
+
+    # The collection's TRUE size, ignoring `q`/`status` — this is what drives
+    # the page's identity (one-file artefact vs. collection, the hero glyph,
+    # the noun, the "Searchable" fraction): a search that narrows the visible
+    # rows to one, or a page slice that happens to land on the last lone row,
+    # must never make a 26-file collection LOOK like a single file. Only the
+    # Files section itself — the count line and its own pager — reacts to the
+    # active filter (`files_total` below).
+    files_total_all = cf_repo.count_for_corpus(col["id"])
+    files_indexed_total = cf_repo.count_for_corpus(col["id"], status="indexed") if files_total_all else 0
+    single_file = None
+    if files_total_all == 1:
+        # Fetch the one true row directly, unfiltered and unpaginated: a
+        # `?q=`/`?status=`/`?files_page=` that happens to not match it must
+        # not turn a genuine one-file artefact into a blank single-file page.
+        _rows = cf_repo.list_for_corpus(col["id"], limit=1)
+        single_file = _rows[0] if _rows else None
+
+    # How many files carry each status, over the WHOLE collection — the
+    # filter chip row needs this to show counts, and it has to ignore the
+    # filter itself (a chip's own count must not change just because it is
+    # the one currently selected). Skipped entirely for an empty collection:
+    # five COUNT queries against nothing is five queries too many.
+    status_counts: dict[str, int] = {}
+    if files_total_all:
+        status_counts = {s: cf_repo.count_for_corpus(col["id"], status=s) for s in _CORPUS_FILE_STATUSES}
+
+    # The Files section's own total: matches `q`/`status`, drives its count
+    # line and its pager. Clamped the same way the Facts pager below always
+    # should have been — `?files_page=999` lands on the last real page
+    # instead of an empty list under a page number nothing links back from.
+    files_total = cf_repo.count_for_corpus(col["id"], q=q_norm, status=status_norm)
+    files_last_page = max(1, -(-files_total // _FILES_SECTION_PAGE_SIZE)) if files_total else 1
+    files_page_clamped = max(1, min(files_page, files_last_page))
+    files = cf_repo.list_for_corpus(
+        col["id"],
+        limit=_FILES_SECTION_PAGE_SIZE,
+        offset=(files_page_clamped - 1) * _FILES_SECTION_PAGE_SIZE,
+        q=q_norm,
+        status=status_norm,
+        order="newest",
+    )
+
     # Owner + sharing are rail facts on every resource detail page (see the page
     # contract in macros/_detail.html); the collection page was the one artefact
     # surface that stated neither, so "who can see this folder?" was only
@@ -5226,18 +5329,32 @@ async def library_detail(
     # this page via a group grant must see exactly what their own grants
     # cover, not the owner's.
     facts_summary = None
+    facts_page_clamped = max(1, facts_page)
     facts_repo_ = _facts_repo_if_available()
     if facts_repo_ is not None:
         try:
-            page = max(1, facts_page)
             summary = facts_repo_.collection_facts_summary(
                 user,
                 col["id"],
                 limit=_FACTS_SECTION_PAGE_SIZE,
-                offset=(page - 1) * _FACTS_SECTION_PAGE_SIZE,
+                offset=(facts_page_clamped - 1) * _FACTS_SECTION_PAGE_SIZE,
             )
             if summary["total"] > 0:
-                facts_summary = {**summary, "page": page, "page_size": _FACTS_SECTION_PAGE_SIZE}
+                # `?facts_page=999` used to render an empty list under "Page
+                # 999 of 3" with no way back — the total (always computed in
+                # full by `collection_facts_summary`, independent of the
+                # requested offset) is what lets us catch that and re-fetch
+                # the real last page instead.
+                last_page = max(1, -(-summary["total"] // _FACTS_SECTION_PAGE_SIZE))
+                if facts_page_clamped > last_page:
+                    facts_page_clamped = last_page
+                    summary = facts_repo_.collection_facts_summary(
+                        user,
+                        col["id"],
+                        limit=_FACTS_SECTION_PAGE_SIZE,
+                        offset=(facts_page_clamped - 1) * _FACTS_SECTION_PAGE_SIZE,
+                    )
+                facts_summary = {**summary, "page": facts_page_clamped, "page_size": _FACTS_SECTION_PAGE_SIZE}
         except Exception as e:
             logger.warning("/library/%s: facts summary failed: %s", slug, e)
 
@@ -5248,6 +5365,17 @@ async def library_detail(
 
     managing = source_managing_connection(col["id"])
 
+    # The one set of "other active query params" every paginated section's
+    # pager shares — see `_pager_href` above. Built once here so a Files
+    # "Next" link can never drop an active Facts page (or vice versa), and a
+    # new search never silently loses the reader's place in Facts.
+    pager_qs = {
+        "q": q_norm,
+        "status": status_norm,
+        "files_page": files_page_clamped,
+        "facts_page": facts_page_clamped,
+    }
+
     ctx = _build_context(
         request,
         user=user,
@@ -5255,6 +5383,17 @@ async def library_detail(
         is_admin=is_admin,
         collection=col,
         files=files,
+        files_total=files_total,
+        files_total_all=files_total_all,
+        files_indexed_total=files_indexed_total,
+        files_page=files_page_clamped,
+        files_page_size=_FILES_SECTION_PAGE_SIZE,
+        files_total_pages=files_last_page,
+        single_file=single_file,
+        files_q=q_norm or "",
+        files_status=status_norm or "",
+        files_status_counts=status_counts,
+        pager_qs=pager_qs,
         owner_name=(_resolve_owner_display(owner_id) if owner_id else None),
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
@@ -5685,7 +5824,9 @@ async def corporate_memory(
     # under auto-membership it applies to BOTH grids — see /catalog's
     # ``_req_first_key`` comment — while classic keeps the pre-redesign
     # contract (Browse only).
-    _req_first_key = lambda e: (0 if e.requirement == "required" else 1, e.name or "")
+    def _req_first_key(e):
+        return (0 if e.requirement == "required" else 1, e.name or "")
+
     browse_entries = sorted(browse_entries, key=_req_first_key)
     if auto_membership:
         stack_entries = sorted(stack_entries, key=_req_first_key)

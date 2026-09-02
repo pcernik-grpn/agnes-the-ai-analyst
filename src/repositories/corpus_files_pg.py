@@ -131,18 +131,87 @@ class CorpusFilesPgRepository:
             )
         return self._decode_row(dict(row)) if row else None
 
-    def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
-        """All files for a given corpus, ordered by created_at."""
+    # Mirrors the DuckDB sibling's ``_ORDER_SQL`` — see its docstring for why
+    # ``order`` is mapped through a literal dict and every fragment ends in
+    # ``, id ASC``.
+    _ORDER_SQL = {
+        "oldest": "created_at ASC, id ASC",
+        "newest": "created_at DESC, id ASC",
+        "name": "LOWER(filename) ASC, id ASC",
+        "size": "size_bytes DESC NULLS LAST, id ASC",
+    }
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE metacharacters so untrusted search text matches
+        literally (see ``users_pg.py::get_by_email_prefix`` for the same idiom)."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _filter_clause(self, corpus_id: str, q: Optional[str], status: Optional[str]) -> tuple[str, Dict[str, Any]]:
+        """Shared WHERE-clause builder for ``list_for_corpus``/``count_for_corpus``.
+
+        Blank (``None``/empty/whitespace-only) ``q``/``status`` means "no
+        filter" — never "match nothing".
+        """
+        where = ["corpus_id = :corpus_id"]
+        params: Dict[str, Any] = {"corpus_id": corpus_id}
+        q_norm = q.strip() if q else ""
+        if q_norm:
+            pattern = f"%{self._escape_like(q_norm)}%"
+            where.append("(LOWER(filename) LIKE LOWER(:q) ESCAPE '\\' OR LOWER(path) LIKE LOWER(:q) ESCAPE '\\')")
+            params["q"] = pattern
+        status_norm = status.strip() if status else ""
+        if status_norm:
+            where.append("processing_status = :status")
+            params["status"] = status_norm
+        return " AND ".join(where), params
+
+    def list_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+        order: str = "oldest",
+    ) -> List[Dict[str, Any]]:
+        """Files for a given corpus, paginated/filtered/ordered.
+
+        Backwards compatible: a bare ``list_for_corpus(corpus_id)`` call
+        keeps returning every row ordered by ``created_at`` ascending, as it
+        always has — 14 existing callers depend on this.
+        """
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        order_sql = self._ORDER_SQL.get(order, self._ORDER_SQL["oldest"])
+        sql = f"SELECT * FROM corpus_files WHERE {where_sql} ORDER BY {order_sql}"
+        if limit is not None:
+            sql += " LIMIT :limit"
+            params["limit"] = limit
+        if offset:
+            sql += " OFFSET :offset"
+            params["offset"] = offset
         with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    sa.text("SELECT * FROM corpus_files WHERE corpus_id = :corpus_id ORDER BY created_at"),
-                    {"corpus_id": corpus_id},
-                )
-                .mappings()
-                .all()
-            )
+            rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode_row(dict(r)) for r in rows]
+
+    def count_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        """Row count for ``list_for_corpus`` under the same ``q``/``status``
+        filters (and nothing else — no limit/offset applies to a count)."""
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(sa.text(f"SELECT COUNT(*) AS n FROM corpus_files WHERE {where_sql}"), params)
+                .mappings()
+                .first()
+            )
+        return int(row["n"]) if row else 0
 
     def count_by_storage_path(self, corpus_id: str, storage_path: str) -> int:
         """How many rows in this corpus reference ``storage_path``.
