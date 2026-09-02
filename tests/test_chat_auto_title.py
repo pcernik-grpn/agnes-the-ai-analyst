@@ -1022,8 +1022,9 @@ def test_announce_title_reaches_local_sinks_only(tmp_path: Path):
         ws = _FakeWS()
         attach_task = asyncio.create_task(manager.attach(s.id, ws))
         await _wait_for_ws_seated(manager, s.id, ws)
-        hit = await manager.announce_title(s.id, "Renamed by hand")
-        miss = await manager.announce_title("chat_not_live_here", "x")
+        manager._repo.set_title(s.id, "Renamed by hand")  # what the rename endpoint persisted
+        hit = await manager.announce_title(s.id)
+        miss = await manager.announce_title("chat_not_live_here")
         await manager.kill(s.id, reason="test_done")
         handle.emit_eof()
         try:
@@ -1036,6 +1037,51 @@ def test_announce_title_reaches_local_sinks_only(tmp_path: Path):
     assert hit is True and miss is False
     renamed = [m for m in ws.sent if m.get("type") == "session_renamed"]
     assert len(renamed) == 1 and renamed[0]["title"] == "Renamed by hand"
+
+
+def test_overlapping_renames_are_announced_in_persistence_order(tmp_path: Path, monkeypatch):
+    """Two renames overlap: the OLDER announcement is slow to deliver. Without
+    ordering, the newer name would be broadcast first and the older one last,
+    leaving every other tab stale. Under the per-session title lock the
+    second announcement reads and sends only after the first finished, so the
+    last frame always carries the persisted title."""
+
+    async def _run():
+        manager = _make_manager(tmp_path)
+        handle = _FakeHandle()
+        manager._provider.spawn = AsyncMock(return_value=handle)
+        s = await manager.create_session(user_email="u@x", surface=Surface.WEB)
+        ws = _FakeWS()
+        attach_task = asyncio.create_task(manager.attach(s.id, ws))
+        await _wait_for_ws_seated(manager, s.id, ws)
+
+        real_broadcast = manager._broadcast
+
+        async def slow_for_the_older_name(live, frame):
+            if frame.get("type") == "session_renamed" and frame.get("title") == "First name":
+                await asyncio.sleep(0.2)  # the older delivery dawdles
+            await real_broadcast(live, frame)
+
+        monkeypatch.setattr(manager, "_broadcast", slow_for_the_older_name)
+
+        manager._repo.set_title(s.id, "First name")
+        first = asyncio.create_task(manager.announce_title(s.id))
+        await asyncio.sleep(0.02)  # the first announcement has read "First name" and is mid-broadcast
+        manager._repo.set_title(s.id, "Second name")
+        second = asyncio.create_task(manager.announce_title(s.id))
+        await asyncio.gather(first, second)
+
+        await manager.kill(s.id, reason="test_done")
+        handle.emit_eof()
+        try:
+            await asyncio.wait_for(attach_task, timeout=1.0)
+        except TimeoutError:
+            pass
+        return ws
+
+    ws = asyncio.run(_run())
+    titles = [m["title"] for m in ws.sent if m.get("type") == "session_renamed"]
+    assert titles == ["First name", "Second name"], titles
 
 
 def test_auto_title_re_arms_when_the_user_row_is_not_there_yet(tmp_path: Path, monkeypatch):

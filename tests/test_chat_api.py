@@ -564,7 +564,7 @@ def test_rename_announces_the_new_title_to_live_sinks(api_client: TestClient, lo
     api_client.app.state.chat_manager = SimpleNamespace(announce_title=announce)
     r = api_client.put(f"/api/chat/sessions/{chat_id}/title", json={"title": "Q3 pipeline review"})
     assert r.status_code == 200, r.text
-    announce.assert_awaited_once_with(chat_id, "Q3 pipeline review")
+    announce.assert_awaited_once_with(chat_id)  # it re-reads the persisted title itself
 
     api_client.app.state.chat_manager = SimpleNamespace(
         announce_title=AsyncMock(side_effect=RuntimeError("socket gone"))

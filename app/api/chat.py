@@ -368,7 +368,7 @@ async def rename_session(
     mgr = getattr(request.app.state, "chat_manager", None)
     if mgr is not None:
         try:
-            await mgr.announce_title(chat_id, title)
+            await mgr.announce_title(chat_id)
         except Exception:
             logger.debug("rename: session_renamed broadcast failed for %s (non-fatal)", chat_id, exc_info=True)
     return {"id": chat_id, "title": title}

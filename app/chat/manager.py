@@ -458,6 +458,9 @@ class LiveSession:
     # single-flow case, so this has no observable effect on memory-mode
     # tests.
     _broadcast_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: Orders "read the persisted title, then broadcast it" (``announce_title``)
+    #: so two overlapping renames can never deliver the older name last.
+    _title_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Live participant emails for co-sessions. Populated by attach() from
     # chat_session_participants WHERE left_at IS NULL; updated by leave_session()
     # when a participant leaves. Empty for non-co sessions.
@@ -4206,12 +4209,19 @@ class ChatManager:
         live.auto_title_started = True
         live.tasks.append(task)
 
-    async def announce_title(self, chat_id: str, title: str) -> bool:
-        """Push a ``session_renamed`` frame for ``chat_id`` to every sink of
-        its live session hosted in THIS process. Returns ``False`` (and does
-        nothing) when the session is not live here — after a rename the
-        initiating browser updates itself from the HTTP response, so this is
-        what keeps a co-driver's or a second tab's sidebar current.
+    async def announce_title(self, chat_id: str) -> bool:
+        """Push the session's PERSISTED title as a ``session_renamed`` frame to
+        every sink of its live session hosted in THIS process. Returns
+        ``False`` (and does nothing) when the session is not live here or has
+        no title. After a rename the initiating browser updates itself from
+        the HTTP response; this is what keeps a co-driver's or a second tab's
+        sidebar current.
+
+        Callers pass no title on purpose: the row is re-read under the
+        session's ``_title_lock`` and broadcast before the lock is released, so
+        two overlapping renames (or a rename racing the auto-title task) are
+        announced in persistence order — the later announcement always reads
+        the later value, and can never be overtaken by an older frame.
 
         Local-only by design: in a role-split deployment the sinks live on the
         owning gateway, and an api-role process has no LiveSession to reach.
@@ -4220,7 +4230,12 @@ class ChatManager:
         live = self._live.get(chat_id)
         if live is None:
             return False
-        await self._broadcast(live, {"type": "session_renamed", "chat_id": chat_id, "title": title})
+        async with live._title_lock:
+            session = self._repo.get_session(chat_id)
+            title = (session.title or "").strip() if session is not None else ""
+            if not title:
+                return False
+            await self._broadcast(live, {"type": "session_renamed", "chat_id": chat_id, "title": title})
         return True
 
     async def _run_auto_title(self, live: LiveSession) -> None:
@@ -4278,33 +4293,20 @@ class ChatManager:
             if not title:
                 return
             # Conditional write: the user may have renamed the chat while we
-            # were awaiting the model, and their name wins. Announce THEIR
-            # title to this session's sinks rather than the model's — the
-            # rename endpoint reaches only sinks hosted in its own process, so
-            # on the owning gateway this is what a co-driver's sidebar sees.
+            # were awaiting the model, and their name wins.
             if not self._repo.set_title_if_unset(live.chat_id, title):
                 logger.debug("auto-title: %s was titled meanwhile (user rename); keeping it", live.chat_id)
-                current = self._repo.get_session(live.chat_id)
-                if current is not None and current.title:
-                    title = current.title
-                else:
-                    return
-            # Push the new title to the live WS so the sidebar +
-            # thread header update without a refresh. _broadcast may
-            # raise if the socket has dropped — swallow it; the
-            # persisted title will surface on the next sidebar load.
+            # Either way, announce whatever is persisted NOW — ours, or the
+            # user's — through the same ordered path the rename endpoint uses,
+            # so the sidebar + thread header update without a refresh and a
+            # co-driver never sees the model's title over the user's.
+            # announce_title may raise if a socket dropped — swallow it; the
+            # persisted title surfaces on the next sidebar load.
             try:
-                await self._broadcast(
-                    live,
-                    {
-                        "type": "session_renamed",
-                        "chat_id": live.chat_id,
-                        "title": title,
-                    },
-                )
+                await self.announce_title(live.chat_id)
             except Exception:
                 logger.debug(
-                    "auto-title: ws.send_json failed for %s; title still persisted",
+                    "auto-title: session_renamed broadcast failed for %s; title still persisted",
                     live.chat_id,
                 )
         except asyncio.CancelledError:
