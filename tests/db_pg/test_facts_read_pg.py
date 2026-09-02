@@ -2289,6 +2289,38 @@ def test_neighbors_applies_a_statement_timeout(pg_env, repo):
     assert result["nodes"][0]["id"] == fact_id
 
 
+def test_claims_applies_a_statement_timeout(pg_env, repo):
+    """`claims()` had no `SET LOCAL statement_timeout` at all — unlike
+    `search()`/`neighbors()`, its one-subject query has no LIMIT either, so
+    a subject carrying a pathological number of claims had nothing bounding
+    how long the connection could sit executing it. Same mechanism, same
+    wiring proof as `test_search_applies_a_statement_timeout`: record every
+    statement issued on the connection `claims()` opens. (A row cap on
+    `claims()` itself is a separate, larger change — it has no
+    `limit_applied`-style truncation signal today, and adding a silent cap
+    without one would recreate the S6 shortfall-oracle shape `search()`/
+    `neighbors()` deliberately avoid — left for a follow-up with its own
+    wire-contract review.)"""
+    from sqlalchemy import event
+
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Exists.")
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        repo.claims(_dict_user("uploader1"), fact_id)
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert any("SET LOCAL statement_timeout" in s for s in statements)
+
+
 # ---------------------------------------------------------------------------
 # Type map — the Library's node-type counts must obey the same gate as
 # search(), or the aggregate becomes the S1/S2 existence oracle in another
@@ -2376,6 +2408,86 @@ def test_type_map_agrees_with_search_for_the_same_caller(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# Edge type map — the `fact_neighbors(edge_types=...)` discovery row: an
+# agent should be able to learn a valid edge type name (e.g. "in_industry")
+# in one cheap call instead of falling back to an unfiltered, every-edge-
+# type traversal on a well-connected node. Same S1/S2 non-disclosure the
+# node type map makes, proven the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_edge_type_map_omits_a_type_the_caller_cannot_see(pg_env, repo):
+    """An edge type whose only instance's claim sits behind an ungranted
+    collection is ABSENT from the map — not reported as 0."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    dst = repo.create_fact(type="industry")
+    edge_id = repo.create_edge(src=src, type="in_industry", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme operates in manufacturing.",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.count_visible_edges_by_type(_dict_user("alice")) == {}
+
+
+def test_edge_type_map_counts_what_the_caller_can_see(pg_env, repo):
+    """The uploader reaches their own collection, so the edge type appears
+    with a real count."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    industry_a = repo.create_fact(type="industry")
+    industry_b = repo.create_fact(type="industry")
+    sponsor = repo.create_fact(type="sponsor")
+    for dst, edge_type, quote in (
+        (industry_a, "in_industry", "Acme operates in manufacturing."),
+        (industry_b, "in_industry", "Acme also serves automotive."),
+        (sponsor, "owned_by", "Acme is owned by Summit Partners."),
+    ):
+        edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
+        repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote)
+
+    assert repo.count_visible_edges_by_type(_dict_user("uploader1")) == {"in_industry": 2, "owned_by": 1}
+
+
+def test_edge_type_map_agrees_with_neighbors_for_the_same_caller(pg_env, repo):
+    """The map's number for an edge type is exactly how many edges of that
+    type the same caller reaches via `neighbors()` from a hub node — the
+    contract that makes the map a trustworthy `edge_types` filter primer."""
+    _seed_full_fixture()
+    hub = repo.create_fact(type="client")
+    for slug in ("alpha", "beta", "gamma"):
+        dst = repo.create_fact(type="industry")
+        repo.add_alias(fact_id=dst, type="industry", natural_key=f"industry:{slug}")
+        edge_id = repo.create_edge(src=hub, type="in_industry", dst=dst)
+        repo.add_claim(
+            edge_id=edge_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"Acme operates in {slug}.",
+        )
+    repo.add_claim(
+        fact_id=hub, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme is a client."
+    )
+
+    caller = _dict_user("uploader1")
+    mapped = repo.count_visible_edges_by_type(caller)
+    neighbors = repo.neighbors(caller, hub, edge_types=["in_industry"])
+    assert mapped["in_industry"] == len([e for e in neighbors["edges"] if e["type"] == "in_industry"])
+
+
+# ---------------------------------------------------------------------------
 # Entity facets — the Library's filter menu (TCRD-250 piece 4). Same gate as
 # search(), plus one extra conservatism: the DOCUMENT tally must not report
 # files sitting in a collection the caller cannot open.
@@ -2412,9 +2524,7 @@ def test_facets_carry_a_label_and_a_document_count(pg_env, repo):
     # corpus_id is the alias's provenance. Without it the alias stays
     # admin-only-visible by design (add_alias's own docstring), so a facet
     # would fall back to the opaque id — see the test below.
-    repo.add_alias(
-        fact_id=fact_id, type="client", natural_key="client:parts-authority", corpus_id=CORPUS_A
-    )
+    repo.add_alias(fact_id=fact_id, type="client", natural_key="client:parts-authority", corpus_id=CORPUS_A)
     for file_id, sha in (("cf_a1", "sha1"), ("cf_a2", "sha2")):
         repo.add_claim(
             fact_id=fact_id,
@@ -2447,6 +2557,166 @@ def test_no_facet_types_requested_is_an_empty_result_not_a_full_scan(pg_env, rep
     assert repo.facet_values(_dict_user("uploader1"), types=[]) == {}
 
 
+# ---------------------------------------------------------------------------
+# facet_values_for_collections — which values each Library ROW carries
+# (TCRD-250 piece 4). The menu's vocabulary is `facet_values` above; this is
+# the per-row half the toolbar slices on.
+# ---------------------------------------------------------------------------
+
+
+def _seed_client(repo, *, corpus_id, file_id, sha, natural_key, fact_type="client", attributed=True):
+    fact_id = repo.create_fact(type=fact_type)
+    repo.add_alias(
+        fact_id=fact_id,
+        type=fact_type,
+        natural_key=natural_key,
+        corpus_id=corpus_id if attributed else None,
+    )
+    repo.add_claim(
+        fact_id=fact_id,
+        corpus_file_id=file_id,
+        corpus_id=corpus_id,
+        file_sha256=sha,
+        quote=f"{natural_key} appears in {file_id}.",
+        attrs={},
+    )
+    return fact_id
+
+
+def test_collection_facets_group_values_under_the_collection_that_evidences_them(pg_env, repo):
+    """The Library renders one row per collection; a value on the wrong row
+    filters the reader to a collection that never mentions it."""
+    _seed_full_fixture()
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="N.B. Handy")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert out == {CORPUS_A: {"client": ["Parts Authority"]}, CORPUS_B: {"client": ["N.B. Handy"]}}
+
+
+def test_a_collection_carries_every_value_its_documents_name(pg_env, repo):
+    """`multi` on the facet: a collection is about as many clients as its
+    files name, and picking either one must keep the row."""
+    _seed_full_fixture()
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2", sha256="sha2")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a2", sha="sha2", natural_key="N.B. Handy")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"])
+    assert out[CORPUS_A]["client"] == ["N.B. Handy", "Parts Authority"], "sorted, both kept"
+
+
+def test_collection_facets_separate_the_types(pg_env, repo):
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(
+        repo,
+        corpus_id=CORPUS_A,
+        file_id="cf_a1",
+        sha="sha1",
+        natural_key="Logistics",
+        fact_type="industry",
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client", "industry"])
+    assert out[CORPUS_A] == {"client": ["Parts Authority"], "industry": ["Logistics"]}
+
+
+def test_collection_facets_are_caller_scoped(pg_env, repo):
+    """S1 applied to the row attributes. Fails if a caller with no grant on
+    the collection can read what it is about off the filter menu — the same
+    existence oracle `facet_values` closes, one surface down."""
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.facet_values_for_collections(_dict_user("alice"), [CORPUS_A], types=["client"]) == {}
+
+
+def test_an_unreadable_collection_in_the_id_list_contributes_nothing(pg_env, repo):
+    """The page passes every id it is rendering; one the caller cannot read
+    must drop out rather than widen what the repo answers."""
+    _seed_full_fixture()
+    _seed_uploader("uploader2")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader2")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="Secret Client")
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert set(out) == {CORPUS_A}, "uploader1 owns A only"
+    assert "Secret Client" not in str(out)
+
+
+def test_a_collection_the_graph_says_nothing_about_is_absent_not_empty(pg_env, repo):
+    """`.get(corpus_id, {})` is the page's read; an entry of empty dicts per
+    collection would cost a graph-less instance a dict per row for nothing."""
+    _seed_full_fixture()
+    assert repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"]) == {}
+
+
+def test_no_ids_or_no_types_is_an_empty_result_not_a_full_scan(pg_env, repo):
+    _seed_full_fixture()
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha1", natural_key="Parts Authority")
+    u = _dict_user("uploader1")
+    assert repo.facet_values_for_collections(u, [], types=["client"]) == {}
+    assert repo.facet_values_for_collections(u, [CORPUS_A], types=[]) == {}
+
+
+def test_collection_facets_fall_back_to_the_opaque_id_for_an_unattributed_alias(pg_env, repo):
+    """Same rule as `facet_values`: a label whose provenance the caller
+    cannot read is itself evidence, so the row carries the id instead. Looks
+    like a bug, is a leak if 'fixed'."""
+    _seed_full_fixture()
+    fact_id = _seed_client(
+        repo,
+        corpus_id=CORPUS_A,
+        file_id="cf_a1",
+        sha="sha1",
+        natural_key="Unattributed Client",
+        attributed=False,
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A], types=["client"])
+    assert out[CORPUS_A]["client"] == [fact_id]
+
+
+def test_endpoint_only_visibility_does_not_attribute_a_subject_to_a_collection(pg_env, repo):
+    """A subject reachable only through an incident edge earns a place in the
+    MENU (`facet_values` lists it) but must not label a row: saying "this
+    collection is about X" on evidence the caller cannot open is a claim the
+    page cannot support."""
+    _seed_full_fixture()
+    _seed_uploader("uploader2")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader2")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="shab")
+    # The subject's only OWN claim sits in the collection uploader1 cannot read.
+    hidden = _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="shab", natural_key="Hidden Client")
+    # ...while a readable edge claim in CORPUS_A reveals it to search().
+    other = repo.create_fact(type="client")
+    edge_id = repo.create_edge(src=other, type="mentions", dst=hidden)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="An edge claim readable to uploader1.",
+        attrs={},
+    )
+
+    out = repo.facet_values_for_collections(_dict_user("uploader1"), [CORPUS_A, CORPUS_B], types=["client"])
+    assert "Hidden Client" not in str(out)
+    assert hidden not in str(out.get(CORPUS_A, {}))
+
+
 def test_an_unattributed_alias_falls_back_to_the_opaque_id(pg_env, repo):
     """An alias with no recorded corpus is admin-only-visible — the same rule
     `search()` applies. A facet must then show the id rather than invent a
@@ -2466,3 +2736,72 @@ def test_an_unattributed_alias_falls_back_to_the_opaque_id(pg_env, repo):
     (row,) = repo.facet_values(_dict_user("uploader1"), types=["client"])["client"]
     assert row["label"] == fact_id, "no readable alias — must not leak the natural key"
     assert row["document_count"] == 1
+
+
+def test_edge_type_map_drops_an_edge_into_a_withheld_endpoint(pg_env, repo):
+    """The map is a primer for the `edge_types` filter, so its number has to
+    be what a traversal would actually yield. `neighbors` resolves the OTHER
+    endpoint per hop and skips the edge when that fact is withheld, but the
+    count applied only the EDGE's own visibility — so an edge into a `wrong`
+    or `restricted` fact was advertised while no traversal could produce it
+    (Devin Review on #2079). For a type that is empty once those are removed,
+    a nonzero count is exactly the existence oracle this method must not be.
+    """
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    good = repo.create_fact(type="industry")
+    withheld = repo.create_fact(type="sponsor")
+
+    for dst, edge_type, quote in (
+        (good, "in_industry", "Acme operates in manufacturing."),
+        (withheld, "owned_by", "Acme is owned by Summit Partners."),
+    ):
+        edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
+        repo.add_claim(
+            edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote
+        )
+
+    caller = _dict_user("uploader1")
+    assert repo.count_visible_edges_by_type(caller) == {"in_industry": 1, "owned_by": 1}
+
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=withheld,
+        natural_keys={"aliases": []},
+        verdict="restricted",
+        reason="named party asked to be withheld",
+        decided_by="admin1",
+    )
+
+    assert repo.count_visible_edges_by_type(caller) == {"in_industry": 1}, (
+        "the only edge of that type points at a withheld fact, so the type must "
+        "disappear rather than advertise a relationship no traversal returns"
+    )
+
+
+def test_a_revealed_endpoint_keeps_its_edge_in_the_map(pg_env, repo):
+    """`revealed` outranks `restricted` on the fact side everywhere else, and
+    it has to here too — otherwise the gate above would hide an edge the
+    caller is explicitly allowed to traverse."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    dst = repo.create_fact(type="sponsor")
+    edge_id = repo.create_edge(src=src, type="owned_by", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme is owned by Summit Partners.",
+    )
+    for verdict, reason in (("restricted", "withheld"), ("revealed", "publicly announced")):
+        repo.upsert_correction(
+            subject_kind="fact",
+            subject_id=dst,
+            natural_keys={"aliases": []},
+            verdict=verdict,
+            reason=reason,
+            decided_by="admin1",
+        )
+
+    assert repo.count_visible_edges_by_type(_dict_user("uploader1")) == {"owned_by": 1}

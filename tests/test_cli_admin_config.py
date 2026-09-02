@@ -374,3 +374,20 @@ class TestApplyPosts:
             result = runner.invoke(app, ["admin", "config", "apply", str(f), "--confirm-danger"])
         assert result.exit_code == 0, result.output
         assert post.call_args.kwargs["json"]["confirm_danger"] is True
+
+
+def test_scrub_secrets_keeps_numeric_values_under_secret_shaped_keys():
+    """A number is never a credential: `chat.max_session_tokens` carries
+    "token" by naming coincidence, and `agnes admin config apply` must send
+    it rather than warn-and-drop it (the same carve-out booleans already
+    had — mirrors the server's `_declared_numeric_fields`)."""
+    from cli.commands.admin_config import _scrub_secrets
+
+    warned: list[str] = []
+    out = _scrub_secrets(
+        {"chat": {"max_session_tokens": 123456, "enabled": True, "api_token": "literal"}},
+        ["secret", "token", "password", "api_key"],
+        warned,
+    )
+    assert out == {"chat": {"max_session_tokens": 123456, "enabled": True}}
+    assert warned == ["chat.api_token"]

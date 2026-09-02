@@ -12,7 +12,7 @@
    `section_open`/`section_close` for the main column, `side_rows` for the
    facts, and (admin only) `manage` for the doors out to management. #}
 
-{% block title %}{{ object_name }} — {{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ object_name }} — {{ model_name }} — Definitions — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block body_attrs %}class="detail-page"{% endblock %}
 
@@ -111,7 +111,7 @@
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }} — read-only</span>
     {% else %}
-    <span class="badge">Native</span>
+    <span class="badge">Created in Agnes</span>
     {% endif %}
 </div>
 {% endset %}
@@ -279,7 +279,7 @@
 {% set _model_link %}<a href="/semantic-layer/{{ slug | urlencode }}">{{ model_name }}</a>{% endset %}
 {{ detail.side_open('') }}
   {# Source only when a source actually owns the document: for a native model
-     the hero badge two lines up already says "Native", and `side_rows` drops a
+     the hero badge two lines up already says so, and `side_rows` drops a
      row whose value is empty rather than printing the same word twice. #}
   {% set _rows = [{'key': 'Source', 'val': source_label if is_imported else None},
                   {'key': 'Source ref', 'val': source_ref}] %}

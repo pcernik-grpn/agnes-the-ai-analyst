@@ -153,9 +153,13 @@ class ChatSessionPgRepository:
         return _row_to_session(row) if row else None
 
     def archive_session(self, chat_id: str) -> None:
+        """Mirrors ``ChatRepository.archive_session`` — including clearing
+        ``pinned_at``, because pinned and archived are contradictory states (see
+        the docstring there for why the invariant lives at the write rather than
+        per surface)."""
         with self._engine.begin() as conn:
             conn.execute(
-                sa.text("UPDATE chat_sessions SET archived = TRUE WHERE id = :id"),
+                sa.text("UPDATE chat_sessions SET archived = TRUE, pinned_at = NULL WHERE id = :id"),
                 {"id": chat_id},
             )
 

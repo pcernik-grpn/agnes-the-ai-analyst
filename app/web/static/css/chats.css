@@ -45,59 +45,37 @@
   .ch-fbar { flex-wrap: wrap; justify-content: center; }
 }
 
-/* ── The four views, inside the Filter menu ───────────────────────────
-   Still the engine's `segments` control (`.fbar-seg` + `.fbar-seg__btn`, so the
-   wiring, the active class and the counts are all the shared component's), but
-   restyled from a horizontal pill tray into a vertical option list — it lives in
-   a menu now, and a tray floating inside a popover reads as a second control
-   panel rather than as that menu's first question.
-   The metrics deliberately match `.fbar-menu__opt` (the checkbox rows below it):
-   same 13.5px text, same 8px radius, same padding, same trailing muted count. */
-.ch-viewsel {
+/* ── The Show block, inside the Filter menu ───────────────────────────
+   TWO groups: the lifecycle state (`.ch-viewsel`, radios — Active / Archived /
+   All) and the independent attributes (`.ch-onlys`, checkboxes — Pinned only /
+   Shared only). Both are `.fbar-menu__opt` rows, the very row the categories
+   below render inside their popovers and styled once by the shared component
+   (filter_toolbar.css), so a choice here and a tick there are visibly the same
+   act. Nothing about the rows is restyled; what lives here is only the two
+   groups' own geometry.
+
+   The RULE between them is doing real work: it says the two groups compose
+   rather than compete. Ticking "Pinned only" narrows within whichever state is
+   chosen, and the one control that used to hold all four made that impossible
+   to see — which is how "All + Shared", a combination that means nothing, came
+   to be offered at all. */
+.ch-viewsel,
+.ch-onlys {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  /* The tray's own fill, border and padding are what made it read as a panel. */
-  background: none;
-  border: none;
-  padding: 0;
-  border-radius: 0;
 }
-.ch-viewsel .fbar-seg__btn {
-  justify-content: flex-start;
-  gap: 9px;
-  width: 100%;
-  height: auto;
-  padding: 7px 10px;
-  font-size: 13.5px;
-  font-weight: 500;
-  border-radius: 8px;
-  color: var(--fbar-ink, var(--ds-text-primary));
+/* The divider is unconditional here because the WRAPPER is conditional: the
+   template emits `.ch-onlys` only when at least one of its options qualifies
+   (see the note there). It used to be guarded with `:not(:empty)`, which never
+   worked — Jinja leaves whitespace text nodes, so `:empty` is false even with
+   zero option rows, and the rule painted over nothing. */
+.ch-onlys {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--ds-border);
+  margin-bottom: 4px;
 }
-.ch-viewsel .fbar-seg__btn:hover { background: var(--fbar-hover, color-mix(in srgb, var(--ds-text-primary) 6%, transparent)); }
-.ch-viewsel .fbar-seg__btn:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
-/* The chosen view. A tint plus the accent ink — no box-shadow lift, which on a
-   flat menu row would read as a floating pill again. */
-.ch-viewsel .fbar-seg__btn.is-active {
-  background: var(--fbar-accent-soft, var(--ds-primary-light));
-  color: var(--fbar-accent, var(--ds-primary));
-  font-weight: 650;
-  box-shadow: none;
-}
-.ch-viewsel__txt { flex: 1 1 auto; text-align: left; }
-.ch-viewsel .fbar-seg__n { margin-left: auto; font-size: 11.5px; }
-
-/* The active view, on the Filter button — the one thing the retired tabs said at
-   rest ("you are looking at Archived"). Hidden on the default view, so the
-   resting button is just "Filter"; it takes the accent because a filter that is
-   ON is state, not decoration. */
-.ch-filter__view {
-  font-weight: 700;
-  color: var(--fbar-accent, var(--ds-primary));
-  white-space: nowrap;
-}
-.ch-filter__view[hidden] { display: none; }
-.ch-filter__view::before { content: "· "; color: var(--fbar-ink-3, var(--ds-text-muted)); }
 
 /* Room under the list for the bulk bar, which is fixed to the foot of the
    viewport while a selection lasts — so the last row is never the one hiding
