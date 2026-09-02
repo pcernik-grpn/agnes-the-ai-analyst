@@ -610,7 +610,7 @@ def source_oauth_client(
         # The endpoint reads an omitted client_secret as "keep whatever is on
         # file" — so omitting it here would silently leave an existing
         # confidential secret in place, and Agnes would keep sending Basic
-        # auth (_client_auth_kwargs keys off secret presence). An explicit ""
+        # auth (_post_token_request keys off secret presence). An explicit ""
         # is the documented "clear it" signal, and converting a registration
         # to public is exactly what this flag means (Devin Review on #1124).
         payload["client_secret"] = ""

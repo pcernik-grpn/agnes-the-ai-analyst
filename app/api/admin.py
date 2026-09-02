@@ -859,6 +859,21 @@ def _switch_default_path(config_keys: tuple[str, ...], fallback: Any) -> Any:
     return fallback
 
 
+def _chat_config_default(name: str):
+    """The runtime default of a ``ChatConfig`` field, for the panel's chat
+    section — the dataclass default IS what ``load_chat_config`` applies to
+    an unset key, so declaring it here keeps one copy, the same way the
+    boolean flags derive from FEATURE_FLAGS."""
+    import dataclasses
+
+    from app.chat.config import ChatConfig
+
+    for f in dataclasses.fields(ChatConfig):
+        if f.name == name:
+            return f.default
+    raise KeyError(name)
+
+
 _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
     # Both sections became editable alongside `mcp`; declaring their booleans
     # here is what makes the panel render a switch instead of a free-text field,
@@ -907,6 +922,55 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "require_admin still refuses everyone else, and admin MUTATIONS "
                 "are always refused from sandboxes regardless of this switch. "
                 "Read live per request by the broker; no restart needed."
+            ),
+        },
+        # The three per-sender limits `enforce_sender_limits`
+        # (app/chat/manager.py) applies before a message is accepted. They
+        # were the section's documented "configurable in /admin/server-config"
+        # knobs, yet the panel never declared them, so an instance that had
+        # not hand-edited its overlay showed no field at all — the only way
+        # to raise the spend cap was a YAML edit on the data disk. Defaults
+        # derive from ChatConfig (the runtime's own dataclass defaults), never
+        # a second literal, for the same reason the flag defaults above come
+        # from FEATURE_FLAGS. All three are read into app.state.chat_config
+        # ONCE at boot — the section's `restart` baseline in
+        # _SECTION_BASELINE_EFFECT — so a save applies after the app process
+        # restarts, never live.
+        "daily_anthropic_spend_usd": {
+            "kind": "float",
+            "default": _chat_config_default("daily_anthropic_spend_usd"),
+            "hint": (
+                "Per-person, per-day (UTC) LLM spend cap in USD across every chat "
+                "surface — priced from the day's tokens at the most expensive "
+                "general-purpose tier, so it stops sooner rather than later. One "
+                "value for everyone on the instance (no per-user override). The "
+                "counter is keyed on the sender's email and clears at midnight "
+                "UTC; recreating the account does not reset it. 0 disables the "
+                "cap. Read once at startup — restart the app process after saving."
+            ),
+        },
+        "max_session_tokens": {
+            "kind": "int",
+            "default": _chat_config_default("max_session_tokens"),
+            "hint": (
+                "Cumulative token budget per conversation — input, output and "
+                "cache writes of every LLM call, summed over the conversation's "
+                "whole life (cache reads excluded). A budget, not a context "
+                "window: an agentic turn re-sends the conversation on every tool "
+                "call, so a value near one context window trips a few turns in. "
+                "When reached, the user is told to start a new conversation. "
+                "0 disables. Read once at startup — restart the app process "
+                "after saving."
+            ),
+        },
+        "rate_messages_per_hour": {
+            "kind": "int",
+            "default": _chat_config_default("rate_messages_per_hour"),
+            "hint": (
+                "Messages one sender may submit per fixed one-hour window, "
+                "across all of their conversations; an attempt made while over "
+                "the cap still counts against the window. Read once at startup "
+                "— restart the app process after saving."
             ),
         },
     },
@@ -2316,10 +2380,39 @@ def _declared_boolean_fields() -> frozenset[str]:
     return frozenset(from_known | from_switches)
 
 
+def _declared_numeric_fields() -> frozenset[str]:
+    """Field names the registry declares as ``kind: "int"`` / ``"float"`` —
+    the numeric sibling of :func:`_declared_boolean_fields`, for the same
+    reason: a number cannot be a credential, and masking one is worse than
+    cosmetic. ``chat.max_session_tokens`` carries the substring "token" by
+    naming coincidence; redacted, GET /server-config hands the panel ``***``
+    for a ``type=number`` input, the browser shows it empty, and the next
+    "Save section" posts ``null`` — silently resetting the operator's budget
+    to the default. ``agnes admin config export`` would likewise omit it as a
+    "secret". Walks nested object declarations too (``auth.keboola.fields``),
+    and the SWITCHES registry, so a future numeric knob is covered without
+    anyone remembering this failure mode.
+    """
+
+    def _walk(fields: dict):
+        for name, spec in fields.items():
+            kind = spec.get("kind")
+            if kind in ("int", "float"):
+                yield name
+            elif kind == "object" and isinstance(spec.get("fields"), dict):
+                yield from _walk(spec["fields"])
+
+    from_known = {name for section in _KNOWN_FIELDS.values() for name in _walk(section)}
+    from_switches = {s.config_keys[-1] for s in SWITCHES if s.kind in ("int", "float") and s.config_keys}
+    return frozenset(from_known | from_switches)
+
+
 def _is_secret_key(key: str) -> bool:
-    """True if a config key holds a credential and should be masked in audit logs."""
+    """True if a config key holds a credential and should be masked in audit
+    logs, GET /server-config, and the config export — unless the registry
+    declares it as a boolean or a number, neither of which can be one."""
     k = key.lower()
-    if k in _declared_boolean_fields():
+    if k in _declared_boolean_fields() or k in _declared_numeric_fields():
         return False
     return any(pat in k for pat in _SECRET_KEY_PATTERNS)
 
