@@ -83,6 +83,7 @@ from src.models.semantic_coverage import ResourceSourceTag
 from src.models.semantic_feedback import SemanticFeedback
 from src.models.semantic_health_mutes import SemanticHealthMute
 from src.models.share_requests import ShareRequest
+from src.models.sharepoint_state import SharepointConnectionState
 from src.models.sso import SsoConfig, UserExternalIdentity
 from src.models.store import (
     MarketplacePlugin,
@@ -185,6 +186,7 @@ __all__ = [
     "SemanticModel",
     "SemanticSource",
     "ShareRequest",
+    "SharepointConnectionState",
     "SessionProcessorState",
     "SetupToken",
     "SourceConnection",

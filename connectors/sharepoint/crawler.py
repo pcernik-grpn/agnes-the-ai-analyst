@@ -89,7 +89,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
-import json
 import logging
 import multiprocessing
 import os
@@ -493,67 +492,55 @@ class _StopWatcher:
 # --------------------------------------------------------------------------
 # Crawl state (per connection): the per-drive deltaLink + per-item cTag map.
 #
-# Persisted as a file under the state dir rather than on the connection row's
-# `config` (where `acl_sync` keeps its own bookkeeping) for one reason: the
-# cTag map is one entry per crawled document — six figures on a real estate —
-# and a JSON column re-serialized on every checkpoint is the wrong home for
-# that. The deltaLinks alone would fit; splitting the two halves across two
-# stores would just create a way for them to disagree.
+# Backed by ``connectors.sharepoint.state_store`` (``kind="crawl"``): a
+# Postgres row when the active app-state backend is Postgres — so ANY
+# extraction worker on ANY host can resume this connection's crawl, not just
+# the one whose local disk holds the file — and the pre-existing per-
+# connection JSON file otherwise (DuckDB, frozen app-state backend, A3). Not
+# kept on the connection row's own `config` (where `acl_sync` keeps its own
+# bookkeeping) for one reason: the cTag map is one entry per crawled
+# document — six figures on a real estate — and a JSON column re-serialized
+# on every checkpoint is the wrong home for that. The deltaLinks alone would
+# fit; splitting the two halves across two stores would just create a way
+# for them to disagree.
 # --------------------------------------------------------------------------
 
-_STATE_SUBDIR = "sharepoint_crawl"
-#: ONE writer for the state file, and one mutator for the in-memory state it
+#: ONE writer for the state store, and one mutator for the in-memory state it
 #: is serialized from. Under in-page concurrency several items finish inside
 #: one page and each writes its own cTag; the page boundary then serializes
-#: the whole dict. A `json.dumps` racing a `dict.__setitem__` is a
-#: "dictionary changed size during iteration" crash on the exact write the
-#: resume guarantee depends on, so both sides take this lock. Re-entrant
-#: because the 410-resync path mutates `delta_links` and then calls
-#: :func:`save_state` while still holding it.
+#: the whole dict. A `json.dumps` (file backend) or the PG upsert's own
+#: `json.dumps` racing a `dict.__setitem__` is a "dictionary changed size
+#: during iteration" crash on the exact write the resume guarantee depends
+#: on, so both sides take this lock. Re-entrant because the 410-resync path
+#: mutates `delta_links` and then calls :func:`save_state` while still
+#: holding it.
 _state_lock = threading.RLock()
-#: Connection ids are repo-minted, but this value reaches a filesystem path,
-#: so it is validated as a single safe segment before use (playbook §6).
-_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def state_path(connection_id: str) -> Path:
-    """``<state dir>/sharepoint_crawl/<connection_id>.json``.
-
-    Validates ``connection_id`` as a single safe path segment AND contains
-    the resolved path inside the state directory — both layers, per the
-    security playbook's filesystem rule.
+    """``<state dir>/sharepoint_crawl/<connection_id>.json`` — the DuckDB
+    fallback (and, until imported, the Postgres path's own source of truth)
+    location. See ``connectors.sharepoint.state_store.file_state_path``.
     """
-    if not _SAFE_SEGMENT_RE.match(connection_id or "") or connection_id in (".", ".."):
-        raise CrawlError(f"unsafe connection id for a state file: {connection_id!r}")
-    from src.db import _get_state_dir
+    from connectors.sharepoint.state_store import StateStoreError, file_state_path
 
-    base = (_get_state_dir() / _STATE_SUBDIR).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    resolved = (base / f"{connection_id}.json").resolve()
-    resolved.relative_to(base)  # containment assertion; raises ValueError if escaped
-    return resolved
+    try:
+        return file_state_path("crawl", connection_id)
+    except StateStoreError as exc:
+        raise CrawlError(str(exc)) from exc
 
 
 def load_state(connection_id: str) -> Dict[str, Any]:
-    """Read this connection's crawl state, tolerating a torn/absent file.
+    """Read this connection's crawl state, tolerating a torn/absent file or
+    a never-before-seen connection.
 
-    A state file that cannot be parsed must not wedge every future run: the
-    worst case of starting over is re-work (already-ingested documents
-    upsert to a no-op), while refusing to run is a permanent outage.
+    Unreadable/missing state must not wedge every future run: the worst
+    case of starting over is re-work (already-ingested documents upsert to
+    a no-op), while refusing to run is a permanent outage.
     """
-    path = state_path(connection_id)
-    state: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state = loaded
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "sharepoint crawl: state for connection %s unreadable (%s) — starting from a full crawl",
-                connection_id,
-                exc,
-            )
+    from connectors.sharepoint.state_store import get as _state_get
+
+    state: Dict[str, Any] = _state_get("crawl", connection_id) or {}
     state.setdefault("delta_links", {})
     state.setdefault("ctags", {})
     #: ``stable_id -> {state_key, path, item, attempts, ..., given_up}`` —
@@ -564,17 +551,17 @@ def load_state(connection_id: str) -> Dict[str, Any]:
 
 
 def save_state(connection_id: str, state: Dict[str, Any]) -> None:
-    """Atomically replace this connection's state file (tmp + ``os.replace``).
+    """Persist this connection's crawl state — a Postgres upsert, or an
+    atomic file replace (tmp + ``os.replace``) on the DuckDB fallback.
 
     Serialized on :data:`_state_lock`: one writer at a time, and never
-    concurrent with an in-page cTag write (which takes the same lock), so the
-    bytes on disk are always a whole, self-consistent snapshot.
+    concurrent with an in-page cTag write (which takes the same lock), so
+    what lands is always a whole, self-consistent snapshot.
     """
+    from connectors.sharepoint.state_store import put as _state_put
+
     with _state_lock:
-        path = state_path(connection_id)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, path)
+        _state_put("crawl", connection_id, state)
 
 
 # --------------------------------------------------------------------------

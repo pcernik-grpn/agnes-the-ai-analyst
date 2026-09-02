@@ -145,6 +145,9 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # identity table's PK IS the bound user (one external identity per
     # user), and sso_config keeps its default "id" PK.
     "user_external_identities": ["user_id"],
+    # SharePoint crawl/facts per-connection state (0096) — PG-only with no
+    # DuckDB source; PK is (connection_id, kind), not "id".
+    "sharepoint_connection_state": ["connection_id", "kind"],
 }
 
 
