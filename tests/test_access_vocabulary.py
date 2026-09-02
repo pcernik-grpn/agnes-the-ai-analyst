@@ -498,3 +498,67 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
         """
         src = self._source()
         assert "if ((groupIds || []).includes(EVERYONE_AUDIENCE.id)) {" in src
+
+
+class TestEveryoneIsNotInTheGroupList:
+    """Decision 04's other half: the list holds groups someone made.
+
+    The carrier stays in `overview.groups` — every id lookup on the page
+    resolves through it, and the grant it carries is stored against it — but
+    it is not offered as a row among real groups. A group named Everyone
+    invites the assumption it can be narrowed like any other, which is the
+    ambiguity the scope exists to remove.
+
+    It gets its own entry above the list instead, carrying the carrier's id
+    in `data-gs` / `data-gsbody` so the existing machinery works untouched:
+    the disclosure handler sets the selection from `data-gs` like any row,
+    and the single Access panel is moved into `data-gsbody`. Selecting it
+    lists exactly the grants that reach every account, with their real tier
+    control and Revoke — which is how an admin sees and changes what has
+    been given to everyone — without a second rendering path to keep in step
+    with the first.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_carrier_is_filtered_out_of_the_list(self):
+        src = self._source()
+        assert "(overview.groups || []).filter((g) => !g.is_everyone).slice().sort(" in src
+
+    def test_it_reuses_the_selection_and_panel_machinery(self):
+        """A second rendering path is the thing this avoids.
+
+        Both attributes are required: `data-gs` is what the disclosure
+        handler reads to set the selection, `data-gsbody` is where
+        `homeWork` moves the one Access panel. With either missing the entry
+        opens onto nothing.
+        """
+        src = self._source()
+        assert '<details class="ax-gs ax-gs--scope" data-gs="${esc(cid)}"' in src
+        assert '<div class="ax-gs__body" data-gsbody="${esc(cid)}"></div>' in src
+
+    def test_the_entry_carries_no_roster(self):
+        src = self._source()
+        entry = src[src.index("const everyoneEntry = cid"):]
+        entry = entry[: entry.index("host.innerHTML")]
+        assert "member_count" not in entry
+        assert "data-gmenu" not in entry     # no rename/delete: it is neither
+        assert "every account ·" in entry
+
+    def test_the_copy_beside_it_does_not_say_group(self):
+        """Three strings in the grant list name their subject.
+
+        Saying "group" over the everyone entry is the same category error the
+        row treatments were fixed for, one level up: it tells the reader the
+        thing they are editing has members. A real group must keep the
+        group wording.
+        """
+        src = self._source()
+        assert "const scopeSelected = !!selectedGroup && selectedGroup === everyoneGroupId();" in src
+        assert '${scopeSelected ? "Add for everyone" : "Add to this group"}' in src
+        assert '${scopeSelected ? "What every account gets" : "What the group gets"}' in src

@@ -2914,7 +2914,14 @@
        the very top because it was the default selection — that is gone, and
        hoisting it now would only pull one system row out of the block its
        heading introduces. */
-    return (overview.groups || []).slice().sort(
+    /* The carrier is NOT a group in this list (decision 04). It stays in
+       `overview.groups` — every id lookup on the page still resolves, and
+       the grant it carries is still stored against it — but it is offered
+       to the reader as the audience it is, in its own entry above the list,
+       not as a row among groups someone made. A group named Everyone
+       invites the assumption that it can be narrowed like any other group,
+       which is exactly the ambiguity the scope removes. */
+    return (overview.groups || []).filter((g) => !g.is_everyone).slice().sort(
       (a, b) => String(a.name).localeCompare(String(b.name)));
   }
 
@@ -3412,7 +3419,50 @@
         <span class="ax-newrow__label">New group</span>
         <span class="ax-newrow__hint">an audience to write grants against</span>
       </button>`;
-    host.innerHTML = newGroupRow + ((custom.length && system.length)
+    /* The everyone audience, first and outside the GROUPS / SYSTEM bands.
+       First because it is the widest reach on the page and therefore the
+       most consequential thing an admin can be wrong about; outside the
+       bands because those label kinds of GROUP and this is not one.
+
+       It carries the carrier's id in `data-gs` / `data-gsbody`, which is
+       what lets the existing machinery work untouched: the disclosure
+       handler sets `selectedGroup` from `data-gs` like any row, and
+       `homeWork` moves the one Access panel into `data-gsbody`. So
+       selecting it shows exactly the grants that reach every account, with
+       their real tier controls and Revoke — the answer to "what has been
+       given to everyone, and how do I change it" — without a second
+       rendering path to keep in step with the first.
+
+       No member count, no kebab: it cannot be renamed or deleted, and a
+       roster number here is the claim three renderers were fixed to stop
+       making. Its People panel is already honest for this case —
+       `renderMembers` says membership is automatic and offers nothing to
+       add or remove. */
+    const cid = everyoneGroupId();
+    const everyoneEntry = cid ? (() => {
+      const open = selectedGroup === cid;
+      const grants = grantCountOf(cid);
+      return `
+      <details class="ax-gs ax-gs--scope" data-gs="${esc(cid)}" ${open ? "open" : ""}>
+        <summary class="ax-gs__hd" title="Every account on this instance, and anyone who joins">
+          <span class="ax-gs__car" aria-hidden="true">›</span>
+          ${AgnesKindGlyph.groupTile()}
+          <span class="ax-gs__id ax-gs__id--g">
+            <span class="ax-gs__line">
+              <span class="ax-g__name">Everyone</span>
+              <span class="ax-orig ax-orig--system">audience</span>
+              <span class="ax-gs__reach">every account · ${grants} granted</span>
+            </span>
+            <span class="ax-gs__desc">Not a group — a scope. Anything here reaches every
+              account, including anyone who joins later.</span>
+          </span>
+          <span class="ax-gs__counts">${familyCounts(cid)}</span>
+        </summary>
+        <div class="ax-gs__body" data-gsbody="${esc(cid)}"></div>
+      </details>`;
+    })() : "";
+
+    host.innerHTML = everyoneEntry + newGroupRow + ((custom.length && system.length)
       ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
       : groups.map(row).join(""));
     homeWork(selectedGroup);
@@ -3673,6 +3723,13 @@
        Everyone. Its control already says `via Everyone` and its Manage cell
        already points there; the section says it once at the top instead of
        twice on every row. */
+    /* The selected audience is not always a group now (decision 04), and
+       three strings in this list name their subject. Saying "group" over
+       the everyone entry is the same category error the row treatments were
+       fixed for, one level up: it tells the reader the thing they are
+       editing has members. */
+    const scopeSelected = !!selectedGroup && selectedGroup === everyoneGroupId();
+
     const sectionOf = (grant) =>
       grant.inherited ? "set_elsewhere" : (grant.section || "change_here");
 
@@ -3748,7 +3805,7 @@
       <button type="button" class="ax-add" data-add-grant>
         <span class="ax-add__plus" aria-hidden="true">+</span>
         <span class="ax-add__body">
-          <span class="ax-add__label">Add to this group</span>
+          <span class="ax-add__label">${scopeSelected ? "Add for everyone" : "Add to this group"}</span>
           <span class="ax-add__hint">packages, memory, plugins, tables — anything grantable</span>
         </span>
       </button>`;
@@ -3769,7 +3826,7 @@
        into the same cell as the tier pair. */
     const colhd = sections ? `
       <div class="ax-colhd">
-        <span>Kind</span><span>What the group gets</span>
+        <span>Kind</span><span>${scopeSelected ? "What every account gets" : "What the group gets"}</span>
         <span>Access tier</span><span class="ax-colhd__u">Manage</span>
       </div>` : "";
 
@@ -4588,7 +4645,8 @@
     person: "Search people…",
   };
   const LEDE = {
-    group: "Every group you can write a grant against, and what each one can reach.",
+    // Not "every group": the list leads with an audience that is not one.
+    group: "Everyone, then every group you can write a grant against — and what each one can reach.",
     resource: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
             + "and which groups can reach it. The mirror of By group.",
   };

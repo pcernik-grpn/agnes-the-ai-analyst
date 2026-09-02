@@ -262,10 +262,34 @@ class TestDataAppResourceType:
         assert slugs == ["my-app"]
 
 
-class TestAccessOverviewIncludesTables:
-    """v19+ — TABLE is unconditionally enabled (no env-gate)."""
+class TestAccessOverviewWithholdsTables:
+    """`table` is a registered type that the Access page does not OFFER.
 
-    def test_tables_section_present(self, seeded_app):
+    This class asserted the opposite until the effort's ticket 11 was
+    reopened and reversed on production evidence: the grant dialog offered
+    every table as knowledge, and a group's list ran page after page of
+    table rows inherited from Everyone, each labelled "reached through a
+    package" — the explanation had become the noise.
+
+    The reversal is narrow, and the two halves are worth keeping apart. The
+    TYPE is untouched: `ResourceType.TABLE` is still registered, table
+    grants still exist and are still read (`src/agent_scope_intersection.py`
+    unions raw grants with package tables when scoping an agent), and the
+    projection still works. Only `offered_on_access` is False, which is what
+    keeps it out of this endpoint's `resources` and therefore out of the
+    picker.
+
+    A table's audience is decided by the data package that carries it, so
+    a direct table grant grants an analyst nothing on its own
+    (`src/rbac.py::can_access_table` intersects the caller's packages with
+    the packages containing the table and never reads a table grant).
+
+    The positive case — that the page offers the other fifteen types and
+    that the endpoint still projects tables for callers that ask for them
+    another way — lives in `tests/test_access_page_does_not_offer_tables.py`.
+    """
+
+    def test_tables_are_not_offered(self, seeded_app):
         c = seeded_app["client"]
         resp = c.get(
             "/api/admin/access-overview",
@@ -273,10 +297,16 @@ class TestAccessOverviewIncludesTables:
         )
         assert resp.status_code == 200
         type_keys = {r["type_key"] for r in resp.json()["resources"]}
-        assert "table" in type_keys
+        assert "table" not in type_keys
         assert "marketplace_plugin" in type_keys  # regression — still there
 
-    def test_seeded_tables_appear_in_overview(self, seeded_app):
+    def test_a_registered_table_does_not_appear(self, seeded_app):
+        """Registering one must not put it back on the page.
+
+        The withholding is a property of the TYPE, not of whether any table
+        happens to exist — so the check is worth making with a row present
+        rather than on an empty registry, where it would pass either way.
+        """
         conn = get_system_db()
         try:
             TableRegistryRepository(conn).register(
@@ -294,9 +324,15 @@ class TestAccessOverviewIncludesTables:
             headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 200
-        tables_section = next(r for r in resp.json()["resources"] if r["type_key"] == "table")
-        all_resource_ids = {it["resource_id"] for block in tables_section["blocks"] for it in block["items"]}
-        assert "overview_test" in all_resource_ids
+        assert not [r for r in resp.json()["resources"] if r["type_key"] == "table"]
+
+    def test_the_type_itself_is_still_registered(self):
+        """The reversal took the table off the PAGE, not out of the model."""
+        from app.resource_types import RESOURCE_TYPES, ResourceType
+
+        spec = RESOURCE_TYPES[ResourceType.TABLE]
+        assert spec.offered_on_access is False
+        assert spec.list_blocks is not None   # still projectable
 
 
 class TestSlackChannelBlocks:
