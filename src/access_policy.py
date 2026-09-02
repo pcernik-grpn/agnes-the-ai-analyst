@@ -1185,6 +1185,12 @@ def _protected_table_self_names(*, table_name: str | None, table_id: str | None)
     return names
 
 
+#: The phrase `src/orchestrator.py` writes into `sync_state.error` when a
+#: connector's own `_meta.rows` came back NULL (#1364) -- the published
+#: `rows=0` next to it is a placeholder, not a verified empty table.
+_COUNT_UNAVAILABLE_MARKER = "Row count unavailable"
+
+
 def _table_resolves_to_cte(table: exp.Table) -> bool:
     """Whether this ``Table`` node names a CTE that is VISIBLE at its
     position, mirroring how DuckDB resolves the identifier.
@@ -1302,6 +1308,15 @@ def raise_if_policy_mapping_empty(
         if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
     ]
     for mapping_row in mapping_rows:
+        # A `query_mode='remote'` mapping table has NO local materialization:
+        # its rows live upstream and the policy's JOIN reads them live, so
+        # whatever `sync_state.rows` says about it is metadata, not a count
+        # (remote connectors publish 0 / NULL -> 0). Refusing on that number
+        # turned every policy joining a populated remote mapping table into
+        # `policy_mapping_empty`; the guard exists to name a broken LOCAL
+        # sync, which a remote row cannot have (#1979, review follow-up).
+        if (mapping_row.get("query_mode") or "").lower() == "remote":
+            continue
         # ID first, NAME only as a fallback. Every current writer keys
         # `sync_state.table_id` by the registry `id` (B1,
         # `src.sync_state_key`), so the id-keyed row is the one that stays
@@ -1324,6 +1339,15 @@ def raise_if_policy_mapping_empty(
             if state:
                 break
         rows = state.get("rows") if state else None
+        # #1364: when the extractor could not COUNT a table this pass the
+        # orchestrator still publishes `rows=0` (the column stays numeric)
+        # but flags the row with a dedicated error, because that 0 is not a
+        # verified empty table -- the previously synced data is still on
+        # disk and still served. Treat that as "unknown", not "empty": the
+        # operator-facing signal is the sync error, and refusing every read
+        # here would turn a counting hiccup into an outage.
+        if state and rows == 0 and _COUNT_UNAVAILABLE_MARKER in str(state.get("error") or ""):
+            continue
         if not rows:
             raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
 

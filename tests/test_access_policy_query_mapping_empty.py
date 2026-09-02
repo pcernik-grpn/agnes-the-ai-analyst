@@ -318,6 +318,73 @@ def test_helper_matches_mapping_table_name_case_insensitively(e2e_env):
     assert exc_info.value.mapping_table == "cost_centres"
 
 
+def test_helper_skips_remote_mapping_tables(e2e_env):
+    """A ``query_mode='remote'`` mapping table has no local materialization,
+    so its ``sync_state.rows`` (0 / NULL -> 0, published by the orchestrator
+    as metadata) is not a count -- the JOIN reads upstream rows live. The
+    guard must not refuse on it (PR #2023 review follow-up)."""
+    from src.access_policy import raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.repositories.sync_state import SyncStateRepository
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id="remote_map",
+            name="remote_map",
+            source_type="bigquery",
+            query_mode="remote",
+            bucket="ds",
+            source_table="m",
+        )
+        registry.set_policy_mapping("remote_map", True)
+        SyncStateRepository(conn).update_sync("remote_map", rows=0, file_size_bytes=0, hash="")
+    finally:
+        conn.close()
+
+    raise_if_policy_mapping_empty(
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM remote_map WHERE email = $user_email)"
+    )
+
+
+def test_helper_treats_count_unavailable_as_unknown_not_empty(e2e_env):
+    """#1364: the orchestrator publishes ``rows=0`` plus a dedicated sync
+    error when the extractor could not count a table this pass; the data
+    previously synced is still served, so the guard must not refuse on that
+    placeholder zero -- while a verified zero (no such error) still raises."""
+    from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.repositories.sync_state import SyncStateRepository
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        for tid in ("uncounted_map", "counted_empty_map"):
+            registry.register(id=tid, name=tid, source_type="keboola", query_mode="local")
+            registry.set_policy_mapping(tid, True)
+        state_repo = SyncStateRepository(conn)
+        state_repo.update_sync("uncounted_map", rows=0, file_size_bytes=10, hash="abc")
+        state_repo.set_error(
+            "uncounted_map",
+            "Row count unavailable for table 'uncounted_map' in source 'x' -- the published rows=0 is NOT a "
+            "verified empty table. See #1364.",
+        )
+        state_repo.update_sync("counted_empty_map", rows=0, file_size_bytes=10, hash="def")
+    finally:
+        conn.close()
+
+    raise_if_policy_mapping_empty(
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM uncounted_map WHERE email = $user_email)"
+    )
+    with pytest.raises(PolicyMappingEmpty, match="counted_empty_map"):
+        raise_if_policy_mapping_empty(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM counted_empty_map WHERE email = $user_email)"
+        )
+
+
 def test_helper_cte_exclusion_is_scope_aware(e2e_env):
     """The CTE exclusion must not hide a PHYSICAL read of a same-named
     mapping table (PR #2023 review, second round on this guard): a
