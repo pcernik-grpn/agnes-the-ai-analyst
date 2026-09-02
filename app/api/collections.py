@@ -89,6 +89,26 @@ router = APIRouter(prefix="/api/collections", tags=["collections"])
 # long-running ingests routinely exceed this window.
 REINGEST_STALE_PROCESSING_MINUTES = 15
 
+# Default/max page size for a collection's file listing — both the dedicated
+# GET .../files endpoint and the inline `files` preview on GET .../{id}.
+DEFAULT_FILE_LIST_LIMIT = 25
+MAX_FILE_LIST_LIMIT = 200
+
+
+def _clamp_file_list_limit(limit: int) -> int:
+    """Clamp to ``1..MAX_FILE_LIST_LIMIT`` — silently, never a 422.
+
+    A caller-visible page-size input (``limit=0``, an absurdly large value)
+    must not error: the web page constructs these query strings itself, and
+    a validation error there would break its own pagination links.
+    """
+    return max(1, min(limit, MAX_FILE_LIST_LIMIT))
+
+
+def _clamp_file_list_offset(offset: int) -> int:
+    """Clamp to ``>= 0`` — silently, same reasoning as the limit clamp above."""
+    return max(0, offset)
+
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -436,18 +456,31 @@ async def get_collection(
     collection_id: str,
     user=Depends(require_collection_access("{collection_id}")),
 ):
-    """Return a collection's metadata + file list.
+    """Return a collection's metadata + a bounded preview of its files.
 
     Requires the caller to hold a grant on this collection (admins exempt).
     Returns **404** (not 403) when the collection does not exist, so that
     unprivileged callers cannot probe for existence via the error code
     difference.
+
+    ``files`` is capped at ``DEFAULT_FILE_LIST_LIMIT`` (oldest-first, the
+    ordering this endpoint always used) — ``files_total`` is the collection's
+    real file count and ``files_truncated`` says whether ``files`` is the
+    whole thing or a preview of it. A caller that needs the rest, or wants to
+    search/paginate/filter, uses ``GET /{collection_id}/files``.
     """
     row = file_corpora_repo().get(collection_id)
     if not row:
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(collection_id)
-    return {**_collection_out(row), "files": [_file_out(f) for f in files]}
+    cf_repo = corpus_files_repo()
+    files = cf_repo.list_for_corpus(collection_id, limit=DEFAULT_FILE_LIST_LIMIT)
+    files_total = cf_repo.count_for_corpus(collection_id)
+    return {
+        **_collection_out(row),
+        "files": [_file_out(f) for f in files],
+        "files_total": files_total,
+        "files_truncated": files_total > len(files),
+    }
 
 
 def _purge_derived_tabular_rows(corpus_id: str) -> None:
@@ -1309,7 +1342,7 @@ def _refuse_source_managed(connection: dict, *, operation: str = "upload") -> No
     name = connection.get("name") or connection.get("id") or "a source connection"
     why = (
         (
-            f"Its name and description are derived from that source's scope, so an edit here "
+            "Its name and description are derived from that source's scope, so an edit here "
             "would be silently reverted by the next sync."
         )
         if operation == "edit"
@@ -1707,14 +1740,55 @@ async def upload_files(
 @router.get("/{collection_id}/files")
 async def list_files(
     collection_id: str,
+    limit: int = DEFAULT_FILE_LIST_LIMIT,
+    offset: int = 0,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    order: str = "newest",
     user=Depends(require_collection_access("{collection_id}")),
 ):
-    """List all files in a collection (all processing statuses)."""
+    """List files in a collection (all processing statuses) — paginated,
+    optionally filtered by filename/path substring (``q``) and/or exact
+    ``processing_status`` (``status``), in ``order`` (``newest`` here by
+    default — the dashboard's most useful default; see
+    ``corpus_files_repo().list_for_corpus`` for the full set and its
+    ``, id ASC`` tie-break).
+
+    ``limit``/``offset`` are clamped, never rejected — see
+    ``_clamp_file_list_limit``/``_clamp_file_list_offset``. A blank ``q`` or
+    ``status`` (``?q=``, what every HTML form sends for an unset optional)
+    means "no filter", exactly like the ``corpus_id`` handling in
+    ``search_collections`` above.
+
+    ``total`` is the row count AFTER the ``q``/``status`` filters and BEFORE
+    ``limit``/``offset`` — the number of matches a caller paging through
+    ``q`` can trust, not the collection's whole file count.
+    """
     corpus = file_corpora_repo().get(collection_id)
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(collection_id)
-    return {"files": [_file_out(f) for f in files]}
+
+    limit = _clamp_file_list_limit(limit)
+    offset = _clamp_file_list_offset(offset)
+    q = (q or "").strip() or None
+    status = (status or "").strip() or None
+
+    cf_repo = corpus_files_repo()
+    total = cf_repo.count_for_corpus(collection_id, q=q, status=status)
+    files = cf_repo.list_for_corpus(
+        collection_id,
+        limit=limit,
+        offset=offset,
+        q=q,
+        status=status,
+        order=order,
+    )
+    return {
+        "files": [_file_out(f) for f in files],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 class MoveFileBody(BaseModel):
