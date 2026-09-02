@@ -2376,6 +2376,86 @@ def test_type_map_agrees_with_search_for_the_same_caller(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# Edge type map — the `fact_neighbors(edge_types=...)` discovery row: an
+# agent should be able to learn a valid edge type name (e.g. "in_industry")
+# in one cheap call instead of falling back to an unfiltered, every-edge-
+# type traversal on a well-connected node. Same S1/S2 non-disclosure the
+# node type map makes, proven the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_edge_type_map_omits_a_type_the_caller_cannot_see(pg_env, repo):
+    """An edge type whose only instance's claim sits behind an ungranted
+    collection is ABSENT from the map — not reported as 0."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    dst = repo.create_fact(type="industry")
+    edge_id = repo.create_edge(src=src, type="in_industry", dst=dst)
+    repo.add_claim(
+        edge_id=edge_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Acme operates in manufacturing.",
+    )
+
+    from src.repositories import users_repo
+
+    users_repo().create(id="alice", email="alice@test.com", name="Alice")
+    _make_group_with_grant(
+        pg_env, group_name="group-b", collection_id="col_other_never_granted", member_user_id="alice"
+    )
+
+    assert repo.count_visible_edges_by_type(_dict_user("alice")) == {}
+
+
+def test_edge_type_map_counts_what_the_caller_can_see(pg_env, repo):
+    """The uploader reaches their own collection, so the edge type appears
+    with a real count."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    industry_a = repo.create_fact(type="industry")
+    industry_b = repo.create_fact(type="industry")
+    sponsor = repo.create_fact(type="sponsor")
+    for dst, edge_type, quote in (
+        (industry_a, "in_industry", "Acme operates in manufacturing."),
+        (industry_b, "in_industry", "Acme also serves automotive."),
+        (sponsor, "owned_by", "Acme is owned by Summit Partners."),
+    ):
+        edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
+        repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote)
+
+    assert repo.count_visible_edges_by_type(_dict_user("uploader1")) == {"in_industry": 2, "owned_by": 1}
+
+
+def test_edge_type_map_agrees_with_neighbors_for_the_same_caller(pg_env, repo):
+    """The map's number for an edge type is exactly how many edges of that
+    type the same caller reaches via `neighbors()` from a hub node — the
+    contract that makes the map a trustworthy `edge_types` filter primer."""
+    _seed_full_fixture()
+    hub = repo.create_fact(type="client")
+    for slug in ("alpha", "beta", "gamma"):
+        dst = repo.create_fact(type="industry")
+        repo.add_alias(fact_id=dst, type="industry", natural_key=f"industry:{slug}")
+        edge_id = repo.create_edge(src=hub, type="in_industry", dst=dst)
+        repo.add_claim(
+            edge_id=edge_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"Acme operates in {slug}.",
+        )
+    repo.add_claim(
+        fact_id=hub, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Acme is a client."
+    )
+
+    caller = _dict_user("uploader1")
+    mapped = repo.count_visible_edges_by_type(caller)
+    neighbors = repo.neighbors(caller, hub, edge_types=["in_industry"])
+    assert mapped["in_industry"] == len([e for e in neighbors["edges"] if e["type"] == "in_industry"])
+
+
+# ---------------------------------------------------------------------------
 # Entity facets — the Library's filter menu (TCRD-250 piece 4). Same gate as
 # search(), plus one extra conservatism: the DOCUMENT tally must not report
 # files sitting in a collection the caller cannot open.
@@ -2412,9 +2492,7 @@ def test_facets_carry_a_label_and_a_document_count(pg_env, repo):
     # corpus_id is the alias's provenance. Without it the alias stays
     # admin-only-visible by design (add_alias's own docstring), so a facet
     # would fall back to the opaque id — see the test below.
-    repo.add_alias(
-        fact_id=fact_id, type="client", natural_key="client:parts-authority", corpus_id=CORPUS_A
-    )
+    repo.add_alias(fact_id=fact_id, type="client", natural_key="client:parts-authority", corpus_id=CORPUS_A)
     for file_id, sha in (("cf_a1", "sha1"), ("cf_a2", "sha2")):
         repo.add_claim(
             fact_id=fact_id,
