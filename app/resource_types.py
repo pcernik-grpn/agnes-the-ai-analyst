@@ -158,6 +158,21 @@ class ResourceTypeSpec:
             per parent entity (e.g. marketplace), one item per grantable
             resource (e.g. plugin). Items must carry ``resource_id`` that
             matches the path string written into ``resource_grants``.
+        offered_on_access: Whether /admin/access OFFERS this type when an
+            admin goes to grant something. False hides it from the picker
+            without touching the type, its enforcement, or grants that
+            already exist — an existing row still renders and still
+            revokes, so an admin can clean up what was written before.
+
+            False for ``table`` only, and measured rather than reasoned:
+            the picker offered every registered table among 239 grantable
+            "knowledge" items, and one production group had ~86 table
+            grants each labelled "reached through a package". Ticking one
+            grants no analyst access at all
+            (``src/rbac.py::can_access_table`` intersects the caller's
+            data packages with the packages containing the table and never
+            reads a table grant), so the picker was writing rows nothing
+            reads. See the effort's ticket 11, reopened on that evidence.
     """
 
     key: ResourceType
@@ -166,6 +181,7 @@ class ResourceTypeSpec:
     description: str
     id_format: str
     list_blocks: ListBlocksFn
+    offered_on_access: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -969,16 +985,25 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         family=ResourceFamily.KNOWLEDGE,
         display_name="Tables",
         description=(
-            "Does NOT grant analyst visibility — the unified-stack design routes "
-            "all analyst table access through Data Packages instead (grant the "
-            "package, not the table). This grant only sets the ceiling agent "
-            "scoping (`tables_mode='selected'`) and co-session grant intersection "
-            "narrow against; a table absent here can never appear in a scoped "
-            "agent's or co-session's effective table set, regardless of package "
-            "membership."
+            "Grants nobody anything on its own. Analyst table access is entirely "
+            "Data-Package-mediated (`src/rbac.py::can_access_table`), so a row "
+            "here is never read for it — grant the package, not the table. Its "
+            "one remaining reader is agent scoping, and even there a data "
+            "package the owner holds is normally sufficient: the data axis "
+            "resolves to `raw TABLE grants UNION the identity's package tables` "
+            "(`src/agent_scope_intersection.py`), and the /agents builder "
+            "declares packages, never bare table ids. Not offered on "
+            "/admin/access for that reason."
         ),
         id_format="<table_id>",
         list_blocks=_table_blocks,
+        # Not offered on /admin/access. The picker listed every registered
+        # table among 239 grantable "knowledge" items and one production
+        # group had ~86 of these grants, each labelled "reached through a
+        # package" — rows an admin ticked believing they granted data, and
+        # which grant no analyst anything. Existing rows still render and
+        # still revoke, so the ones already written can be cleaned up.
+        offered_on_access=False,
     ),
     ResourceType.DATA_PACKAGE: ResourceTypeSpec(
         key=ResourceType.DATA_PACKAGE,

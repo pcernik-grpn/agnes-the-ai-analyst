@@ -339,6 +339,20 @@ async def access_overview(
     # registry order. The page renders Knowledge → Capabilities → Surfaces;
     # sending them interleaved (registry order starts on a capability) would
     # make the UI re-derive an order the registry already knows.
+    #
+    # `offered_on_access=False` types are skipped entirely, which is what
+    # takes `table` out of the picker. Measured, not reasoned: the picker
+    # listed every registered table among 239 grantable "knowledge" items,
+    # and one production group carried ~86 table grants each labelled
+    # "reached through a package" — rows an admin ticked believing they
+    # granted data. Ticking one grants no analyst access
+    # (`src/rbac.py::can_access_table` never reads a table grant), so the
+    # picker was writing rows nothing reads.
+    #
+    # Only the OFFER goes. `grants` above is untouched, so an existing table
+    # row still renders and still revokes — otherwise the rows already
+    # written would become invisible AND unremovable, which is worse than
+    # the crowding this fixes.
     _family_rank = {fam: i for i, fam in enumerate(RESOURCE_FAMILIES)}
     resources = [
         {
@@ -349,7 +363,10 @@ async def access_overview(
             "family_display": RESOURCE_FAMILIES[spec.family].display_name,
             "blocks": spec.list_blocks(),
         }
-        for spec in sorted(enabled_resource_types(), key=lambda s: _family_rank[s.family])
+        for spec in sorted(
+            (s for s in enabled_resource_types() if s.offered_on_access),
+            key=lambda s: _family_rank[s.family],
+        )
     ]
     # Section headers travel separately from the types, so a family with
     # nothing granted still renders as an empty section rather than
