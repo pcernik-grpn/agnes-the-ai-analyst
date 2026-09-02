@@ -399,3 +399,157 @@ def test_registering_a_table_purges_any_orphaned_revisions_at_its_reused_id(tmp_
     reborn = _register(c, token, name="rev_defense_in_depth", server_only=True)
     assert reborn == table_id
     assert _revisions(c, token, reborn)["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The per-table registry write lock (R17 review follow-up on PR #2023)
+#
+# The advisory lock stopped being "the policy write + its history append" and
+# became "every registry write to this table id". These two tests are the
+# reason for each half of that widening, and they need REAL Postgres: an
+# advisory lock is what makes one waiter actually wait.
+# ---------------------------------------------------------------------------
+
+
+def test_delete_waits_for_an_in_flight_policy_save_and_leaves_no_revisions(tmp_path, monkeypatch, pg_engine):
+    """R17-1: ``DELETE /api/admin/registry/{id}`` purges the table's revision
+    history, and used to do it with no lock at all — so a policy save already
+    holding the lock could append its revision AFTER the purge, stranding
+    history under a table id that no longer exists (and handing it to the next
+    table registered at that reused id). The DELETE must wait for the in-flight
+    save instead."""
+    import threading
+
+    c, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    table_id = _register(c, token, name="rev_delete_lock", server_only=True)
+    _put(c, token, table_id, {"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "why"})
+
+    from src.repositories import access_policy_revisions_repo
+
+    assert access_policy_revisions_repo().count_for_table(table_id) == 1
+
+    holding = threading.Event()
+    release = threading.Event()
+    saved: dict[str, object] = {}
+
+    def _in_flight_save() -> None:
+        # Stands in for a concurrent PUT that is already past the lock: it
+        # holds the per-table lock and appends a revision only once the
+        # DELETE has had its chance to run.
+        try:
+            with access_policy_revisions_repo().policy_write_lock(table_id):
+                holding.set()
+                release.wait(timeout=20)
+                access_policy_revisions_repo().record(
+                    table_id=table_id,
+                    policy_sql=f"SELECT * FROM {table_id} WHERE racing = true",
+                    policy_note="written while the DELETE waited",
+                    saved_by="racer@example.com",
+                )
+                saved["ok"] = True
+        except Exception as e:  # pragma: no cover - surfaced by the assert below
+            saved["error"] = repr(e)
+
+    holder = threading.Thread(target=_in_flight_save, daemon=True)
+    holder.start()
+    assert holding.wait(timeout=20), "the in-flight save never took the lock"
+
+    deleted: dict[str, object] = {}
+
+    def _delete() -> None:
+        try:
+            deleted["status"] = c.delete(f"/api/admin/registry/{table_id}", headers=_auth(token)).status_code
+        except Exception as e:  # pragma: no cover - surfaced by the assert below
+            deleted["error"] = repr(e)
+
+    deleter = threading.Thread(target=_delete, daemon=True)
+    deleter.start()
+    deleter.join(timeout=2.0)
+    assert deleter.is_alive(), (
+        "the DELETE completed while a policy save held the per-table lock -- "
+        f"its revision purge is unserialized ({deleted})"
+    )
+
+    release.set()
+    holder.join(timeout=20)
+    assert saved.get("ok") is True, saved
+
+    deleter.join(timeout=20)
+    assert not deleter.is_alive(), "the DELETE never completed after the lock was released"
+    assert deleted.get("status") == 204, deleted
+
+    # The purge ran after the racing revision landed, so nothing is stranded.
+    assert access_policy_revisions_repo().count_for_table(table_id) == 0
+
+    from src.repositories import table_registry_repo
+
+    assert table_registry_repo().get(table_id) is None
+
+
+def test_concurrent_puts_on_one_table_keep_both_edits(tmp_path, monkeypatch, pg_engine):
+    """R17-2: ``update_table`` reads the row, merges this PUT's fields onto
+    it, and upserts EVERY column back. Two concurrent PUTs touching disjoint
+    fields therefore each restored the other's stale value — last writer wins,
+    silently. The whole read -> validate -> write sequence now runs under the
+    per-table lock, so the second PUT reads the first one's committed row.
+
+    Determinism, not luck: the first registry read of each request parks on a
+    barrier. Unserialized, both requests clear it at once and both write from
+    the same stale snapshot. Serialized, the second request cannot reach its
+    read at all until the first has committed, so the barrier simply times out
+    and the two run in order.
+    """
+    import threading
+
+    c, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    table_id = _register(c, token, name="rev_concurrent_put", server_only=True)
+
+    from src.repositories import table_registry_repo
+
+    repo_cls = type(table_registry_repo())
+    original_get = repo_cls.get
+
+    both_read = threading.Barrier(2)
+    armed = threading.Event()
+    armed.set()
+    seen_threads: set[int] = set()
+    seen_lock = threading.Lock()
+
+    def _barriered_get(self, requested_id, *args, **kwargs):
+        first = False
+        if armed.is_set() and requested_id == table_id:
+            with seen_lock:
+                ident = threading.get_ident()
+                if ident not in seen_threads:
+                    seen_threads.add(ident)
+                    first = True
+        if first:
+            try:
+                both_read.wait(timeout=3.0)
+            except threading.BrokenBarrierError:
+                pass
+        return original_get(self, requested_id, *args, **kwargs)
+
+    monkeypatch.setattr(repo_cls, "get", _barriered_get)
+
+    results: dict[str, int] = {}
+
+    def _put_field(key: str, body: dict) -> None:
+        results[key] = _put(c, token, table_id, body).status_code
+
+    threads = [
+        threading.Thread(target=_put_field, args=("description", {"description": "edited by request A"}), daemon=True),
+        threading.Thread(target=_put_field, args=("schedule", {"sync_schedule": "daily 04:00"}), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "a concurrent PUT never finished"
+
+    armed.clear()
+    assert results == {"description": 200, "schedule": 200}, results
+
+    row = original_get(table_registry_repo(), table_id)
+    assert row["description"] == "edited by request A", row
+    assert row["sync_schedule"] == "daily 04:00", row

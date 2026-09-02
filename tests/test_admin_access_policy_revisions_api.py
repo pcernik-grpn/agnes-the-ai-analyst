@@ -242,6 +242,7 @@ class _FakeRevisionStore:
         return "apr_fake"
 
     def delete_for_table(self, table_id: str) -> int:
+        self.events.append(f"delete_for_table:{table_id}")
         return 0
 
 
@@ -325,6 +326,9 @@ class TestPolicyWriteLock:
     def test_the_setters_and_the_record_run_inside_the_lock(self, seeded_app, fake_store, monkeypatch):
         c, token = seeded_app["client"], seeded_app["admin_token"]
         table_id = _register(c, token, name="rev_lock_scope", server_only=True)
+        # Registration takes the same per-table lock (and purges any orphaned
+        # revisions under the reused id) -- not what this test is about.
+        fake_store.events.clear()
 
         from src.repositories import table_registry_repo
 
@@ -359,6 +363,83 @@ class TestPolicyWriteLock:
             "set_access_policy",
             "set_policy_mapping",
             f"record:{table_id}",
+            f"lock_exit:{table_id}",
+        ], fake_store.events
+
+    def _spy_repo_method(self, monkeypatch, fake_store, name):
+        """Record ``name`` on the fake store's event log when the registry
+        repo method is called, so a test can place it relative to the lock."""
+        from src.repositories import table_registry_repo
+
+        repo_cls = type(table_registry_repo())
+        original = getattr(repo_cls, name)
+
+        def _spy(self, *args, **kwargs):
+            fake_store.events.append(name)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(repo_cls, name, _spy)
+
+    def test_a_put_with_no_policy_field_still_runs_under_the_lock(self, seeded_app, fake_store, monkeypatch):
+        """R17-2: the lock covers the WHOLE read -> validate -> write
+        sequence of every registry PUT, not just the policy setters.
+
+        ``update_table`` upserts EVERY column from the row it read on the way
+        in, so two concurrent PUTs touching disjoint fields each write the
+        other's stale value back. Taking the lock only for policy-carrying
+        PUTs left that open; a plain edit must enter it too."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = _register(c, token, name="rev_lock_plain_put", server_only=True)
+        fake_store.events.clear()
+        self._spy_repo_method(monkeypatch, fake_store, "register")
+
+        r = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"description": "not a policy field in sight"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        assert fake_store.events == [
+            f"lock_enter:{table_id}",
+            "register",
+            f"lock_exit:{table_id}",
+        ], fake_store.events
+
+    def test_unregister_purges_and_drops_the_row_under_the_lock(self, seeded_app, fake_store, monkeypatch):
+        """R17-1: the DELETE purges the table's revision history and then
+        drops the registry row. Unserialized, a policy save already holding
+        the lock could append a revision between the two, stranding history
+        under a dead table id -- and offering it to whatever is registered at
+        that reused id next."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = _register(c, token, name="rev_lock_delete", server_only=True)
+        fake_store.events.clear()
+        self._spy_repo_method(monkeypatch, fake_store, "unregister")
+
+        r = c.delete(f"/api/admin/registry/{table_id}", headers=_auth(token))
+        assert r.status_code == 204, r.text
+
+        assert fake_store.events == [
+            f"lock_enter:{table_id}",
+            f"delete_for_table:{table_id}",
+            "unregister",
+            f"lock_exit:{table_id}",
+        ], fake_store.events
+
+    def test_register_purges_and_inserts_under_the_lock(self, seeded_app, fake_store, monkeypatch):
+        """The third writer of one table id: a re-registration purges the
+        orphaned revisions and inserts the row, and must not interleave with
+        either of the other two."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        self._spy_repo_method(monkeypatch, fake_store, "register")
+
+        table_id = _register(c, token, name="rev_lock_register", server_only=True)
+
+        assert fake_store.events == [
+            f"lock_enter:{table_id}",
+            f"delete_for_table:{table_id}",
+            "register",
             f"lock_exit:{table_id}",
         ], fake_store.events
 

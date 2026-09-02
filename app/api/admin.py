@@ -5414,58 +5414,64 @@ def register_table(
     # policy bodies. `RequiresPostgresBackend` is the one exception
     # swallowed (the frozen DuckDB backend has no store to purge at all);
     # everything else is a structured 500, matching unregister_table.
-    try:
-        _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
-        if _orphaned:
-            logger.warning(
-                "register_table: purged %d orphaned access-policy revision(s) "
-                "for reused table id %s",
-                _orphaned,
+    #
+    # R17-1 (review follow-up) — purge and insert together under the
+    # per-table registry write lock, so a save, a delete and a
+    # re-registration of ONE table id are mutually exclusive: an in-flight
+    # policy save holding the lock can no longer land a revision between
+    # this purge and the row it is clearing the way for.
+    with _access_policy_write_lock(table_id):
+        try:
+            _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
+            if _orphaned:
+                logger.warning(
+                    "register_table: purged %d orphaned access-policy revision(s) for reused table id %s",
+                    _orphaned,
+                    table_id,
+                )
+        except RequiresPostgresBackend:
+            pass
+        except Exception as e:
+            logger.error(
+                "Could not purge pre-existing access-policy revisions for newly "
+                "registered table %s before inserting the registry row -- "
+                "aborting the registration rather than risk offering a previous "
+                "table's history as this one's: %s",
                 table_id,
+                e,
             )
-    except RequiresPostgresBackend:
-        pass
-    except Exception as e:
-        logger.error(
-            "Could not purge pre-existing access-policy revisions for newly "
-            "registered table %s before inserting the registry row -- "
-            "aborting the registration rather than risk offering a previous "
-            "table's history as this one's: %s",
-            table_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
-        )
+            raise HTTPException(
+                status_code=500,
+                detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+            )
 
-    repo.register(
-        id=table_id,
-        name=request.name,
-        folder=request.folder,
-        sync_strategy=request.sync_strategy,
-        primary_key=request.primary_key,
-        description=request.description,
-        registered_by=user.get("email"),
-        source_type=request.source_type,
-        bucket=request.bucket,
-        source_table=request.source_table,
-        source_query=request.source_query,
-        query_mode=request.query_mode,
-        sync_schedule=request.sync_schedule,
-        # v26 sync-strategy support fields. None for non-Keboola or
-        # full_refresh tables; persisted as NULL.
-        incremental_window_days=request.incremental_window_days,
-        max_history_days=request.max_history_days,
-        incremental_column=request.incremental_column,
-        where_filters=request.where_filters,
-        partition_by=request.partition_by,
-        partition_granularity=request.partition_granularity,
-        initial_load_chunk_days=request.initial_load_chunk_days,
-        bq_fqn=request.bq_fqn,
-        server_only=request.server_only,
-        connection_id=request.connection_id,
-    )
+        repo.register(
+            id=table_id,
+            name=request.name,
+            folder=request.folder,
+            sync_strategy=request.sync_strategy,
+            primary_key=request.primary_key,
+            description=request.description,
+            registered_by=user.get("email"),
+            source_type=request.source_type,
+            bucket=request.bucket,
+            source_table=request.source_table,
+            source_query=request.source_query,
+            query_mode=request.query_mode,
+            sync_schedule=request.sync_schedule,
+            # v26 sync-strategy support fields. None for non-Keboola or
+            # full_refresh tables; persisted as NULL.
+            incremental_window_days=request.incremental_window_days,
+            max_history_days=request.max_history_days,
+            incremental_column=request.incremental_column,
+            where_filters=request.where_filters,
+            partition_by=request.partition_by,
+            partition_granularity=request.partition_granularity,
+            initial_load_chunk_days=request.initial_load_chunk_days,
+            bq_fqn=request.bq_fqn,
+            server_only=request.server_only,
+            connection_id=request.connection_id,
+        )
 
     # Audit entry — masked params; description kept raw (it's documentation).
     audit_repo().log(
@@ -6208,14 +6214,28 @@ def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
 
 
 def _access_policy_write_lock(table_id: str):
-    """Serialize a table's policy write + history append across processes.
+    """The per-table REGISTRY WRITE lock — every write to one table id.
 
-    Two concurrent PUTs on one table could otherwise commit policy A, commit
-    policy B, record B's revision, then record A's — leaving a history whose
-    newest revision (A) is not the stored policy (B). The revision store's
-    ``policy_write_lock`` (a transaction-scoped Postgres advisory lock keyed
-    on the table id) makes the whole "set_access_policy / set_policy_mapping
-    then record the revision" sequence mutually exclusive per table.
+    Named for the policy write it was introduced for (#1979), but its scope
+    is wider since the R17 review follow-up: a policy save, an ordinary
+    registry PUT, a DELETE and a re-registration of ONE table id are now all
+    mutually exclusive. The mechanism is the revision store's
+    ``policy_write_lock`` — a transaction-scoped Postgres advisory lock keyed
+    on the table id — and it is what makes each of these safe:
+
+    * ``update_table`` reads the row, merges this PUT's fields onto it and
+      upserts EVERY column back, so two concurrent PUTs touching disjoint
+      fields each wrote the other's stale value back (R17-2). Holding the
+      lock across the whole read -> validate -> write makes the second PUT
+      merge onto the first one's committed row.
+    * ``unregister_table`` purges the table's revision bodies and drops its
+      row; ``register_table`` purges any orphan under a reused id and
+      inserts. Unserialized, a save already past the lock could append a
+      revision after either purge, stranding history under a dead id (R17-1).
+    * the policy write and its history append stay ORDERED, the original
+      reason: without it two savers could commit policy A, commit policy B,
+      record B, then record A — a history whose newest revision (A) is not
+      the stored policy (B).
 
     **Ordering, not coupling.** The lock does not put the policy write and
     the history append into one transaction: each keeps its own, exactly as
@@ -6223,15 +6243,27 @@ def _access_policy_write_lock(table_id: str):
     that there is none — a revision that cannot be written is still just a
     missing history row (``_record_access_policy_revision`` swallows it), and
     the policy save it belongs to has already landed. What the lock buys is
-    only that concurrent savers of ONE table cannot interleave those two
-    steps into a contradictory order.
+    only that concurrent writers of ONE table cannot interleave their steps
+    into a contradictory order.
+
+    **What it costs.** Writes to the SAME table id serialize; writes to
+    DIFFERENT tables never wait on each other, because the advisory lock is
+    keyed on the table id. Two admins editing one table were already racing
+    — one of them was silently losing their edit — so the serialization
+    replaces a lost write, not a concurrent one. The other cost is a pooled
+    Postgres connection held for the duration of the guarded section (the
+    lock lives in a transaction), which is why the DELETE releases it before
+    its filesystem and ``sync_state`` cleanup: no other writer of that id
+    contends for those.
 
     When there is no revision store — a DuckDB-backed instance, where
     resolving the PG-only repo raises ``RequiresPostgresBackend`` — this
-    returns ``nullcontext()`` and the save runs exactly as it did before the
-    lock existed. There is no history to misorder there, and the ability to
-    narrow access to a table must not depend on the history feature being
-    available.
+    returns ``nullcontext()`` and every one of those writes runs exactly as
+    it did before the lock existed. That is deliberate: the frozen DuckDB
+    app-state backend is single-process/single-writer by contract, so there
+    is no cross-process race to close there, and the A3 ratchet says not to
+    extend it. The ability to narrow access to a table must also never
+    depend on the history feature being available.
     """
     try:
         return access_policy_revisions_repo().policy_write_lock(table_id)
@@ -6349,519 +6381,535 @@ async def update_table(
     up changes (e.g. a renamed dataset) without waiting for the next
     scheduled sync.
     """
-    repo = table_registry_repo()
-    existing = repo.get(table_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Table not found")
-
-    # v79 — validate connection_id FK before persisting, mirroring
-    # register_table. Checked directly against the request field (not
-    # `updates`) so an explicit `connection_id: null` (meaning "use the
-    # default connection") is treated the same as omission -- both skip
-    # the FK lookup, and an omitted field never clobbers the stored value
-    # once `updates`/`merged` below apply exclude_unset=True.
-    if request.connection_id is not None:
-        from src.repositories import source_connections_repo
-
-        if source_connections_repo().get(request.connection_id) is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"connection_id '{request.connection_id}' not found in source_connections",
-            )
-
-    # `exclude_unset=True` honors the PUT-shape distinction between
-    # "field omitted from body" (keep existing) vs "field sent as null"
-    # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
-    # `if v is not None`, which collapsed both cases to "omitted" — meaning
-    # an admin couldn't clear a field via PUT. v26 needs the clear path so
-    # the Edit modal can switch a partitioned row back to full_refresh and
-    # have the stale partition_by / partition_granularity / max_history_days
-    # actually go away (without this fix, those fields linger and either
-    # confuse the dispatcher or trip the v26 conflict-policy validator on
-    # the next edit).
+    # R17-2 (review follow-up on PR #2023) — the WHOLE read -> validate ->
+    # write sequence below runs under the per-table registry write lock, not
+    # just the policy setters the lock was introduced for. This handler
+    # upserts EVERY column of the row (``merged`` = the row it read on the
+    # way in, plus this PUT's fields), so two concurrent PUTs touching
+    # disjoint fields each wrote the other's stale value back: a
+    # ``description`` edit silently reverted a ``sync_schedule`` edit saved a
+    # moment earlier, last writer wins, no error anywhere. Reading INSIDE the
+    # lock is what makes the second PUT merge onto the first one's COMMITTED
+    # row instead of onto a pre-lock snapshot of it.
     #
-    # Contract change (Devin Review finding 0001): callers that previously
-    # sent explicit `null` to mean "no-op, keep existing" will now have the
-    # field cleared. In practice this is fine — the only known caller is
-    # the Edit modal, which pre-populates form fields from the existing row
-    # and JSON-encodes the populated (non-null) value back. CLI register-table
-    # only POSTs new rows, never PUTs nulls. If a future client needs the
-    # old "null = no-op" semantics for some field, it should omit the field
-    # from the body instead of sending null — that's the canonical PUT shape.
-    updates = request.model_dump(exclude_unset=True)
-    # Whether this PUT actually CHANGED the stored access policy, and the
-    # values it left behind. Computed inside the `if updates:` block below;
-    # pre-seeded here because the dedicated `access_policy.set`/`.clear`
-    # audit row keys off them AFTER that block, and an empty PUT body never
-    # reaches it.
-    _policy_body_written = False
-    _final_access_policy_sql = existing.get("access_policy_sql")
-    _final_access_policy_note = existing.get("access_policy_note")
-    # View-name / id collision guard, mirrored from register_table's
-    # `existing_by_name` check. `table_registry.name` has no DB-level
-    # uniqueness constraint and register_table only pre-checks it against
-    # OTHER names on the way in (a duplicate matching another row's ID is
-    # already caught there, indirectly, by the derived-id collision check —
-    # PUT never re-derives an id, so that protection doesn't carry over
-    # here). Left unchecked, a rename could collide with another table's
-    # `name` (the original register_table concern: a silent view overwrite
-    # at next rebuild) OR — since B1 — with another table's `id`: every
-    # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
-    # the distribution mirror job in `app/worker/kinds.py`, this module's
-    # own `list_registry`) tries a raw key against the registry BY ID
-    # before falling back to name, so a legacy name-keyed sync_state row
-    # sharing that string would resolve to the WRONG registry entry.
-    if "name" in updates and updates["name"] != existing.get("name"):
-        new_name = updates["name"]
-        collision = next(
-            (
-                r
-                for r in repo.list_all()
-                if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
-            ),
-            None,
-        )
-        if collision is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
-            )
-    # Run BQ-shape validation BEFORE persisting whenever the merged record
-    # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
-    # or the patch touches BQ-relevant fields on an already-BQ row). Without
-    # this gate, an admin could PUT `bucket="evil\"; DROP --"` onto a BQ
-    # row and the next rebuild would silently fail at view-create time —
-    # surface the bad shape at PUT time instead.
-    if updates:
-        # Preserve the original `registered_at` across PUTs — `repo.register`
-        # now accepts it as an optional kwarg; without this the upsert would
-        # stamp a fresh `now()` on every edit (issue #130).
-        merged = dict(existing)
-        merged.update(updates)
-        merged.pop("id", None)  # avoid duplicate id kwarg
+    # The cost is bounded, and was already being paid the hard way: PUTs to
+    # the SAME table id serialize (they were racing before — one of them was
+    # losing its write), while PUTs to DIFFERENT tables never wait on each
+    # other, since the advisory lock is keyed on the table id. On a
+    # DuckDB-backed instance the lock is a ``nullcontext``; that is not a gap
+    # deliberately left open but the frozen app-state backend's own contract
+    # — it is single-process/single-writer — and the A3 ratchet says not to
+    # extend it.
+    with _access_policy_write_lock(table_id):
+        repo = table_registry_repo()
+        existing = repo.get(table_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Table not found")
 
-        # v52 + v56: per-table docs fields (sample_questions /
-        # things_to_know / pairs_well_with + grain / platforms /
-        # partition_col / history / gotchas) live on table_registry
-        # but have their own PATCH /registry/{id}/docs endpoint.
-        # ``repo.register()`` doesn't know them; stripping here keeps
-        # the read-modify-write loop the PUT handler relies on
-        # (existing → merged → register) from blowing up with
-        # TypeError when the docs columns are populated.
-        for _docs_key in (
-            "sample_questions",
-            "things_to_know",
-            "pairs_well_with",
-            "grain",
-            "platforms",
-            "partition_col",
-            "history",
-            "gotchas",
-        ):
-            merged.pop(_docs_key, None)
+        # v79 — validate connection_id FK before persisting, mirroring
+        # register_table. Checked directly against the request field (not
+        # `updates`) so an explicit `connection_id: null` (meaning "use the
+        # default connection") is treated the same as omission -- both skip
+        # the FK lookup, and an omitted field never clobbers the stored value
+        # once `updates`/`merged` below apply exclude_unset=True.
+        if request.connection_id is not None:
+            from src.repositories import source_connections_repo
 
-        # v116 — table access policies (access_policy_sql/_note/_updated_at/
-        # _updated_by + policy_mapping) live on table_registry but, like the
-        # docs fields above, are written through their own dedicated setters
-        # (``table_registry_repo().set_access_policy`` / ``.set_policy_mapping``),
-        # not ``register()``. Unlike the docs fields, the interlock below needs
-        # to read these values off ``merged`` first (a PUT that only touches
-        # server_only/query_mode must still be judged against a policy that's
-        # already persisted and simply carried over from ``existing`` here) —
-        # so the strip that keeps ``register()`` from TypeErroring on them runs
-        # much later, immediately before the ``register()`` call itself.
+            if source_connections_repo().get(request.connection_id) is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"connection_id '{request.connection_id}' not found in source_connections",
+                )
 
-        # v74 (#607) — validate the server_only ↔ query_mode invariant
-        # against the *merged* record (the PUT body may toggle either field
-        # independently). server_only=true is only coherent for a row with a
-        # server-stored parquet (local / materialized); a 'remote' row has
-        # none. Mirror the RegisterTableRequest validator at PUT time.
-        if merged.get("server_only") and merged.get("query_mode") == "remote":
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "server_only=true is only valid for query_mode='local' or "
-                    "'materialized' (a 'remote' table has no server-stored "
-                    "parquet to suppress from agnes pull)"
+        # `exclude_unset=True` honors the PUT-shape distinction between
+        # "field omitted from body" (keep existing) vs "field sent as null"
+        # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
+        # `if v is not None`, which collapsed both cases to "omitted" — meaning
+        # an admin couldn't clear a field via PUT. v26 needs the clear path so
+        # the Edit modal can switch a partitioned row back to full_refresh and
+        # have the stale partition_by / partition_granularity / max_history_days
+        # actually go away (without this fix, those fields linger and either
+        # confuse the dispatcher or trip the v26 conflict-policy validator on
+        # the next edit).
+        #
+        # Contract change (Devin Review finding 0001): callers that previously
+        # sent explicit `null` to mean "no-op, keep existing" will now have the
+        # field cleared. In practice this is fine — the only known caller is
+        # the Edit modal, which pre-populates form fields from the existing row
+        # and JSON-encodes the populated (non-null) value back. CLI register-table
+        # only POSTs new rows, never PUTs nulls. If a future client needs the
+        # old "null = no-op" semantics for some field, it should omit the field
+        # from the body instead of sending null — that's the canonical PUT shape.
+        updates = request.model_dump(exclude_unset=True)
+        # Whether this PUT actually CHANGED the stored access policy, and the
+        # values it left behind. Computed inside the `if updates:` block below;
+        # pre-seeded here because the dedicated `access_policy.set`/`.clear`
+        # audit row keys off them AFTER that block, and an empty PUT body never
+        # reaches it.
+        _policy_body_written = False
+        _final_access_policy_sql = existing.get("access_policy_sql")
+        _final_access_policy_note = existing.get("access_policy_note")
+        # View-name / id collision guard, mirrored from register_table's
+        # `existing_by_name` check. `table_registry.name` has no DB-level
+        # uniqueness constraint and register_table only pre-checks it against
+        # OTHER names on the way in (a duplicate matching another row's ID is
+        # already caught there, indirectly, by the derived-id collision check —
+        # PUT never re-derives an id, so that protection doesn't carry over
+        # here). Left unchecked, a rename could collide with another table's
+        # `name` (the original register_table concern: a silent view overwrite
+        # at next rebuild) OR — since B1 — with another table's `id`: every
+        # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
+        # the distribution mirror job in `app/worker/kinds.py`, this module's
+        # own `list_registry`) tries a raw key against the registry BY ID
+        # before falling back to name, so a legacy name-keyed sync_state row
+        # sharing that string would resolve to the WRONG registry entry.
+        if "name" in updates and updates["name"] != existing.get("name"):
+            new_name = updates["name"]
+            collision = next(
+                (
+                    r
+                    for r in repo.list_all()
+                    if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
                 ),
+                None,
             )
-
-        # When switching the merged record away from materialized mode, drop
-        # the stale source_query — the request validator can't clear it via
-        # the `if v is not None` filter above. Without this, a remote/local
-        # row would carry an orphan source_query in the registry.
-        if merged.get("query_mode") != "materialized":
-            merged["source_query"] = None
-
-        # Cross-source coherence: query_mode='materialized' + source_query rules:
-        # - bigquery: null OK — server-generates source_query from bucket+source_table.
-        # - keboola:  null OK — null means full-table export (valid at registration too;
-        #             see RegisterTableRequest validator which guards only non-empty sq).
-        # - all others: require an explicit non-empty source_query.
-        if merged.get("query_mode") == "materialized":
-            sq = merged.get("source_query")
-            if not sq or not str(sq).strip():
-                # BQ, Keboola and Snowflake all allow null/empty source_query —
-                # the server generates it from bucket+source_table. All other
-                # source types require an explicit source_query; raise 422.
-                if merged.get("source_type") not in ("bigquery", "keboola", "snowflake"):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "query_mode='materialized' requires a non-empty "
-                            "source_query. To revert to a non-materialized mode, "
-                            "PATCH query_mode='local' (Keboola) or 'remote' "
-                            "(BigQuery) and the stale source_query is cleared "
-                            "automatically."
-                        ),
-                    )
-            # Backtick guard removed for materialized rows: the Task 2 wrapping
-            # path (connectors.bigquery.extractor.materialize_query) now runs
-            # admin SQL through the BQ jobs API using BQ-native syntax, which
-            # requires backticks for dashed project/dataset identifiers.
-            # Non-materialized rows still reject backticks in the model validator.
-
-            # Keboola materialized: source_query must be a JSON filter spec,
-            # not SQL. Validate after the non-empty check above so we know sq
-            # is a non-empty string here.
-            if merged.get("source_type") == "keboola":
-                _sq = str(merged.get("source_query", "") or "").strip()
-                if _sq.upper().startswith(("SELECT", "WITH")):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "Keboola materialized source_query must be a JSON "
-                            "filter spec (columns/whereFilters/changedSince), "
-                            "not SQL. Use null for full-table export, or set "
-                            "query_mode='local' for DuckDB-based Keboola pulls."
-                        ),
-                    )
-                if _sq:
-                    try:
-                        json.loads(_sq)
-                    except json.JSONDecodeError as _e:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"Keboola materialized source_query must be valid JSON: {_e}",
-                        ) from _e
-
-        if merged.get("source_type") == "databricks":
-            # Reuse the register-time contract on updates too: the synthetic
-            # runs the model validator (materialized-only gate) and the
-            # payload validator (server-generated source_query), so a PUT
-            # can neither flip a Databricks row out of 'materialized' nor
-            # strand it without runnable SQL.
-            try:
-                synthetic = RegisterTableRequest(
-                    name=merged.get("name") or table_id,
-                    bucket=merged.get("bucket"),
-                    source_table=merged.get("source_table"),
-                    source_query=merged.get("source_query"),
-                    source_type="databricks",
-                    query_mode=merged.get("query_mode") or "materialized",
-                    primary_key=merged.get("primary_key"),
-                    description=merged.get("description"),
-                    folder=merged.get("folder"),
-                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                    sync_schedule=merged.get("sync_schedule"),
-                    server_only=bool(merged.get("server_only") or False),
+            if collision is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
                 )
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=str(e)) from e
-            _validate_databricks_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["source_query"] = synthetic.source_query
+        # Run BQ-shape validation BEFORE persisting whenever the merged record
+        # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
+        # or the patch touches BQ-relevant fields on an already-BQ row). Without
+        # this gate, an admin could PUT `bucket="evil\"; DROP --"` onto a BQ
+        # row and the next rebuild would silently fail at view-create time —
+        # surface the bad shape at PUT time instead.
+        if updates:
+            # Preserve the original `registered_at` across PUTs — `repo.register`
+            # now accepts it as an optional kwarg; without this the upsert would
+            # stamp a fresh `now()` on every edit (issue #130).
+            merged = dict(existing)
+            merged.update(updates)
+            merged.pop("id", None)  # avoid duplicate id kwarg
 
-        if merged.get("source_type") == "snowflake":
-            # Reuse the register-time contract on updates too: validate the
-            # Snowflake shape and server-generate source_query when omitted.
-            try:
-                synthetic = RegisterTableRequest(
-                    name=merged.get("name") or table_id,
-                    bucket=merged.get("bucket"),
-                    source_table=merged.get("source_table"),
-                    source_query=merged.get("source_query"),
-                    source_type="snowflake",
-                    query_mode=merged.get("query_mode") or "materialized",
-                    primary_key=merged.get("primary_key"),
-                    description=merged.get("description"),
-                    folder=merged.get("folder"),
-                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                    sync_schedule=merged.get("sync_schedule"),
-                    server_only=bool(merged.get("server_only") or False),
-                )
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=str(e)) from e
-            _validate_snowflake_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["source_query"] = synthetic.source_query
+            # v52 + v56: per-table docs fields (sample_questions /
+            # things_to_know / pairs_well_with + grain / platforms /
+            # partition_col / history / gotchas) live on table_registry
+            # but have their own PATCH /registry/{id}/docs endpoint.
+            # ``repo.register()`` doesn't know them; stripping here keeps
+            # the read-modify-write loop the PUT handler relies on
+            # (existing → merged → register) from blowing up with
+            # TypeError when the docs columns are populated.
+            for _docs_key in (
+                "sample_questions",
+                "things_to_know",
+                "pairs_well_with",
+                "grain",
+                "platforms",
+                "partition_col",
+                "history",
+                "gotchas",
+            ):
+                merged.pop(_docs_key, None)
 
-        if merged.get("source_type") == "bigquery":
-            # Reuse the register-time validator. It mutates the request to
-            # force query_mode='remote' / profile_after_sync=False (or to
-            # leave a materialized row alone) — apply the same coercion to
-            # `merged` so the persisted row matches.
-            synthetic = RegisterTableRequest(
-                name=merged.get("name") or table_id,
-                bucket=merged.get("bucket"),
-                source_table=merged.get("source_table"),
-                source_query=merged.get("source_query"),
-                source_type="bigquery",
-                query_mode=merged.get("query_mode") or "remote",
-                profile_after_sync=bool(merged.get("profile_after_sync") or False),
-                primary_key=merged.get("primary_key"),
-                description=merged.get("description"),
-                folder=merged.get("folder"),
-                sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                sync_schedule=merged.get("sync_schedule"),
-                # v74 (#607) — carry server_only into the synthetic so the
-                # validator's post-coercion check fires when this PUT lands
-                # the row in 'remote' mode; the merged-record check above
-                # only saw the pre-coercion query_mode.
-                server_only=bool(merged.get("server_only") or False),
-            )
-            _validate_bigquery_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["profile_after_sync"] = synthetic.profile_after_sync
-            merged["source_query"] = synthetic.source_query
-            # FQN normalization mutates source_table the same way the
-            # validator coerces query_mode — copy it back so the persisted
-            # row carries the bare table name, not the pasted path.
-            merged["source_table"] = synthetic.source_table
+            # v116 — table access policies (access_policy_sql/_note/_updated_at/
+            # _updated_by + policy_mapping) live on table_registry but, like the
+            # docs fields above, are written through their own dedicated setters
+            # (``table_registry_repo().set_access_policy`` / ``.set_policy_mapping``),
+            # not ``register()``. Unlike the docs fields, the interlock below needs
+            # to read these values off ``merged`` first (a PUT that only touches
+            # server_only/query_mode must still be judged against a policy that's
+            # already persisted and simply carried over from ``existing`` here) —
+            # so the strip that keeps ``register()`` from TypeErroring on them runs
+            # much later, immediately before the ``register()`` call itself.
 
-            # v51 — same bq_fqn validation as register-table. PUT can both
-            # add a fresh bq_fqn or update an existing one; in either case
-            # malformed values should reject at PUT time, not silently
-            # land in the DB and break the next rebuild.
-            if merged.get("bq_fqn"):
-                from connectors.bigquery.extractor import parse_bq_fqn
-
-                try:
-                    parse_bq_fqn(merged["bq_fqn"])
-                except ValueError as e:
-                    raise HTTPException(status_code=422, detail=str(e))
-        else:
-            # Non-BQ row carrying bq_fqn is nonsensical — reject the same
-            # way register-table does.
-            if merged.get("bq_fqn"):
+            # v74 (#607) — validate the server_only ↔ query_mode invariant
+            # against the *merged* record (the PUT body may toggle either field
+            # independently). server_only=true is only coherent for a row with a
+            # server-stored parquet (local / materialized); a 'remote' row has
+            # none. Mirror the RegisterTableRequest validator at PUT time.
+            if merged.get("server_only") and merged.get("query_mode") == "remote":
                 raise HTTPException(
                     status_code=422,
-                    detail="bq_fqn only applies to source_type='bigquery'",
+                    detail=(
+                        "server_only=true is only valid for query_mode='local' or "
+                        "'materialized' (a 'remote' table has no server-stored "
+                        "parquet to suppress from agnes pull)"
+                    ),
                 )
 
-        # v116 (table access policies design doc §3.1/§3.2) — evaluated
-        # against the FINAL, fully-normalized ``merged`` record, i.e. AFTER
-        # the BQ coercion above: a PUT that flips query_mode via BQ
-        # coercion must be judged on the post-coercion value, the same
-        # reason the server_only re-check on the BQ synthetic exists
-        # (Devin Review, #630).
-        if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
-            # Attaching or replacing a policy in THIS request. Clearing
-            # (explicit null, handled by the interlock below via
-            # ``merged``) always stays possible regardless of the flag —
-            # it is a safety valve, not a new grant — so only an actual
-            # non-null SQL body is flag-gated and SQL-validated here.
-            from app.instance_config import feature_enabled
+            # When switching the merged record away from materialized mode, drop
+            # the stale source_query — the request validator can't clear it via
+            # the `if v is not None` filter above. Without this, a remote/local
+            # row would carry an orphan source_query in the registry.
+            if merged.get("query_mode") != "materialized":
+                merged["source_query"] = None
 
-            if not feature_enabled(
-                "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+            # Cross-source coherence: query_mode='materialized' + source_query rules:
+            # - bigquery: null OK — server-generates source_query from bucket+source_table.
+            # - keboola:  null OK — null means full-table export (valid at registration too;
+            #             see RegisterTableRequest validator which guards only non-empty sq).
+            # - all others: require an explicit non-empty source_query.
+            if merged.get("query_mode") == "materialized":
+                sq = merged.get("source_query")
+                if not sq or not str(sq).strip():
+                    # BQ, Keboola and Snowflake all allow null/empty source_query —
+                    # the server generates it from bucket+source_table. All other
+                    # source types require an explicit source_query; raise 422.
+                    if merged.get("source_type") not in ("bigquery", "keboola", "snowflake"):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "query_mode='materialized' requires a non-empty "
+                                "source_query. To revert to a non-materialized mode, "
+                                "PATCH query_mode='local' (Keboola) or 'remote' "
+                                "(BigQuery) and the stale source_query is cleared "
+                                "automatically."
+                            ),
+                        )
+                # Backtick guard removed for materialized rows: the Task 2 wrapping
+                # path (connectors.bigquery.extractor.materialize_query) now runs
+                # admin SQL through the BQ jobs API using BQ-native syntax, which
+                # requires backticks for dashed project/dataset identifiers.
+                # Non-materialized rows still reject backticks in the model validator.
+
+                # Keboola materialized: source_query must be a JSON filter spec,
+                # not SQL. Validate after the non-empty check above so we know sq
+                # is a non-empty string here.
+                if merged.get("source_type") == "keboola":
+                    _sq = str(merged.get("source_query", "") or "").strip()
+                    if _sq.upper().startswith(("SELECT", "WITH")):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "Keboola materialized source_query must be a JSON "
+                                "filter spec (columns/whereFilters/changedSince), "
+                                "not SQL. Use null for full-table export, or set "
+                                "query_mode='local' for DuckDB-based Keboola pulls."
+                            ),
+                        )
+                    if _sq:
+                        try:
+                            json.loads(_sq)
+                        except json.JSONDecodeError as _e:
+                            raise HTTPException(
+                                status_code=422,
+                                detail=f"Keboola materialized source_query must be valid JSON: {_e}",
+                            ) from _e
+
+            if merged.get("source_type") == "databricks":
+                # Reuse the register-time contract on updates too: the synthetic
+                # runs the model validator (materialized-only gate) and the
+                # payload validator (server-generated source_query), so a PUT
+                # can neither flip a Databricks row out of 'materialized' nor
+                # strand it without runnable SQL.
+                try:
+                    synthetic = RegisterTableRequest(
+                        name=merged.get("name") or table_id,
+                        bucket=merged.get("bucket"),
+                        source_table=merged.get("source_table"),
+                        source_query=merged.get("source_query"),
+                        source_type="databricks",
+                        query_mode=merged.get("query_mode") or "materialized",
+                        primary_key=merged.get("primary_key"),
+                        description=merged.get("description"),
+                        folder=merged.get("folder"),
+                        sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                        sync_schedule=merged.get("sync_schedule"),
+                        server_only=bool(merged.get("server_only") or False),
+                    )
+                except ValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                _validate_databricks_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["source_query"] = synthetic.source_query
+
+            if merged.get("source_type") == "snowflake":
+                # Reuse the register-time contract on updates too: validate the
+                # Snowflake shape and server-generate source_query when omitted.
+                try:
+                    synthetic = RegisterTableRequest(
+                        name=merged.get("name") or table_id,
+                        bucket=merged.get("bucket"),
+                        source_table=merged.get("source_table"),
+                        source_query=merged.get("source_query"),
+                        source_type="snowflake",
+                        query_mode=merged.get("query_mode") or "materialized",
+                        primary_key=merged.get("primary_key"),
+                        description=merged.get("description"),
+                        folder=merged.get("folder"),
+                        sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                        sync_schedule=merged.get("sync_schedule"),
+                        server_only=bool(merged.get("server_only") or False),
+                    )
+                except ValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                _validate_snowflake_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["source_query"] = synthetic.source_query
+
+            if merged.get("source_type") == "bigquery":
+                # Reuse the register-time validator. It mutates the request to
+                # force query_mode='remote' / profile_after_sync=False (or to
+                # leave a materialized row alone) — apply the same coercion to
+                # `merged` so the persisted row matches.
+                synthetic = RegisterTableRequest(
+                    name=merged.get("name") or table_id,
+                    bucket=merged.get("bucket"),
+                    source_table=merged.get("source_table"),
+                    source_query=merged.get("source_query"),
+                    source_type="bigquery",
+                    query_mode=merged.get("query_mode") or "remote",
+                    profile_after_sync=bool(merged.get("profile_after_sync") or False),
+                    primary_key=merged.get("primary_key"),
+                    description=merged.get("description"),
+                    folder=merged.get("folder"),
+                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                    sync_schedule=merged.get("sync_schedule"),
+                    # v74 (#607) — carry server_only into the synthetic so the
+                    # validator's post-coercion check fires when this PUT lands
+                    # the row in 'remote' mode; the merged-record check above
+                    # only saw the pre-coercion query_mode.
+                    server_only=bool(merged.get("server_only") or False),
+                )
+                _validate_bigquery_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["profile_after_sync"] = synthetic.profile_after_sync
+                merged["source_query"] = synthetic.source_query
+                # FQN normalization mutates source_table the same way the
+                # validator coerces query_mode — copy it back so the persisted
+                # row carries the bare table name, not the pasted path.
+                merged["source_table"] = synthetic.source_table
+
+                # v51 — same bq_fqn validation as register-table. PUT can both
+                # add a fresh bq_fqn or update an existing one; in either case
+                # malformed values should reject at PUT time, not silently
+                # land in the DB and break the next rebuild.
+                if merged.get("bq_fqn"):
+                    from connectors.bigquery.extractor import parse_bq_fqn
+
+                    try:
+                        parse_bq_fqn(merged["bq_fqn"])
+                    except ValueError as e:
+                        raise HTTPException(status_code=422, detail=str(e))
+            else:
+                # Non-BQ row carrying bq_fqn is nonsensical — reject the same
+                # way register-table does.
+                if merged.get("bq_fqn"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="bq_fqn only applies to source_type='bigquery'",
+                    )
+
+            # v116 (table access policies design doc §3.1/§3.2) — evaluated
+            # against the FINAL, fully-normalized ``merged`` record, i.e. AFTER
+            # the BQ coercion above: a PUT that flips query_mode via BQ
+            # coercion must be judged on the post-coercion value, the same
+            # reason the server_only re-check on the BQ synthetic exists
+            # (Devin Review, #630).
+            if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
+                # Attaching or replacing a policy in THIS request. Clearing
+                # (explicit null, handled by the interlock below via
+                # ``merged``) always stays possible regardless of the flag —
+                # it is a safety valve, not a new grant — so only an actual
+                # non-null SQL body is flag-gated and SQL-validated here.
+                from app.instance_config import feature_enabled
+
+                if not feature_enabled(
+                    "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "access_policies_disabled: table access policies are not "
+                            "enabled on this instance -- set access_policies.enabled=true "
+                            "(or AGNES_ACCESS_POLICIES_ENABLED=1) before attaching one"
+                        ),
+                    )
+
+                from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+
+                _mapping_table_names = {
+                    r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
+                }
+                try:
+                    validate_policy_sql(
+                        updates["access_policy_sql"],
+                        table_id=table_id,
+                        table_name=merged.get("name") or table_id,
+                        mapping_table_names=_mapping_table_names,
+                        for_remote=(merged.get("query_mode") == "remote"),
+                    )
+                except PolicyValidationError as e:
+                    raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+            # §4 (Task 14) — access_policy_note is MANDATORY whenever a non-null
+            # access_policy_sql is attached or replaced. Tasks 2/4 deliberately
+            # left this to the API layer: the repository setter accepts sql and
+            # note independently (a future non-HTTP caller may have its own
+            # reason to write without one), but every write through THIS
+            # endpoint must explain why the policy exists — the inheriting
+            # admin who finds forty lines of SQL joining `user_access` otherwise
+            # has no way to tell "legal requirement" from "hunch", and the safe
+            # move is always "leave it alone", so an unexplained policy
+            # calcifies (§4's own reasoning).
+            #
+            # Evaluated against the MERGED/final record, like the §3.1/§3.2
+            # interlocks below — not merely "did THIS PUT's body include a
+            # note" — so a SEPARATE PUT that blanks only access_policy_note
+            # while access_policy_sql stays attached is caught too (a naive
+            # "only check when this PUT touches sql" rule would miss exactly
+            # that "one toggle away" shape). Clearing the policy itself
+            # (access_policy_sql explicit null) short-circuits this — merged
+            # carries no sql, so nothing to explain — the same safety-valve
+            # carve-out the flag gate above already gives clearing.
+            if merged.get("access_policy_sql") and not (merged.get("access_policy_note") or "").strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "policy_note_required: access_policy_note is required whenever "
+                        "access_policy_sql is set -- explain why this policy exists so the "
+                        "next admin to find it knows whether it's safe to change"
+                    ),
+                )
+
+            # §3.1 — the interlock itself: a policy (attached by this PUT, or
+            # already persisted and simply left untouched by it) may only
+            # survive on a merged record that is 'remote' or server_only=true.
+            # One check catches both directions the design doc names —
+            # attaching a policy to a distributed table, AND clearing
+            # server_only / moving query_mode to 'local' on an already-policied
+            # one — because both leave the SAME incoherent shape: a policy on a
+            # row `agnes pull` would otherwise download unfiltered.
+            if (
+                merged.get("access_policy_sql")
+                and merged.get("query_mode") != "remote"
+                and not merged.get("server_only")
             ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "access_policies_disabled: table access policies are not "
-                        "enabled on this instance -- set access_policies.enabled=true "
-                        "(or AGNES_ACCESS_POLICIES_ENABLED=1) before attaching one"
+                        "access_policy_requires_undistributed: a table carrying an access "
+                        "policy must stay undistributed (query_mode='remote' or "
+                        "server_only=true), so the policy can't be routed around via agnes "
+                        "pull -- set server_only=true first, attach the policy to a "
+                        "query_mode='remote' table instead, or clear access_policy_sql "
+                        "before making this table distributable"
                     ),
                 )
 
-            from src.access_policy_validate import PolicyValidationError, validate_policy_sql
-
-            _mapping_table_names = {
-                r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
-            }
-            try:
-                validate_policy_sql(
-                    updates["access_policy_sql"],
-                    table_id=table_id,
-                    table_name=merged.get("name") or table_id,
-                    mapping_table_names=_mapping_table_names,
-                    for_remote=(merged.get("query_mode") == "remote"),
-                )
-            except PolicyValidationError as e:
-                raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
-
-        # §4 (Task 14) — access_policy_note is MANDATORY whenever a non-null
-        # access_policy_sql is attached or replaced. Tasks 2/4 deliberately
-        # left this to the API layer: the repository setter accepts sql and
-        # note independently (a future non-HTTP caller may have its own
-        # reason to write without one), but every write through THIS
-        # endpoint must explain why the policy exists — the inheriting
-        # admin who finds forty lines of SQL joining `user_access` otherwise
-        # has no way to tell "legal requirement" from "hunch", and the safe
-        # move is always "leave it alone", so an unexplained policy
-        # calcifies (§4's own reasoning).
-        #
-        # Evaluated against the MERGED/final record, like the §3.1/§3.2
-        # interlocks below — not merely "did THIS PUT's body include a
-        # note" — so a SEPARATE PUT that blanks only access_policy_note
-        # while access_policy_sql stays attached is caught too (a naive
-        # "only check when this PUT touches sql" rule would miss exactly
-        # that "one toggle away" shape). Clearing the policy itself
-        # (access_policy_sql explicit null) short-circuits this — merged
-        # carries no sql, so nothing to explain — the same safety-valve
-        # carve-out the flag gate above already gives clearing.
-        if merged.get("access_policy_sql") and not (merged.get("access_policy_note") or "").strip():
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "policy_note_required: access_policy_note is required whenever "
-                    "access_policy_sql is set -- explain why this policy exists so the "
-                    "next admin to find it knows whether it's safe to change"
-                ),
+            # §3.2 — the physical-source twin: a DIFFERENT row with no policy of
+            # its own, pointing at the exact same physical source as an existing
+            # policied table, hands every granted analyst the raw rows the policy
+            # exists to withhold — through `agnes pull` when it is distributable,
+            # and through `/api/query` resolving its name server-side when it is
+            # not. Runs on every write that leaves the merged row UNPOLICIED (the
+            # earlier draft keyed on distributability, which a live instance
+            # disproved), independent of which fields this particular PUT changed —
+            # the danger is the merged row's current shape, not the delta. Shared
+            # with register_table's own call to the same helper, so a brand-new twin
+            # is caught at registration too, not only here.
+            _check_access_policy_physical_source_conflict(
+                source_type=merged.get("source_type"),
+                connection_id=merged.get("connection_id"),
+                bucket=merged.get("bucket"),
+                source_table=merged.get("source_table"),
+                bq_fqn=merged.get("bq_fqn"),
+                source_query=merged.get("source_query"),
+                query_mode=merged.get("query_mode"),
+                server_only=bool(merged.get("server_only")),
+                has_access_policy=bool(merged.get("access_policy_sql")),
+                # Wording only — see the helper. A PUT that REMOVES a policy is
+                # still refused while another policied row covers the same source
+                # (that is the disclosure), but the default message tells the admin
+                # to attach a policy they are in the middle of removing.
+                clearing_policy=bool(existing.get("access_policy_sql")) and not merged.get("access_policy_sql"),
+                exclude_id=table_id,
             )
 
-        # §3.1 — the interlock itself: a policy (attached by this PUT, or
-        # already persisted and simply left untouched by it) may only
-        # survive on a merged record that is 'remote' or server_only=true.
-        # One check catches both directions the design doc names —
-        # attaching a policy to a distributed table, AND clearing
-        # server_only / moving query_mode to 'local' on an already-policied
-        # one — because both leave the SAME incoherent shape: a policy on a
-        # row `agnes pull` would otherwise download unfiltered.
-        if merged.get("access_policy_sql") and merged.get("query_mode") != "remote" and not merged.get("server_only"):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "access_policy_requires_undistributed: a table carrying an access "
-                    "policy must stay undistributed (query_mode='remote' or "
-                    "server_only=true), so the policy can't be routed around via agnes "
-                    "pull -- set server_only=true first, attach the policy to a "
-                    "query_mode='remote' table instead, or clear access_policy_sql "
-                    "before making this table distributable"
-                ),
-            )
+            # §3.2, the OTHER direction — the check just above is structurally
+            # blind to it. It returns early whenever the row it is called for
+            # carries a policy of its own, which on the attach path is always the
+            # case, so it can only ever reject the TWIN's own write. A twin
+            # registered BEFORE the policy existed is never PUT again, so nothing
+            # would ever run that check for it: scan for one here instead.
+            _check_policied_row_has_no_unpolicied_twin(merged, table_id=table_id)
 
-        # §3.2 — the physical-source twin: a DIFFERENT row with no policy of
-        # its own, pointing at the exact same physical source as an existing
-        # policied table, hands every granted analyst the raw rows the policy
-        # exists to withhold — through `agnes pull` when it is distributable,
-        # and through `/api/query` resolving its name server-side when it is
-        # not. Runs on every write that leaves the merged row UNPOLICIED (the
-        # earlier draft keyed on distributability, which a live instance
-        # disproved), independent of which fields this particular PUT changed —
-        # the danger is the merged row's current shape, not the delta. Shared
-        # with register_table's own call to the same helper, so a brand-new twin
-        # is caught at registration too, not only here.
-        _check_access_policy_physical_source_conflict(
-            source_type=merged.get("source_type"),
-            connection_id=merged.get("connection_id"),
-            bucket=merged.get("bucket"),
-            source_table=merged.get("source_table"),
-            bq_fqn=merged.get("bq_fqn"),
-            source_query=merged.get("source_query"),
-            query_mode=merged.get("query_mode"),
-            server_only=bool(merged.get("server_only")),
-            has_access_policy=bool(merged.get("access_policy_sql")),
-            # Wording only — see the helper. A PUT that REMOVES a policy is
-            # still refused while another policied row covers the same source
-            # (that is the disclosure), but the default message tells the admin
-            # to attach a policy they are in the middle of removing.
-            clearing_policy=bool(existing.get("access_policy_sql")) and not merged.get("access_policy_sql"),
-            exclude_id=table_id,
-        )
+            # §14.6 — the live LIMIT 0 execution probe. Runs LAST among the
+            # policy-write checks: after static validation (rule 1-5, above)
+            # AND after the §3.1/§3.2 interlocks, so a table this PUT would be
+            # rejected for on distribution grounds gets that specific, cheaper
+            # rejection instead of a probe failure — and never pays for a live
+            # DuckDB execution it was always going to reject anyway. Static
+            # analysis alone cannot catch a policy that references a column
+            # the underlying table has since dropped (or never had) — this
+            # turns that failure into a rejected write here, instead of the
+            # first analyst's request.
+            if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
+                from src.access_policy_validate import PolicyValidationError, probe_policy
+                from src.db import get_analytics_db_readonly
 
-        # §3.2, the OTHER direction — the check just above is structurally
-        # blind to it. It returns early whenever the row it is called for
-        # carries a policy of its own, which on the attach path is always the
-        # case, so it can only ever reject the TWIN's own write. A twin
-        # registered BEFORE the policy existed is never PUT again, so nothing
-        # would ever run that check for it: scan for one here instead.
-        _check_policied_row_has_no_unpolicied_twin(merged, table_id=table_id)
+                probe_conn = get_analytics_db_readonly()
+                try:
+                    probe_policy(updates["access_policy_sql"], table_id, probe_conn)
+                except PolicyValidationError as e:
+                    raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+                finally:
+                    probe_conn.close()
 
-        # §14.6 — the live LIMIT 0 execution probe. Runs LAST among the
-        # policy-write checks: after static validation (rule 1-5, above)
-        # AND after the §3.1/§3.2 interlocks, so a table this PUT would be
-        # rejected for on distribution grounds gets that specific, cheaper
-        # rejection instead of a probe failure — and never pays for a live
-        # DuckDB execution it was always going to reject anyway. Static
-        # analysis alone cannot catch a policy that references a column
-        # the underlying table has since dropped (or never had) — this
-        # turns that failure into a rejected write here, instead of the
-        # first analyst's request.
-        if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
-            from src.access_policy_validate import PolicyValidationError, probe_policy
-            from src.db import get_analytics_db_readonly
+            # Strip the policy fields out of ``merged`` now that every check
+            # above has been evaluated against them (register() doesn't accept
+            # them — see the v116 comment above). What gets PERSISTED for those
+            # fields is re-derived under the write lock below, against the
+            # registry row as it is THERE rather than against this pre-lock
+            # snapshot.
+            for _policy_key in (
+                "access_policy_sql",
+                "access_policy_note",
+                "access_policy_updated_at",
+                "access_policy_updated_by",
+                "policy_mapping",
+                # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
+                # bookkeeping, not a human-editable PUT field. register() doesn't
+                # accept it; it has its own setters
+                # (mark_semantic_draft_pending / clear_semantic_draft_pending).
+                "semantic_draft_pending_at",
+            ):
+                merged.pop(_policy_key, None)
 
-            probe_conn = get_analytics_db_readonly()
-            try:
-                probe_policy(updates["access_policy_sql"], table_id, probe_conn)
-            except PolicyValidationError as e:
-                raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
-            finally:
-                probe_conn.close()
+            repo.register(id=table_id, **merged)
 
-        # Strip the policy fields out of ``merged`` now that every check
-        # above has been evaluated against them (register() doesn't accept
-        # them — see the v116 comment above). What gets PERSISTED for those
-        # fields is re-derived under the write lock below, against the
-        # registry row as it is THERE rather than against this pre-lock
-        # snapshot.
-        for _policy_key in (
-            "access_policy_sql",
-            "access_policy_note",
-            "access_policy_updated_at",
-            "access_policy_updated_by",
-            "policy_mapping",
-            # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
-            # bookkeeping, not a human-editable PUT field. register() doesn't
-            # accept it; it has its own setters
-            # (mark_semantic_draft_pending / clear_semantic_draft_pending).
-            "semantic_draft_pending_at",
-        ):
-            merged.pop(_policy_key, None)
-
-        repo.register(id=table_id, **merged)
-
-        # finding 1 (follow-up review of PR #2023) — hold a per-table lock
-        # across BOTH the policy write and its history append. Without it,
-        # two concurrent PUTs on this table can commit policy A, commit
-        # policy B, record B, then record A: a history whose newest revision
-        # is not the stored policy. The lock ORDERS the two steps; it does
-        # not couple them (they keep their own transactions), so a history
-        # append that fails still leaves the policy saved — see
-        # ``_access_policy_write_lock`` and ``_record_access_policy_revision``.
-        # A DuckDB instance has no revision store, hence nothing to misorder:
-        # there the lock is a nullcontext and this runs exactly as before.
-        # Taken for any PUT that CARRIES a policy field — whether it actually
-        # CHANGES one can only be judged against the row inside the lock (see
-        # below), so that judgement has to be made under it. An edit that
-        # touches no policy field at all still neither waits on nor blocks a
-        # policy save.
-        _policy_lock = (
-            _access_policy_write_lock(table_id)
-            if any(k in updates for k in ("access_policy_sql", "access_policy_note", "policy_mapping"))
-            else contextlib.nullcontext()
-        )
-        with _policy_lock:
-            # finding 3 (third follow-up review of PR #2023) — re-read the
-            # registry row INSIDE the lock and merge this PUT's policy fields
-            # onto THAT, not onto the pre-lock ``existing``/``merged``
-            # snapshot. Otherwise: request A edits the body and commits under
-            # the lock; request B (a mapping-only flip) computed its finals
-            # from the pre-A row, takes the lock, and both writes back and
-            # records A's PREDECESSOR body — the newest revision holds a
-            # policy nobody saved, so "restore this version" restores the
-            # wrong one. Only the policy write and its revision snapshot need
-            # the current row; every validation and interlock above
-            # legitimately runs against the pre-lock one (they judge the
-            # shape this PUT is asking for, which A cannot change).
-            _current = repo.get(table_id) or existing
+            # finding 1 (follow-up review of PR #2023) — the policy write and its
+            # history append are ordered by the SAME per-table lock this whole
+            # handler holds (see the top of the function). Without it, two
+            # concurrent PUTs on this table could commit policy A, commit policy
+            # B, record B, then record A: a history whose newest revision is not
+            # the stored policy. Ordering, not coupling — the two steps keep
+            # their own transactions, so a history append that fails still leaves
+            # the policy saved (see ``_access_policy_write_lock`` and
+            # ``_record_access_policy_revision``).
+            # finding 3 (third follow-up review of PR #2023) — this PUT's
+            # policy fields merge onto the registry row as it is INSIDE the
+            # lock, never onto a snapshot taken before it. Otherwise: request
+            # A edits the body and commits under the lock; request B (a
+            # mapping-only flip) computed its finals from the pre-A row,
+            # takes the lock, and writes back — and records — A's PREDECESSOR
+            # body, so the newest revision holds a policy nobody saved and
+            # "restore this version" restores the wrong one.
+            #
+            # ``existing`` IS that under-lock row since R17-2 widened the
+            # lock over the whole handler, so the separate re-read this block
+            # used to do is gone: one read, and nothing can write the policy
+            # columns between it and the setters below. The only intervening
+            # write is ``repo.register()`` above, whose upsert names every
+            # column EXCEPT ``access_policy_*``/``policy_mapping`` (those
+            # have their own setters, which is why they were stripped out of
+            # ``merged``) — so it provably cannot move what is read here.
             _final_access_policy_sql = (
-                updates["access_policy_sql"] if "access_policy_sql" in updates else _current.get("access_policy_sql")
+                updates["access_policy_sql"] if "access_policy_sql" in updates else existing.get("access_policy_sql")
             )
             _final_access_policy_note = (
-                updates["access_policy_note"] if "access_policy_note" in updates else _current.get("access_policy_note")
+                updates["access_policy_note"] if "access_policy_note" in updates else existing.get("access_policy_note")
             )
             # finding 1 (second follow-up review of PR #2023) -- keyed on an
             # ACTUAL change, not on the mere presence of the keys. The Edit
@@ -6877,11 +6925,11 @@ async def update_table(
             # cleared on both sides, while a genuine clear (a real body ->
             # ``None``) still counts as a change.
             _policy_body_written = ("access_policy_sql" in updates or "access_policy_note" in updates) and (
-                _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(_current.get("access_policy_sql"))
-                or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(_current.get("access_policy_note"))
+                _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(existing.get("access_policy_sql"))
+                or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(existing.get("access_policy_note"))
             )
             _final_policy_mapping = bool(
-                updates["policy_mapping"] if "policy_mapping" in updates else _current.get("policy_mapping")
+                updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
             )
             # finding 2 (follow-up review of PR #2023) — a mapping-only edit
             # is a policy edit as far as the history is concerned: a revision
@@ -6890,7 +6938,7 @@ async def update_table(
             # modal round-trips every field, so `"policy_mapping" in updates`
             # alone would fill the history with rows that changed nothing.
             _policy_mapping_flipped = "policy_mapping" in updates and _final_policy_mapping != bool(
-                _current.get("policy_mapping")
+                existing.get("policy_mapping")
             )
 
             # Persist the access-policy fields through their dedicated setters
@@ -6935,7 +6983,7 @@ async def update_table(
                 }
                 _record_access_policy_revision(
                     table_id,
-                    existing=_current,
+                    existing=existing,
                     policy_sql=_persisted.get("access_policy_sql"),
                     policy_note=_persisted.get("access_policy_note"),
                     policy_mapping=bool(_persisted.get("policy_mapping")),
@@ -8349,45 +8397,57 @@ async def unregister_table(
     access to what" for the event that caused it.
     """
     repo = table_registry_repo()
-    existing = repo.get(table_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Table not found")
 
-    was_bigquery = existing.get("source_type") == "bigquery"
-    was_materialized = existing.get("query_mode") == "materialized"
-    source_type = existing.get("source_type") or ""
-    name = existing.get("name") or table_id
+    # R17-1 (review follow-up on PR #2023) — the revision purge and the
+    # registry drop run under the per-table registry write lock, which this
+    # handler previously did not take at all. An in-flight policy save
+    # holding that lock could otherwise append its revision AFTER the purge
+    # had run, stranding history under a table id that no longer exists —
+    # and, since ids are derived from names, handing it to whatever is
+    # registered at that reused id next. Reading the row inside the lock too
+    # means the 404 and the drop cannot disagree with a concurrent
+    # re-registration. Released before the filesystem/sync_state cleanup
+    # below, which no other writer of this id contends for.
+    with _access_policy_write_lock(table_id):
+        existing = repo.get(table_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Table not found")
 
-    # #1979 (PR #2023 review, finding 3) — purge the table's access-policy
-    # revision bodies BEFORE dropping the registry row, not after. Table ids
-    # are derived from names, so re-registering the same name yields the same
-    # id; without this purge-first ordering, a Postgres failure here after the
-    # registry row was already deleted would leave the old revisions orphaned
-    # but reachable the moment an identically named table is registered again
-    # (its policy history would show the PREVIOUS table's bodies). Purging
-    # first means a genuine failure aborts the whole unregistration cleanly
-    # instead of orphaning. Still PG-only and still not load-bearing in that
-    # narrow sense: `RequiresPostgresBackend` (the frozen DuckDB backend has no
-    # store to purge at all) is the ONE exception this swallows — everything
-    # else denies the unregistration rather than risk stranding history.
-    try:
-        access_policy_revisions_repo().delete_for_table(table_id)
-    except RequiresPostgresBackend:
-        pass
-    except Exception as e:
-        logger.error(
-            "Could not drop access-policy revisions for table %s before "
-            "unregistering it -- aborting the unregistration rather than risk "
-            "orphaning them: %s",
-            table_id,
-            e,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
-        )
+        was_bigquery = existing.get("source_type") == "bigquery"
+        was_materialized = existing.get("query_mode") == "materialized"
+        source_type = existing.get("source_type") or ""
+        name = existing.get("name") or table_id
 
-    cascade = repo.unregister(table_id)
+        # #1979 (PR #2023 review, finding 3) — purge the table's access-policy
+        # revision bodies BEFORE dropping the registry row, not after. Table ids
+        # are derived from names, so re-registering the same name yields the same
+        # id; without this purge-first ordering, a Postgres failure here after the
+        # registry row was already deleted would leave the old revisions orphaned
+        # but reachable the moment an identically named table is registered again
+        # (its policy history would show the PREVIOUS table's bodies). Purging
+        # first means a genuine failure aborts the whole unregistration cleanly
+        # instead of orphaning. Still PG-only and still not load-bearing in that
+        # narrow sense: `RequiresPostgresBackend` (the frozen DuckDB backend has no
+        # store to purge at all) is the ONE exception this swallows — everything
+        # else denies the unregistration rather than risk stranding history.
+        try:
+            access_policy_revisions_repo().delete_for_table(table_id)
+        except RequiresPostgresBackend:
+            pass
+        except Exception as e:
+            logger.error(
+                "Could not drop access-policy revisions for table %s before "
+                "unregistering it -- aborting the unregistration rather than risk "
+                "orphaning them: %s",
+                table_id,
+                e,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+            )
+
+        cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the

@@ -80,13 +80,24 @@ class AccessPolicyRevisionsPgRepository:
 
     @contextmanager
     def policy_write_lock(self, table_id: str) -> Iterator[None]:
-        """Serialize "save this table's policy, then append its revision".
+        """Serialize every registry write to ONE table id.
 
-        Two concurrent PUTs on one table could otherwise commit policy A,
-        commit policy B, record B's revision, then record A's — leaving a
-        history whose newest row (A) is not what the table actually stores
-        (B), which is precisely the claim the panel makes and the body an
-        admin would restore FROM.
+        Named for the sequence it was introduced for — "save this table's
+        policy, then append its revision" — but the admin API takes it for
+        the whole of a registry PUT, a DELETE (revision purge + row drop)
+        and a re-registration (orphan purge + insert) as well, so those
+        three and a policy save are mutually exclusive per table id. See
+        ``app/api/admin.py::_access_policy_write_lock`` for what each of
+        them would otherwise race on.
+
+        The original reason still holds: two concurrent PUTs on one table
+        could otherwise commit policy A, commit policy B, record B's
+        revision, then record A's — leaving a history whose newest row (A)
+        is not what the table actually stores (B), which is precisely the
+        claim the panel makes and the body an admin would restore FROM.
+
+        Keyed on the table id (``hashtext(table_id)`` in one namespace), so
+        writers of DIFFERENT tables never wait on each other.
 
         A **transaction-scoped** advisory lock, so the release is Postgres's
         job, not the caller's: the lock goes away when this transaction
