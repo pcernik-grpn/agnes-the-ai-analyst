@@ -2037,12 +2037,19 @@ def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     probe (facts extraction never touches ``markitdown``/``pypdfium2`` — it
     reads already-converted markdown out of ``corpus_files``, not raw
     documents).
+
+    The refusal names the config key that is off in ``switch`` (additive to
+    ``error``/``message``): the source card's "Extract facts now" button
+    reads the same verdict through ``app/web/router.py``'s pipeline cell and
+    renders that key as its disabled reason, so the UI and the 409 can never
+    disagree about what an admin has to flip.
     """
     from connectors.sharepoint.facts_extraction import facts_extraction_enabled, facts_surface_enabled
 
     if not facts_extraction_enabled():
         return False, {
             "error": "facts_extraction_disabled",
+            "switch": "extraction.facts.enabled",
             "message": (
                 "extraction.facts.enabled is off — turn it on in /admin/server-config "
                 "before running a facts-extraction pass (it is the cost gate: this stage "
@@ -2052,6 +2059,7 @@ def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     if not facts_surface_enabled():
         return False, {
             "error": "facts_extraction_disabled",
+            "switch": "facts.enabled",
             "message": (
                 "facts.enabled is off — turn it on before running a facts-extraction pass "
                 "(writing claims into a surface nothing can read is never useful)."

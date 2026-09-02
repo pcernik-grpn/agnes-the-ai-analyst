@@ -71,6 +71,8 @@ _SIGNATURES = (
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
     "function _extRenderInAgnesButton(connId, status) {",
+    "function _extFactsJobLine(job) {",
+    "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
     "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
@@ -90,6 +92,7 @@ const _elements = {{
   "ext-block-sp1": {{ hidden: true, innerHTML: "" }},
   "ext-crawl-live-sp1": {{ hidden: true, innerHTML: "" }},
   "ext-inagnes-btn-sp1": {{ dataset: {{ extractionReady: "1" }}, disabled: false, title: "" }},
+  "ext-facts-btn-sp1": {{ dataset: {{ factsReady: "1" }}, disabled: false, title: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] }};
 
@@ -1042,3 +1045,85 @@ class TestPollFollowsTheCards:
         # renderers that call it, and the parser may run a fetch continuation
         # between the two.
         assert tpl.count('if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();') == 2
+
+
+class TestFactsPassSurfacesOnTheCard:
+    """The standalone facts pass is a JOB (`sharepoint-facts-extraction`),
+    not a crawl run — it opens no `extraction_runs` row — so the status
+    poll carries it as `facts_job` off the job queue, and the card must
+    (a) say so in the Run row and (b) never keep offering "Extract facts
+    now" while one is queued or running: the server can only answer that
+    click with `409 facts_extraction_already_running`."""
+
+    _IDLE = {
+        "connection_id": "sp1",
+        "running": None,
+        "last_completed": None,
+        "runs_total": 0,
+        "can_stop": True,
+        "as_of": "2026-09-02T10:00:00+00:00",
+    }
+
+    def test_a_queued_facts_pass_is_named_in_the_run_row(self):
+        data = {
+            **self._IDLE,
+            "facts_job": {"id": "job-9", "status": "queued", "created_at": "2026-09-02T09:58:00+00:00"},
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "facts pass" in html.lower()
+        assert "queued" in html
+        assert "job-9" in html
+
+    def test_a_running_facts_pass_reads_running_not_queued(self):
+        data = {
+            **self._IDLE,
+            "facts_job": {
+                "id": "job-10",
+                "status": "running",
+                "created_at": "2026-09-02T09:58:00+00:00",
+                "started_at": "2026-09-02T09:59:00+00:00",
+            },
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "facts pass" in html.lower()
+        assert "running" in html
+        assert "queued" not in html
+
+    def test_no_facts_pass_draws_no_facts_line(self):
+        data = {**self._IDLE, "facts_job": None}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "facts pass" not in out["html"].lower()
+
+    def test_the_button_is_disabled_while_a_pass_is_in_flight_and_restored_after(self):
+        body = """
+_extRenderFactsButton('sp1', { facts_job: { id: 'job-9', status: 'queued' } });
+const during = { disabled: _elements['ext-facts-btn-sp1'].disabled, title: _elements['ext-facts-btn-sp1'].title };
+_extRenderFactsButton('sp1', { facts_job: null });
+const after = { disabled: _elements['ext-facts-btn-sp1'].disabled, title: _elements['ext-facts-btn-sp1'].title };
+console.log(JSON.stringify({ during, after }));
+"""
+        out = _run_js(body)
+        assert out["during"]["disabled"] is True
+        assert "already" in out["during"]["title"].lower()
+        assert out["after"]["disabled"] is False
+        assert out["after"]["title"] == ""
+
+    def test_a_pass_ending_never_re_enables_a_button_the_server_gated_off(self):
+        body = """
+_elements['ext-facts-btn-sp1'].dataset.factsReady = '0';
+_elements['ext-facts-btn-sp1'].disabled = true;
+_extRenderFactsButton('sp1', { facts_job: null });
+console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }));
+"""
+        assert _run_js(body)["disabled"] is True

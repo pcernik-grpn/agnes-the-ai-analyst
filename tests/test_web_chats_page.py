@@ -157,11 +157,12 @@ class TestChatsPage:
         sid = _seed(web_client, title="Revenue deep dive", messages=4)
         html = web_client.get("/chats", cookies=admin_cookie).text
         row = _row(html, sid)
-        # Search, sort keys and the segment set — the whole client-side contract.
+        # Search, sort keys and the lifecycle state — the whole client-side
+        # contract.
         assert 'data-search="revenue deep dive' in row
         assert 'data-name="revenue deep dive"' in row
         assert "data-updated=" in row
-        assert 'data-buckets="all"' in row
+        assert 'data-status="all|active"' in row
         assert 'data-owned="1"' in row
         # The row IS the link to the conversation.
         assert f'data-href="/chat?session={sid}"' in row
@@ -174,23 +175,138 @@ class TestChatsPage:
         assert "data-messages" not in row
         assert ">Messages<" not in html
 
-    def test_archived_rows_are_only_in_the_archived_bucket(self, web_client, admin_cookie, monkeypatch):
-        """`all` is a token every live row carries, not a wildcard — that is what
-        keeps an archived conversation out of All, Pinned and Shared without a
-        special case in the filter engine (see `segments.multi`)."""
+    def test_the_row_carries_its_state_and_its_attributes_separately(self, web_client, admin_cookie, monkeypatch):
+        """Two dimensions, two attributes on the row. `data-status` is the
+        LIFECYCLE STATE the Show radios filter on — `active` on every live row
+        (the facet's resting value, which is what keeps the archive out of the
+        default list without a special case in the engine) and `all` on every
+        row, so the option of that name can mean what it says.
+
+        `data-pinned` / `data-shared` are ATTRIBUTES and stay out of it: they
+        are their own toggle facets, and archiving a conversation does not unpin
+        it, so a pinned archived row is real and "Pinned only" has to reach it.
+        Putting them in the state set is what made "All + Shared" a combination
+        with no meaning."""
         _enable_chat(web_client, monkeypatch)
         live = _seed(web_client, title="Live one")
+        pinned_live = _seed(web_client, title="Pinned live one", pinned=True)
         gone = _seed(web_client, title="Old one", archived=True)
         html = web_client.get("/chats", cookies=admin_cookie).text
-        assert 'data-buckets="all"' in _row(html, live)
-        assert 'data-buckets="archived"' in _row(html, gone)
+        assert 'data-status="all|active"' in _row(html, live)
+        assert 'data-status="all|active"' in _row(html, pinned_live)
+        assert 'data-pinned="1"' in _row(html, pinned_live)
+        assert 'data-status="all|archived"' in _row(html, gone)
+        assert "pinned" not in _row(html, gone) and "shared" not in _row(html, gone)
         # ...and the archived one is still LISTED. Before this page there was no
         # surface that showed an archived conversation at all, which is what made
         # the old soft-delete a one-way door.
         assert "Old one" in html
-        # The segment badge counts the buckets, not the rows.
-        assert '<span class="fbar-seg__n" data-seg-count="archived">1</span>' in html
-        assert '<span class="fbar-seg__n" data-seg-count="all">1</span>' in html
+        # The option tallies: `all` is the whole list because that is what the
+        # option shows, and the attribute tally spans the archive because that
+        # is the scope its toggle has.
+        assert 'data-opt-count="all">3</span>' in html
+        assert 'data-opt-count="active">2</span>' in html
+        assert 'data-opt-count="archived">1</span>' in html
+        assert 'data-opt-count="pinned">1</span>' in html
+
+    def test_archiving_unpins_and_an_archived_row_never_reads_as_pinned(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """The invariant, end to end. A pin means "keep this at the top of my
+        list" and archiving means "this is not in my list", so the two cannot
+        both hold: archiving clears the pin.
+
+        The read side normalises as well, which is what makes a row written
+        BEFORE this invariant conform without a data migration (the DuckDB
+        schema ladder is frozen, so there is no step to carry one)."""
+        _enable_chat(web_client, monkeypatch)
+        sid = _seed(web_client, title="Pinned then archived", pinned=True)
+        repo = web_client.app.state.chat_repo
+
+        html = web_client.get("/chats", cookies=admin_cookie).text
+        assert 'data-pinned="1"' in _row(html, sid)
+
+        r = web_client.put(
+            f"/api/chat/sessions/{sid}/archived", json={"archived": True}, cookies=admin_cookie
+        )
+        assert r.status_code == 200, r.text
+        assert repo.get_session(sid).pinned_at is None, "archiving must clear the pin"
+
+        html = web_client.get("/chats", cookies=admin_cookie).text
+        row = _row(html, sid)
+        assert 'data-status="all|archived"' in row
+        assert "data-pinned" not in row
+        # Nothing is pinned any more, so the option is not rendered at all — the
+        # "an option that cannot change the list is a dead end" rule.
+        assert 'data-facet="pinned"' not in html
+
+        # A row still pinned in the database — written before the invariant —
+        # is normalised on read rather than migrated. `set_pinned` is used
+        # directly because the endpoint now refuses exactly this.
+        repo.set_pinned(sid, True)
+        assert repo.get_session(sid).pinned_at is not None, "the DB row really is pinned"
+        html = web_client.get("/chats", cookies=admin_cookie).text
+        assert "data-pinned" not in _row(html, sid), "legacy pinned+archived reads as unpinned"
+        assert 'data-facet="pinned"' not in html
+
+    def test_pinning_an_archived_conversation_is_refused(self, web_client, admin_cookie, monkeypatch):
+        """409, not a silent success: the API is the other way the contradictory
+        state could be created. Unpinning stays allowed, so a row pinned before
+        the invariant can still be tidied up."""
+        _enable_chat(web_client, monkeypatch)
+        sid = _seed(web_client, title="Put away", archived=True)
+        r = web_client.put(f"/api/chat/sessions/{sid}/pin", json={"pinned": True}, cookies=admin_cookie)
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "session_archived"
+
+        r = web_client.put(f"/api/chat/sessions/{sid}/pin", json={"pinned": False}, cookies=admin_cookie)
+        assert r.status_code == 200, "unpinning an archived row must stay allowed"
+
+        # A live conversation is unaffected.
+        live = _seed(web_client, title="Still going")
+        r = web_client.put(f"/api/chat/sessions/{live}/pin", json={"pinned": True}, cookies=admin_cookie)
+        assert r.status_code == 200, r.text
+
+    def test_an_option_that_cannot_change_the_list_is_not_rendered(self, web_client, admin_cookie, monkeypatch):
+        """The rule the Agent and Source categories already follow. "Shared 0"
+        sat in the menu as a row whose only possible effect was to empty the
+        page — not a filter, a dead end.
+
+        The WRAPPER goes with the last of its options, and it has to be the
+        template that decides: a CSS guard cannot, because `:empty` is false for
+        an element containing whitespace and Jinja leaves plenty — so
+        `.ch-onlys:not(:empty)` matched a wrapper with zero option rows and
+        painted its divider and 10px of margin over nothing."""
+        _enable_chat(web_client, monkeypatch)
+        _seed(web_client, title="Just mine")
+        html = web_client.get("/chats", cookies=admin_cookie).text
+        assert 'data-facet="pinned"' not in html, "nothing is pinned, so no Pinned only row"
+        assert 'data-facet="shared"' not in html, "nothing is shared, so no Shared only row"
+        assert 'class="ch-onlys"' not in html, "and no empty wrapper left behind"
+        # The state radios always render: one of them is always the answer.
+        for key in ("active", "archived", "all"):
+            assert f'data-facet="status" value="{key}"' in html
+
+        # One qualifying option brings the wrapper back — with a role and an
+        # accessible name, so its checkboxes are announced as part of "Show"
+        # the way the radios above them are.
+        _seed(web_client, title="Kept handy", pinned=True)
+        html = web_client.get("/chats", cookies=admin_cookie).text
+        assert 'class="ch-onlys" role="group" aria-labelledby="ch-status-label"' in html
+        assert 'data-facet="pinned"' in html
+        assert 'data-facet="shared"' not in html, "still nothing shared"
+
+    def test_the_no_results_panel_does_not_point_at_views_that_no_longer_exist(self):
+        """It read "Try a different search term, or another view" — there are no
+        views to send anyone to since the four became two filter groups. It now
+        names the two things that can actually be narrowing the list, and its
+        button says what it clears (`data-fbar-reset` clears the search box too,
+        which the Filter menu's own Clear deliberately does not)."""
+        html = (TEMPLATES / "chats.html").read_text(encoding="utf-8")
+        panel = html.split('id="ch-noresults"', 1)[1].split("</div>", 1)[0]
+        assert "another view" not in panel
+        assert "Try a shorter search term, or take a filter off above." in panel
+        assert ">Clear search and filters<" in panel
 
     def test_pinned_row_is_marked_and_leads_the_list(self, web_client, admin_cookie, monkeypatch):
         _enable_chat(web_client, monkeypatch)
@@ -199,38 +315,56 @@ class TestChatsPage:
         html = web_client.get("/chats", cookies=admin_cookie).text
         row = _row(html, pin)
         assert 'data-pinned="1"' in row
-        assert "pinned" in row.split('data-buckets="')[1].split('"')[0]
+        assert 'data-status="all|active"' in row, "pinned is an attribute, not a state"
         # Pinned first, the same order the rail uses, so the page opens on the
         # ordering the caller already knows.
         assert html.index("The pinned one") < html.index("Just chatting")
 
-    def test_the_four_views_live_inside_the_filter_menu(self, web_client, admin_cookie, monkeypatch):
-        """All · Pinned · Shared · Archived are the FIRST thing in the Filter
-        popover, not a segmented control beside the Filter button — two controls
-        doing one job, of which the wider spent its width on counts a caller reads
-        once. They stay single-select (the engine's `segments`, one `data-own`
-        each): a chat is shown in one view at a time, and unlike a checkbox facet
-        these have no "nothing selected" state that would let archived
-        conversations back into the default view."""
+    def test_the_show_block_is_two_groups_in_the_filter_menu(
+        self, web_client, admin_cookie, monkeypatch
+    ):
+        """The FIRST thing in the Filter popover, and TWO groups rather than one
+        list of four — because the four were never four of a kind.
+
+        `Archived` is a lifecycle STATE (live or archived, never both, hidden
+        until asked for); `Pinned` and `Shared` are ATTRIBUTES a conversation
+        carries on either side of it. Crammed into one control they produced
+        combinations that answer nothing — as segments (exactly one on) "my
+        pinned ones in the archive" was unaskable; as one OR-group `All` was a
+        superset of `Shared`, so ticking both said nothing extra. Now: radios for
+        the state, checkboxes for the attributes, ANDed. The engine is executed
+        over these values in tests/test_web_chats_filter_clear.py."""
         _enable_chat(web_client, monkeypatch)
-        _seed(web_client, title="Something")
+        _seed(web_client, title="Something", pinned=True)
         html = web_client.get("/chats", cookies=admin_cookie).text
         menu = html.split('id="ch-filter-menu"', 1)[1].split("</div>\n    </div>", 1)[0]
-        for label in ("All", "Pinned", "Shared", "Archived"):
-            assert f'<span class="ch-viewsel__txt">{label}</span>' in menu, f"{label} must be in the Filter menu"
-        for own in ("all", "pinned", "shared", "archived"):
-            assert f'data-own="{own}"' in menu
-        assert 'id="ch-seg"' in menu, "the engine's segment container moves into the menu with them"
-        # The views come FIRST, above the optional refinements.
-        assert menu.index('id="ch-seg"') < menu.index("fbar-menu__foot")
-        # ...and there is no segmented control left on the bar itself.
-        # Anchored on the bar's aria-label, not its class list: the class list
-        # carries opt-in modifiers (`fbar--ranked`) that this test has no view on.
+        for key, label in (("active", "Active"), ("archived", "Archived"), ("all", "All")):
+            assert f'type="radio" name="ch-status" data-facet="status" value="{key}"' in menu
+            assert f'<span class="fbar-menu__opt-text">{label}</span>' in menu
+            assert f'data-opt-count="{key}"' in menu
+        # The resting option is checked, so the group is never in a "no choice"
+        # state the engine would have to invent a meaning for.
+        assert 'value="active"\n                   checked' in menu or 'value="active" checked' in menu.replace(
+            "\n                   ", " "
+        )
+        # The attributes are CHECKBOXES, in their own group, under the state.
+        assert 'type="checkbox" data-facet="pinned" value="1"' in menu
+        assert '<span class="fbar-menu__opt-text">Pinned only</span>' in menu
+        assert menu.index('class="ch-viewsel"') < menu.index('class="ch-onlys"')
+        # Both groups come FIRST, above the optional refinements.
+        assert menu.index('class="ch-onlys"') < menu.index("fbar-menu__foot")
+        # No segmented control anywhere on the page any more — not on the bar,
+        # not in the menu. Anchored on the bar's aria-label rather than its class
+        # list: the class list carries opt-in modifiers (`fbar--ranked`) that
+        # this test has no view on.
         bar = html.split('aria-label="Search, filter and sort chats"', 1)[1].split('id="ch-filter-menu"', 1)[0]
         assert "fbar-seg__btn" not in bar
-        # The active view is named on the Filter button, which is the one thing the
-        # tabs said at rest.
-        assert 'id="ch-filter-view"' in html
+        assert "fbar-seg__btn" not in html and 'data-own="' not in html
+        # The bespoke "· Archived" label on the Filter button is gone with them:
+        # the chips beside the count say what is applied, and unlike the label
+        # they can be clicked off.
+        assert 'id="ch-filter-view"' not in html
+        assert 'id="ch-chips"' in html
         # Search and sort — and NO view toggle: this page has one projection, so
         # `.fbar-view` is absent from the bar and `view` from the engine config.
         assert 'id="ch-search"' in html
@@ -282,7 +416,7 @@ class TestChatsPage:
         bar = html.split('aria-label="Search, filter and sort chats"', 1)[1].split('class="ch-listhead"', 1)[0]
         assert 'id="ch-search"' in bar, "search rides the toolbar, not the header"
         assert 'class="cc-btn cc-btn--primary ch-new"' in bar, "the primary action closes the row"
-        assert bar.index('id="ch-search"') < bar.index('id="ch-seg"') < bar.index("ch-new")
+        assert bar.index('id="ch-search"') < bar.index('id="ch-filter-btn"') < bar.index("ch-new")
         # The state line is BELOW the controls, against the list it describes —
         # the dock had the chips ABOVE the bar, which was right only while the
         # bar itself sat under the list.
@@ -423,6 +557,74 @@ class TestChatsPageScript:
         js = PAGE_JS.read_text(encoding="utf-8")
         assert 'dataset.owned === "1"' in js
 
+    def test_every_mutation_refreshes_the_rail(self):
+        """The rail sits BESIDE this page and lists the same conversations, so
+        anything that moves here has to move there. It did not: an archived
+        conversation went on sitting in the rail's Pinned shelf, and a rename or
+        a delete was just as stale, until the next full page load — because
+        `rail_history.js`'s `load()` was module-private and nothing on the page
+        could reach it.
+
+        The refresh rides `afterMutation`, the single funnel every action on this
+        page already goes through (archive, restore, pin, unpin, rename, delete,
+        and every bulk equivalent), rather than being bolted onto each one."""
+        page = PAGE_JS.read_text(encoding="utf-8")
+        fn = page[page.index("function afterMutation()") : page.index("// ---- Feedback for one row's action")]
+        assert "window.railChatHistory.reload()" in fn
+        # Guarded, because /chats renders for callers whose rail has no history
+        # section at all — a missing hook must not break the mutation itself.
+        assert "if (window.railChatHistory && window.railChatHistory.reload)" in fn
+
+        rail = RAIL_JS.read_text(encoding="utf-8")
+        assert "window.railChatHistory = Object.assign(" in rail, "merged, so railChatSections survives"
+        assert "{ reload: load }" in rail
+
+    def test_archiving_offers_an_undo_and_restoring_does_not(self):
+        """Archive is the one row action whose result LEAVES THE VIEW while
+        being reversible, so it is the one that earns a toast: without it the row
+        simply vanished, and undoing a click meant opening Filter, choosing
+        Archived, finding the row and hitting Restore.
+
+        Restore gets none — it happens while the caller is deliberately looking
+        AT the archive, having gone there to do exactly this, so the row leaving
+        is the confirmation and an Undo would only offer to re-archive it.
+
+        It rides the shared `showUndoToast` every admin delete already uses, so
+        the app keeps ONE undo affordance."""
+        page = PAGE_JS.read_text(encoding="utf-8")
+        assert "function announceUndo" in page
+        assert "window.showUndoToast" in page
+        # Absent helper → no toast, never a broken action.
+        assert 'if (typeof window.showUndoToast !== "function") return;' in page
+
+        archive = page[page.index("onArchive: function ()") : page.index("onRestore: function ()")]
+        assert "announceUndo(" in archive
+        restore = page[page.index("onRestore: function ()") : page.index("onDelete: function ()")]
+        assert "announceUndo(" not in restore
+
+        # The bulk equivalent announces ONCE for the batch, and only on a clean
+        # run — an Undo over a half-failed batch would promise to put back rows
+        # that never moved.
+        assert "function runBulk(label, targets, action, onAllDone)" in page
+        assert "if (onAllDone) onAllDone();" in page
+        bulk = page[page.index('} else if (kind === "archive")') : page.index('} else if (kind === "restore")')]
+        assert "announceUndo(" in bulk
+        assert 'Promise.all(going.map(' in bulk, "undo puts back exactly the rows this action moved"
+
+    def test_the_shared_undo_toast_accepts_a_callback(self):
+        """/chats un-archives with `PUT .../archived {archived:false}`, which the
+        helper's POST-to-a-URL form cannot express. The two forms report failure
+        differently and must not be conflated: a URL is judged on `response.ok`,
+        a callback on whether its promise settles. Reading `.ok` off a callback's
+        result would break the common case, since the app's own `api()` throws on
+        non-2xx and resolves with parsed JSON that has no `ok` at all."""
+        html = (TEMPLATES / "_app_scripts.html").read_text(encoding="utf-8")
+        toast = html[html.index("window.showUndoToast = function") :]
+        assert "if (typeof restoreUrl === 'function') {" in toast
+        assert "await restoreUrl();   // rejects on failure; nothing to inspect" in toast
+        # The URL form keeps its own check.
+        assert "if (!r.ok) {" in toast
+
     def test_bulk_failure_does_not_lose_the_rest(self):
         """One failure among ten must not abort the other nine — allSettled
         semantics, not a Promise.all that rejects on the first error."""
@@ -439,6 +641,26 @@ class TestChatsPageScript:
         # Archive and Restore are one wiring, chosen from the row's own state.
         assert "s.archived && opts.onRestore" in menu
         assert "!s.archived && opts.onArchive" in menu
+
+    def test_no_pin_control_anywhere_on_an_archived_row(self):
+        """Pinned and archived are contradictory states, so neither control
+        offers either direction on an archived row.
+
+        A pin means "keep this at the top of my list"; archiving means "this is
+        not in my list". The state is therefore prevented at the source —
+        `archive_session` clears `pinned_at`, the pin endpoint refuses a pin on
+        an archived row, and `_chats_rows` never presents one as pinned — which
+        is why there is no Unpin branch to keep here either: an archived row
+        never carries `data-pinned` for a control to act on."""
+        menu = MENU_JS.read_text(encoding="utf-8")
+        assert "if (!s.archived) {" in menu
+        assert '{ id: "pin", label: s.pinned ? "Unpin" : "Pin"' in menu
+        page = PAGE_JS.read_text(encoding="utf-8")
+        # The bulk bar's availability check AND its action, both gated.
+        assert page.count('r.dataset.pinned !== "1" && r.dataset.archived !== "1"') == 2
+        # Archiving in place drops the pin too, or the row keeps a glyph and a
+        # `data-pinned` that a reload would not reproduce.
+        assert 'if (archived && row.dataset.pinned === "1") setRowPinned(row, false);' in page
 
     def test_menu_offers_archive_only_where_a_caller_supplies_it(self):
         """The rail and the chat page pass no archive handler and must keep the
@@ -468,24 +690,29 @@ class TestChatsPageScript:
 
 
 class TestNothingIsUnreachable:
-    def test_search_looks_in_every_view_not_just_the_one_showing(self):
-        """A search is a request for one named thing. A view that hides it makes
+    def test_search_looks_past_the_show_filter_not_just_inside_it(self):
+        """A search is a request for one named thing. A filter that hides it makes
         the thing unfindable, not merely unlisted — so on /chats the search
-        outranks the segment. Opt-in on the shared engine: a page whose segments
-        are a real scope ("mine" vs "everyone's") means them, search included."""
+        outranks the Show filter. Per-FACET and opt-in (`spansSearch`), which is
+        why it does not leak to Agent or Source: those the reader set on purpose.
+
+        This rode `segments.searchSpansSegments` until the four views became a
+        facet; the option went with them, since /library's tabs — the one
+        remaining `segments` caller — are a real scope and mean it. The
+        behaviour is executed, not just grepped, in
+        tests/test_web_chats_filter_clear.py."""
         js = TOOLBAR_JS.read_text(encoding="utf-8")
-        assert "searchSpansSegments" in js
-        seg = js[js.index("function segMatch(row)") : js.index("function facetMatch(row)")]
-        assert "if (segSpansOnSearch && searchActive()) return true;" in seg
-        assert seg.index("segSpansOnSearch") < seg.index("segValue === 'all'"), (
-            "the search override has to come BEFORE the segment test, or it never runs"
-        )
-        # Facets are NOT overridden — those the user set on purpose.
-        facet = js[js.index("function facetMatch(row)") : js.index("// ── Facets whose control sits OUTSIDE")]
-        assert "segSpansOnSearch" not in facet
+        assert "searchSpansSegments" not in js and "segSpansOnSearch" not in js
+        facet = js[js.index("function facetMatch(row)") : js.index("function has(allowed, value)")]
+        assert "if (f.spansSearch && searchActive()) continue;" in facet
+        # It has to come BEFORE the facet's own test, or it never runs.
+        assert facet.index("f.spansSearch") < facet.index("f.whenEmpty")
 
         page = PAGE_JS.read_text(encoding="utf-8")
-        assert "searchSpansSegments: true" in page, "/chats is the page that opts in"
+        assert "spansSearch: true" in page, "/chats' state facet is what opts in"
+        assert page.index('key: "status"') < page.index("spansSearch: true")
+        # NOT on the attribute toggles or the categories — those the reader set.
+        assert page.index("spansSearch: true") < page.index('key: "pinned"')
 
     def test_the_count_has_a_control_behind_it(self):
         """"7 of 27" is a filter's readout; without something to click it reads
@@ -497,20 +724,25 @@ class TestNothingIsUnreachable:
             "the control belongs next to the count it explains"
         )
         page = PAGE_JS.read_text(encoding="utf-8")
-        fn = page[page.index("function syncHiddenNote()") : page.index("// ---- Segment badge counts")]
-        assert 'toolbar.setSegment("archived")' in page, "clicking it must actually change the view"
+        fn = page[page.index("function syncHiddenNote()") : page.index("// ---- Show-option counts")]
+        # Goes through the engine, so this and choosing Archived in the menu are
+        # the same act — including growing the chip that takes it back off.
+        assert 'toolbar.setFacet("status", "archived", true)' in page
         assert '"Show " + archived + " archived"' in fn
-        # Shown ONLY when the view is what's hiding rows: a search now spans
-        # every view, and an applied facet is already explained by its chip.
-        assert 'view === "all" && !searching && archived > 0' in fn
+        # Shown ONLY while nothing is applied: that is the state with no control
+        # on screen saying the archive exists, and the only one in which this
+        # control's own number is the number you would actually get.
+        assert 'statusValue() === "active" && !anyFacetApplied() && !searching && archived > 0' in fn
         # …and recomputed after an action, or archiving the last chat leaves a
-        # control offering a view with nothing in it.
+        # control offering an archive with nothing in it.
         counts = page[page.index("function updateSegmentCounts()") :]
         assert "syncHiddenNote();" in counts[: counts.index("\n  }")]
 
-    def test_the_engine_exposes_the_segment_setter_it_needs(self):
+    def test_the_engine_exposes_the_facet_setter_it_needs(self):
         js = TOOLBAR_JS.read_text(encoding="utf-8")
         api = js[js.index("    return {\n      apply: apply") :]
+        assert "setFacet: setFacet," in api[: api.index("};")]
+        # `setSegment` stays exposed for /library's tabs.
         assert "setSegment: setSegment," in api[: api.index("};")]
 
 
