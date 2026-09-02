@@ -4054,9 +4054,7 @@ async def library_page(
                 # 170px column while offering something true of every row in
                 # the band equally.
                 "band_link": (
-                    {"href": "/agents?from_template=1", "label": "Start from a template"}
-                    if key == "agent"
-                    else None
+                    {"href": "/agents?from_template=1", "label": "Start from a template"} if key == "agent" else None
                 ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
@@ -9835,6 +9833,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # the block below never runs.
         "extraction_ready": False,
         "extraction_unready_reason": None,
+        # The "Extract facts now" gate — the standalone
+        # `sharepoint-facts-extraction` pass. Same posture as the two keys
+        # above: computed here so the card disables the button with the
+        # reason instead of letting the click land a 409 the server already
+        # knows about, and closed (not ready, no switch named) if the block
+        # below never runs.
+        "facts_extraction_ready": False,
+        "facts_extraction_unready_switch": None,
     }
     try:
         from app.instance_config import feature_enabled, get_value
@@ -9861,6 +9867,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         usable, error = _extraction_readiness()
         in_agnes_schedule["extraction_ready"] = usable
         in_agnes_schedule["extraction_unready_reason"] = None if usable else (error or {}).get("error")
+
+        # The facts pass honours the connector switch first (router-level:
+        # the whole `/api/admin/sharepoint/*` surface answers `409
+        # feature_disabled` without it) and then its own two switches —
+        # `_facts_extraction_readiness`, the SAME check the trigger runs
+        # before enqueueing, whose refusal names the key that is off. It
+        # deliberately does NOT need the `extraction` dependency extra
+        # (`extraction_dependencies_missing` above): the pass reads
+        # already-converted markdown, never raw documents.
+        from app.api.admin_sharepoint import _facts_extraction_readiness
+
+        if not in_agnes_schedule["enabled"]:
+            facts_usable, facts_switch = False, "sharepoint.enabled"
+        else:
+            facts_usable, facts_error = _facts_extraction_readiness()
+            facts_switch = None if facts_usable else (facts_error or {}).get("switch")
+        in_agnes_schedule["facts_extraction_ready"] = facts_usable
+        in_agnes_schedule["facts_extraction_unready_switch"] = facts_switch
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 
@@ -11635,20 +11659,31 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
         if s.id in seen:
             continue
         seen.add(s.id)
-        pinned = owned and s.pinned_at is not None
         archived = bool(s.archived)
+        # An archived conversation is never presented as pinned. `archive_session`
+        # clears `pinned_at` and the pin endpoint refuses a pin on an archived
+        # row, so the invariant holds at the source going forward — this is what
+        # makes it hold for rows written BEFORE it existed, on every instance, in
+        # place of a data migration the frozen DuckDB ladder could not carry.
+        pinned = owned and s.pinned_at is not None and not archived
         shared = bool(s.is_co_session) or not owned
-        # The segment set (see filter_toolbar.js `segments.multi`). `all` is a
-        # real token, not a wildcard, which is what keeps archived conversations
-        # out of every other view without a special case in the engine. Archived
-        # is deliberately exclusive: an archived chat is put away, so it should
-        # not also be sitting in Pinned.
-        buckets = ["archived"] if archived else ["all"]
-        if not archived:
-            if pinned:
-                buckets.append("pinned")
-            if shared:
-                buckets.append("shared")
+        # The LIFECYCLE STATE the page's `Show` radios filter on — one
+        # `exclusive` facet over `data-status` (filter_toolbar.js), so exactly
+        # one of Active / Archived / All is ever chosen. A set rather than a
+        # single value only so that `all` can be a token every row carries and
+        # the option of that name can mean what it says.
+        #
+        # `active` is the facet's `whenEmpty` value — what the list rests on
+        # before anything is chosen — which is how archived conversations stay
+        # out of the default view without a special case in the engine.
+        #
+        # Pinned and Shared are NOT in here. They are ATTRIBUTES, not states: a
+        # conversation carries them on either side of the archive, they are
+        # independent of each other, and they are independent toggle facets over
+        # the `data-pinned` / `data-shared` the row already carries. Mixing the
+        # two dimensions into one OR-group is what made combinations like
+        # "All + Shared" mean nothing.
+        status = ["all", "archived" if archived else "active"]
         agent_label = agent_names.get(s.agent_id or "", "Default agent")
         updated = s.last_message_at or s.started_at
         title = (s.title or "").strip() or "Untitled chat"
@@ -11669,7 +11704,7 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
                 "archived": archived,
                 "shared": shared,
                 "owned": owned,
-                "buckets": "|".join(buckets),
+                "status": "|".join(status),
                 # What the page's search box matches on — lowercased here so the
                 # engine's own lowercased query is a plain substring test.
                 "search": " ".join([title, agent_label, SURFACE_LABELS.get(s.surface.value, "")]).lower(),
@@ -11683,11 +11718,20 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
     # inside their own segment.
     rows.sort(key=lambda r: (r["pinned"], r["updated_iso"] or ""), reverse=True)
 
+    # The UNFILTERED tally per option — the same convention every other Filter
+    # menu in the app uses. `all` is the whole list, because that is what the
+    # option means now.
+    #
+    # `pinned` is live-only by construction (archiving unpins, and an archived
+    # row is never presented as pinned above), so the tally needs no `archived`
+    # clause. `shared` is genuinely orthogonal to the state — an archived
+    # co-session is coherent — so it spans the archive.
     counts = {
-        "all": sum(1 for r in rows if not r["archived"]),
-        "pinned": sum(1 for r in rows if r["pinned"] and not r["archived"]),
-        "shared": sum(1 for r in rows if r["shared"] and not r["archived"]),
+        "all": len(rows),
+        "active": sum(1 for r in rows if not r["archived"]),
         "archived": sum(1 for r in rows if r["archived"]),
+        "pinned": sum(1 for r in rows if r["pinned"]),
+        "shared": sum(1 for r in rows if r["shared"]),
     }
 
     # Facet options carry the UNFILTERED tally per value, matching how every
@@ -11718,9 +11762,10 @@ async def chats_page(
     grant; both failures bounce home rather than 403, matching the chat page (the
     rail hides the link for them too, so this guards a direct URL hit).
 
-    Rendering is server-side; search, the four segments (All / Pinned / Shared /
-    Archived), the Agent + Source facets, sort, the table ⇄ grid switch, the
-    row actions and the bulk bar are all client-side over those rows
+    Rendering is server-side; search, the Show controls (a lifecycle state —
+    Active / Archived / All, resting on Active — plus independent "Pinned only"
+    and "Shared only" toggles), the Agent + Source facets, sort, the row actions
+    and the bulk bar are all client-side over those rows
     (static/js/chats_page.js).
     """
     if not request.app.state.chat_config.enabled:

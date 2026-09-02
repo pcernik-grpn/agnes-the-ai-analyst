@@ -306,12 +306,27 @@ async def set_session_pinned(
     used to probe for other users' session ids. Idempotent — pinning an already
     pinned session just re-stamps ``pinned_at``, which re-orders it to the front
     of the Pinned group.
+
+    Pinning an ARCHIVED conversation is refused (409): a pin means "keep this at
+    the top of my list" and archiving means "this is not in my list", so the two
+    states contradict each other — ``archive_session`` clears the pin for the
+    same reason. Restore it first if you want it back on the shelf. UNpinning is
+    always allowed, so a row pinned before this invariant existed can still be
+    tidied up.
     """
     _reject_restricted_principal(user, "pin a conversation")
     repo = _get_repo(request)
     s = repo.get_session(chat_id)
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
+    if body.pinned and s.archived:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "session_archived",
+                "message": "This conversation is archived. Restore it before pinning it.",
+            },
+        )
     repo.set_pinned(chat_id, body.pinned)
     return {"id": chat_id, "pinned": body.pinned}
 

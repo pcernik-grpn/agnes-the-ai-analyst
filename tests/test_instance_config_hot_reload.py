@@ -219,3 +219,35 @@ class TestCorruptOverlayAfterGoodLoad:
                 "_last_good_config must still hold the last GOOD merge after "
                 "a corrupt reload, not the degraded static-only config"
             )
+
+
+class TestExtractionWorkerReadsAnAdminSavedCrawlerConcurrency:
+    """The incident this file pins, one setting over: `extraction.crawler.
+    concurrency` is the knob that decides the extraction worker's peak
+    memory, and the worker is a separate process from the app container
+    that handles the admin panel's save. A value saved in the panel must
+    be what the worker's NEXT crawl resolves — without the worker being
+    recreated."""
+
+    def test_worker_process_resolves_the_value_the_app_process_saved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        overlay_path = _write_overlay(tmp_path, {"extraction": {"crawler": {"concurrency": 6}}})
+
+        from unittest.mock import patch
+
+        from connectors.sharepoint.crawler import _crawl_concurrency
+
+        with patch("config.loader.load_instance_config", return_value={}):
+            # The worker booted, ran a crawl, and cached the config.
+            assert _crawl_concurrency() == 6
+
+        # The app container's save: the overlay is rewritten on disk by
+        # ANOTHER process. Deliberately no `reset_cache()` here.
+        overlay_path.write_text(yaml.dump({"extraction": {"crawler": {"concurrency": 2}}}))
+        _bump_mtime(overlay_path)
+
+        with patch("config.loader.load_instance_config", return_value={}):
+            assert _crawl_concurrency() == 2, (
+                "the extraction worker must resolve the admin-saved crawler concurrency "
+                "on its next run without being recreated"
+            )

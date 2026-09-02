@@ -88,20 +88,17 @@
   }
 
   // ---- Row state, written in place -------------------------------------
-  // The segment set is DERIVED from the three state flags rather than patched, so
-  // there is exactly one rule for which buckets a row belongs to and it cannot
-  // drift from the server's (see `_chats_rows` in app/web/router.py). Archived is
-  // exclusive: a chat that has been put away should not also sit in Pinned.
+  // The lifecycle-state set is DERIVED from the row's `archived` flag rather
+  // than patched, so there is exactly one rule for it and it cannot drift from
+  // the server's (see `_chats_rows` in app/web/router.py). `all` is on every row
+  // so the option of that name can mean what it says.
+  //
+  // Pinned and Shared are NOT in here — they are their own toggle facets over
+  // `data-pinned` / `data-shared`, which setRowPinned() already maintains, so
+  // archiving a pinned chat leaves it pinned (it is, on the server too) and
+  // "Pinned only" still reaches it.
   function syncBuckets(row) {
-    var archived = row.dataset.archived === "1";
-    if (archived) {
-      row.dataset.buckets = "archived";
-      return;
-    }
-    var buckets = ["all"];
-    if (row.dataset.pinned === "1") buckets.push("pinned");
-    if (row.dataset.shared === "1") buckets.push("shared");
-    row.dataset.buckets = buckets.join("|");
+    row.dataset.status = "all|" + (row.dataset.archived === "1" ? "archived" : "active");
   }
 
   function setRowPinned(row, pinned) {
@@ -127,6 +124,11 @@
   }
 
   function setRowArchived(row, archived) {
+    // Archiving UNPINS (ChatRepository.archive_session), so the row has to lose
+    // its pin here as well — otherwise it keeps a glyph, a `data-pinned` the
+    // `Pinned only` filter would match, and a place at the top of the sort that
+    // a reload would not reproduce.
+    if (archived && row.dataset.pinned === "1") setRowPinned(row, false);
     if (archived) row.dataset.archived = "1";
     else delete row.dataset.archived;
     row.classList.toggle("is-archived", archived);
@@ -243,6 +245,30 @@
     }
     updateSegmentCounts();
     syncSelection();
+    // The rail is on screen BESIDE this page and holds the same conversations,
+    // so anything that moves here has to move there: an archived chat went on
+    // sitting in its Pinned shelf until the next full page load, and a rename
+    // or a delete was just as stale. This page updates its own rows in place (a
+    // reload would throw away the search and filters the caller used to find
+    // the row); the rail has no such constraint, so it simply re-fetches.
+    if (window.railChatHistory && window.railChatHistory.reload) {
+      window.railChatHistory.reload();
+    }
+  }
+
+  // ---- Feedback for one row's action ----------------------------------
+  // A row menu action was silent: the row left the view and nothing said what
+  // had happened or offered a way back. Archiving especially — it is reversible,
+  // but reversing it meant opening Filter, choosing Archived, finding the row
+  // again and hitting Restore, which is a lot of work to undo a click.
+  //
+  // Rides the shared `showUndoToast` every admin delete already uses, so this is
+  // the app's one undo affordance rather than a second one for this page.
+  // Silent when it is absent: feedback must never be the thing that breaks an
+  // action that already succeeded.
+  function announceUndo(message, undo) {
+    if (typeof window.showUndoToast !== "function") return;
+    window.showUndoToast(message, undo, afterMutation);
   }
 
   function runAndSettle(promise) {
@@ -252,33 +278,16 @@
     });
   }
 
-  // ---- The active view, on the Filter button ---------------------------
-  // The four views live inside the Filter menu now, so at rest the bar has to
-  // say which one is on — that is the one thing the segmented control it replaced
-  // did without being opened. "All" is the default and says nothing, so the
-  // resting button stays a plain "Filter"; anything else names itself.
-  //
-  // Read off the engine's own `.is-active` class rather than tracked here: the
-  // engine owns that state and pushes it onto the buttons, so this cannot drift.
-  function syncFilterView() {
-    var label = document.getElementById("ch-filter-view");
-    var btn = document.getElementById("ch-filter-btn");
-    if (!label) return;
-    var active = document.querySelector("#ch-seg .fbar-seg__btn.is-active");
-    var view = active && active.getAttribute("data-own");
-    var txt = active ? (active.querySelector(".ch-viewsel__txt") || active).textContent.trim() : "";
-    var on = !!view && view !== "all";
-    label.textContent = on ? txt : "";
-    label.hidden = !on;
-    // The button's own is-active is the engine's (it counts applied facets); the
-    // view is a second reason to light it up, so OR the two rather than
-    // overwriting — clearing a facet must not un-light an active view.
-    if (btn && on) btn.classList.add("is-active");
-    // aria-checked follows the class for the radio group, since the engine only
-    // maintains `aria-selected` on segment buttons.
-    document.querySelectorAll("#ch-seg .fbar-seg__btn").forEach(function (b) {
-      b.setAttribute("aria-checked", b.classList.contains("is-active") ? "true" : "false");
-    });
+  // ---- What is applied -------------------------------------------------
+  // Read off the inputs themselves — the engine owns their state and pushes it
+  // back onto them on every path (a choice, a tick, a chip's ×, Clear), so this
+  // cannot drift from what is filtering the list.
+  function statusValue() {
+    var on = document.querySelector('#ch-filter-menu input[data-facet="status"]:checked');
+    return (on && on.value) || "active";
+  }
+  function anyFacetApplied() {
+    return !!document.querySelector('#ch-filter-menu input[type="checkbox"][data-facet]:checked');
   }
 
   // ---- "N archived" — the control behind the count ---------------------
@@ -288,21 +297,23 @@
   // through was a segment button inside the Filter menu (#1974). This puts
   // the way in beside the number that raises the question.
   //
-  // Shown while the VIEW is what is hiding rows — which stays true with a
-  // facet applied, so it is not conditioned on that. Not during a search:
-  // a search already looks in every view (filter_toolbar.js
-  // `searchSpansSegments`), so there would be nothing left to offer.
+  // Shown only while NOTHING is applied — the resting state, which is the one
+  // with no control on screen saying the archive exists. The moment anything is
+  // applied the chips say so and the Filter menu is one click away, so a second
+  // control would be noise; it is also the only state in which this control's
+  // own number ("8 archived") is the number you would actually get, since it
+  // counts every archived row rather than the ones the other filters would
+  // leave. Not during a search either: a search already looks everywhere
+  // (`spansSearch`), so there would be nothing left to offer.
   function syncHiddenNote() {
     var btn = document.getElementById("ch-show-archived");
     if (!btn) return;
     var search = document.getElementById("ch-search");
     var searching = !!(search && (search.value || "").trim());
-    var active = document.querySelector("#ch-seg .fbar-seg__btn.is-active");
-    var view = (active && active.getAttribute("data-own")) || "all";
     var archived = rows().filter(function (r) {
-      return (r.dataset.buckets || "").split("|").indexOf("archived") !== -1;
+      return (r.dataset.status || "").split("|").indexOf("archived") !== -1;
     }).length;
-    var show = view === "all" && !searching && archived > 0;
+    var show = statusValue() === "active" && !anyFacetApplied() && !searching && archived > 0;
     btn.hidden = !show;
     if (show) btn.textContent = "Show " + archived + " archived";
   }
@@ -310,23 +321,33 @@
   var showArchivedBtn = document.getElementById("ch-show-archived");
   if (showArchivedBtn) {
     showArchivedBtn.addEventListener("click", function () {
-      if (toolbar && toolbar.setSegment) toolbar.setSegment("archived");
+      // Goes through the engine, so this and choosing Archived in the menu are
+      // the same act — including growing the chip that takes it back off.
+      if (toolbar && toolbar.setFacet) toolbar.setFacet("status", "archived", true);
     });
   }
 
-  // ---- Segment badge counts -------------------------------------------
-  // The UNFILTERED tally per segment, matching how the Filter menu's category
-  // options count. Recomputed from the rows' own bucket sets after any action, so
-  // archiving four chats moves four out of All and into Archived immediately.
+  // ---- Show-option counts ---------------------------------------------
+  // The UNFILTERED tally per option, matching how every other Filter menu in the
+  // app counts. Recomputed after any action, so archiving four chats moves four
+  // out of Active and into Archived immediately.
+  //
+  // `pinned` can only ever be a live row (archiving unpins), so its tally is
+  // the same whether counted over the whole list or the live half; `shared` is
+  // genuinely orthogonal to the state — an archived co-session is coherent — so
+  // it does span the archive. An option the server did not render (a caller with
+  // nothing shared) simply has no element to write to.
   function updateSegmentCounts() {
-    var counts = { all: 0, pinned: 0, shared: 0, archived: 0 };
+    var counts = { all: 0, active: 0, archived: 0, pinned: 0, shared: 0 };
     rows().forEach(function (row) {
-      (row.dataset.buckets || "").split("|").forEach(function (b) {
+      (row.dataset.status || "").split("|").forEach(function (b) {
         if (b in counts) counts[b] += 1;
       });
+      if (row.dataset.pinned) counts.pinned += 1;
+      if (row.dataset.shared) counts.shared += 1;
     });
     Object.keys(counts).forEach(function (key) {
-      var el = document.querySelector('[data-seg-count="' + key + '"]');
+      var el = document.querySelector('[data-opt-count="' + key + '"]');
       if (el) el.textContent = String(counts[key]);
     });
     // Same tally, other readout: archiving the last unarchived chat has to move
@@ -397,6 +418,11 @@
       return chosen.some(fn);
     };
     var avail = {
+      // Neither direction on an archived row: pinned and archived contradict
+      // each other, so the state does not exist (archiving clears the pin, the
+      // endpoint refuses a pin on an archived row, and the server never renders
+      // one as pinned). `unpin` needs no such clause for the same reason — an
+      // archived row never carries `data-pinned`.
       pin: some(function (r) {
         return r.dataset.pinned !== "1" && r.dataset.archived !== "1";
       }),
@@ -421,7 +447,7 @@
   // none is needed at this cardinality; what matters is that ONE failure among
   // ten does not lose the other nine, hence allSettled semantics rather than a
   // Promise.all that rejects on the first error.
-  function runBulk(label, targets, action) {
+  function runBulk(label, targets, action, onAllDone) {
     if (!targets.length) return;
     var failures = 0;
     var done = targets.map(function (row) {
@@ -431,7 +457,12 @@
     });
     Promise.all(done).then(function () {
       afterMutation();
-      if (!failures) return;
+      if (!failures) {
+        // Only on a CLEAN run: offering "Undo" over a batch that half failed
+        // would promise to restore rows that never moved.
+        if (onAllDone) onAllDone();
+        return;
+      }
       // Two different facts, and saying the wrong one is worse than saying
       // nothing: a partial failure has to name what DID happen, and a total
       // failure must not imply that anything did.
@@ -476,15 +507,25 @@
           },
         );
       } else if (kind === "archive") {
-        runBulk(
-          "archived",
-          chosen.filter(function (r) {
-            return r.dataset.archived !== "1";
-          }),
-          function (r) {
-            return setArchived(r, true);
-          },
-        );
+        var going = chosen.filter(function (r) {
+          return r.dataset.archived !== "1";
+        });
+        runBulk("archived", going, function (r) {
+          return setArchived(r, true);
+        }, function () {
+          // ONE toast for the batch, not one per row. Undo puts back exactly
+          // the rows this action moved — captured here rather than re-derived
+          // from the archive, which by then also holds everything the caller
+          // archived earlier and meant to keep archived.
+          announceUndo(
+            going.length === 1
+              ? "Archived “" + (going[0].dataset.title || "that conversation") + "”"
+              : "Archived " + going.length + " conversations",
+            function () {
+              return Promise.all(going.map(function (r) { return setArchived(r, false); }));
+            },
+          );
+        });
       } else if (kind === "restore") {
         runBulk(
           "restored",
@@ -544,8 +585,23 @@
       // Both handlers, always: the menu picks which one to show from the row's
       // live `archived` state, so archiving a conversation and restoring it are
       // the same wiring.
+      // Archive is the one row action whose result LEAVES THE VIEW while
+      // being reversible, so it is the one that earns a toast: without it the
+      // row simply vanished, and undoing a click meant opening Filter, choosing
+      // Archived, finding the row and hitting Restore.
+      //
+      // Restore gets none. It is the same shape of change, but it happens while
+      // the caller is deliberately looking AT the archive, having gone there to
+      // do exactly this — so the row leaving is the confirmation, and an Undo
+      // for it would be a control for re-archiving something the caller just
+      // chose to take out.
       onArchive: function () {
-        return runAndSettle(setArchived(row, true));
+        var title = row.dataset.title || "That conversation";
+        return runAndSettle(setArchived(row, true)).then(function () {
+          announceUndo("Archived “" + title + "”", function () {
+            return setArchived(row, false);
+          });
+        });
       },
       onRestore: function () {
         return runAndSettle(setArchived(row, false));
@@ -633,16 +689,44 @@
     toolbar = window.FilterToolbar.init({
       rows: "#ch-list .ch-row",
       search: { el: "#ch-search", attr: "data-search" },
-      // Non-exclusive segments over a pipe-separated set — a chat can be pinned
-      // AND shared, and `all` is a real token so archived rows stay out of every
-      // view but their own (see `segments.multi` in filter_toolbar.js).
-      // `searchSpansSegments`: a search looks in EVERY view, not just the one
-      // showing. Without it an archived conversation was unreachable twice
-      // over — absent from the default list AND invisible to a search for its
-      // own title, which is how a chat from the same morning became impossible
-      // to reopen (#1974). The facets still apply: those the user set.
-      segments: { container: "#ch-seg", attr: "data-buckets", multi: true, searchSpansSegments: true },
       facets: [
+        // ── The lifecycle state ────────────────────────────────────────────
+        // Active / Archived / All: alternatives, so `exclusive` — one chosen,
+        // selecting replaces. This and the two toggles below were ONE list of
+        // four (All · Pinned · Shared · Archived), first as the engine's
+        // single-select `segments` control and then as one OR-group of
+        // checkboxes. Both were wrong the same way: a state and two attributes
+        // are not four of a kind. As segments, "my pinned ones in the archive"
+        // was unaskable; as one OR-group, `All` was a superset of `Shared` so
+        // ticking both said nothing extra, and `All` only existed because a
+        // checkbox group already spends "nothing ticked" on "no filter".
+        //
+        // `whenEmpty` is the resting condition a plain facet cannot express:
+        // before anything is chosen the list shows the LIVE conversations, so
+        // the archive stays out of it, and a choice REPLACES that rather than
+        // narrowing within it. A facet resting on that value is not an applied
+        // filter — no chip, no badge count — however it got there, which is
+        // what keeps "Active" from chipping as a filter over an unfiltered
+        // list.
+        //
+        // `spansSearch`: a search looks EVERYWHERE, not just in the chosen
+        // state. Without it an archived conversation was unreachable twice
+        // over — absent from the default list AND invisible to a search for
+        // its own title, which is how a chat from the same morning became
+        // impossible to reopen (#1974).
+        { key: "status", attr: "data-status", label: "Show",
+          multi: true, exclusive: true,
+          whenEmpty: ["active"], spansSearch: true },
+        // ── The attributes ────────────────────────────────────────────────
+        // Independent flags, ANDed with the state and with each other, so
+        // "All + Pinned only" is every pinned conversation either side of the
+        // archive and "Archived + Pinned only" is the pinned ones inside it.
+        // `toggle`: one condition rather than a category of values, so the chip
+        // states the condition ("Pinned only") instead of naming a category.
+        // The row already carries both attributes for the pin indicator and the
+        // Shared pill, so there is nothing new to keep in step.
+        { key: "pinned", attr: "data-pinned", label: "Pinned only", toggle: true },
+        { key: "shared", attr: "data-shared", label: "Shared only", toggle: true },
         { key: "agent", attr: "data-agent", label: "Agent" },
         { key: "surface", attr: "data-surface", label: "Source" },
       ],
@@ -684,7 +768,6 @@
         // A filter change can hide a selected row; the selection must not
         // survive invisibly (see syncSelection).
         syncSelection();
-        syncFilterView();
         syncHiddenNote();
       },
     });
@@ -692,6 +775,5 @@
 
   updateSegmentCounts();
   syncSelection();
-  syncFilterView();
   syncHiddenNote();
 })();

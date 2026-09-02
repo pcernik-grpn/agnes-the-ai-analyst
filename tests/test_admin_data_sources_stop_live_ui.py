@@ -68,10 +68,12 @@ _SIGNATURES = (
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
     "function _extActivityHtml(activity) {",
+    "function _extFactsJobLine(job) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
     "function _extRenderInAgnesButton(connId, status) {",
+    "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
 )
 

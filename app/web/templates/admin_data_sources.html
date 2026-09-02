@@ -2588,6 +2588,21 @@ function _sharepointFactsHtml(row) {
       `document${forceDocs === 1 ? "" : "s"} — not just what changed.`
     : "Re-downloads, re-converts, and (if fact extraction is on) re-runs the LLM pass over every document — not just what changed.";
 
+  // "Extract facts now" — the standalone `sharepoint-facts-extraction`
+  // pass: the fact graph over what this connection has ALREADY indexed,
+  // no crawl. Its own honest-UI gate (`facts_extraction_ready` /
+  // `facts_extraction_unready_switch`, the SAME two switches the job
+  // honours, behind the connector switch) — never a button whose click can
+  // only 409. Fail closed on an older/degraded cell shape, like the Run
+  // button above.
+  const factsReady = inAgnes.facts_extraction_ready === true;
+  const factsUnreadyText = factsReady ? "" : _factsExtractionUnreadyText(inAgnes.facts_extraction_unready_switch);
+  const factsParts = [];
+  if (!factsReady) {
+    factsParts.push(`<span class="ds-badge badge-unset">${_esc(factsUnreadyText)}</span>`);
+  }
+  factsParts.push(`<span style="color:var(--ds-text-muted)">Runs over documents indexed so far; safe to repeat.</span>`);
+
   return `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Static label — the built-in crawl's live state is the extraction row below.">Schedule</span>
@@ -2612,6 +2627,11 @@ function _sharepointFactsHtml(row) {
     <span class="field-hint" style="flex-basis:100%;">${_esc(forceReprocessHelp)}</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The standalone facts pass (sharepoint-facts-extraction): builds the fact graph over documents this connection has already indexed, without a crawl — its own time budget (extraction.facts.run_timeout_s), and it runs alongside a crawl.">Fact graph</span>
+    <span class="ds-src__fact-v">${factsParts.join(" · ")}</span>
+    <span class="ds-src__fact-a"><button type="button" id="ext-facts-btn-${row.id}" class="btn btn-secondary" data-facts-ready="${factsReady ? "1" : "0"}" ${factsReady ? "" : "disabled"} title="${_esc(factsUnreadyText)}" onclick="runSpFactsExtraction('${row.id}')">Extract facts now</button></span>
   </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
@@ -2702,6 +2722,24 @@ const EXTRACTION_UNREADY_REASON_TEXT = {
 };
 function _extractionUnreadyReasonText(reason) {
   return EXTRACTION_UNREADY_REASON_TEXT[reason] || "Extraction is not ready on this instance.";
+}
+
+/* "Extract facts now" honest-UI gate — `facts_extraction_unready_switch`
+   names the first config key the standalone facts pass needs and does not
+   have (`app/web/router.py`'s pipeline cell, reading the SAME
+   `_facts_extraction_readiness` verdict the trigger's own 409 carries as
+   `switch`). Rendered as the button's disabled reason, so a click can never
+   409 on a switch the page already knew about. */
+const FACTS_EXTRACTION_UNREADY_TEXT = {
+  "sharepoint.enabled":
+    "The SharePoint connector is disabled on this instance — set sharepoint.enabled: true in instance.yaml (or AGNES_SHAREPOINT_ENABLED) first.",
+  "extraction.facts.enabled":
+    "Fact extraction is off — turn on extraction.facts.enabled in /admin/server-config (the cost switch: this pass spends model tokens per document).",
+  "facts.enabled":
+    "The fact graph is off — turn on facts.enabled in /admin/server-config first.",
+};
+function _factsExtractionUnreadyText(switchKey) {
+  return FACTS_EXTRACTION_UNREADY_TEXT[switchKey] || "Fact extraction is not ready on this instance.";
 }
 
 /* Duplicate (doc_id, reason) pairs collapse into one row with a "2×" count
@@ -3259,6 +3297,51 @@ async function runSpExtraction(id) {
       resultEl.textContent = "✗ " + msg;
       showToast(msg, false);
     }
+  } catch (e) {
+    resultEl.className = "ds-conn-test-result show fail";
+    resultEl.textContent = "✗ Request failed";
+  }
+}
+
+/* "Extract facts now" — `POST .../connections/{id}/facts-extract` enqueues
+   the `sharepoint-facts-extraction` job (app/api/admin_sharepoint.py): the
+   fact graph over whatever this connection has ALREADY indexed, no crawl.
+   Its plan is incremental (indexed documents without up-to-date facts), so
+   repeating it is safe, and it never dedups against a crawl — the two run
+   side by side. Fire-and-forget from the card's point of view, same as
+   runSpExtraction: the visible result here is "queued" or a typed refusal
+   (a switch off, a pass already running), never the pass's own outcome —
+   that arrives through the status poll's `facts_job` line. */
+async function runSpFactsExtraction(id) {
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  setSourceOpen(id, true);
+  resultEl.className = "ds-conn-test-result show";
+  resultEl.textContent = "Queuing facts pass…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/facts-extract`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const body = await r.json().catch(() => ({}));
+    const detail = body && typeof body.detail === "object" ? body.detail : null;
+    if (r.ok) {
+      resultEl.className = "ds-conn-test-result show ok";
+      resultEl.textContent = `✓ Facts pass queued (job ${body.job_id}) — runs over documents indexed so far.`;
+      showToast("Facts pass queued.", true);
+    } else if (r.status === 409 && detail && detail.error === "facts_extraction_already_running") {
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = `✗ A facts pass is already running for this connection (job ${detail.job_id}).`;
+      showToast("A facts pass is already running.", false);
+    } else {
+      const msg = detailMessage(body, "failed to queue the facts pass");
+      resultEl.className = "ds-conn-test-result show fail";
+      resultEl.textContent = "✗ " + msg;
+      showToast(msg, false);
+    }
+    // The status poll owns the live "facts pass queued/running" line and
+    // the button's in-flight lock — ask it now rather than waiting for its
+    // next tick.
+    if (typeof _extTick === "function") _extTick();
   } catch (e) {
     resultEl.className = "ds-conn-test-result show fail";
     resultEl.textContent = "✗ Request failed";
@@ -5934,6 +6017,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); openSpWizardForConnection('${id}')">Manage scopes…</button>
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>
@@ -7621,6 +7705,19 @@ function _extRenderInAgnesButton(connId, status) {
     : "";
 }
 
+/* The standalone facts pass is a JOB (`sharepoint-facts-extraction`), not
+   a crawl run — it opens no `extraction_runs` row — so the status endpoint
+   carries it as `facts_job` off the job queue. One line in the Run row
+   while it is queued or running; nothing at all otherwise (`null` means
+   "no pass in flight", never a stale or guessed one). */
+function _extFactsJobLine(job) {
+  if (!job) return "";
+  const running = job.status === "running";
+  const since = running && job.started_at ? job.started_at : job.created_at;
+  const sinceText = since ? ` · since ${_extEsc(_extTime(since))}` : "";
+  return `<div class="ext-sub">${_extDot(running ? "running" : "idle")}facts pass <strong>${running ? "running" : "queued"}</strong> · job ${_extEsc(job.id)}${sinceText}</div>`;
+}
+
 function _extRunLine(run) {
   const bits = [];
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
@@ -7817,6 +7914,8 @@ function _extRunRowHtml(connId, st) {
     sub = `<div class="ext-sub">No extraction run has been recorded for this connection yet.</div>`;
   }
 
+  sub += _extFactsJobLine(status.facts_job);
+
   if (st.error) {
     sub += `<div class="ext-sub ext-danger"><span class="ext-stale">stale</span> couldn't refresh — last read ${_extEsc(_extTime(st.lastOk))}</div>`;
   }
@@ -7887,6 +7986,25 @@ function _extPanelHtml(tone, title, body, connId, retry) {
   </div>`;
 }
 
+/* "Extract facts now" mirrors `_extRenderInAgnesButton` above: never keep
+   offering the verb while a facts pass is already queued/running for this
+   connection (the server can only answer with `409
+   facts_extraction_already_running`), and never re-enable a button the
+   server gated off — `data-facts-ready` remembers the switch verdict, and
+   its server-rendered `title` (the reason) is left alone in that case. */
+function _extRenderFactsButton(connId, status) {
+  const btn = document.getElementById(`ext-facts-btn-${connId}`);
+  if (!btn) return;
+  const ready = btn.dataset.factsReady === "1";
+  const inFlight = !!(status && status.facts_job);
+  btn.disabled = !ready || inFlight;
+  if (inFlight) {
+    btn.title = "A facts pass is already queued or running for this connection — see the Run row above.";
+  } else if (ready) {
+    btn.title = "";
+  }
+}
+
 function _extRender(connId) {
   const block = document.getElementById(`ext-block-${connId}`);
   if (!block) return;
@@ -7903,6 +8021,7 @@ function _extRender(connId) {
     );
     _extRenderCrawlCell(connId, null);
     _extRenderInAgnesButton(connId, null);
+    _extRenderFactsButton(connId, null);
     return;
   }
 
@@ -7924,6 +8043,7 @@ function _extRender(connId) {
   block.innerHTML = _extRunRowHtml(connId, st);
   _extRenderCrawlCell(connId, st.data);
   _extRenderInAgnesButton(connId, st.data);
+  _extRenderFactsButton(connId, st.data);
 }
 
 async function _extFetchOne(connId) {
