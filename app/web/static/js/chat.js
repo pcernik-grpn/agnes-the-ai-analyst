@@ -240,7 +240,7 @@ function _resyncOpenSessionMeta() {
   if (!meta) return;
   if (meta.agent_id && !_currentAgentId) {
     _currentAgentId = meta.agent_id;
-    _syncAgentPicker();
+    _syncAgentIdentity();
   }
   if (meta.title && _sessionHasTurns) setThreadTitle(meta.title);
 }
@@ -1701,26 +1701,44 @@ function _syncSessionUrl(chatId) {
   }
 }
 
-// --- Composer agent picker ------------------------------------------------
+// --- Agents in the chat window --------------------------------------------
 // Which of the caller's agents a conversation runs AS. The runtime for this
 // has existed since the agent-as-API work (`POST /api/chat/sessions` takes an
 // `agent_slug`, and `chat_sessions.agent_id` has recorded the answer since
-// v101) — but the only door into it was the Chat button on an agent card, and
-// nothing in the chat window ever said who you were talking to.
+// v101). What was missing was never the plumbing — it was that the chat window
+// never SAID who you were talking to.
 //
-// An agent is bound at session CREATION: its scope, memory notebook, pinned
-// model and token budget are fixed for the life of the session. So this
-// control cannot re-target a conversation, and it does not pretend to —
-// choosing an agent starts a NEW session as that agent, and once a
-// conversation has turns the button goes disabled with a title that names the
-// way out. An EMPTY session is not a dead end though: picking a different
-// agent there just spawns another one, and `ChatManager.create_session`
-// already soft-archives the orphan (the same GC that keeps repeated "+ New
-// chat" clicks from littering the sidebar).
+// Two jobs, deliberately split, because a single control could not do both
+// honestly. An agent is bound at session CREATION: its scope, memory notebook,
+// pinned model and token budget are fixed for the life of the session, so
+// nothing can re-target a conversation in progress.
+//
+//   • CHOOSING  → #chat-agent-select, one small selector under the composer,
+//     empty state only. Picking starts a NEW session as that agent, which is
+//     the only thing that was ever possible. An empty session is not a dead
+//     end: starting another just spawns it, `newChat` releases the one being
+//     left, and `ChatManager.create_session` soft-archives the orphan (the
+//     same GC that keeps repeated "+ New chat" clicks from littering the
+//     sidebar).
+//   • SAYING WHO → the hero (#chat-agent-intro) before the first turn, and
+//     #chat-thread-agent for the life of the thread after it. Only for an
+//     agent the caller named; the default agent is the plain chat and carries
+//     no badge at all.
+//
+// Two shapes were tried and rejected before this one, and both failures are
+// worth keeping. A pill INSIDE the composer beside Send, labelled "Default":
+// it named the mechanism rather than an identity, and its position promised it
+// adjusted the message being composed when clicking it in fact abandoned that
+// session for a new one. Then a ROW OF CHIPS under the composer, one per
+// agent: right for three, wrong for fifteen — it grew with the list, wrapped
+// over the composer it was meant to sit under, and needed a cap and a "+11
+// more" link, which is a list apologising for being a list. A selector's
+// footprint does not depend on how many agents exist.
 
 /** Resolves when the /api/v1/agents fetch has settled (successfully or not).
  * `loadAndRenderHistory` awaits it before looking up an agent's greeting: the
- * `/chat?agent=<slug>` deep link and a picker click both open a session within
+ * `/chat?agent=<slug>` deep link and a pick from the selector both open a
+ * session within
  * the same tick as the fetch, and without this the greeting silently lost the
  * race about as often as it won it. */
 let _agentsLoaded = Promise.resolve();
@@ -1749,13 +1767,13 @@ let _sessionHasTurns = false;
  * exist: thread header, Copy transcript, composer pushed to the foot, and
  * the dashboard still sitting there underneath.
  *
- * The distinction the picker already drew is the right one everywhere — "has
- * this conversation started", not "does a session row exist" — so the header
- * is driven from here too, and a session with no turns keeps the empty-state
- * layout it had before the switch. */
+ * The distinction the agent code already drew is the right one everywhere —
+ * "has this conversation started", not "does a session row exist" — so the
+ * header is driven from here too, and a session with no turns keeps the
+ * empty-state layout it had before the switch. */
 function _markConversationStarted() {
   _sessionHasTurns = true;
-  _syncAgentPicker();
+  _syncAgentIdentity();
   const meta = _sessionsCache.find(s => s.id === currentChatId);
   setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
   // #1914: the moment a conversation has a turn is the moment it deserves a
@@ -1765,53 +1783,25 @@ function _markConversationStarted() {
   _syncSessionUrl(currentChatId);
 }
 
-/** The inverse: no turns, so the empty-state dashboard and the live picker,
- * and no thread chrome for a transcript that does not exist yet. */
+/** The inverse: no turns, so the empty-state dashboard and its selector, and
+ * no thread chrome for a transcript that does not exist yet. */
 function _markConversationNotStarted() {
   _sessionHasTurns = false;
-  _syncAgentPicker();
+  _syncAgentIdentity();
   setThreadTitle(null);
 }
 
-/** What to call an agent in the picker. The seeded default agent is named the
- * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
- * answer to "who am I talking to?" — show the instance brand there instead.
- * A default the owner has since RENAMED keeps its own name. */
-/** How long a name may be before the pill abbreviates it. Sized to the widest
- *  name that fits the 9rem cap at the button's weight without ellipsis. */
-const AGENT_LABEL_MAX = 14;
-
-/** The FULL name, for the menu, the in-conversation label and the title
- *  attribute — everywhere there is room to say it.
+/** The name to show for an agent. User-authored, so every caller writes it
+ *  with textContent.
  *
- *  The default agent is "Default", not the brand. It used to render as "Agnes",
- *  which read more naturally on its own but was the odd one out once the caller
- *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
- *  different kind of thing), and it disagreed with the /agents page, where the
- *  same row is called Default. One name per agent, everywhere. */
-function _agentLabel(a, brand) {
-  if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
+ *  The seeded default agent is literally named "Default", which answers "who
+ *  am I talking to?" with the mechanism rather than an identity. Nothing
+ *  displays it any more — the default agent IS the plain chat, and the plain
+ *  chat says nothing about agents at all — so this only ever has to name the
+ *  ones a person built and named themselves. */
+function _agentLabel(a) {
+  if (!a) return "";
   return a.name || "Untitled agent";
-}
-
-/** The label as the PILL shows it: initials once a name is long enough to crowd
- *  the composer ("Finance Proposals" → "FP").
- *
- *  Initials, not an ellipsis, so the pill's width is stable across agents rather
- *  than growing to the cap — the trade is that two names sharing initials look
- *  alike in the pill. The full name is always one hover (title) or one click
- *  (the menu, which ticks the current row) away, and the in-conversation label
- *  spells it out, so nothing depends on reading the pill alone.
- *
- *  Single long word has no initials to take, so it falls back to the CSS
- *  ellipsis rather than rendering one lonely letter. */
-function _agentPillLabel(name) {
-  const full = String(name || "").trim();
-  if (full.length <= AGENT_LABEL_MAX) return full;
-  const words = full.split(/\s+/).filter(Boolean);
-  if (words.length < 2) return full;
-  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1822,75 +1812,177 @@ function _defaultAgent() {
   return _agentsCache.find(a => a.is_default) || null;
 }
 
-/** Which of the two agent elements is showing, and what it says.
+/** The agent this conversation runs as, IF it is one worth announcing.
  *
- * Before the first turn there is a real choice, so the picker button shows.
- * After it there is not — the agent is fixed at session creation — so the
- * button is swapped for a plain label. A disabled button was the first
- * version of this and it was worse in two ways: it still announced itself as
- * a button to assistive tech, and it still looked like something to click.
- *
- * The button keeps its server-rendered brand text as the fallback name, so a
- * failed /api/v1/agents fetch degrades to today's behaviour rather than a
- * blank pill. */
-function _syncAgentPicker() {
-  const btn = $("chat-agent-btn");
-  if (!btn) return;
-  const btnLabel = $("chat-agent-btn-label");
-  const staticLabel = $("chat-agent-label");
-  if (!btn.dataset.fallbackLabel) {
-    btn.dataset.fallbackLabel = btnLabel ? btnLabel.textContent : "Agnes";
-  }
-  const agent = _agentById(_currentAgentId) || _defaultAgent();
-  const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  const pill = _agentPillLabel(name);
-  if (btnLabel) btnLabel.textContent = pill;
-  // When the pill abbreviates, the title is the only place the full name shows
-  // on hover — so say it there rather than repeating the generic instruction.
-  btn.title = pill === name
-    ? "Choose which agent to chat with"
-    : `${name} — choose which agent to chat with`;
-  btn.hidden = _sessionHasTurns;
-  if (staticLabel) {
-    staticLabel.textContent = name;
-    staticLabel.title = `This conversation runs as ${name} — start a new chat to switch agent`;
-    staticLabel.hidden = !_sessionHasTurns;
-  }
-  if (_sessionHasTurns) _closeAgentMenu();
+ * Null for the default agent and null when the list has not loaded — both mean
+ * "show nothing", and they mean it for the same reason: the unmarked state is
+ * the plain chat, so an unknown agent degrades into it rather than into a
+ * half-populated banner. */
+function _namedAgentForSession() {
+  const a = _agentById(_currentAgentId);
+  if (!a || a.is_default) return null;
+  return a;
 }
 
-function _closeAgentMenu() {
-  const btn = $("chat-agent-btn");
-  const menu = $("chat-agent-menu");
+/** Say WHO this conversation is with — in the hero before it starts, and in
+ * the thread header once it has.
+ *
+ * This replaced a pill in the composer, and the placement is the whole fix.
+ * Arriving through an agent's own front door (its Chat button, or a starter
+ * chip) used to look identical to arriving at the general chat: the only
+ * evidence was a small control that read as a settings switch, so people came
+ * through the door and never saw that they had. Now the agent's name is the
+ * heading, in the slot the generic heading was using — same size, same place,
+ * more specific claim — and it follows the conversation into the header.
+ *
+ * The default agent gets NOTHING, in either state. Badging the ordinary case
+ * is how a badge stops being read. */
+function _syncAgentIdentity() {
+  const agent = _namedAgentForSession();
+  const name = _agentLabel(agent);
+
+  // 1. The hero, before the first turn. The whole block swaps: `has-agent-intro`
+  //    hides the greeting/heading/lede that would otherwise be making a
+  //    competing claim about what this page is for (rule in chat.css).
+  const intro = $("chat-agent-intro");
+  const aside = $("chat-capabilities");
+  if (intro) {
+    const nameEl = $("chat-agent-intro-name");
+    const roleEl = $("chat-agent-intro-role");
+    if (agent) {
+      if (nameEl) nameEl.textContent = name;
+      if (roleEl) {
+        // The agent's own role line when its owner wrote one. The fallback is
+        // deliberately about the ARRANGEMENT rather than the agent — anything
+        // that guessed at what this particular agent does would be inventing a
+        // description its owner declined to write.
+        roleEl.textContent = agent.role
+          || "One of your agents, with its own knowledge and permissions.";
+        roleEl.hidden = false;
+      }
+    }
+    intro.hidden = !agent;
+    if (aside) aside.classList.toggle("has-agent-intro", !!agent);
+  }
+
+  // The suggested questions go with it. They are INSTANCE-level prompts —
+  // "Who can see what?", "What are we missing definitions for?" — computed
+  // from what this deployment holds and offered to everyone; under a heading
+  // that just said "You're chatting with Delivery Health" they read as that
+  // agent's suggestions, which is a claim nothing behind them supports. An
+  // agent has no suggestions of its own to put here yet (there is no authored
+  // field for them on `agents`), so the honest state is none rather than four
+  // wrong ones. The class rides `.cloud-chat-main` because #chat-suggested is
+  // the intro panel's SIBLING, not its child.
+  const main = document.querySelector(".cloud-chat-main");
+  if (main) main.classList.toggle("has-agent-intro", !!agent);
+
+  // 2. The thread header, for the life of the conversation. The agent is bound
+  //    at session creation and cannot be re-pointed, so this is a fact about
+  //    the thread, which is exactly what the header is for.
+  // The selector's button states the current agent, so it follows the identity
+  // rather than being painted only at boot.
+  _syncAgentSelect();
+
+  const chip = $("chat-thread-agent");
+  if (chip) {
+    chip.textContent = name;
+    chip.title = agent
+      ? `This conversation runs as ${name} — start a new chat to talk to someone else`
+      : "";
+    chip.hidden = !agent;
+  }
+}
+
+/** The caller's named agents, most recently talked to first.
+ *
+ * Ranked by their own last conversation with each — read off the sidebar
+ * cache, which already carries `agent_id` and `last_message_at` — then the
+ * ones they have never chatted with, in the order the API returned. With
+ * fifteen agents the panel scrolls, so what it puts at the top is the whole
+ * question, and "the ones you were just talking to" beats both alphabetical
+ * and creation order. */
+function _rankedNamedAgents() {
+  const named = _agentsCache.filter(a => !a.is_default && a.slug);
+  const lastSeen = new Map();
+  for (const sess of _sessionsCache) {
+    if (!sess.agent_id) continue;
+    const at = sess.last_message_at || sess.started_at || "";
+    const prev = lastSeen.get(sess.agent_id);
+    if (prev === undefined || at > prev) lastSeen.set(sess.agent_id, at);
+  }
+  return named.slice().sort((a, b) => {
+    const av = lastSeen.get(a.id);
+    const bv = lastSeen.get(b.id);
+    if (av && bv) return av < bv ? 1 : av > bv ? -1 : 0;
+    if (av) return -1;
+    if (bv) return 1;
+    return 0;  // neither has been chatted with: keep the API's own order
+  });
+}
+
+/** Above this many rows the panel grows a filter. Below it, a search box over
+ *  five names is furniture. */
+const AGENT_FILTER_THRESHOLD = 8;
+
+/** Every agent the selector offers: the default first, under the instance's
+ * own name, then the named ones by recency.
+ *
+ * The default entry does NOT depend on its row existing. That row is seeded
+ * lazily — on the owner's first session as the default — so a caller whose
+ * sessions have all been with named agents has none, and building the entry
+ * from the cache alone would drop the way back in exactly the state that needs
+ * it. A slugless entry falls through to `newChat()` with no agent, the same
+ * request "+ New chat" makes, which seeds the row on its way through. */
+function _agentSelectRows() {
+  const wrap = $("chat-agent-select");
+  const brand = (wrap && wrap.dataset.brand) || "Agnes";
+  const dflt = _defaultAgent() || {is_default: true, id: null, slug: null};
+  return [{...dflt, _label: brand}].concat(
+    _rankedNamedAgents().map(a => ({...a, _label: _agentLabel(a)}))
+  );
+}
+
+function _closeAgentSelect() {
+  const btn = $("chat-agent-select-btn");
+  const menu = $("chat-agent-select-menu");
   if (!btn || !menu) return;
   menu.hidden = true;
   btn.classList.remove("is-open");
   btn.setAttribute("aria-expanded", "false");
 }
 
-function _renderAgentMenu() {
-  const menu = $("chat-agent-menu");
-  if (!menu) return;
-  menu.innerHTML = "";
-  if (!_agentsCache.length) {
-    const note = document.createElement("li");
-    note.className = "cloud-chat-agent-menu-note";
-    // No "build one on the Agents page" instruction any more: the create row
-    // below IS that path, so the note only has to state the fact.
-    note.textContent = "No agents yet.";
-    menu.appendChild(note);
+/** Paint the panel. `filter` is the caller's typing, matched against name and
+ * role — the role is what makes a name findable to someone who named an agent
+ * for its subject rather than its job. */
+function _renderAgentSelectMenu(filter) {
+  const list = $("chat-agent-select-list");
+  if (!list) return;
+  const q = (filter || "").trim().toLowerCase();
+  const rows = _agentSelectRows().filter(a => {
+    if (!q) return true;
+    return `${a._label} ${a.role || ""}`.toLowerCase().includes(q);
+  });
+  const currentId = (_namedAgentForSession() || {}).id || null;
+  list.innerHTML = "";
+  if (!rows.length) {
+    const none = document.createElement("li");
+    none.className = "cloud-chat-agent-select-empty";
+    none.textContent = "No agent matches that.";
+    list.appendChild(none);
+    return;
   }
-  const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of (_agentsCache.length ? _agentsCache : [])) {
+  for (const a of rows) {
     const li = document.createElement("li");
-    li.className = "cloud-chat-agent-menu-item";
-    if (a.id === currentId) li.classList.add("is-current");
-    li.setAttribute("role", "menuitem");
+    li.className = "cloud-chat-agent-select-item";
+    li.setAttribute("role", "option");
     li.tabIndex = 0;
-    li.dataset.agentSlug = a.slug || "";
+    const isCurrent = a.is_default ? currentId === null : a.id === currentId;
+    li.setAttribute("aria-selected", isCurrent ? "true" : "false");
+    if (isCurrent) li.classList.add("is-current");
 
     const tick = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    tick.setAttribute("class", "cloud-chat-agent-menu-item-tick");
+    tick.setAttribute("class", "cloud-chat-agent-select-tick");
     tick.setAttribute("viewBox", "0 0 24 24");
     tick.setAttribute("fill", "none");
     tick.setAttribute("aria-hidden", "true");
@@ -1903,29 +1995,30 @@ function _renderAgentMenu() {
     tick.appendChild(path);
     li.appendChild(tick);
 
-    // textContent throughout — agent name/role are user-authored strings and
-    // this menu is rebuilt from the API on every open.
+    // textContent throughout — name and role are user-authored, and this panel
+    // is rebuilt from the API on every open.
     const text = document.createElement("span");
-    text.className = "cloud-chat-agent-menu-item-text";
+    text.className = "cloud-chat-agent-select-item-text";
     const name = document.createElement("span");
-    name.className = "cloud-chat-agent-menu-item-label";
-    const btnEl = $("chat-agent-btn");
-    name.textContent = _agentLabel(a, (btnEl && btnEl.dataset.fallbackLabel) || "Agnes");
+    name.className = "cloud-chat-agent-select-item-name";
+    name.textContent = a._label;
     text.appendChild(name);
-    const hint = a.role || (a.is_default ? "Your default agent" : "");
+    const hint = a.is_default
+      ? `The general chat — delegates to your other agents`
+      : (a.role || "");
     if (hint) {
-      const hintEl = document.createElement("span");
-      hintEl.className = "cloud-chat-agent-menu-item-hint";
-      hintEl.textContent = hint;
-      text.appendChild(hintEl);
+      const role = document.createElement("span");
+      role.className = "cloud-chat-agent-select-item-role";
+      role.textContent = hint;
+      text.appendChild(role);
     }
     li.appendChild(text);
 
     const choose = () => {
-      _closeAgentMenu();
-      if (!a.slug) return;
-      hideCapabilities();
-      newChat(a.slug).catch((err) => {
+      _closeAgentSelect();
+      // `undefined`, not `null`: newChat only sets `agent_slug` on a truthy
+      // value, and the slugless default entry must post the plain create.
+      newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
         if (window.appToast) {
           window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
@@ -1936,54 +2029,99 @@ function _renderAgentMenu() {
     li.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); choose(); }
     });
-    menu.appendChild(li);
+    list.appendChild(li);
   }
+}
 
-  /* …and one row that is not an agent: the way to make another.
-   *
-   * It belongs here because this menu is where the caller finds out their
-   * agents are not enough — you go looking for the one that answers this
-   * question, do not find it, and the next move should be in reach rather than
-   * back through the rail to /agents. Standard account-switcher shape: the set,
-   * then "add one".
-   *
-   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
-   * (agents.html strips the param and calls createAgent, so the server mints
-   * the row) — not a second way to create an agent, just a second door to the
-   * one that exists. An <a>, so it is a real link: middle-click and
-   * open-in-new-tab work, and it needs no JS to function.
-   *
-   * Separated from the list by a rule, because it is a different KIND of row:
-   * every item above it switches this conversation, this one leaves the page. */
-  const create = document.createElement("li");
-  create.className = "cloud-chat-agent-menu-create";
-  create.setAttribute("role", "none");
-  const link = document.createElement("a");
-  link.href = "/agents?new=1";
-  link.setAttribute("role", "menuitem");
-  link.className = "cloud-chat-agent-menu-create-link";
-  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
-  plus.setAttribute("viewBox", "0 0 24 24");
-  plus.setAttribute("fill", "none");
-  plus.setAttribute("aria-hidden", "true");
-  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  pp.setAttribute("d", "M12 5v14M5 12h14");
-  pp.setAttribute("stroke", "currentColor");
-  pp.setAttribute("stroke-width", "2");
-  pp.setAttribute("stroke-linecap", "round");
-  plus.appendChild(pp);
-  link.appendChild(plus);
-  const ctext = document.createElement("span");
-  ctext.textContent = "Create new agent";
-  link.appendChild(ctext);
-  create.appendChild(link);
-  menu.appendChild(create);
+/** The selector's own state: whether it shows at all, and what the button says.
+ *
+ * Hidden unless the caller has at least one agent they BUILT — a control whose
+ * only entry is the agent the composer already talks to cannot change
+ * anything, which is most instances on day one. */
+function _syncAgentSelect() {
+  const wrap = $("chat-agent-select");
+  const label = $("chat-agent-select-label");
+  if (!wrap || !label) return;
+  // Two or more agents, or no control. One entry is not a choice — and the one
+  // entry a caller with no agents of their own has is the default, which is
+  // what the composer directly above already talks to. Counted on the ROWS the
+  // panel would actually offer, so the rule reads the way it is stated rather
+  // than as a claim about a filtered list somewhere else.
+  wrap.hidden = _agentSelectRows().length < 2;
+  if (wrap.hidden) {
+    _closeAgentSelect();
+    return;
+  }
+  const brand = wrap.dataset.brand || "Agnes";
+  const current = _namedAgentForSession();
+  const name = current ? _agentLabel(current) : brand;
+  label.textContent = name;
+  const btn = $("chat-agent-select-btn");
+  if (btn) {
+    btn.title = current && current.role
+      ? `${current.role} — choose which agent to chat with`
+      : "Choose which agent to chat with";
+  }
+}
+
+/** Load the agent list, wire the selector, paint everything it feeds.
+ * Best-effort throughout: every failure path leaves the plain chat intact. */
+async function initAgentSelect() {
+  const btn = $("chat-agent-select-btn");
+  const menu = $("chat-agent-select-menu");
+  const filter = $("chat-agent-select-filter");
+  if (btn && menu) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!menu.hidden) { _closeAgentSelect(); return; }
+      // Paint from cache first so the panel opens with no delay, then reconcile
+      // against the API — the DEFAULT agent's row is seeded lazily, so a
+      // boot-time fetch on a fresh account can legitimately have missed it.
+      const rowCount = _agentSelectRows().length;
+      if (filter) {
+        filter.value = "";
+        filter.hidden = rowCount <= AGENT_FILTER_THRESHOLD;
+      }
+      _renderAgentSelectMenu("");
+      menu.hidden = false;
+      btn.classList.add("is-open");
+      btn.setAttribute("aria-expanded", "true");
+      // Flip above the button when the panel would run past the fold. Measured
+      // rather than assumed: the control's distance to the bottom of the window
+      // depends on the empty state's height, which varies with the greeting,
+      // the suggestions and whether this instance has any data registered.
+      menu.classList.remove("is-up");
+      const room = window.innerHeight - btn.getBoundingClientRect().bottom;
+      if (menu.getBoundingClientRect().height + 12 > room) {
+        menu.classList.add("is-up");
+      }
+      if (filter && !filter.hidden) filter.focus();
+      _refreshAgents().then(() => {
+        if (!menu.hidden) _renderAgentSelectMenu(filter ? filter.value : "");
+        _syncAgentSelect();
+      });
+    });
+    if (filter) {
+      filter.addEventListener("input", () => _renderAgentSelectMenu(filter.value));
+      filter.addEventListener("click", (e) => e.stopPropagation());
+    }
+    document.addEventListener("click", (e) => {
+      if (menu.hidden) return;
+      if (!menu.contains(e.target) && !btn.contains(e.target)) _closeAgentSelect();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !menu.hidden) { _closeAgentSelect(); btn.focus(); }
+    });
+  }
+  _agentsLoaded = _refreshAgents();
+  await _agentsLoaded;
+  _syncAgentSelect();
+  _syncAgentIdentity();
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
- * leaves the composer exactly as it is today — brand label, no menu — because
- * failing to enumerate agents must not block chatting with the default one. */
+ * leaves the page exactly as it is without agents — no selector, no identity
+ * banner — because failing to enumerate agents must not block chatting. */
 async function _refreshAgents() {
   try {
     // Re-pointed from this page's own now-deleted /api/agents (Task C1.2) —
@@ -1991,65 +2129,20 @@ async function _refreshAgents() {
     const res = await api("/api/v1/agents");
     // Ready agents only — a draft is unfinished by its author's own say-so,
     // and offering one here invites a conversation with something half-built.
-    // The picker is the "who am I talking to" control, not the agent index;
-    // /agents is where drafts belong, beside the thing that finishes them.
     //
-    // `status`/`is_default` survive the move: v1's `_serialize` starts from
-    // `dict(row)`, so both columns pass through unchanged.
-    //
-    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent
-    // is seeded `status: "ready"` and an older draft one is promoted on first
-    // touch (`AgentsRepository.get_or_create_default`), so it passes the
-    // status test on its own. This keeps it from being dropped in the window
-    // before that heal lands — a picker without the default is a one-way
-    // switch, the same dead end the on-open refresh exists to avoid.
+    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent is
+    // seeded `status: "ready"` and an older draft one is promoted on first
+    // touch (`AgentsRepository.get_or_create_default`); this keeps it in the
+    // cache in the window before that heal lands, so `_namedAgentForSession`
+    // can still recognise a default session as the unmarked case.
     _agentsCache = (res.data || []).filter(
       a => a.mine && a.slug && (a.status === "ready" || a.is_default)
     );
   } catch (err) {
-    console.warn("chat: could not load agents for the picker", err);
+    console.warn("chat: could not load agents", err);
   }
 }
 
-/** Fetch the agent list and wire the button. Best-effort: any failure leaves
- * the composer exactly as it is today (brand label, no menu), because being
- * unable to LIST agents must not block chatting with the default one. */
-async function initAgentPicker() {
-  const btn = $("chat-agent-btn");
-  const menu = $("chat-agent-menu");
-  if (!btn || !menu) return;
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (_sessionHasTurns) return;
-    if (menu.hidden) {
-      // Paint from cache first (no open-delay), then reconcile. The list goes
-      // stale in one ordinary way: the DEFAULT agent row is seeded lazily, on
-      // the owner's first session — so a boot-time fetch on a fresh account
-      // misses it, and without this refresh someone who switched to a named
-      // agent would have no way back to their default except "+ New chat".
-      _renderAgentMenu();
-      menu.hidden = false;
-      btn.classList.add("is-open");
-      btn.setAttribute("aria-expanded", "true");
-      _refreshAgents().then(() => {
-        if (!menu.hidden) _renderAgentMenu();
-        _syncAgentPicker();
-      });
-    } else {
-      _closeAgentMenu();
-    }
-  });
-  document.addEventListener("click", (e) => {
-    if (menu.hidden) return;
-    if (!menu.contains(e.target) && e.target !== btn) _closeAgentMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !menu.hidden) { _closeAgentMenu(); btn.focus(); }
-  });
-  _agentsLoaded = _refreshAgents();
-  await _agentsLoaded;
-  _syncAgentPicker();
-}
 
 async function newChat(agentSlug) {
   const body = { surface: "web" };
@@ -2299,8 +2392,8 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // Are we ATTACHING to a different conversation, or re-opening this one? Not
   // the same thing: submitUserMessage -> ensureWsReady re-enters openSession
   // for the CURRENT session whenever the socket is closed, so treating every
-  // open as a fresh conversation re-enabled the agent picker one tick after
-  // the first message disabled it.
+  // open as a fresh conversation re-showed the empty-state hero one tick
+  // after the first message replaced it.
   const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
@@ -2322,8 +2415,8 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // A titled session is necessarily one with turns (titles are derived from
   // the conversation), so it can raise its header right away, before history
   // hydrates. An UNTITLED one cannot be judged yet — it is equally a thread
-  // whose title never landed and a session created a moment ago by the agent
-  // picker — so the chrome waits for `loadAndRenderHistory` to say which.
+  // whose title never landed and a session created a moment ago by a starter
+  // chip — so the chrome waits for `loadAndRenderHistory` to say which.
   setThreadTitle(meta && meta.title ? meta.title : null);
   // Who this conversation runs as. Read from the sidebar row (agent_id is
   // projected by GET /api/chat/sessions) rather than a per-open round-trip;
@@ -2346,7 +2439,7 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // restoring it a fetch later is what made a deep link look like a new chat
   // (the address bar lost the id before anything had failed).
   if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);
-  _syncAgentPicker();
+  _syncAgentIdentity();
   if (!restoring) setStatus("");
 
   // Hydrate history. Show the capability/intro panel only when this
@@ -5923,8 +6016,8 @@ async function submitUserMessage(text) {
   hideCapabilities();
   // The conversation is now under way, so the agent is settled for good: a
   // session's scope/memory/model/budget are fixed at creation and cannot be
-  // re-pointed mid-thread. Disabling here rather than at session creation is
-  // what keeps an empty "+ New chat" from dead-ending the picker.
+  // re-pointed mid-thread. Marking it here rather than at session creation is
+  // what keeps an empty "+ New chat" showing its selector.
   _markConversationStarted();
   const ta = $("chat-input");
   if (ta) {
@@ -5951,7 +6044,7 @@ async function submitUserMessage(text) {
     // Re-asserted for exactly the reason hideCapabilities() is, one line up.
     // For a brand-new chat this submit created the session itself, so
     // openSession saw a session id it had never opened and reset the turns
-    // flag — flipping the settled agent label back into a live picker
+    // flag — flipping the settled thread chrome back into the empty-state hero
     // mid-send. The session is new; the conversation is not.
     _markConversationStarted();
   } catch (err) {
@@ -5969,10 +6062,9 @@ async function submitUserMessage(text) {
     // Same reasoning for what was attached: the turn never started, so the
     // screenshot belongs to the retry, not to the void.
     ChatAttachments.restore(pendingAttachments);
-    // The turn never started, so nothing is settled — hand the picker back
-    // with the dashboard. Otherwise a chat backend that is down strands the
-    // reader on a label they cannot change and a conversation that never
-    // began.
+    // The turn never started, so nothing is settled — hand the empty state
+    // back with the dashboard. Otherwise a chat backend that is down strands
+    // the reader in thread chrome for a conversation that never began.
     _markConversationNotStarted();
     return;
   }
@@ -6128,8 +6220,7 @@ function autosizeComposer() {
 }
 
 // The composer also changes height for reasons no keystroke reports — the
-// window resizing under a wrapped line, the agent picker or an attachment row
-// appearing. Observing the form covers all of them with one rule instead of a
+// window resizing under a wrapped line, or an attachment row appearing. Observing the form covers all of them with one rule instead of a
 // call site per cause; the polyfill-free fallback is the autosize path above,
 // which already covers typing.
 if (typeof ResizeObserver === "function") {
@@ -8308,12 +8399,13 @@ const ChatAttachments = (() => {
   wireSuggestionButtons();
   wireCopyTranscript();
   autosizeComposer();
-  // Composer agent picker. Not awaited: the fetch behind it must never delay
-  // the composer becoming usable, and it degrades to the brand label on
-  // failure. Called BEFORE the deep-link restore below so `_agentsLoaded` is
-  // the real fetch by the time the restore awaits it (an empty session's
-  // greeting is read from it) rather than the resolved placeholder.
-  initAgentPicker();
+  // The agent selector + the "who you are talking to" identity. Not awaited: the
+  // fetch behind it must never delay the composer becoming usable, and every
+  // failure path leaves the plain chat exactly as it is. Called BEFORE the
+  // deep-link restore below so `_agentsLoaded` is the real fetch by the time
+  // the restore awaits it (an empty session's greeting is read from it) rather
+  // than the resolved placeholder.
+  initAgentSelect();
   // #1973: a `?session=` deep link (which is also what a refresh of an open
   // conversation is) starts restoring HERE — before the sidebar fetch, before
   // the dashboard wiring — so the pre-conversation hero never shows for a
