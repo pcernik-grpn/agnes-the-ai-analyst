@@ -1373,3 +1373,50 @@ class TestSectionMetadataHasNoPhantomSections:
             f"SECTION_GROUPS lists sections the API no longer accepts: {phantom}. "
             "Remove them from admin_server_config.html together with the server-side section."
         )
+
+
+def test_a_masked_name_is_never_also_declared_unmaskable_elsewhere():
+    """`_is_secret_key` carves booleans and numbers out of masking by LEAF
+    name, matched globally rather than per section.
+
+    That is fine today — the only carve-out a secret pattern would otherwise
+    catch is `max_session_tokens`, which carries "token" by naming
+    coincidence. It stops being fine the moment two sections share a leaf
+    name where one is a declared number or boolean and the other holds a
+    credential: the credential is then unmasked everywhere, silently, because
+    of a declaration made somewhere else entirely.
+
+    Cheap to prevent, invisible to find afterwards — the value would simply
+    start appearing in `GET /server-config`, the audit diff and
+    `agnes admin config export`.
+    """
+    from app.api.admin import (
+        _KNOWN_FIELDS,
+        _declared_boolean_fields,
+        _declared_numeric_fields,
+    )
+
+    unmaskable = _declared_numeric_fields() | _declared_boolean_fields()
+
+    def walk(fields: dict):
+        for name, spec in fields.items():
+            yield name, spec.get("kind")
+            if spec.get("kind") == "object" and isinstance(spec.get("fields"), dict):
+                yield from walk(spec["fields"])
+
+    declared: dict = {}
+    for section, fields in _KNOWN_FIELDS.items():
+        for name, kind in walk(fields):
+            declared.setdefault(name, set()).add((section, kind))
+
+    conflicts = {
+        name: sorted(where)
+        for name, where in declared.items()
+        if name in unmaskable and any(kind not in ("int", "float", "bool") for _s, kind in where)
+    }
+    assert not conflicts, (
+        "these leaf names are declared as a number/boolean in one section and as "
+        "something else in another, so the numeric/boolean carve-out in "
+        f"_is_secret_key unmasks BOTH: {conflicts}. Rename one, or make the "
+        "carve-out section-aware."
+    )
