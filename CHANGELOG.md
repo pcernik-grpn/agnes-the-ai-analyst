@@ -16,6 +16,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- Marketplace pages (`/marketplace/flea/{id}`, `/marketplace/curated/…`, the guides) now send a signed-out browser to `/login?next=…` like every other HTML page instead of answering with a raw JSON 401 — a shared deep link to a plugin looked broken to anyone not yet signed in. The machine-facing `/marketplace/info` and `/marketplace/cowork/*.zip` keep the JSON 401.
+
 ### Removed
 
 ### Internal
