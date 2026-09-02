@@ -2201,6 +2201,13 @@
   /* The audience that is not a group. A left rule and the shared accent, so
      an everyone-scoped row reads as a different KIND of row before its text
      is read — the same treatment the mock uses for the Everyone audience. */
+  /* The one entry in the group list that is not a group. Same left rule as
+     the audience row in By resource, so "this is a scope, not a roster" is
+     the same visual statement in both views rather than two dialects. */
+  .ax-gs--scope > .ax-gs__hd{
+    border-left: 3px solid var(--ds-primary);
+    padding-left: 9px;
+  }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
@@ -3278,7 +3285,20 @@
       // The two numbers that make a group list scannable, in the order the
       // page reads: who it reaches, then how much it carries. "0 granted" is
       // said rather than omitted — an empty group is the thing worth seeing.
-      const meta = `${members} ${members === 1 ? "person" : "people"} · ${grants} granted`;
+      /* Everyone is not a group with a roster, and printing its member count
+         here made the same false claim the other two renderers made: that a
+         membership list decides this, and that someone leaving would change
+         it. It is a SCOPE — every account, and anyone who joins — so the
+         reach half of the line says that instead of counting it. The grant
+         half is unchanged, because how much it carries is exactly as worth
+         seeing here as it is for any other row.
+
+         `is_everyone` is already on the payload (`everyoneGroupId()` reads it
+         a few hundred lines up), so this needs nothing new from the server
+         and is right on both app-state backends. */
+      const meta = g.is_everyone
+        ? `every account · ${grants} granted`
+        : `${members} ${members === 1 ? "person" : "people"} · ${grants} granted`;
       /* The kebab is a SIBLING of the row button, positioned over its right
          edge — not a child. A <button> inside a <button> is invalid markup
          and the browser resolves it by breaking one of them; the wrapper
@@ -3292,7 +3312,7 @@
          carries origin, reach, and a count per family: enough to decide a
          group needs no opening. */
       return `
-      <details class="ax-gs" data-gs="${esc(g.id)}" ${open ? "open" : ""}>
+      <details class="ax-gs${g.is_everyone ? " ax-gs--scope" : ""}" data-gs="${esc(g.id)}" ${open ? "open" : ""}>
         <summary class="ax-gs__hd" title="${esc(g.description || label)}">
           <span class="ax-gs__car" aria-hidden="true">›</span>
           ${AgnesKindGlyph.groupTile()}

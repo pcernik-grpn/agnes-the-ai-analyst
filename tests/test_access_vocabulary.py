@@ -342,6 +342,23 @@ class TestAnEveryoneAudienceIsNotARoster:
         src = self._source()
         assert "every account, and anyone who joins" in src   # the audience row
         assert "everyone, and anyone who joins" in src        # the collapsed line
+        assert "`every account · ${grants} granted`" in src   # the By group row
+
+    def test_all_three_renderers_are_covered(self):
+        """Three renderers made the same claim, in three views.
+
+        By group listed Everyone with a member count, By resource's audience
+        row did the same, and By resource's collapsed line said it a third
+        time. Fixing one and not the others is the failure mode worth a test:
+        each was written at a different time and none of them knew about the
+        others.
+        """
+        src = self._source()
+        # By group branches on the flag already on the payload; the two in By
+        # resource branch on the server's `audience` field.
+        assert "g.is_everyone" in src
+        assert 'grant.audience === "everyone"' in src
+        assert '(g) => g.audience === "everyone"' in src
 
     def test_the_row_still_says_people_for_an_ordinary_group(self):
         """The fix must not cost the ordinary case its member count."""
