@@ -61,9 +61,11 @@ never a silently empty document.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -311,6 +313,26 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 
 # ---------------------------------------------------------------- legacy office
 
+#: Serializes soffice invocations within ONE process (see _convert_legacy_office).
+_LIBREOFFICE_LOCK = threading.Lock()
+#: pid → this process's own LibreOffice user profile directory. Keyed by pid,
+#: not cached once: a worker child forked after the parent's first conversion
+#: must not inherit (and race on) the parent's profile.
+_LIBREOFFICE_PROFILES: dict[int, str] = {}
+
+
+def _libreoffice_profile_dir() -> str:
+    """A LibreOffice ``UserInstallation`` directory private to this process,
+    created on first use and reused for every later conversion in the same
+    process (the first headless start on a fresh profile costs seconds; the
+    ones after it do not)."""
+    pid = os.getpid()
+    profile = _LIBREOFFICE_PROFILES.get(pid)
+    if profile is None or not os.path.isdir(profile):
+        profile = tempfile.mkdtemp(prefix=f"agnes-libreoffice-profile-{pid}-")
+        _LIBREOFFICE_PROFILES[pid] = profile
+    return profile
+
 
 def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
     """Legacy Office / OpenDocument formats markitdown cannot read directly.
@@ -335,21 +357,30 @@ def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
     tmpdir = tempfile.mkdtemp(prefix="agnes-libreoffice-")
     try:
         try:
-            completed = subprocess.run(
-                [
-                    "soffice",
-                    "--headless",
-                    "--norestore",
-                    "--convert-to",
-                    target_format,
-                    "--outdir",
-                    tmpdir,
-                    str(path),
-                ],
-                capture_output=True,
-                timeout=LIBREOFFICE_TIMEOUT_SECONDS,
-                check=False,
-            )
+            # One soffice at a time PER PROCESS, on a profile that is this
+            # process's own: LibreOffice keeps a lock in its user profile and
+            # a second headless instance on the same profile exits 1 (measured
+            # live: 3 of 6 concurrent conversions failed). The crawl's
+            # parallelism is across worker child processes, so a per-process
+            # profile + lock costs nothing there and makes an in-process
+            # caller (threads) serialize instead of fail.
+            with _LIBREOFFICE_LOCK:
+                completed = subprocess.run(
+                    [
+                        "soffice",
+                        f"-env:UserInstallation=file://{_libreoffice_profile_dir()}",
+                        "--headless",
+                        "--norestore",
+                        "--convert-to",
+                        target_format,
+                        "--outdir",
+                        tmpdir,
+                        str(path),
+                    ],
+                    capture_output=True,
+                    timeout=LIBREOFFICE_TIMEOUT_SECONDS,
+                    check=False,
+                )
         except subprocess.TimeoutExpired as exc:
             raise ConversionError(
                 filename,

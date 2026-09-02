@@ -702,3 +702,43 @@ def test_structure_pass_failure_raises_conversion_error(tmp_path, monkeypatch):
 
     assert excinfo.value.filename == "fallback.pdf"
     assert excinfo.value.engine == "pypdfium2"
+
+
+def test_legacy_office_runs_on_a_per_process_profile_and_serializes(tmp_path, monkeypatch):
+    """Two headless LibreOffice instances on the SAME user profile do not
+    coexist — the second exits 1 (measured live: 3 of 6 concurrent
+    conversions failed). Every soffice call must therefore carry a
+    ``-env:UserInstallation=`` pointing at a directory private to this
+    process, reused across calls (a fresh profile costs seconds on first
+    start), and calls within one process are serialized by a lock."""
+    import os
+
+    import connectors.sharepoint.convert as convert_module
+
+    monkeypatch.setattr(convert_module, "_LIBREOFFICE_PROFILES", {})
+    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f: "text")
+    calls = _stub_soffice(monkeypatch, convert_module)
+
+    for name in ("a.doc", "b.xls"):
+        path = tmp_path / name
+        path.write_bytes(b"legacy")
+        convert_to_markdown(path, "application/octet-stream")
+
+    profiles = []
+    for call in calls:
+        env = [a for a in call["argv"] if a.startswith("-env:UserInstallation=file://")]
+        assert len(env) == 1, call["argv"]
+        profiles.append(env[0].split("file://", 1)[1])
+    # same private profile for both calls of this process, and it exists
+    assert profiles[0] == profiles[1]
+    assert os.path.isdir(profiles[0])
+    assert str(os.getpid()) in profiles[0]
+    # the profile the calls used is exactly the one the helper hands out for
+    # this pid (module identity resolved through the function that ran, so a
+    # second import path of the same file cannot fool the check)
+    import sys
+
+    live = sys.modules[convert_to_markdown.__module__]
+    assert profiles[0] == live._libreoffice_profile_dir()
+    assert os.getpid() in live._LIBREOFFICE_PROFILES
+    assert live._LIBREOFFICE_LOCK is not None
