@@ -264,6 +264,14 @@ def show_collection(
     if not files:
         if q_clean:
             typer.echo(f"  (none matched --q {q_clean!r} — try a different term, or drop --q to see all files)")
+        elif page_offset and total:
+            # Paged past the end. "(none)" here would contradict the count on
+            # the line above and read as an empty collection, which is the
+            # expensive thing to misdiagnose (Devin Review on #2062).
+            typer.echo(
+                f"  (no files at --offset {page_offset} — the collection holds {total}; "
+                f"use --offset 0 to start over)"
+            )
         else:
             typer.echo("  (none)")
         return

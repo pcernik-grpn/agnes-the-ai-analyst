@@ -533,11 +533,18 @@ def register_foundation_tools(
 
         files = page.get("files", [])
         total = page.get("total", len(files))
+        # The offset the SERVER used, which is not always the one asked for —
+        # it clamps a negative or out-of-range value. Deriving `truncated`
+        # from the requested offset then miscounts what has been seen: a
+        # clamped -5 leaves `-5 + len(files)` below the true position, so the
+        # tool reports more pages than exist and a paginating agent walks off
+        # the end (Devin Review on #2062). Everything below reads this one.
+        effective_offset = page.get("offset", offset)
         detail["files"] = files
         detail["files_total"] = total
-        detail["files_truncated"] = total > (offset + len(files))
+        detail["files_truncated"] = total > (effective_offset + len(files))
         detail["files_limit"] = page.get("limit", limit)
-        detail["files_offset"] = page.get("offset", offset)
+        detail["files_offset"] = effective_offset
         return detail
 
     @tool(read_only=True)

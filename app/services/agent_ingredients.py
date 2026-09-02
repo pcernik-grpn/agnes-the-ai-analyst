@@ -95,21 +95,31 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
         # where each chat file-drop is its own one-file collection, that is the
         # common case rather than the pathological one. A corpus with no files
         # is simply absent from the mapping, hence the `.get(..., 0)`.
+        # `None` means "the count could not be read", which is NOT the same as
+        # zero. Swallowing the failure into an empty mapping labelled every
+        # reachable collection "0 files" — so one transient repository error
+        # made a populated Library look empty, and read as an access problem
+        # rather than a hiccup (Devin Review on #2062).
         try:
             file_counts = cf_repo.count_by_corpus()
-        except Exception:
-            file_counts = {}
+        except Exception as exc:  # noqa: BLE001 — a count is metadata, never the listing
+            logger.warning("agent ingredients: could not count collection files: %s", exc)
+            file_counts = None
         for col in file_corpora_repo().list_all():
             if allowed is not None and col["id"] not in allowed:
                 continue
-            fcount = file_counts.get(col["id"], 0)
+            fcount = None if file_counts is None else file_counts.get(col["id"], 0)
             sources.append(
                 {
                     "id": col["id"],
                     "kind": "file",
                     "name": col.get("name") or col.get("slug"),
                     "description": col.get("description") or "",
-                    "meta": f"{fcount} file{'' if fcount == 1 else 's'}",
+                    "meta": (
+                        "file count unavailable"
+                        if fcount is None
+                        else f"{fcount} file{'' if fcount == 1 else 's'}"
+                    ),
                 }
             )
     except Exception as e:

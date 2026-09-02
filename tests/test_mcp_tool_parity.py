@@ -10,6 +10,7 @@ transports now register from the shared `app.api.mcp.foundation_tools` module.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -505,3 +506,19 @@ def test_stdio_and_http_agree_on_shared_tool_behaviour():
             f"{name} declares different behaviour on stdio vs HTTP"
         )
         assert h.title == s.title, f"{name} is titled differently on stdio vs HTTP"
+
+
+def test_collection_get_derives_truncation_from_the_offset_the_server_used():
+    """The server clamps a negative or out-of-range offset; the response
+    echoes the one it actually used.
+
+    Deriving `files_truncated` from the REQUESTED offset then miscounts what
+    has been seen — a clamped `-5` leaves `-5 + len(files)` below the true
+    position, so the tool reports more pages than exist and a paginating
+    agent walks off the end (Devin Review on #2062)."""
+    src = Path("app/api/mcp/foundation_tools.py").read_text(encoding="utf-8")
+    block = src.split('detail["files_total"] = total', 1)[1].split("return detail", 1)[0]
+    assert "offset + len(files)" not in block.replace("effective_offset + len(files)", ""), (
+        "truncation must be derived from the offset the server used, not the one asked for"
+    )
+    assert "effective_offset" in block
