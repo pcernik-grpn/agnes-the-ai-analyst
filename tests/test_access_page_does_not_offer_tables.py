@@ -1,9 +1,15 @@
 """`/admin/access` stops offering `table`, and keeps the rows already written.
 
-Measured, not reasoned. The picker listed every registered table among 239
-grantable "knowledge" items, and one production group carried ~86 `table`
-grants, each rendered with the label *"reached through a package"*. An admin
-ticked those believing they granted data.
+Observed, not reasoned. The picker listed every registered table among 239
+grantable "knowledge" items, and a production group's own list showed page
+after page of `table` rows inherited from `Everyone`, each rendered with the
+label *"reached through a package"*. An admin ticked those believing they
+granted data.
+
+(An earlier version of this docstring said "~86 table grants". That number
+was inferred from a "86 via Everyone" badge, which counts inherited grants
+of EVERY type — the tables are a subset of it, and nobody has counted them.
+`scripts/audit_table_grants.py` reports the real figure.)
 
 They granted nothing. `src/rbac.py::can_access_table` resolves the caller's
 data packages, returns False outright if they have none, then intersects
@@ -16,7 +22,7 @@ do"; the screenshots reopened and reversed it. See
 `docs/superpowers/maps/access-who-can-see-what/issues/11-*`.
 
 The second test is the half that is easy to get wrong: only the OFFER goes.
-Hiding existing rows too would leave the ~86 already written invisible AND
+Hiding existing rows too would leave the ones already written invisible AND
 unremovable, which is worse than the crowding.
 """
 
@@ -68,7 +74,7 @@ def test_the_overview_projection_omits_tables_but_keeps_table_grants(monkeypatch
 
     `resources` drives the picker and must not contain tables. `grants` is
     every row in the table and must still contain an existing table grant —
-    that is what keeps the ~86 cleanable.
+    that is what keeps the existing ones cleanable.
     """
     import app.api.access as access_mod
 
@@ -139,6 +145,6 @@ def test_the_overview_projection_omits_tables_but_keeps_table_grants(monkeypatch
 
     grant_types = {g["resource_type"] for g in payload["grants"]}
     assert "table" in grant_types, (
-        "an existing table grant vanished from the payload — the ~86 rows already "
+        "an existing table grant vanished from the payload — the rows already "
         "written would be invisible and unremovable"
     )

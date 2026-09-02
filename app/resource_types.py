@@ -164,11 +164,12 @@ class ResourceTypeSpec:
             already exist — an existing row still renders and still
             revokes, so an admin can clean up what was written before.
 
-            False for ``table`` only, and measured rather than reasoned:
+            False for ``table`` only, and observed rather than reasoned:
             the picker offered every registered table among 239 grantable
-            "knowledge" items, and one production group had ~86 table
-            grants each labelled "reached through a package". Ticking one
-            grants no analyst access at all
+            "knowledge" items, and a production group's own list showed
+            page after page of table rows inherited from ``Everyone``, each
+            labelled "reached through a package". Ticking one grants no
+            analyst access at all
             (``src/rbac.py::can_access_table`` intersects the caller's
             data packages with the packages containing the table and never
             reads a table grant), so the picker was writing rows nothing
@@ -998,11 +999,12 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         id_format="<table_id>",
         list_blocks=_table_blocks,
         # Not offered on /admin/access. The picker listed every registered
-        # table among 239 grantable "knowledge" items and one production
-        # group had ~86 of these grants, each labelled "reached through a
-        # package" — rows an admin ticked believing they granted data, and
-        # which grant no analyst anything. Existing rows still render and
-        # still revoke, so the ones already written can be cleaned up.
+        # table among 239 grantable "knowledge" items, and a production
+        # group's list showed page after page of table rows inherited from
+        # `Everyone`, each labelled "reached through a package" — rows an
+        # admin ticked believing they granted data, and which grant no
+        # analyst anything. Existing rows still render and still revoke, so
+        # what was already written can be cleaned up.
         offered_on_access=False,
     ),
     ResourceType.DATA_PACKAGE: ResourceTypeSpec(

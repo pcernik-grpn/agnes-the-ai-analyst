@@ -341,13 +341,13 @@ async def access_overview(
     # make the UI re-derive an order the registry already knows.
     #
     # `offered_on_access=False` types are skipped entirely, which is what
-    # takes `table` out of the picker. Measured, not reasoned: the picker
+    # takes `table` out of the picker. Observed, not reasoned: the picker
     # listed every registered table among 239 grantable "knowledge" items,
-    # and one production group carried ~86 table grants each labelled
-    # "reached through a package" — rows an admin ticked believing they
-    # granted data. Ticking one grants no analyst access
-    # (`src/rbac.py::can_access_table` never reads a table grant), so the
-    # picker was writing rows nothing reads.
+    # and a production group's list showed page after page of table rows
+    # inherited from `Everyone`, each labelled "reached through a package" —
+    # rows an admin ticked believing they granted data. Ticking one grants
+    # no analyst access (`src/rbac.py::can_access_table` never reads a table
+    # grant), so the picker was writing rows nothing reads.
     #
     # Only the OFFER goes. `grants` above is untouched, so an existing table
     # row still renders and still revokes — otherwise the rows already
