@@ -2523,12 +2523,25 @@ class FactsPgRepository:
         still anchors its endpoints here exactly like any other edge.
 
         Edges are swept FIRST: an edge with zero claims of its own is
-        removed before the fact sweep runs. That ordering is what makes the
-        fact predicate cheap — by the time the fact DELETE runs, every
-        surviving edge carries >=1 claim (the edge sweep just removed every
-        one that didn't), so "zero incident edges carrying any claims"
-        collapses to "zero incident edges, period": ``NOT EXISTS (SELECT 1
-        FROM edges e WHERE e.src = f.id OR e.dst = f.id)``. Deleting an
+        removed before the fact sweep runs — with ONE exception.
+        ``possible_duplicate_of`` is claimless BY DESIGN: it is a proposal
+        about two facts, not an assertion a document made, and neither a
+        producer's own proposal nor an automatic candidate carries evidence.
+        Sweeping it as an orphan deleted every candidate in the same
+        ``ingest_batch`` that had just minted it, so the review queue never
+        received one and the feature produced nothing (Devin Review on
+        #2075). It is therefore excluded from the edge sweep, and — the half
+        that is easy to miss — from the fact sweep's "is anything incident"
+        test too: a claimless edge must not anchor an unevidenced fact, or a
+        proposal about two garbage-collected facts would keep both alive
+        forever. A candidate whose endpoint is swept dies with it through the
+        existing ``ON DELETE CASCADE`` on ``src``/``dst``.
+
+        With that exception the ordering argument still holds: by the time
+        the fact DELETE runs, every surviving edge either carries >=1 claim
+        or is a proposal that does not anchor anything, so "zero incident
+        edges carrying any claims" collapses to "zero incident edges that
+        are not proposals". Deleting an
         orphaned FACT afterwards can then cascade (``ON DELETE CASCADE``)
         any edge still pointing at it even if THAT edge carried its own
         claims — an edge to a subject this design has garbage-collected
@@ -2541,7 +2554,8 @@ class FactsPgRepository:
             edge_ids = (
                 conn.execute(
                     sa.text(
-                        "DELETE FROM edges e WHERE NOT EXISTS "
+                        "DELETE FROM edges e WHERE e.type <> 'possible_duplicate_of' "
+                        "AND NOT EXISTS "
                         "(SELECT 1 FROM claims c WHERE c.edge_id = e.id) RETURNING e.id"
                     )
                 )
@@ -2553,7 +2567,9 @@ class FactsPgRepository:
                     sa.text(
                         "DELETE FROM facts f WHERE NOT EXISTS "
                         "(SELECT 1 FROM claims c WHERE c.fact_id = f.id) "
-                        "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = f.id OR e.dst = f.id) "
+                        "AND NOT EXISTS (SELECT 1 FROM edges e "
+                        "WHERE (e.src = f.id OR e.dst = f.id) "
+                        "AND e.type <> 'possible_duplicate_of') "
                         "RETURNING f.id"
                     )
                 )
