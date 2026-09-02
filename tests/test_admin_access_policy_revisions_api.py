@@ -116,3 +116,42 @@ class TestDuckDbDegradesCleanly:
 
         r = c.delete(f"/api/admin/registry/{table_id}", headers=_auth(token))
         assert r.status_code == 204, r.text
+
+    def test_registering_a_table_still_works_with_no_revision_store_to_purge(self, seeded_app):
+        """finding 3 (PR #2023 review): `register_table`'s defense-in-depth
+        orphan purge degrades the same way the write hook and the
+        unregister-time purge do — a DuckDB instance (no revision store at
+        all) must still be able to register a brand-new table."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+
+        r = c.post(
+            "/api/admin/register-table",
+            json={"name": "rev_duckdb_register", "source_type": "keboola", "query_mode": "local"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+
+
+class TestUnregisterPurgeFailure:
+    def test_unregister_aborts_if_purge_fails_for_a_reason_other_than_missing_backend(self, seeded_app, monkeypatch):
+        """finding 3 (PR #2023 review): a genuine failure while purging a
+        table's access-policy revisions must abort the whole unregistration
+        cleanly -- never silently drop the registry row and leave the (now
+        unreachable-to-purge) old revisions sitting under an id a
+        re-registration of the same name would reuse."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        table_id = _register(c, token, name="rev_purge_fails")
+
+        class _BoomRepo:
+            def delete_for_table(self, table_id):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr("app.api.admin.access_policy_revisions_repo", lambda: _BoomRepo())
+
+        r = c.delete(f"/api/admin/registry/{table_id}", headers=_auth(token))
+        assert r.status_code != 204, r.text
+        assert r.status_code >= 400, r.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get(table_id) is not None, "registry row must survive a failed purge"

@@ -336,3 +336,38 @@ def test_unregistering_a_table_drops_its_revisions(tmp_path, monkeypatch, pg_eng
     reborn = _register(c, token, name="rev_purge", server_only=True)
     assert reborn == table_id
     assert _revisions(c, token, reborn)["count"] == 0
+
+
+def test_registering_a_table_purges_any_orphaned_revisions_at_its_reused_id(tmp_path, monkeypatch, pg_engine):
+    """finding 3 (PR #2023 review): defense in depth. Even if a revision
+    somehow survived under a table id that is no longer registered (the
+    unregister-time purge above is the primary defense; this is the
+    second one), `register_table` must not let a brand-new table at that
+    reused id offer the leftover revision as its own restorable history."""
+    c, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    table_id = _register(c, token, name="rev_defense_in_depth", server_only=True)
+    _put(
+        c,
+        token,
+        table_id,
+        {"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "original owner"},
+    )
+    assert c.delete(f"/api/admin/registry/{table_id}", headers=_auth(token)).status_code == 204
+
+    # Simulate a revision that leaked past the unregister-time purge (a
+    # write racing the DELETE, a bug in a future refactor, debris from
+    # before this fix shipped, ...) -- straight through the repo, bypassing
+    # the HTTP layer entirely so this test is independent of *how* the
+    # orphan got there.
+    from src.repositories import access_policy_revisions_repo
+
+    access_policy_revisions_repo().record(
+        table_id=table_id,
+        policy_sql=f"SELECT * FROM {table_id} WHERE leaked = true",
+        policy_note="orphaned revision",
+        saved_by="old-admin@example.com",
+    )
+
+    reborn = _register(c, token, name="rev_defense_in_depth", server_only=True)
+    assert reborn == table_id
+    assert _revisions(c, token, reborn)["count"] == 0

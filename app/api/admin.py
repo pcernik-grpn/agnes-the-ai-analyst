@@ -5426,6 +5426,39 @@ def register_table(
         connection_id=request.connection_id,
     )
 
+    # #1979 (PR #2023 review, finding 3) — defense in depth. Table ids are
+    # derived from names (see `table_id` above), so a table unregistered and
+    # then re-registered under the same name reuses the same id. The
+    # unregister path already purges `access_policy_revisions` for that id
+    # up front (before dropping the registry row), but this row is
+    # confirmed brand-new here (the 409 check above proved no registry row
+    # existed for `table_id`) regardless of how it got here — so any
+    # revision still sitting under this id is, by construction, an orphan
+    # from before this registration and must not be offered as this table's
+    # restorable history. `RequiresPostgresBackend` is the one exception
+    # swallowed (the frozen DuckDB backend has no store); anything else is
+    # logged, not load-bearing — a purge failure here must not block a
+    # registration that already committed.
+    try:
+        _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
+        if _orphaned:
+            logger.warning(
+                "register_table: purged %d orphaned access-policy revision(s) "
+                "for reused table id %s",
+                _orphaned,
+                table_id,
+            )
+    except RequiresPostgresBackend:
+        pass
+    except Exception as e:
+        logger.warning(
+            "Could not purge pre-existing access-policy revisions for newly "
+            "registered table %s: %s -- if any are orphaned from a previous "
+            "table at this id, they may still be reachable",
+            table_id,
+            e,
+        )
+
     # Audit entry — masked params; description kept raw (it's documentation).
     audit_repo().log(
         user_id=user.get("id"),
@@ -7981,27 +8014,36 @@ async def unregister_table(
     source_type = existing.get("source_type") or ""
     name = existing.get("name") or table_id
 
-    cascade = repo.unregister(table_id)
-
-    # #1979 — the table's access-policy revision bodies go with it. Table
-    # ids are derived from names, so re-registering the same name yields the
-    # same id; without this purge a brand-new table would inherit (and offer
-    # for restore) the policy SQL of the one that used to live at that id.
-    # PG-only store, and never load-bearing: a DuckDB instance has none, and
-    # a failure here must not strand a DELETE whose registry row is already
-    # gone.
+    # #1979 (PR #2023 review, finding 3) — purge the table's access-policy
+    # revision bodies BEFORE dropping the registry row, not after. Table ids
+    # are derived from names, so re-registering the same name yields the same
+    # id; without this purge-first ordering, a Postgres failure here after the
+    # registry row was already deleted would leave the old revisions orphaned
+    # but reachable the moment an identically named table is registered again
+    # (its policy history would show the PREVIOUS table's bodies). Purging
+    # first means a genuine failure aborts the whole unregistration cleanly
+    # instead of orphaning. Still PG-only and still not load-bearing in that
+    # narrow sense: `RequiresPostgresBackend` (the frozen DuckDB backend has no
+    # store to purge at all) is the ONE exception this swallows — everything
+    # else denies the unregistration rather than risk stranding history.
     try:
         access_policy_revisions_repo().delete_for_table(table_id)
     except RequiresPostgresBackend:
         pass
     except Exception as e:
-        logger.warning(
-            "Could not drop access-policy revisions for unregistered table %s: %s "
-            "-- the registry row is still gone; the orphaned revisions are only "
-            "reachable again if an identically named table is registered",
+        logger.error(
+            "Could not drop access-policy revisions for table %s before "
+            "unregistering it -- aborting the unregistration rather than risk "
+            "orphaning them: %s",
             table_id,
             e,
         )
+        raise HTTPException(
+            status_code=500,
+            detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+        )
+
+    cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the
