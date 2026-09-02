@@ -2014,6 +2014,106 @@ def _batch_is_expired_by_age(submitted_at: Optional[str]) -> bool:
     return age_s > BATCH_RESULT_RETENTION_DAYS * 86400
 
 
+def _load_work_for_file(
+    file_id: str, *, files_repo: Any, sources_repo: Any, max_doc_chars: int
+) -> Optional[Tuple["_Work", bool]]:
+    """Re-derive one document's ``_Work`` FRESH from the database at
+    collection time, rather than caching what :func:`_plan_documents` built
+    at submission time — a batch's result may be collected in a LATER pass
+    (a different process invocation entirely), so nothing about the
+    document can be assumed to have survived in memory. Returns ``(work,
+    was_truncated)``, or ``None`` when the document itself is gone (deleted
+    between submission and collection — rare, but a batch's ~hour-to-24h
+    round trip makes it possible).
+    """
+    file_row = files_repo.get(file_id)
+    if not file_row:
+        return None
+    mapping = sources_repo.get(file_id) or {}
+    doc_id = mapping.get("source_doc_id")
+    if not doc_id:
+        return None
+    doc_id = str(doc_id)
+    collection_id = str(file_row.get("corpus_id") or "")
+    path = file_row.get("path")
+    filename = file_row.get("filename")
+    sha256 = str(file_row.get("sha256") or "")
+    chunk_texts, text = _document_text(file_id)
+    truncated = False
+    if len(text) > max_doc_chars:
+        text = text[:max_doc_chars]
+        truncated = True
+    metadata = {"doc_id": doc_id, "name": filename, "path": path, "collection_id": collection_id}
+    work = _Work(
+        file_id=file_id,
+        doc_id=doc_id,
+        collection_id=collection_id,
+        filename=filename,
+        path=path,
+        sha256=sha256,
+        mapping=mapping,
+        chunk_texts=chunk_texts,
+        user_message=build_user_message(metadata, text),
+    )
+    return work, truncated
+
+
+def _requeue_or_fail(
+    file_id: str,
+    *,
+    reason: str,
+    permanent: bool,
+    docs_state: Dict[str, Any],
+    batch_attempts: Dict[str, int],
+    report: "_Report",
+) -> None:
+    """One document's batch attempt did not produce a usable reply.
+
+    ``permanent`` (an ``invalid_request`` error) fails it outright — no
+    resubmission fixes a request the API itself rejected as malformed.
+    Everything else (errored/canceled/expired/a missing result row) is
+    transient and gets bounded resubmission — the same "attempts accumulate
+    across runs, reset only by success" shape
+    ``connectors.sharepoint.crawler._note_retry`` already applies to a
+    failed download, applied here to :data:`MAX_BATCH_REQUEUE_ATTEMPTS`.
+    The attempt counter lives in ``batch_attempts`` (kept apart from
+    ``docs_state``, which is CLEARED on a transient requeue so
+    :func:`_plan_documents` re-derives and resubmits the document next
+    pass) and is only dropped on success or permanent failure.
+    """
+    if permanent:
+        docs_state[file_id] = {"status": "failed", "reason": reason, "at": _now_iso()}
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        logger.warning("facts extraction: document %s permanently failed (%s) — not retried", file_id, reason)
+        return
+    attempts = int(batch_attempts.get(file_id, 0)) + 1
+    batch_attempts[file_id] = attempts
+    docs_state.pop(file_id, None)
+    if attempts >= MAX_BATCH_REQUEUE_ATTEMPTS:
+        docs_state[file_id] = {
+            "status": "failed",
+            "reason": f"{reason} (gave up after {attempts} batch attempts)",
+            "at": _now_iso(),
+        }
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        logger.warning(
+            "facts extraction: giving up on document %s after %d failed batch attempts (%s)",
+            file_id,
+            attempts,
+            reason,
+        )
+    else:
+        logger.info(
+            "facts extraction: document %s requeued for batch retry (%s, attempt %d/%d)",
+            file_id,
+            reason,
+            attempts,
+            MAX_BATCH_REQUEUE_ATTEMPTS,
+        )
+
+
 def _ingest_identity() -> Any:
     """The identity claims from this pass are attributed to.
 

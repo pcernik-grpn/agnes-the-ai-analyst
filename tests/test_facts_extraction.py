@@ -795,6 +795,59 @@ def test_collect_batch_results_keys_by_custom_id_in_any_order():
 
 
 # ---------------------------------------------------------------------------
+# Cross-pass requeue — bounded attempts, same shape as the crawler's own
+# per-item retry counter.
+# ---------------------------------------------------------------------------
+
+
+def test_requeue_clears_the_state_entry_so_the_next_pass_replans_it():
+    docs_state = {"cf_1": {"status": "batch-submitted", "batch_id": "b1"}}
+    batch_attempts: dict = {}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1",
+        reason="errored: overloaded_error",
+        permanent=False,
+        docs_state=docs_state,
+        batch_attempts=batch_attempts,
+        report=report,
+    )
+    assert "cf_1" not in docs_state
+    assert batch_attempts["cf_1"] == 1
+    assert report.facts_failed == 0
+
+
+def test_requeue_gives_up_after_the_attempt_ceiling():
+    docs_state: dict = {}
+    batch_attempts = {"cf_1": fe.MAX_BATCH_REQUEUE_ATTEMPTS - 1}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1", reason="expired", permanent=False, docs_state=docs_state, batch_attempts=batch_attempts, report=report
+    )
+    assert docs_state["cf_1"]["status"] == "failed"
+    assert "cf_1" not in batch_attempts
+    assert report.facts_failed == 1
+
+
+def test_requeue_permanent_fails_immediately_without_consuming_an_attempt():
+    docs_state: dict = {}
+    batch_attempts: dict = {}
+    report = fe._Report()
+    fe._requeue_or_fail(
+        "cf_1",
+        reason="invalid_request: bad model",
+        permanent=True,
+        docs_state=docs_state,
+        batch_attempts=batch_attempts,
+        report=report,
+    )
+    assert docs_state["cf_1"]["status"] == "failed"
+    assert docs_state["cf_1"]["reason"] == "invalid_request: bad model"
+    assert "cf_1" not in batch_attempts
+    assert report.facts_failed == 1
+
+
+# ---------------------------------------------------------------------------
 # Failure posture
 # ---------------------------------------------------------------------------
 
