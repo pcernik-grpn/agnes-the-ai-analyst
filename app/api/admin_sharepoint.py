@@ -1757,9 +1757,7 @@ async def clone_connection(
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
 
-    cloned_config = {
-        k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS
-    }
+    cloned_config = {k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS}
 
     new_id = str(uuid4())
     repo.create(
@@ -1902,6 +1900,17 @@ class ExtractionRunOptions(BaseModel):
             "the LLM pass over every document — a materially more expensive run than a "
             "plain trigger or `resync`. Never written to the state file up front: an "
             "interrupted run leaves the connection exactly as resumable as before."
+        ),
+    )
+    retry_failed: Optional[bool] = Field(
+        None,
+        description=(
+            "Give every item this connection's own failure queue already knows about one "
+            "more chance — including ones already given up on after repeated failures — "
+            "without a full `resync`. The cheap, targeted recovery for a handful of "
+            "permanently-stuck documents (a conversion crash, a transient download error) "
+            "that a plain trigger alone would never re-offer. This run's ordinary "
+            "incremental delta walk still runs afterward, unaffected."
         ),
     )
 
@@ -2102,10 +2111,15 @@ async def trigger_extraction(
     ingested (see ``connectors.sharepoint.crawler._apply_resync``), and
     ``force_reprocess``, the stronger "re-process everything" control that
     additionally ignores cTags so already-unchanged documents are
-    re-downloaded and re-ingested too — never persisted beyond this one run.
+    re-downloaded and re-ingested too, and ``retry_failed``, the targeted
+    alternative to ``resync`` that gives every item this connection's own
+    failure queue already knows about — including ones already given up on
+    — one more chance (see
+    ``connectors.sharepoint.crawler._retry_failed_items``'s
+    ``include_given_up``) — never persisted beyond this one run.
 
     Every option here is per-run, not a setting: an absent key falls back to
-    whatever is currently configured (or, for the two booleans, to "off"),
+    whatever is currently configured (or, for the three booleans, to "off"),
     and nothing in this endpoint ever writes an option's value anywhere an
     admin could re-read it as the new default.
 
@@ -2145,6 +2159,8 @@ async def trigger_extraction(
             payload["resync"] = True
         if options.force_reprocess:
             payload["force_reprocess"] = True
+        if options.retry_failed:
+            payload["retry_failed"] = True
 
     job = jobs_repo().enqueue(
         "corpus-extraction",

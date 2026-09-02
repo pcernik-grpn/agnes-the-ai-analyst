@@ -320,6 +320,13 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         "http_429": live.get("http_429"),
         "throttle_wait_s": live.get("throttle_wait_s"),
         "errors": live.get("errors"),
+        # A file no conversion backend even attempts (video/audio with no
+        # usable codec path, Power BI, OneNote, ...) — never an error, so it
+        # is a separate counter (`CrawlStats.skipped_unsupported`), not
+        # folded into `errors` above. The itemized list rides only in
+        # `report.skipped_items` (the full-report endpoint), same as
+        # `failed_items`/`errors_detail`.
+        "skipped_unsupported": live.get("skipped_unsupported"),
         # `extraction.crawl.min_modified` age filter — see `CrawlStats.
         # filtered_by_age`/`age_unknown`. `live` already picks `report` (a
         # finished run) or `progress` (a running one), so this reads the
@@ -1023,6 +1030,16 @@ async def extraction_run_detail(
     top-level key or column because it is exactly as itemizable as the rest
     of a run's numbers, never a separate concern — the source card's
     error-count line fetches this endpoint on first expand to render it.
+
+    ``report.failed_items`` (convert-stage failures — ``convert_failed`` /
+    ``convert_empty``, each with ``item_id``/``drive_id`` alongside ``path``,
+    ``reason_type`` and a truncated ``reason``, capped at 5000 with
+    ``report.failed_items_truncated``) is the operator-facing list an
+    admin-requested ``retry_failed`` run works from and reads to see WHICH
+    documents are missing from the corpus — never the raw ``path`` for an
+    anonymize-marked scope's item. ``report.skipped_items`` /
+    ``report.skipped_unsupported`` is the same shape for a file no
+    conversion backend even attempts (never counted an error).
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo

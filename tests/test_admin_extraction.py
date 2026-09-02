@@ -419,6 +419,22 @@ class TestRunProjection:
         out = _run_out({"id": "er_1", "status": "done", "checkpoint_at": stamp, "report": {}})
         assert out["checkpoint_at"] == stamp
 
+    def test_run_out_surfaces_skipped_unsupported_never_folded_into_errors(self):
+        """A file no conversion backend even attempts is a separate counter
+        from `errors` — the fleet view and the source card must be able to
+        show BOTH without one masking the other."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"errors": 3, "skipped_unsupported": 7},
+            }
+        )
+        assert out["errors"] == 3
+        assert out["skipped_unsupported"] == 7
+
     def test_usage_empty_dict_survives_the_projection(self):
         from app.api.admin_extraction import _run_out
 

@@ -24,6 +24,7 @@ from connectors.sharepoint.convert import (
     ConversionError,
     ConvertResult,
     MissingConversionDependency,
+    UnsupportedConversionFormat,
     convert_to_markdown,
 )
 
@@ -590,6 +591,25 @@ def test_missing_file_raises_conversion_error(tmp_path):
         convert_to_markdown(tmp_path / "gone.docx", "application/octet-stream")
 
     assert excinfo.value.filename == "gone.docx"
+
+
+@pytest.mark.parametrize("suffix", [".pbix", ".one"])
+def test_a_format_with_no_registered_backend_raises_unsupported_not_a_plain_conversion_error(tmp_path, suffix):
+    # Power BI (.pbix) and OneNote (.one): no markitdown converter's
+    # `accepts()` matches these at all (verified empirically — see
+    # `UnsupportedConversionFormat`'s docstring), so markitdown raises its
+    # own `UnsupportedFormatException` before any backend is even tried.
+    # Random bytes, not a crafted file: the point is that NOTHING attempts
+    # this format, regardless of content.
+    path = tmp_path / f"deck{suffix}"
+    path.write_bytes(bytes((i * 37) % 256 for i in range(2048)))
+
+    with pytest.raises(UnsupportedConversionFormat) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    assert isinstance(excinfo.value, ConversionError)
+    assert excinfo.value.filename == f"deck{suffix}"
+    assert excinfo.value.engine == "markitdown"
 
 
 def test_a_directory_is_not_convertible(tmp_path):

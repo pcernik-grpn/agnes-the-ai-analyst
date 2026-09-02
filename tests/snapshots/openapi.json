@@ -4597,6 +4597,18 @@
             "description": "Drop this connection's persisted deltaLinks and item-failure queue before running, so every drive re-enumerates from scratch (already-ingested files are not re-downloaded \u2014 cTags are kept). The supported recovery path for a connection whose delta cursor ran past documents it never actually ingested.",
             "title": "Resync"
           },
+          "retry_failed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Give every item this connection's own failure queue already knows about one more chance \u2014 including ones already given up on after repeated failures \u2014 without a full `resync`. The cheap, targeted recovery for a handful of permanently-stuck documents (a conversion crash, a transient download error) that a plain trigger alone would never re-offer. This run's ordinary incremental delta walk still runs afterward, unaffected.",
+            "title": "Retry Failed"
+          },
           "timeout_s": {
             "anyOf": [
               {
@@ -13810,7 +13822,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.95.0"
+    "version": "0.96.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -32181,7 +32193,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extract": {
       "post": {
-        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested (see ``connectors.sharepoint.crawler._apply_resync``), and\n``force_reprocess``, the stronger \"re-process everything\" control that\nadditionally ignores cTags so already-unchanged documents are\nre-downloaded and re-ingested too \u2014 never persisted beyond this one run.\n\nEvery option here is per-run, not a setting: an absent key falls back to\nwhatever is currently configured (or, for the two booleans, to \"off\"),\nand nothing in this endpoint ever writes an option's value anywhere an\nadmin could re-read it as the new default.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
+        "description": "Admin-triggered one-off extraction run for this connection\n(TCRD-226) \u2014 enqueues the existing ``corpus-extraction`` job kind\n(``app/worker/kinds.py::_run_corpus_extraction``) with\n``{\"connection_id\": connection_id}``, the exact payload shape that\nhandler documents. An optional :class:`ExtractionRunOptions` body adds\nthe handler's per-run overrides (``concurrency``, ``timeout_s``) for\nTHIS run only \u2014 configured values stay untouched \u2014 plus ``resync``, the\nsupported alternative to hand-editing the crawl state file on the data\ndisk when a connection's delta cursor ran past documents it never\ningested (see ``connectors.sharepoint.crawler._apply_resync``), and\n``force_reprocess``, the stronger \"re-process everything\" control that\nadditionally ignores cTags so already-unchanged documents are\nre-downloaded and re-ingested too, and ``retry_failed``, the targeted\nalternative to ``resync`` that gives every item this connection's own\nfailure queue already knows about \u2014 including ones already given up on\n\u2014 one more chance (see\n``connectors.sharepoint.crawler._retry_failed_items``'s\n``include_given_up``) \u2014 never persisted beyond this one run.\n\nEvery option here is per-run, not a setting: an absent key falls back to\nwhatever is currently configured (or, for the three booleans, to \"off\"),\nand nothing in this endpoint ever writes an option's value anywhere an\nadmin could re-read it as the new default.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work.\nThen refuses cleanly (never a job that fails 30 minutes later in a\nworker) when the feature isn't usable: ``409 extraction_disabled``\n(``sharepoint.enabled`` is false) or ``409\nextraction_dependencies_missing`` (the ``extraction`` optional\ndependency extra is not installed) \u2014 see :func:`_extraction_readiness`.\n\nDeduped on the STABLE per-connection idempotency key\n(:func:`_extraction_idempotency_key`) also used by the scheduled sweep\nbelow, so a manual trigger and a scheduled run can never both be in\nflight for the same connection. ``enqueue()``'s own ``\"deduped\"``\nreturn value (not a pre-check peek \u2014 see ``app/api/sync.py::\ntrigger_sync``'s docstring for why a peek races a concurrent call)\ndecides 202 vs. ``409 extraction_already_running``.",
         "operationId": "trigger_extraction_api_admin_sharepoint_connections__connection_id__extract_post",
         "parameters": [
           {
@@ -32545,7 +32557,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}": {
       "get": {
-        "description": "A3 \u2014 one run's stored report, usage and capped skip list.\n\nThe skip list carries ``listed`` alongside ``total``: only oversize\nskips keep a path, so a run that refused 27 documents and can name 20 of\nthem says exactly that instead of implying the list is the whole story.\n\nThe per-file error detail (download/convert/ingest failures \u2014 a path, a\nreason, an upstream status code when known, and a message) lives at\n``report.errors_detail``, same ``{items, total, listed, truncated}``\nenvelope. It rides inside ``report`` rather than getting its own\ntop-level key or column because it is exactly as itemizable as the rest\nof a run's numbers, never a separate concern \u2014 the source card's\nerror-count line fetches this endpoint on first expand to render it.",
+        "description": "A3 \u2014 one run's stored report, usage and capped skip list.\n\nThe skip list carries ``listed`` alongside ``total``: only oversize\nskips keep a path, so a run that refused 27 documents and can name 20 of\nthem says exactly that instead of implying the list is the whole story.\n\nThe per-file error detail (download/convert/ingest failures \u2014 a path, a\nreason, an upstream status code when known, and a message) lives at\n``report.errors_detail``, same ``{items, total, listed, truncated}``\nenvelope. It rides inside ``report`` rather than getting its own\ntop-level key or column because it is exactly as itemizable as the rest\nof a run's numbers, never a separate concern \u2014 the source card's\nerror-count line fetches this endpoint on first expand to render it.\n\n``report.failed_items`` (convert-stage failures \u2014 ``convert_failed`` /\n``convert_empty``, each with ``item_id``/``drive_id`` alongside ``path``,\n``reason_type`` and a truncated ``reason``, capped at 5000 with\n``report.failed_items_truncated``) is the operator-facing list an\nadmin-requested ``retry_failed`` run works from and reads to see WHICH\ndocuments are missing from the corpus \u2014 never the raw ``path`` for an\nanonymize-marked scope's item. ``report.skipped_items`` /\n``report.skipped_unsupported`` is the same shape for a file no\nconversion backend even attempts (never counted an error).",
         "operationId": "extraction_run_detail_api_admin_sharepoint_connections__connection_id__extraction_runs__run_id__get",
         "parameters": [
           {

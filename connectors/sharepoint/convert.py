@@ -39,7 +39,11 @@ malformed input — is raised as :class:`ConversionError`, which names the file.
 A missing optional dependency raises :class:`MissingConversionDependency` (a
 subclass, so a caller that only catches ``ConversionError`` still survives) and
 names the extra to install; the imports are lazy so importing this module on a
-server that never converts anything costs nothing and cannot fail.
+server that never converts anything costs nothing and cannot fail. A file no
+registered markitdown converter even attempts (Power BI ``.pbix``, OneNote
+``.one``, and other formats with no backend at all) raises
+:class:`UnsupportedConversionFormat` — also a subclass, but the caller counts
+it apart from an attempted-and-failed conversion (see that class's docstring).
 
 The PDF route is :mod:`connectors.sharepoint.pdf_structure` and nothing else
 (owner decision 2026-08-31 — one pipeline, no dual modes). It reconstructs
@@ -159,6 +163,22 @@ class ConversionError(RuntimeError):
         self.filename = filename
         self.engine = engine
         super().__init__(f"{filename}: {message}")
+
+
+class UnsupportedConversionFormat(ConversionError):
+    """No conversion backend recognizes this file at all.
+
+    Distinct from the base :class:`ConversionError` (a backend WAS found and
+    attempted, and failed on this specific document's content): this is
+    markitdown reporting that no registered converter's ``accepts()`` matched
+    the file — video/audio containers markitdown genuinely has no codec path
+    for, Power BI ``.pbix``, OneNote ``.one``, and similar formats with no
+    backend at all (verified empirically per format, never assumed from a
+    suffix list — see ``markitdown.UnsupportedFormatException``, the signal
+    this wraps). The crawler counts these separately (``skipped_unsupported``,
+    never ``errors``/``convert_failed``): the document was never attempted,
+    so there is nothing to retry and nothing to diagnose.
+    """
 
 
 class MissingConversionDependency(ConversionError):
@@ -312,6 +332,7 @@ def _convert_markitdown(path: Path, filename: str) -> str:
     """
     try:
         from markitdown import MarkItDown
+        from markitdown import UnsupportedFormatException as _MarkItDownUnsupported
     except Exception as exc:
         # Broader than ImportError on purpose: a live finding showed a
         # MemoryError from deep inside numpy/OpenBLAS init (this import's
@@ -323,11 +344,24 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 
     try:
         result = MarkItDown(enable_plugins=False).convert(str(path))
+    except _MarkItDownUnsupported as exc:
+        # No registered converter's `accepts()` matched this file AT ALL —
+        # markitdown never attempted a conversion, as opposed to every other
+        # branch below (a backend was found and it failed). See
+        # `UnsupportedConversionFormat`'s docstring for why the crawler
+        # counts this differently. Never document content: markitdown's own
+        # message here names no file bytes, only "no suitable converter".
+        raise UnsupportedConversionFormat(
+            filename,
+            "no conversion backend recognizes this file type",
+            engine=ENGINE_MARKITDOWN,
+        ) from exc
     except Exception as exc:
         # markitdown surfaces backend failures as many different exception
-        # types (its own UnsupportedFormatException, zipfile.BadZipFile,
-        # XML parse errors, ...). A crawl cannot enumerate them, and any of
-        # them means the same thing: this document did not convert.
+        # types (its own FileConversionException, zipfile.BadZipFile, XML
+        # parse errors, ...). A crawl cannot enumerate them, and any of them
+        # means the same thing: a backend was found and this document did
+        # not convert.
         raise ConversionError(
             filename,
             f"markitdown could not convert this file ({type(exc).__name__})",
@@ -531,6 +565,7 @@ __all__ = [
     "ConversionError",
     "ConvertResult",
     "MissingConversionDependency",
+    "UnsupportedConversionFormat",
     "convert_to_markdown",
     "DEFAULT_MAX_CHARS",
     "PAGE_BREAK",
