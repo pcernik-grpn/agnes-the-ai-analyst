@@ -89,7 +89,12 @@ x-gcp-logging: &gcp-logging
     fluentd-retry-wait: "1s"
     # Keep reconnecting for the life of the container — an agent restart
     # must not permanently detach a long-running service from logging.
-    fluentd-max-retries: "4294967295"
+    # int32 max, not uint32 max: dockerd parses this option as a 32-bit int
+    # and refuses 4294967295 with "invalid fluentd-max-retries: value out of
+    # range" — which fails EVERY container create under this overlay (seen
+    # live on Docker 29.7: the first recreate after the overlay armed). At
+    # 1 s retry-wait, 2^31-1 retries is still ~68 years of reconnecting.
+    fluentd-max-retries: "2147483647"
     fluentd-sub-second-precision: "true"
     # Keeps services distinguishable in the Logs Explorer, the same job
     # `jsonPayload.container.name` did under the gcplogs driver.
