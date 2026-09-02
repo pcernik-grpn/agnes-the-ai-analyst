@@ -130,6 +130,22 @@ on its own, with its own wall-clock budget
 (`--doc-id` narrows it to one document, e.g. to test a prompt change
 cheaply; `--timeout-s` overrides the budget for that one run).
 
+## Watching several connections at once
+
+Running crawl + facts over more than one connection (several tenants, or
+several scopes split into separate connections) is one screen:
+`/admin/extraction` — one row per connection with its phase, files
+done/seen, a derived files/min, the facts pass's own done/pending counts,
+token spend and estimated cost, and how old its last checkpoint is (flagged
+once it passes 10 minutes on a run still marked running — "stuck?", not an
+outcome, just a prompt to go look). Defaults to connections with a run
+active right now (`?active=1`); `?all=1` broadens to every connection, idle
+ones included. `agnes admin sharepoint runs [--all] [--json] [--watch]` is
+the same view from a terminal — `--watch` refreshes every 10s, for an
+operator watching an overnight run over SSH with no browser open. Both read
+`GET /api/admin/sharepoint/extraction/runs`, PG-only like the rest of run
+observability (see the troubleshooting row below).
+
 ## Troubleshooting quick table
 
 | Symptom | Meaning | Fix |

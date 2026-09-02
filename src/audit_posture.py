@@ -792,6 +792,12 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "sharepoint_connection.extraction_config_read"
     ),
+    # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
+    # is active) — one row per connection of the SAME run counters A1
+    # already exempts, plus a derived rate and a derived "stuck" flag. Same
+    # noise class as A1: nothing here is document content, a secret, or
+    # another user's data.
+    "GET /api/admin/sharepoint/extraction/runs": "exempt:noise",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
@@ -1197,6 +1203,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/data-sources": "exempt:ui_support",
     "GET /admin/database": "exempt:ui_support",
     "GET /admin/datasource-credentials": "exempt:ui_support",
+    # The SharePoint extraction fleet dashboard shell (2026-09-02) — the
+    # table itself is fetched client-side from the already-exempt
+    # `GET /api/admin/sharepoint/extraction/runs` above.
+    "GET /admin/extraction": "exempt:ui_support",
     "GET /admin/grants": "exempt:ui_support",
     "GET /admin/groups": "exempt:ui_support",
     "GET /admin/groups/{group_id}": "exempt:ui_support",

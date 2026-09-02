@@ -252,6 +252,36 @@ class ExtractionRunsPgRepository:
             )
         return _decode_row(dict(row)) if row else None
 
+    def list_latest_for_connections(
+        self, connection_ids: List[str], *, running_only: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """One row per connection id — its NEWEST run — keyed by
+        ``connection_id``. A connection with no run at all (or, when
+        ``running_only``, no CURRENTLY running run) is simply absent from
+        the returned mapping rather than represented with a placeholder —
+        the caller (the fleet dashboard) already walks its own connection
+        list and treats a missing key as "idle"/"never run".
+
+        ``running_only`` narrows to ``status = 'running'`` rows only — the
+        fleet view's default "what is on pace right now" scope, as opposed
+        to its ``?all=1`` mode which wants the last run regardless of
+        outcome. One query for the whole fleet (``DISTINCT ON``, Postgres-
+        specific — this table has no DuckDB sibling) rather than one round
+        trip per connection, so an operator's 8-connection dashboard costs
+        the same as a 1-connection one.
+        """
+        if not connection_ids:
+            return {}
+        sql = "SELECT DISTINCT ON (connection_id) * FROM extraction_runs WHERE connection_id = ANY(:ids)"
+        params: Dict[str, Any] = {"ids": list(connection_ids)}
+        if running_only:
+            sql += " AND status = :running"
+            params["running"] = RUNNING
+        sql += " ORDER BY connection_id, started_at DESC"
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return {str(r["connection_id"]): _decode_row(dict(r)) for r in rows}
+
     def abandon_stale_running(self, connection_id: str) -> List[str]:
         """Close out every ``running`` row for this connection — call this
         right before opening a NEW one (see ``_RunRecorder.start``).
