@@ -1622,6 +1622,63 @@ def test_data_table_wrap_disables_sticky_thead() -> None:
     )
 
 
+# ── Every admin table that ends in verbs pins that column ────────────────
+# An off-screen DESTINATION is recoverable — scroll back to it, or read the
+# header you scrolled past. An off-screen ACTION is simply unavailable, and
+# it is always the last column, so it is always what a cut table takes
+# first. Every admin table whose final column holds the row's verbs
+# therefore carries `.data-table--pinned-actions`; the class does nothing
+# until the table is actually cut, so pinning one that always fits costs
+# nothing and stops a narrow window from hiding the verb.
+_LAST_TH_RE = re.compile(r"<table\b([^>]*)>(.*?)</thead>", re.DOTALL)
+_TH_RE = re.compile(r"<th[^>]*>(.*?)</th>", re.DOTALL)
+_STRIP_RE = re.compile(r"<[^>]+>|\s+")
+
+
+def test_every_admin_table_ending_in_verbs_pins_that_column() -> None:
+    offenders: list[str] = []
+    for path in sorted(TEMPLATES.glob("admin_*.html")) + [TEMPLATES / "data_apps.html"]:
+        src = path.read_text(encoding="utf-8")
+        for m in _LAST_TH_RE.finditer(src):
+            heads = _TH_RE.findall(m.group(2))
+            if not heads:
+                continue
+            last = _STRIP_RE.sub(" ", heads[-1]).strip().lower()
+            # "Open" is data_apps' verb; the blank header on /admin/chat and
+            # /admin/initial-workspace labels a control column too, but a
+            # blank string is also what a checkbox or a chevron column uses,
+            # so only the named ones are enforced here.
+            if last not in ("actions", "action", "open"):
+                continue
+            if "data-table--pinned-actions" not in m.group(1):
+                offenders.append(f"{path.name}: last column {last!r} is not pinned")
+    assert not offenders, (
+        "an admin table ends in the row's verbs without "
+        "`data-table--pinned-actions`, so a narrow window hides the one thing "
+        "scrolling cannot recover:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_a_fixed_layout_admin_table_has_a_width_floor() -> None:
+    """`table-layout: fixed` divides whatever width it is given, so without a
+    floor a narrow window does not scroll — it CRUSHES. Measured on
+    /admin/users at 900px before this: "DATA ACCESS" overlapping "LAST
+    PULL", "DEACTIVATED" cut mid-word, and no scrollbar anywhere because
+    nothing technically overflowed. A floor turns that back into a scroll,
+    which the wrap and the pinned column are built for."""
+    for name, selector in (
+        ("admin_users.html", "#users-table"),
+        ("admin_tables.html", "#adminTablesFlat"),
+        ("admin_data_packages.html", ".adp-table"),
+    ):
+        src = (TEMPLATES / name).read_text(encoding="utf-8")
+        block = src[src.index(selector + " { table-layout: fixed") :][:120]
+        assert "min-width" in block, (
+            f"{name}: {selector} is `table-layout: fixed` with no min-width — a "
+            "narrow window will crush its columns instead of scrolling"
+        )
+
+
 # ── The edge cue: a cut table has to SAY it is cut ───────────────────────
 # The scrollbar the rules above paint sits under the LAST ROW, so on a
 # twelve-row table it is hundreds of pixels below the reader's eye and on a
