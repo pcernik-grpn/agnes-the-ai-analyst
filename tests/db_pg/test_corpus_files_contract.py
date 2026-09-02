@@ -6,6 +6,7 @@ both backends; the same return shapes must come back.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -524,3 +525,289 @@ def test_count_by_corpus_groups_every_corpus_in_one_read(repo):
 
 def test_count_by_corpus_is_empty_when_there_are_no_files(repo):
     assert repo.count_by_corpus() == {}
+
+
+# ---------------------------------------------------------------------------
+# list_for_corpus / count_for_corpus — pagination + search (contract §1)
+# ---------------------------------------------------------------------------
+
+
+def _set_created_at(repo, file_id, ts: datetime) -> None:
+    """Force a row's ``created_at`` directly, bypassing the DB default, so
+    ordering/pagination tests are deterministic instead of racing the clock."""
+    if hasattr(repo, "conn"):
+        # DuckDB's TIMESTAMP column is naive.
+        naive = ts.replace(tzinfo=None) if ts.tzinfo is not None else ts
+        repo.conn.execute("UPDATE corpus_files SET created_at = ? WHERE id = ?", [naive, file_id])
+    else:
+        with repo._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE corpus_files SET created_at = :ts WHERE id = :id"),
+                {"ts": ts, "id": file_id},
+            )
+
+
+def _seed_ordered(repo, n, corpus_id=CORPUS_ID, prefix="seed"):
+    """Insert ``n`` files with strictly increasing ``created_at`` and return
+    their ids oldest -> newest."""
+    ids = []
+    base = datetime.now(timezone.utc)
+    for i in range(n):
+        fid = repo.add(
+            corpus_id=corpus_id,
+            filename=f"{prefix}{i}.txt",
+            sha256=f"{prefix}-sha{i}",
+            file_type=None,
+            size_bytes=None,
+            storage_path=None,
+        )
+        _set_created_at(repo, fid, base + timedelta(seconds=i))
+        ids.append(fid)
+    return ids
+
+
+def test_list_for_corpus_default_call_is_backward_compatible(repo):
+    """14 existing callers depend on the bare ``list_for_corpus(corpus_id)``
+    call returning every row ordered by ``created_at`` ascending."""
+    ids = _seed_ordered(repo, 3)
+    rows = repo.list_for_corpus(CORPUS_ID)
+    assert [r["id"] for r in rows] == ids
+
+
+def test_list_for_corpus_limit_offset_paging(repo):
+    ids = _seed_ordered(repo, 5)
+    page1 = repo.list_for_corpus(CORPUS_ID, limit=2, offset=0)
+    page2 = repo.list_for_corpus(CORPUS_ID, limit=2, offset=2)
+    page3 = repo.list_for_corpus(CORPUS_ID, limit=2, offset=4)
+    assert [r["id"] for r in page1] == ids[0:2]
+    assert [r["id"] for r in page2] == ids[2:4]
+    assert [r["id"] for r in page3] == ids[4:5]
+
+
+def test_list_for_corpus_limit_none_means_no_limit(repo):
+    ids = _seed_ordered(repo, 4)
+    rows = repo.list_for_corpus(CORPUS_ID, limit=None)
+    assert [r["id"] for r in rows] == ids
+
+
+def test_list_for_corpus_stable_tiebreak_pages_through_identical_created_at(repo):
+    """The single most important test here: files uploaded in one batch share
+    a ``created_at``. Without an ``id`` tie-break, paging at limit=1 repeats
+    or skips rows instead of covering the set exactly once."""
+    ts = datetime.now(timezone.utc)
+    ids = []
+    for i in range(4):
+        fid = repo.add(
+            corpus_id=CORPUS_ID,
+            filename=f"batch{i}.txt",
+            sha256=f"batch-sha{i}",
+            file_type=None,
+            size_bytes=None,
+            storage_path=None,
+        )
+        _set_created_at(repo, fid, ts)
+        ids.append(fid)
+
+    seen = []
+    for offset in range(4):
+        page = repo.list_for_corpus(CORPUS_ID, limit=1, offset=offset)
+        assert len(page) == 1
+        seen.append(page[0]["id"])
+
+    # Every row appears exactly once across the pages — no repeats, no skips.
+    assert sorted(seen) == sorted(ids)
+    assert len(set(seen)) == 4
+    # The tie-break is ``id ASC``, so the page sequence is fully determined.
+    assert seen == sorted(ids)
+    # One shot with a real LIMIT agrees with the paged walk.
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, limit=4)] == sorted(ids)
+
+
+def test_list_for_corpus_order_oldest_is_default(repo):
+    ids = _seed_ordered(repo, 3)
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, order="oldest")] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID)] == ids
+
+
+def test_list_for_corpus_order_newest(repo):
+    ids = _seed_ordered(repo, 3)
+    rows = repo.list_for_corpus(CORPUS_ID, order="newest")
+    assert [r["id"] for r in rows] == list(reversed(ids))
+
+
+def test_list_for_corpus_order_name(repo):
+    id_b = repo.add(
+        corpus_id=CORPUS_ID, filename="Banana.txt", sha256="s1", file_type=None, size_bytes=None, storage_path=None
+    )
+    id_a = repo.add(
+        corpus_id=CORPUS_ID, filename="apple.txt", sha256="s2", file_type=None, size_bytes=None, storage_path=None
+    )
+    id_c = repo.add(
+        corpus_id=CORPUS_ID, filename="Cherry.txt", sha256="s3", file_type=None, size_bytes=None, storage_path=None
+    )
+    rows = repo.list_for_corpus(CORPUS_ID, order="name")
+    # Case-insensitive: apple < Banana < Cherry.
+    assert [r["id"] for r in rows] == [id_a, id_b, id_c]
+
+
+def test_list_for_corpus_order_size_nulls_last(repo):
+    id_big = repo.add(
+        corpus_id=CORPUS_ID, filename="big.bin", sha256="s1", file_type=None, size_bytes=300, storage_path=None
+    )
+    id_small = repo.add(
+        corpus_id=CORPUS_ID, filename="small.bin", sha256="s2", file_type=None, size_bytes=100, storage_path=None
+    )
+    id_null = repo.add(
+        corpus_id=CORPUS_ID, filename="unknown.bin", sha256="s3", file_type=None, size_bytes=None, storage_path=None
+    )
+    rows = repo.list_for_corpus(CORPUS_ID, order="size")
+    assert [r["id"] for r in rows] == [id_big, id_small, id_null]
+
+
+def test_list_for_corpus_unknown_order_falls_back_to_oldest(repo):
+    """An unknown ``order`` value never raises and never reaches SQL as text —
+    it must be mapped through a literal dict, so even a string shaped like an
+    injection attempt just falls back to the default ordering."""
+    ids = _seed_ordered(repo, 3)
+    rows = repo.list_for_corpus(CORPUS_ID, order="not-a-real-order; DROP TABLE corpus_files;--")
+    assert [r["id"] for r in rows] == ids
+
+
+def test_list_for_corpus_q_matches_filename_substring(repo):
+    hit = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="quarterly_report_final.pdf",
+        sha256="s1",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+    )
+    miss = repo.add(
+        corpus_id=CORPUS_ID, filename="notes.txt", sha256="s2", file_type=None, size_bytes=None, storage_path=None
+    )
+    rows = repo.list_for_corpus(CORPUS_ID, q="report")
+    ids = {r["id"] for r in rows}
+    assert hit in ids
+    assert miss not in ids
+    # Case-insensitive.
+    rows_upper = repo.list_for_corpus(CORPUS_ID, q="REPORT")
+    assert hit in {r["id"] for r in rows_upper}
+
+
+def test_list_for_corpus_q_matches_path_substring(repo):
+    hit = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="x.md",
+        sha256="s1",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+        path="apis/storage-api.md",
+    )
+    miss = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="y.md",
+        sha256="s2",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+        path="notes/misc.md",
+    )
+    rows = repo.list_for_corpus(CORPUS_ID, q="storage-api")
+    ids = {r["id"] for r in rows}
+    assert hit in ids
+    assert miss not in ids
+
+
+def test_list_for_corpus_q_escapes_like_metacharacters(repo):
+    """``q`` is untrusted: a literal ``%``/``_`` in the search term must match
+    literally rather than acting as a SQL wildcard."""
+    literal = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="report_v2.pdf",
+        sha256="s1",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+    )
+    decoy = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="reportXv2.pdf",
+        sha256="s2",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+    )
+    rows = repo.list_for_corpus(CORPUS_ID, q="report_v2")
+    ids = {r["id"] for r in rows}
+    assert literal in ids
+    assert decoy not in ids
+
+    percent_literal = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="100%done.txt",
+        sha256="s3",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+    )
+    percent_decoy = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="100Xdone.txt",
+        sha256="s4",
+        file_type=None,
+        size_bytes=None,
+        storage_path=None,
+    )
+    rows_pct = repo.list_for_corpus(CORPUS_ID, q="100%done")
+    ids_pct = {r["id"] for r in rows_pct}
+    assert percent_literal in ids_pct
+    assert percent_decoy not in ids_pct
+
+
+def test_list_for_corpus_blank_q_and_status_mean_no_filter(repo):
+    """A prior bug of exactly this shape narrowed a search to nothing on a
+    blank input — blank must behave identically to ``None``, never "match
+    nothing"."""
+    ids = _seed_ordered(repo, 3)
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, q=None)] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, q="")] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, q="   ")] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, status=None)] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, status="")] == ids
+    assert [r["id"] for r in repo.list_for_corpus(CORPUS_ID, status="   ")] == ids
+
+
+def test_list_for_corpus_status_exact_match(repo):
+    a = repo.add(corpus_id=CORPUS_ID, filename="a.pdf", sha256="s1", file_type=None, size_bytes=None, storage_path=None)
+    b = repo.add(corpus_id=CORPUS_ID, filename="b.pdf", sha256="s2", file_type=None, size_bytes=None, storage_path=None)
+    repo.set_status(a, status="indexed")
+    repo.set_status(b, status="needs_review")
+    rows = repo.list_for_corpus(CORPUS_ID, status="indexed")
+    assert [r["id"] for r in rows] == [a]
+
+
+def test_count_for_corpus_matches_list_length_under_filters(repo):
+    ids = _seed_ordered(repo, 5, prefix="batch")
+    repo.set_status(ids[0], status="indexed")
+    repo.set_status(ids[1], status="indexed")
+
+    assert repo.count_for_corpus(CORPUS_ID) == 5
+    assert repo.count_for_corpus(CORPUS_ID) == len(repo.list_for_corpus(CORPUS_ID))
+
+    assert repo.count_for_corpus(CORPUS_ID, status="indexed") == 2
+    assert repo.count_for_corpus(CORPUS_ID, status="indexed") == len(repo.list_for_corpus(CORPUS_ID, status="indexed"))
+
+    assert repo.count_for_corpus(CORPUS_ID, q="batch") == 5
+    assert repo.count_for_corpus(CORPUS_ID, q="batch") == len(repo.list_for_corpus(CORPUS_ID, q="batch"))
+
+    assert repo.count_for_corpus(CORPUS_ID, q="batch", status="indexed") == 2
+    assert repo.count_for_corpus(CORPUS_ID, q="batch", status="indexed") == len(
+        repo.list_for_corpus(CORPUS_ID, q="batch", status="indexed")
+    )
+
+
+def test_count_for_corpus_zero_when_no_match(repo):
+    _seed_ordered(repo, 2)
+    assert repo.count_for_corpus(CORPUS_ID, q="no-such-substring-anywhere") == 0
+    assert repo.count_for_corpus("col_nonexistent") == 0

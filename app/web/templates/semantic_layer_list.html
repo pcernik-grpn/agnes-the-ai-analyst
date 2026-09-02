@@ -547,7 +547,7 @@
         <nav class="sl-cat-nav" aria-label="Glossary sources">
           <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
             <span>All</span>
-            <span class="sl-cat-n">{{ glossary_count }}</span>
+            <span class="sl-cat-n">{{ glossary_count_label }}</span>
           </button>
           {% for cat in glossary_categories %}
           <button type="button" class="sl-cat-btn" data-cat="{{ cat.key | lower }}">
@@ -654,7 +654,7 @@
     <div class="sl-main-panel is-active" id="panel-glossary">
       <div class="sl-main-bar">
         <span class="sl-main-title">Glossary</span>
-        <span class="sl-n-pill" id="glossary-shown">{{ glossary_count }}</span>
+        <span class="sl-n-pill" id="glossary-shown">{{ glossary_count_label }}</span>
       </div>
       <div class="sl-scroll">
         <div id="glossary-list" class="sl-glossary-grid">

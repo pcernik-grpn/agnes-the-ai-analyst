@@ -139,14 +139,36 @@ def collections_list() -> dict:
 
 
 @tool(read_only=True)
-def collection_get(collection_id: str) -> dict:
-    """Show one Collection's detail plus its files and per-file status.
+def collection_get(collection_id: str, limit: int = 25, offset: int = 0, q: str = "") -> dict:
+    """Show one Collection's detail plus a PAGE of its files with per-file status.
+
+    The file list is paginated, not exhaustive — a crawled collection can
+    hold thousands of files, far more than fits in a model's context. This
+    returns at most ``limit`` files starting at ``offset``; read
+    ``files_total`` (the true count, after any ``q`` filter) and
+    ``files_truncated`` (``files_total`` greater than the files returned)
+    before treating ``files`` as the whole collection. When
+    ``files_truncated`` is true, call again with ``offset=<this call's offset
+    + len(files)>`` (or a larger ``limit``, capped at 200 server-side) to
+    reach the rest — ``files_limit`` and ``files_offset`` on the response say
+    exactly what page you just saw.
+
+    ``q`` filters files by a case-insensitive SUBSTRING match over the
+    filename OR path — this is NOT the whole-word content search
+    ``collections_search`` performs inside file text. Use ``q`` to find a
+    file by name, use ``collections_search`` to find a passage inside one.
 
     Args:
         collection_id: Collection id from ``collections_list`` (``col_...``).
+        limit: Max files to return in this page (default 25; server clamps to 1-200).
+        offset: Files to skip before this page (default 0).
+        q: Filter files by a substring of the filename or path (default: no filter).
     """
+    params: dict = {"limit": limit, "offset": offset}
+    if q:
+        params["q"] = q
     try:
-        return api_get_json(f"/api/collections/{collection_id}")
+        return api_get_json(f"/api/collections/{collection_id}", **params)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("collection_get", exc)) from exc
 

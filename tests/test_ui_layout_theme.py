@@ -513,8 +513,12 @@ class TestRailOptIn:
         assert 'class="pnote"' not in text
         assert "Content being prepared" not in text
         assert "lib-status" not in text
-        assert 'class="lib-count-note"' in text
-        assert ">More coming soon<" in text
+        # …and nothing at all above the inventory now: the "More coming soon"
+        # note went with the panels. It described the product's roadmap, not
+        # the list in front of the reader, and it had already been moved three
+        # times looking for a home it never had.
+        assert 'class="lib-count-note"' not in text
+        assert "More coming soon" not in text
         assert "lib-strip" not in text
         # The Data apps badge is NOT asserted here, and its absence is correct:
         # this instance has no files, so there is no Files band to carry it. The
