@@ -2869,7 +2869,20 @@ class ChatManager:
         if live is not None:
 
             async def _notify(frame: dict) -> None:
-                await self._broadcast(live, frame)
+                # To the SENDER's own sinks only, never a broadcast: in a
+                # co-driven conversation the other participants sent nothing
+                # and must not read "you've reached your daily spend cap"
+                # (review finding on #2050). Unstamped and not appended to
+                # the replay stream on purpose — it is a notice to one
+                # person about one refused submit, not a turn frame every
+                # client should replay on reconnect. A sender with no local
+                # sink (a Slack mention forwarded from another gateway) is
+                # explained by that surface's own handler instead.
+                for entry in [e for e in list(live.sinks) if e.participant_email == sender]:
+                    try:
+                        await entry.sink.send_json(frame)
+                    except Exception:
+                        logger.warning("sender-limit notice: sink send failed for %s", chat_id)
 
             on_limit = _notify
         await enforce_sender_limits(self._repo, self._config, sender, chat_id, on_limit=on_limit)
@@ -4878,6 +4891,35 @@ def _seed_daily_tokens_from_db_if_needed(
             pass
 
 
+#: The ``RuntimeError`` reasons ``enforce_sender_limits`` raises — one per
+#: guardrail the send gate enforces: the sender's daily spend, the
+#: conversation's token budget, the sender's message rate. Every surface that
+#: catches a refusal keys on these strings (the Slack bot's
+#: ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader loops in app/api/chat.py),
+#: so they are named here rather than re-typed.
+SENDER_LIMIT_REASONS = frozenset({"daily_budget_exhausted", "max_session_tokens_exhausted", "rate_limit_exceeded"})
+#: The ``kind`` of the ``error`` frame ``enforce_sender_limits`` broadcasts for
+#: each of those refusals, in the same order. A sink that shares its delivery
+#: channel with a handler that already explains the refusal (the Slack
+#: slash command's ``EphemeralCommandSink``) uses this to post it once.
+SENDER_LIMIT_FRAME_KINDS = frozenset({"daily_budget", "max_session_tokens", "rate_limit"})
+
+
+def session_token_budget_message(used: int, cap: int) -> str:
+    """Copy for the ``max_session_tokens`` refusal frame.
+
+    Names what was exhausted — a budget of tokens billed across every turn —
+    and the next step, in words a reader who never heard of a context window
+    can act on. It is Agnes's own guardrail, so it must not be worded (or,
+    downstream, presented) as something the engine reported.
+    """
+    return (
+        f"This conversation has reached its token budget ({used:,} of {cap:,} tokens billed "
+        "across all its turns). Start a new conversation to continue, or ask an admin to "
+        "raise chat.max_session_tokens."
+    )
+
+
 async def enforce_sender_limits(
     repo: ChatRepository,
     config: ChatConfig,
@@ -4896,58 +4938,62 @@ async def enforce_sender_limits(
     api-role thin producer passes nothing (no local socket to put it on).
     The raised ``RuntimeError`` reasons are unchanged either way.
     """
-    # Enforce daily Anthropic spend cap — see daily_token_totals.
-    tokens_in, tokens_out = daily_token_totals(repo, sender)
-    # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
-    # expensive general-purpose tier. Deliberate: the day's spend arrives here
-    # as a two-bucket token counter with no model attached (a session's model
-    # is whatever the sandbox's CLI resolved, recorded per message, and one
-    # day can mix several), so a cap that must guess guesses in the direction
-    # that stops sooner. It previously guessed Sonnet 4.6's $3/$15 and let an
-    # Opus-running instance spend ~3x its configured cap. Exact, per-model
-    # cost is the measured readout's job (`cost_breakdown` + this module),
-    # not this guardrail's.
-    #
-    # `tokens_in` already carries the day's cache-write tokens (see
-    # ChatManager._record_daily_tokens), priced here at the plain input rate
-    # rather than 1.25x: the counter keeps one in-bucket, so the small
-    # under-price is stated rather than hidden.
-    spent_usd = cost_usd(
-        model=None,
-        input_tokens=tokens_in,
-        output_tokens=tokens_out,
-    )
-    if spent_usd >= config.daily_anthropic_spend_usd:
-        if on_limit is not None:
-            await on_limit(
-                {
-                    "type": "error",
-                    "kind": "daily_budget",
-                    "message": (
-                        f"Daily spend cap of ${config.daily_anthropic_spend_usd:.2f} reached. Try again tomorrow."
-                    ),
-                }
-            )
-        raise RuntimeError("daily_budget_exhausted")
-    # Per-session token cap — operators set max_session_tokens in
-    # instance.yaml; previously the knob was dead config. Tokens already
-    # spent in this session are summed from chat_messages on every send;
-    # the session row itself is never UPDATEd (DuckDB 1.5.3 FK+index bug
-    # documented in persistence.py).
-    session_tokens = repo.session_total_tokens(chat_id)
-    if session_tokens >= config.max_session_tokens:
-        if on_limit is not None:
-            await on_limit(
-                {
-                    "type": "error",
-                    "kind": "max_session_tokens",
-                    "message": (
-                        f"Per-session token cap of {config.max_session_tokens} reached "
-                        f"(used {session_tokens}). Start a new chat session."
-                    ),
-                }
-            )
-        raise RuntimeError("max_session_tokens_exhausted")
+    # Enforce daily Anthropic spend cap — see daily_token_totals. ``0``
+    # disables it, and then the day's counters are not even read (no
+    # coordination round trip, no DB re-seed).
+    if config.daily_anthropic_spend_usd > 0:
+        tokens_in, tokens_out = daily_token_totals(repo, sender)
+        # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
+        # expensive general-purpose tier. Deliberate: the day's spend arrives here
+        # as a two-bucket token counter with no model attached (a session's model
+        # is whatever the sandbox's CLI resolved, recorded per message, and one
+        # day can mix several), so a cap that must guess guesses in the direction
+        # that stops sooner. It previously guessed Sonnet 4.6's $3/$15 and let an
+        # Opus-running instance spend ~3x its configured cap. Exact, per-model
+        # cost is the measured readout's job (`cost_breakdown` + this module),
+        # not this guardrail's.
+        #
+        # `tokens_in` already carries the day's cache-write tokens (see
+        # ChatManager._record_daily_tokens), priced here at the plain input rate
+        # rather than 1.25x: the counter keeps one in-bucket, so the small
+        # under-price is stated rather than hidden.
+        spent_usd = cost_usd(
+            model=None,
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+        )
+        if spent_usd >= config.daily_anthropic_spend_usd:
+            if on_limit is not None:
+                await on_limit(
+                    {
+                        "type": "error",
+                        "kind": "daily_budget",
+                        "message": (
+                            f"Daily spend cap of ${config.daily_anthropic_spend_usd:.2f} reached. Try again tomorrow."
+                        ),
+                    }
+                )
+            raise RuntimeError("daily_budget_exhausted")
+    # Per-conversation token budget — the CUMULATIVE tokens billed over the
+    # whole conversation (chat_messages tokens_in + tokens_out + cache
+    # writes, summed on every send; the session row itself is never UPDATEd
+    # — DuckDB 1.5.3 FK+index bug documented in persistence.py). This is not
+    # the context window: compaction bounds what the engine re-sends per
+    # call, and nothing but this knob bounds the sum, so the refusal must
+    # say "budget", never read as a context overflow the engine should have
+    # compacted away (TCRD-291). ``0`` disables the cap.
+    if config.max_session_tokens > 0:
+        session_tokens = repo.session_total_tokens(chat_id)
+        if session_tokens >= config.max_session_tokens:
+            if on_limit is not None:
+                await on_limit(
+                    {
+                        "type": "error",
+                        "kind": "max_session_tokens",
+                        "message": session_token_budget_message(session_tokens, config.max_session_tokens),
+                    }
+                )
+            raise RuntimeError("max_session_tokens_exhausted")
     # Per-user message-rate cap keyed on the SENDER (SR-10), enforced via
     # a coordination-backend fixed-window counter (see _msg_window_key) —
     # atomic incr-then-compare: this attempt is unconditionally counted

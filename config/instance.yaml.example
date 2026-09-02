@@ -1139,9 +1139,18 @@ chat:
   idle_ttl_seconds: 1800              # 30 min
   per_tool_call_seconds: 90
   per_session_bq_scan_bytes: 21474836480   # 20 GiB
+  # Per-sender daily spend estimate (USD; a message with no recorded model is
+  # priced at the most expensive general-purpose tier). 0 disables.
   daily_anthropic_spend_usd: 20.0
   max_session_seconds: 14400
-  max_session_tokens: 200000
+  # Tokens billed over ONE conversation's whole life (input + output + cache
+  # writes, summed over every turn) — NOT its context window, which the
+  # engine compacts on its own. An agentic turn re-sends the context on every
+  # tool call, so a busy conversation bills several hundred thousand tokens
+  # per turn and a value near the model's context size trips mid-conversation.
+  # A runaway-conversation guard, not the cost control (that is
+  # daily_anthropic_spend_usd). 0 disables.
+  max_session_tokens: 2000000
   rate_messages_per_hour: 100
   tool_calls_per_turn_budget: 50
   # How long the in-runner approval gate waits for the user to answer an
