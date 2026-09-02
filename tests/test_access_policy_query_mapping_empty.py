@@ -318,6 +318,39 @@ def test_helper_matches_mapping_table_name_case_insensitively(e2e_env):
     assert exc_info.value.mapping_table == "cost_centres"
 
 
+def test_helper_ignores_cte_aliases_that_shadow_a_mapping_table_name(e2e_env):
+    """A CTE alias is not a physical dependency (PR #2023 review follow-up):
+    a body whose CTE happens to be named like an empty ``policy_mapping``
+    row reads the CTE, never that row, so the guard must not raise on it --
+    while a body that ALSO reads the real empty mapping table still must."""
+    from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+    from src.db import get_system_db
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(id="cost_centres", name="cost_centres", source_type="keboola", query_mode="local")
+        registry.set_policy_mapping("cost_centres", True)
+        # Deliberately no sync_state row -- never synced.
+    finally:
+        conn.close()
+
+    # Only the CTE is read: no dependency on the registry row of that name.
+    raise_if_policy_mapping_empty(
+        "WITH cost_centres AS (SELECT $user_email AS email, 'A' AS unit) "
+        "SELECT * FROM orders WHERE unit IN (SELECT unit FROM cost_centres)"
+    )
+
+    # The real table is read under another CTE's name: still refused.
+    with pytest.raises(PolicyMappingEmpty) as exc_info:
+        raise_if_policy_mapping_empty(
+            "WITH me AS (SELECT $user_email AS email) "
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM cost_centres WHERE email IN (SELECT email FROM me))"
+        )
+    assert exc_info.value.mapping_table == "cost_centres"
+
+
 def _find_table_entry(payload: dict, table_id: str):
     return next((t for t in payload.get("tables") or [] if t["table_id"] == table_id), None)
 

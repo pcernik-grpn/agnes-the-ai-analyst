@@ -1239,7 +1239,13 @@ def raise_if_policy_mapping_empty(
     # `Cost_Centres` while the registry row is named `cost_centres` (or vice
     # versa) silently misses the mapping row, and this whole check no-ops
     # (PR #2023 review, finding 1).
-    referenced_names = {t.name.lower() for t in statement.find_all(exp.Table) if t.name}
+    # A CTE alias is not a physical dependency: `WITH cost_centres AS (...)
+    # SELECT ... FROM cost_centres` reads the CTE, never the registry row
+    # that happens to share its name, so counting it would refuse a valid
+    # policy body over an empty (or unrelated) mapping table of that name
+    # (PR #2023 review follow-up).
+    cte_names = {c.alias_or_name.lower() for c in statement.find_all(exp.CTE) if c.alias_or_name}
+    referenced_names = {t.name.lower() for t in statement.find_all(exp.Table) if t.name} - cte_names
     referenced_names -= _protected_table_self_names(table_name=table_name, table_id=table_id)
     if not referenced_names:
         return
