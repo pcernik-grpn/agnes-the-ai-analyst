@@ -69,10 +69,12 @@ def _scrub_secrets(value: Any, secret_patterns: list[str], warned: list[str], pa
     git-committed apply file; it protects against re-applying a stale
     export, not against an admin who deliberately wants to set one.
     A key ending in ``_env`` (an env-var NAME), a ``${VAR}`` reference, or a
-    boolean value is left alone — a boolean cannot itself be a credential,
-    and several switches (e.g. `mcp.allow_query_param_token`) have "token"/
+    boolean or numeric value is left alone — neither a boolean nor a number
+    can itself be a credential, and several knobs (e.g.
+    `mcp.allow_query_param_token`, `chat.max_session_tokens`) have "token"/
     "secret" substrings in their name purely by naming coincidence (the same
-    reasoning as the server's own `_declared_boolean_fields()` guard).
+    reasoning as the server's own `_declared_boolean_fields()` /
+    `_declared_numeric_fields()` guards).
     """
     if isinstance(value, dict):
         out: dict[str, Any] = {}
@@ -80,7 +82,7 @@ def _scrub_secrets(value: Any, secret_patterns: list[str], warned: list[str], pa
             child_path = f"{path}.{k}" if path else k
             k_lower = k.lower()
             is_secret_key = not k_lower.endswith("_env") and any(p in k_lower for p in secret_patterns)
-            if is_secret_key and not isinstance(v, bool) and not _is_env_ref(v):
+            if is_secret_key and not isinstance(v, (bool, int, float)) and not _is_env_ref(v):
                 warned.append(child_path)
                 continue
             out[k] = _scrub_secrets(v, secret_patterns, warned, child_path)

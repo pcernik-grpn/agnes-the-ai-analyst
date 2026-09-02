@@ -179,14 +179,17 @@ settings:
 
 ## Cost & limits
 
-Per-user defaults (configurable in `/admin/server-config`):
+Per-user defaults (the three per-sender limits are editable under
+"Chat access" in `/admin/server-config`; they are read once at startup, so a
+save applies after the app process restarts):
 
 | Setting | Default |
 |---|---|
 | Concurrent sessions per user | 3 |
 | Idle TTL | 30 min |
-| Anthropic spend cap | $20 / day |
+| LLM spend cap per person, per UTC day (`chat.daily_anthropic_spend_usd`) | $20 / day (`0` disables) |
 | Tokens billed per conversation, cumulative (`chat.max_session_tokens`) | 2 M (`0` disables) |
+| Messages per sender per hour (`chat.rate_messages_per_hour`) | 100 |
 | Per-tool-call wall clock | 90 s |
 | BigQuery scan per session | 20 GiB |
 | Sandbox pause after disconnect linger | 60 s (`chat.detach_linger_seconds`) |

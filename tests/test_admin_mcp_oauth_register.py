@@ -1470,7 +1470,7 @@ def test_repointing_the_endpoints_drops_the_old_providers_secret(seeded_app, mon
     identity fields, so a PUT that moved `issuer`/`token_endpoint` to a
     DIFFERENT authorization server while re-typing the same client name purged
     the user tokens yet kept the previous provider's client secret — which
-    `_client_auth_kwargs` then sends as HTTP Basic to the new token endpoint
+    `_post_token_request` then sends as HTTP Basic to the new token endpoint
     (Devin Review on #1124).
     """
     from src.repositories import mcp_source_oauth_clients_repo
