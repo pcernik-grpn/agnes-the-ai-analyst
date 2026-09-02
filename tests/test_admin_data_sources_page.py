@@ -1977,6 +1977,7 @@ class TestSharePointSourceCardRendering:
                 "function _esc(s) {",
                 "function _sharepointPipelineStripHtml(row) {",
                 "function _extRenderFactsPolicy(row) {",
+                "function _extRenderCrawlFilter(row) {",
                 "function _sharepointFactsHtml(row) {",
                 "const SP_REJECTION_REASON_TEXT = {",
                 "function _spRejectionReasonText(reason) {",

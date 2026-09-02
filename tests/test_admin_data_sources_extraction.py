@@ -77,6 +77,7 @@ _SIGNATURES = (
     "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
     "function _extConfigHtml(body) {",
+    "function _extMaybeFetchOnExpand(connId) {",
 )
 
 
@@ -169,6 +170,121 @@ class TestCardAnchors:
         # page, not invented per render.
         assert "EXT_POLL_ACTIVE_MS = 3000" in body
         assert "EXT_POLL_IDLE_MS = 30000" in body
+
+
+# --------------------------------------------------------------------------
+# Expanding a card must show its extraction status immediately (2026-09 live
+# walkthrough, design gap 1): the block stayed empty behind "Run extraction
+# now" / "View configuration" until the poll's own idle cadence caught up —
+# up to 30s on a fresh page. `_extMaybeFetchOnExpand` is the poll's own
+# `_extFetchOne` reused (never a second fetch path), and `setSourceOpen` is
+# wrapped so every expand path on the page reaches it with no second
+# listener to keep in sync.
+# --------------------------------------------------------------------------
+
+
+class TestFetchOnExpandDecision:
+    """`_extMaybeFetchOnExpand`'s own guard: fetch once, only for a
+    SharePoint card, only when there is nothing live to show yet."""
+
+    def _run(self, *, cached_state=None):
+        return _run_js(
+            """
+const fetchCalls = [];
+async function _extFetchOne(connId) { fetchCalls.push(connId); }
+_extMaybeFetchOnExpand("sp1");
+console.log(JSON.stringify({ fetchCalls }));
+""",
+            state=_state(**(cached_state or {})),
+        )
+
+    def test_fetches_when_nothing_is_cached_yet(self):
+        out = self._run()
+        assert out["fetchCalls"] == ["sp1"]
+
+    def test_does_not_refetch_once_data_is_already_cached(self):
+        out = self._run(cached_state={"data": _RUNNING})
+        assert out["fetchCalls"] == []
+
+    def test_does_not_fetch_a_501_stopped_connection(self):
+        out = self._run(cached_state={"stopped": True})
+        assert out["fetchCalls"] == []
+
+    def test_a_non_sharepoint_card_with_no_ext_block_anchor_is_left_alone(self):
+        """`ext-block-<id>` only exists on a SharePoint card — a Keboola or
+        BigQuery card's expand must not go looking for extraction status
+        that was never going to exist."""
+        out = _run_js(
+            """
+const fetchCalls = [];
+async function _extFetchOne(connId) { fetchCalls.push(connId); }
+_extMaybeFetchOnExpand("kbc1");
+console.log(JSON.stringify({ fetchCalls }));
+"""
+        )
+        assert out["fetchCalls"] == []
+
+
+class TestSetSourceOpenWiring:
+    """`setSourceOpen` — every expand path on the page (the caret, a click
+    on the head, and every "open this card" helper elsewhere) — is wrapped,
+    not reimplemented, so the immediate fetch reaches all of them."""
+
+    def _run(self, body: str) -> dict:
+        tpl = TEMPLATE.read_text(encoding="utf-8")
+        fns = "\n".join(
+            _extract_block(tpl, sig)
+            for sig in (
+                "function setSourceOpen(id, open) {",
+                'if (typeof setSourceOpen === "function") {',
+            )
+        )
+        script = f"""
+const CSS = {{ escape: (s) => s }};
+const _body = {{ hidden: true }};
+const _caret = {{ setAttribute: () => {{}} }};
+const document = {{
+  getElementById: () => _body,
+  querySelector: () => _caret,
+}};
+const calls = [];
+function _extMaybeFetchOnExpand(id) {{ calls.push(id); }}
+
+{fns}
+
+{body}
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_expanding_calls_the_immediate_fetch_hook(self):
+        out = self._run('setSourceOpen("sp1", true); console.log(JSON.stringify({ calls }));')
+        assert out["calls"] == ["sp1"]
+
+    def test_collapsing_never_calls_it(self):
+        out = self._run('setSourceOpen("sp1", false); console.log(JSON.stringify({ calls }));')
+        assert out["calls"] == []
+
+    def test_the_original_behavior_still_runs(self):
+        """The wrap must not swallow what `setSourceOpen` already did —
+        the body's `hidden` flag and the caret's `aria-expanded` still
+        flip."""
+        out = self._run(
+            """
+setSourceOpen("sp1", true);
+console.log(JSON.stringify({ hidden: _body.hidden }));
+"""
+        )
+        assert out["hidden"] is False
 
 
 class TestRunRow:

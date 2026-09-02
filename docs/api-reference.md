@@ -1616,10 +1616,11 @@ that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
 `sharepoint_connection.extraction_config_read`. The response also carries
 `min_modified: {value, source}` — the SAME resolved shape `…/extraction/
-crawl-config`'s own PATCH response returns — so the drawer's Crawl filter
-panel (a date input plus Save/Clear) opens pre-filled with whatever cutoff
-is already set on the connection, rather than a blank field with no way to
-tell what is active.
+crawl-config`'s own PATCH response returns. The card's own Crawl filter
+control (a date input plus Save/Clear, next to "Facts policy") reads this
+straight off the connection row it already has rather than calling this
+endpoint, since there is no instance-level default `min_modified` could
+resolve against — see the PATCH entry below.
 
 `POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
 connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
