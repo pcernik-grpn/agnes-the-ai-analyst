@@ -624,18 +624,22 @@ def test_as_metadata_issuer_trailing_slash_is_tolerated():
     assert meta["issuer"] == "https://as.example.com/"
 
 
-def test_registration_fails_closed_on_post_only_client_auth():
-    """An AS supporting only client_secret_post must be refused at
-    registration — announcing a method the token calls never use would get
-    every exchange/refresh rejected (Devin Review on #1124)."""
+def test_registration_fails_closed_on_a_client_auth_method_the_token_calls_cannot_send():
+    """An AS supporting only a method the token calls never use must be
+    refused at registration — announcing it would get every exchange and
+    refresh rejected (Devin Review on #1124).
+
+    ``client_secret_post`` used to be such a method and no longer is; the
+    fail-closed contract itself still holds for the rest.
+    """
     meta = dict(_AS_METADATA)
-    meta["token_endpoint_auth_methods_supported"] = ["client_secret_post"]
+    meta["token_endpoint_auth_methods_supported"] = ["private_key_jwt"]
 
     async def _impl():
         async with _client(lambda request: httpx.Response(500)) as client:
             return await register_dynamic_client(meta, redirect_uri="https://agnes.example.com/cb", client=client)
 
-    with pytest.raises(OAuthDiscoveryError, match="client_secret_basic"):
+    with pytest.raises(OAuthDiscoveryError, match="private_key_jwt"):
         run(_impl())
 
 
@@ -751,7 +755,7 @@ def _dcr(body, *, status=201, scopes=None, meta=None):
 
 
 def test_a_confidential_registration_without_a_secret_is_refused():
-    """`_client_auth_kwargs` keys off secret PRESENCE, so a client the AS
+    """`_post_token_request` keys off secret PRESENCE, so a client the AS
     recorded as `client_secret_basic` but issued no secret for would send no
     client authentication at all — every exchange and refresh coming back
     `invalid_client`. Fail at registration, where the message can say what to
@@ -821,3 +825,157 @@ def test_secret_presence_agrees_with_the_registered_method():
     )
     with pytest.raises(OAuthDiscoveryError):
         _dcr({"client_id": "a", "token_endpoint_auth_method": "client_secret_basic"})
+
+
+# ---------------------------------------------------------------------------
+# client_secret_post — the fallback for an AS that refuses HTTP Basic
+# ---------------------------------------------------------------------------
+#
+# RFC 6749 §2.3.1 lets a confidential client present its secret either as
+# HTTP Basic or as body parameters, and says the AS decides which it takes.
+# Agnes leads with Basic (the method §2.3.1 requires every AS to support)
+# and falls back to `client_secret_post` exactly once, on the AS's own
+# `invalid_client` answer — so an AS advertising only `client_secret_post`
+# works without a stored per-client auth-method setting.
+
+
+def _form(request) -> dict:
+    return dict(httpx.QueryParams(request.read().decode()))
+
+
+def test_exchange_code_for_token_retries_with_client_secret_post_when_basic_is_rejected():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            assert request.headers.get("Authorization", "").startswith("Basic ")
+            assert "client_secret" not in _form(request)
+            return httpx.Response(401, json={"error": "invalid_client"})
+        assert "Authorization" not in request.headers
+        assert _form(request)["client_secret"] == "csecret"
+        assert _form(request)["client_id"] == "cid"
+        return httpx.Response(200, json={"access_token": "at1"})
+
+    async def _impl():
+        async with _client(handler) as client:
+            return await exchange_code_for_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret="csecret",
+                code="authcode",
+                redirect_uri="https://agnes.example.com/cb",
+                code_verifier="verifier",
+                client=client,
+            )
+
+    tok = run(_impl())
+    assert tok.access_token == "at1"
+    assert len(seen) == 2
+
+
+def test_refresh_access_token_retries_with_client_secret_post_when_basic_is_rejected():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(400, json={"error": "invalid_client"})
+        assert _form(request)["client_secret"] == "csecret"
+        return httpx.Response(200, json={"access_token": "at2", "refresh_token": "rt2"})
+
+    async def _impl():
+        async with _client(handler) as client:
+            return await refresh_access_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret="csecret",
+                refresh_token="rt1",
+                client=client,
+            )
+
+    tok = run(_impl())
+    assert tok.access_token == "at2"
+    assert len(seen) == 2
+
+
+def test_exchange_code_for_token_does_not_retry_a_failure_that_is_not_client_auth():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    async def _impl():
+        async with _client(handler) as client:
+            await exchange_code_for_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret="csecret",
+                code="authcode",
+                redirect_uri="https://agnes.example.com/cb",
+                code_verifier="verifier",
+                client=client,
+            )
+
+    with pytest.raises(OAuthTokenError, match="invalid_grant"):
+        run(_impl())
+    assert len(seen) == 1
+
+
+def test_public_client_never_retries_because_it_has_no_secret_to_post():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(401, json={"error": "invalid_client"})
+
+    async def _impl():
+        async with _client(handler) as client:
+            await exchange_code_for_token(
+                token_endpoint="https://as.example.com/token",
+                client_id="cid",
+                client_secret=None,
+                code="authcode",
+                redirect_uri="https://agnes.example.com/cb",
+                code_verifier="verifier",
+                client=client,
+            )
+
+    with pytest.raises(OAuthTokenError, match="invalid_client"):
+        run(_impl())
+    assert len(seen) == 1
+
+
+def test_register_dynamic_client_announces_client_secret_post_when_basic_is_unsupported():
+    meta = {**_AS_METADATA, "token_endpoint_auth_methods_supported": ["client_secret_post"]}
+
+    def handler(request):
+        assert json.loads(request.read())["token_endpoint_auth_method"] == "client_secret_post"
+        return httpx.Response(201, json={"client_id": "abc123", "client_secret": "s3cr3t"})
+
+    async def _impl():
+        async with _client(handler) as client:
+            return await register_dynamic_client(meta, redirect_uri="https://agnes.example.com/cb", client=client)
+
+    assert run(_impl()).client_id == "abc123"
+
+
+def test_register_dynamic_client_accepts_a_granted_client_secret_post():
+    meta = {**_AS_METADATA, "token_endpoint_auth_methods_supported": ["client_secret_post"]}
+
+    def handler(request):
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "abc123",
+                "client_secret": "s3cr3t",
+                "token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+
+    async def _impl():
+        async with _client(handler) as client:
+            return await register_dynamic_client(meta, redirect_uri="https://agnes.example.com/cb", client=client)
+
+    assert run(_impl()).client_secret == "s3cr3t"

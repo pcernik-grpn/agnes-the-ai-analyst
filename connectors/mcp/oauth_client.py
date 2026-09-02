@@ -57,6 +57,21 @@ REQUIRED_CODE_CHALLENGE_METHOD = "S256"
 #: linear time regardless of input size (security playbook F5).
 _RESOURCE_METADATA_RE = re.compile(r'resource_metadata="([^"]*)"')
 
+#: The ``token_endpoint_auth_method`` values :func:`_post_token_request`
+#: can actually satisfy. Anything else must fail closed at registration
+#: rather than at the first token call.
+_IMPLEMENTED_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "none")
+
+#: The subset of those that carry a client secret. A registration recorded
+#: as one of these but issued no secret is unusable — see
+#: :func:`register_dynamic_client`.
+_CONFIDENTIAL_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
+
+#: RFC 6749 §5.2 — the AS's way of saying "I did not accept your client
+#: authentication". The one error worth re-presenting the same credential
+#: for, in the other style §2.3.1 permits.
+_CLIENT_AUTH_REJECTED = "invalid_client"
+
 
 class OAuthDiscoveryError(Exception):
     """Raised when RFC 9728 / RFC 8414 discovery or RFC 7591 registration
@@ -349,21 +364,24 @@ def _choose_token_endpoint_auth_method(as_metadata: Dict[str, Any]) -> str:
     """Pick the client-auth style to ANNOUNCE at registration.
 
     Only styles the token-call path actually implements may be announced —
-    ``_client_auth_kwargs`` speaks HTTP Basic (confidential) or public-client
-    (``client_id`` in the body). Announcing anything else (e.g. an AS that
-    supports only ``client_secret_post``) would register a contract the token
-    calls then violate, and the AS would reject every exchange/refresh
-    (Devin Review on #1124) — fail closed with an actionable message instead.
+    :func:`_post_token_request` speaks HTTP Basic and ``client_secret_post``
+    (confidential) or public-client (``client_id`` in the body). Announcing
+    anything else would register a contract the token calls then violate, and
+    the AS would reject every exchange/refresh (Devin Review on #1124) — fail
+    closed with an actionable message instead.
+
+    Basic comes first because RFC 6749 §2.3.1 requires every AS to support
+    it; ``client_secret_post`` is the one it may offer *instead*.
     """
     supported = as_metadata.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
-    if "client_secret_basic" in supported:
-        return "client_secret_basic"
-    if "none" in supported:
-        return "none"
+    for method in ("client_secret_basic", "client_secret_post", "none"):
+        if method in supported:
+            return method
     raise OAuthDiscoveryError(
         "authorization server supports only these client-auth methods at the token endpoint: "
-        f"{supported!r}; Agnes implements 'client_secret_basic' and 'none'. Configure the "
-        "client manually via PUT …/oauth/client if the server offers another compatible option."
+        f"{supported!r}; Agnes implements 'client_secret_basic', 'client_secret_post' and 'none'. "
+        "Configure the client manually via PUT …/oauth/client if the server offers another "
+        "compatible option."
     )
 
 
@@ -422,14 +440,15 @@ async def register_dynamic_client(
     # Same fail-closed reasoning as _choose_token_endpoint_auth_method, on
     # the one path that check cannot see (Devin Review on #1124).
     granted_auth_method = body.get("token_endpoint_auth_method")
-    if granted_auth_method and granted_auth_method not in ("client_secret_basic", "none"):
+    if granted_auth_method and granted_auth_method not in _IMPLEMENTED_AUTH_METHODS:
         raise OAuthDiscoveryError(
             f"authorization server registered the client with token_endpoint_auth_method="
-            f"{granted_auth_method!r}; Agnes implements 'client_secret_basic' and 'none'. "
+            f"{granted_auth_method!r}; Agnes implements "
+            f"{', '.join(repr(m) for m in _IMPLEMENTED_AUTH_METHODS)}. "
             "Configure the client manually via PUT …/oauth/client instead."
         )
     # A registration recorded as confidential but issued no secret is unusable:
-    # _client_auth_kwargs keys off secret PRESENCE, so it would send no client
+    # _post_token_request keys off secret PRESENCE, so it would send no client
     # authentication at all against a client the AS has on file as Basic, and
     # every exchange and refresh would come back invalid_client. Omitting
     # token_endpoint_auth_method means the RFC 7591 default, which is
@@ -440,12 +459,12 @@ async def register_dynamic_client(
     # (Devin Review on #1124).
     effective_auth_method = granted_auth_method or auth_method
     client_secret = body.get("client_secret")
-    if effective_auth_method == "client_secret_basic" and not client_secret:
+    if effective_auth_method in _CONFIDENTIAL_AUTH_METHODS and not client_secret:
         raise OAuthDiscoveryError(
-            "authorization server registered the client for 'client_secret_basic' but issued no "
-            "client_secret, so no client authentication could ever be sent. Configure the client "
-            "manually via PUT …/oauth/client, or use an authorization server that advertises 'none' "
-            "for public clients."
+            f"authorization server registered the client for {effective_auth_method!r} but issued "
+            "no client_secret, so no client authentication could ever be sent. Configure the "
+            "client manually via PUT …/oauth/client, or use an authorization server that "
+            "advertises 'none' for public clients."
         )
     if effective_auth_method == "none" and client_secret:
         # The mirror case, and the reason both are worth handling: token calls
@@ -588,13 +607,83 @@ def _token_set_from_response(body: Dict[str, Any]) -> TokenSet:
     )
 
 
-def _client_auth_kwargs(client_id: str, client_secret: Optional[str]) -> Dict[str, Any]:
-    """HTTP Basic auth when a confidential client secret is present; the
-    public-client (PKCE-only) path sends ``client_id`` in the form body
-    instead — added by the caller."""
+def _is_client_auth_rejection(resp: httpx.Response) -> bool:
+    """True iff ``resp`` is the AS refusing our *client authentication*
+    (RFC 6749 §5.2 ``invalid_client``), as opposed to refusing the grant.
+
+    Only that one error justifies re-sending the secret the other way; a
+    bad code or a dead refresh token must surface on the first answer.
+    """
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("error") == _CLIENT_AUTH_REJECTED
+
+
+async def _post_token_request(
+    *,
+    token_endpoint: str,
+    client_id: str,
+    client_secret: Optional[str],
+    data: Dict[str, str],
+    client: httpx.AsyncClient,
+    action: str,
+) -> Dict[str, Any]:
+    """POST a grant to ``token_endpoint``, presenting the client secret the
+    way this authorization server accepts it, and return the parsed body.
+
+    RFC 6749 §2.3.1 lets a confidential client authenticate with HTTP Basic
+    *or* with body parameters, and leaves the choice to the server. Agnes
+    leads with Basic — §2.3.1 requires every AS to support it — and, for a
+    confidential client only, retries once with ``client_secret`` in the body
+    when the AS answers ``invalid_client``. That makes an AS advertising only
+    ``client_secret_post`` work without Agnes storing a per-client auth
+    method: there is nowhere to put one, since the DuckDB app-state schema is
+    frozen and a stored column would be Postgres-only — the feature would
+    then silently not work on a DuckDB instance.
+
+    A public (PKCE-only) client has no secret to re-present, so it never
+    retries; neither does any failure that is not ``invalid_client``.
+
+    Redirects are never followed (an AS redirecting a token response is
+    never legitimate).
+    """
+    attempts: List[Dict[str, Any]] = [{"auth": (client_id, client_secret)} if client_secret else {}]
     if client_secret:
-        return {"auth": (client_id, client_secret)}
-    return {}
+        attempts.append({"form": {"client_secret": client_secret}})
+
+    resp: Optional[httpx.Response] = None
+    for index, style in enumerate(attempts):
+        body_params = {**data, **style.pop("form", {})}
+        try:
+            resp = await client.post(
+                token_endpoint,
+                data=body_params,
+                follow_redirects=False,
+                **style,
+            )
+        except httpx.HTTPError as exc:
+            raise OAuthTransportError(f"{action} failed: {exc_summary(exc)}") from exc
+        if resp.status_code == 200:
+            break
+        if index + 1 < len(attempts) and _is_client_auth_rejection(resp):
+            logger.info(
+                "mcp oauth: %s — authorization server rejected HTTP Basic client auth; "
+                "retrying once with client_secret_post",
+                action,
+            )
+            continue
+        await _raise_as_error(resp, action=action)
+
+    assert resp is not None  # every loop path either breaks, continues or raises
+    try:
+        parsed = resp.json()
+    except ValueError as exc:
+        raise OAuthTokenError(f"{action} response is not valid JSON") from exc
+    return parsed
 
 
 async def exchange_code_for_token(
@@ -615,28 +704,20 @@ async def exchange_code_for_token(
     followed on this call (an AS redirecting a token response is never
     legitimate).
     """
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "client_id": client_id,
-        "code_verifier": code_verifier,
-    }
-    try:
-        resp = await client.post(
-            token_endpoint,
-            data=data,
-            follow_redirects=False,
-            **_client_auth_kwargs(client_id, client_secret),
-        )
-    except httpx.HTTPError as exc:
-        raise OAuthTransportError(f"token exchange failed: {exc_summary(exc)}") from exc
-    if resp.status_code != 200:
-        await _raise_as_error(resp, action="token exchange")
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        raise OAuthTokenError("token exchange response is not valid JSON") from exc
+    body = await _post_token_request(
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        client_secret=client_secret,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        },
+        client=client,
+        action="token exchange",
+    )
     return _token_set_from_response(body)
 
 
@@ -655,26 +736,18 @@ async def refresh_access_token(
     stored ``mcp_source_oauth_clients`` row, never from caller-supplied
     request data.
     """
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-    }
-    try:
-        resp = await client.post(
-            token_endpoint,
-            data=data,
-            follow_redirects=False,
-            **_client_auth_kwargs(client_id, client_secret),
-        )
-    except httpx.HTTPError as exc:
-        raise OAuthTransportError(f"token refresh failed: {exc_summary(exc)}") from exc
-    if resp.status_code != 200:
-        await _raise_as_error(resp, action="token refresh")
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        raise OAuthTokenError("token refresh response is not valid JSON") from exc
+    body = await _post_token_request(
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        client_secret=client_secret,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        },
+        client=client,
+        action="token refresh",
+    )
     return _token_set_from_response(body)
 
 
