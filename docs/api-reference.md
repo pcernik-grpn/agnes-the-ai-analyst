@@ -2486,16 +2486,24 @@ open. Triple-surface with `agnes facts facets` and the `fact_facets` MCP
 tool.
 
 `GET /api/facts/type-map` answers "what is in the graph at all" —
-`{"types": [{"type", "count"}], "total"}`, ordered by type. Counts run
-through the SAME visibility gate as `search()` with no `type` (shared via
-`_visible_facts_for_corpus_cte(all_collections=True)`, never a second copy
-of the rule), so a type's number is exactly what that caller could reach
-through `search(type=...)`. A type with no subjects visible to the caller
-is OMITTED rather than reported as `0`: absence is deliberately
-indistinguishable from "no such type in this ontology", because a `0` would
-confirm the type exists and that something occupies it — the aggregate form
-of the §5 existence oracle. Triple-surface with `agnes facts type-map` and
-the `fact_type_map` MCP tool.
+`{"types": [{"type", "count"}], "total", "edge_types": [{"type",
+"count"}]}`, both lists ordered by type. Counts run through the SAME
+visibility gate as `search()`/`neighbors()` with no `type` filter (shared
+via `_visible_facts_for_corpus_cte(all_collections=True)` and
+`_visible_edges_for_corpus_cte(all_collections=True)`, never a second copy
+of the rule), so a node type's number is exactly what that caller could
+reach through `search(type=...)`, and an edge type's number is exactly what
+`neighbors(edge_types=[that type])` could reach from somewhere. A type with
+nothing visible to the caller is OMITTED rather than reported as `0`:
+absence is deliberately indistinguishable from "no such type in this
+ontology", because a `0` would confirm the type exists and that something
+occupies it — the aggregate form of the §5 existence oracle. `edge_types`
+is the primer a caller should read BEFORE traversing a well-connected node
+with `neighbors(edge_types=[...])` — a live-run finding showed that without
+a cheap way to learn a valid edge type name (e.g. `in_industry`), an agent
+fell back to an unfiltered traversal that returned every relationship type
+the node had. Triple-surface with `agnes facts type-map` and the
+`fact_type_map` MCP tool.
 
 Every successful ingest batch also persists a copy of its run report to
 `facts_ingest_runs` — written AFTER the ingest transaction commits, so a

@@ -143,21 +143,31 @@ def facts_facets(
 
 @router.get("/type-map")
 def facts_type_map(user=Depends(get_current_user)) -> Dict[str, Any]:
-    """Live counts per node type over everything the caller can see — the
-    head of the Library's Knowledge tab, where each type is a way in.
+    """Live counts per node type AND per edge (relationship) type over
+    everything the caller can see — the head of the Library's Knowledge
+    tab, where each node type is a way in, and the cheap primer to read
+    BEFORE calling ``POST /api/facts/neighbors`` with an ``edge_types``
+    filter on a well-connected node (a live-run finding: omitting
+    ``edge_types`` because the caller had no cheap way to learn a valid
+    name pulled every relationship off the node instead of the one wanted).
 
     Same visibility gate as :func:`facts_search` with no ``type``, just
-    aggregated: a type's ``count`` is exactly how many subjects a
-    ``search(type=...)`` would let this caller reach. A type nobody can see
-    is absent rather than reported as ``0``, so the response never
-    distinguishes "no such type here" from "none you may read" — the same
-    non-disclosure ``search()`` makes. Response: ``{"types": [{"type",
-    "count"}], "total"}``, ordered by type.
+    aggregated: a node type's ``count`` is exactly how many subjects a
+    ``search(type=...)`` would let this caller reach, and an edge type's
+    ``count`` is exactly how many edges of that type
+    ``neighbors(edge_types=[that type])`` would let this caller reach from
+    somewhere. A type nobody can see is absent rather than reported as
+    ``0``, so the response never distinguishes "no such type here" from
+    "none you may read" — the same non-disclosure ``search()``/``neighbors()``
+    make. Response: ``{"types": [{"type", "count"}], "total",
+    "edge_types": [{"type", "count"}]}``, both lists ordered by type.
     """
     counts = facts_repo().count_visible_facts_by_type(user)
+    edge_counts = facts_repo().count_visible_edges_by_type(user)
     return {
         "types": [{"type": t, "count": n} for t, n in counts.items()],
         "total": sum(counts.values()),
+        "edge_types": [{"type": t, "count": n} for t, n in edge_counts.items()],
     }
 
 

@@ -2,21 +2,116 @@
 {% from "macros/_fbar_card.html" import fbar_card %}
 {% import "macros/_state.html" as state %}
 
-{# NAME: "Semantic models", never "Semantic layer" — that name was worn by
-   three of the four semantic surfaces at once, so a browser tab could not
-   tell them apart. The eyebrow keeps the concept; the title names the page's
-   contents. Guarded by tests/test_semantic_page_names_contract.py.
+{# NAME: "Definitions". The page had FOUR names between the Library card that
+   sends you here and its own detail pages — the card said "Definitions", its
+   link said "Browse semantic models", this title said "Semantic models" over
+   an eyebrow saying "Semantic layer", and the detail page's eyebrow said
+   "Semantic models" again. One area, four words, all within two clicks.
+
+   "Definitions" wins because it is the word a reader who is not an engineer
+   already has: these are the words and numbers the organization agreed on.
+   "Semantic layer" is the architecture's name for the machinery, and
+   "semantic model" stays the name of a DOCUMENT TYPE inside this page — which
+   is what the Models tab lists, and what it is still correctly called there.
+
+   The two admin surfaces keep their own vocabulary ("Semantic layer health",
+   "Semantic sources") on purpose: an admin operates the layer, an analyst
+   reads the definitions, and the naming contract's own rule is that each page
+   is named for what it is FOR.
 
    The name does NOT change per tab. Since the fold (#1707 N5) this one page
    carries three views — the stored documents, and the flat metric/glossary
    projections that used to live at /catalog/semantics — and a <title> that
-   changed under the reader would put three names back into circulation,
-   which is the exact collision that contract exists to prevent. #}
-{% block title %}Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+   changed under the reader would put several names back into circulation,
+   which is the exact collision that contract exists to prevent.
+   Guarded by tests/test_semantic_page_names_contract.py. #}
+{% block title %}Definitions — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {#- The writer badge on a flat registry row. Kept in step with its client-side
     twin in this page's own script (the glossary list is fetched, not
     server-rendered), which reads the same server-injected source set. -#}
+{# ── The SAME toolbar the Library runs on ──────────────────────────────────
+   This page carried three filtering idioms, one per tab: Semantic models had
+   none at all, Metrics had a left sidebar of categories plus its own search
+   box, Glossary had a different sidebar plus another search box. Every other
+   list surface in the app — the Library, /chats, /admin/users, /admin/tables —
+   runs on one shared engine, so this corner behaved like a different product
+   and each of its tabs behaved like a different page.
+
+   One search, one Filter button holding every facet, chips stating what is
+   applied, a live count, one empty state. Facets are built server-side, and one
+   with fewer than two values does not render — which is what retired the
+   glossary's "All 12 / Defined directly 12" nav, a control that could not
+   change what was on screen. #}
+{% macro page_toolbar(facets, tabs, total) %}
+<div class="fbar sl-fbar" role="group" aria-label="Search and filter definitions">
+  <div class="fbar__search" role="search">
+    <svg class="fbar__search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
+    <input id="sl-search" type="search" placeholder="Search definitions…" autocomplete="off" aria-label="Search definitions">
+  </div>
+  {% if facets %}
+  <div class="fbar-filter">
+    <button type="button" class="fbar-filter__btn" id="sl-filter-btn" aria-haspopup="true" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M7 12h10M11 18h2"/></svg>
+      Filter<span class="fbar-filter__n" hidden>0</span>
+    </button>
+    <div class="fbar-menu fbar-menu--cats" id="sl-filter-menu" role="menu" aria-label="Filter definitions" hidden>
+      {% for facet_key, cat_label, options in facets %}
+      <div class="fbar-cat" data-cat="{{ facet_key }}">
+        <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+          <span class="fbar-cat__label">{{ cat_label }}</span>
+          <span class="fbar-cat__end">
+            <span class="fbar-cat__n" data-cat-count="{{ facet_key }}" hidden>0</span>
+            <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+        </button>
+        <div class="fbar-cat__pop" hidden>
+          {% for key, label, n in options %}
+          <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ facet_key }}" value="{{ key }}"><span class="fbar-menu__opt-text">{{ label }}</span><span class="fbar-menu__opt-n">{{ n }}</span></label>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+      <div class="fbar-menu__foot">
+        <button type="button" data-fbar-clear>Clear</button>
+        <button type="button" data-fbar-done>Done</button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+  {# A–Z / Z–A. The list opened alphabetical and offered no way to say so or to
+     reverse it — the Library has had a sort control since it shipped, and a
+     reader who scrolled to the bottom of 21 metrics had no way back up by
+     name. Two options only: there is no date on these rows and no size, so
+     "recently added" would be a control with nothing behind it. #}
+  <label class="sl-sort">
+    <span class="sl-sort__label">Sort</span>
+    <select id="sl-sort" aria-label="Sort definitions">
+      <option value="name_asc">A → Z</option>
+      <option value="name_desc">Z → A</option>
+    </select>
+  </label>
+</div>
+{# Chips under the bar that set them, THEN the tabs. The order is the claim:
+   everything above narrows the whole page, and the tabs below split what
+   survives — which is why their counts move as you type. #}
+<div class="fbar-chips" id="sl-chips" hidden></div>
+<div class="tab-strip sl-tabs" id="sl-tabs" role="radiogroup" aria-label="Definitions views">
+  {% for t in tabs %}
+  <button type="button" class="fbar-seg__btn{% if t.active %} is-active{% endif %}"
+          data-own="{{ t.key }}" role="radio" aria-checked="{{ 'true' if t.active else 'false' }}">
+    <span>{{ t.label }}</span>
+    <span class="fbar-seg__n" data-seg-count="{{ t.key }}">{{ t.count }}</span>
+  </button>
+  {% endfor %}
+</div>
+{# `aria-live`: the count and the state below it ARE the answer to what the
+   reader just typed, and without this a screen-reader user types into the box
+   and hears nothing at all. `polite`, so it waits for a pause instead of
+   interrupting every keystroke. #}
+<div class="sl-countline" aria-live="polite"><span id="sl-count">{{ total }} item{{ '' if total == 1 else 's' }}</span></div>
+{% endmacro %}
+
 {% macro source_badge(source) -%}
 {%- if source in keboola_semantic_layer_sources -%}
 <span class="badge badge--success">Keboola sync</span>
@@ -45,27 +140,34 @@
 
    `--ds-text-secondary`, not `--ds-text-muted` — muted is 3.67:1 on this
    page's background, under the 4.5:1 AA floor for 13px text. */
+/* Matched to `.apg-back` (admin_page.css), the way-back every other content
+   page renders: same weight, same spacing below, same hover. It diverged on
+   all three, which is the kind of near-miss that makes one page feel like a
+   different product. Still its own class — renaming it is a separate sweep. */
 .slb-back {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    margin: 0 0 10px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
-.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back:hover { color: var(--ds-primary); }
 .slb-back svg { width: 15px; height: 15px; }
 
 /* ── Head band — the same anatomy as /me/activity's, /me/profile's ── */
-.sl-head { margin: 2px 0 0; }
-.sl-kicker { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ds-agnes); }
 
 /* `.fbar-grid` (filter_toolbar.css) is fixed at 3 columns; auto-fill reads
    better for a collection this short and matches the pre-shell grid's own
    sizing — same page-specific-override pattern as admin_data_packages'
    own `.adp-grid`. */
 .sl-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+/* The counts are the card's substance here, so they wrap rather than ellipse.
+   Platform-wide `.fbar-card__meta` is one nowrap line, which is right for a
+   path or a dialect and wrong for five facts. */
+.sl-grid .fbar-card__meta { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.45; }
 
 /* An invalid document is still a real card, flagged rather than styled
    away — an attribute selector rather than a second class on the `<article>`
@@ -96,112 +198,81 @@
     color: var(--ds-text-secondary);
 }
 
-/* ── Shell: sidebar + main ───────────────────────────────────────────── */
-.sl-shell {
-    display: grid;
-    grid-template-columns: 200px 1fr;
+/* ── The flat registries: toolbar, then list ─────────────────────────────
+   The sidebar+main grid this replaces is gone with the sidebar. Rows sit in a
+   bordered card the way the Library's do, so the two pages are the same shape
+   under the same toolbar. */
+.sl-flat { display: flex; flex-direction: column; gap: 0; }
+.sl-fbar { margin: 0; }
+/* The sort control sits at the far end of the bar, after the Filter button —
+   the Library's order, so the two bars read the same left to right. */
+.sl-sort { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+.sl-sort__label { font-size: 12.5px; color: var(--ds-text-muted); }
+.sl-sort select {
+    height: 34px; padding: 0 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--radius-md, 8px);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+    font: inherit; font-size: 13px; cursor: pointer;
+}
+.sl-sort select:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
+/* Chips clear of the bar that SET them: butted against it they read as a second
+   row of the control rather than as its result. Scoped to the page's own chip
+   row (not `.sl-flat`'s, which is inside a bucket) — the row lives above the
+   tabs now. */
+#sl-chips { margin: 10px 0 0; justify-content: flex-start; }
+#sl-chips[hidden] { display: none; }
+/* The break between "what I asked for" (search, filter, chips) and "what came
+   back" (tabs, count, rows). Bigger than the gaps inside either group, so the
+   eye finds the two zones without reading them. */
+.sl-tabs { margin: 20px 0 0; }
+/* Three tabs with counts do not fit 375px, so the strip scrolls — and a strip
+   that scrolls with its last tab cut flush at the edge looks clipped rather
+   than scrollable. The padding leaves a sliver of the next tab showing, which
+   is the cue; `-webkit-overflow-scrolling` keeps it from feeling stuck on iOS.
+   `scrollbar-width: none` because the bar is 3 items long and a scrollbar under
+   it would read as a second rule beneath the tab underline. */
+@media (max-width: 560px) {
+    .sl-tabs {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        padding-right: 24px;
+    }
+    .sl-tabs::-webkit-scrollbar { display: none; }
+}
+.sl-countline {
+    margin: 14px 0 10px;
+    font-size: 12.5px;
+    color: var(--ds-text-muted);
+}
+/* No top padding: this sits directly under the count line, which already
+   spaced it, and the empty bucket above it renders nothing at all now. */
+.sl-elsewhere { padding: 2px 0 24px; }
+.sl-elsewhere[hidden] { display: none; }
+.sl-elsewhere__lede { margin: 0 0 10px; font-size: 13.5px; color: var(--ds-text-secondary); }
+.sl-elsewhere__jumps { display: flex; gap: 8px; flex-wrap: wrap; }
+.sl-elsewhere__btn {
+    padding: 0; border: none; background: none; font: inherit;
+    font-weight: 600; color: var(--ds-primary); cursor: pointer;
+}
+.sl-elsewhere__btn:hover { text-decoration: underline; }
+/* Where the rest of the answer is — muted, on the count's own line, because it
+   is a fact about the result set and not a notice. */
+.sl-crosstab { color: var(--ds-text-muted); }
+.sl-crosstab[hidden] { display: none; }
+.sl-crosstab__link { color: var(--ds-primary); font-weight: 600; text-decoration: none; }
+.sl-crosstab__link:hover { text-decoration: underline; }
+.sl-scroll {
     border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
+    border-radius: 12px;
     overflow: hidden;
     background: var(--ds-surface);
-    min-height: 480px;
-    margin-bottom: var(--space-9);
 }
-@media (max-width: 660px) {
-    .sl-shell { grid-template-columns: 1fr; }
-    .sl-sidebar { border-right: none; border-bottom: 1px solid var(--ds-border); }
-}
+/* A list whose every row is filtered out is not an empty card — it is nothing.
+   Left to itself the bordered box collapsed to a 2px hairline under the count,
+   which reads as a rule the page did not mean to draw. */
+.sl-scroll.is-empty, .sl-grid.is-empty { display: none; }
 
-/* ── Sidebar ─────────────────────────────────────────────────────────── */
-.sl-sidebar {
-    border-right: 1px solid var(--ds-border);
-    background: var(--ds-surface-dim);
-    display: flex;
-    flex-direction: column;
-}
-
-.sl-sidebar-body { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.sl-sidebar-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
-.sl-sidebar-panel.is-active { display: flex; }
-
-.sl-sidebar-search {
-    padding: 10px 10px 8px;
-    flex-shrink: 0;
-}
-.sl-sidebar-search input {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-md);
-    background: var(--ds-surface);
-    color: var(--ds-text-primary);
-    font: 12px/1.4 inherit;
-    padding: 6px 10px;
-    outline: none;
-}
-.sl-sidebar-search input:focus {
-    border-color: var(--ds-primary);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--ds-primary) 18%, transparent);
-}
-.sl-sidebar-search input::placeholder { color: var(--ds-text-muted); }
-
-.sl-cat-nav { display: block; flex: 1; overflow-y: auto; padding: 4px 0 8px; }
-.sl-cat-btn {
-    width: 100%;
-    text-align: left;
-    border: none;
-    background: none;
-    cursor: pointer;
-    padding: 6px 12px;
-    font: 13px/1.4 inherit;
-    color: var(--ds-text-secondary);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 4px;
-    transition: background 0.1s, color 0.1s;
-}
-.sl-cat-btn:hover { background: color-mix(in srgb, var(--ds-primary) 5%, transparent); color: var(--ds-text-primary); }
-.sl-cat-btn.is-active { background: color-mix(in srgb, var(--ds-primary) 9%, transparent); color: var(--ds-primary); font-weight: 600; }
-.sl-cat-n {
-    font-size: 10px;
-    background: var(--ds-surface);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-full);
-    padding: 1px 6px;
-    color: var(--ds-text-muted);
-    flex-shrink: 0;
-}
-.sl-cat-btn.is-active .sl-cat-n {
-    background: color-mix(in srgb, var(--ds-primary) 8%, transparent);
-    border-color: color-mix(in srgb, var(--ds-primary) 28%, transparent);
-    color: var(--ds-primary);
-}
-
-/* ── Main ────────────────────────────────────────────────────────────── */
-.sl-main { display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-.sl-main-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
-.sl-main-panel.is-active { display: flex; }
-
-.sl-main-bar {
-    padding: var(--space-3) var(--space-4);
-    border-bottom: 1px solid var(--ds-border);
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-shrink: 0;
-}
-.sl-main-title { font-size: 14px; font-weight: 600; color: var(--ds-text-primary); flex: 1; }
-.sl-n-pill {
-    font-size: 11px;
-    background: var(--ds-surface-dim);
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-full);
-    padding: 2px 8px;
-    color: var(--ds-text-muted);
-}
-
-.sl-scroll { flex: 1; overflow-y: auto; }
 
 /* ── Metric rows ─────────────────────────────────────────────────────── */
 .sl-item { border-bottom: 1px solid var(--ds-border); }
@@ -240,13 +311,22 @@
 
 .sl-row__main { flex: 1; min-width: 0; }
 .sl-row__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); }
+/* Two lines, wrapped — for a METRIC as much as for a term. One line meant a
+   description a few words too long was cut mid-sentence on the row and then
+   restated in full inside the panel, so the reader paid a click to be told
+   what they had already half-read. Two lines hold every description this
+   registry actually carries; the panel keeps the overflow case (see
+   `trimRedundantDescriptions` below), so nothing is ever unreadable. */
 .sl-row__desc {
     font-size: 12px;
     color: var(--ds-text-muted);
     margin-top: 1px;
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
     overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    line-height: 1.45;
 }
 .sl-row__right {
     display: flex;
@@ -254,6 +334,29 @@
     align-items: center;
     flex-shrink: 0;
 }
+/* The initial, kept from the card: on a list of 50 terms it is what the eye
+   scans down. Quiet — it is a wayfinding mark, not data. */
+/* A row with nothing behind it: no chevron, no cursor change, no click. It
+   still renders as a row — the term and its wrapped definition ARE the content,
+   and there is simply no second layer. */
+.sl-seealso {
+    padding: 0; border: none; background: none; font: inherit;
+    color: var(--ds-primary); font-weight: 600; cursor: pointer;
+}
+.sl-seealso:hover { text-decoration: underline; }
+.sl-seealso-sep { color: var(--ds-border); margin: 0 2px; }
+.sl-seealso--dead { color: var(--ds-text-muted); }
+.sl-item.is-flat .sl-row { cursor: default; }
+.sl-item.is-flat .sl-row__chev { visibility: hidden; }
+.sl-row__letter {
+  flex: none; display: inline-grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 6px;
+  background: var(--ds-surface-dim); color: var(--ds-text-muted);
+  font-size: 11px; font-weight: 700;
+}
+/* Where a term is defined, on the row — the same quiet register the metrics
+   row uses for its source badge. */
+.sl-row__prov { font-size: 12px; color: var(--ds-text-muted); white-space: nowrap; }
 .sl-row__chev {
     color: var(--ds-text-muted);
     flex-shrink: 0;
@@ -320,73 +423,10 @@
 .sl-detail__model-link { margin: 0 0 8px; font-size: 12px; }
 
 /* ── Glossary grid ───────────────────────────────────────────────────── */
-.sl-glossary-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 10px;
-    padding: 14px 18px;
-    align-content: start;
-}
+/* The glossary's card grid and `.sl-term` styles went with the cards: one
+   registry rendered two ways is one of them drifting. Terms are `.sl-item`
+   rows now, styled above with the metrics. */
 
-.sl-term {
-    border: 1px solid var(--ds-border);
-    border-radius: var(--radius-lg);
-    background: var(--ds-surface);
-    cursor: pointer;
-    text-align: left;
-    font: inherit;
-    padding: 0;
-    overflow: hidden;
-    transition: box-shadow 0.12s, border-color 0.12s;
-    display: block;
-    width: 100%;
-}
-.sl-term:hover {
-    border-color: color-mix(in srgb, var(--ds-primary) 35%, transparent);
-    box-shadow: 0 2px 8px color-mix(in srgb, var(--ds-primary) 8%, transparent);
-}
-.sl-term.is-open { border-color: color-mix(in srgb, var(--ds-primary) 45%, transparent); }
-
-.sl-term__head { padding: 12px 12px 8px; }
-.sl-term__letter {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px; height: 24px;
-    border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--ds-primary) 10%, transparent);
-    color: var(--ds-primary);
-    font: 700 11px/1 inherit;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-}
-.sl-term__name { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); margin-bottom: 4px; }
-.sl-term__preview {
-    font-size: 12px;
-    color: var(--ds-text-muted);
-    line-height: 1.4;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-}
-.sl-term__foot {
-    padding: 6px 12px 10px;
-    display: flex;
-    justify-content: flex-end;
-}
-.sl-term__body {
-    display: none;
-    padding: 10px 12px 12px;
-    border-top: 1px solid var(--ds-border);
-    background: var(--ds-surface-dim);
-    font-size: 12px;
-    color: var(--ds-text-secondary);
-    line-height: 1.5;
-}
-.sl-term.is-open .sl-term__body { display: block; }
-.sl-term__body p { margin: 0 0 6px; }
-.sl-term__body p:last-child { margin-bottom: 0; }
 
 /* ── Empty / loading ─────────────────────────────────────────────────── */
 .sl-empty {
@@ -404,7 +444,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .sl-cat-btn, .sl-row, .sl-row__dot, .sl-row__chev, .sl-term {
+    .sl-row, .sl-row__dot, .sl-row__chev {
         transition: none;
     }
 }
@@ -413,50 +453,92 @@
 
 {% block page_head %}
 {% set _back = detail_back('semantics', '/library', 'Library') %}
-<a class="slb-back" href="{{ _back.href }}">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-  {{ _back.label }}
-</a>
-<div class="sl-head">
-  <div class="sl-kicker">Semantic layer</div>
-  <h1 class="page-title">Semantic models</h1>
-  <p class="page-lede">Browse your organization's datasets, metrics, relationships and glossary — the stored documents, and the flat metric and glossary registries projected from them.</p>
-</div>
-{# ── One page, three views (#1707 N5) ─────────────────────────────────────
-   The flat `metric_definitions` / `glossary_terms` projection used to be its
-   own page (/catalog/semantics, now a 308 onto the All-metrics tab). Two
-   pages over one semantic layer asked the reader to know, before arriving,
-   whether the thing they wanted was "a metric" or "the model a metric came
-   from" — and each page's way to the other was a single line of prose.
-
-   Server-rendered LINK tabs (`ds.tabs`, the same strip one model's own
-   object types use a level down), not client-side toggles: the tab is part
-   of the address, so a deep link, a bookmark and a browser Back all agree —
-   which is precisely what the retired page's `#metrics` fragment could not
-   do, since a fragment never reaches the server. #}
-{{ ds.tabs(items=tabs, aria_label='Semantic layer views') }}
+{# Same mark as `.apg-back` and as the model detail page: an arrow, not a
+   chevron. Two ways back drawn two ways, one screen apart, is the kind of
+   near-miss that makes one page feel like a different product. #}
+<a class="slb-back" href="{{ _back.href }}"><span aria-hidden="true">&larr;</span> {{ _back.label }}</a>
+{# The SAME header every other content page renders — `page-header--plain`
+   with an eyebrow, a title and a subtitle (see `_page_hero.html`). This page
+   hand-rolled its own `.sl-head` / `.sl-kicker` / `.page-title` trio, which
+   is why it read as a different product from the Library one click away: a
+   heavier eyebrow, a different title size, its own spacing. The markup is
+   copied rather than included because this page extends `base_index.html`
+   (whose `.idx` shell paints its own surface) and so cannot take
+   `base_page.html`'s hero variables — one shape, two hosts. #}
+<section class="page-header page-header--plain">
+  <div class="page-header__main">
+    {# No eyebrow. It read "LIBRARY" directly under a back link that already
+       says "← Library" — the same word twice, two lines apart, one of them in
+       caps. The back link is the relation; the eyebrow was restating it. #}
+    <h1 class="page-header__title">Definitions</h1>
+    {# Said in the reader's terms, not the implementation's. The old subtitle
+       ("the stored documents, and the flat metric and glossary registries
+       projected from them") described the data model: a reader has to know
+       what a projection is before the sentence means anything. #}
+    <p class="page-header__subtitle">The words and numbers your organization has agreed on — what counts as revenue, what an active account is. Your agents answer with them.</p>
+  </div>
+</section>
 {% endblock %}
 
 {% block page_surface %}
-{% if active_tab == 'models' %}
+{{ page_toolbar(page_facets, tabs, (models | length) + (metric_rows | length) + (glossary_terms | length)) }}
+
+{# The three buckets, all on the page at once. They used to be three
+   server-rendered pages behind link tabs, which is why one search could only
+   ever see the tab it was typed on. Rendering all three is what lets the tabs
+   be BUCKETS of one filtered set — narrow above, and every tab's count moves.
+
+   The cost is smaller than it looks: the metrics tab already rendered its
+   whole (unbounded) list, so what is added is the glossary (capped at 500)
+   and the model cards, not three times anything. #}
+<div class="sl-bucket" data-bucket="models"{% if active_tab != 'models' %} hidden{% endif %}>
 {% if models %}
-<div class="fbar-grid sl-grid">
+<div class="fbar-grid sl-grid" id="models-list">
     {% for m in models %}
     {% set _is_invalid = m.status == 'invalid' %}
+    {# The card's `tags` carry only what the model HAS. A zero spent one of the
+       three visible chips saying a thing is ABSENT, which pushed the real counts
+       behind a "+2" and left the survivors truncated mid-word ("0 constrai…").
+       A model with two datasets and two metrics now says exactly that. #}
+    {# `data-tab` is the bucket this row belongs to and `data-ft` the search
+       index — the two things every row on this page must declare.
+
+       Escaped with `replace`, not `| e`. The macro emits this whole string
+       with `| safe`, so the VALUE has to be escaped here — but `escape`
+       returns Markup, and Jinja's `~` escapes the PLAIN side whenever either
+       operand is Markup, so the quotes of this very string came out as `&#34;`
+       and the attribute was malformed. (`| string` does not undo it either:
+       that filter is `soft_str`, and Markup is a str subclass, so it passes
+       straight through.) It LOOKED fine — the browser read the mangled value
+       as a stray attribute and `indexOf` still matched most queries — which is
+       how it survived being screenshotted. `replace` takes a str and returns a
+       str, so the concatenation stays plain and `| safe` emits it once. #}
+    {# What the model CONTAINS goes in the card's META line, and the dialect —
+       one short label — becomes its chip. It was the other way round, and the
+       counts did not fit: the card renders three chips at 11ch each, so a model
+       with all five kinds came out as "2 datasets · 2 metrics · 2 constrai…"
+       with the rest behind a "+2". Counts are prose, a dialect is a label; each
+       now sits in the slot shaped for it.
+
+       Only what the model HAS — a zero spent a slot saying a thing is absent. #}
+    {% set _counts = [
+         m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's') if m.counts.datasets else None,
+         m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's') if m.counts.metrics else None,
+         m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's') if m.counts.constraints else None,
+         m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's') if m.counts.relationships else None,
+         m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's') if m.counts.glossary else None,
+       ] | reject('none') | list %}
     {% set _card = {
          'kind': 'data',
          'title': m.name,
          'href': '/semantic-layer/' ~ m.slug,
          'description': m.description or '',
-         'meta': ('SQL dialect' ~ ('' if m.dialects | length == 1 else 's') ~ ': ' ~ (m.dialects | join(', '))) if m.dialects else '',
-         'tags': [] if _is_invalid else [
-             m.counts.datasets ~ ' dataset' ~ ('' if m.counts.datasets == 1 else 's'),
-             m.counts.metrics ~ ' metric' ~ ('' if m.counts.metrics == 1 else 's'),
-             m.counts.constraints ~ ' constraint' ~ ('' if m.counts.constraints == 1 else 's'),
-             m.counts.relationships ~ ' relationship' ~ ('' if m.counts.relationships == 1 else 's'),
-             m.counts.glossary ~ ' glossary term' ~ ('' if m.counts.glossary == 1 else 's'),
-         ],
-         'attrs': 'data-status="invalid"' if _is_invalid else None,
+         'meta': _counts | join(' · '),
+         'tags': [] if _is_invalid else (m.dialects or []),
+         'attrs': ('data-tab="models" data-name="' ~ ((m.name or '') | lower | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;')) ~ '" data-ft="'
+                   ~ ((m.name ~ ' ' ~ (m.description or '')) | lower
+                      | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
+                   ~ '"' ~ (' data-status="invalid"' if _is_invalid else '')),
        } %}
     {% if m.is_imported or _is_invalid %}
     {% call fbar_card(_card) %}
@@ -501,139 +583,77 @@
 {{ state.panel('empty', 'No semantic model available',
                body='Ask an admin to import or author one, or to grant you access to an existing one.') }}
 {% endif %}
-<p class="sl-empty-related-link">The <a href="/semantic-layer?tab=all_metrics">All metrics</a> tab lists every metric registered here, document-backed or not.</p>
+<p class="sl-empty-related-link">The <a href="/semantic-layer?tab=all_metrics">Metrics</a> tab lists every metric registered here, document-backed or not.</p>
 {% endif %}
+</div>
 
-{% else %}
-{# ── The flat projections ────────────────────────────────────────────────
-   Ported whole from the retired /catalog/semantics: the same sidebar+main
-   shell, the same accordion rows and the same client-side filter over
-   server-rendered markup (the scale is tens-to-low-hundreds, so there is no
-   search endpoint to add). What changed is the SHELL around it — this is a
-   tab of the model list now, so the page's own back link, stats header and
-   client-side tab row are gone; the strip above owns the switch. #}
-<div class="sl-shell">
-
-  <aside class="sl-sidebar">
-    <div class="sl-sidebar-body">
-      {% if active_tab == 'all_metrics' %}
-      <div class="sl-sidebar-panel is-active" id="sidebar-metrics">
-        <div class="sl-sidebar-search">
-          <input id="metric-filter" type="search" placeholder="Filter metrics…" autocomplete="off" aria-label="Filter metrics">
-        </div>
-        <nav class="sl-cat-nav" aria-label="Metric categories">
-          <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
-            <span>All</span>
-            <span class="sl-cat-n">{{ metric_count }}</span>
-          </button>
-          {% for cat in metric_categories %}
-          <button type="button" class="sl-cat-btn" data-cat="{{ cat.name | lower }}">
-            <span>{{ cat.name }}</span>
-            <span class="sl-cat-n">{{ cat.metrics | length }}</span>
-          </button>
-          {% endfor %}
-        </nav>
-      </div>
-      {% else %}
-      <div class="sl-sidebar-panel is-active" id="sidebar-glossary">
-        <div class="sl-sidebar-search">
-          <input id="glossary-search" type="search" placeholder="Search glossary…" autocomplete="off" aria-label="Search glossary">
-        </div>
-        {# #1956 item 1: mirrors the metrics sidebar's category nav above —
-           same markup, same classes. Glossary terms carry no per-MODEL
-           attribution (unlike a document-projected metric's `category`), so
-           this buckets by the term's own `source` instead — the coarser
-           provenance a glossary row actually has (see the router). #}
-        <nav class="sl-cat-nav" aria-label="Glossary sources">
-          <button type="button" class="sl-cat-btn is-active" data-cat="__all__">
-            <span>All</span>
-            <span class="sl-cat-n">{{ glossary_count_label }}</span>
-          </button>
-          {% for cat in glossary_categories %}
-          <button type="button" class="sl-cat-btn" data-cat="{{ cat.key | lower }}">
-            <span>{{ cat.label }}</span>
-            <span class="sl-cat-n">{{ cat.count }}</span>
-          </button>
-          {% endfor %}
-        </nav>
-      </div>
-      {% endif %}
-    </div>
-  </aside>
-
-  <main class="sl-main">
-
-    {% if active_tab == 'all_metrics' %}
-    <div class="sl-main-panel is-active" id="panel-metrics">
-      <div class="sl-main-bar">
-        <span class="sl-main-title" id="metrics-title">All metrics</span>
-        <span class="sl-n-pill" id="metrics-shown">{{ metric_count }}</span>
-      </div>
-      <div class="sl-scroll" id="metrics-list">
-        {% if metric_categories %}
-          {% for cat in metric_categories %}
-          <div class="sl-cat-group" data-cat="{{ cat.name | lower }}">
-            {% for m in cat.metrics %}
-            <div class="sl-item"
-                 data-ft="{{ ((m.name or '') ~ ' ' ~ (m.display_name or '') ~ ' ' ~ (m.description_text or '') ~ ' ' ~ ((m.synonyms or []) | join(' '))) | lower }}"
-                 data-cat="{{ cat.name | lower }}">
-              <button type="button" class="sl-row">
-                <span class="sl-row__dot"></span>
-                <div class="sl-row__main">
-                  <div class="sl-row__name">{{ m.display_name or m.name }}</div>
-                  {% if m.description_text %}<div class="sl-row__desc">{{ m.description_text }}</div>{% endif %}
-                </div>
-                <div class="sl-row__right">
-                  {{ source_badge(m.source) }}
-                  {% if m.tables %}<span class="badge">JOIN</span>{% endif %}
-                  <span class="sl-row__chev">›</span>
-                </div>
-              </button>
-              <div class="sl-detail">
-                {% if m.description_html %}<div class="sl-detail__desc">{{ m.description_html | safe }}</div>{% endif %}
-                <div class="sl-meta-row">
-                  <span><strong>Type</strong> {{ m.type or '—' }}</span>
-                  {% if m.unit %}<span><strong>Unit</strong> {{ m.unit }}</span>{% endif %}
-                  {% if m.grain %}<span><strong>Grain</strong> {{ m.grain }}</span>{% endif %}
-                  {% if m.tables %}<span><strong>Tables</strong> {{ m.tables | join(', ') }}</span>
-                  {% elif m.table_name %}<span><strong>Table</strong> {{ m.table_name }}</span>{% endif %}
-                  {% if m.dimensions %}<span><strong>Dimensions</strong> {{ m.dimensions | join(', ') }}</span>{% endif %}
-                  {% if m.synonyms %}<span><strong>Synonyms</strong> {{ m.synonyms | join(', ') }}</span>{% endif %}
-                  {% if m.time_column %}<span><strong>Time column</strong> {{ m.time_column }}</span>{% endif %}
-                </div>
-                {# The upstream definition, above the SQL composed from it. A
-                   metric imported from an external catalog carries its
-                   expression verbatim, and that — not the generated query — is
-                   what an analyst opens this detail to read. #}
-                {% if m.expression %}
-                <p><strong>Expression</strong></p>
-                <pre><code>{{ m.expression }}</code></pre>
-                {% endif %}
-                <pre><code>{{ m.sql }}</code></pre>
-                {% if m.sql_variants %}
-                <p><strong>Variants</strong></p>
-                {% for variant, variant_sql in m.sql_variants.items() %}
-                <p class="sl-variant-name"><code>{{ variant }}</code></p>
-                <pre><code>{{ variant_sql }}</code></pre>
-                {% endfor %}
-                {% endif %}
-                {# Door into the document this row was projected from — set
-                   only for a metric that HAS such an object and whose model
-                   the caller can read (app/web/router.py::
-                   _document_metric_hrefs). A hand-authored or yaml_import
-                   metric renders without it. #}
-                {% if m.model_href %}
-                <p class="sl-detail__model-link"><a href="{{ m.model_href }}">Open in the model &rarr;</a></p>
-                {% endif %}
-                {% if m.filters %}<p><strong>Filters</strong></p><ul>{% for f in m.filters %}<li><code>{{ f }}</code></li>{% endfor %}</ul>{% endif %}
-                {% if m.notes %}<p><strong>Notes:</strong></p><ul>{% for n in m.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
-                {% if m.validation %}<p><strong>Validation:</strong> <code>{{ m.validation }}</code></p>{% endif %}
-              </div>
+<div class="sl-bucket" data-bucket="all_metrics"{% if active_tab != 'all_metrics' %} hidden{% endif %}>
+<div class="sl-flat">
+<div class="sl-scroll" id="metrics-list">
+    {% for m in metric_rows %}
+        <div class="sl-item" data-tab="all_metrics"
+             data-name="{{ (m.display_name or m.name or '') | lower }}"
+             data-ft="{{ ((m.name or '') ~ ' ' ~ (m.display_name or '') ~ ' ' ~ (m.description_text or '') ~ ' ' ~ ((m.synonyms or []) | join(' '))) | lower }}"
+             data-model="{{ m.facet_model }}"
+             data-domain="{{ m.facet_domain }}"
+             data-source="{{ m.facet_source }}">
+          <button type="button" class="sl-row" aria-expanded="false">
+            <span class="sl-row__dot"></span>
+            <div class="sl-row__main">
+              <div class="sl-row__name">{{ m.display_name or m.name }}</div>
+              {% if m.description_text %}<div class="sl-row__desc">{{ m.description_text }}</div>{% endif %}
             </div>
+            <div class="sl-row__right">
+              <span class="sl-row__prov">{{ m.defined_in_label }}</span>
+              {{ source_badge(m.source) }}
+              {% if m.tables %}<span class="badge">JOIN</span>{% endif %}
+              <span class="sl-row__chev">›</span>
+            </div>
+          </button>
+          <div class="sl-detail">
+            {% if m.description_html %}<div class="sl-detail__desc">{{ m.description_html | safe }}</div>{% endif %}
+            <div class="sl-meta-row">
+              <span><strong>Type</strong> {{ m.type or '—' }}</span>
+              {% if m.unit %}<span><strong>Unit</strong> {{ m.unit }}</span>{% endif %}
+              {% if m.grain %}<span><strong>Grain</strong> {{ m.grain }}</span>{% endif %}
+              {% if m.tables %}<span><strong>Tables</strong> {{ m.tables | join(', ') }}</span>
+              {% elif m.table_name %}<span><strong>Table</strong> {{ m.table_name }}</span>{% endif %}
+              {% if m.dimensions %}<span><strong>Dimensions</strong> {{ m.dimensions | join(', ') }}</span>{% endif %}
+              {% if m.synonyms %}<span><strong>Synonyms</strong> {{ m.synonyms | join(', ') }}</span>{% endif %}
+              {% if m.time_column %}<span><strong>Time column</strong> {{ m.time_column }}</span>{% endif %}
+            </div>
+            {# The upstream definition, above the SQL composed from it. A
+               metric imported from an external catalog carries its
+               expression verbatim, and that — not the generated query — is
+               what an analyst opens this detail to read. #}
+            {% if m.expression %}
+            <p><strong>Expression</strong></p>
+            <pre><code>{{ m.expression }}</code></pre>
+            {% endif %}
+            <pre><code>{{ m.sql }}</code></pre>
+            {% if m.sql_variants %}
+            <p><strong>Variants</strong></p>
+            {% for variant, variant_sql in m.sql_variants.items() %}
+            <p class="sl-variant-name"><code>{{ variant }}</code></p>
+            <pre><code>{{ variant_sql }}</code></pre>
             {% endfor %}
+            {% endif %}
+            {# Door into the document this row was projected from — set
+               only for a metric that HAS such an object and whose model
+               the caller can read (app/web/router.py::
+               _document_metric_hrefs). A hand-authored or yaml_import
+               metric renders without it. #}
+            {% if m.model_href %}
+            <p class="sl-detail__model-link"><a href="{{ m.model_href }}">Open in the model &rarr;</a></p>
+            {% endif %}
+            {% if m.filters %}<p><strong>Filters</strong></p><ul>{% for f in m.filters %}<li><code>{{ f }}</code></li>{% endfor %}</ul>{% endif %}
+            {% if m.notes %}<p><strong>Notes:</strong></p><ul>{% for n in m.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+            {% if m.validation %}<p><strong>Validation:</strong> <code>{{ m.validation }}</code></p>{% endif %}
           </div>
-          {% endfor %}
-        {% else %}
+        </div>
+        
+    {% endfor %}
+    {% if not metric_rows %}
         <div class="sl-empty">
           {% if models %}
           {# Zero metrics is the DEFAULT state of an imported document that
@@ -647,29 +667,89 @@
           No metrics registered yet.<br>Import a starter pack with<br><code>agnes admin metrics import docs/metrics/</code>
           {% endif %}
         </div>
-        {% endif %}
-      </div>
-    </div>
-    {% else %}
-    <div class="sl-main-panel is-active" id="panel-glossary">
-      <div class="sl-main-bar">
-        <span class="sl-main-title">Glossary</span>
-        <span class="sl-n-pill" id="glossary-shown">{{ glossary_count_label }}</span>
-      </div>
-      <div class="sl-scroll">
-        <div id="glossary-list" class="sl-glossary-grid">
-          <div class="sl-empty">Loading…</div>
-        </div>
-      </div>
-    </div>
     {% endif %}
-
-  </main>
+    <p class="sl-empty" id="metrics-noresults" hidden>Nothing matches that search.</p>
+  </div>
 </div>
-{% endif %}
+</div>
+
+<div class="sl-bucket" data-bucket="all_glossary"{% if active_tab != 'all_glossary' %} hidden{% endif %}>
+<div class="sl-flat">
+<div class="sl-scroll" id="glossary-list">
+    {% for t in glossary_terms %}
+        <div class="sl-item" data-tab="all_glossary"
+             data-name="{{ (t.term or '') | lower }}"
+             data-ft="{{ ((t.term or '') ~ ' ' ~ (t.definition_text or '') ~ ' ' ~ ((t.see_also or []) | join(' ')) ~ ' ' ~ (t.defined_in_label or '')) | lower }}"
+             data-model="{{ t.facet_model }}"
+             data-source="{{ t.facet_source }}"
+             {% if t.has_more %}data-has-more="1"{% endif %}>
+          <button type="button" class="sl-row" aria-expanded="false">
+            <span class="sl-row__letter" aria-hidden="true">{{ t.letter }}</span>
+            <div class="sl-row__main">
+              <div class="sl-row__name">{{ t.term }}</div>
+              {% if t.definition_text %}<div class="sl-row__desc">{{ t.definition_text }}</div>{% endif %}
+            </div>
+            <div class="sl-row__right">
+              <span class="sl-row__prov">{{ t.defined_in_label }}</span>
+              {{ source_badge(t.source) }}
+              {# Hidden on a row with nothing behind it — see `is-flat` in this
+                 page's script. A chevron that opens a verbatim repeat of the
+                 line above it teaches the reader to stop clicking. #}
+              <span class="sl-row__chev">›</span>
+            </div>
+          </button>
+          {# `definition_rich` ONLY, and that is the whole point of the flag.
+             The closed row already shows the definition, wrapped and unclipped
+             — so repeating it here is the duplication this panel exists to
+             stop. It earns its place only when the markdown renders something
+             the plain-text preview above cannot: a link, emphasis, a list. #}
+          <div class="sl-detail">
+            {% if t.definition_rich %}<div class="sl-detail__desc">{{ t.definition_html | safe }}</div>{% endif %}
+            {# A cross-reference is a way TO the other term, not a mention of
+               it. Each one filters this list to that term — the same `?q=`
+               contract the deep links from a model's object page use, applied
+               without a page load since the whole registry is already here. #}
+            {% if t.see_also_refs %}
+            <div class="sl-meta-row"><span><strong>See also</strong>
+              {% for ref in t.see_also_refs %}
+              {%- if ref.kind == 'term' -%}
+              <button type="button" class="sl-seealso" data-seealso="{{ ref.label }}">{{ ref.label }}</button>
+              {%- elif ref.kind == 'metric' -%}
+              <a class="sl-seealso" href="/semantic-layer?tab=all_metrics&amp;q={{ ref.label | urlencode }}">{{ ref.label }}</a>
+              {%- else -%}
+              {# Neither registry has it any more: stated, never linked. #}
+              <span class="sl-seealso--dead" title="No definition with this name">{{ ref.label }}</span>
+              {%- endif -%}
+              {%- if not loop.last %}<span class="sl-seealso-sep">·</span>{% endif -%}
+              {% endfor %}
+            </span></div>
+            {% endif %}
+          </div>
+        </div>
+        
+    {% endfor %}
+    {% if not glossary_terms %}
+    <div class="sl-empty">No glossary terms yet.</div>
+    {% endif %}
+    <p class="sl-empty" id="glossary-noresults" hidden>Nothing matches that search.</p>
+  </div>
+</div>
+</div>
+
+{# Two different empty states, and telling them apart is the whole point. The
+   engine's `noResults` fires when the WHOLE page matches nothing; this one
+   fires when the bucket you are looking at is empty while another still has
+   matches — the state a search across three registries creates constantly, and
+   the one where a blank page is a lie. #}
+<p class="sl-empty" id="sl-noresults" hidden>Nothing matches that search.</p>
+<div class="sl-elsewhere" id="sl-elsewhere" aria-live="polite" hidden>
+  <p class="sl-elsewhere__lede">Nothing here matches — but <span data-elsewhere-n></span>.</p>
+  <div class="sl-elsewhere__jumps" data-elsewhere-jumps></div>
+</div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/filter_toolbar.js') }}"></script>
 <script>
 (function () {
     // ── Legacy fragment → tab ────────────────────────────────────────────
@@ -693,162 +773,354 @@
         d.textContent = s == null ? '' : String(s);
         return d.innerHTML;
     }
-    function trunc(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); }
-    function sourceBadge(src) {
-        if (KEBOOLA_SEMANTIC_LAYER_SOURCES.has(src)) return '<span class="badge badge--success">Keboola sync</span>';
-        if (src === 'yaml_import') return '<span class="badge badge--info">YAML import</span>';
-        if (src === 'openmetadata') return '<span class="badge badge--warn">OpenMetadata</span>';
-        return '<span class="badge">' + esc(src || 'manual') + '</span>';
-    }
 
     // ── Accordion ──
     document.addEventListener('click', (e) => {
-        const btn = e.target.closest('.sl-row, .sl-term');
+        const btn = e.target.closest('.sl-row');
         if (!btn) return;
+        // Nothing behind it — see `is-flat` above.
+        if (btn.closest('.sl-item.is-flat')) return;
         const item = btn.closest('.sl-item') || btn;
         item.classList.toggle('is-open');
+        // The row says whether its panel is open. It is a real <button> that
+        // toggles real content, and a screen reader had no way to know the
+        // click had done anything.
+        btn.setAttribute('aria-expanded', item.classList.contains('is-open') ? 'true' : 'false');
     });
 
-    // ── Metrics: filter + category ──
-    const metricFilter = document.getElementById('metric-filter');
-    // Scoped to the metrics sidebar: `.sl-cat-btn` is the same reused
-    // component the glossary sidebar's source nav renders below, and only
-    // one of the two sidebars exists in the DOM at a time (server-picked by
-    // `active_tab`) — but scoping here keeps each nav's wiring honest even
-    // if that ever changes.
-    const catBtns = document.querySelectorAll('#sidebar-metrics .sl-cat-btn');
-    const metricsTitle = document.getElementById('metrics-title');
-    const metricsShown = document.getElementById('metrics-shown');
-    let activeCat = '__all__';
+    // A term row is worth opening only if it holds something the closed row
+    // cannot show — `see_also`, or a definition whose markdown renders markup
+    // the preview cannot. The server knows both, so it decides both, and this
+    // flattens the rest: no chevron, no click, no expansion.
+    //
+    // Length used to be a third case, measured here because it depends on the
+    // width. It is gone with the clamp that caused it: a definition two words
+    // too long opened a panel repeating the sentence above it. Term rows wrap
+    // to two lines now (metrics keep the one-line clamp — their detail holds
+    // SQL, not more prose), so length reveals nothing to trade a click for.
+    document.querySelectorAll('#glossary-list .sl-item').forEach(item => {
+        if (!item.dataset.hasMore) item.classList.add('is-flat');
+    });
 
-    function applyMetrics() {
-        const q = metricFilter ? metricFilter.value.trim().toLowerCase() : '';
-        let n = 0;
+    // ── A metric's description, said once ────────────────────────────────
+    //    A metric row always has something behind it (type, expression, the
+    //    link into its model), so unlike a term it always earns its chevron.
+    //    What it had not earned was restating the description at the top of
+    //    that panel: the row above shows the same sentence, and now wraps to
+    //    two lines, so on all but the longest descriptions the panel opened
+    //    with a line the reader had just finished reading.
+    //
+    //    Removed only when BOTH hold: the row is not clipping (the browser is
+    //    the only thing that knows, and it depends on the width — hence the
+    //    resize pass), and the panel's text is the row's text and nothing more,
+    //    so a description whose markdown renders a link or a list keeps its
+    //    rendered copy. The effect is that the description is always fully
+    //    readable — on the row when it fits, in the panel when it does not —
+    //    and never twice.
+    function trimRedundantDescriptions() {
         document.querySelectorAll('.sl-item[data-cat]').forEach(item => {
-            const catOk = activeCat === '__all__' || item.dataset.cat === activeCat;
-            const txtOk = !q || (item.dataset.ft || '').includes(q);
-            const show = catOk && txtOk;
-            item.hidden = !show;
-            if (show) n++;
+            const row = item.querySelector('.sl-row__desc');
+            const panel = item.querySelector('.sl-detail__desc');
+            if (!row || !panel) return;
+            const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+            if (norm(panel.textContent) !== norm(row.textContent)) return;
+            const clipped = row.scrollHeight > row.clientHeight + 1;
+            panel.hidden = !clipped;
         });
-        document.querySelectorAll('.sl-cat-group[data-cat]').forEach(g => {
-            g.hidden = activeCat !== '__all__' && g.dataset.cat !== activeCat;
-        });
-        if (metricsShown) metricsShown.textContent = String(n);
     }
+    trimRedundantDescriptions();
+    let _descPass;
+    window.addEventListener('resize', () => {
+        clearTimeout(_descPass);
+        _descPass = setTimeout(trimRedundantDescriptions, 150);
+    });
 
-    if (metricFilter) metricFilter.addEventListener('input', applyMetrics);
-    catBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            catBtns.forEach(b => b.classList.remove('is-active'));
-            btn.classList.add('is-active');
-            activeCat = btn.dataset.cat;
-            if (metricsTitle) metricsTitle.textContent = activeCat === '__all__' ? 'All metrics' : btn.querySelector('span').textContent.trim();
-            applyMetrics();
+    // A cross-reference to another TERM stays on this page: it types the name
+    // into the toolbar's search box and lets the engine answer, which is the
+    // same state a deep link's `?q=` produces. It used to call a page-local
+    // `applyGlossary()`; that function is gone, and dispatching a real `input`
+    // event is how anything outside the engine asks it to re-filter.
+    //
+    // A reference to a METRIC is a real <a> to the metrics tab (the server
+    // decides which of the two a name is, and renders a reference to neither as
+    // plain text), so it needs nothing here.
+    document.querySelectorAll('[data-seealso]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();  // …or the row it sits in would close
+            const term = btn.dataset.seealso || '';
+            const box = document.getElementById('sl-search');
+            if (!box) return;
+            box.value = term;
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+            const hit = [...document.querySelectorAll('#glossary-list .sl-item')]
+                .find(i => !i.hidden &&
+                    i.querySelector('.sl-row__name').textContent.trim().toLowerCase() === term.toLowerCase());
+            if (hit) hit.scrollIntoView({ block: 'center', behavior: 'auto' });
         });
     });
 
-    // The return leg of the deep link: a metric's object page links back here
-    // with `?tab=all_metrics&q=<metric name>`, so the row it means is the one
-    // visible result instead of one entry in an unfiltered list. Read once on
-    // load; typing in the box afterwards is unaffected (the URL is not
-    // rewritten). The same `q` prefills the glossary search, so one parameter
-    // means one thing on both flat tabs.
-    const initialQuery = new URLSearchParams(window.location.search).get('q');
-    if (initialQuery && metricFilter) {
-        metricFilter.value = initialQuery;
-        applyMetrics();
-    }
+    // ── One engine, both flat tabs ────────────────────────────────────────
+    //    This was ~150 lines of page-local filtering: `applyMetrics` walking
+    //    `.sl-item[data-cat]`, `applyGlossary` walking `.sl-item[data-gcat]`,
+    //    two sidebars driving them, two search boxes, two "shown" counters and
+    //    two empty states — a second implementation of what
+    //    static/js/filter_toolbar.js already does for the Library, /chats and
+    //    three admin pages, and one that had drifted (no chips, no way to see
+    //    what was applied, and a nav that rendered even when it had one option).
+    //
+    //    The engine takes the rows as they stand: `data-ft` is the search index
+    //    it already wanted, and the facet attributes come off the same rows the
+    //    counts were tallied from, so an option can never offer a slice that
+    //    matches nothing.
+    // ── One toolbar over all three buckets ───────────────────────────────
+    //    The tabs are BUCKETS of one filtered set, not three pages: everything
+    //    in the bar above narrows the whole page, and the tabs below split what
+    //    survives. That is the Library's model, and it is why one search can
+    //    finally see all three registries — the cross-tab index this replaces
+    //    existed only because the other tabs' rows were not on the page.
+    //
+    //    `.sl-item` covers the two flat registries and `.fbar-card` the models,
+    //    so one engine drives all three.
+    const SL_FACETS = [
+        { key: 'model',  attr: 'data-model',  label: 'Model' },
+        { key: 'domain', attr: 'data-domain', label: 'Domain' },
+        { key: 'source', attr: 'data-source', label: 'Source' },
+    ];
+    const ROWS = '.sl-bucket .sl-item, .sl-bucket .fbar-card';
 
-    // ── Glossary ──
-    const gList = document.getElementById('glossary-list');
-    const gInput = document.getElementById('glossary-search');
-    const gShown = document.getElementById('glossary-shown');
-    // Own bucket state and button set (#1956 item 1) — the glossary list is
-    // fetched client-side (unlike the server-rendered metrics list), so the
-    // source facet is a client-side hide/show over whatever `loadGlossary`
-    // most recently rendered, the same layering `applyMetrics` does over its
-    // server-rendered rows.
-    const glossaryCatBtns = document.querySelectorAll('#sidebar-glossary .sl-cat-btn');
-    let activeGlossarySource = '__all__';
-    let gTimer;
+    if (window.FilterToolbar && document.getElementById('sl-tabs')) {
+        // Only the facets the server actually rendered: it drops one with fewer
+        // than two values, and a facet with no markup behind it would grow a
+        // chip for a control nobody can see.
+        const present = new Set(
+            [...document.querySelectorAll('#sl-filter-menu .fbar-cat')].map(c => c.dataset.cat));
 
-    function applyGlossaryFacet() {
-        let n = 0;
-        document.querySelectorAll('#glossary-list .sl-term[data-cat]').forEach(item => {
-            const show = activeGlossarySource === '__all__' || item.dataset.cat === activeGlossarySource;
-            item.hidden = !show;
-            if (show) n++;
+        window.FilterToolbar.init({
+            rows: ROWS,
+            search: { el: '#sl-search', attr: 'data-ft' },
+            facets: SL_FACETS.filter(f => present.has(f.key)),
+            segments: { container: '#sl-tabs', attr: 'data-tab' },
+            filterBtn: '#sl-filter-btn', menu: '#sl-filter-menu', chips: '#sl-chips',
+            sort: { el: '#sl-sort', keys: { name: 'data-name' } },
+            count: { el: '#sl-count', noun: 'item' },
+            noResults: '#sl-noresults',
+            onApply: () => {
+                showActiveBucket();
+                refreshTabCounts();
+                syncBucketState();
+                syncUrl();
+                document.querySelectorAll(ROWS + '.is-open').forEach(r => {
+                    if (!r.hidden) return;
+                    r.classList.remove('is-open');
+                    const b = r.querySelector('.sl-row');
+                    if (b) b.setAttribute('aria-expanded', 'false');
+                });
+                trimRedundantDescriptions();
+            },
         });
-        if (gShown) gShown.textContent = String(n);
     }
 
-    glossaryCatBtns.forEach(btn => {
-        btn.addEventListener('click', () => {
-            glossaryCatBtns.forEach(b => b.classList.remove('is-active'));
-            btn.classList.add('is-active');
-            activeGlossarySource = btn.dataset.cat;
-            applyGlossaryFacet();
-        });
-    });
+    // ── The view rides the URL ───────────────────────────────────────────
+    //    These tabs used to be real links, so the address bar named the tab you
+    //    were on, Back returned to the previous one and a copied link opened
+    //    where you were. Turning them into client-side buckets silently took
+    //    all three away: you could click Glossary and hand someone a link that
+    //    opened on Metrics.
+    //
+    //    pushState for the TAB, following /admin/access's note on the same
+    //    move — switching view is exactly what Back should undo, and
+    //    replaceState there "walked you out of the page". replaceState for the
+    //    QUERY, because pushing per keystroke would bury the page in history.
+    let urlTab = new URLSearchParams(location.search).get('tab') || 'models';
 
-    function renderTerm(t) {
-        const letter = (t.term || '?')[0];
-        // `definition_text` is the server's plain-text projection: this column
-        // also holds definitions imported verbatim from an external catalog,
-        // which are often rich HTML, and esc() would render those tags as
-        // visible text. Falls back to the stored column.
-        const definition = t.definition_text || t.definition;
-        // `data-cat`: same attribute name and matching convention the
-        // metrics tab's `.sl-item[data-cat]` uses for its category facet —
-        // here the term's own `source` (#1956 item 1), lower-cased the same
-        // way the sidebar buttons' `data-cat` is.
-        const cat = String(t.source || 'manual').toLowerCase();
-        return '<button type="button" class="sl-term" data-cat="' + esc(cat) + '">' +
-            '<div class="sl-term__head">' +
-            '<div class="sl-term__letter">' + esc(letter) + '</div>' +
-            '<div class="sl-term__name">' + esc(t.term) + '</div>' +
-            '<div class="sl-term__preview">' + esc(trunc(definition, 100)) + '</div>' +
-            '</div>' +
-            '<div class="sl-term__foot">' + sourceBadge(t.source) + '</div>' +
-            '<div class="sl-term__body"><p>' + esc(definition) + '</p>' +
-            (t.see_also && t.see_also.length ? '<p><strong>See also:</strong> ' + t.see_also.map(esc).join(', ') + '</p>' : '') +
-            '</div>' +
-            '</button>';
-    }
+    // Read BEFORE anything can rewrite it. This used to run at the end of the
+    // file, by which time the engine's first apply() had already called
+    // syncUrl() with an empty box — which replaceState'd `q` straight out of
+    // the address. Reload a filtered link and you got the whole list with the
+    // query sitting in the box, describing a filter that was not applied.
+    const INITIAL_Q = new URLSearchParams(window.location.search).get('q') || '';
 
-    async function loadGlossary(q) {
-        if (!gList) return;
-        gList.innerHTML = '<div class="sl-empty">Loading…</div>';
-        try {
-            const url = q ? '/api/glossary/search?q=' + encodeURIComponent(q) + '&limit=50' : '/api/glossary?limit=500';
-            const r = await fetch(url, { credentials: 'same-origin' });
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const data = await r.json();
-            const terms = data.terms || [];
-            gList.innerHTML = terms.length ? terms.map(renderTerm).join('') : '<div class="sl-empty">No terms found.</div>';
-            // Re-applies the active source bucket to the freshly rendered
-            // list and sets `gShown` from what actually stayed visible —
-            // the search text and the source facet narrow together, not as
-            // two independent counts.
-            applyGlossaryFacet();
-        } catch (e) {
-            gList.innerHTML = '<div class="sl-empty">Could not load glossary: ' + esc(e.message) + '</div>';
+    function syncUrl() {
+        const active = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
+        const tab = (active && active.getAttribute('data-own')) || 'models';
+        const q = ((document.getElementById('sl-search') || {}).value || '').trim();
+        const p = new URLSearchParams();
+        // The default tab keeps the BARE URL — one canonical address for the
+        // page, so a link to it and a click on its own tab agree.
+        if (tab !== 'models') p.set('tab', tab);
+        if (q) p.set('q', q);
+        const url = p.toString() ? location.pathname + '?' + p : location.pathname;
+        if (tab !== urlTab) {
+            history.pushState({ tab: tab }, '', url);
+            urlTab = tab;
+        } else {
+            history.replaceState({ tab: tab }, '', url);
         }
     }
 
-    if (gInput) {
-        gInput.addEventListener('input', () => {
-            clearTimeout(gTimer);
-            gTimer = setTimeout(() => loadGlossary(gInput.value.trim()), 250);
+    // Back/Forward across those pushes. The tab is the only thing restored —
+    // the engine re-reads the box itself when we dispatch `input`.
+    window.addEventListener('popstate', () => {
+        const p = new URLSearchParams(location.search);
+        const tab = p.get('tab') || 'models';
+        urlTab = tab;
+        const btn = document.querySelector('#sl-tabs [data-own="' + tab + '"]');
+        if (btn && !btn.classList.contains('is-active')) btn.click();
+        const box = document.getElementById('sl-search');
+        if (box && box.value !== (p.get('q') || '')) {
+            box.value = p.get('q') || '';
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    });
+
+    // Only the active bucket's block is on screen. The engine hides individual
+    // ROWS; the wrappers are ours, or all three lists would stack.
+    function showActiveBucket() {
+        const seg = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
+        const tab = seg && seg.getAttribute('data-own');
+        document.querySelectorAll('.sl-bucket').forEach(b => {
+            b.hidden = b.dataset.bucket !== tab;
         });
     }
-    // The glossary tab is its own request now, so the list loads on arrival
-    // rather than on a tab click — there is no other moment.
-    if (gList) {
-        if (initialQuery && gInput) { gInput.value = initialQuery; }
-        loadGlossary(initialQuery || '');
+
+    // What each tab WOULD hold under the current search and filters — counted
+    // with the tab itself ignored, or every badge but the active one would read
+    // zero. `.is-active` is the only trustworthy marker of the current tab: the
+    // engine sets it, while the server-rendered `aria-checked` is never updated.
+    function refreshTabCounts() {
+        const q = ((document.getElementById('sl-search') || {}).value || '').trim().toLowerCase();
+        const sel = {};
+        SL_FACETS.forEach(f => {
+            const on = [...document.querySelectorAll(
+                '#sl-filter-menu input[data-facet="' + f.key + '"]:checked')].map(i => i.value);
+            if (on.length) sel[f.attr] = on;
+        });
+        const counts = {};
+        document.querySelectorAll(ROWS).forEach(r => {
+            // No default bucket here, deliberately. A fallback is what let this
+            // break silently: the model cards carried no `data-tab`, so the
+            // ENGINE hid them on any other segment and never brought them
+            // back, while this count assumed them into the models bucket and
+            // cheerfully reported "2" over an empty grid. A row that declares
+            // no bucket is now counted nowhere, which is visible.
+            const tab = r.getAttribute('data-tab');
+            if (!tab) return;
+            if (q && !((r.getAttribute('data-ft') || '').includes(q))) return;
+            for (const attr in sel) {
+                if (!sel[attr].includes(r.getAttribute(attr) || '')) return;
+            }
+            counts[tab] = (counts[tab] || 0) + 1;
+        });
+        document.querySelectorAll('#sl-tabs [data-seg-count]').forEach(b => {
+            b.textContent = String(counts[b.getAttribute('data-seg-count')] || 0);
+        });
     }
+
+    // The state a page-wide search over three buckets creates constantly: this
+    // tab has nothing, another one does. Left alone the reader gets a blank
+    // area under a tab strip whose other badges are non-zero, which reads as a
+    // bug. Name the number and offer the jump — the same contract the Library's
+    // empty state uses, and the reason the cross-tab note is not needed here:
+    // the tab badges already say where the matches are, so this only has to
+    // handle the case where the reader is looking at the wrong one.
+    // Everything that has to agree once the engine has filtered: the count,
+    // the empty bucket, and WHICH empty state is speaking. Run as one pass,
+    // after the engine, because all three read the same numbers and reading
+    // them at different moments is how they came to disagree on screen.
+    function syncBucketState() {
+        const active = document.querySelector('#sl-tabs .fbar-seg__btn.is-active');
+        const tab = active && active.getAttribute('data-own');
+        const bucket = document.querySelector('.sl-bucket[data-bucket="' + tab + '"]');
+        const here = active ? Number(active.querySelector('[data-seg-count]').textContent || 0) : 0;
+
+        // The count describes what you are LOOKING at. The engine's own number
+        // counts every row it kept across all three buckets, which on a tab
+        // holding none of them said "2 of 35 items" over an empty list.
+        const total = document.querySelectorAll(
+            '.sl-bucket[data-bucket="' + tab + '"] .sl-item, ' +
+            '.sl-bucket[data-bucket="' + tab + '"] .fbar-card').length;
+        const countEl = document.getElementById('sl-count');
+        if (countEl) {
+            const noun = tab === 'models' ? 'model' : tab === 'all_metrics' ? 'metric' : 'term';
+            countEl.textContent = (here === total ? total : here + ' of ' + total)
+                + ' ' + noun + (total === 1 && here === total ? '' : 's');
+        }
+
+        // An emptied list renders nothing rather than an empty bordered card.
+        if (bucket) {
+            bucket.querySelectorAll('.sl-scroll, .sl-grid').forEach(l => {
+                l.classList.toggle('is-empty', here === 0);
+            });
+        }
+
+        // Two empty states, and only ever one of them. `sl-elsewhere` knows
+        // where the matches went, so it outranks the engine's generic
+        // "nothing matches" — which is also plainly wrong when another bucket
+        // has some, and both were firing at once.
+        const box = document.getElementById('sl-elsewhere');
+        const none = document.getElementById('sl-noresults');
+        const others = [...document.querySelectorAll('#sl-tabs .fbar-seg__btn')]
+            .filter(b => b !== active)
+            .map(b => ({ btn: b, n: Number(b.querySelector('[data-seg-count]').textContent || 0),
+                         label: b.querySelector('span').textContent.trim() }))
+            .filter(o => o.n > 0);
+        const elsewhere = here === 0 && others.length > 0;
+        if (box) box.hidden = !elsewhere;
+        if (none) none.hidden = !(here === 0 && !elsewhere);
+        if (!elsewhere || !box) return;
+
+        box.querySelector('[data-elsewhere-n]').textContent =
+            others.map(o => o.n + ' in ' + o.label).join(' and ');
+        const jumps = box.querySelector('[data-elsewhere-jumps]');
+        jumps.textContent = '';
+        others.forEach(o => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'sl-elsewhere__btn';
+            b.textContent = 'Show ' + o.label;
+            // addEventListener, never a handler-property assignment: the
+            // description sanitizer's guard is a page-wide substring check for
+            // inline handlers, so writing one in the script body trips it even
+            // though nothing untrusted is involved. Cheap to honour, and it
+            // keeps that guard strict rather than scoped down to suit us.
+            b.addEventListener('click', () => o.btn.click());
+            jumps.appendChild(b);
+        });
+    }
+
+    // Typed into the box before the first paint, so the engine's own apply()
+    // filters on it rather than being corrected afterwards.
+    (function () {
+        const box = document.getElementById('sl-search');
+        if (INITIAL_Q && box) {
+            box.value = INITIAL_Q;
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    })();
+
+    // "Clear all" sits in the chip row and clears the FACETS — leaving the
+    // search box holding a query the reader just asked to be rid of, so the
+    // list stayed narrowed and the button looked broken. One gesture clears
+    // the toolbar. Delegated, because the engine rebuilds that button.
+    document.getElementById('sl-chips').addEventListener('click', (e) => {
+        if (!e.target.closest('.fbar-chips__clear')) return;
+        const box = document.getElementById('sl-search');
+        if (box && box.value) {
+            box.value = '';
+            box.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+    });
+
+    showActiveBucket();
+    refreshTabCounts();
+    syncBucketState();
+
+    // The return leg of the deep link: a metric's object page links back here
+    // with `?tab=all_metrics&q=<name>`, and a glossary cross-reference to a
+    // metric does the same — so the row it means is the one visible result
+    // rather than one entry in an unfiltered list. Read once on load and typed
+    // into the engine's own box, so there is one search on this page and the
+    // URL is not rewritten as the reader types.
 })();
 </script>
 {% endblock %}

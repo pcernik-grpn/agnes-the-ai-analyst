@@ -4330,6 +4330,62 @@ async def skills_page(
     return templates.TemplateResponse(request, "skills.html", ctx)
 
 
+#: The Model facet's value for a row no document declares. A real option, not
+#: an absence: "which of these did nobody write a model for" is a question a
+#: reader genuinely asks, and it is how the flat registries stay legible next
+#: to the documents.
+_DIRECT_KEY = "direct"
+_DIRECT_LABEL = "Defined directly"
+
+
+def _flat_facet(key: str, label: str, rows: list[dict], attr: str, labels: dict | None = None) -> tuple:
+    """One filter category for a flat registry, tallied off the ROWS.
+
+    Counting the rows rather than fetching a second list is what makes an
+    option's number the number of rows clicking it leaves on screen — the same
+    reason the Library builds its facets this way.
+
+    A row whose value is empty is in NO option: it is not a hidden "other"
+    bucket, it simply carries nothing on this axis (a metric declared by no
+    document has no Model, and one projected from a document has no Domain of
+    its own — its category IS the model's name).
+
+    Returns ``()`` for a facet with fewer than two values, because every row
+    then matches it and the control cannot change what is on screen. That rule
+    is why the glossary's provenance nav no longer renders on an instance where
+    no document declares a term: it was offering "All 12 / Defined directly 12".
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        v = str(r.get(attr) or "")
+        if v:
+            counts[v] = counts.get(v, 0) + 1
+    if len(counts) < 2:
+        return ()
+    opts = sorted(
+        ((v, (labels or {}).get(v, v), n) for v, n in counts.items()),
+        key=lambda o: str(o[1]).lower(),
+    )
+    return (key, label, opts)
+
+
+def _definition_is_rich(html: str) -> bool:
+    """Whether a definition's rendered markdown carries markup its plain-text
+    preview cannot show — a link, emphasis, a list, code.
+
+    Tested by looking for residual markup, NOT by diffing the rendered text
+    against the plain projection: a link's visible text is identical either way
+    ("See the policy…"), so a diff would call the one case most worth expanding
+    — a definition imported verbatim from an external catalog, often rich HTML
+    — plain. Paragraph wrappers and line breaks do not count; they are how the
+    renderer returns a single sentence.
+    """
+    import re as _re
+
+    body = _re.sub(r"</?(?:p|br)\s*/?>", "", html or "", flags=_re.I)
+    return "<" in body
+
+
 def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
     """``{metric_definitions id: object-page URL}`` for every metric of every
     semantic model the caller can read (#1707).
@@ -4532,28 +4588,37 @@ def _readable_model_by_slug(slug: str, user: dict, conn) -> dict | None:
 #: not be deleting it.
 _SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
 
+#: The tab KEYS stay `models` / `all_metrics` / `all_glossary` — they are in
+#: bookmarks, in the 308 from the retired /catalog/semantics, and in skill
+#: references. Only the labels changed.
+#:
+#: "All" went because it did no work beside a count badge that already says how
+#: many, and read as a filter state on tabs that have none. "Models" became
+#: "Semantic models" for the opposite reason — it was too little, not too much:
+#: on a page called Definitions, a bare "Models" names no particular kind of
+#: thing, while "semantic model" is the actual name of the document type this
+#: tab lists and the one piece of the old vocabulary worth keeping.
 _SEMANTIC_LAYER_LIST_TAB_LABELS = {
-    "models": "Models",
+    "models": "Semantic models",
     "all_metrics": "All metrics",
     "all_glossary": "All glossary",
 }
 
 
-#: The bound both glossary counts read under — the ``/semantic-layer`` tab
-#: strip and ``/library``'s Definitions strip. Shared so the two numbers, shown
-#: to the same caller one click apart, cannot drift.
+#: The bound every glossary count reads under — the `/semantic-layer` tab
+#: strip, the list it heads, and `/library`'s Definitions card. 500 is
+#: `GET /api/glossary`'s own max `limit` and the repo has no unbounded mode
+#: (it bounds a full-table scan), comfortably above the tens-to-low-hundreds
+#: scale this feature targets — so an exact count in practice rather than a
+#: true cap. Named because those numbers are shown to the same caller one
+#: click apart: two literals that agree today are two literals that can
+#: disagree later. "In practice" is not "always", which is what
+#: :func:`_glossary_count_label` is for: a registry at or past the limit
+#: renders ``500+`` rather than stating this cap as an exact total.
 _GLOSSARY_COUNT_LIMIT = 500
 
 
 def _glossary_terms_count() -> int:
-    """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
-    unbounded mode (it bounds a full-table scan) — comfortably above the
-    tens-to-low-hundreds scale this feature targets, so an exact count in
-    practice rather than a true cap.
-
-    "In practice" is not "always", which is why :func:`_glossary_count_label`
-    exists: a registry at or past the limit renders ``500+`` rather than
-    stating 500 as an exact total (Devin Review on #2069)."""
     return len(glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT))
 
 
@@ -4659,12 +4724,139 @@ async def semantic_layer_list(
     accessible_ids = get_accessible_tables(user, conn)
     allowed = None if accessible_ids is None else set(accessible_ids)
     visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
-    glossary_count = _glossary_terms_count()
+    #: Read ONCE. `_glossary_terms_count()` fetched these rows and threw them
+    #: away to return a length; the cross-tab index below needs the rows, and
+    #: the glossary tab needs them again. One read, three uses.
+    glossary_all = glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT)
+    glossary_count = len(glossary_all)
+
+    #: Which document declares what — read ONCE, for both registries and for
+    #: the Model facet's labels. It used to be two passes over the same
+    #: documents, one inside each tab's block, which quietly disagreed: the
+    #: glossary pass titled a model from its DOCUMENT while the metrics pass
+    #: titled it from the stored row, so the same model could be labelled two
+    #: ways depending on which tab you were looking at.
+    from app.web.semantic_layer_view import model_glossary, model_of, projected_metric_ids
+
+    #: Every model that declares a term, not the last one to be seen. Two
+    #: models sharing a term used to overwrite each other here, so the row's
+    #: "defined in" badge named whichever document the iteration happened to
+    #: reach last — a provenance claim decided by dict ordering (Devin Review
+    #: on #2070). Collected as a list, sorted, and labelled honestly below.
+    term_models: dict[str, list[str]] = {}
+    metric_model: dict[str, str] = {}
+    model_titles: dict[str, str] = {}
+    for _row in newest_by_slug.values():
+        _slug = str(_row.get("slug") or "")
+        try:
+            _doc = model_of(_row)
+            model_titles[_slug] = _row.get("name") or _doc.get("name") or _slug
+            for _entry in model_glossary(_doc):
+                _term = str(_entry.get("term") or "").strip()
+                if _term:
+                    term_models.setdefault(_term.casefold(), []).append(_slug)
+            for _mid in projected_metric_ids(_row):
+                metric_model[_mid] = _slug
+        except Exception as e:  # noqa: BLE001 - one bad document costs its own provenance
+            logger.warning("/semantic-layer: provenance unavailable for %s: %s", _slug, e)
+
+    #: The glossary, SERVER-rendered like the metrics beside it. It used to be
+    #: fetched on tab-open and drawn by a JS card builder — which is why the two
+    #: halves of one registry looked like different products (cards vs rows) and
+    #: why the glossary sidebar could only ever hold a search box: the server did
+    #: not know the terms at render time, so it had nothing to build a nav from.
+    #: One shape, one filter, one place that knows what a source badge looks
+    #: like (#1956 item 1).
+    glossary_terms: list[dict] = []
+    #: Every registry, every time — the tabs are BUCKETS of one filtered set
+    #: now, not three separate pages, so one search has to be able to see all
+    #: of it. The metrics tab already rendered its whole (unbounded) list, so
+    #: the marginal cost is the glossary (capped at 500) and the model cards
+    #: beside it, not three times anything.
+    if True:
+        from app.markdown_render import render_plain, render_safe
+
+        # NOTE: `model_title` is the #1955 branch's resolver (display_name →
+        # document-declared title → identifier) and does not exist here yet.
+        # Same fallback chain this page already uses for its model cards, so
+        # the two agree until that branch lands.
+
+        #: Which model DECLARES each term. The glossary projector does not stamp
+        #: `model_uuid`, so the document is the only place that knows — the same
+        #: join the metrics side gets for free from `category`, which the
+        #: projector sets to the model name.
+
+        for t in glossary_all:
+            term = str(t.get("term") or "")
+            slugs = sorted(set(term_models.get(term.casefold(), [])))
+            slug = slugs[0] if slugs else None
+            glossary_terms.append(
+                {
+                    **t,
+                    "letter": (term[:1] or "?").upper(),
+                    "definition_html": render_safe(t.get("definition")),
+                    "definition_text": render_plain(t.get("definition")),
+                    "facet_model": slug or _DIRECT_KEY,
+                    "facet_source": str(t.get("source") or "manual"),
+                    #: Names the first model alphabetically and SAYS when there
+                    #: are more, rather than presenting one of several as the
+                    #: only answer. The facet value stays single (the toolbar
+                    #: facet is single-valued here) but is now deterministic.
+                    "defined_in_label": (
+                        _DIRECT_LABEL
+                        if not slug
+                        else model_titles.get(slug, slug)
+                        if len(slugs) == 1
+                        else f"{model_titles.get(slug, slug)} +{len(slugs) - 1} more"
+                    ),
+                    #: Whether the rendered definition shows anything its
+                    #: plain-text preview cannot — a link, emphasis, a list.
+                    #: This is the ONLY thing that puts the definition inside
+                    #: the expansion panel too, because the row above it
+                    #: already carries the same sentence, wrapped and
+                    #: unclipped. Repeating it there was the duplication a
+                    #: reader has no reason to click twice for.
+                    "definition_rich": _definition_is_rich(render_safe(t.get("definition"))),
+                }
+            )
+        glossary_terms.sort(key=lambda t: (t.get("term") or "").lower())
+
+        #: Resolve every cross-reference against BOTH registries before drawing
+        #: it. A `see_also` value names another definition, and a definition is
+        #: as often a metric as a term — "Credit note → Net revenue" points at a
+        #: metric, which lives on the other tab. Three outcomes, and the third
+        #: is why this is resolved at all:
+        #:   term   → filters this list, no page load
+        #:   metric → the metrics tab, carrying the name as `?q=`
+        #:   neither→ rendered as plain text, NOT a link. A reference to
+        #:            something that no longer exists must not look clickable;
+        #:            a dead link is worse than an unlinked word.
+        _term_names = {(t.get("term") or "").casefold() for t in glossary_terms}
+        _metric_names = {n.casefold() for m in visible_metrics for n in (m.get("display_name"), m.get("name")) if n}
+        for t in glossary_terms:
+            refs = []
+            for ref in t.get("see_also") or []:
+                label = str(ref).strip()
+                if not label:
+                    continue
+                key = label.casefold()
+                kind = "term" if key in _term_names else ("metric" if key in _metric_names else "")
+                refs.append({"label": label, "kind": kind})
+            t["see_also_refs"] = refs
+            #: A row opens only when opening adds something: cross-references
+            #: to follow, or markup the preview flattened away. LENGTH is
+            #: deliberately not a third reason — it was, and it meant a
+            #: definition two words too long for the row's clamp opened a panel
+            #: repeating that same sentence. The clamp was the bug; a term's
+            #: definition wraps on the row now. (A metric row keeps its
+            #: one-line preview: its panel holds SQL, grain and tables, so
+            #: there is always something behind it.)
+            t["has_more"] = bool(refs) or bool(t.get("definition_rich"))
 
     # The per-row rendering (markdown, SQL variants, document links) is paid
     # for only by the tab that shows the rows.
-    metric_categories: list[dict] = []
-    if active_tab == "all_metrics":
+    metric_rows: list[dict] = []
+    if True:  # see the note on the glossary block above
         from app.api.metrics import stores_html
         from app.markdown_render import render_plain, render_safe
 
@@ -4713,48 +4905,91 @@ async def semantic_layer_list(
             }
             for m in visible_metrics
         ]
-        by_category: dict[str, list[dict]] = {}
-        for m in rendered:
-            by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
-        metric_categories = [
-            {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
-            for cat, items in sorted(by_category.items())
-        ]
+        #: Which model DECLARES each metric, keyed on the id the PROJECTOR
 
-    # #1956 item 1: the metrics sidebar's "All / <model slugs>" filter reads
-    # `category`, which `src/semantic/projection.py` sets to the owning
-    # model's own name for every document-projected metric. `glossary_terms`
-    # has no equivalent per-model column — `project_document` stamps every
-    # term from a call with the SAME `(source, source_ref)` regardless of
-    # which of a multi-model document's models it came from (see
-    # `src/semantic/importer.py`'s module docstring, step 5), so a document
-    # declaring more than one model cannot be told apart here. `source` is
-    # the finest attribution a glossary row actually carries — the same
-    # provenance the term's own source badge already renders — so that is
-    # what this buckets by; true per-model glossary attribution is tracked
-    # as a #1956 follow-up, not invented here.
-    glossary_categories: list[dict] = []
-    if active_tab == "all_glossary":
-        by_source: dict[str, int] = {}
-        for t in glossary_repo().list(limit=500):
-            src = t.get("source") or "manual"
-            by_source[src] = by_source.get(src, 0) + 1
-        glossary_categories = [
-            {"key": src, "label": source_label(src), "count": n}
-            for src, n in sorted(by_source.items(), key=lambda kv: source_label(kv[0]))
-        ]
+        #: The two axes `category` was carrying at once. A metric projected from
+        #: a document has `category` set to the MODEL's name; a hand-authored one
+        #: has it set to a business domain. One control offering
+        #: "commercial · delivery · finance · people · sales" therefore mixed
+        #: two kinds of thing under one unlabelled heading, and a reader could
+        #: not tell which was which. Split, each says one thing:
+        #:   Model  — which document declares it (or nothing)
+        #:   Domain — what its author filed it under, for the rows no document
+        #:            declares; a projected row has no domain of its own.
+        for m in rendered:
+            slug = metric_model.get(str(m.get("id") or ""))
+            m["facet_model"] = slug or _DIRECT_KEY
+            #: Stated on the ROW, not only filterable. The glossary rows beside
+            #: these have carried it since they were built; a metric row that
+            #: hid it meant you could narrow by Model and still not see the
+            #: answer without opening something. It also separates the pairs
+            #: that share a display name — the same concept defined once in a
+            #: document and once by hand is a real state, and the row was giving
+            #: a reader nothing to tell them apart with.
+            m["defined_in_label"] = model_titles.get(slug, "") if slug else _DIRECT_LABEL
+            m["facet_domain"] = "" if slug else str(m.get("category") or "")
+            m["facet_source"] = str(m.get("source") or "manual")
+
+        #: One flat, alphabetical list. It used to be grouped by `category`
+        #: into `.sl-cat-group` wrappers with no heading of their own — the
+        #: grouping was invisible, existing only so the sidebar could show and
+        #: hide whole blocks. With the sidebar replaced by facets there is
+        #: nothing left for a group to be, and a reader scanning for a name
+        #: gets one A-Z list instead of five.
+        metric_rows = sorted(rendered, key=lambda m: str(m.get("display_name") or m.get("name") or "").lower())
+
+    #: ONE set of facets over every row on the page, because the tabs are
+    #: buckets of one filtered set rather than three pages. A facet a whole
+    #: bucket has no value for simply never matches those rows — a model card
+    #: has no Domain, a metric projected from a document has no Domain of its
+    #: own — which is the engine's existing behaviour for an empty attribute,
+    #: not a special case.
+    _all_rows = (
+        [dict(m, facet_kind="metric") for m in metric_rows]
+        + [dict(t, facet_kind="term") for t in glossary_terms]
+        + [{"facet_model": _DIRECT_KEY, "facet_domain": "", "facet_source": "", "facet_kind": "model"} for _ in models]
+    )
+    page_facets = [
+        f
+        for f in (
+            _flat_facet(
+                "model",
+                "Model",
+                _all_rows,
+                "facet_model",
+                {**model_titles, _DIRECT_KEY: _DIRECT_LABEL},
+            ),
+            _flat_facet("domain", "Domain", _all_rows, "facet_domain"),
+            _flat_facet("source", "Source", _all_rows, "facet_source"),
+        )
+        if f
+    ]
+
+    # NOTE (#1956 item 1): main's first pass at this bucketed the glossary by
+    # `source` and said so — "true per-model glossary attribution is tracked as
+    # a #1956 follow-up, not invented here". That follow-up is what the Model
+    # facet above now does: the term's owning model is read from the DOCUMENT
+    # (`model_glossary`), which is the one place that knows, rather than from a
+    # column the projector never stamps. So the source bucketing is gone with
+    # the sidebar it fed — `source` survives as its own facet, beside Model,
+    # where it is one axis rather than a stand-in for another.
 
     tab_counts = {
         "models": len(models),
         "all_metrics": len(visible_metrics),
         "all_glossary": glossary_count,
     }
+    #: Buckets, not pages. The label and the count are separate now because the
+    #: count MOVES: everything in the toolbar narrows the whole page, and each
+    #: tab's badge reports what it would hold under the current search and
+    #: filters (`refreshTabCounts` in the template). `active` seeds the engine's
+    #: opening segment, so `?tab=` deep links and the 308 from the retired
+    #: /catalog/semantics still land where they name.
     tabs = [
         {
-            "label": f"{_SEMANTIC_LAYER_LIST_TAB_LABELS[key]} ({tab_counts[key]})",
-            # The default tab keeps the BARE URL — one canonical address for
-            # the page, so a link to it and a click on its own tab agree.
-            "href": "/semantic-layer" if key == "models" else f"/semantic-layer?tab={key}",
+            "key": key,
+            "label": _SEMANTIC_LAYER_LIST_TAB_LABELS[key],
+            "count": tab_counts[key],
             "active": key == active_tab,
         }
         for key in _SEMANTIC_LAYER_LIST_TABS
@@ -4766,11 +5001,12 @@ async def semantic_layer_list(
         models=models,
         active_tab=active_tab,
         tabs=tabs,
-        metric_categories=metric_categories,
+        metric_rows=metric_rows,
+        page_facets=page_facets,
+        glossary_terms=glossary_terms,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
         glossary_count_label=_glossary_count_label(glossary_count),
-        glossary_categories=glossary_categories,
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
 

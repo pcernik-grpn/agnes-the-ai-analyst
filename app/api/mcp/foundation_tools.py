@@ -1091,22 +1091,26 @@ def register_foundation_tools(
 
     @tool(read_only=True)
     async def fact_type_map() -> dict:
-        """List every fact type in the graph with a live count of the
-        subjects YOU can see. Use this to orient BEFORE `fact_search` when
-        you do not yet know what types exist — each row's `type` is a valid
-        `fact_search(type=...)` argument, and its `count` tells you whether
-        searching it is worth a call.
+        """List every fact (node) type AND every edge (relationship) type
+        with a live count of what YOU can see — orient here BEFORE
+        `fact_search` (node types) and BEFORE `fact_neighbors` on a
+        well-connected subject (edge types, e.g. `in_industry` for
+        `fact_neighbors(edge_types=[...])`): learning the name here is one
+        small call, versus an unfiltered traversal returning every
+        relationship type a hub node has.
 
-        Counted through the same visibility gate `fact_search` applies, so a
-        number is what you could actually reach and never a total inflated
-        by evidence you cannot read. A type with no subjects visible to you
-        is omitted entirely rather than returned with a count of 0 — absence
-        here means "nothing you can see", which is deliberately
-        indistinguishable from "no such type". Behind the `facts` feature
-        flag (off by default); requires the Postgres app-state backend.
-        Mirrors `GET /api/facts/type-map` and `agnes facts type-map`.
+        Counted through the same visibility gate `fact_search`/
+        `fact_neighbors` apply, so a number is what you could actually
+        reach and never a total inflated by evidence you cannot read. A
+        type with nothing visible to you is omitted entirely rather than
+        returned with a count of 0 — absence here means "nothing you can
+        see", which is deliberately indistinguishable from "no such type".
+        Behind the `facts` feature flag (off by default); requires the
+        Postgres app-state backend. Mirrors `GET /api/facts/type-map` and
+        `agnes facts type-map`.
 
-        Returns ``{"types": [{"type", "count"}], "total"}``, ordered by type.
+        Returns ``{"types": [{"type", "count"}], "total",
+        "edge_types": [{"type", "count"}]}``, both lists ordered by type.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
@@ -1114,9 +1118,11 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         counts = await asyncio.to_thread(facts_repo().count_visible_facts_by_type, caller)
+        edge_counts = await asyncio.to_thread(facts_repo().count_visible_edges_by_type, caller)
         return {
             "types": [{"type": t, "count": n} for t, n in counts.items()],
             "total": sum(counts.values()),
+            "edge_types": [{"type": t, "count": n} for t, n in edge_counts.items()],
         }
 
     @tool(read_only=True)
@@ -1166,10 +1172,20 @@ def register_foundation_tools(
     ) -> dict:
         """Traverse relationships between facts — use for connection/chain
         questions ("how are X and Y connected", "who does X report to",
-        "which team owns this client") once you have a starting
-        `subject_id` from `fact_search`; prefer this over inferring
-        structure from a SQL join or a document search. Depth <= 2, capped
-        fanout (design doc §12).
+        "which industries is X in", "which team owns this client") once
+        you have a starting `subject_id` from `fact_search`; prefer this
+        over inferring structure from a SQL join or a document search.
+        Depth <= 2, capped fanout (design doc §12).
+
+        PASS `edge_types` WHEN YOU KNOW IT — a well-connected node (a hub
+        client, a busy person) can carry many relationship types at once;
+        omitting `edge_types` returns ALL of them, which costs far more
+        context than the one relationship your question needs. If you do
+        not yet know the exact edge type name (e.g. `in_industry`,
+        `owned_by`), call `fact_type_map` FIRST — its `edge_types` list is
+        a one-call, low-cost primer naming every relationship type you can
+        see, with a count each. Do not discover it the expensive way by
+        reading an unfiltered `fact_neighbors` result.
 
         Re-checks visibility at EVERY hop — an edge into a subject whose
         claims you cannot read is dropped silently, never revealed as
@@ -1179,7 +1195,10 @@ def register_foundation_tools(
 
         Args:
             subject_id: Fact id to traverse from (from `fact_search`).
-            edge_types: Restrict traversal to these edge types. Omit for all.
+            edge_types: Restrict traversal to these edge types (see
+                `fact_type_map`'s `edge_types` list for valid names). Omit
+                for all — expensive on a well-connected node, so only omit
+                when you are still exploring what relationships exist.
             depth: Traversal depth, 1 (default) or 2.
             fanout: Max edges expanded per node (server caps at 100).
             limit: Max total nodes+edges returned (server caps at 500).
