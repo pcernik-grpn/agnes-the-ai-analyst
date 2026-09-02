@@ -27,8 +27,9 @@ written.
 from __future__ import annotations
 
 import secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -42,6 +43,16 @@ _MAX_LIMIT = 50
 #: What ``list_for_table`` returns when the caller states no preference —
 #: the "last ~10 edits" the panel renders.
 _DEFAULT_LIMIT = 10
+
+#: Namespace for this module's advisory locks — the FIRST of the two int4
+#: keys ``pg_advisory_xact_lock(int4, int4)`` takes, with ``hashtext(table_id)``
+#: as the second. The two-key form (rather than a single ``hashtext``) keeps
+#: this lock class in its own address space: any future advisory lock in
+#: Agnes picks its own namespace and can never collide with a table id whose
+#: hash happens to equal that lock's key. Within the namespace, a hash
+#: collision between two table ids only costs a little needless
+#: serialization -- never a missed lock. The value is the issue number.
+_LOCK_NAMESPACE = 1979
 
 
 def _now() -> datetime:
@@ -64,6 +75,38 @@ def _decode_row(row: Dict[str, Any]) -> Dict[str, Any]:
 class AccessPolicyRevisionsPgRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    # -- serialization ----------------------------------------------------
+
+    @contextmanager
+    def policy_write_lock(self, table_id: str) -> Iterator[None]:
+        """Serialize "save this table's policy, then append its revision".
+
+        Two concurrent PUTs on one table could otherwise commit policy A,
+        commit policy B, record B's revision, then record A's — leaving a
+        history whose newest row (A) is not what the table actually stores
+        (B), which is precisely the claim the panel makes and the body an
+        admin would restore FROM.
+
+        A **transaction-scoped** advisory lock, so the release is Postgres's
+        job, not the caller's: the lock goes away when this transaction
+        commits or rolls back, including when the ``with`` body raises or
+        the process dies mid-save. Nothing is written in this transaction —
+        it exists only to hold the lock; the policy write and the revision
+        append keep their own transactions, so this ORDERS them without
+        COUPLING them (a failed history append still never rolls back a
+        policy save — see ``app/api/admin.py::_record_access_policy_revision``).
+
+        Cross-process by construction, which the in-process alternative
+        (a ``threading.Lock``) is not: an api and a worker replica saving
+        the same table are the shape the ordering bug actually takes.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:ns, hashtext(:table_id))"),
+                {"ns": _LOCK_NAMESPACE, "table_id": table_id},
+            )
+            yield
 
     # -- write ------------------------------------------------------------
 

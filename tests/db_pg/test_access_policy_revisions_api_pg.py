@@ -124,6 +124,34 @@ def test_an_unrelated_edit_records_no_revision(tmp_path, monkeypatch, pg_engine)
     assert _revisions(c, token, table_id)["count"] == 1
 
 
+def test_a_mapping_only_edit_records_a_revision(tmp_path, monkeypatch, pg_engine):
+    """finding 2 (follow-up review of PR #2023): flipping only the
+    "referenceable from other policies" switch is a policy edit — the
+    revision carries ``policy_mapping`` and the panel's diff names a mapping
+    toggle, so an unrecorded flip leaves the panel diffing against a state
+    nothing ever recorded. A no-op resend still records nothing."""
+    c, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    table_id = _register(c, token, name="rev_mapping", server_only=True)
+
+    _put(c, token, table_id, {"access_policy_sql": f"SELECT * FROM {table_id}", "access_policy_note": "why"})
+    assert _revisions(c, token, table_id)["count"] == 1
+
+    assert _put(c, token, table_id, {"policy_mapping": True}).status_code == 200
+    body = _revisions(c, token, table_id)
+    assert body["count"] == 2
+    latest = body["revisions"][0]
+    assert latest["policy_mapping"] is True
+    # The body is unchanged — the revision is the CURRENT policy under its
+    # new mapping flag, never an empty one.
+    assert latest["policy_sql"] == f"SELECT * FROM {table_id}"
+    assert latest["policy_note"] == "why"
+
+    # The Edit modal round-trips every field: resending the same value must
+    # not manufacture a revision that changed nothing.
+    assert _put(c, token, table_id, {"policy_mapping": True}).status_code == 200
+    assert _revisions(c, token, table_id)["count"] == 2
+
+
 def test_a_policy_stored_before_this_feature_is_backfilled_as_a_baseline(tmp_path, monkeypatch, pg_engine):
     """A table already carrying a policy has no revision for it. The first
     write after that must record the state it is REPLACING first, or the

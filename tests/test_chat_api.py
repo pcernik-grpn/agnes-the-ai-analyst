@@ -552,6 +552,28 @@ def test_rename_session(api_client: TestClient, logged_in_user):
     assert api_client.get("/api/chat/sessions").json()[0]["title"] == "Q3 pipeline review"
 
 
+def test_rename_announces_the_new_title_to_live_sinks(api_client: TestClient, logged_in_user):
+    """A rename reaches the session's other sinks (co-driver, second tab) via
+    the manager's local broadcast — and a broadcast failure never fails the
+    rename."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    chat_id = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()["id"]
+    announce = AsyncMock(return_value=True)
+    api_client.app.state.chat_manager = SimpleNamespace(announce_title=announce)
+    r = api_client.put(f"/api/chat/sessions/{chat_id}/title", json={"title": "Q3 pipeline review"})
+    assert r.status_code == 200, r.text
+    announce.assert_awaited_once_with(chat_id)  # it re-reads the persisted title itself
+
+    api_client.app.state.chat_manager = SimpleNamespace(
+        announce_title=AsyncMock(side_effect=RuntimeError("socket gone"))
+    )
+    r = api_client.put(f"/api/chat/sessions/{chat_id}/title", json={"title": "Still renamed"})
+    assert r.status_code == 200, r.text
+    assert api_client.get("/api/chat/sessions").json()[0]["title"] == "Still renamed"
+
+
 def test_rename_strips_surrounding_whitespace(api_client: TestClient, logged_in_user):
     chat_id = api_client.post("/api/chat/sessions", json={"surface": "web"}).json()["id"]
     r = api_client.put(f"/api/chat/sessions/{chat_id}/title", json={"title": "  padded  "})
