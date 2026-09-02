@@ -217,6 +217,66 @@ def test_verbatim_gate_accepts_a_real_substring(pg_env, repo):
 
 
 # ---------------------------------------------------------------------------
+# The gate's document-wide join — a quote crossing what was, to the model,
+# an invisible chunk boundary (cost-levers spec 2026-09-02 §2.1(b)/§2.2).
+# ---------------------------------------------------------------------------
+
+
+def test_verbatim_gate_accepts_a_quote_spanning_two_adjacent_chunks(pg_env, repo):
+    """`facts_extraction.py`'s `_document_text` shows the model its chunks
+    joined by `CHUNK_JOIN_SEPARATOR` — a quote that genuinely reproduces
+    that exact join, crossing what the extraction happened to split as two
+    chunks, is real evidence of what the model read and must not fail the
+    gate just because the split landed there."""
+    file_id = "cf_boundary1"
+    doc_id = "doc_boundary1"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text="The engagement began in March", ordinal=0)
+    _seed_chunk(file_id=file_id, text="and concluded successfully in April.", ordinal=1)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:boundary",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+
+def test_verbatim_gate_still_rejects_a_quote_with_the_wrong_separator(pg_env, repo):
+    """The join widens WHERE the gate looks, not WHAT counts as a match —
+    a quote whose separator does not match the real `\\n\\n` join still
+    fails, exactly as a fabricated quote would."""
+    file_id = "cf_boundary2"
+    doc_id = "doc_boundary2"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text="... began in March", ordinal=0)
+    _seed_chunk(file_id=file_id, text="and April ...", ordinal=1)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:mismatch",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "March and April"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 0
+    assert report["claims_rejected"][0]["reason"] == "verbatim_gate_failed"
+
+
+# ---------------------------------------------------------------------------
 # Identity haystack — a document's own SERVER-STORED filename/path counts as
 # verbatim evidence too (spec §8, live regression: the extraction ontology
 # legitimately grounds e.g. a `part_of` edge in the document's folder path +
@@ -1167,6 +1227,49 @@ def test_ingest_endpoint_only_edge_destinations_survive_sweep_and_are_reachable(
     assert len(result["nodes"]) == 4  # core + 3 endpoint-only dsts
     for edge in result["edges"]:
         assert edge["src"] == core_id
+
+
+def test_two_edges_to_the_same_resolved_not_emitted_endpoint_does_not_keyerror(pg_env, repo):
+    """Regression: `node_fact_ids`/`node_types` are documented as parallel
+    dicts (`ingest_batch`, "nodes: alias resolution + evidence"), but the
+    edge-endpoint path only ever populated `node_fact_ids` when an endpoint
+    is resolved rather than emitted (never present in this batch's own
+    `nodes[]`) — `_endpoint()`'s "already resolved this batch" fast path
+    then indexed the never-populated `node_types` unconditionally and
+    raised `KeyError`. This only shows up when a SECOND edge in the SAME
+    batch references that same resolved endpoint (a single edge per
+    endpoint never hits the fast path at all) — here both `task:onboarding`
+    and `task:billing` point at `engagement:acme`, which never gets its own
+    `nodes[]` entry. Pre-fix this raised `KeyError('engagement:acme')` and
+    lost the whole batch, not just the second edge."""
+    doc_id = _seed_ready_doc(
+        pg_env,
+        text="Onboarding belongs to the Acme engagement. Billing also belongs to the Acme engagement.",
+    )
+    report = repo.ingest_batch(
+        edges=[
+            {
+                "src": "task:onboarding",
+                "type": "belongs_to",
+                "dst": "engagement:acme",
+                "evidence": [{"doc_id": doc_id, "quote": "Onboarding belongs to the Acme engagement."}],
+            },
+            {
+                "src": "task:billing",
+                "type": "belongs_to",
+                "dst": "engagement:acme",
+                "evidence": [{"doc_id": doc_id, "quote": "Billing also belongs to the Acme engagement."}],
+            },
+        ],
+    )
+    assert report["claims_rejected"] == []
+    assert report["claims_written"] == 2
+
+    engagement_id = repo.search(_admin(), type="engagement")["subjects"][0]["id"]
+    result = repo.neighbors(_admin(), engagement_id, depth=1)
+    assert len(result["edges"]) == 2
+    for edge in result["edges"]:
+        assert edge["dst"] == engagement_id
 
 
 # ---------------------------------------------------------------------------
@@ -2554,3 +2657,58 @@ def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
         edges_left = conn.execute(sa.text("SELECT count(*) FROM edges")).scalar_one()
     assert facts_left == 0, "a proposal must not anchor a fact no document evidences"
     assert edges_left == 0, "the proposal dies with its endpoints (ON DELETE CASCADE)"
+
+
+def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env, repo, monkeypatch):
+    """The boundary-crossing check joins the whole document, and it runs per
+    QUOTE. A batch where many quotes miss their individual chunks — exactly
+    the batch this repair path exists for — rebuilt and rescanned the entire
+    document once for each of them, so cost grew with quotes x document size
+    (Devin Review on #2063).
+
+    Counted rather than grepped: the separator every join goes through is a
+    module constant, so a subclass that tallies its own `join` measures the
+    real number of rebuilds and stays true across any refactor that keeps the
+    behaviour."""
+    from src.repositories import facts_pg
+
+    class _CountingSeparator(str):
+        calls = 0
+
+        def join(self, parts):  # noqa: D102 — str.join, plus a tally
+            _CountingSeparator.calls += 1
+            return str.join(self, parts)
+
+    monkeypatch.setattr(
+        facts_pg, "CHUNK_JOIN_SEPARATOR", _CountingSeparator(facts_pg.CHUNK_JOIN_SEPARATOR)
+    )
+
+    file_id = "cf_joinonce"
+    doc_id = "doc_joinonce"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text="The engagement began in March", ordinal=0)
+    _seed_chunk(file_id=file_id, text="and concluded successfully in April.", ordinal=1)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    # Five quotes that all cross the chunk boundary, so every one of them
+    # misses the per-chunk check and reaches the document-level fallback.
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": f"engagement:joinonce{i}",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [
+                    {"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}
+                ],
+            }
+            for i in range(5)
+        ]
+    )
+
+    assert report["claims_written"] == 5, report
+    assert _CountingSeparator.calls == 1, (
+        f"the document must be rebuilt once per file per batch, not once per quote; "
+        f"joined {_CountingSeparator.calls} times for 5 boundary-crossing quotes"
+    )

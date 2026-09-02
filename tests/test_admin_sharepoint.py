@@ -1898,6 +1898,142 @@ class TestSubtreeSweepTrigger:
         assert sweep.json()["job_id"] != acl_sync.json()["job_id"]
 
 
+_ENABLED_FACTS_CONFIG = {
+    "sharepoint": {"enabled": True},
+    "extraction": {"facts": {"enabled": True}},
+    "facts": {"enabled": True},
+}
+
+
+class TestFactsExtractionTrigger:
+    """``POST /connections/{connection_id}/facts-extract`` — admin/ops
+    trigger for the ``sharepoint-facts-extraction`` job: build the fact
+    graph over a connection's already-indexed corpus, without a crawl.
+    Mirrors ``TestAclSyncTrigger``/``TestSubtreeSweepTrigger``'s mechanics,
+    plus its OWN readiness gate (the two facts-specific switches, checked
+    BEFORE enqueue like ``TestExtractionTrigger``'s own readiness check)."""
+
+    FACTS_EXTRACT = "{base}/{cid}/facts-extract"
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.FACTS_EXTRACT.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.FACTS_EXTRACT.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_409_when_sharepoint_disabled_even_for_an_unknown_connection(self, seeded_app, monkeypatch):
+        """The router-level gate refuses the WHOLE surface before any
+        per-route work — including the connection lookup."""
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        r = seeded_app["client"].post(
+            self.FACTS_EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_404_for_unknown_connection_before_the_facts_readiness_gate(self, seeded_app, monkeypatch):
+        """404 fires even with the two facts switches OFF — connection
+        existence is checked BEFORE facts readiness, same ordering as the
+        crawl trigger's own extraction-readiness check."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"sharepoint": {"enabled": True}}))
+        r = seeded_app["client"].post(
+            self.FACTS_EXTRACT.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_the_cost_switch_is_off(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"sharepoint": {"enabled": True}, "facts": {"enabled": True}}),
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-cost-off")
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "facts_extraction_disabled"
+        assert "extraction.facts.enabled" in r.json()["detail"]["message"]
+
+    def test_409_when_the_facts_surface_is_off(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "app.instance_config.get_value",
+            _config_get_value({"sharepoint": {"enabled": True}, "extraction": {"facts": {"enabled": True}}}),
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-surface-off")
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "facts_extraction_disabled"
+        assert "facts.enabled" in r.json()["detail"]["message"]
+
+    def test_happy_path_enqueues_the_exact_payload_shape(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-happy")
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["job_id"]
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(body["job_id"])
+        assert job["kind"] == "sharepoint-facts-extraction"
+        assert job["payload_json"] == {"connection_id": conn_id}
+
+    def test_options_ride_in_the_payload_only_when_set(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-options")
+        r = c.post(
+            self.FACTS_EXTRACT.format(base=BASE, cid=conn_id),
+            headers=_auth(seeded_app["admin_token"]),
+            json={"doc_ids": ["d1", "d2"], "timeout_s": 120},
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "doc_ids": ["d1", "d2"], "timeout_s": 120}
+
+    def test_duplicate_run_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-dup")
+        first = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+        second = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "facts_extraction_already_running"
+        assert second.json()["detail"]["job_id"] == first.json()["job_id"]
+
+    def test_idempotency_key_is_distinct_from_the_crawl_trigger(self, seeded_app, monkeypatch):
+        """A facts-extract trigger and an in-flight ``corpus-extraction`` job
+        for the SAME connection must never dedup against each other —
+        different job kinds, different idempotency-key prefixes. The crawl
+        side is enqueued directly (not via ``POST …/extract``, which also
+        gates on the ``extraction`` optional dependency actually being
+        installed — a separate concern this test has no business on)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-vs-crawl")
+
+        from src.repositories import jobs_repo
+
+        crawl_job = jobs_repo().enqueue(
+            "corpus-extraction", {"connection_id": conn_id}, idempotency_key=f"corpus-extraction:{conn_id}"
+        )
+
+        facts = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert facts.status_code == 202, facts.text
+        assert facts.json()["job_id"] != crawl_job["id"]
+
+
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
     for the source card / an admin's own comparison against the identity

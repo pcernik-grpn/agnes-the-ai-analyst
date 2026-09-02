@@ -131,7 +131,11 @@ html[data-ui-layout="rail"] .rdb {
     gap: 8px;
     padding: 7px 12px 7px 10px;
     border: 1px solid color-mix(in srgb, var(--ds-border) 70%, transparent);
-    border-radius: 11px;
+    /* --ds-radius-btn (9px), not a raw 11px. This chip is a labelled button
+       and the design system reserves one radius for those; the hand-set value
+       was the last thing keeping it and the answer's follow-up chips — which
+       now reuse this exact class — from being the same shape. */
+    border-radius: var(--ds-radius-btn);
     background: color-mix(in srgb, var(--ds-surface) 60%, transparent);
     font: inherit;
     text-align: left;
