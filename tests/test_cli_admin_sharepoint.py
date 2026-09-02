@@ -94,3 +94,129 @@ class TestFactsExtract:
             result = runner.invoke(app, ["admin", "sharepoint", "facts-extract", "does-not-exist"])
         assert result.exit_code == 1
         assert "connection_not_found" in result.output
+
+
+class TestScopeBulkAdd:
+    """`agnes admin sharepoint scope bulk-add` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk`."""
+
+    def test_repeatable_path_option_rides_the_payload(self):
+        body = {"created": [{"path": "A"}, {"path": "B"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--path", "B"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Created 2, skipped 0, failed 0" in result.output
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/scopes/bulk"
+        assert kwargs["json"] == {"paths": ["A", "B"]}
+
+    def test_drive_id_rides_the_payload(self):
+        body = {"created": [{"path": "A"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--drive-id", "drv1"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["A"], "drive_id": "drv1"}
+
+    def test_paths_file_is_read_and_combined_with_path_options(self, tmp_path):
+        paths_file = tmp_path / "split.json"
+        paths_file.write_text(json.dumps({"paths": ["From File A", "From File B"]}), encoding="utf-8")
+        body = {"created": [], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "scope",
+                    "bulk-add",
+                    "conn1",
+                    "--paths-file",
+                    str(paths_file),
+                    "--path",
+                    "From Flag",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["From Flag", "From File A", "From File B"]}
+
+    def test_bare_json_list_paths_file(self, tmp_path):
+        paths_file = tmp_path / "split.json"
+        paths_file.write_text(json.dumps(["Only A"]), encoding="utf-8")
+        body = {"created": [], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--paths-file", str(paths_file)],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["Only A"]}
+
+    def test_no_paths_at_all_is_a_clean_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "scope", "bulk-add", "conn1"])
+        assert result.exit_code == 1
+        assert "no paths given" in result.output
+
+    def test_json_output_includes_the_full_breakdown(self):
+        body = {
+            "created": [{"path": "A"}],
+            "skipped": [{"path": "B", "source_scope_id": "b1", "reason": "already_present"}],
+            "failed": [{"path": "C", "reason": "not_found"}],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--json"],
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported_and_exits_nonzero(self):
+        detail = {"error": "drive_id_required", "message": "drive_id was not supplied..."}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(400, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A"])
+        assert result.exit_code == 1
+        assert "drive_id was not supplied" in result.output
+
+
+class TestConnectionClone:
+    """`agnes admin sharepoint connection clone` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/clone`."""
+
+    def test_happy_path(self):
+        body = {"id": "conn2", "name": "clone-target"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)) as mock_post:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "clone-target"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "conn1 -> conn2" in result.output
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/clone"
+        assert kwargs["json"] == {"name": "clone-target"}
+
+    def test_json_output(self):
+        body = {"id": "conn2", "name": "clone-target"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "clone-target", "--json"]
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_name_conflict_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post",
+            return_value=_resp(409, {"detail": "connection_name_exists"}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "taken"])
+        assert result.exit_code == 1
+        assert "connection_name_exists" in result.output

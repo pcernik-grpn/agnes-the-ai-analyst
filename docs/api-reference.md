@@ -1202,6 +1202,8 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
+- /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
+- /api/admin/sharepoint/connections/{connection_id}/clone
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1295,6 +1297,47 @@ probing and `rel_path`). `include_excluded_subtrees: true` on `POST` asks to
 must_not_forbids_subtree_override` under the `must_not` guarantee mode
 (`acl_sync.guarantee_mode`, default), accepted and audited
 (`sharepoint_acl.subtree_override`) under `should_not`.
+
+`POST …/scopes/bulk` — CLI: `agnes admin sharepoint scope bulk-add
+<connection_id>` — confirms many admin-typed folder paths as scopes in one
+call: the fast path for splitting one large SharePoint site across several
+connections, each with its own crawl and facts jobs, so they run in
+parallel. Body `{"paths": [...], "drive_id"?}`; each path is resolved to a
+Graph drive item (`/drives/{drive_id}/root:/{path}`) and written as a scope
+with the same defaults a single manual confirm gets
+(`access_mode="manual"`, `include_excluded_subtrees=false` — #2032's
+round-trip contract). `drive_id` is required unless the connection already
+has a scope with one set (reused from the first match) — `400
+drive_id_required` otherwise. Never all-or-nothing: the response reports
+every path independently, `{"created": [...], "skipped": [...], "failed":
+[{"path", "reason"}]}` — `created` entries are `{"path", ...scope}`
+(the same projection `GET …/scopes` returns); `skipped` is a path whose
+resolved `source_scope_id` is already a scope on this connection
+(`{"path", "source_scope_id", "reason": "already_present"}`); `failed` is a
+Graph 404/403 on that one path (`{"path", "reason": "not_found"|
+"forbidden"}`). Any OTHER Graph failure (401/429/5xx, a network fault)
+aborts the remaining unprocessed paths with a typed `502
+sharepoint_graph_error` — whatever was already created before that point
+stays persisted.
+
+`POST …/clone` — CLI: `agnes admin sharepoint connection clone
+<connection_id>` — the other half of the split-a-large-site workflow: body
+`{"name"}` creates a sibling `source_type=sharepoint` connection wired to
+the SAME credential material (`tenant_id`, `client_id`, `auth_method`,
+`cert_private_key_env`/`client_secret_env` — copied as config REFERENCES,
+never a copied secret VALUE) with zero scopes and no extraction-dispatch
+history, so no scheduled crawl/ACL-sync/subtree-sweep/facts-extraction
+sweep touches it until an admin confirms scopes on it (e.g. via `POST
+…/scopes/bulk` above). Every OTHER config key carries over, notably
+`manual_sites` — under `Sites.Selected` (`/sites` enumeration 403-forbidden)
+a bookmarked site is how the clone can resolve the site AT ALL, so leaving
+it behind would leave the clone unable to browse the very site it exists
+to split. When the source's certificate lives in a deployment env var, the
+clone resolves the identical value with no further action; when it was
+instead uploaded to the source's own vault slot, it is NOT duplicated into
+a second row — an admin re-uploads it to the clone separately. `409
+connection_name_exists` if `name` is taken (same rule as `POST
+/api/admin/source-connections`). Returns `{"id", "name"}`.
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues
