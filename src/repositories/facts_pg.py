@@ -423,7 +423,122 @@ def _single_valued_edge_types() -> frozenset:
     return frozenset(str(t) for t in configured)
 
 
+# ---------------------------------------------------------------------------
+# possible_duplicate_of — SYSTEM-proposed candidates (entity-resolution
+# review, spec's own two-pass split: extraction is per-document and
+# stateless, so a cross-document duplicate can only be caught HERE, at
+# ingest, never by the extraction pass itself — see the ontology's own
+# `entity_resolution` convention, "merge on exact normalized slug only... a
+# probable-but-unsure match is never auto-merged, emit a
+# `possible_duplicate_of` edge for human review"). `ingest_batch` calls
+# `_duplicate_candidate_reason` for every NEWLY minted fact against every
+# OTHER alias of the same type already on file; a hit becomes a
+# `possible_duplicate_of` edge through the exact same review-item mechanism
+# a producer's own proposal uses (`_review_items_for_corpus`,
+# `collection_facts_summary`) — a second SOURCE for that edge type, not a
+# new review surface. This NEVER merges anything on its own initiative —
+# `merge_facts` stays the only path that folds two facts into one, and
+# that remains an explicit, separate, human-triggered call.
+# ---------------------------------------------------------------------------
+
+#: Minimum combined character length of the SHORTER slug's tokens for the
+#: name-token-prefix rule (below) to fire — guards against a bare 1-3 char
+#: stub ("co", "hq") trivially prefix-matching almost anything.
+_MIN_PREFIX_TOKEN_CHARS = 4
+#: Same guard for the near-identical-spelling rule below — shorter strings
+#: make an edit-distance-<=1 match far more likely to be coincidence than
+#: a typo in one of the two extractions.
+_MIN_TYPO_CHARS = 5
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    """Standard edit distance (insert/delete/substitute), iterative DP.
+
+    Both inputs here are single ontology-slug tokens — a handful of
+    characters, never document text — so O(len(a)*len(b)) is trivial and
+    no third-party dependency is worth adding for it.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[-1]
+
+
+def _duplicate_candidate_reason(slug_a: str, slug_b: str) -> Optional[str]:
+    """A short, human-readable reason two SAME-TYPE natural-key slugs
+    (the part after ``type:``) might denote one real-world entity under
+    different names — ``None`` when neither narrow, deterministic check
+    below fires.
+
+    This never decides identity. A hit here only ever earns a
+    `possible_duplicate_of` edge — a PROPOSAL for a human (spec §7.2's
+    review-item mechanism), the same as when the extraction model
+    volunteers one inline. The caller must not, and does not, use this to
+    skip alias creation or fold two facts into one.
+
+    Two checks, both pattern-only — no wordlist, no ontology-specific
+    vocabulary, so this module stays agnostic to what an instance's node
+    types are actually called:
+
+    - **name-token prefix**: one slug's ``-``-separated tokens are an
+      exact, in-order, STRICT prefix of the other's (``acme`` /
+      ``acme-group``) — the shape of "a short form vs. a longer, more
+      qualified name for the same thing", which is exactly what varies
+      across documents written by different people, departments, or
+      times. Two names that are merely the SAME length and share a
+      leading word (``acme-east`` / ``acme-west``) are not a prefix
+      relationship and do not match.
+    - **near-identical single-token spelling**: both slugs are ONE token
+      and differ by an edit distance of at most 1 (``acmee`` / ``acme``)
+      — a probable typo in one of the two extractions.
+
+    Both are cheap and structural, and neither is risk-free on its own (a
+    common short word, or two genuinely different short names one edit
+    apart, can still match) — see the caller's per-fact match cap
+    (`FactsPgRepository._MAX_DUPLICATE_CANDIDATES_PER_FACT`) for the
+    mitigation this function does not attempt itself: a token shared by
+    an unusually large number of existing aliases is far more likely a
+    common word than N variants of one entity, so the caller skips
+    proposing anything for it rather than guessing which pair(s) matter.
+    """
+    if slug_a == slug_b:
+        return None
+    tokens_a = slug_a.split("-")
+    tokens_b = slug_b.split("-")
+    shorter, longer = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if len(shorter) < len(longer) and longer[: len(shorter)] == shorter:
+        if len("".join(shorter)) >= _MIN_PREFIX_TOKEN_CHARS:
+            return "name-token prefix of a longer/more-qualified name"
+    if len(tokens_a) == 1 and len(tokens_b) == 1:
+        shortest_len = min(len(slug_a), len(slug_b))
+        if shortest_len >= _MIN_TYPO_CHARS and abs(len(slug_a) - len(slug_b)) <= 1:
+            if _levenshtein_distance(slug_a, slug_b) <= 1:
+                return "near-identical spelling (possible typo)"
+    return None
+
+
 class FactsPgRepository:
+    #: Cap on how many existing aliases may match ONE newly created fact
+    #: via `_duplicate_candidate_reason` before `_propose_duplicate_
+    #: candidates` proposes anything for it at all. A token shared by more
+    #: matches than this is far more likely a common short word (a first
+    #: name, a generic business word) than N variants of the SAME entity —
+    #: the two rules above are meant to produce a narrow candidate set a
+    #: human can actually work through, not a similarity search, so this
+    #: instance skips the whole group rather than guessing which pair(s)
+    #: to keep.
+    _MAX_DUPLICATE_CANDIDATES_PER_FACT = 4
+
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
@@ -2611,12 +2726,25 @@ class FactsPgRepository:
         still anchors its endpoints here exactly like any other edge.
 
         Edges are swept FIRST: an edge with zero claims of its own is
-        removed before the fact sweep runs. That ordering is what makes the
-        fact predicate cheap — by the time the fact DELETE runs, every
-        surviving edge carries >=1 claim (the edge sweep just removed every
-        one that didn't), so "zero incident edges carrying any claims"
-        collapses to "zero incident edges, period": ``NOT EXISTS (SELECT 1
-        FROM edges e WHERE e.src = f.id OR e.dst = f.id)``. Deleting an
+        removed before the fact sweep runs — with ONE exception.
+        ``possible_duplicate_of`` is claimless BY DESIGN: it is a proposal
+        about two facts, not an assertion a document made, and neither a
+        producer's own proposal nor an automatic candidate carries evidence.
+        Sweeping it as an orphan deleted every candidate in the same
+        ``ingest_batch`` that had just minted it, so the review queue never
+        received one and the feature produced nothing (Devin Review on
+        #2075). It is therefore excluded from the edge sweep, and — the half
+        that is easy to miss — from the fact sweep's "is anything incident"
+        test too: a claimless edge must not anchor an unevidenced fact, or a
+        proposal about two garbage-collected facts would keep both alive
+        forever. A candidate whose endpoint is swept dies with it through the
+        existing ``ON DELETE CASCADE`` on ``src``/``dst``.
+
+        With that exception the ordering argument still holds: by the time
+        the fact DELETE runs, every surviving edge either carries >=1 claim
+        or is a proposal that does not anchor anything, so "zero incident
+        edges carrying any claims" collapses to "zero incident edges that
+        are not proposals". Deleting an
         orphaned FACT afterwards can then cascade (``ON DELETE CASCADE``)
         any edge still pointing at it even if THAT edge carried its own
         claims — an edge to a subject this design has garbage-collected
@@ -2629,7 +2757,8 @@ class FactsPgRepository:
             edge_ids = (
                 conn.execute(
                     sa.text(
-                        "DELETE FROM edges e WHERE NOT EXISTS "
+                        "DELETE FROM edges e WHERE e.type <> 'possible_duplicate_of' "
+                        "AND NOT EXISTS "
                         "(SELECT 1 FROM claims c WHERE c.edge_id = e.id) RETURNING e.id"
                     )
                 )
@@ -2641,7 +2770,9 @@ class FactsPgRepository:
                     sa.text(
                         "DELETE FROM facts f WHERE NOT EXISTS "
                         "(SELECT 1 FROM claims c WHERE c.fact_id = f.id) "
-                        "AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.src = f.id OR e.dst = f.id) "
+                        "AND NOT EXISTS (SELECT 1 FROM edges e "
+                        "WHERE (e.src = f.id OR e.dst = f.id) "
+                        "AND e.type <> 'possible_duplicate_of') "
                         "RETURNING f.id"
                     )
                 )
@@ -2740,6 +2871,77 @@ class FactsPgRepository:
             "verdict": row["verdict"],
             "reason": row["reason"],
         }
+
+    def _propose_duplicate_candidates(
+        self, conn, *, new_facts: List[Tuple[str, str, str]], already_proposed: set
+    ) -> List[Dict[str, Any]]:
+        """For each ``(node_id, fact_id, type)`` in ``new_facts`` — a fact
+        THIS `ingest_batch` call just minted (``_resolve_alias``'s
+        ``created=True`` path, which fires exactly once per fact's
+        lifetime) — compare its natural key against every OTHER alias of
+        the same type already in the graph, INCLUDING ones this same
+        batch minted earlier, and write a `possible_duplicate_of` edge for
+        every :func:`_duplicate_candidate_reason` hit, the same way a
+        producer's own proposal is written (no evidence required). The
+        edge surfaces through the SAME review-item mechanism a
+        model-authored one does (`_review_items_for_corpus`,
+        `collection_facts_summary`) — this is a second SOURCE for that
+        edge type, not a new review surface, and it never merges anything
+        on its own initiative.
+
+        Fires only for facts THIS batch newly minted, so a pair already
+        covered by an earlier ingest is never re-scanned (a re-crawled,
+        unchanged document that only adds a claim to an already-existing
+        fact triggers nothing here). ``already_proposed`` — an unordered
+        ``frozenset({fact_id, fact_id})`` per pair, owned by the caller —
+        exists only to stop THIS call proposing the same pair twice when
+        a batch mints both halves of it (each half's scan would otherwise
+        find the other)."""
+        if not new_facts:
+            return []
+        by_type: Dict[str, List[Tuple[str, str]]] = {}
+        for node_id, fact_id, type_ in new_facts:
+            by_type.setdefault(type_, []).append((node_id, fact_id))
+
+        proposed: List[Dict[str, Any]] = []
+        for type_, entries in by_type.items():
+            pool = (
+                conn.execute(
+                    sa.text("SELECT natural_key, fact_id FROM fact_aliases WHERE type = :type"), {"type": type_}
+                )
+                .mappings()
+                .all()
+            )
+            for node_id, fact_id in entries:
+                slug = node_id.split(":", 1)[1] if ":" in node_id else node_id
+                matches: List[Tuple[str, str, str]] = []  # (other_node_id, other_fact_id, reason)
+                for row in pool:
+                    other_key, other_fact_id = row["natural_key"], row["fact_id"]
+                    if other_fact_id == fact_id:
+                        continue
+                    other_slug = other_key.split(":", 1)[1] if ":" in other_key else other_key
+                    reason = _duplicate_candidate_reason(slug, other_slug)
+                    if reason:
+                        matches.append((other_key, other_fact_id, reason))
+                if not matches or len(matches) > self._MAX_DUPLICATE_CANDIDATES_PER_FACT:
+                    continue
+                for other_node_id, other_fact_id, reason in matches:
+                    pair = frozenset((fact_id, other_fact_id))
+                    if pair in already_proposed:
+                        continue
+                    already_proposed.add(pair)
+                    edge_id = self.create_edge(src=fact_id, type="possible_duplicate_of", dst=other_fact_id)
+                    proposed.append(
+                        {
+                            "type": "possible_duplicate_of",
+                            "edge_id": edge_id,
+                            "src": node_id,
+                            "dst": other_node_id,
+                            "auto": True,
+                            "reason": reason,
+                        }
+                    )
+        return proposed
 
     def _resolve_alias(self, conn, node_id: str, declared_type: Optional[str]) -> Dict[str, Any]:
         """Resolve a producer node id ``<type>:<slug>`` to a fact_id via
@@ -3214,6 +3416,12 @@ class FactsPgRepository:
         touched_fact_ids: set = set()
         touched_edge_pairs: set = set()
         single_valued_types = _single_valued_edge_types()
+        # (node_id, fact_id, type) for every fact THIS batch newly minted —
+        # fed to `_propose_duplicate_candidates` once the node loop below
+        # is done resolving. `duplicate_pairs_proposed` is the unordered-
+        # pair dedupe set that spans both directions within this one call.
+        newly_created_facts: List[Tuple[str, str, str]] = []
+        duplicate_pairs_proposed: set = set()
 
         def _write_evidence(
             *,
@@ -3399,6 +3607,7 @@ class FactsPgRepository:
                 subjects_created += 1
                 if resolution.get("reattached"):
                     corrections_active.append(resolution["reattached"])
+                newly_created_facts.append((node_id, resolution["fact_id"], resolution["type"]))
             node_fact_ids[node_id] = resolution["fact_id"]
             node_types[node_id] = resolution["type"]
             _write_evidence(
@@ -3454,6 +3663,7 @@ class FactsPgRepository:
                     node_types[endpoint_id] = res["type"]
                     if res.get("reattached"):
                         corrections_active.append(res["reattached"])
+                    newly_created_facts.append((endpoint_id, res["fact_id"], res["type"]))
 
             edge_id = self.create_edge(src=src_res["fact_id"], type=edge_type, dst=dst_res["fact_id"])
             with self._engine.begin() as conn:
@@ -3482,6 +3692,22 @@ class FactsPgRepository:
                 # being visible and findable by existence.
                 alias_targets=[(src_res["type"], src_id), (dst_res["type"], dst_id)],
             )
+
+        # ---- entity-resolution candidates (spec's own `entity_resolution`
+        # convention: extraction never guess-merges, a probable-but-unsure
+        # match earns a `possible_duplicate_of` edge for human review) --
+        # every fact THIS batch newly minted, compared against every OTHER
+        # same-type alias already in the graph. Runs after BOTH the node
+        # and edge loops so it also covers a fact minted purely as an edge
+        # endpoint (`_endpoint()`'s fallback above), not only ones listed
+        # in `nodes[]`.
+        if newly_created_facts:
+            with self._engine.connect() as conn:
+                review_items.extend(
+                    self._propose_duplicate_candidates(
+                        conn, new_facts=newly_created_facts, already_proposed=duplicate_pairs_proposed
+                    )
+                )
 
         # ---- functionally single-valued edges (spec §7.3): a (src, type)
         # pair TOUCHED by this batch (an edge of a configured type was just

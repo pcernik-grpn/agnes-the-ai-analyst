@@ -91,7 +91,33 @@
      or _path.startswith('/admin/data-packages'))
    ) or _path.startswith('/admin/linked-apps') %}
 {% set _admin_page = (_path == '/admin' or _path.startswith('/admin/')) and not _builder_page %}
-<nav class="rail{% if _admin_page %} rail-icon-mode{% endif %}" aria-label="Primary"
+{# Does this page render the ADMIN SECONDARY NAV (`_admin_nav.html`, via
+   base_admin.html / base_admin_page.html)? If it does, the collapsed rail must
+   not PEEK OPEN AT ALL: the peek is a 240px overlay and that column is 200px
+   wide starting at the rail's own edge, so opening it erased the navigation the
+   caller was actually using (#1956 item 6). `.rail-strip-only` turns both
+   triggers off — hover AND focus. Focus was kept at first, on the reasoning
+   that it is deliberate where a pointer pass is not; the search box is focused
+   by CLICKING it, so that put the mouse straight back on the peek and the bug
+   returned by a second route. This rail does not widen in place; what needs
+   width flies out beside it — a hovered or focused row's label as a chip, the
+   onboarding panel, the search field (rail.css). The toggle still pins the
+   whole column open for anyone who wants it.
+
+   `_admin_page` is the same test, which is why it is reused rather than
+   restated: every /admin/* page renders that column EXCEPT the three Library
+   builders, and those are exactly what `_admin_page` already excludes (all
+   three extend `base_index.html`).
+
+   A PATH is only a guess at what a template will render, though — an /admin
+   route whose feature flag is off answers with the plain error page, which has
+   no second column. So the class is rendered here for FIRST PAINT (a hover
+   cannot be waiting on JS to know whether it may peek) and reconciled against
+   the DOM by js/rail_toggle.js the moment the document is parsed: `.admin-nav`
+   present adds it, absent removes it. Same division of labour as
+   `.rail-icon-mode` directly above — the server supplies the value that has to
+   be right before paint, and script owns the truth. #}
+<nav class="rail{% if _admin_page %} rail-icon-mode rail-strip-only{% endif %}" aria-label="Primary"
      data-rail-context="{{ 'admin' if _admin_page else 'app' }}">
     <script>
       (function () {
@@ -642,7 +668,9 @@
            the ellipsis the label already had is recoverable on hover. #}
         <a class="rail-i{% if _path == '/how-it-works' %} is-active{% endif %}"
            href="/how-it-works#connect"
-           title="Take {{ instance_brand_short }} to your tools">
+           {# No `title`: the row's own label names it (screen-reader-only in the
+              collapsed strip, a chip on hover) and this repeated it as an
+              unthemed OS box over the top of that chip. #}>
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10 13.5a4 4 0 0 0 5.7.4l2.6-2.6a4 4 0 0 0-5.7-5.7l-1.5 1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M14 10.5a4 4 0 0 0-5.7-.4l-2.6 2.6a4 4 0 0 0 5.7 5.7l1.5-1.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
             <span class="rail-i-label">Take {{ instance_brand_short }} to your tools</span>
         </a>
@@ -729,8 +757,12 @@
                 id="rail-setupchain-toggle"
                 aria-expanded="false"
                 aria-controls="rail-setupchain-panel"
-                aria-label="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete"
-                title="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete">
+                {# `aria-label` only, no `title`. The two carried the identical
+                   sentence, and the native tooltip was pure duplication of a
+                   panel that already opens on the same hover and says more —
+                   an unthemed OS box laid over the top of it, a beat later.
+                   The accessible name is unchanged. #}
+                aria-label="Set up {{ instance_brand_short or 'Agnes' }} — {{ _setup_chain.done }} of {{ _setup_chain.total }} steps complete">
             <span class="rail-getstarted-ring" aria-hidden="true">
                 <svg viewBox="0 0 36 36" class="rail-getstarted-ring-svg">
                     <circle class="rail-getstarted-ring-track" cx="18" cy="18" r="15"></circle>
@@ -926,7 +958,7 @@
                 {% if session.user.picture %}
                 <img src="{{ session.user.picture }}" alt="" class="app-avatar-img">
                 {% else %}
-                <span class="app-avatar">{{ (session.user.name or session.user.email)[:2] | upper }}</span>
+                <span class="app-avatar" aria-hidden="true">{{ (session.user.name or session.user.email)[:2] | upper }}</span>
                 {% endif %}
                 <span class="rail-user-txt">
                     <b>{{ session.user.name or session.user.email }}</b>
