@@ -1362,11 +1362,11 @@ def raise_if_policy_mapping_empty(
 # ---------------------------------------------------------------------------
 
 
-def policy_cache_identity(principal, *, table_id: str) -> tuple[str | None, tuple[str, ...]]:
-    """``(user_id, sorted-group-tuple)`` -- the identity component a
-    policied table's response-cache key must carry (§9), so one caller's
-    filtered/masked slice out of ``_sample_cache`` / ``_schema_cache`` is
-    never served to another.
+def policy_cache_identity(principal, *, table_id: str) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """``(user_id, user_email, sorted-group-tuple)`` -- the identity
+    component a policied table's response-cache key must carry (§9), so one
+    caller's filtered/masked slice out of ``_sample_cache`` /
+    ``_schema_cache`` is never served to another.
 
     Reuses ``_resolve_identity``'s own principal-shape handling rather than
     inventing a second one: a plain user dict binds itself, an
@@ -1387,9 +1387,20 @@ def policy_cache_identity(principal, *, table_id: str) -> tuple[str | None, tupl
     an admin editing that policy body to start referencing groups it did
     not before, without an old, narrower-keyed cache entry ever being
     mistaken for a hit against the new policy.
+
+    Includes the resolved EMAIL for the same reason, and against a second
+    change an admin can make out from under a warm cache entry: a policy
+    binding ``$user_email`` makes the response a function of the email, so
+    once an account is renamed the pre-rename slice must not keep being
+    served out of ``_sample_cache`` / ``_schema_cache`` for the rest of the
+    TTL. ``user_id`` alone does not cover it -- the id is exactly what
+    survives an email change -- and, as with groups, the email belongs in
+    the key whether or not the policy text references it today, because the
+    policy body an entry was computed under can be edited to start doing so
+    tomorrow.
     """
-    user_id, _user_email, live_groups = _resolve_identity(principal, table_id=table_id)
-    return (user_id, tuple(sorted(live_groups())))
+    user_id, user_email, live_groups = _resolve_identity(principal, table_id=table_id)
+    return (user_id, user_email, tuple(sorted(live_groups())))
 
 
 # ---------------------------------------------------------------------------
@@ -1407,10 +1418,11 @@ def policy_cache_identity(principal, *, table_id: str) -> tuple[str | None, tupl
 
 
 def policy_fingerprint(table_id: str, principal) -> str | None:
-    """``sha256(access_policy_sql + '|' + repr(sorted(caller_group_names)))``
-    -- a fingerprint of the policy text a table currently carries plus the
-    caller's live group membership (§10.3: "hash of the policy SQL + the
-    caller's bound group set").
+    """``sha256(access_policy_sql + '|' + repr(caller_email) + '|' +
+    repr(sorted(caller_group_names)))`` -- a fingerprint of the policy text
+    a table currently carries plus the caller identity it would bind: their
+    email and their live group membership (§10.3: "hash of the policy SQL +
+    the caller's bound group set").
 
     ``None`` -- the same "nothing to protect" passthrough
     :func:`policied_relation` itself uses -- when the table carries no
@@ -1420,12 +1432,16 @@ def policy_fingerprint(table_id: str, principal) -> str | None:
 
     Reuses :func:`policy_cache_identity` for the identity half rather than
     inlining a fresh ``_resolve_identity`` + live-groups read: a fingerprint
-    must invalidate on ANY group-membership change, not only when the
-    CURRENT policy text happens to reference ``$user_groups`` -- the exact
-    reasoning ``policy_cache_identity`` already documents for its own
-    caller (response-cache keys, §9) applies here unchanged, since an admin
-    could edit the policy tomorrow to start referencing groups it does not
-    reference today.
+    must invalidate on ANY group-membership OR email change, not only when
+    the CURRENT policy text happens to reference ``$user_groups`` /
+    ``$user_email`` -- the exact reasoning ``policy_cache_identity`` already
+    documents for its own caller (response-cache keys, §9) applies here
+    unchanged, since an admin could edit the policy tomorrow to start
+    referencing an identity variable it does not reference today. Folding
+    the email in is what stops a snapshot taken under an account's PREVIOUS
+    email from going on answering with that account's old slice after a
+    rename; the mismatch blocks the snapshot's view once and ``agnes pull``
+    re-fetches it.
     """
     row = _resolve_table_row(table_id)
     policy_sql = row.get("access_policy_sql")
@@ -1434,6 +1450,6 @@ def policy_fingerprint(table_id: str, principal) -> str | None:
     if _is_admin_bypass(principal):
         return None
 
-    _, groups = policy_cache_identity(principal, table_id=row["id"])
-    digest_input = f"{policy_sql}|{sorted(groups)!r}"
+    _, user_email, groups = policy_cache_identity(principal, table_id=row["id"])
+    digest_input = f"{policy_sql}|{user_email!r}|{sorted(groups)!r}"
     return hashlib.sha256(digest_input.encode()).hexdigest()

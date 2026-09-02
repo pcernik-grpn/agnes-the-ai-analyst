@@ -318,7 +318,8 @@ def invalidate_for_table(table_id: str, *, _publish: bool = True) -> None:
 
     _table_rows_cache.clear()
     v2_schema._schema_cache.invalidate(table_id)
-    # A POLICIED table's schema is cached per caller identity, under
+    # A POLICIED table's schema is cached per caller identity (user id,
+    # email and live groups), under
     # `f"{table_id}|policy:{policy_cache_identity(...)!r}"` (table access
     # policies §9) — keys the exact-key `invalidate` above can never match.
     # Without this the caller kept the PRE-edit column list for the full
