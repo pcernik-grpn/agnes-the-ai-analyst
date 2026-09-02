@@ -201,6 +201,8 @@ __all__ = [
     "sharepoint_state_repo",
     # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B) — Postgres-only
     "facts_llm_cache_repo",
+    # SharePoint collection consolidation — Postgres-only
+    "sharepoint_collection_consolidation_repo",
 ]
 
 
@@ -704,6 +706,18 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "facts_llm_cache": {
         PG: ("src.repositories.facts_llm_cache_pg", "FactsLlmCachePgRepository"),
     },
+    # SharePoint collection consolidation (fold several per-scope
+    # collections into one) — POSTGRES-ONLY, A3 ratchet: the tables it
+    # touches beyond the frozen file_corpora/corpus_files/corpus_chunks
+    # pair (corpus_file_sources, corpus_file_events, claims,
+    # fact_alias_sources) are themselves PG-only, so the whole operation
+    # can never run on a DuckDB-backed instance.
+    "sharepoint_collection_consolidation": {
+        PG: (
+            "src.repositories.sharepoint_collection_consolidation_pg",
+            "SharePointCollectionConsolidationPgRepository",
+        ),
+    },
 }
 
 
@@ -1171,3 +1185,11 @@ def sharepoint_state_repo() -> Any:
 # (one log line) rather than letting a missing cache table fail extraction.
 def facts_llm_cache_repo() -> Any:
     return _build("facts_llm_cache")
+
+
+# SharePoint collection consolidation (fold several per-scope collections
+# into one) — POSTGRES-ONLY. Raises RequiresPostgresBackend on a
+# DuckDB-backed instance; the route (app/api/admin_sharepoint.py's
+# consolidate_collections) lets it propagate to the app-wide 501 handler.
+def sharepoint_collection_consolidation_repo() -> Any:
+    return _build("sharepoint_collection_consolidation")

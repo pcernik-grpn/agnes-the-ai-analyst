@@ -181,6 +181,14 @@ POSTURE: dict[str, str] = {
     # a fallback-emitted action.
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": "sharepoint_connection.scope_bulk_add",
     "POST /api/admin/sharepoint/connections/{connection_id}/clone": "sharepoint_connection.clone",
+    # Collection consolidation writes its own row EVERY call, dry-run
+    # included (`params.dry_run` distinguishes a preview from the real
+    # merge) — richer than the fallback could derive (source/target ids,
+    # the per-table moved-row summary), same posture as bulk scope-add
+    # above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate": (
+        "sharepoint_connection.collections_consolidate"
+    ),
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # Persistence for a site added by URL (2026-09-01 bug report): the
     # ``Sites.Selected`` escape hatch used to resolve a site without ever

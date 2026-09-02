@@ -3543,6 +3543,19 @@ KNOWN_UNTESTED = {
     # not duplicated here.
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
     "POST /api/admin/sharepoint/connections/{connection_id}/clone",
+    # Collection consolidation — PG-only by construction (it touches
+    # corpus_file_sources/corpus_file_events/claims/fact_alias_sources,
+    # themselves PG-only, A3 ratchet): the DuckDB side answers the typed
+    # 501 the ratchet requires (asserted by
+    # assert_pg_only_exemptions_fail_clean in the mutation-status parity
+    # sweep — see that sweep's own `_PG_ONLY_ROUTE_EXEMPTIONS`). Repo-level
+    # behaviour (preview counts, the per-table move, grants union, the
+    # path/stable-id conflict refusal) is covered directly by
+    # tests/db_pg/test_sharepoint_collection_consolidation_pg.py; the route
+    # itself (auth matrix, dry-run vs real, the cross-connection 409) by
+    # tests/test_admin_sharepoint.py::TestCollectionsConsolidate. Not
+    # duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate",
     # Per-connection facts policy override (retry_mode + transport) — writes
     # `source_connections.config`, the same frozen pair, needs a body; 200/
     # 422/clear semantics and the audit row are covered by

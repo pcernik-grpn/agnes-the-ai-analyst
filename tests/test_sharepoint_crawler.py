@@ -2653,6 +2653,110 @@ class TestZoneRouting:
 
 
 # --------------------------------------------------------------------------
+# Shared scope collection (bulk-add's `collection_id`/`collection` option,
+# or a post-consolidation re-point): several DIFFERENT scopes on ONE
+# connection can route to the SAME collection.
+# --------------------------------------------------------------------------
+
+
+class TestSharedScopeCollection:
+    """``_route_collection`` picks the deepest matching zone, else the
+    scope's own collection — nothing about that logic cares whether two
+    scopes happen to share the same ``collection_id``, but this is the
+    scenario a per-scope collection was never tested against before bulk-add
+    grew the option to point several scopes at one target. Two invariants
+    matter: every file from either scope lands in the shared collection, and
+    a delete driven by one scope's stable id never disturbs the other
+    scope's file — ``_Ingestor.delete`` is scoped by ``(collection_id,
+    stable_id)``, not by scope, so this only holds if the crawler always
+    passes the RIGHT collection id per file, never "whichever scope ran
+    last"."""
+
+    def test_two_scopes_sharing_a_collection_both_land_their_files_there(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "/drives/b!drive1/root/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("from-a", name="a.docx", parent_path="/drives/b!drive1/root:/Reports")],
+                        "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=1",
+                    },
+                )
+            if "/drives/b!drive2/root/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("from-b", name="b.docx", parent_path="/drives/b!drive2/root:/Reports")],
+                        "@odata.deltaLink": f"{GRAPH}/drives/b!drive2/root/delta?t=1",
+                    },
+                )
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": url})
+
+        _install_graph(monkeypatch, handler)
+        scopes = [
+            _drive_scope(source_scope_id="b!drive1", collection_id="shared_col"),
+            _drive_scope(source_scope_id="b!drive2", collection_id="shared_col"),
+        ]
+        _run(_connection(scopes), monkeypatch)
+
+        by_stable = {row["stable_id"]: row["collection_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert by_stable == {"graph:from-a": "shared_col", "graph:from-b": "shared_col"}
+
+    def test_deleting_one_scopes_file_never_touches_the_other_scopes_file_in_the_shared_collection(
+        self, crawl_env, monkeypatch
+    ):
+        pages_a = iter(
+            [
+                {
+                    "value": [_file_item("from-a", name="a.docx", parent_path="/drives/b!drive1/root:/Reports")],
+                    "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=1",
+                },
+                {
+                    "value": [{"id": "from-a", "name": "a.docx", "deleted": {"state": "deleted"}}],
+                    "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=2",
+                },
+            ]
+        )
+        page_b = {
+            "value": [_file_item("from-b", name="b.docx", parent_path="/drives/b!drive2/root:/Reports")],
+            "@odata.deltaLink": f"{GRAPH}/drives/b!drive2/root/delta?t=1",
+        }
+        page_holder = {"a": next(pages_a)}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "/drives/b!drive1/root/delta" in url:
+                return httpx.Response(200, json=page_holder["a"])
+            if "/drives/b!drive2/root/delta" in url:
+                return httpx.Response(200, json=page_b)
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": url})
+
+        _install_graph(monkeypatch, handler)
+        scopes = [
+            _drive_scope(source_scope_id="b!drive1", collection_id="shared_col"),
+            _drive_scope(source_scope_id="b!drive2", collection_id="shared_col"),
+        ]
+        connection = _connection(scopes)
+
+        _run(connection, monkeypatch)
+        assert {row["stable_id"] for row in FakeIngestor.instances[-1].ingested} == {"graph:from-a", "graph:from-b"}
+
+        page_holder["a"] = next(pages_a)
+        report = _run(connection, monkeypatch)
+
+        assert report["deleted"] == 1
+        assert FakeIngestor.instances[-1].deleted == ["graph:from-a"]
+        # The OTHER scope's file, ingested into the SAME shared collection,
+        # is untouched by the delete driven by THIS scope's stable id.
+        assert FakeIngestor._collection_of.get("graph:from-b") == "shared_col"
+
+
+# --------------------------------------------------------------------------
 # File-kind exclusions (TCRD-284): exact match, never a subtree prefix
 # --------------------------------------------------------------------------
 

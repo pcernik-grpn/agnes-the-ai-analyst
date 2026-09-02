@@ -3436,6 +3436,92 @@ async function runSpFactsExtraction(id) {
   }
 }
 
+/* "Consolidate collections…" — folds this connection's per-scope
+   collections (one per bulk-added scope; the common outcome of splitting a
+   large site across many scopes before bulk-add grew its own
+   shared-collection option) into ONE target. `POST .../collections/
+   consolidate` — see app/api/admin_sharepoint.py::consolidate_collections.
+
+   Dry-run-first, always: the FIRST call is always `dry_run: true` (a pure
+   preview — the server never mints anything on that call, see the route's
+   own docstring), rendering "N collection(s), M file(s) → target" for the
+   admin to read BEFORE anything is touched; only an explicit confirm sends
+   the second, real (`dry_run: false`) call. A blocked source (still shared
+   with another connection) is surfaced and the flow stops — it would only
+   be refused with a 409 anyway. */
+async function consolidateSpCollections(id) {
+  const targetName = window.prompt(
+    "Fold this connection's per-scope collections into ONE collection.\n\n" +
+      "Name the target collection (a new one is created):",
+  );
+  if (!targetName || !targetName.trim()) return;
+  const name = targetName.trim();
+  setSourceOpen(id, true);
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  if (resultEl) {
+    resultEl.className = "ds-conn-test-result show";
+    resultEl.textContent = "Checking what would be consolidated…";
+  }
+  const url = `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`;
+  try {
+    const previewResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target: { name }, dry_run: true }),
+    });
+    const preview = await previewResp.json().catch(() => ({}));
+    if (!previewResp.ok) {
+      const msg = detailMessage(preview, "failed to preview consolidation");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const sources = preview.sources || [];
+    const totalFiles = sources.reduce((sum, s) => sum + (s.file_count || 0), 0);
+    const blocking = preview.blocking || [];
+    if (blocking.length) {
+      const msg = `${blocking.length} collection(s) are still shared with another connection — consolidating would be refused.`;
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const proceed = window.confirm(
+      `This will fold ${sources.length} collection(s) (${totalFiles} file(s) total) into ` +
+        `"${name}". This cannot be undone. Continue?`,
+    );
+    if (!proceed) {
+      if (resultEl) { resultEl.className = "ds-conn-test-result show"; resultEl.textContent = ""; }
+      return;
+    }
+    if (resultEl) resultEl.textContent = "Consolidating…";
+    const execResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target: { name }, dry_run: false }),
+    });
+    const execBody = await execResp.json().catch(() => ({}));
+    if (execResp.ok) {
+      if (resultEl) {
+        resultEl.className = "ds-conn-test-result show ok";
+        resultEl.textContent =
+          `✓ Folded ${(execBody.sources || []).length} collection(s) into "${execBody.target.name}" ` +
+          `(${execBody.files_moved} file(s)).`;
+      }
+      showToast("Collections consolidated.", true);
+      await loadConnections();
+    } else {
+      const msg = detailMessage(execBody, "failed to consolidate collections");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+    }
+  } catch (e) {
+    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    showToast("Request failed.", false);
+  }
+}
+
 /* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
    `PATCH .../extraction/facts-config`
    (`app/api/admin_extraction.py::patch_extraction_facts_config`). Both
@@ -6227,6 +6313,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
     <div class="apg-menu__sep"></div>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); consolidateSpCollections('${id}')">Consolidate collections…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item apg-menu__item--danger" role="menuitem" onclick="closeSourceMenu(); deleteConn('${id}')">Delete source</button>`;

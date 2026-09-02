@@ -124,6 +124,58 @@ class TestScopeBulkAdd:
         _, kwargs = mock_post.call_args
         assert kwargs["json"] == {"paths": ["A"], "drive_id": "drv1"}
 
+    def test_collection_id_rides_the_payload(self):
+        body = {"created": [{"path": "A"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--collection-id", "col_shared"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["A"], "collection_id": "col_shared"}
+
+    def test_collection_name_rides_the_payload(self):
+        body = {"created": [{"path": "A"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "scope",
+                    "bulk-add",
+                    "conn1",
+                    "--path",
+                    "A",
+                    "--collection-name",
+                    "One Big Site",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["A"], "collection": {"name": "One Big Site"}}
+
+    def test_collection_id_and_collection_name_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "scope",
+                "bulk-add",
+                "conn1",
+                "--path",
+                "A",
+                "--collection-id",
+                "col_x",
+                "--collection-name",
+                "Y",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
     def test_paths_file_is_read_and_combined_with_path_options(self, tmp_path):
         paths_file = tmp_path / "split.json"
         paths_file.write_text(json.dumps({"paths": ["From File A", "From File B"]}), encoding="utf-8")
@@ -230,6 +282,130 @@ class TestConnectionClone:
             result = runner.invoke(app, ["admin", "sharepoint", "connection", "clone", "conn1", "--name", "taken"])
         assert result.exit_code == 1
         assert "connection_name_exists" in result.output
+
+
+class TestCollectionsConsolidate:
+    """`agnes admin sharepoint collections consolidate` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate`."""
+
+    def test_defaults_to_a_dry_run(self):
+        body = {
+            "dry_run": True,
+            "target": {"id": "col_target", "name": "Merged", "slug": "merged"},
+            "sources": [{"id": "col_a", "name": "A", "slug": "a", "file_count": 3}],
+            "blocking": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "Merged"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "[dry run]" in result.output
+        assert "A (col_a) — 3 file(s)" in result.output
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/collections/consolidate"
+        assert kwargs["json"] == {"dry_run": True, "target": {"name": "Merged"}}
+
+    def test_target_collection_id_rides_the_payload(self):
+        body = {
+            "dry_run": True,
+            "target": {"id": "col_target", "name": "Existing", "slug": "existing"},
+            "sources": [],
+            "blocking": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "collections",
+                    "consolidate",
+                    "conn1",
+                    "--target-collection-id",
+                    "col_target",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"dry_run": True, "target_collection_id": "col_target"}
+
+    def test_execute_flag_sends_dry_run_false_and_reports_the_summary(self):
+        body = {
+            "dry_run": False,
+            "target": {"id": "col_target", "name": "Merged", "slug": "merged"},
+            "sources": [{"id": "col_a", "name": "A", "slug": "a", "file_count": 3}],
+            "files_moved": 3,
+            "chunks_moved": 5,
+            "sources_moved": 3,
+            "events_moved": 1,
+            "claims_moved": 2,
+            "grants_merged": 1,
+            "scopes_repointed": 1,
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "collections",
+                    "consolidate",
+                    "conn1",
+                    "--target-name",
+                    "Merged",
+                    "--execute",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Folded 1 collection(s)" in result.output
+        assert "files=3" in result.output and "scopes_repointed=1" in result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"dry_run": False, "target": {"name": "Merged"}}
+
+    def test_neither_target_flag_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "collections", "consolidate", "conn1"])
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_both_target_flags_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "collections",
+                "consolidate",
+                "conn1",
+                "--target-collection-id",
+                "col_x",
+                "--target-name",
+                "Y",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_json_output(self):
+        body = {"dry_run": True, "target": {"id": "t", "name": "T", "slug": "t"}, "sources": [], "blocking": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "T", "--json"],
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported_and_exits_nonzero(self):
+        detail = {"error": "collection_referenced_by_other_connection", "blocking": [{"collection_id": "col_a"}]}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "T", "--execute"],
+            )
+        assert result.exit_code == 1
+        assert "collection_referenced_by_other_connection" in result.output
 
 
 class TestFactsConfig:

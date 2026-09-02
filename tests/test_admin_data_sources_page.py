@@ -2524,6 +2524,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         "Manage scopes…",
         "Test connection",
         "Run extraction now",
+        "Consolidate collections…",
         "Update certificate…",
         "Delete source",
     ]
@@ -2548,6 +2549,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "testConn('sp-conn-1')" not in html
         assert "openSpWizardForConnection('sp-conn-1')" in html
         assert "toggleSpCertRow('sp-conn-1')" in html
+        assert "consolidateSpCollections('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(

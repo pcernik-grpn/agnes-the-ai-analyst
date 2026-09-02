@@ -1204,6 +1204,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
 - /api/admin/sharepoint/connections/{connection_id}/clone
+- /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1318,7 +1319,11 @@ Graph 404/403 on that one path (`{"path", "reason": "not_found"|
 "forbidden"}`). Any OTHER Graph failure (401/429/5xx, a network fault)
 aborts the remaining unprocessed paths with a typed `502
 sharepoint_graph_error` — whatever was already created before that point
-stays persisted.
+stays persisted. Optional `collection_id` (an existing, live collection) or
+`collection: {"name"}` (mint one new) routes every scope THIS call creates
+to ONE shared target instead of minting one per path — mutually exclusive
+(`400 both_collection_id_and_collection`); an unknown `collection_id` is
+`404 collection_not_found`.
 
 `POST …/clone` — CLI: `agnes admin sharepoint connection clone
 <connection_id>` — the other half of the split-a-large-site workflow: body
@@ -1341,6 +1346,37 @@ rule as `POST /api/admin/source-connections`). Returns `{"id", "name",
 "secret_copied"}` — `secret_copied` is `true` iff a vault row existed to
 copy (`false` just means the source's credential comes from an env var,
 which the clone already resolves on its own).
+
+`POST …/collections/consolidate` — CLI: `agnes admin sharepoint collections
+consolidate <connection_id>`; UI: the source card's overflow menu
+("Consolidate collections…") — the after-the-fact fix for a site that
+ALREADY ended up split across many per-scope collections (a large split
+predating the shared-collection option above, or several bulk-add calls
+without it). Body `{"target_collection_id"|"target": {"name"}, "dry_run"?}`
+— exactly one of `target_collection_id` (an existing, live collection — not
+necessarily one of this connection's own) or `target` (mint a new one) is
+required (`400 target_required` / `400
+both_target_collection_id_and_target`); an unknown `target_collection_id`
+is `404 collection_not_found`; no OTHER scope collection on this connection
+is `400 nothing_to_consolidate`. `dry_run` defaults to `true` — a pure
+preview (`{"dry_run", "target", "sources": [{"id", "name", "slug",
+"file_count"}], "blocking"}`; a NAMED `target` is not minted during a
+preview, so `target.id` is `null` there) that touches nothing. Set
+`dry_run: false` to perform the real merge: every row carrying a
+`corpus_id` for a source collection (`corpus_files`, `corpus_chunks`,
+`corpus_file_sources`, `corpus_file_events`, `claims`,
+`fact_alias_sources`) is re-pointed to the target in ONE transaction, every
+one of this connection's scopes that routed to a source now routes to the
+target, the sources' `resource_grants` are unioned onto the target (ties
+go to the target's own pre-existing grant), and the emptied sources are
+soft-deleted. Refused with `409 collection_referenced_by_other_connection`
+(nothing touched) when a source is still routed to by a DIFFERENT
+connection's own scope, and `409 consolidation_conflict` (nothing touched)
+when the merge would collide on a duplicate `corpus_files.path` or
+`corpus_file_sources.source_stable_id` across the collections being
+folded. PG-only (A3 ratchet) — `501 requires_postgres_backend` on a
+DuckDB-backed instance. ACL-mirroring permission zones
+(`config.acl_zones`) are NOT touched — only scope-level collections.
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

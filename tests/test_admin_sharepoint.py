@@ -1331,6 +1331,138 @@ class TestScopeRemoval:
         assert len(remaining) == 1
         assert remaining[0]["group_id"] == admin_group_id
 
+    def test_removing_a_scope_that_shares_a_collection_keeps_it_even_when_empty(self, seeded_app, monkeypatch):
+        """Two scopes sharing ONE collection (bulk-add's `collection` option)
+        — unticking one must not soft-delete (or tombstone as solely-owned)
+        the collection while the OTHER scope still routes to it, even
+        though the collection holds zero files."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-shared-conn")
+
+        bulk = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B"], "drive_id": "drv1", "collection": {"name": "Shared Site"}},
+            headers=_auth(token),
+        )
+        assert bulk.status_code == 200, bulk.text
+        created = bulk.json()["created"]
+        shared_collection_id = created[0]["collection_id"]
+        assert created[1]["collection_id"] == shared_collection_id
+
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["collection_kept"] is True
+        assert body["collection"]["id"] == shared_collection_id
+
+        # The collection is still live and the OTHER scope still resolves it.
+        coll = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll.status_code == 200
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert [i["source_scope_id"] for i in listed] == ["item-b"]
+        assert listed[0]["collection_id"] == shared_collection_id
+
+    def test_removing_a_scope_that_shares_a_collection_with_another_connection_keeps_it(self, seeded_app, monkeypatch):
+        """The shared collection can be referenced from a DIFFERENT
+        connection too (a second bulk-add call reusing ``collection_id``, or
+        post-consolidation) — untick must scan every SharePoint connection,
+        not just this one, and only clean up once the LAST reference is
+        gone."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn1 = _create_connection(c, token, name="remove-shared-conn-1")
+        conn2 = _create_connection(c, token, name="remove-shared-conn-2")
+
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        bulk1 = c.post(
+            f"{BASE}/{conn1}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection": {"name": "Cross-conn Site"}},
+            headers=_auth(token),
+        )
+        assert bulk1.status_code == 200, bulk1.text
+        shared_collection_id = bulk1.json()["created"][0]["collection_id"]
+
+        _install_item_resolver(monkeypatch, {"Folder B": _folder_item("item-b", "Folder B")})
+        bulk2 = c.post(
+            f"{BASE}/{conn2}/scopes/bulk",
+            json={"paths": ["Folder B"], "drive_id": "drv1", "collection_id": shared_collection_id},
+            headers=_auth(token),
+        )
+        assert bulk2.status_code == 200, bulk2.text
+        assert bulk2.json()["created"][0]["collection_id"] == shared_collection_id
+
+        r = c.delete(f"{BASE}/{conn1}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection_kept"] is True
+
+        coll = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll.status_code == 200
+
+        # Now remove the LAST reference (conn2's scope) — nothing shares it
+        # any more, so the empty collection is finally cleaned up.
+        r2 = c.delete(f"{BASE}/{conn2}/scopes", params={"source_scope_id": "item-b"}, headers=_auth(token))
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["collection_kept"] is False
+
+        coll2 = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll2.status_code == 404
+
+    def test_removing_a_scope_that_shares_a_collection_keeps_the_sentinel_grant(self, seeded_app, monkeypatch):
+        """Untick of ONE scope sharing a collection must not purge the
+        OTHER, still-live scope's sharepoint-acl-sync sentinel grant — the
+        sync will keep reconciling that collection on its own schedule."""
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-shared-sentinel")
+
+        bulk = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A", "Folder B"],
+                "drive_id": "drv1",
+                "collection": {"name": "Shared Sentinel Site"},
+            },
+            headers=_auth(token),
+        )
+        assert bulk.status_code == 200, bulk.text
+        shared_collection_id = bulk.json()["created"][0]["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(
+            name="entra:remove-shared-sentinel-oid", created_by=ACL_SYNC_SENTINEL
+        )
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, shared_collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection_kept"] is True
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == shared_collection_id
+        ]
+        assert len(remaining) == 1
+        assert remaining[0]["group_id"] == sentinel_group["id"]
+
 
 class TestUntickRetickLifecycle:
     """Tick → untick → re-tick must never breed a duplicate collection.
@@ -2182,6 +2314,59 @@ class TestChangesFeedFailsCleanOnDuckDB:
             headers=_auth(token),
         )
         r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+class TestConsolidateCollectionsFailsCleanOnDuckDB:
+    """Collection consolidation (`POST .../collections/consolidate`) is
+    PG-only by construction — it touches `corpus_file_sources` / `claims` /
+    `fact_alias_sources`, themselves PG-only (A3 ratchet). The happy path
+    (preview counts, the real merge, grants union, soft-delete) lives in
+    tests/db_pg/test_sharepoint_collection_consolidate_route_pg.py; this
+    suite (the DuckDB-backed default here) only proves the typed 501 —
+    never a raw 500 — for both the dry-run and the real-merge shape."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def _connection_with_two_scopes(self, c, token, name):
+        conn_id = _create_connection(c, token, name=name)
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:b", "display_path": "B"},
+            headers=_auth(token),
+        )
+        return conn_id
+
+    def test_dry_run_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-dry")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_real_merge_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-real")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}, "dry_run": False},
+            headers=_auth(token),
+        )
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 
@@ -3298,6 +3483,127 @@ class TestBulkScopeAdd:
 
         detail = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
         assert "item-a" not in (detail["config"].get("retired_scope_collections") or {})
+
+    def test_collection_name_mints_one_shared_collection_for_every_created_path(self, seeded_app, monkeypatch):
+        """``collection: {"name": ...}`` mints ONE new collection and routes
+        every scope THIS call creates into it — the split-a-big-site fix:
+        without it, every path forks its own collection (see
+        ``test_creates_a_scope_per_resolved_path`` above)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B/Sub": _folder_item("item-b", "Sub")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-name")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A", "Folder B/Sub"],
+                "drive_id": "drv1",
+                "collection": {"name": "One Big Site"},
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 2
+        collection_ids = {e["collection_id"] for e in body["created"]}
+        assert len(collection_ids) == 1
+
+        coll = c.get(f"/api/collections/{next(iter(collection_ids))}", headers=_auth(token))
+        assert coll.status_code == 200
+        assert coll.json()["name"] == "One Big Site"
+
+    def test_collection_id_routes_to_an_existing_collection(self, seeded_app, monkeypatch):
+        """``collection_id`` reuses an existing, live collection instead of
+        minting one — the option a SECOND bulk-add call (a different
+        connection in the split, or later paths on the same one) uses to
+        keep growing the SAME site collection."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-id")
+
+        from src.repositories import file_corpora_repo
+
+        existing_id = file_corpora_repo().create(
+            name="Pre-existing Site", slug="pre-existing-site-bulk", description=None, created_by="admin"
+        )
+
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection_id": existing_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"][0]["collection_id"] == existing_id
+
+    def test_collection_id_unknown_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-404")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection_id": "col_doesnotexist"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_collection_id_and_collection_are_mutually_exclusive(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-both")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A"],
+                "drive_id": "drv1",
+                "collection_id": "col_x",
+                "collection": {"name": "Y"},
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_collection_id_and_collection"
+
+    def test_a_path_already_present_keeps_its_own_collection_not_the_shared_target(self, seeded_app, monkeypatch):
+        """A ``skipped`` path (already a scope on this connection) must keep
+        whatever collection it already owns — the shared target only ever
+        applies to scopes THIS call newly creates."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-skip-keeps-own")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        own_collection_id = confirmed.json()["collection_id"]
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection": {"name": "Shared, not for item-a"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"] == []
+        assert r.json()["skipped"] == [{"path": "Folder A", "source_scope_id": "item-a", "reason": "already_present"}]
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert listed[0]["collection_id"] == own_collection_id
 
 
 class TestConnectionClone:

@@ -720,6 +720,13 @@ CATALOG: dict[str, AuditEvent] = {
         "material, including a copied vault secret when the source's certificate was uploaded "
         "rather than sourced from a deployment env var.",
     ),
+    "sharepoint_connection.collections_consolidate": AuditEvent(
+        "sharepoint_connection.collections_consolidate",
+        "mutation",
+        "An admin folded several of a SharePoint connection's per-scope collections into one "
+        "target, re-pointing every scope and moving the source collections' files/chunks/claims "
+        "and resource grants onto it.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",
