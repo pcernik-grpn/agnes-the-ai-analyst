@@ -458,6 +458,9 @@ class LiveSession:
     # single-flow case, so this has no observable effect on memory-mode
     # tests.
     _broadcast_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: Orders "read the persisted title, then broadcast it" (``announce_title``)
+    #: so two overlapping renames can never deliver the older name last.
+    _title_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Live participant emails for co-sessions. Populated by attach() from
     # chat_session_participants WHERE left_at IS NULL; updated by leave_session()
     # when a participant leaves. Empty for non-co sessions.
@@ -1723,6 +1726,11 @@ class ChatManager:
             live.current_pump = pump_task
             live.current_wait = wait_task
             self._repo.set_sandbox_paused_at(live.chat_id, None)
+            # The pause cancelled every task in live.tasks — a title task still
+            # awaiting the model included, which re-armed the flag on its way
+            # out (TCRD-290). Retry now: nothing else would, since a finished
+            # turn is not replayed.
+            self._retry_auto_title_if_untitled(live)
 
     async def _destroy_old_sandbox(self, session: "ChatSession") -> None:
         """Best-effort teardown of a session's paused sandbox before its
@@ -2619,13 +2627,16 @@ class ChatManager:
                 self._record_turn_usage(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
-                # Auto-title: the first assistant_message in a session
-                # is the trigger to ask Haiku for a short title. We
-                # check the per-session flag (not just the persisted
-                # title) so two rapid-fire assistant frames during
-                # crash-respawn replay don't both fire the call.
+                # Auto-title backstop: the primary trigger is the first
+                # user message (``_deliver_local_user_message``); the first
+                # assistant_message re-arms it for a session whose title
+                # task never landed (a restart cancelled it mid-flight, or
+                # the user row was not yet visible when it ran). We check
+                # the per-session flag (not just the persisted title) so two
+                # rapid-fire assistant frames during crash-respawn replay
+                # don't both fire the call.
                 if not live.auto_title_started:
-                    self._maybe_start_auto_title(live)
+                    self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
@@ -2908,6 +2919,22 @@ class ChatManager:
         live.state = SessionState.ACTIVE
         # Track C7: a fresh turn gets its own one-delegation budget.
         live.delegated_this_turn = False
+        # Auto-title: the FIRST user message is the trigger (TCRD-290). Every
+        # path that delivers one funnels through here with the row already
+        # persisted — send_user_message and produce_inbound_user_message both
+        # append before delivering, the post-restart replay re-sends a row
+        # that already exists — so the title lands while the answer is still
+        # streaming, and a session whose turn is then refused, capped or lost
+        # to a restart is titled all the same. Never lets a scheduling error
+        # fail the send: the title is cosmetic, the message is not.
+        if not live.auto_title_started:
+            try:
+                self._maybe_start_auto_title(live)
+            except Exception:
+                # Leave the session re-armed: a flag stuck at True here would
+                # silence the assistant_message backstop for its whole live span.
+                live.auto_title_started = False
+                logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
 
     async def deliver_approval_decision(
         self,
@@ -4176,13 +4203,15 @@ class ChatManager:
     def _maybe_start_auto_title(self, live: LiveSession) -> None:
         """Schedule a Haiku call to generate a session title if it
         doesn't have one yet. Idempotent per live session — sets
-        ``auto_title_started`` before returning so a second
-        ``assistant_message`` for the same session is a no-op.
+        ``auto_title_started`` before returning so the second trigger
+        (the first ``assistant_message``, after the first user message
+        already fired it) is a no-op.
 
         Best-effort: any failure is swallowed inside the task so the
         chat session never breaks because Haiku is down or
-        ``ANTHROPIC_API_KEY`` is missing. The task itself is appended
-        to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
+        ``ANTHROPIC_API_KEY`` is missing — the task falls back to a title
+        cut from the user's own message instead. The task itself is
+        appended to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
         """
         session = self._repo.get_session(live.chat_id)
         if session is None or session.title:
@@ -4191,56 +4220,134 @@ class ChatManager:
             # flag was reset by a respawn) or the session vanished.
             live.auto_title_started = True
             return
-        live.auto_title_started = True
+        # Schedule first, flag second: a create_task that raises (loop already
+        # shutting down) must not leave the flag set with no task behind it.
+        # The task cannot run before this method returns, so the order is safe.
         task = asyncio.create_task(self._run_auto_title(live))
+        live.auto_title_started = True
         live.tasks.append(task)
 
+    def _retry_auto_title_if_untitled(self, live: LiveSession) -> None:
+        """Guarded ``_maybe_start_auto_title``: a scheduling failure (repo
+        hiccup, loop shutting down) is logged, never raised into the caller
+        — the WS pump and the resume path must not die for a cosmetic task —
+        and leaves the session re-armed for the next trigger."""
+        if live.auto_title_started:
+            return
+        try:
+            self._maybe_start_auto_title(live)
+        except Exception:
+            live.auto_title_started = False
+            logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
+
+    async def announce_title(self, chat_id: str) -> bool:
+        """Push the session's PERSISTED title as a ``session_renamed`` frame to
+        every sink of its live session hosted in THIS process. Returns
+        ``False`` (and does nothing) when the session is not live here or has
+        no title. After a rename the initiating browser updates itself from
+        the HTTP response; this is what keeps a co-driver's or a second tab's
+        sidebar current.
+
+        Callers pass no title on purpose: the row is re-read under the
+        session's ``_title_lock`` and broadcast before the lock is released, so
+        two overlapping renames (or a rename racing the auto-title task) are
+        announced in persistence order — the later announcement always reads
+        the later value, and can never be overtaken by an older frame.
+
+        Local-only by design: in a role-split deployment the sinks live on the
+        owning gateway, and an api-role process has no LiveSession to reach.
+        Best-effort — a dropped socket is handled inside ``_broadcast``.
+        """
+        live = self._live.get(chat_id)
+        if live is None:
+            return False
+        async with live._title_lock:
+            session = self._repo.get_session(chat_id)
+            title = (session.title or "").strip() if session is not None else ""
+            if not title:
+                return False
+            await self._broadcast(live, {"type": "session_renamed", "chat_id": chat_id, "title": title})
+        return True
+
     async def _run_auto_title(self, live: LiveSession) -> None:
-        """Task body: fetch the first user message, call Haiku, persist
-        the title, broadcast a ``session_renamed`` frame.
+        """Task body: fetch the first user message, ask the model for a
+        title — falling back to a cut of the message itself when the model
+        path yields nothing — persist it, broadcast a ``session_renamed``
+        frame.
 
         All errors are caught and logged — title generation is a
         cosmetic enhancement, not a load-bearing piece of the chat
-        pipeline."""
-        from app.chat.auto_title import generate_title
+        pipeline. Best-effort, but with a floor: when the model path yields
+        nothing the fallback title is used, so a session with a message ends
+        up titled unless persisting the title itself fails or the task is
+        cancelled mid-flight (TCRD-290)."""
+        from app.chat.auto_title import fallback_title, generate_title
 
         try:
             first_user = self._repo.get_first_user_message(live.chat_id)
             if not first_user:
-                # The runner emitted an assistant_message before any
-                # user_msg was persisted — shouldn't happen in normal
-                # flow, but bail cleanly if it does.
+                # Fired before any user_msg row was visible (shouldn't
+                # happen — every trigger path persists first). Re-arm so
+                # the next trigger for this session tries again instead of
+                # leaving it untitled for the rest of its live span.
+                live.auto_title_started = False
                 return
-            title = await generate_title(
-                first_user,
-                llm_auth=self._config.llm_auth,
-                llm_provider=getattr(self._config, "llm_provider", "anthropic"),
-                vertex=(
-                    getattr(self._config, "vertex_project_id", ""),
-                    getattr(self._config, "vertex_region", ""),
-                ),
-            )
-            if not title:
-                return
-            self._repo.set_title(live.chat_id, title)
-            # Push the new title to the live WS so the sidebar +
-            # thread header update without a refresh. _broadcast may
-            # raise if the socket has dropped — swallow it; the
-            # persisted title will surface on the next sidebar load.
+            title: Optional[str] = None
             try:
-                await self._broadcast(
-                    live,
-                    {
-                        "type": "session_renamed",
-                        "chat_id": live.chat_id,
-                        "title": title,
-                    },
+                title = await generate_title(
+                    first_user,
+                    llm_auth=self._config.llm_auth,
+                    llm_provider=getattr(self._config, "llm_provider", "anthropic"),
+                    vertex=(
+                        getattr(self._config, "vertex_project_id", ""),
+                        getattr(self._config, "vertex_region", ""),
+                    ),
                 )
+            except asyncio.CancelledError:
+                # A pause or a kill cancels every task in ``live.tasks``, this
+                # one included. Stop here — never fall through to the fallback
+                # + persist below — but leave the session re-armed: a paused
+                # session is resumed with the same LiveSession, and
+                # ``_resume_live`` retries an untitled one right away instead
+                # of waiting for a message the user may never send.
+                # CancelledError is a BaseException so ``except Exception``
+                # would not catch it anyway — this makes the intent explicit.
+                live.auto_title_started = False
+                raise
             except Exception:
-                logger.debug(
-                    "auto-title: ws.send_json failed for %s; title still persisted",
+                logger.exception(
+                    "auto-title model call crashed for %s; falling back to the first message",
                     live.chat_id,
                 )
+            if not title:
+                title = fallback_title(first_user)
+                if title:
+                    # DEBUG, not INFO: on a keyless instance this is every
+                    # session, and the once-per-process WARNING in auto_title
+                    # already carries the operator-facing signal.
+                    logger.debug("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
+            if not title:
+                return
+            # Conditional write: the user may have renamed the chat while we
+            # were awaiting the model, and their name wins.
+            if not self._repo.set_title_if_unset(live.chat_id, title):
+                logger.debug("auto-title: %s was titled meanwhile (user rename); keeping it", live.chat_id)
+            # Either way, announce whatever is persisted NOW — ours, or the
+            # user's — through the same ordered path the rename endpoint uses,
+            # so the sidebar + thread header update without a refresh and a
+            # co-driver never sees the model's title over the user's.
+            # announce_title may raise if a socket dropped — swallow it; the
+            # persisted title surfaces on the next sidebar load.
+            try:
+                await self.announce_title(live.chat_id)
+            except Exception:
+                logger.debug(
+                    "auto-title: session_renamed broadcast failed for %s; title still persisted",
+                    live.chat_id,
+                )
+        except asyncio.CancelledError:
+            live.auto_title_started = False
+            raise
         except Exception:
             logger.exception("auto-title task crashed for %s", live.chat_id)
 

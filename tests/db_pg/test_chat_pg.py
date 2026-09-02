@@ -116,6 +116,19 @@ def test_set_title(sessions):
     assert sessions.get_session(s.id).title == "Renamed"
 
 
+def test_set_title_if_unset_fills_only_an_empty_title(sessions):
+    """Mirror of the DuckDB test in tests/test_chat_auto_title.py: the
+    auto-title task's conditional write never overwrites a user rename."""
+    s = sessions.create_session(user_email="u@x.com", surface=Surface.WEB)
+    assert sessions.set_title_if_unset(s.id, "Model title") is True
+    assert sessions.get_session(s.id).title == "Model title"
+    assert sessions.set_title_if_unset(s.id, "Later model title") is False
+    assert sessions.get_session(s.id).title == "Model title"
+    sessions.set_title(s.id, "")
+    assert sessions.set_title_if_unset(s.id, "Filled") is True
+    assert sessions.set_title_if_unset("chat_does_not_exist", "x") is False
+
+
 def test_slack_dm_partial_unique_index(sessions, engine):
     sessions.create_session(user_email="u@x.com", surface=Surface.SLACK_DM, slack_channel_id="C1")
     found = sessions.get_slack_dm_session("C1")
