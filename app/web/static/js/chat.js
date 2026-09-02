@@ -3357,7 +3357,9 @@ function enhanceCodeBlocks(root) {
 //
 // The `wheel` / `touchmove` handlers add nothing to that; they only make the
 // button appear on the first notch instead of on the next append, because a
-// gesture handler runs before the scroll it causes.
+// gesture handler runs before the scroll it causes. Being an optimisation and
+// not the contract is exactly why they must not fire on a gesture that moves
+// nothing — see `gestureCanScrollTranscriptUp`.
 //
 // `SCROLL_STICK_PX` is what counts as "at the floor" on the way back down — a
 // rounding zone for fractional scroll heights and for the last line of a turn
@@ -3454,6 +3456,36 @@ function maybeScrollToBottom() {
   scrollToFloor(el);
 }
 
+/** Would an UPWARD gesture on `target` actually move the transcript?
+ *
+ *  The fast path below is only allowed to pre-disarm following for a gesture
+ *  that can. Two kinds cannot, and both used to disarm it (Devin review on
+ *  #2083) — leaving a reader who is still at the floor not following, with the
+ *  recovery button correctly hidden because there is nothing above them to go
+ *  back from, so new tokens simply walked off the bottom of the screen:
+ *
+ *    - the transcript has nothing to give: already at the top, or not
+ *      overflowing at all (a short thread, the first tokens of a turn);
+ *    - a nested scroller eats the gesture. A tool console or a code block
+ *      scrolled down consumes an upward wheel entirely; the event still
+ *      bubbles here, but the transcript never moved. Chained gestures — a
+ *      nested scroller already AT its own top — do move the transcript, and
+ *      `scrollTop > 0` is what tells the two apart.
+ *
+ *  The drift check in `maybeScrollToBottom` is unaffected either way: it
+ *  measures what the container actually did, so a gesture this predicate turns
+ *  away is still caught by the next append if it did move the transcript. */
+function gestureCanScrollTranscriptUp(el, target) {
+  if (!el || el.scrollTop <= 0) return false;
+  for (let n = target instanceof Element ? target : null; n && n !== el; n = n.parentElement) {
+    if (n.scrollTop > 0 && n.scrollHeight - n.clientHeight > 1) {
+      const overflowY = getComputedStyle(n).overflowY;
+      if (overflowY === "auto" || overflowY === "scroll") return false;
+    }
+  }
+  return true;
+}
+
 /** The way back. Shown only while the reader is off the floor, because that is
  *  the only state it can fix — a button that is always up is chrome. */
 function syncJumpToLatest() {
@@ -3471,7 +3503,9 @@ function syncJumpToLatest() {
   // Passive throughout: none of these call preventDefault, and saying so keeps
   // them off the critical path of the very gestures they exist to honour.
   el.addEventListener("scroll", onMessagesScroll, { passive: true });
-  el.addEventListener("wheel", (e) => { if (e.deltaY < 0) stopFollowingStream(); }, { passive: true });
+  el.addEventListener("wheel", (e) => {
+    if (e.deltaY < 0 && gestureCanScrollTranscriptUp(el, e.target)) stopFollowingStream();
+  }, { passive: true });
   el.addEventListener("touchstart", (e) => {
     _touchStartY = e.touches && e.touches[0] ? e.touches[0].clientY : null;
   }, { passive: true });
@@ -3480,7 +3514,10 @@ function syncJumpToLatest() {
     // A finger travelling DOWN the screen drags the transcript down, which
     // uncovers what is above it — that is scrolling up. 4px of slack so a tap
     // that wobbles is not a scroll.
-    if (_touchStartY !== null && y !== null && y > _touchStartY + 4) stopFollowingStream();
+    if (_touchStartY !== null && y !== null && y > _touchStartY + 4 &&
+        gestureCanScrollTranscriptUp(el, e.target)) {
+      stopFollowingStream();
+    }
   }, { passive: true });
   const btn = $("chat-jump-latest");
   if (btn) {

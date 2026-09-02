@@ -50,6 +50,18 @@ def _follow_section() -> str:
     return js[js.index("const SCROLL_STICK_PX") : js.index("(function wireStreamFollow()")]
 
 
+def _gesture_predicate() -> str:
+    """`gestureCanScrollTranscriptUp` alone, with the DOM it reaches for faked."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function gestureCanScrollTranscriptUp(") : js.index("/** The way back.")]
+    return (
+        "class Element { get parentElement() { return this._parent || null; } }\n"
+        "const getComputedStyle = (n) => ({ overflowY: n._overflowY || 'visible' });\n"
+        "const node = (o) => Object.assign(new Element(), "
+        "{ scrollTop: 0, scrollHeight: 0, clientHeight: 0 }, o);\n" + fn
+    )
+
+
 # The harness stands in for the two elements the section reaches for. `top`
 # is writable exactly as `scrollTop` is, so a "scroll" is a write plus the
 # event the browser would fire.
@@ -247,14 +259,22 @@ def test_the_scroll_listener_is_registered_once_and_is_passive():
     assert js.count("function onMessagesScroll(") == 1
 
 
-def test_gesture_handlers_are_passive_and_only_fire_on_upward_intent():
-    """They are the fast path, not the correctness path — but a non-passive
-    listener on wheel/touchmove would tax the scroll they exist to honour."""
+def test_every_gesture_handler_is_passive():
+    """They are the fast path, not the correctness path — a non-passive
+    listener would tax the very gestures they exist to honour."""
     js = _read(CHAT_JS)
-    assert 'el.addEventListener("wheel", (e) => { if (e.deltaY < 0) stopFollowingStream(); }, { passive: true });' in js
-    for evt in ("touchstart", "touchmove"):
-        block = js.split(f'el.addEventListener("{evt}"', 1)[1].split("});", 1)[0]
-        assert "passive: true" in block
+    wiring = js[js.index("(function wireStreamFollow()") : js.index('$("chat-input")?.focus();')]
+    for evt in ("scroll", "wheel", "touchstart", "touchmove"):
+        marker = f'el.addEventListener("{evt}"'
+        assert marker in wiring
+        assert "passive: true" in wiring.split(marker, 1)[1].split("addEventListener", 1)[0]
+
+
+def test_only_an_upward_gesture_disarms_following():
+    js = _read(CHAT_JS)
+    assert "if (e.deltaY < 0 &&" in js, "a downward wheel is the reader coming back, not leaving"
+    touchmove = js.split('el.addEventListener("touchmove"', 1)[1].split("}, { passive: true });", 1)[0]
+    assert "y > _touchStartY + 4" in touchmove
 
 
 def test_following_never_resumes_without_re_taking_the_baseline():
@@ -275,3 +295,73 @@ def test_the_jump_button_ships_hidden_and_cannot_leak_through_inline_flex():
     assert ".cloud-chat-jump[hidden] { display: none; }" in css, (
         "display: inline-flex would otherwise beat the [hidden] default"
     )
+
+
+# ── the gesture fast path only pre-disarms a gesture that can move the
+#    transcript (Devin review on #2083) ───────────────────────────────────────
+
+
+def _gesture(body: str) -> dict:
+    return json.loads(_node_run(_gesture_predicate() + body))
+
+
+def test_a_gesture_that_can_move_the_transcript_takes_the_fast_path():
+    res = _gesture("""
+      const el = node({ scrollTop: 400, scrollHeight: 5000, clientHeight: 1000 });
+      const target = node({ _parent: el });
+      process.stdout.write(JSON.stringify({ ok: gestureCanScrollTranscriptUp(el, target) }));
+    """)
+    assert res["ok"] is True
+
+
+def test_a_transcript_with_nothing_to_give_does_not_disarm_following():
+    """The stranding case: at the top, or not overflowing yet — the reader is
+    still at the floor, so the recovery button is correctly hidden, and
+    disarming here walked new tokens off the bottom of the screen with no way
+    back."""
+    res = _gesture("""
+      const atTop = node({ scrollTop: 0, scrollHeight: 5000, clientHeight: 1000 });
+      const short = node({ scrollTop: 0, scrollHeight: 300, clientHeight: 1000 });
+      process.stdout.write(JSON.stringify({
+        atTop: gestureCanScrollTranscriptUp(atTop, node({ _parent: atTop })),
+        short: gestureCanScrollTranscriptUp(short, node({ _parent: short })),
+        noElement: gestureCanScrollTranscriptUp(null, null),
+      }));
+    """)
+    assert res == {"atTop": False, "short": False, "noElement": False}
+
+
+def test_a_nested_scroller_that_eats_the_gesture_does_not_disarm_following():
+    """A tool console or code block scrolled down consumes an upward wheel
+    entirely. The event still bubbles to the transcript, which never moved."""
+    res = _gesture("""
+      const el = node({ scrollTop: 400, scrollHeight: 5000, clientHeight: 1000 });
+      // A console scrolled down, with its own vertical overflow.
+      const consoleScrolledDown = node({
+        _parent: el, scrollTop: 90, scrollHeight: 600, clientHeight: 200, _overflowY: 'auto',
+      });
+      // The same console at ITS top: the gesture chains through to the transcript.
+      const consoleAtItsTop = node({
+        _parent: el, scrollTop: 0, scrollHeight: 600, clientHeight: 200, _overflowY: 'auto',
+      });
+      // A table wrapper is overflow-x only, so scrollTop never leaves 0.
+      const tableWrap = node({
+        _parent: el, scrollTop: 0, scrollHeight: 200, clientHeight: 200, _overflowY: 'visible',
+      });
+      process.stdout.write(JSON.stringify({
+        eaten: gestureCanScrollTranscriptUp(el, node({ _parent: consoleScrolledDown })),
+        chained: gestureCanScrollTranscriptUp(el, node({ _parent: consoleAtItsTop })),
+        horizontalOnly: gestureCanScrollTranscriptUp(el, node({ _parent: tableWrap })),
+      }));
+    """)
+    assert res["eaten"] is False
+    assert res["chained"] is True, "a nested scroller at its own top does not eat the gesture"
+    assert res["horizontalOnly"] is True
+
+
+def test_both_gesture_handlers_are_gated_on_the_predicate():
+    js = _read(CHAT_JS)
+    assert "if (e.deltaY < 0 && gestureCanScrollTranscriptUp(el, e.target)) stopFollowingStream();" in js
+    touchmove = js.split('el.addEventListener("touchmove"', 1)[1].split("}, { passive: true });", 1)[0]
+    assert "gestureCanScrollTranscriptUp(el, e.target)" in touchmove
+
