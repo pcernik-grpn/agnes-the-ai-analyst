@@ -2589,6 +2589,50 @@ def test_http_deleting_a_file_via_collections_api_sweeps_orphaned_subjects(tmp_p
     assert after.json()["subjects"] == []
 
 
+def test_moving_a_file_repoints_its_claims_at_the_new_collection(pg_env, repo):
+    """`claims.corpus_id` is denormalized from `corpus_files` and is the
+    column fact visibility is filtered on. Moving a file updated the file row
+    and left every claim behind, so the facts stayed grouped under — and
+    readable to — the collection the file had just left (Devin Review on
+    #2068)."""
+    file_id = "cf_moved"
+    doc_id = "doc_moved"
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_collection(collection_id="col_b")
+    _seed_corpus_file(file_id=file_id)
+    _seed_chunk(file_id=file_id, text="The engagement began in March.", ordinal=0)
+    _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
+
+    report = repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:moved",
+                "type": "engagement",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement began in March"}],
+            }
+        ]
+    )
+    assert report["claims_written"] == 1
+
+    from src.repositories import corpus_files_repo
+
+    assert corpus_files_repo().move_to_corpus(file_id, "col_b") is True
+    moved = repo.reassign_file_corpus(file_id, "col_b")
+    assert moved == 1, "every claim anchored to the moved file must follow it"
+
+    import sqlalchemy as sa
+
+    with repo._engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("SELECT corpus_id FROM claims WHERE corpus_file_id = :f"),
+            {"f": file_id},
+        ).fetchall()
+    assert [r[0] for r in rows] == ["col_b"], (
+        "a claim left on the old collection stays visible to that collection's audience"
+    )
+
+
 def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env, repo, monkeypatch):
     """The boundary-crossing check joins the whole document, and it runs per
     QUOTE. A batch where many quotes miss their individual chunks — exactly

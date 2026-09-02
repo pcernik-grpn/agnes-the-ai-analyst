@@ -88,6 +88,16 @@
        as "some documents"; a folder reads as "a container you can put files
        into", which is exactly the affordance that row carries. #}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h3.2a1.5 1.5 0 0 1 1.06.44L11 7.5h7.5A1.5 1.5 0 0 1 20 9v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M4 10.5h16" stroke="currentColor" stroke-width="1.6"/></svg>
+  {%- elif kind == 'definitions' -%}
+    {# The agreed vocabulary — metrics and glossary terms. An open REFERENCE
+       book: the thing you look a meaning up in, which is what this is for.
+       Deliberately not the 'data' cylinder it borrowed at first — that glyph
+       means "a store of rows you can query", and a definition is the opposite
+       end of the same subject: the rule you apply TO those rows. Two different
+       things must not share a mark on a page that shows both. Also not 'doc'
+       or 'recipes' (single sheet, lined sheet): both read as one file, and
+       this is a body of agreed language, not a document. #}
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 7.2C10.4 5.7 7.9 5.1 4 5.6v12.6c3.9-.5 6.4.1 8 1.6 1.6-1.5 4.1-2.1 8-1.6V5.6c-3.9-.5-6.4.1-8 1.6Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 7.2v12.6" stroke="currentColor" stroke-width="1.6"/></svg>
   {%- elif kind == 'skill' -%}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M13 3 4 14h6l-1 7 9-11h-6l1-7Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
   {%- elif kind == 'group' -%}
