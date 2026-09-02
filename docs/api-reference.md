@@ -1562,6 +1562,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/stop
 - /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1610,7 +1611,12 @@ environment overrides. The whole `extraction` section stays out of
 section name and then deep-merges, so one editable key would make the section
 that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
-`sharepoint_connection.extraction_config_read`.
+`sharepoint_connection.extraction_config_read`. The response also carries
+`min_modified: {value, source}` — the SAME resolved shape `…/extraction/
+crawl-config`'s own PATCH response returns — so the drawer's Crawl filter
+panel (a date input plus Save/Clear) opens pre-filled with whatever cutoff
+is already set on the connection, rather than a blank field with no way to
+tell what is active.
 
 `POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
 connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
@@ -1672,12 +1678,33 @@ and its source). CLI: `agnes admin sharepoint facts-config <connection_id>
 transport) are also settable from the SharePoint source card on
 `/admin/data-sources`, for an admin with no server or CLI access.
 
+`PATCH …/extraction/crawl-config` sets or clears a per-connection age filter
+for the crawl — `config.extraction.crawl.min_modified`, another sibling on
+the same JSON column. A backfill run can crawl only files modified on/after
+a cutoff date instead of re-walking a whole multi-year corpus. Body:
+`{"min_modified": "YYYY-MM-DD" | null}` — `null` (or the field omitted)
+clears the override; there is no instance-level fallback (the cutoff is
+inherently connection-specific). Returns `{connection_id, min_modified:
+{value, source}}`, `source` being `"connection"` or `"none"`. `400
+invalid_min_modified` for a value that is not a parseable ISO date; `404`
+for an unknown or non-SharePoint connection. Works on both app-state
+backends, same as `…/extraction/stop`. Audited as `extraction.
+min_modified_set` — the handler writes its own row, same shape as
+`facts-config`'s above. CLI: `agnes admin sharepoint crawl-config
+<connection_id> --min-modified <date>` / `--clear`. The crawler gate itself
+keeps items on/after 00:00:00 UTC of the cutoff date, skips strictly-before
+ones (counted as `filtered_by_age` in the run report), and always keeps an
+item whose modified timestamp cannot be read at all (counted separately as
+`age_unknown`) — an unfilterable item is never silently dropped. A deleted
+item is still processed for deletion regardless of the filter.
+
 The four `GET`/stop routes above are admin-only display primitives with no
-analyst CLI/MCP analogue. The fleet endpoint and `facts-config` are both
-CLI-reachable — an operator watching the fleet, or scripting a
-per-connection cost/recall tradeoff — but deliberately not MCP-exposed: a
-fleet-wide operational status read and a connection's retry policy are both
-operator decisions, not query surfaces any agent needs.
+analyst CLI/MCP analogue. The fleet endpoint, `facts-config` and
+`crawl-config` are all CLI-reachable — an operator watching the fleet, or
+scripting a per-connection cost/recall/scope tradeoff — but deliberately not
+MCP-exposed: a fleet-wide operational status read and a connection's
+retry/crawl policy are all operator decisions, not query surfaces any agent
+needs.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

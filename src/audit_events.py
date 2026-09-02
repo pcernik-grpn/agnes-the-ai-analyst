@@ -1171,6 +1171,12 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin set (or cleared) a SharePoint connection's per-connection extraction.facts.retry_mode override.",
     ),
+    # -- Per-connection age filter for a crawl backfill --------------------
+    "extraction.min_modified_set": AuditEvent(
+        "extraction.min_modified_set",
+        "mutation",
+        "An admin set (or cleared) a SharePoint connection's per-connection extraction.crawl.min_modified filter.",
+    ),
     "run_sharepoint_extraction": AuditEvent(
         "run_sharepoint_extraction",
         "system",

@@ -80,7 +80,7 @@ import logging
 import os
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -893,6 +893,84 @@ async def patch_extraction_facts_config(
     }
 
 
+class CrawlConfigPatch(BaseModel):
+    #: `None` means BOTH "not provided" and "clear the override" — same
+    #: reading as `FactsConfigPatch.retry_mode` above. An ISO `YYYY-MM-DD`
+    #: string, validated below; anything else is a 400.
+    min_modified: Optional[str] = None
+
+
+@router.patch("/connections/{connection_id}/extraction/crawl-config")
+async def patch_extraction_crawl_config(
+    connection_id: str,
+    body: CrawlConfigPatch,
+    _user: dict = Depends(require_admin),
+):
+    """Per-connection age filter for the crawl (a backfill lever): a
+    connection can crawl only files modified on/after a cutoff date instead
+    of re-walking a whole multi-year corpus.
+
+    Writes ``config.extraction.crawl.min_modified`` on the connection row —
+    a sibling of ``config.extraction.facts.retry_mode`` (the facts-config
+    endpoint above) and ``config.extraction.stop_requested_at`` (the Stop
+    control): the established home for per-connection extraction state,
+    carried forward on every generic connection edit. ``min_modified: null``
+    (or the field simply omitted) CLEARS the override — there is no
+    instance-level fallback to fall back to (see
+    :func:`connectors.sharepoint.crawler.resolve_min_modified`'s own
+    docstring for why). A value that is not a parseable ISO ``YYYY-MM-DD``
+    date is refused with a plain ``400`` (``invalid_min_modified``) rather
+    than silently ignored — a caller setting a value expects it to take
+    effect.
+
+    Works on BOTH app-state backends, like its siblings above: this touches
+    only ``source_connections``, never a PG-only table.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    if body.min_modified is not None:
+        try:
+            date.fromisoformat(body.min_modified)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_min_modified") from None
+
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    extraction = dict((connection.get("config") or {}).get("extraction") or {})
+    crawl_cfg = dict(extraction.get("crawl") or {})
+    if body.min_modified is None:
+        crawl_cfg.pop("min_modified", None)
+    else:
+        crawl_cfg["min_modified"] = body.min_modified
+    if crawl_cfg:
+        extraction["crawl"] = crawl_cfg
+    else:
+        extraction.pop("crawl", None)
+    updated = repo.config_patch(connection_id, {"extraction": extraction})
+
+    cutoff, source = resolve_min_modified(updated)
+
+    # More than the fallback middleware can say (it never sees the body) —
+    # same reasoning as the facts-config endpoint's own log_safe above.
+    log_safe(
+        user_id=_user.get("id"),
+        action="extraction.min_modified_set",
+        resource=f"sharepoint_connection:{connection_id}",
+        params={
+            "min_modified": body.min_modified,
+            "resolved": cutoff.isoformat() if cutoff else None,
+            "source": source,
+        },
+    )
+
+    return {
+        "connection_id": connection_id,
+        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": source},
+    }
+
+
 @router.get("/connections/{connection_id}/extraction/runs")
 async def extraction_runs(
     connection_id: str,
@@ -1285,8 +1363,17 @@ async def extraction_config(
     Answers on BOTH backends: nothing here reads ``extraction_runs``, and
     an admin locked out of the configuration read-out because their instance
     is on DuckDB would be a degradation with no cause.
+
+    ``min_modified`` carries the resolved crawl age filter (the SAME
+    ``{value, source}`` shape the ``…/extraction/crawl-config`` PATCH
+    response returns) — the drawer's Crawl filter panel needs the CURRENT
+    override to pre-fill its date input, not just a place to write a new one.
     """
     connection = _sharepoint_connection_or_404(connection_id)
+
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    cutoff, min_modified_source = resolve_min_modified(connection)
 
     scopes: List[Dict[str, Any]] = []
     try:
@@ -1316,6 +1403,7 @@ async def extraction_config(
         "section_lock_reason": None
         if section_editable
         else "The `extraction` section is not admin-writable on this instance.",
+        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": min_modified_source},
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 

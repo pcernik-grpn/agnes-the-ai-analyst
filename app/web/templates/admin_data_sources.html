@@ -8640,4 +8640,116 @@ if (typeof _extConfigHtml === "function") {
   };
 }
 </script>
+
+{#- ── Crawl filter (backfill lever) ──────────────────────────────────────
+     Same additive-wrap contract as the redaction preview block above:
+     `_extConfigHtml` is a global function this block re-wraps, so this is
+     purely additive and does not touch the drawer's own renderer. It
+     reads `body.connection_id` — already on every `…/extraction/config`
+     response — rather than needing a new parameter threaded through
+     `toggleExtractionDrawer`.
+
+     Sets `extraction.crawl.min_modified` via `PATCH …/extraction/
+     crawl-config`, the same `/api/**` JSON endpoint the Stop button above
+     calls: cookie-session authed, protected by the app-wide
+     `CsrfOriginMiddleware` origin check (not the separate `web_csrf`
+     double-submit token, which covers only the HTML <form> handlers) —
+     `credentials: "include"`, no token field, exactly like `extStopRun`. -#}
+<style>
+  .crawlfilter { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ds-border-light); }
+  .crawlfilter__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .crawlfilter__title { font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); }
+  .crawlfilter__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .crawlfilter__input {
+    font-size: 12.5px; padding: 5px 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .crawlfilter__input:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+</style>
+<script>
+/* Every field here is either server-trusted (the connection id, the
+   resolved date this same endpoint just wrote) or set via `textContent`
+   (never `innerHTML`) — `_extEsc` is still applied defensively, same
+   discipline the drawer's own rows already follow. */
+function _crawlFilterPanel(body) {
+  const connId = body.connection_id;
+  const mm = body.min_modified || {};
+  const value = mm.value || "";
+  const statusText = value
+    ? `Currently: files modified on/after ${value} (${mm.source}).`
+    : "Currently: no filter — every file is crawled.";
+  return `
+    <div class="crawlfilter">
+      <div class="crawlfilter__head">
+        <span class="crawlfilter__title">Crawl filter</span>
+        <span class="ext-sub">Crawl only files modified on or after a date, instead of the whole corpus — useful for a backfill.</span>
+      </div>
+      <div class="crawlfilter__row">
+        <input type="date" class="crawlfilter__input" id="crawlfilter-${_extEsc(connId)}-date"
+          value="${_extEsc(value)}" aria-label="Crawl only files modified on/after this date">
+        <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${connId}')">Save</button>
+        <button type="button" class="btn btn-secondary" onclick="crawlFilterClear('${connId}')">Clear</button>
+      </div>
+      <div class="ext-sub" id="crawlfilter-${_extEsc(connId)}-status">${_extEsc(statusText)}</div>
+    </div>`;
+}
+
+async function _crawlFilterPatch(connId, minModified) {
+  const status = document.getElementById(`crawlfilter-${connId}-status`);
+  if (status) status.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/crawl-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_modified: minModified }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't save the crawl filter") : "couldn't save the crawl filter";
+      if (status) status.textContent = "Save failed — see the notification above.";
+      if (typeof showToast === "function") showToast(`Crawl filter: ${msg}`, false);
+      return;
+    }
+    const mm = body.min_modified || {};
+    if (status) {
+      status.textContent = mm.value
+        ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
+        : "Currently: no filter — every file is crawled.";
+    }
+    if (typeof showToast === "function") {
+      showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+    }
+  } catch (e) {
+    if (status) status.textContent = "Request failed.";
+    if (typeof showToast === "function") showToast("Request failed.", false);
+  }
+}
+
+function crawlFilterSave(connId) {
+  const input = document.getElementById(`crawlfilter-${connId}-date`);
+  const value = (input && input.value || "").trim();
+  if (!value) {
+    if (typeof showToast === "function") showToast("Pick a date first, or use Clear to remove the filter.", false);
+    return;
+  }
+  _crawlFilterPatch(connId, value);
+}
+
+function crawlFilterClear(connId) {
+  const input = document.getElementById(`crawlfilter-${connId}-date`);
+  if (input) input.value = "";
+  _crawlFilterPatch(connId, null);
+}
+
+/* Append the panel to the config drawer without touching its renderer —
+   the SAME wrap contract the redaction-preview block above uses, applied
+   again on top of it, so both additions compose. */
+if (typeof _extConfigHtml === "function") {
+  const _crawlFilterBaseConfigHtml = _extConfigHtml;
+  _extConfigHtml = function (body) {
+    return _crawlFilterBaseConfigHtml(body) + _crawlFilterPanel(body);
+  };
+}
+</script>
 {% endblock %}

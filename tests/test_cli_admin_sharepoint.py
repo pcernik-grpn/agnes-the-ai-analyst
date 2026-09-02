@@ -292,6 +292,80 @@ class TestFactsConfig:
         assert "connection_not_found" in result.output
 
 
+class TestCrawlConfig:
+    """`agnes admin sharepoint crawl-config` — CLI counterpart to
+    `PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config`."""
+
+    def test_min_modified_patches_the_connection(self):
+        body = {"connection_id": "conn1", "min_modified": {"value": "2023-12-31", "source": "connection"}}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "conn1", "--min-modified", "2023-12-31"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "2023-12-31" in result.output and "connection" in result.output
+        args, kwargs = mock_patch.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/crawl-config"
+        assert kwargs["json"] == {"min_modified": "2023-12-31"}
+
+    def test_clear_sends_a_null_min_modified(self):
+        body = {"connection_id": "conn1", "min_modified": {"value": None, "source": "none"}}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--clear"])
+        assert result.exit_code == 0, result.output
+        assert "none" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": None}
+
+    def test_neither_flag_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1"])
+        assert result.exit_code == 1
+        assert "--min-modified or --clear" in result.output
+
+    def test_both_flags_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "crawl-config", "conn1", "--min-modified", "2023-12-31", "--clear"]
+        )
+        assert result.exit_code == 1
+        assert "not both" in result.output
+
+    def test_an_invalid_min_modified_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--min-modified", "not-a-date"])
+        assert result.exit_code == 1
+        assert "YYYY-MM-DD" in result.output
+
+    def test_json_output(self):
+        body = {"connection_id": "conn1", "min_modified": {"value": "2023-12-31", "source": "connection"}}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "conn1", "--min-modified", "2023-12-31", "--json"]
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_server_side_400_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_patch",
+            return_value=_resp(400, {"detail": "invalid_min_modified"}),
+        ):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "conn1", "--min-modified", "2023-12-31"]
+            )
+        assert result.exit_code == 1
+        assert "invalid_min_modified" in result.output
+
+    def test_a_404_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_patch",
+            return_value=_resp(404, {"detail": "connection_not_found"}),
+        ):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "does-not-exist", "--min-modified", "2023-12-31"]
+            )
+        assert result.exit_code == 1
+        assert "connection_not_found" in result.output
+
+
 _FLEET_BODY = {
     "connections": [
         {

@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -163,8 +164,9 @@ def _file_item(
     ctag: str = "ctag-1",
     size: int = 1024,
     parent_path: str = "/drives/b!drive1/root:/Reports",
+    modified: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    item: Dict[str, Any] = {
         "id": item_id,
         "name": name,
         "cTag": ctag,
@@ -172,6 +174,9 @@ def _file_item(
         "file": {"mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
         "parentReference": {"path": parent_path},
     }
+    if modified is not None:
+        item["lastModifiedDateTime"] = modified
+    return item
 
 
 @pytest.fixture
@@ -2143,6 +2148,209 @@ class TestScopes:
 
 
 # --------------------------------------------------------------------------
+# min_modified age filter (connection.config.extraction.crawl.min_modified)
+# --------------------------------------------------------------------------
+
+
+def _with_min_modified(scope: Dict[str, Any], cutoff: str) -> Dict[str, Any]:
+    conn = _connection([scope])
+    conn["config"]["extraction"] = {"crawl": {"min_modified": cutoff}}
+    return conn
+
+
+class TestResolveMinModified:
+    """``crawler.resolve_min_modified`` — the per-connection-only resolver
+    (no instance-level fallback: a cutoff date is inherently connection-
+    specific), mirroring the ``(value, source)`` shape of
+    ``facts_extraction.resolve_retry_mode``."""
+
+    def test_no_connection_is_unfiltered(self):
+        assert crawler.resolve_min_modified(None) == (None, "none")
+
+    def test_a_connection_that_sets_nothing_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {}}
+        assert crawler.resolve_min_modified(connection) == (None, "none")
+
+    def test_a_connection_override_sets_the_cutoff(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        assert crawler.resolve_min_modified(connection) == (date(2023, 12, 31), "connection")
+
+    def test_an_invalid_connection_override_is_ignored_and_logged(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "not-a-date"}}}}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_min_modified(connection) == (None, "none")
+        assert "min_modified" in caplog.text
+
+    def test_a_blank_connection_override_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": ""}}}}
+        assert crawler.resolve_min_modified(connection) == (None, "none")
+
+
+class TestMinModifiedFilter:
+    """Boundary rule: a cutoff of ``2023-12-31`` keeps items modified on
+    2023-12-31T00:00:00Z or later — strictly-before is filtered. An item
+    whose age cannot be determined is always kept (never silently dropped)
+    and counted separately as ``age_unknown``."""
+
+    def test_item_modified_before_the_cutoff_is_filtered_and_not_ingested(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-30T23:59:59Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_item_modified_exactly_at_cutoff_midnight_utc_is_kept(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-31T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_item_modified_after_the_cutoff_is_kept(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2024-01-15T09:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_an_item_with_no_modified_timestamp_is_kept_and_counted_as_age_unknown(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert report["age_unknown"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_file_system_info_timestamp_is_used_when_the_top_level_field_is_absent(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            item = _file_item()
+            item["fileSystemInfo"] = {"lastModifiedDateTime": "2023-01-01T00:00:00Z"}
+            return httpx.Response(200, json={"value": [item], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert report["age_unknown"] == 0
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_no_min_modified_configured_applies_no_filter(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(drive_id="b!drive1")]), monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_a_filtered_item_leaves_no_ctag_behind(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        _run(conn, monkeypatch)
+
+        assert "graph:item1" not in _state(crawl_env)["ctags"]
+
+    def test_a_deleted_item_is_processed_for_deletion_regardless_of_the_filter(self, crawl_env, monkeypatch):
+        def handler_ingest(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler_ingest)
+        connection = _connection([_drive_scope(drive_id="b!drive1")])
+        _run(connection, monkeypatch)
+        assert FakeIngestor.instances[-1].ingested
+
+        def handler_delete(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "value": [{"id": "item1", "name": "brief.docx", "deleted": {"state": "deleted"}}],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=2",
+                },
+            )
+
+        _install_graph(monkeypatch, handler_delete)
+        connection["config"]["extraction"] = {"crawl": {"min_modified": "2023-12-31"}}
+        report = _run(connection, monkeypatch)
+
+        assert report["deleted"] == 1
+        assert FakeIngestor.instances[-1].deleted == ["graph:item1"]
+        assert "graph:item1" not in _state(crawl_env)["ctags"]
+
+
+# --------------------------------------------------------------------------
 # Permission-zone routing (TCRD-284)
 # --------------------------------------------------------------------------
 
@@ -2428,9 +2636,7 @@ class TestState:
 
         calls = []
         monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
-        monkeypatch.setattr(
-            state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload))
-        )
+        monkeypatch.setattr(state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload)))
 
         state = crawler.load_state("conn1")
         assert ("get", "crawl", "conn1") in calls

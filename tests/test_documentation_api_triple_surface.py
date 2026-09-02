@@ -1370,6 +1370,17 @@ _EXEMPT: dict[str, str] = {
         "connection's retry/cost policy is an operator decision, not something an "
         "agent should be able to flip on a whim"
     ),
+    # Per-connection age filter for a crawl backfill — same class as the
+    # facts-config exemption directly above: CLI-reachable (`agnes admin
+    # sharepoint crawl-config`) for an operator scripting a backfill cutoff,
+    # but deliberately not MCP-exposed — a crawl's scope is an operator
+    # decision, not something an agent should be able to narrow on a whim.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": (
+        "per-connection extraction.crawl.min_modified override — CLI-reachable "
+        "(agnes admin sharepoint crawl-config) but deliberately not MCP-exposed: a "
+        "connection's crawl scope is an operator decision, not something an agent "
+        "should be able to narrow on a whim"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
         "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
         "job (2026-08-31 plan, Task 8) — admin/scheduler maintenance op, mirrors "

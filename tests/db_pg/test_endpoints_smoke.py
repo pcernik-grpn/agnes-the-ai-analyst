@@ -3511,6 +3511,13 @@ KNOWN_UNTESTED = {
     # the 202 shape, the connection-row write, and the audit row are covered
     # by tests/test_extraction_stop.py.
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop",
+    # Per-connection crawl age filter (extraction.crawl.min_modified) — same
+    # reasoning as `extraction/stop` and `extraction/facts-config` right
+    # above/below: writes to `source_connections`/`config_patch`, a frozen
+    # pre-A3 pair present on BOTH backends, so its per-backend behaviour is
+    # not the point of a PG-only smoke sweep. RBAC, the write, validation,
+    # and the audit row are covered by tests/test_extraction_crawl_config.py.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config",
     # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
     # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
     # "enqueues into the EXISTING jobs table, no new schema surface"

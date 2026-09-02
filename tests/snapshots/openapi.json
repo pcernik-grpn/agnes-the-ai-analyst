@@ -2293,6 +2293,23 @@
         "title": "CoverageTagCreate",
         "type": "object"
       },
+      "CrawlConfigPatch": {
+        "properties": {
+          "min_modified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Modified"
+          }
+        },
+        "title": "CrawlConfigPatch",
+        "type": "object"
+      },
       "CreateAgentRequest": {
         "properties": {
           "description": {
@@ -32244,7 +32261,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": {
       "get": {
-        "description": "A5 \u2014 the read-only effective configuration for this connection's\nextraction, with an origin and a lock state on every row.\n\nCataloged rather than exempt (``sharepoint_connection.extraction_config_read``):\nit discloses credential env-var NAMES and the per-scope audience-class\nmapping \u2014 the same disclosure class as its ``scopes_read`` /\n``certificate_read`` siblings.\n\nAnswers on BOTH backends: nothing here reads ``extraction_runs``, and\nan admin locked out of the configuration read-out because their instance\nis on DuckDB would be a degradation with no cause.",
+        "description": "A5 \u2014 the read-only effective configuration for this connection's\nextraction, with an origin and a lock state on every row.\n\nCataloged rather than exempt (``sharepoint_connection.extraction_config_read``):\nit discloses credential env-var NAMES and the per-scope audience-class\nmapping \u2014 the same disclosure class as its ``scopes_read`` /\n``certificate_read`` siblings.\n\nAnswers on BOTH backends: nothing here reads ``extraction_runs``, and\nan admin locked out of the configuration read-out because their instance\nis on DuckDB would be a degradation with no cause.\n\n``min_modified`` carries the resolved crawl age filter (the SAME\n``{value, source}`` shape the ``\u2026/extraction/crawl-config`` PATCH\nresponse returns) \u2014 the drawer's Crawl filter panel needs the CURRENT\noverride to pre-fill its date input, not just a place to write a new one.",
         "operationId": "extraction_config_api_admin_sharepoint_connections__connection_id__extraction_config_get",
         "parameters": [
           {
@@ -32300,6 +32317,79 @@
           }
         },
         "summary": "Extraction Config",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": {
+      "patch": {
+        "description": "Per-connection age filter for the crawl (a backfill lever): a\nconnection can crawl only files modified on/after a cutoff date instead\nof re-walking a whole multi-year corpus.\n\nWrites ``config.extraction.crawl.min_modified`` on the connection row \u2014\na sibling of ``config.extraction.facts.retry_mode`` (the facts-config\nendpoint above) and ``config.extraction.stop_requested_at`` (the Stop\ncontrol): the established home for per-connection extraction state,\ncarried forward on every generic connection edit. ``min_modified: null``\n(or the field simply omitted) CLEARS the override \u2014 there is no\ninstance-level fallback to fall back to (see\n:func:`connectors.sharepoint.crawler.resolve_min_modified`'s own\ndocstring for why). A value that is not a parseable ISO ``YYYY-MM-DD``\ndate is refused with a plain ``400`` (``invalid_min_modified``) rather\nthan silently ignored \u2014 a caller setting a value expects it to take\neffect.\n\nWorks on BOTH app-state backends, like its siblings above: this touches\nonly ``source_connections``, never a PG-only table.",
+        "operationId": "patch_extraction_crawl_config_api_admin_sharepoint_connections__connection_id__extraction_crawl_config_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CrawlConfigPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Extraction Crawl Config",
         "tags": [
           "admin"
         ]

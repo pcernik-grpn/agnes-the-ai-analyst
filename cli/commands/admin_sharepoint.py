@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Five surfaces:
+Six surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``);
@@ -27,6 +27,11 @@ Five surfaces:
     instance.yaml edit. CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     facts-config``.
+  - ``crawl-config`` — a per-connection age filter: a backfill run can crawl
+    only what changed on/after a cutoff date instead of re-walking a whole
+    multi-year corpus. CLI counterpart to
+    ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
+    crawl-config``.
 
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
@@ -46,6 +51,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -543,3 +549,51 @@ def facts_config(
     resolved_t = body.get("transport") or {}
     if resolved_t:
         typer.echo(f"transport: {resolved_t.get('value')} (source: {resolved_t.get('source')})")
+
+
+@admin_sharepoint_app.command("crawl-config")
+def crawl_config(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    min_modified: Optional[str] = typer.Option(
+        None,
+        "--min-modified",
+        help="Crawl only files modified on/after this UTC date (YYYY-MM-DD) — e.g. a backfill that only "
+        "needs everything changed since a given cutoff. Items modified before it are skipped and counted; "
+        "an item with no modified timestamp is always kept.",
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove the override — the connection crawls unfiltered."),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Set (or clear) this connection's own ``extraction.crawl.min_modified``
+    age filter — a 190k-document connection can crawl only what changed
+    since a cutoff date instead of re-walking the whole corpus.
+
+    Exactly one of ``--min-modified`` / ``--clear`` is required. Prints the
+    RESOLVED value and where it came from (``connection`` or ``none``) — the
+    same shape the admin config drawer would show.
+    """
+    if clear and min_modified is not None:
+        typer.echo("Error: pass either --min-modified or --clear, not both", err=True)
+        raise typer.Exit(1)
+    if not clear and min_modified is None:
+        typer.echo("Error: one of --min-modified or --clear is required", err=True)
+        raise typer.Exit(1)
+    if min_modified is not None:
+        try:
+            date.fromisoformat(min_modified)
+        except ValueError:
+            typer.echo(f"Error: --min-modified must be an ISO YYYY-MM-DD date, got {min_modified!r}", err=True)
+            raise typer.Exit(1) from None
+
+    resp = api_patch(
+        f"/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config",
+        json={"min_modified": min_modified},
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    resolved = body.get("min_modified") or {}
+    typer.echo(f"min_modified: {resolved.get('value')} (source: {resolved.get('source')})")

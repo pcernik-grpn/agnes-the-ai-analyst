@@ -155,6 +155,25 @@ class TestExtractionConfig:
         assert cap["origin"] == "default"
         assert cap["value"] == 50
 
+    def test_min_modified_reads_unset_by_default(self, seeded_app):
+        """The config drawer's Crawl filter panel needs the CURRENT
+        per-connection ``extraction.crawl.min_modified`` override to
+        pre-fill its date input — the same resolved shape the crawl-config
+        PATCH endpoint itself returns."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-min-modified")
+        body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
+        assert body["min_modified"] == {"value": None, "source": "none"}
+
+    def test_min_modified_reflects_a_set_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-min-modified-set")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+        body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
+        assert body["min_modified"] == {"value": "2023-12-31", "source": "connection"}
+
     def test_detector_defaults_to_regex_and_says_no_tokens_are_spent(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-config-detector")
