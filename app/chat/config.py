@@ -14,6 +14,11 @@ from app.instance_config import coerce_flag_value
 
 logger = logging.getLogger(__name__)
 
+#: ``chat.max_session_tokens`` at or below this is one model context window —
+#: the pre-0.96 example value that tripped mid-conversation (TCRD-291); the
+#: loader warns so an explicit legacy setting is not mistaken for the default.
+LOW_SESSION_TOKEN_BUDGET = 200_000
+
 
 @dataclass(frozen=True)
 class SlackConfig:
@@ -51,9 +56,24 @@ class ChatConfig:
     idle_ttl_seconds: int = 30 * 60
     per_tool_call_seconds: int = 90
     per_session_bq_scan_bytes: int = 20 * 1024**3
+    # Two spend guardrails, both summed from ``chat_messages`` tokens (input +
+    # output + cache writes; cache reads excluded — the
+    # ``src.llm_pricing.budget_tokens`` definition): the daily cap is CHECKED
+    # per sender (SR-10; the day's accrual is recorded against the session
+    # owner, see ``ChatManager._record_daily_tokens``), the token budget below
+    # is per CONVERSATION. ``0`` disables either one.
     daily_anthropic_spend_usd: float = 20.0
     max_session_seconds: int = 4 * 3600
-    max_session_tokens: int = 200_000
+    # CUMULATIVE tokens billed over a conversation's whole life, NOT the size of
+    # its context window. Every LLM call of an agentic turn re-sends the
+    # context, so one turn with a dozen tool calls bills several hundred
+    # thousand tokens while the context the engine compacts stays far below
+    # its limit — a value near a context window trips mid-conversation and
+    # reads as "compaction does not work" (TCRD-291; the old 200k default did
+    # exactly that once 0.95.0 started metering engine sessions). Sized as a
+    # runaway-conversation guard: ten context windows' worth of re-sent
+    # input. The cost control is ``daily_anthropic_spend_usd``.
+    max_session_tokens: int = 2_000_000
     rate_messages_per_hour: int = 100
     tool_calls_per_turn_budget: int = 50
     # How long the runner's ApprovalGate waits for the user to answer an
@@ -412,6 +432,19 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
     data = yaml.safe_load(instance_yaml.read_text()) or {}
     raw = data.get("chat", {}) or {}
     detach_linger_seconds = _raw_int(raw, "detach_linger_seconds", 60)
+    max_session_tokens = _raw_int(raw, "max_session_tokens", 2_000_000)
+    if 0 < max_session_tokens <= LOW_SESSION_TOKEN_BUDGET:
+        # An explicit value copied from the pre-0.96 example (200000). The knob
+        # counts tokens billed across a conversation's whole life, so a value
+        # the size of one context window refuses a busy conversation a few
+        # turns in — and the default change cannot reach a key that is set.
+        logger.warning(
+            "chat.max_session_tokens=%d is at or below one model context window; it is a budget of tokens "
+            "billed across a conversation's whole life (every tool call re-bills the context), so long "
+            "conversations will be refused after a few turns. Raise it (default %d) or set 0 to disable.",
+            max_session_tokens,
+            2_000_000,
+        )
     return ChatConfig(
         enabled=_resolve_chat_enabled(raw),
         provider=_resolve_chat_provider(raw),
@@ -423,7 +456,7 @@ def load_chat_config(instance_yaml: Path) -> ChatConfig:
         per_session_bq_scan_bytes=_raw_int(raw, "per_session_bq_scan_bytes", 20 * 1024**3),
         daily_anthropic_spend_usd=_raw_float(raw, "daily_anthropic_spend_usd", 20.0),
         max_session_seconds=_raw_int(raw, "max_session_seconds", 4 * 3600),
-        max_session_tokens=_raw_int(raw, "max_session_tokens", 200_000),
+        max_session_tokens=max_session_tokens,
         rate_messages_per_hour=_raw_int(raw, "rate_messages_per_hour", 100),
         tool_calls_per_turn_budget=_raw_int(raw, "tool_calls_per_turn_budget", 50),
         approval_timeout_seconds=_raw_int(raw, "approval_timeout_seconds", 300),
