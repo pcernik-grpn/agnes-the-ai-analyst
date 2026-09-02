@@ -405,7 +405,6 @@ fi
 # silently strands the VM on its cached image. So refresh it in place, but
 # only when it already exists.
 if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
-  GCP_OVERLAY_BEFORE=$(sha256sum /opt/agnes/docker-compose.gcp-logging.yml 2>/dev/null | cut -d" " -f1)
   extract_host_artifact docker-compose.gcp-logging.yml /opt/agnes/docker-compose.gcp-logging.yml \
     || logger -t agnes-auto-upgrade "WARN: failed to refresh docker-compose.gcp-logging.yml from $IMAGE -- keeping existing"
   GCP_OVERLAY_AFTER=$(sha256sum /opt/agnes/docker-compose.gcp-logging.yml 2>/dev/null | cut -d" " -f1)
@@ -419,10 +418,19 @@ if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
   # content really changing — clearing unconditionally would re-probe every
   # tick and, because the marker is hashed as config, churn a recreate
   # every five minutes.
-  if [ -n "$GCP_OVERLAY_AFTER" ] && [ "$GCP_OVERLAY_BEFORE" != "$GCP_OVERLAY_AFTER" ] \
-     && [ -f /opt/agnes/.gcp-logging-ok ]; then
+  # Compare the marker's OWN stamp against the overlay on disk, not this
+  # tick's before/after. The before/after form cannot fire on the rollout
+  # that introduces it: this script replaces itself at the END of a tick,
+  # so the PREVIOUS version refreshes the overlay (keeping the marker) and
+  # this version's first run five minutes later already sees
+  # before == after — the stale verdict survives exactly the upgrade it
+  # was meant to catch (Devin Review on #2057). Stamped markers are
+  # written by agnes_gcp_logging_probe; an empty one from an older image
+  # never matches, so such a VM re-probes once and is stamped from then on.
+  if [ -n "$GCP_OVERLAY_AFTER" ] && [ -f /opt/agnes/.gcp-logging-ok ] \
+     && [ "$(cat /opt/agnes/.gcp-logging-ok 2>/dev/null)" != "$GCP_OVERLAY_AFTER" ]; then
     rm -f /opt/agnes/.gcp-logging-ok
-    logger -t agnes-auto-upgrade "docker-compose.gcp-logging.yml changed — clearing the probe marker so the new pipeline is verified before it is engaged"
+    logger -t agnes-auto-upgrade "the probe marker was armed for a different docker-compose.gcp-logging.yml — clearing it so the current pipeline is verified before it is engaged"
   fi
 fi
 
