@@ -297,6 +297,43 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 %{ endif ~}
 
+%{ if enable_gcp_logging ~}
+# --- OPS AGENT (Cloud Logging collector) ---------------------------------
+# The overlay forwards container logs to a fluent_forward receiver on
+# loopback; this is what listens on it. Using the agent rather than Docker's
+# gcplogs driver is the whole reason the entries end up structured: it parses
+# the app's JSON line back into fields and lifts `severity` onto the entry.
+#
+# Every step is failure-tolerant. A logging add-on must never fail a boot,
+# and the overlay is probe-gated anyway — if the agent is not listening when
+# the probe runs, the overlay simply stays disarmed with a warning and the
+# next auto-upgrade tick re-probes. Installation is skipped when the agent
+# is already present, so a reboot costs nothing.
+if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
+    echo "installing the Cloud Ops Agent..."
+    (
+        cd /tmp \
+        && curl -fsSL -o add-google-cloud-ops-agent-repo.sh \
+             https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \
+        && bash add-google-cloud-ops-agent-repo.sh --also-install
+    ) || echo "WARNING: Cloud Ops Agent install failed — container logs stay local for this boot; the Cloud Logging overlay will not arm" >&2
+fi
+
+# The receiver + parsers. Written on every boot so an edited config
+# self-heals, and so a VM provisioned before this existed picks it up.
+if [ -d /etc/google-cloud-ops-agent ]; then
+    echo "${ops_agent_config_b64}" | base64 -d > /etc/google-cloud-ops-agent/config.yaml \
+        && systemctl restart google-cloud-ops-agent \
+        || echo "WARNING: could not apply the Cloud Ops Agent config — the Cloud Logging overlay will not arm" >&2
+    # The probe below connects to the forward port; give the agent a moment
+    # to bind it rather than losing the overlay for a whole boot on a race.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if bash -c "exec 3<>/dev/tcp/127.0.0.1/24224" >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+fi
+%{ endif ~}
+
 # Boot-time gcplogs driver probe — defense in depth for #1557. Docker
 # refuses to START a container whose log driver cannot initialize, so an
 # armed overlay on a VM whose service account cannot write to Cloud Logging
@@ -321,9 +358,9 @@ rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 if [ -f "$APP_DIR/scripts/ops/agnes-compose-file.sh" ]; then
     . "$APP_DIR/scripts/ops/agnes-compose-file.sh"
     if agnes_gcp_logging_probe "$APP_DIR" "$${IMAGE_REPO}:$${IMAGE_TAG}"; then
-        echo "gcplogs driver probe OK — Cloud Logging overlay armed"
+        echo "Cloud Ops Agent is receiving on 127.0.0.1:24224 — Cloud Logging overlay armed"
     elif [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
-        echo "WARNING: docker-compose.gcp-logging.yml is present but the gcplogs log driver failed its probe (is roles/logging.logWriter granted to the VM service account?) — DISABLING the Cloud Logging overlay for this boot instead of letting container starts fail; grant the role and the next auto-upgrade tick re-arms it" >&2
+        echo "WARNING: docker-compose.gcp-logging.yml is present but nothing is listening on 127.0.0.1:24224 (did the Cloud Ops Agent install or start fail? is roles/logging.logWriter granted to the VM service account?) — leaving the Cloud Logging overlay DISARMED rather than buffering every log line into a socket nobody reads; fix the agent and the next auto-upgrade tick re-arms it" >&2
     fi
 else
     rm -f "$APP_DIR/.gcp-logging-ok"

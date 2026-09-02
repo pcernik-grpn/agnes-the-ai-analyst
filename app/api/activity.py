@@ -27,7 +27,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.access import require_admin
-from src.observability.posthog_client import get_posthog
 
 from src.repositories import (
     audit_repo,
@@ -78,14 +77,6 @@ def _audit_read(user: dict, endpoint: str, filter_payload: dict) -> None:
         # client_kind intentionally omitted (F0 audit-context autofill,
         # Task 1) — this read isn't necessarily browser-only.
     )
-    try:
-        get_posthog().capture(
-            event=f"activity_{endpoint}_viewed",
-            distinct_id=actor_id,
-            properties={k: v for k, v in filter_payload.items() if v is not None},
-        )
-    except Exception:
-        pass  # never break the request
 
 
 @router.get("")

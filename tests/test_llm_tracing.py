@@ -1,225 +1,116 @@
-"""LLM tracing emits well-formed $ai_generation events."""
+"""LLM call instrumentation — one structured log record per generation.
+
+The signal an operator needs from an LLM call is provider / model / token
+counts / latency / whether it failed. It is emitted as a single structured
+log record so it lands wherever the deployment already ships logs, with no
+second sink and no vendor account to hold it.
+
+Prompts and completions are deliberately NOT recorded: they routinely carry
+customer data in this product, and a log pipeline is the wrong place for it.
+Their sizes are, because a size is the part that explains a cost or a
+latency.
+"""
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+import logging
 
 import pytest
 
-
-@pytest.fixture
-def enabled_posthog(monkeypatch):
-    monkeypatch.setenv("POSTHOG_API_KEY", "phc_x")
-    monkeypatch.delenv("POSTHOG_LLM_PAYLOADS", raising=False)
-    from src.observability import reset_posthog
-
-    reset_posthog()
-    yield
-    reset_posthog()
+from src.observability import trace_generation
 
 
-def test_success_emits_ai_generation_with_token_counts(enabled_posthog):
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
-
-        with trace_generation(provider="anthropic", model="claude-test", distinct_id="u-1") as t:
-            t.set_input("hello")
-            t.set_tokens(input_tokens=5, output_tokens=10)
-
-        # The wrapper calls sdk.capture exactly once.
-        sdk.capture.assert_called_once()
-        kwargs = sdk.capture.call_args.kwargs
-        assert kwargs["event"] == "$ai_generation"
-        assert kwargs["distinct_id"] == "u-1"
-        props = kwargs["properties"]
-        assert props["$ai_provider"] == "anthropic"
-        assert props["$ai_model"] == "claude-test"
-        assert props["$ai_input_tokens"] == 5
-        assert props["$ai_output_tokens"] == 10
-        assert "$ai_latency" in props
-        assert "$ai_trace_id" in props
-        # Payloads off by default — neither input nor output bodies leak.
-        assert "$ai_input" not in props
-        assert "$ai_output_choices" not in props
-        assert "$ai_is_error" not in props
+def _records(caplog) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if getattr(r, "event", None) == "llm_generation"]
 
 
-def test_payloads_flag_enables_prompt_and_completion(enabled_posthog, monkeypatch):
-    monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
-    from src.observability import reset_posthog
+def test_a_generation_emits_one_record_with_the_operator_facing_numbers(caplog):
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="anthropic", model="claude-x") as trace:
+            trace.set_tokens(input_tokens=120, output_tokens=45)
 
-    reset_posthog()
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
-
-        with trace_generation(provider="openai_compat", model="gpt-x") as t:
-            t.set_input("the prompt")
-            t.set_output("the completion")
-            t.set_tokens(input_tokens=1, output_tokens=2)
-
-        kwargs = sdk.capture.call_args.kwargs
-        props = kwargs["properties"]
-        assert props["$ai_input"] == "the prompt"
-        assert props["$ai_output_choices"] == "the completion"
+    (record,) = _records(caplog)
+    assert record.provider == "anthropic"
+    assert record.model == "claude-x"
+    assert record.input_tokens == 120
+    assert record.output_tokens == 45
+    assert record.is_error is False
+    assert isinstance(record.latency_ms, int) and record.latency_ms >= 0
 
 
-def test_exception_emits_error_event_and_reraises(enabled_posthog):
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
+def test_a_failing_generation_is_marked_and_the_error_still_propagates(caplog):
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError, match="upstream is down"):
+            with trace_generation(provider="anthropic", model="claude-x"):
+                raise RuntimeError("upstream is down")
 
-        with pytest.raises(RuntimeError, match="api down"):
-            with trace_generation(provider="anthropic", model="claude-test") as t:
-                t.set_input("x")
-                raise RuntimeError("api down")
-
-        sdk.capture.assert_called_once()
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert props["$ai_is_error"] is True
-        assert "api down" in props["$ai_error"]
-        assert props["$ai_provider"] == "anthropic"
-        assert "$ai_latency" in props
+    (record,) = _records(caplog)
+    assert record.is_error is True
+    assert record.error_type == "RuntimeError"
 
 
-def test_set_output_from_anthropic_extracts_tokens(enabled_posthog):
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
+def test_the_prompt_is_measured_never_recorded(caplog):
+    """A char count explains a cost; the text is customer data."""
+    secret = "patient Nováková, birth number 815623/1234"
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="anthropic", model="claude-x") as trace:
+            trace.set_input(secret)
+            trace.set_output("the answer")
 
-        # Build a fake Anthropic response object.
-        block = SimpleNamespace(text="some output text")
-        response = SimpleNamespace(
-            usage=SimpleNamespace(input_tokens=11, output_tokens=22),
-            content=[block],
-        )
-
-        with trace_generation(provider="anthropic", model="claude-test") as t:
-            t.set_output_from_anthropic(response)
-
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert props["$ai_input_tokens"] == 11
-        assert props["$ai_output_tokens"] == 22
+    (record,) = _records(caplog)
+    assert record.prompt_chars == len(secret)
+    assert record.completion_chars == len("the answer")
+    serialized = repr(record.__dict__) + record.getMessage()
+    assert "Nováková" not in serialized and "815623" not in serialized
 
 
-def test_payload_truncation_under_default_cap(enabled_posthog, monkeypatch):
-    """Oversized prompt/output gets clipped so PostHog doesn't drop the event.
+def test_token_counts_are_read_off_an_anthropic_response(caplog):
+    class _Usage:
+        input_tokens = 11
+        output_tokens = 22
 
-    Agnes ships LLM prompts containing sample rows / SQL that routinely
-    exceed PostHog's ~32 KB per-event ingest cap. Without truncation the
-    interesting events vanish silently. PR #231 review (minasarustamyan).
-    """
-    monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
-    from src.observability import reset_posthog
+    class _Response:
+        usage = _Usage()
+        content = [type("Block", (), {"type": "text", "text": "hi"})()]
 
-    reset_posthog()
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="anthropic", model="claude-x") as trace:
+            trace.set_output_from_anthropic(_Response())
 
-    big_prompt = "P" * 50_000
-    big_output = "O" * 50_000
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
-
-        with trace_generation(provider="anthropic", model="claude-x") as t:
-            t.set_input(big_prompt)
-            t.set_output(big_output)
-            t.set_tokens(input_tokens=1, output_tokens=2)
-
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert len(props["$ai_input"]) < len(big_prompt)
-        assert len(props["$ai_output_choices"]) < len(big_output)
-        # Truncation marker present so reader knows it was clipped.
-        assert "[truncated " in props["$ai_input"]
-        assert "[truncated " in props["$ai_output_choices"]
-        # Cap stays well under PostHog's ~32 KB per-event limit.
-        assert len(props["$ai_input"]) < 32_000
-        assert len(props["$ai_output_choices"]) < 32_000
+    (record,) = _records(caplog)
+    assert (record.input_tokens, record.output_tokens) == (11, 22)
 
 
-def test_payload_truncation_respects_env_override(enabled_posthog, monkeypatch):
-    monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
-    monkeypatch.setenv("POSTHOG_LLM_PAYLOAD_MAX_CHARS", "100")
-    from src.observability import reset_posthog
+def test_token_counts_are_read_off_an_openai_response(caplog):
+    class _Usage:
+        prompt_tokens = 7
+        completion_tokens = 9
 
-    reset_posthog()
+    class _Response:
+        usage = _Usage()
+        choices: list = []
 
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="openai_compat", model="gpt-x") as trace:
+            trace.set_output_from_openai(_Response())
 
-        with trace_generation(provider="anthropic", model="claude-x") as t:
-            t.set_input("X" * 500)
-            t.set_output("Y" * 500)
-
-        props = sdk.capture.call_args.kwargs["properties"]
-        # Cap honored — first 100 chars then the marker.
-        assert props["$ai_input"].startswith("X" * 100)
-        assert props["$ai_input"].endswith("[truncated 400 chars]")
+    (record,) = _records(caplog)
+    assert (record.input_tokens, record.output_tokens) == (7, 9)
 
 
-def test_payload_under_cap_is_passed_through_unchanged(enabled_posthog, monkeypatch):
-    monkeypatch.setenv("POSTHOG_LLM_PAYLOADS", "1")
-    from src.observability import reset_posthog
+def test_a_response_shape_it_cannot_read_never_breaks_the_call(caplog):
+    """Instrumentation is not allowed to be the thing that fails a generation."""
 
-    reset_posthog()
+    class _Hostile:
+        @property
+        def usage(self):  # noqa: ANN201
+            raise ValueError("nope")
 
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
+    with caplog.at_level(logging.INFO):
+        with trace_generation(provider="anthropic", model="claude-x") as trace:
+            trace.set_output_from_anthropic(_Hostile())
+            result = "the call still returned"
 
-        small = "tiny prompt"
-        with trace_generation(provider="anthropic", model="claude-x") as t:
-            t.set_input(small)
-            t.set_output(small)
-
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert props["$ai_input"] == small
-        assert props["$ai_output_choices"] == small
-        assert "[truncated" not in props["$ai_input"]
-
-
-def test_set_output_from_openai_extracts_tokens(enabled_posthog):
-    sdk = MagicMock()
-    with patch("posthog.Posthog", return_value=sdk):
-        from src.observability import trace_generation
-
-        msg = SimpleNamespace(content="hi")
-        choice = SimpleNamespace(message=msg)
-        response = SimpleNamespace(
-            usage=SimpleNamespace(prompt_tokens=3, completion_tokens=7),
-            choices=[choice],
-        )
-
-        with trace_generation(provider="openai_compat", model="gpt-x") as t:
-            t.set_output_from_openai(response)
-
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert props["$ai_input_tokens"] == 3
-        assert props["$ai_output_tokens"] == 7
-
-
-def test_vertex_extractor_traces_provider_vertex(enabled_posthog):
-    """VertexExtractor inherits AnthropicExtractor's extraction loop but must
-    label its traces provider="vertex" (via the _TRACE_PROVIDER hook)."""
-    sdk = MagicMock()
-    with (
-        patch("posthog.Posthog", return_value=sdk),
-        patch("connectors.llm.vertex_provider.anthropic.AnthropicVertex") as mock_vertex_cls,
-    ):
-        from connectors.llm.vertex_provider import VertexExtractor
-
-        client = MagicMock()
-        mock_vertex_cls.return_value = client
-        client.messages.create.return_value = SimpleNamespace(
-            stop_reason="end_turn",
-            content=[SimpleNamespace(text="{}", type="text")],
-        )
-        ext = VertexExtractor(project_id="p", region="global", model="claude-haiku-4-5-20251001")
-        ext.extract_json(prompt="q", max_tokens=8, json_schema={"type": "object"}, schema_name="t")
-
-        sdk.capture.assert_called_once()
-        props = sdk.capture.call_args.kwargs["properties"]
-        assert props["$ai_provider"] == "vertex"
-        assert props["$ai_model"] == "claude-haiku-4-5@20251001"
+    assert result == "the call still returned"
+    (record,) = _records(caplog)
+    assert record.is_error is False
