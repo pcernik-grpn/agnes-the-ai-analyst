@@ -23,7 +23,7 @@ from __future__ import annotations
 import contextlib
 import os
 import threading
-from typing import Iterator, Optional
+from typing import Iterator, Optional, TypedDict
 
 import sqlalchemy as sa
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -157,8 +157,14 @@ def _pg_revisions() -> tuple[Optional[str], Optional[str], bool]:
     ``db_current`` is the revision stamped in ``alembic_version`` (None
     when never stamped); ``script_head`` is the head of the migration
     scripts shipped in this image. ``db_ahead`` is True when the DB's
-    revision is unknown to this image's scripts — the app-rollback case,
-    whose remedy differs from plain drift.
+    revision is unknown to this image's scripts — either a genuine
+    app-rollback (a newer image already migrated past this one) or a
+    database stranded by a since-renumbered/deleted revision id (issue
+    #2086). This function does not distinguish the two; ``assert_pg_at_head``
+    does, using the repo's strict ``NNNN_name`` numbering (see
+    ``_unknown_revision_is_stranded`` below) — the remedies are opposite
+    (roll the image forward vs. apply the registered repair), so conflating
+    them would send an operator the wrong way.
     """
     import sqlalchemy as sa
     from alembic.script import ScriptDirectory
@@ -202,6 +208,76 @@ def _pg_revisions() -> tuple[Optional[str], Optional[str], bool]:
     return current, head, db_ahead
 
 
+def _revision_number_prefix(revision_id: str) -> Optional[int]:
+    """Return the leading 4-digit numeric prefix of a strict ``NNNN_name``
+    revision id (e.g. ``77`` for ``"0077_ontology_drafts"``), or ``None``
+    when the id doesn't follow that shape (a raw hex id from a botched
+    manual stamp, or any other id this repo never generated).
+    """
+    prefix = revision_id[:4]
+    if len(revision_id) < 5 or revision_id[4] != "_" or not prefix.isdigit():
+        return None
+    return int(prefix)
+
+
+def _unknown_revision_is_stranded(current: str, head: str) -> Optional[bool]:
+    """Classify a DB revision this image's ``ScriptDirectory`` doesn't know.
+
+    Returns ``True`` when the id's numeric prefix proves it CANNOT have come
+    from a newer image (its prefix is <= this image's head prefix) — i.e. it
+    was shipped once, under this exact string, and later renumbered or
+    deleted out from under a database that had already applied it (issue
+    #2086). Such a database is STRANDED, not ahead: no image, past or
+    future, ships a script under that id any more.
+
+    Returns ``False`` when the prefix is strictly greater than head's — the
+    ordinary app-rollback case (a newer image already migrated past this
+    one; rolling forward again is the fix).
+
+    Returns ``None`` when either id's prefix cannot be parsed — this repo's
+    numbering convention doesn't cover every historical id (a manually
+    stamped hex value, for instance), and guessing either way risks sending
+    an operator to the wrong remedy with false confidence.
+    """
+    current_prefix = _revision_number_prefix(current)
+    head_prefix = _revision_number_prefix(head)
+    if current_prefix is None or head_prefix is None:
+        return None
+    return current_prefix <= head_prefix
+
+
+class _RenumberedRevisionRepair(TypedDict):
+    """One ``RENUMBERED_REVISION_REPAIRS`` entry — see that map's docstring."""
+
+    apply: tuple[str, ...]
+    stamp: str
+
+
+#: Registered repairs for a database stamped at a shipped-then-renumbered
+#: revision id (issue #2086). Keyed by the STRANDED id — the string some
+#: already-migrated database may still have in ``alembic_version``.
+#: ``"apply"`` lists, in order, the CURRENT revision module(s) whose
+#: ``upgrade()`` reproduces the DDL the stranded id's chain never applied
+#: (the migration(s) that were inserted BEFORE it when it got renumbered);
+#: ``"stamp"`` is the id that occupies the stranded id's old position in
+#: the CURRENT chain — what ``alembic_version`` is re-stamped to once that
+#: DDL has landed, since a database that has both is schema-equivalent to
+#: one that walked the current chain in the current order.
+#:
+#: ``ensure_pg_at_head()`` applies a matching entry automatically at
+#: startup; ``assert_pg_at_head()`` never does — it only names the repair
+#: (see its STRANDED message). This map is append-only, like
+#: ``migrations/shipped_revision_ids.txt``: a past renumbering incident
+#: stays listed forever, because an operator's database may still be
+#: sitting on the stranded id years later.
+RENUMBERED_REVISION_REPAIRS: dict[str, _RenumberedRevisionRepair] = {
+    "0077_facts_ingest_runs": _RenumberedRevisionRepair(
+        apply=("0077_ontology_drafts",),
+        stamp="0078_facts_ingest_runs",
+    ),
+}
+
+
 def assert_pg_at_head() -> None:
     """Fail closed unless the Postgres DB is at the head Alembic revision.
 
@@ -220,6 +296,16 @@ def assert_pg_at_head() -> None:
     ``RuntimeError`` when they disagree (including the never-stamped
     ``current is None`` case) naming both revisions and the manual
     remediation. A no-op when they match.
+
+    A revision unknown to this image's scripts (``_pg_revisions()``'s
+    ``db_ahead``) is further split by ``_unknown_revision_is_stranded``:
+    a STRANDED database (a shipped id later renumbered/deleted out from
+    under it — issue #2086) gets a distinct message naming the id and
+    pointing at ``RENUMBERED_REVISION_REPAIRS`` / the docs/migrations.md
+    runbook, never the AHEAD wording — rolling the app image forward or
+    backward does not fix a stranded database, and telling an operator to
+    do so wastes a deploy cycle finding that out. This function never
+    applies a repair itself; only ``ensure_pg_at_head()`` does.
 
     Honors the ``AGNES_SKIP_PG_REVISION_CHECK=1`` escape hatch for
     emergency boots. This check is PG-only by design — DuckDB needs no
@@ -245,15 +331,53 @@ def assert_pg_at_head() -> None:
         return
 
     if db_ahead:
+        # _pg_revisions() only sets db_ahead=True when current is a real,
+        # non-None stamped value; head is None only for an empty script
+        # directory, which never happens in a real checkout. Asserting here
+        # (rather than widening the helper to Optional[str]) keeps the
+        # narrowing local to the one call site that needs it.
+        assert current is not None and head is not None
+        stranded = _unknown_revision_is_stranded(current, head)
+
+        if stranded:
+            raise RuntimeError(
+                f"Postgres schema is stamped at Alembic revision {current!r}, "
+                "which this image's migration scripts do not contain — but "
+                f"its numbering ({current[:4]!r} <= this image's head "
+                f"{head[:4]!r}) rules out an app rollback, since no newer "
+                "image could ship a lower-numbered head. This id existed in "
+                "an earlier release's migration chain and was renumbered or "
+                "removed since it shipped (issue #2086): the database is "
+                "STRANDED, not AHEAD — no image, old or new, ships a script "
+                "under this exact id any more, so rolling the app image "
+                "forward or backward will not fix it. Check "
+                f"RENUMBERED_REVISION_REPAIRS in src/db_pg.py for a "
+                f"registered repair for {current!r} (ensure_pg_at_head() "
+                "applies it automatically at startup), and see "
+                'docs/migrations.md -> "A database stranded by a renumbered '
+                'revision" for the manual recovery recipe if none is '
+                "registered yet. Set AGNES_SKIP_PG_REVISION_CHECK=1 to boot "
+                "anyway (emergency only)."
+            )
+
+        stranded_hint = (
+            " (this id also doesn't follow this repo's NNNN_name numbering, "
+            "so it could instead be a database stranded by a past "
+            "renumbering — issue #2086 — rather than a genuine rollback; "
+            "check RENUMBERED_REVISION_REPAIRS in src/db_pg.py for a "
+            "registered repair before assuming a rollback)"
+            if stranded is None
+            else ""
+        )
         raise RuntimeError(
             "Postgres schema is AHEAD of the application: the DB is at "
             f"Alembic revision {current!r}, which this image's migration "
             f"scripts do not contain (its head is {head!r}) — typically an "
             "app rollback after a newer image already migrated (issue "
-            "#636). Roll the app image forward to one that knows this "
-            "revision (preferred), or restore the DB backup matching this "
-            "image. Set AGNES_SKIP_PG_REVISION_CHECK=1 to boot anyway "
-            "(emergency only)."
+            f"#636){stranded_hint}. Roll the app image forward to one that "
+            "knows this revision (preferred), or restore the DB backup "
+            "matching this image. Set AGNES_SKIP_PG_REVISION_CHECK=1 to "
+            "boot anyway (emergency only)."
         )
 
     current_label = current if current is not None else "<none — never stamped>"
@@ -268,6 +392,115 @@ def assert_pg_at_head() -> None:
     )
 
 
+#: SQLSTATEs meaning "the object this DDL statement would create already
+#: exists" — duplicate table/index (Postgres treats an index as a relation
+#: too, same code as a table), duplicate column, and the generic
+#: duplicate-object class (named constraint, type, …). Caught ONLY while
+#: applying a ``RENUMBERED_REVISION_REPAIRS`` entry's DDL, so a previous
+#: half-applied repair attempt (crashed between statements) or a manual
+#: operator fix (per the docs/migrations.md recipe) does not crash the boot
+#: loop on retry.
+_ALREADY_EXISTS_SQLSTATES = frozenset({"42P07", "42701", "42710"})
+
+
+def _apply_renumbered_revision_repair(engine: sa.Engine, current: str) -> None:
+    """Repair a database stamped at a shipped-then-renumbered id (#2086).
+
+    Applies each ``RENUMBERED_REVISION_REPAIRS[current]["apply"]`` revision's
+    ``upgrade()`` against a real connection, then atomically re-stamps
+    ``alembic_version`` to the entry's ``stamp`` id. Called only from
+    ``ensure_pg_at_head()``, under ``_PG_MIGRATE_LOCK_KEY`` — never from
+    ``assert_pg_at_head()``, which only names this repair.
+
+    Each ``upgrade()`` is bound to the connection via
+    ``MigrationContext.configure(conn)`` + ``Operations.context(ctx)`` — the
+    same mechanism ``alembic upgrade`` uses internally to install the global
+    ``alembic.op`` proxy a revision module's ``upgrade()`` body calls into —
+    run directly against the target revision's module rather than through
+    ``alembic upgrade <rev>``, because that command resolves its *starting*
+    point from the DB's own stamped revision, which here is the stranded id
+    ``ScriptDirectory`` cannot locate at all.
+
+    Idempotent against a partially-applied prior attempt: each listed
+    revision runs inside its own SAVEPOINT, and a duplicate-object error
+    (``_ALREADY_EXISTS_SQLSTATES`` — e.g. a previous boot got as far as
+    creating the table before crashing, or an operator applied the DDL by
+    hand) is logged and treated as "already done" rather than propagated.
+    Any other error is a genuine failure and aborts the whole repair —
+    the SAVEPOINT rolls back only that revision's own statements, so the
+    surrounding transaction (and therefore the re-stamp below) never
+    commits, leaving the DB at ``current`` for the next boot attempt or a
+    manual fix rather than half-migrated.
+
+    Narrow, documented edge case: if a crash landed BETWEEN two DDL
+    statements inside one listed revision's own ``upgrade()`` (e.g. its
+    table exists but an index the same revision also creates does not), the
+    first statement's duplicate-object error is caught and the rest of that
+    revision's body is skipped along with it — a partial object created by
+    that specific revision is not independently detected or completed. This
+    map is a one-off, cataloged repair for a known incident, not a general
+    schema-diffing engine; a database caught in that narrower state is
+    exactly what the manual recipe in docs/migrations.md is for.
+
+    Raises ``RuntimeError`` if the final re-stamp does not affect exactly
+    one row (expected to always affect exactly one — callers hold
+    ``_PG_MIGRATE_LOCK_KEY`` for the whole operation, so a concurrent writer
+    changing ``current`` from under it is not the ordinary case).
+    """
+    import logging
+
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    logger = logging.getLogger(__name__)
+    repair = RENUMBERED_REVISION_REPAIRS[current]
+    apply_ids = repair["apply"]
+    stamp_id = repair["stamp"]
+
+    logger.warning(
+        "Postgres alembic_version is stamped at %r, a revision id that "
+        "shipped in an earlier release and was renumbered to %r since "
+        "(issue #2086). Applying the registered repair: running %s, then "
+        "re-stamping to %r.",
+        current,
+        stamp_id,
+        ", ".join(apply_ids),
+        stamp_id,
+    )
+
+    script = ScriptDirectory.from_config(_alembic_config())
+    with engine.begin() as conn:
+        migration_ctx = MigrationContext.configure(conn)
+        for rev_id in apply_ids:
+            rev = script.get_revision(rev_id)
+            try:
+                with conn.begin_nested():
+                    with Operations.context(migration_ctx):
+                        rev.module.upgrade()
+            except sa.exc.ProgrammingError as exc:
+                if getattr(exc.orig, "sqlstate", None) not in _ALREADY_EXISTS_SQLSTATES:
+                    raise
+                logger.warning(
+                    "Renumbered-revision repair: %r looks already applied "
+                    "(duplicate-object error on retry) — skipping.",
+                    rev_id,
+                )
+
+        result = conn.execute(
+            sa.text("UPDATE alembic_version SET version_num = :new WHERE version_num = :old"),
+            {"new": stamp_id, "old": current},
+        )
+        if result.rowcount != 1:
+            raise RuntimeError(
+                f"Renumbered-revision repair for {current!r} applied its DDL "
+                f"but could not re-stamp alembic_version to {stamp_id!r} "
+                f"(matched {result.rowcount} row(s), expected exactly 1) — "
+                "refusing to continue on a schema whose applied DDL and "
+                "stamped revision may now disagree."
+            )
+
+
 def ensure_pg_at_head() -> None:
     """Bring the Postgres schema to the head Alembic revision at startup.
 
@@ -280,13 +513,23 @@ def ensure_pg_at_head() -> None:
 
     Safety properties:
 
-    - **AHEAD stays fail-closed.** A revision unknown to this image means
-      an app rollback after a newer image migrated; auto-rollback is never
-      safe, so this delegates to ``assert_pg_at_head`` and refuses to boot.
-    - **Replica-safe.** The upgrade runs under a session-scoped Postgres
-      advisory lock (``_PG_MIGRATE_LOCK_KEY``) and re-checks the revision
-      after acquiring it, so concurrent replicas serialize and the late
-      acquirer no-ops instead of double-applying.
+    - **AHEAD stays fail-closed.** A revision unknown to this image AND not
+      covered by a registered repair means either an app rollback after a
+      newer image migrated, or a stranded database with no repair on file
+      yet; auto-rollback is never safe and an unregistered repair cannot be
+      guessed, so this delegates to ``assert_pg_at_head`` and refuses to
+      boot.
+    - **A registered renumbering repair (issue #2086) is applied
+      automatically.** When the DB's stamped revision matches a
+      ``RENUMBERED_REVISION_REPAIRS`` key exactly, the repair runs (see
+      ``_apply_renumbered_revision_repair``) before the normal
+      behind-head upgrade, under the same advisory lock and re-check
+      discipline as that upgrade. ``assert_pg_at_head`` itself never does
+      this — it only names the repair.
+    - **Replica-safe.** The upgrade (and any repair) runs under a
+      session-scoped Postgres advisory lock (``_PG_MIGRATE_LOCK_KEY``) and
+      re-checks the revision after acquiring it, so concurrent replicas
+      serialize and the late acquirer no-ops instead of double-applying.
     - **Opt-out.** ``AGNES_PG_AUTO_MIGRATE=0`` restores the fail-closed
       check for pipeline-controlled deployments;
       ``AGNES_SKIP_PG_REVISION_CHECK=1`` still skips everything
@@ -308,8 +551,8 @@ def ensure_pg_at_head() -> None:
         return
 
     current, head, db_ahead = _pg_revisions()
-    if current == head or db_ahead:
-        assert_pg_at_head()  # no-op, or the AHEAD refusal
+    if current not in RENUMBERED_REVISION_REPAIRS and (current == head or db_ahead):
+        assert_pg_at_head()  # no-op, or the AHEAD/STRANDED refusal
         return
 
     engine = get_engine()
@@ -320,8 +563,26 @@ def ensure_pg_at_head() -> None:
         )
         try:
             # Re-check under the lock — a sibling replica may have finished
-            # the upgrade while this one waited.
+            # the repair and/or upgrade while this one waited.
             current, head, db_ahead = _pg_revisions()
+            if current in RENUMBERED_REVISION_REPAIRS:
+                try:
+                    _apply_renumbered_revision_repair(engine, current)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Automatic repair of renumbered revision {current!r} "
+                        f"failed ({exc}); refusing to serve on a database "
+                        "whose repair may be half-applied (issue #2086). "
+                        'See docs/migrations.md -> "A database stranded by '
+                        'a renumbered revision" for the manual recovery '
+                        "recipe. Set AGNES_SKIP_PG_REVISION_CHECK=1 to boot "
+                        "anyway (emergency only)."
+                    ) from exc
+                # The repair re-stamped alembic_version to a real, known
+                # id (the map's "stamp") — recompute so the ordinary
+                # behind-head branch below picks up from there.
+                current, head, db_ahead = _pg_revisions()
+
             if current != head and not db_ahead:
                 logger.warning(
                     "Postgres schema is behind the application (%s -> %s) — "

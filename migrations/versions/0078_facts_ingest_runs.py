@@ -13,8 +13,16 @@ back an ingest (``app/api/facts.py::facts_ingest`` writes it AFTER
 PG-first ratchet (A3): brand-new app-state table, Alembic-only — no matching
 DuckDB ``_vN_to_v(N+1)`` step, ``SCHEMA_VERSION`` does not move.
 
-Revision ID: 0077_facts_ingest_runs
-Revises: 0076_facts_tables
+Renumbered from 0077 to 0078 on 2026-08-28 when ``0077_ontology_drafts`` was
+inserted ahead of it — this is exactly the incident issue #2086 fixed: a
+database that had already applied the old ``0077_facts_ingest_runs`` id was
+stranded, since no image's migration scripts contain that string any more.
+See ``RENUMBERED_REVISION_REPAIRS`` in ``src/db_pg.py`` for the automatic
+repair and ``migrations/shipped_revision_ids.txt`` for the ratchet that
+prevents a repeat.
+
+Revision ID: 0078_facts_ingest_runs
+Revises: 0077_ontology_drafts
 Create Date: 2026-08-28
 """
 
