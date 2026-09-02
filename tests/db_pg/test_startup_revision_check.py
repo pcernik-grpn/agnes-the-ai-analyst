@@ -13,6 +13,7 @@ hardcoded), then assert:
   (ii)  at head                → no raise
   (iii) escape-hatch env set   → no raise even when behind
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -141,14 +142,9 @@ def test_raises_db_ahead_when_revision_unknown(pg_under_app):
     head, _prev = _head_and_prev()
     engine = get_engine()
     with engine.begin() as conn:
-        conn.execute(sa.text(
-            "CREATE TABLE IF NOT EXISTS alembic_version "
-            "(version_num VARCHAR(32) NOT NULL)"
-        ))
+        conn.execute(sa.text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"))
         conn.execute(sa.text("DELETE FROM alembic_version"))
-        conn.execute(sa.text(
-            "INSERT INTO alembic_version (version_num) VALUES ('ffffffffffff')"
-        ))
+        conn.execute(sa.text("INSERT INTO alembic_version (version_num) VALUES ('ffffffffffff')"))
 
     with pytest.raises(RuntimeError) as exc:
         assert_pg_at_head()
@@ -177,9 +173,7 @@ def _current_revision(engine) -> str | None:
 
     with engine.connect() as conn:
         try:
-            return conn.execute(
-                sa.text("SELECT version_num FROM alembic_version")
-            ).scalar()
+            return conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
         except Exception:
             return None
 
@@ -240,9 +234,7 @@ def test_ensure_ahead_still_fails_closed(pg_under_app):
     cfg = _alembic_config(str(pg_under_app.url))
     command.upgrade(cfg, "head")
     with pg_under_app.connect() as conn:
-        conn.execute(
-            sa.text("UPDATE alembic_version SET version_num = 'ffffffffffff'")
-        )
+        conn.execute(sa.text("UPDATE alembic_version SET version_num = 'ffffffffffff'"))
         conn.commit()
 
     with pytest.raises(RuntimeError) as exc:
@@ -333,16 +325,143 @@ def test_pg_revisions_multiple_heads_fail_closed(pg_under_app):
 
     engine = get_engine()
     with engine.begin() as conn:
-        conn.execute(
-            sa.text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
-        )
+        conn.execute(sa.text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"))
         conn.execute(sa.text("DELETE FROM alembic_version"))
-        conn.execute(
-            sa.text(
-                "INSERT INTO alembic_version (version_num) "
-                "VALUES ('aaaaaaaaaaaa'), ('bbbbbbbbbbbb')"
-            )
-        )
+        conn.execute(sa.text("INSERT INTO alembic_version (version_num) VALUES ('aaaaaaaaaaaa'), ('bbbbbbbbbbbb')"))
 
     with pytest.raises(sa.exc.MultipleResultsFound):
         _pg_revisions()
+
+
+# ---------------------------------------------------------------------------
+# Renumbered-revision repair (issue #2086).
+#
+# facts_ingest_runs shipped as revision id "0077_facts_ingest_runs", then got
+# renumbered to "0078_facts_ingest_runs" when "0077_ontology_drafts" was
+# inserted before it. A database that had already applied the old id is
+# stranded: its stamped revision no longer exists in any image's
+# ScriptDirectory, so it has facts_ingest_runs but is missing the
+# ontology_drafts table the renumbering inserted ahead of it.
+# ``ensure_pg_at_head()`` repairs this automatically via
+# ``RENUMBERED_REVISION_REPAIRS``; ``assert_pg_at_head()`` (the check-only
+# path) only names the repair.
+# ---------------------------------------------------------------------------
+
+
+def _build_legacy_pre_renumber_state(engine) -> None:
+    """Reproduce the EXACT historical state issue #2086 stranded.
+
+    Upgrades to the shared ancestor (``0076_facts_tables``), then applies
+    the CURRENT ``0078_facts_ingest_runs`` module's ``upgrade()`` directly
+    against the connection — its DDL is byte-identical to what the OLD
+    ``"0077_facts_ingest_runs"`` id shipped before the rename (only the
+    ``revision``/``down_revision`` fields and the file's position in the
+    chain changed) — then stamps ``alembic_version`` to that old,
+    now-orphaned string via raw SQL (``command.stamp`` would fail: the id
+    is not in this image's ``ScriptDirectory``). The result has
+    ``facts_ingest_runs`` but NOT ``ontology_drafts`` — exactly the gap the
+    renumbering left behind for anyone who had already applied the old id.
+    """
+    import sqlalchemy as sa
+    from alembic import command
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    cfg = _alembic_config(str(engine.url))
+    command.upgrade(cfg, "0076_facts_tables")
+
+    script = ScriptDirectory.from_config(cfg)
+    rev = script.get_revision("0078_facts_ingest_runs")
+    with engine.begin() as conn:
+        migration_ctx = MigrationContext.configure(conn)
+        with Operations.context(migration_ctx):
+            rev.module.upgrade()
+        conn.execute(sa.text("UPDATE alembic_version SET version_num = '0077_facts_ingest_runs'"))
+
+
+def test_ensure_repairs_a_database_stranded_by_the_0077_renumbering(pg_under_app):
+    """The exact issue #2086 scenario, end to end: ``ensure_pg_at_head()``
+    must not raise, must create ``ontology_drafts``, and must finish at the
+    REAL chain head — not merely at the repair's own ``stamp`` id."""
+    import sqlalchemy as sa
+
+    from src.db_pg import RENUMBERED_REVISION_REPAIRS, ensure_pg_at_head
+
+    assert "0077_facts_ingest_runs" in RENUMBERED_REVISION_REPAIRS, (
+        "this test exercises the registered #2086 repair; if it is ever "
+        "removed, retarget it at the map's current historical entry"
+    )
+
+    _build_legacy_pre_renumber_state(pg_under_app)
+
+    ensure_pg_at_head()  # must not raise
+
+    inspector = sa.inspect(pg_under_app)
+    assert inspector.has_table("ontology_drafts"), "repair must apply the skipped 0077_ontology_drafts DDL"
+    assert inspector.has_table("facts_ingest_runs"), "the table the legacy id itself created must be untouched"
+
+    head, _prev = _head_and_prev()
+    with pg_under_app.connect() as conn:
+        stamped = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+    assert stamped == head, "must fall through to the real chain head, not stop at the repair's stamp id"
+
+
+def test_ensure_repair_is_idempotent_against_a_half_applied_prior_attempt(pg_under_app):
+    """A crash between the repair's DDL and its re-stamp (or a manual
+    operator fix applying the same DDL by hand) leaves ``ontology_drafts``
+    already created while ``alembic_version`` is still the stranded id.
+    Retrying must not crash the boot loop on ``CREATE TABLE`` of an
+    existing table."""
+    import sqlalchemy as sa
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    from src.db_pg import ensure_pg_at_head
+
+    _build_legacy_pre_renumber_state(pg_under_app)
+
+    # Simulate the half-run by hand: apply the repair's DDL directly, but
+    # leave alembic_version at the stranded id, as if a previous
+    # ensure_pg_at_head() call crashed after this statement but before its
+    # UPDATE.
+    cfg = _alembic_config(str(pg_under_app.url))
+    script = ScriptDirectory.from_config(cfg)
+    rev = script.get_revision("0077_ontology_drafts")
+    with pg_under_app.begin() as conn:
+        migration_ctx = MigrationContext.configure(conn)
+        with Operations.context(migration_ctx):
+            rev.module.upgrade()
+
+    ensure_pg_at_head()  # must not raise despite ontology_drafts pre-existing
+
+    head, _prev = _head_and_prev()
+    with pg_under_app.connect() as conn:
+        stamped = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+    assert stamped == head
+
+
+def test_assert_pg_at_head_raises_stranded_not_ahead_on_the_legacy_state(pg_under_app):
+    """The un-repaired legacy state must raise the Part-2 STRANDED message,
+    never the AHEAD one — and ``assert_pg_at_head()`` is the check-only
+    path, so it must not have touched the schema at all."""
+    import sqlalchemy as sa
+
+    from src.db_pg import assert_pg_at_head
+
+    _build_legacy_pre_renumber_state(pg_under_app)
+
+    with pytest.raises(RuntimeError) as exc:
+        assert_pg_at_head()
+
+    msg = str(exc.value)
+    assert "STRANDED" in msg
+    assert "Postgres schema is AHEAD of the application" not in msg
+    assert "0077_facts_ingest_runs" in msg
+
+    inspector = sa.inspect(pg_under_app)
+    assert not inspector.has_table("ontology_drafts")
+    with pg_under_app.connect() as conn:
+        stamped = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar()
+    assert stamped == "0077_facts_ingest_runs"
