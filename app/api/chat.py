@@ -15,7 +15,7 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import require_resource_access
 from app.auth.dependencies import _get_db
 from app.chat.frame_seq import stamp_frame
-from app.chat.manager import ChatManager, ConcurrencyCapHit, SessionNotFound
+from app.chat.manager import SENDER_LIMIT_REASONS, ChatManager, ConcurrencyCapHit, SessionNotFound
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
@@ -361,6 +361,16 @@ async def rename_session(
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
     repo.set_title(chat_id, title)
+    # Tell every sink of the live session about the new name — the caller's
+    # own tab updates from this response, a co-driver's or a second tab's
+    # sidebar does not. Local-process only (see ChatManager.announce_title)
+    # and never a reason to fail the rename itself.
+    mgr = getattr(request.app.state, "chat_manager", None)
+    if mgr is not None:
+        try:
+            await mgr.announce_title(chat_id)
+        except Exception:
+            logger.debug("rename: session_renamed broadcast failed for %s (non-fatal)", chat_id, exc_info=True)
     return {"id": chat_id, "title": title}
 
 
@@ -776,6 +786,20 @@ async def ws_stream(ws: WebSocket, chat_id: str, ticket: str, last_seq: int = 0)
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)
+                        except RuntimeError as exc:
+                            if str(exc) not in SENDER_LIMIT_REASONS:
+                                raise
+                            # A sender-limit refusal (daily spend, conversation
+                            # token budget, message rate). The manager already
+                            # broadcast the ``error`` frame to this socket
+                            # before raising; letting the exception unwind the
+                            # handler closed the socket right behind it, so the
+                            # reader saw the refusal for an instant and then
+                            # "Disconnected — click the conversation again"
+                            # (TCRD-291). Nothing was sent, nothing is broken:
+                            # stay attached so the copy can be read and a
+                            # rate-limited sender can simply try again.
+                            break
                     else:
                         # Sent directly on the WS before any LiveSession
                         # exists (so it can't go through
@@ -901,6 +925,12 @@ async def ws_join(ws: WebSocket, session_id: str, ticket: str, last_seq: int = 0
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)
+                        except RuntimeError as exc:
+                            if str(exc) not in SENDER_LIMIT_REASONS:
+                                raise
+                            # Same as ws_stream's branch above: the refusal
+                            # frame is already on the socket, keep it open.
+                            break
                     else:
                         # See ws_stream's identical branch above — stamp for
                         # the same reason (wave-2F task 2).

@@ -41,6 +41,11 @@ locals {
     for f in fileset("${path.module}/files", "agnes-*") :
     f => filebase64("${path.module}/files/${f}")
   }
+  # The Ops Agent's receiver + parser config. Delivered inline like the
+  # watchdog artifacts rather than through the image's /opt/agnes-host
+  # bundle: it configures a HOST service, so it must not depend on which
+  # app image tag a VM happens to be pinned to.
+  ops_agent_config_b64 = filebase64("${path.module}/files/ops-agent-config.yaml")
   # Per-VM OAuth (Sign-in with Google) secret names, derived from
   # var.oauth_secret_name_template. Empty template -> empty map ->
   # startup-script falls back to legacy `google-oauth-client-{id,secret}`.
@@ -624,6 +629,7 @@ resource "google_compute_instance" "vm" {
     enable_gcp_logging           = var.enable_gcp_logging
     alert_webhook_url            = var.alert_webhook_url
     watchdog_files_b64           = local.watchdog_files_b64
+    ops_agent_config_b64         = local.ops_agent_config_b64
     dispatcher_enabled           = each.value.dispatcher_enabled
     dispatcher_image             = var.dispatcher_image
     dispatcher_key_secret        = var.dispatcher_key_secret

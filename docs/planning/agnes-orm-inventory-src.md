@@ -108,13 +108,12 @@ Already-ORM. These DEFINE the target schema for the migration.
 
 ---
 
-## `src/observability/` — PostHog wrappers
+## `src/observability/` — instrumentation helpers
 
 | Path | Purpose | Category | Verdict |
 |---|---|---|---|
-| `src/observability/__init__.py` | re-export `get_posthog`, `trace_generation` | infra | keep-as-is |
-| `src/observability/llm_tracing.py` | `trace_generation` context manager → PostHog `$ai_generation` events | infra | keep-as-is |
-| `src/observability/posthog_client.py` | env-gated lazy PostHog client (361 LOC) | infra | keep-as-is |
+| `src/observability/__init__.py` | re-export `trace_generation` | infra | keep-as-is |
+| `src/observability/llm_tracing.py` | `trace_generation` context manager → one structured `llm_generation` log record | infra | keep-as-is |
 
 ---
 

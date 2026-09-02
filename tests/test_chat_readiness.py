@@ -527,7 +527,7 @@ def test_secrets_endpoints_require_admin(monkeypatch):
     assert client.post("/admin/chat/secrets/test").status_code == 403
 
 
-# --- kai-agent: the two cost caps the engine cannot feed ---
+# --- kai-agent: the two token-derived caps are metered here too ---
 
 
 def _kai_cfg(**over):
@@ -545,33 +545,27 @@ def _kai_cfg(**over):
     return SimpleNamespace(**base)
 
 
-def test_readiness_names_the_caps_the_engine_cannot_meter(monkeypatch):
-    """`daily_anthropic_spend_usd` and `max_session_tokens` are enforced off
-    `chat_messages.tokens_in/out`, which only a usage-carrying frame writes.
-    The engine's SSE stream carries none, so on this provider both are inert —
-    and both ship LIVE defaults, so flipping one YAML key silently removes two
-    budgets instance-wide. An operator should not learn that from a bill.
+def test_readiness_no_longer_calls_the_engine_caps_unmetered(monkeypatch):
+    """`daily_anthropic_spend_usd` and `max_session_tokens` are summed from
+    `chat_messages` tokens, which the kai-agent stream never carried — so
+    readiness used to list both as inert on that provider. Since 0.95.0 the
+    broker's turn-usage counters hydrate every engine turn at persist and the
+    caps DO trip (TCRD-291 was one tripping). Telling the operator the cap is
+    "not enforced" while it refuses their users' messages sends them to the
+    wrong component; the key stays for API compatibility and is empty.
     """
     from app.chat.readiness import secret_status
 
     monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
     out = secret_status(_kai_cfg())
-    assert set(out["unmetered_caps"]) == {"daily_anthropic_spend_usd", "max_session_tokens"}
-
-
-def test_a_cap_explicitly_disabled_is_not_reported_as_unmetered(monkeypatch):
-    """Only a cap the operator actually set is worth warning about — one
-    already turned off is not a surprise waiting to happen."""
-    from app.chat.readiness import secret_status
-
-    monkeypatch.setenv("KAI_HOST_JWT_SECRET", "s")
-    out = secret_status(_kai_cfg(daily_anthropic_spend_usd=0, max_session_tokens=0))
     assert out["unmetered_caps"] == []
+    # The old "0 means already off" carve-out is moot for the same reason.
+    assert secret_status(_kai_cfg(daily_anthropic_spend_usd=0, max_session_tokens=0))["unmetered_caps"] == []
 
 
 def test_other_providers_meter_normally(monkeypatch):
-    """Non-vacuity: the native runner writes usage, so its caps are live and
-    must not be reported as inert."""
+    """The native runner writes usage on its own frames, so its caps were
+    always live and never reported as inert."""
     from types import SimpleNamespace
 
     from app.chat.readiness import secret_status

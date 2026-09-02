@@ -174,20 +174,22 @@ def _parse_json_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
 
 def _parse_sse_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
     """Scan a buffered ``text/event-stream`` body for ``message_start`` /
-    ``message_delta`` events and sum their ``usage`` fields.
+    ``message_delta`` events and recover the response's usage.
 
-    ``message_start`` carries the request's true ``input_tokens`` and
-    cache-token totals (and an initial, usually-zero ``output_tokens``).
-    Each subsequent ``message_delta`` carries the incremental output
-    tokens generated since the previous event. Summing field-by-field
-    across every scanned event therefore recovers the response's total
-    usage. If a future upstream instead reports a cumulative running
-    total per ``message_delta`` (multi-delta responses, e.g. under
-    extended thinking), this sums to a conservative OVER-count rather
-    than an under-count — acceptable for a soft monthly budget guardrail
-    (never silently opens the budget wider than it should be), the same
-    "not a billing ledger" posture the daily chat token guardrail takes
-    (``ChatManager._daily_token_totals``).
+    Every ``usage`` block on the stream is CUMULATIVE for the message:
+    ``message_start`` carries the request's ``input_tokens`` and cache-token
+    totals (plus an initial ``output_tokens`` of ~1), and each
+    ``message_delta`` repeats those same input/cache totals alongside the
+    running ``output_tokens``. So the per-field MAXIMUM across the events is
+    the message's final usage. This used to SUM the events instead, which
+    counted input, cache reads and cache writes exactly twice (and output
+    once too many) on every streamed completion — a real engine turn's
+    cache writes read as 160k when the provider had billed 80k, and every
+    consumer downstream inherited the doubling: the per-conversation token
+    budget (``max_session_tokens``, TCRD-291), the daily spend cap, the
+    agent monthly budget, ``usage_turns`` and the admin cost readout. A
+    stream where the delta omits a field (older shapes carried only
+    ``output_tokens``) still resolves to the ``message_start`` value.
     """
     text = resp_body.decode("utf-8", errors="replace")
     model: Optional[str] = None
@@ -221,7 +223,8 @@ def _parse_sse_usage(resp_body: bytes) -> Optional[Dict[str, Any]]:
         if isinstance(usage, dict):
             seen = True
             for key in totals:
-                totals[key] += _to_int(usage.get(key, 0))
+                # Cumulative per event — keep the largest value seen, never add.
+                totals[key] = max(totals[key], _to_int(usage.get(key, 0)))
     if not seen:
         return None
     return {

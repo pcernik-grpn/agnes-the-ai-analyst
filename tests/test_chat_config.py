@@ -14,6 +14,9 @@ def test_default_disabled(tmp_path: Path):
     assert cfg.per_tool_call_seconds == 90
     assert cfg.per_session_bq_scan_bytes == 20 * 1024**3
     assert cfg.daily_anthropic_spend_usd == 20.0
+    # A budget of tokens billed over the conversation's life, not a context
+    # window — the 200k default matched one and tripped mid-conversation.
+    assert cfg.max_session_tokens == 2_000_000
     assert not hasattr(cfg, "e2b_template_id")
     assert not hasattr(cfg, "e2b_kill_on_ws_disconnect")
 

@@ -43,7 +43,7 @@ POSTGRES_CONTAINER="${AGNES_DB_BACKUP_POSTGRES_CONTAINER:-agnes-postgres-1}"
 HOST=$(hostname)
 STAGE="${ENV_STAGE:-}"
 if [ -z "$STAGE" ]; then
-    STAGE=$(grep -E '^POSTHOG_ENVIRONMENT=' /opt/agnes/.env 2>/dev/null | cut -d= -f2 | tr -d '"')
+    STAGE=$(grep -E '^AGNES_DEPLOYMENT_ENV=' /opt/agnes/.env 2>/dev/null | cut -d= -f2 | tr -d '"')
 fi
 case "$STAGE" in
   prod*) EMOJI=$(printf '\xf0\x9f\x94\xb4');;
