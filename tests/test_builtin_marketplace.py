@@ -445,6 +445,62 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
     )
 
 
+def test_details_panel_branches_on_is_builtin_before_promising_a_schedule():
+    """The details panel is the sibling surface of the table row above, and it
+    must not describe a sync the server refuses. `sync_marketplace` opens with
+    `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a bundled
+    marketplace enters neither sync path — promising it a nightly run, and
+    pointing at a `Sync now` the row does not render for it, describes
+    something that cannot happen.
+
+    Source inspection, like its row-cell sibling above: this pins that the
+    branch EXISTS and reaches the schedule sentence, not what the rendered
+    string looks like."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1]
+    branch = details_js.split("syncEl.innerHTML")[0]
+    assert "is_builtin" in branch, (
+        "openDetails must branch on m.is_builtin before it states the nightly "
+        "schedule — a bundled marketplace never enters the sync path"
+    )
+
+
+def test_details_panel_calls_a_failed_attempt_an_attempt():
+    """`last_synced_at` is stamped on FAILURE as well as success: both error
+    branches in `src/marketplace.py` call `update_sync_status(..., synced_at=
+    now, error=str(e))`. So the timestamp alone means "last attempted", and
+    labelling it "Last synced" tells an admin a failed refresh worked.
+    `last_error` is what separates the two — set on failure, cleared when a
+    commit_sha arrives clean — and the table row already reads it."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1].split("const body")[0]
+    assert "last_error" in details_js, (
+        "openDetails must consult m.last_error before calling the timestamp "
+        "'Last synced' — it is stamped on failed attempts too"
+    )
+    assert "Last synced" in details_js and "Last attempt" in details_js, (
+        "both wordings must exist: a success says 'Last synced', a failure "
+        "says 'Last attempt ... failed'"
+    )
+
+
+def test_next_nightly_sync_rolls_forward_on_the_boundary():
+    """At exactly 03:00:00 UTC the next run is TOMORROW's, not the instant
+    that has just arrived — so the roll-forward comparison has to be `<=`,
+    not `<`. With `<` the panel would show a "next" time equal to now for a
+    whole second, which reads as "it is happening" rather than "it just did".
+
+    Source inspection: this pins the comparison, not the arithmetic. The date
+    math itself is the browser's `Date.UTC`, which is not ours to test."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    fn = template.split("function nextNightlySync()")[1].split("\n}")[0]
+    assert "next <= now" in fn, (
+        "the roll-forward must use <=, so exactly 03:00:00 UTC advances to "
+        "the following day instead of reporting the current instant"
+    )
+    assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
+
+
 def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
     """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
     checked meant admin_disabled=true, so switching it ON looked like it

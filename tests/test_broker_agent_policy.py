@@ -140,6 +140,14 @@ def _sse_event(event: str, data: dict) -> str:
 
 
 def test_parse_usage_sse_message_start_plus_two_deltas():
+    """Every ``usage`` block on the stream is cumulative for the message, so
+    the parser keeps the per-field maximum: ``output_tokens`` is the LAST
+    delta's running total (15), not ``1 + 10 + 15``, and the input/cache
+    fields — which the first-party API repeats on every ``message_delta``
+    (cumulative, identical to ``message_start``) — are counted once, not once
+    per event. The old sum doubled cache reads/writes and input on every
+    streamed completion (TCRD-291 saw a 160k cache-write turn the provider had
+    billed at 80k)."""
     body = (
         _sse_event(
             "message_start",
@@ -161,7 +169,18 @@ def test_parse_usage_sse_message_start_plus_two_deltas():
         + _sse_event("message_delta", {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 10}})
         + _sse_event(
             "message_delta",
-            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 15}},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                # The real first-party shape: the closing delta repeats the
+                # cumulative input/cache totals next to the running output.
+                "usage": {
+                    "input_tokens": 50,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 2,
+                    "output_tokens": 15,
+                },
+            },
         )
         + _sse_event("message_stop", {"type": "message_stop"})
     ).encode()
@@ -169,9 +188,45 @@ def test_parse_usage_sse_message_start_plus_two_deltas():
     assert usage == {
         "model": "claude-sonnet-4-6",
         "input_tokens": 50,
-        "output_tokens": 1 + 10 + 15,
+        "output_tokens": 15,
         "cache_read_tokens": 2,
         "cache_creation_tokens": 5,
+    }
+
+
+def test_parse_usage_sse_delta_without_input_fields_keeps_message_start_values():
+    """An older stream shape whose ``message_delta`` carries only
+    ``output_tokens`` must still resolve the input/cache fields to what
+    ``message_start`` reported — the maximum, not the last event."""
+    body = (
+        _sse_event(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_2",
+                    "model": "claude-opus-4-6",
+                    "usage": {
+                        "input_tokens": 14,
+                        "output_tokens": 1,
+                        "cache_creation_input_tokens": 80_391,
+                        "cache_read_input_tokens": 268_137,
+                    },
+                },
+            },
+        )
+        + _sse_event(
+            "message_delta",
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 48}},
+        )
+    ).encode()
+    usage = pol.parse_usage(body, "text/event-stream; charset=utf-8")
+    assert usage == {
+        "model": "claude-opus-4-6",
+        "input_tokens": 14,
+        "output_tokens": 48,
+        "cache_read_tokens": 268_137,
+        "cache_creation_tokens": 80_391,
     }
 
 

@@ -817,18 +817,6 @@ body.chat-page-body main { margin: 0; padding: 0; }
 .msg-source-more:focus-visible {
   text-decoration: underline;
 }
-/* Assumptions are prose about method, not references — no chip, no border,
-   and their own line so they stop competing with the things you can open. */
-.msg-assumptions {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-top: 6px;
-}
-.msg-assumption {
-  font-size: var(--text-xs);
-  color: var(--ds-text-secondary);
-}
 .msg-source-chip.is-none {
   border-style: dashed;
   color: var(--ds-text-muted);
@@ -875,6 +863,66 @@ a.msg-source-chip.is-link:focus-visible {
 .msg-source-flag svg {
   width: 12px;
   height: 12px;
+}
+
+/* Assumptions get their own row under the sources row (TCRD-289). A `table:`
+   is something the answer READ; an `assumption:` is something it DECIDED —
+   and six `assumes …` chips filed under a SOURCES label read as neither. The
+   second row shares the first's voice but not its hairline: one rule, two
+   lists. */
+.msg-sources.is-assumptions {
+  margin-top: 6px;
+  padding-top: 0;
+  border-top: 0;
+}
+/* An assumption chip is two lines when the answer gave a rationale: the
+   statement with its origin badge, then the `why` underneath. The chip wraps
+   its own flex items rather than growing a nested block. */
+.msg-source-chip.is-assumption {
+  flex-wrap: wrap;
+  row-gap: 2px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+/* Where the assumption came from — a badge in the vocabulary the server
+   normalizes to (`ASSUMPTION_ORIGINS`). Set in the UI face, not mono: it is
+   a category, not a name the reader would type. No font-size shrink, for
+   the same measured reason as `.msg-source-flag` above. */
+.msg-source-origin {
+  font-family: var(--ds-font);
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0 6px;
+  border-radius: var(--ds-radius-pill);
+  border: 1px solid var(--ds-border);
+  color: var(--ds-text-secondary);
+  background: var(--ds-surface);
+}
+/* The one origin the reader most needs to notice: nothing in the question,
+   the definitions or the data settles it. Amber on the BADGE only — the
+   statement itself is not in question, the backing is. */
+.msg-source-origin.is-origin-judgment {
+  border-color: var(--ds-accent-warn-line);
+  background: var(--ds-accent-warn-bg);
+  color: var(--ds-accent-warn-ink);
+}
+/* No origin given — the same dashed "absence made visible" as `.is-none`. */
+.msg-source-origin.is-origin-unstated {
+  border-style: dashed;
+  color: var(--ds-text-muted);
+}
+.msg-source-why {
+  flex-basis: 100%;
+  font-family: var(--ds-font);
+  color: var(--ds-text-secondary);
+}
+.msg-source-why-label {
+  font-weight: var(--font-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--ds-text-muted);
+  margin-right: 4px;
 }
 
 /* Mermaid output. Inserted WITHOUT the markdown sanitizer (its <style> block

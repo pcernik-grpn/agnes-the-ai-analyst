@@ -181,18 +181,23 @@ def test_the_sources_row_says_each_thing_once():
     assert "`${kindWord} ${c.ref}, unverified`" in fn
 
     # The verdict, once for the row rather than per chip.
-    assert "const unverified = refs.filter((c) => c.verified === false).length;" in fn
+    assert "const unverified = provenance.filter((c) => c.verified === false).length;" in fn
     assert "`${unverified} unverified`" in fn
     # Counted over ALL references, not just the visible ones — a count that
     # changed when you expanded the row would be worse than none.
-    assert "refs.filter" in fn and "chips.slice" in fn
+    assert "provenance.filter" in fn and "chips.slice" in fn
 
     # Verified is the calm state: it adds nothing to the base chip.
     css = _read(CHAT_CSS)
     ok = re.search(r"\.msg-source-chip\.is-ok \{(.*?)\}", _code_only(css), re.DOTALL)
     assert ok is None, "a verified chip wears the base chip — no fill of its own"
 
-    assert ".msg-assumptions {" in css, "assumptions are prose on their own line, not a chip"
+    # Assumptions get their own ROW either way — TCRD-289's version (chips with
+    # an origin badge and a rationale) landed while this was in review and says
+    # strictly more than the prose line this branch first drew, so its row is
+    # the one kept. What matters here is unchanged: they are not filed in among
+    # the things you can open.
+    assert ".msg-sources.is-assumptions {" in css, "assumptions keep a row of their own"
 
 
 def test_the_source_chip_states_use_ink_not_line_tokens():
@@ -209,7 +214,7 @@ def test_the_source_chip_states_use_ink_not_line_tokens():
     lightness between themes, so one percentage lands in two different places.)
     """
     css = _code_only(_read(CHAT_CSS))
-    row = css[css.index(".msg-source-chip {") : css.index(".msg-assumptions {")]
+    row = css[css.index(".msg-source-chip {") : css.index(".msg-source-chip.is-none {")]
     assert "-line)" not in row, "a --ds-accent-*-line token on the sources row — invisible on an untinted chip"
     assert "color-mix" not in row, "a transparent mix resolves differently per theme"
     assert "var(--ds-accent-success-ink)" in row and "var(--ds-accent-warn-ink)" in row
@@ -221,23 +226,28 @@ def test_the_source_chip_states_use_ink_not_line_tokens():
 
 
 def test_an_answer_resting_only_on_assumptions_declares_no_sources():
-    """`refs`, not `claims`. An assumption is filtered out of the references two
-    lines later, so keying the empty state on `claims.length` drew the "Sources"
-    label over a row with nothing under it for exactly the answer that rests on
-    assumptions alone. An answer resting only on assumptions has declared no
-    sources — and it still states the assumptions, on their own line, which is
-    why that path reaches `_renderAssumptions` before returning.
-    (Review on #2049.)"""
+    """An assumption is not provenance, so the empty state is keyed on the
+    references — an answer resting only on assumptions has, truthfully,
+    declared no source. It still shows its assumptions: the row falls through
+    rather than returning early.
+
+    TCRD-289 landed the same conclusion independently while this branch was in
+    review, and its `provenance` split is the one kept here."""
     js = _read(CHAT_JS)
     fn = js[js.index("function renderSourcesChips") : js.index("// ---------- Next-actions block")]
-    assert "if (!refs.length) {" in fn, "the empty state is keyed on references, not on claims"
-    assert "if (!claims.length) {" not in fn
-    empty = fn[fn.index("if (!refs.length) {") :]
+    assert "if (!provenance.length) {" in fn, "the empty state is keyed on references, not on claims"
+    assert "none declared" in fn
+    # No early return in that branch — the assumptions row below still runs.
+    empty = fn[fn.index("if (!provenance.length) {") :]
     empty = empty[: empty.index("\n  }")]
-    assert "none declared" in empty
-    assert "_renderAssumptions(bubble, assumptions)" in empty, (
-        "an answer with only assumptions still has assumptions to state"
-    )
+    assert "return" not in empty, "an answer with only assumptions still has assumptions to show"
+
+    rows = _render({"declared": True, "claims": [dict(_ASSUMPTION, ref="paid orders only")]})
+    assert len(rows) == 2, "the sources row and the assumptions row"
+    assert _label(rows[0]) == "Sources"
+    assert [c["text"] for c in _chips(rows[0])] == ["none declared"]
+    assert _label(rows[1]) == "Assumptions"
+    assert len(_chips(rows[1])) == 1
 
 
 def test_a_long_source_row_caps_before_it_wraps():
@@ -489,3 +499,226 @@ def test_a_linked_chip_is_an_anchor_and_keeps_its_verification_state():
         "the chip keeps its own state colour — anything said about colour here outranks the "
         "state rules and erases the verified/unverified signal"
     )
+
+
+# ── assumptions: origin + why (TCRD-289) ───────────────────────────────────
+# Six `assumes …` chips under one SOURCES label, and the reader could not tell
+# where any of them came from or why it was made. The server now hands the
+# client an `origin` (closed vocabulary) and a `why` per assumption; the
+# client draws assumptions on their own row, each with an origin badge and the
+# rationale underneath. These run the real renderer in node over a minimal
+# DOM, so they test what is drawn — not what the source text contains.
+
+_MINI_DOM = r"""
+class El {
+  constructor(tag) {
+    this.tagName = tag; this.children = []; this.className = "";
+    this.textContent = ""; this.title = ""; this.href = ""; this.nodeType = 1;
+  }
+  appendChild(c) { this.children.push(c); return c; }
+  insertBefore(c, ref) { const i = this.children.indexOf(ref); this.children.splice(i < 0 ? this.children.length : i, 0, c); return c; }
+  replaceChildren(...c) { this.children = []; c.forEach((x) => this.appendChild(x)); }
+  setAttribute(k, v) { this.attrs = this.attrs || {}; this.attrs[k] = String(v); }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  get text() {
+    return this.nodeType === 3 ? this.textContent
+      : (this.children.length ? this.children.map((c) => c.text).join(" ") : this.textContent);
+  }
+  toJSON() {
+    if (this.nodeType === 3) return { text: this.textContent };
+    return { tag: this.tagName, cls: this.className, title: this.title, href: this.href,
+             attrs: this.attrs || {},
+             text: this.text, children: this.children.map((c) => c.toJSON()) };
+  }
+}
+const document = {
+  createElement: (t) => new El(t),
+  createTextNode: (s) => { const n = new El("#text"); n.nodeType = 3; n.textContent = String(s); return n; },
+};
+// The chip's category glyph and the row's "+N more" control come from the
+// shared helpers, which live outside the slice this harness evals. Stubbed to
+// the shape the renderer uses: an icon element, and the [meta, button] pair.
+function iconEl(name) { const i = new El("svg"); i.className = "icon-" + name; return i; }
+function _expandInPlace({ paint, expandLabel }) {
+  paint(false);
+  const b = new El("button");
+  b.className = "msg-source-more";
+  b.textContent = expandLabel;
+  return [null, b];
+}
+"""
+
+
+def _render(verdict: dict) -> list[dict]:
+    """Run renderSourcesChips over a fake bubble; return the rows it appended."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    js = _read(CHAT_JS)
+    fn = js[js.index("const _CLAIM_LABEL") : js.index("// ---------- Next-actions block")]
+    script = (
+        _MINI_DOM
+        + fn
+        + f"""
+const bubble = new El("div");
+renderSourcesChips(bubble, {json.dumps(verdict)});
+process.stdout.write(JSON.stringify(bubble.children.map((c) => c.toJSON())));
+"""
+    )
+    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def _chips(row: dict) -> list[dict]:
+    """Every chip in a row, whether or not it sits in the list wrapper.
+
+    The provenance row nests its chips in `.msg-sources-list` so the
+    cap/"+N more" control can repaint just the chips without disturbing the
+    label or the trailing summary. The assumptions row has no cap and appends
+    its chips directly. Flattening one level covers both."""
+    out = []
+    for c in row["children"]:
+        if "msg-sources-list" in c["cls"]:
+            out.extend(k for k in c["children"] if "msg-source-chip" in k["cls"])
+        elif "msg-source-chip" in c["cls"]:
+            out.append(c)
+    return out
+
+
+def _label(row: dict) -> str:
+    return next(c["text"] for c in row["children"] if "msg-sources-label" in c["cls"])
+
+
+_ASSUMPTION = {
+    "kind": "assumption",
+    "ref": "signed date proxied by OPPORTUNITY_CLOSE_DATE",
+    "verified": None,
+    "origin": "data",
+    "why": "no executed-SOW date exists in the CRM",
+}
+
+
+def test_assumptions_are_drawn_on_their_own_row_under_sources():
+    """A `table:` is something the answer READ; an `assumption:` is something
+    it DECIDED. Filed together under one label they read as neither."""
+    rows = _render({"declared": True, "claims": [{"kind": "table", "ref": "orders", "verified": True}, _ASSUMPTION]})
+    assert [_label(r) for r in rows] == ["Sources", "Assumptions"]
+    assert "is-assumptions" in rows[1]["cls"]
+    # The category is a glyph on this row now, with the word on `aria-label`
+    # (see the icon commit), so the chip's TEXT is the ref alone.
+    (prov,) = _chips(rows[0])
+    assert prov["text"].strip() == "orders", "the sources row holds provenance only"
+    assert prov["attrs"]["aria-label"] == "table orders, verified", "the category is still named"
+    assert len(_chips(rows[1])) == 1
+
+
+def test_an_assumption_chip_shows_its_origin_badge_and_its_rationale():
+    (row,) = [r for r in _render({"declared": True, "claims": [_ASSUMPTION]}) if "is-assumptions" in r["cls"]]
+    (chip,) = _chips(row)
+    assert chip["tag"] == "span", "an assumption names nothing to open — never a link"
+    assert "is-assumption" in chip["cls"] and "is-origin-data" in chip["cls"]
+    parts = {c["cls"]: c for c in chip["children"]}
+    assert parts["msg-source-kind"]["text"] == "assumes"
+    badge = parts["msg-source-origin is-origin-data"]
+    assert badge["title"], "the badge explains its category on hover"
+    assert badge["text"] == "data gap"
+    assert parts["msg-source-text"]["text"] == "signed date proxied by OPPORTUNITY_CLOSE_DATE"
+    assert parts["msg-source-why"]["text"] == "why no executed-SOW date exists in the CRM"
+
+
+@pytest.mark.parametrize(
+    ("origin", "label"),
+    [
+        ("user", "from your question"),
+        ("definition", "from a definition"),
+        ("data", "data gap"),
+        ("judgment", "own judgment"),
+    ],
+)
+def test_every_origin_in_the_vocabulary_has_reader_facing_copy(origin, label):
+    (row,) = _render({"declared": True, "claims": [{**_ASSUMPTION, "origin": origin}]})[1:]
+    (chip,) = _chips(row)
+    badge = next(c for c in chip["children"] if "msg-source-origin" in c["cls"])
+    assert badge["text"] == label
+    assert f"is-origin-{origin}" in badge["cls"]
+
+
+@pytest.mark.parametrize("origin", [None, "salesforce", ""], ids=["missing", "off-vocabulary", "empty"])
+def test_an_assumption_without_a_stated_origin_says_so(origin):
+    """The absence made visible — the same rule as "none declared". A legacy
+    line (history predating this change, or a model that ignored the segments)
+    keeps its statement and gets a dashed badge, not a blank."""
+    claim = {"kind": "assumption", "ref": "excludes contractors", "verified": None, "origin": origin, "why": None}
+    (row,) = _render({"declared": True, "claims": [claim]})[1:]
+    (chip,) = _chips(row)
+    assert "is-origin-unstated" in chip["cls"]
+    badge = next(c for c in chip["children"] if "msg-source-origin" in c["cls"])
+    assert badge["text"] == "origin not stated"
+    assert "is-origin-unstated" in badge["cls"]
+    assert not any("msg-source-why" in c["cls"] for c in chip["children"]), "no rationale, no why line"
+
+
+def test_a_pre_tcrd_289_claim_without_the_new_keys_still_renders():
+    """`GET /sessions/{id}/messages` recomputes the verdict from saved content,
+    so every row carries the keys — but a client must not depend on it."""
+    claim = {"kind": "assumption", "ref": "x", "verified": None}
+    rows = _render({"declared": True, "claims": [claim]})
+    assert [_label(r) for r in rows] == ["Sources", "Assumptions"]
+    assert [c["text"] for c in _chips(rows[0])] == ["none declared"], (
+        "an answer that named only assumptions has, truthfully, declared no source"
+    )
+
+
+def test_the_client_vocabulary_is_the_servers():
+    """`_ASSUMPTION_ORIGIN` in chat.js and `ASSUMPTION_ORIGINS` in
+    app/chat/sources.py are one contract written twice. The server normalizes,
+    the client labels; a value one knows and the other does not is a badge
+    that never appears or a badge with no copy."""
+    from app.chat.sources import ASSUMPTION_ORIGINS
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    js = _read(CHAT_JS)
+    fn = js[js.index("const _ASSUMPTION_ORIGIN = {") : js.index("const _ASSUMPTION_ORIGIN_UNSTATED")]
+    out = subprocess.run(
+        [node, "-e", fn + "process.stdout.write(JSON.stringify(Object.keys(_ASSUMPTION_ORIGIN)));"],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert sorted(json.loads(out.stdout)) == sorted(ASSUMPTION_ORIGINS)
+
+
+def test_the_origin_badge_is_not_shrunk_below_the_chip():
+    """Same defect class as `.msg-source-flag`: the word that places an
+    assumption must not be the smallest thing on the row."""
+    css = _code_only(_read(CHAT_CSS))
+    for selector in (".msg-source-origin", ".msg-source-why", ".msg-source-why-label"):
+        block = re.search(re.escape(selector) + r" \{(.*?)\}", css, re.DOTALL)
+        assert block, f"{selector} moved — re-point this guard"
+        assert "font-size" not in block.group(1)
+
+
+def test_only_the_judgment_badge_is_amber():
+    """Amber on the BADGE, not the chip, and only for the origin the reader
+    most needs to weigh — nothing in the question, the definitions or the
+    data settles it. The other three are categories, not warnings."""
+    css = _code_only(_read(CHAT_CSS))
+    judgment = re.search(r"\.msg-source-origin\.is-origin-judgment \{(.*?)\}", css, re.DOTALL)
+    assert judgment and "--ds-accent-warn" in judgment.group(1)
+    for origin in ("user", "definition", "data"):
+        assert f".msg-source-origin.is-origin-{origin}" not in css, f"{origin} must not carry a colour of its own"
+    unstated = re.search(r"\.msg-source-origin\.is-origin-unstated \{(.*?)\}", css, re.DOTALL)
+    assert unstated and "dashed" in unstated.group(1), "an unstated origin is dashed, like `is-none`"
+    chip = re.search(r"\.msg-source-chip\.is-assumption \{(.*?)\}", css, re.DOTALL)
+    assert chip and "--ds-accent-warn" not in chip.group(1)
+
+
+def test_the_assumptions_row_has_no_second_hairline():
+    css = _code_only(_read(CHAT_CSS))
+    block = re.search(r"\.msg-sources\.is-assumptions \{(.*?)\}", css, re.DOTALL)
+    assert block and "border-top: 0" in block.group(1), "two rules under one answer read as two answers"

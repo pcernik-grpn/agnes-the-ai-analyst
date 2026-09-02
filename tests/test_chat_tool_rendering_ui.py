@@ -689,7 +689,15 @@ def test_the_bubble_tail_reads_sources_then_actions_then_suggestions():
     # line land under the suggestions it is supposed to precede (review on
     # #2049) — so the guard is that nothing in the tail appends by hand.
     order = js[js.index("const _BUBBLE_TAIL_ORDER") : js.index("function _placeInTail")]
-    for sel in (".msg-sources", ".msg-assumptions", ".msg-facts-scope", ".msg-actions", ".cloud-chat-next-actions"):
+    for sel in (
+        ".msg-sources",
+        # TCRD-289's assumptions row, which landed while this was in review
+        # and supersedes the prose line this branch first drew.
+        ".msg-sources.is-assumptions",
+        ".msg-facts-scope",
+        ".msg-actions",
+        ".cloud-chat-next-actions",
+    ):
         assert f'"{sel}"' in order, f"{sel} is part of the tail and must declare its rank"
     assert order.index('".msg-sources"') < order.index('".msg-actions"') < order.index('".cloud-chat-next-actions"'), (
         "what the answer rested on, then what you can do with it, then what to ask next"

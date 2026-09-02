@@ -53,7 +53,7 @@ class _WriteCounter:
 
     Deliberately an OBJECT rather than a plain ``int`` in the ContextVar.
     Starlette's ``BaseHTTPMiddleware`` (several are mounted below this
-    middleware pair — posthog injection, version headers, metrics) runs the
+    middleware pair — version headers, metrics) runs the
     downstream app in its own asyncio task, and a new task gets a COPY of
     the context: a ``ContextVar.set(n + 1)`` performed inside the handler
     mutates only that copy and is invisible to the outer middleware once

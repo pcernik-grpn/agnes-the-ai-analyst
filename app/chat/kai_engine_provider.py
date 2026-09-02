@@ -649,9 +649,10 @@ class KaiEngineHandle:
         content = state.text()
         if content or state.tool_names:
             # tokens/model deliberately absent: the engine does not surface
-            # usage on this stream. NOTE this is what leaves the manager's
-            # token-derived caps unmetered for engine sessions (module
-            # docstring, "Known limitations").
+            # usage on this stream. The manager hydrates both at persist from
+            # the broker-observed turn counters (ChatManager._hydrate_frame_usage
+            # over app/chat/turn_usage.py), which is what meters the
+            # token-derived caps for engine sessions.
             self.stdout.feed_frame({"type": "assistant_message", "content": content})
         self.stdout.feed_frame({"type": "done"})
 
