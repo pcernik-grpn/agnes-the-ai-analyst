@@ -445,6 +445,24 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         assert "(o.controls || '')" in shell, "the slot must be optional, not required"
 
 
+def _decommented() -> str:
+    """The template's <style> text with CSS comments stripped.
+
+    Not cosmetic: the narrow block's own comment explains why `display: none`
+    is wrong there, and a naive substring check reads that prose as the
+    declaration it warns about.
+    """
+    src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+    return re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+
+
+def _narrow_block() -> str:
+    """The `@container` block that drops the Category column."""
+    src = _decommented()
+    start = src.index("@container adp-table")
+    return src[start : src.index("\n  }", start)]
+
+
 class TestTheGridsTableStaysInsideThePage:
     """The five-column package table has to FIT its column, not just scroll.
 
@@ -470,26 +488,54 @@ class TestTheGridsTableStaysInsideThePage:
         assert "table-layout: fixed" in src
         # The floor: fixed layout divides whatever width it is given, so
         # without one a narrow window shrinks Actions below its own button
-        # instead of handing the overflow to the wrap.
-        assert "min-width: 900px" in src
+        # instead of handing the overflow to the wrap. 720px is the FOUR
+        # column floor — see the responsive test below for why five is not
+        # what has to fit.
+        assert "min-width: 720px" in src
 
-    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
-        """Page-local no longer: the rule lives on the shared class."""
-        sheet = (STATIC / "style-custom.css").read_text(encoding="utf-8")
-        assert re.search(
-            r"\.data-table-wrap\s*\{[^}]*overflow-x\s*:\s*auto", sheet, re.DOTALL
+    def test_a_narrow_table_drops_a_column_instead_of_scrolling(self) -> None:
+        """Every cue for a cut table is a consolation prize. The reader came
+        to read an index, not to scroll one sideways, so below the width where
+        five columns fit the table gives up its least load-bearing column and
+        goes on fitting — Category, the only decorative column here, which
+        survives as a filter above the table and in full on the package's own
+        page.
+
+        A CONTAINER query, because what decides this is the width of the
+        column the table sits in — the viewport minus a 200px sidebar that
+        itself disappears at 820px. A viewport breakpoint would be a guess at
+        that arithmetic, wrong on both sides of the sidebar's collapse."""
+        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+        assert "container-type: inline-size" in src
+        assert "@container adp-table (max-width: 900px)" in src
+
+    def test_the_dropped_column_collapses_rather_than_leaves_the_row(self) -> None:
+        """`display: none` on the cells shifts every cell after them one
+        column left — the <colgroup> maps by position, so Shared with
+        inherited the zeroed column (measured at 0px) and Actions took its
+        32%. The cells have to stay in flow and give up what occupies space
+        instead."""
+        narrow = _narrow_block()
+        assert "display: none" not in narrow.split(".adp-cell--cat > *")[0], (
+            "the collapsed column uses `display: none` on its cells, which "
+            "re-maps every column after it"
+        )
+        assert "font-size: 0" in narrow, (
+            "the <th>'s label is a bare text node — `> * { display: none }` "
+            "cannot reach it, so the header would still print 'Category'"
         )
 
-    def test_the_one_verb_stays_reachable_when_it_does_scroll(self) -> None:
-        """Below the floor the wrap scrolls, and an off-screen action is not
-        recoverable the way an off-screen destination is — you can scroll back
-        to a column, you cannot click a button that is not there."""
-        src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        packages, domains = src.split("Memory Domains", 1)
-        assert 'class="data-table adp-table data-table--pinned-actions"' in packages
-        # NOT on the Memory Domains table: the pin targets `td:last-child`,
-        # and that table's last column is "Shared with", not a verb.
-        assert "data-table--pinned-actions" not in domains
+    def test_both_width_sets_sum_to_a_hundred(self) -> None:
+        """Under `table-layout: fixed` a colgroup summing to less than 100
+        does NOT scale back up in proportion: Chrome hands the whole
+        remainder to the LAST column — measured as 206px of Actions beside a
+        107px 'Shared with' reading 'Not sh…'."""
+        src = _decommented()
+        wide = re.findall(r"\.adp-table \.adp-col--\w+ \{ width: (\d+)%", src)
+        assert wide and sum(int(v) for v in wide[:5]) == 100, f"five-column set: {wide[:5]}"
+        narrow = re.findall(r"width: (\d+)%", _narrow_block())
+        # Category's own `width: 0` carries no unit and is excluded.
+        assert narrow and sum(int(v) for v in narrow) == 100, f"four-column set: {narrow}"
 
     def test_the_chip_is_capped_by_its_cell_not_by_a_fraction_of_it(self) -> None:
         """`max-width: 60%` of a ~100px column was 41px of pill around 58px of

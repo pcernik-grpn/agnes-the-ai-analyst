@@ -5778,41 +5778,44 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
         black calc(100% - var(--dtw-fade-right)), transparent 100%);
 }
 
-/* The pinned column's own cue. The permanent left hairline says "this column
-   is pinned"; the shadow says "and there is table under it right now", so it
-   is here and not on the base rule — a pinned column with nothing hidden
-   beneath it should look flush, not raised.
+/* ── The pinned column's own cue, at the weight a frozen pane wants ──────
+   Three passes got this wrong in both directions, so the reasoning is worth
+   keeping. A `-8px` spread against a 12px blur painted a ~4px feather nobody
+   could see. Answering that with 42% ink and a 34% border painted a grey
+   slab down the middle of a white table — heavier than every rule and
+   divider around it, which is not "visible", it is loud.
 
-   Offset and blur are what make it legible at all: the first pass spent the
-   blur against a -8px spread and painted a ~4px feather nobody could see on
-   screen. This one reads to the left of the pin, which is where the hidden
-   table is. */
+   What a frozen column wants is PRECISION, not weight: one crisp hairline
+   at a step above the table's own dividers, and a narrow, soft shading to
+   its right so the edge reads as an edge rather than another cell border.
+   The tones sit between `--ds-border` and `--ds-text-muted` — visible
+   against surface at any width, quiet enough that the eye goes to the rows.
+
+   The inset layer is the one that always works: the outer shadow and the
+   slide-under band below both paint over the NEIGHBOURING column, so they
+   are only as visible as whatever is in it, and the width this was reported
+   from had Category next door — "—" and one short word per row, i.e. white
+   fading into white. Inset paints on the pinned column's own background, so
+   it survives a blank neighbour. It is narrow (6px) and light on purpose:
+   its job is to define the edge, not to shade the column. */
 .data-table-wrap.is-cue-right .data-table--pinned-actions tbody td:last-child:not([colspan]),
 .data-table-wrap.is-cue-right .data-table--pinned-actions thead th:last-child {
-    /* TWO shadows, and the INSET one is the one that always works.
-       The outer shadow and the slide-under band below both paint over the
-       NEIGHBOURING column, so both are only as visible as what happens to be
-       in it — and at the width this was reported at, the neighbour was
-       Category, whose cells hold "—" and a short word each. White fading
-       into white space says nothing, which is exactly what the report said.
-       The inset shadow is drawn on the pinned column's OWN background, so it
-       reads at every width, over every neighbour, in both themes, and it
-       travels down each row with the pin. */
     box-shadow:
-        inset 14px 0 12px -10px color-mix(in srgb, var(--ds-text-primary) 42%, transparent),
-        -16px 0 20px -2px color-mix(in srgb, var(--ds-text-primary) 26%, transparent);
-    /* A hairline says "pinned" at rest; while there is table under the
-       column it steps up, so the column's edge reads as the edge of a
-       frozen pane rather than one more cell divider. */
-    border-left-color: color-mix(in srgb, var(--ds-text-primary) 34%, transparent);
+        inset 6px 0 6px -6px color-mix(in srgb, var(--ds-text-muted) 26%, transparent),
+        -8px 0 10px -8px color-mix(in srgb, var(--ds-text-primary) 14%, transparent);
+    /* One step above the table's own dividers — enough to read as the edge
+       of a frozen pane, not enough to compete with the header rule. */
+    border-left-color: color-mix(in srgb, var(--ds-text-muted) 42%, transparent);
 }
 
-/* The slide-under band — the part that actually makes it obvious.
-   A shadow alone was measured on screen and it is not enough: it says
-   "raised", which a reader can take for one more piece of chrome. What says
-   "the table continues beneath this" is seeing the neighbouring column's
-   text DISSOLVE into the pinned column's own background, the way a frozen
-   column reads in a spreadsheet.
+/* The slide-under band — the pretty half, where there is content to fade.
+   A shadow says "raised", which a reader can take for one more piece of
+   chrome; what says "the table continues beneath this" is seeing the
+   neighbouring column's text DISSOLVE into the pinned column's own
+   background, the way a frozen column reads in a spreadsheet. It is not
+   sufficient on its own — a blank neighbour has nothing to dissolve, which
+   is what the edge above is for — but where there IS text it is the part
+   that reads as designed rather than as an effect.
 
    It has to be a pseudo-element on the pinned cell rather than a mask on the
    wrap: a mask would take the button with it (see the note above the
@@ -5832,7 +5835,7 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     top: 0;
     bottom: 0;
     right: 100%;
-    width: 30px;
+    width: 24px;
     background: linear-gradient(to left,
         var(--dtw-pin-bg, var(--ds-surface)),
         color-mix(in srgb, var(--dtw-pin-bg, var(--ds-surface)) 0%, transparent));
