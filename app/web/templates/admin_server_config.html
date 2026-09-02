@@ -805,12 +805,19 @@ function renderLeafInput(fieldId, section, pathSegments, kind, value, opts, isUn
       : (value === "<empty>" ? "unset — type to set" : "*** — type to overwrite");
     return `<input id="${fieldId}" type="password" class="is-secret" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" placeholder="${escHtml(ph)}" autocomplete="off">`;
   }
+  // An unset number renders the registry default as its value, exactly like
+  // the text and bool branches below: `collectSection` posts every rendered
+  // leaf, so an empty input posted `null` on the next "Save section" and the
+  // operator was left reading `rate_messages_per_hour: null` in the overlay
+  // with no idea what is actually in force (the runtime treats null as the
+  // default, so nothing broke — it just said nothing).
+  const numDefault = (isUnset && opts && opts.spec && opts.spec.default != null) ? String(opts.spec.default) : "";
   if (kind === "int") {
-    const v = (value == null || value === "") ? "" : value;
+    const v = (value == null || value === "") ? numDefault : value;
     return `<input id="${fieldId}" type="number" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" value="${escHtml(v)}">`;
   }
   if (kind === "float") {
-    const v = (value == null || value === "") ? "" : value;
+    const v = (value == null || value === "") ? numDefault : value;
     return `<input id="${fieldId}" type="number" step="any" data-section="${section}" data-key="${escHtml(dottedKey)}" data-path="${dataPath}" data-cast="float" value="${escHtml(v)}">`;
   }
   if (kind === "bool") {
