@@ -51,6 +51,19 @@
       // soft-deleted resources can be brought back inside the dwell
       // window (default 10s). Click Undo → POST + onSuccess() (typically
       // a list refresh) — then the toast closes.
+      //
+      // `restoreUrl` may instead be a FUNCTION returning a promise, for an
+      // undo that is not a bare POST to a URL: /chats un-archives with
+      // `PUT /api/chat/sessions/{id}/archived {archived:false}`, which this
+      // helper cannot express as a URL alone. Everything else about the toast
+      // is identical, so a caller with an odd verb does not need its own.
+      //
+      // The two forms report failure differently and must not be conflated: a
+      // URL is judged on `response.ok`, while a CALLBACK is judged on whether
+      // its promise settles — resolve is success, reject is failure. Reading
+      // `.ok` off a callback's result is what would break the common case,
+      // since a fetch wrapper that throws on non-2xx (the app's own `api()`
+      // does) resolves with parsed JSON that has no `ok` at all.
       window.showUndoToast = function (message, restoreUrl, onSuccess, dwellMs) {
         const dwell = dwellMs || 10000;
         let el = document.getElementById('agnes-undo-toast');
@@ -92,25 +105,28 @@
           clearTimeout(timer);
           btn.disabled = true;
           btn.textContent = 'Restoring…';
+          const fail = (why) => {
+            msg.textContent = 'Undo failed: ' + why;
+            btn.textContent = 'Undo';
+            btn.disabled = false;
+          };
           try {
-            const r = await fetch(restoreUrl, {
-              method: 'POST', credentials: 'same-origin',
-            });
-            if (!r.ok) {
-              const d = await r.json().catch(() => ({}));
-              msg.textContent = 'Undo failed: ' + (d.detail || r.statusText);
-              btn.textContent = 'Undo';
-              btn.disabled = false;
-              return;
+            if (typeof restoreUrl === 'function') {
+              await restoreUrl();   // rejects on failure; nothing to inspect
+            } else {
+              const r = await fetch(restoreUrl, { method: 'POST', credentials: 'same-origin' });
+              if (!r.ok) {
+                const d = await r.json().catch(() => ({}));
+                fail(d.detail || r.statusText);
+                return;
+              }
             }
             dismiss();
             if (typeof onSuccess === 'function') {
               try { onSuccess(); } catch (_) { /* swallow */ }
             }
           } catch (e) {
-            msg.textContent = 'Network error: ' + e.message;
-            btn.textContent = 'Undo';
-            btn.disabled = false;
+            fail(e.message || 'something went wrong');
           }
         });
       };

@@ -514,3 +514,93 @@ class TestRunProjection:
 
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["facts_progress"] is None
+
+
+class TestFactsJobInFlight:
+    """The standalone facts pass (``sharepoint-facts-extraction``) writes no
+    ``extraction_runs`` row — it is a JOB, not a crawl run — so the card's
+    status poll reads it off the job queue instead: ``_facts_job_in_flight``
+    is the one lookup ``GET …/extraction/status`` uses to say "a facts pass
+    is queued/running for this connection". Backend-agnostic (the jobs
+    table exists on both), so it is pinned here on DuckDB even though the
+    status route itself is Postgres-only."""
+
+    KIND = "sharepoint-facts-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": connection_id},
+            idempotency_key=f"sharepoint-facts-extraction:{connection_id}",
+        )
+
+    def test_nothing_in_flight_is_none(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        assert _facts_job_in_flight("sp-none") is None
+
+    def test_a_queued_pass_is_reported_with_its_id_and_status(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        job = self._enqueue("sp-queued")
+        found = _facts_job_in_flight("sp-queued")
+        assert found is not None
+        assert found["id"] == job["id"]
+        assert found["status"] == "queued"
+        assert found["created_at"]
+
+    def test_another_connections_pass_is_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+
+        self._enqueue("sp-other")
+        assert _facts_job_in_flight("sp-mine") is None
+
+    def test_a_running_pass_is_reported_running_and_a_finished_one_is_gone(self, seeded_app):
+        from app.api.admin_extraction import _facts_job_in_flight
+        from src.repositories import jobs_repo
+
+        job = self._enqueue("sp-running")
+        claimed = jobs_repo().claim_next(kinds=[self.KIND], worker_id="w1", lease_seconds=60)
+        assert claimed and claimed["id"] == job["id"]
+        found = _facts_job_in_flight("sp-running")
+        assert found is not None and found["status"] == "running"
+
+        assert jobs_repo().complete(job["id"], "w1", claimed["lease_token"], result={"docs_extracted": 0})
+        assert _facts_job_in_flight("sp-running") is None
+
+    def test_the_lookup_follows_the_triggers_own_key_and_kind(self, seeded_app):
+        """The reader must find a job enqueued the way the TRIGGER enqueues it.
+
+        `_facts_job_in_flight` is a consumer of a key and kind that
+        `POST …/facts-extract` is the sole producer of
+        (`app/api/admin_sharepoint.py::_facts_extraction_idempotency_key`).
+        Every other test in this class enqueues with a literal, so all of
+        them stay green if the producer's shape ever changes — while the
+        card goes permanently blind and the button never locks, with no
+        symptom. This one enqueues through the producer's OWN key builder
+        and kind constant, so a change on that side fails here instead.
+        """
+        from app.api.admin_extraction import _FACTS_JOB_KIND, _facts_job_in_flight
+        from app.api.admin_sharepoint import _facts_extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        # The `list(kind=…)` filter must name the same job kind the key is
+        # prefixed with; the trigger builds both from that one string, so a
+        # rename on its side that left this constant behind would filter
+        # every real job out before the key is even compared.
+        assert _facts_extraction_idempotency_key("sp-contract") == f"{_FACTS_JOB_KIND}:sp-contract"
+
+        job = jobs_repo().enqueue(
+            _FACTS_JOB_KIND,
+            {"connection_id": "sp-contract"},
+            idempotency_key=_facts_extraction_idempotency_key("sp-contract"),
+        )
+        found = _facts_job_in_flight("sp-contract")
+        assert found is not None, (
+            "the status reader did not find a job enqueued with the trigger's own "
+            "idempotency key + kind — the two surfaces have drifted apart"
+        )
+        assert found["id"] == job["id"]
