@@ -24,6 +24,16 @@
  * have no surface that lists archived rows, so archiving there would put a
  * conversation somewhere the caller cannot see it again).
  *
+ * Pin follows the same shape: an ARCHIVED row offers NO pin item at all. Pinned
+ * and archived are contradictory states — a pin means "keep this at the top of
+ * my list", archiving means "this is not in my list" — so the state cannot
+ * exist: `ChatRepository.archive_session` clears `pinned_at`, the pin endpoint
+ * refuses a pin on an archived row (409), and /chats never presents an archived
+ * row as pinned. There is therefore nothing here to offer in either direction,
+ * and no Unpin branch to keep for legacy rows: the read side normalises them.
+ * `s.archived` is undefined for the rail and the chat page, which list no
+ * archived rows, so this is a no-op there.
+ *
  * Contract: call it from render/event code, never at top-level parse time —
  * same rule _app_scripts.html documents for confirmModal. Both loaders use
  * `defer`, so by the time a row is built (after an async sessions fetch) this
@@ -203,10 +213,13 @@
 
     function buildActions() {
       const s = state();
-      const actions = [
-        { id: "pin", label: s.pinned ? "Unpin" : "Pin", run: () => opts.onPin(!s.pinned) },
-        { id: "rename", label: "Rename", run: () => opts.onRename() },
-      ];
+      const actions = [];
+      // No pin item on an archived row, in either direction — see the note at
+      // the top of this file.
+      if (!s.archived) {
+        actions.push({ id: "pin", label: s.pinned ? "Unpin" : "Pin", run: () => opts.onPin(!s.pinned) });
+      }
+      actions.push({ id: "rename", label: "Rename", run: () => opts.onRename() });
       // Archive / Restore sits between Rename and Delete — after the harmless
       // actions, before the irreversible one, and next to the action it is most
       // likely to be mistaken for. Which of the two shows follows the row's own
