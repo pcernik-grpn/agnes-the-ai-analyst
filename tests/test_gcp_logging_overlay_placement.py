@@ -350,6 +350,70 @@ class TestAutoUpgradeTickConverges:
         )
 
 
+class TestAProbeVerdictBelongsToOnePipeline:
+    """A refreshed overlay must invalidate the marker that armed the old one.
+
+    The live failure (2026-09-02): the tick refreshes
+    `docker-compose.gcp-logging.yml` in place from the pinned image, so a
+    running VM picked up the fluentd/Ops-Agent overlay within five minutes of
+    the switch landing in `:stable`. Its `.gcp-logging-ok` marker was still
+    the one the OLD gcplogs probe had written, and the tick re-probes only a
+    marker-LESS overlay — so the gate engaged a pipeline nothing had ever
+    verified. Async forwarding meant no outage; it meant every log line went
+    to a socket with no listener, on a VM whose Ops Agent arrives only with a
+    later Terraform apply. Silent total log loss, which is the failure mode
+    the marker exists to prevent.
+
+    A probe verdict is about one pipeline. Change the pipeline and the
+    verdict is stale, not inherited.
+    """
+
+    def test_a_refreshed_overlay_clears_the_marker(self):
+        body = AUTO_UPGRADE.read_text()
+        refresh_idx = body.index("extract_host_artifact docker-compose.gcp-logging.yml")
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[refresh_idx:probe_idx]
+        assert f"rm -f /opt/agnes/{MARKER}" in window, (
+            "refreshing the overlay must drop the marker that armed the "
+            "previous one, so the marker-less probe below re-runs against "
+            "the pipeline that is now actually on disk"
+        )
+
+    def test_the_marker_is_cleared_only_when_the_overlay_really_changed(self):
+        """Not on every tick — an unconditional clear would re-probe forever
+        and, because the marker is hashed, churn a recreate every five
+        minutes."""
+        body = AUTO_UPGRADE.read_text()
+        refresh_idx = body.index("extract_host_artifact docker-compose.gcp-logging.yml")
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[refresh_idx:probe_idx]
+        assert "sha256sum" in window or "cmp -s" in window, (
+            "the clear must be conditional on the overlay's content actually "
+            "changing, not fire on every refresh"
+        )
+
+
+class TestTheTickNamesTheRightCause:
+    """A guard that misreports its own cause sends the operator to the wrong
+    fix. The tick's messages described the gcplogs driver and pointed at
+    roles/logging.logWriter; the probe now asks whether the Ops Agent is
+    accepting on its forward port, which that role has nothing to do with."""
+
+    def test_no_message_blames_the_log_writer_role(self):
+        body = AUTO_UPGRADE.read_text()
+        for line in body.splitlines():
+            if "logger -t agnes-auto-upgrade" in line and "logging.logWriter" in line:
+                raise AssertionError(f"message names a cause the probe no longer tests: {line.strip()}")
+
+    def test_the_probe_messages_name_the_collector(self):
+        body = AUTO_UPGRADE.read_text()
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[probe_idx : probe_idx + 900]
+        assert "24224" in window or "Ops Agent" in window, (
+            "the arm/disarm messages must name what was actually probed"
+        )
+
+
 class TestOverlayCoversEveryBaseComposeService:
     """The overlay's service list must track `docker-compose.yml`, both ways.
 

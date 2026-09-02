@@ -569,7 +569,7 @@ def register_foundation_tools(
         Fans out server-side over Collections chunks (hybrid lexical+vector),
         corporate-memory knowledge items (fulltext), table catalog cards,
         business metrics, and the glossary — all RBAC-filtered (glossary is
-        public). Results are typed ``chunk | knowledge | table | metric | glossary``;
+        public). Results are typed ``chunk | knowledge | table | metric | glossary | plugin``;
         a ``table`` hit means structured data: pivot to SQL via the ``query``
         tool with the hit's ``table_id`` instead of reading text chunks.
         A ``metric`` hit links to /semantic-layer?tab=all_metrics; a ``glossary``

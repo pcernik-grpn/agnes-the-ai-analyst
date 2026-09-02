@@ -62,6 +62,52 @@ def _resolve_knowledge_grants(user) -> Tuple[Optional[List[str]], Optional[List[
     return groups, domains
 
 
+def _accessible_plugins(user) -> List[Dict[str, Any]]:
+    """Marketplace plugins the caller may see, fail-closed.
+
+    Mirrors ``/library``'s plugin band (app/web/router.py): admins see every
+    registered plugin, everyone else sees the ones granted to their groups via
+    ``resource_grants(… , 'marketplace_plugin', '<marketplace_id>/<name>')``,
+    and an ``admin_disabled`` plugin is invisible to both — that flag is
+    instance-wide "does not exist" for every user-facing surface, grants
+    notwithstanding.
+
+    A restricted principal (co-session or agent-session) gets its live
+    intersection, never its owner's set, like every other source here.
+    """
+    from src.repositories import marketplace_plugins_repo
+
+    def _live(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [r for r in rows if not r.get("admin_disabled")]
+
+    try:
+        if isinstance(user, PRINCIPAL_TYPES):
+            allowed = user.intersection.get(ResourceType.MARKETPLACE_PLUGIN.value, frozenset())
+            return [
+                r
+                for r in _live(marketplace_plugins_repo().list_all())
+                if f"{r.get('marketplace_id')}/{r.get('name')}" in allowed
+            ]
+        user_id = user.get("id")
+        if not user_id:
+            return []
+        if is_user_admin(user_id):
+            return _live(marketplace_plugins_repo().list_all())
+        granted = set(
+            resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.MARKETPLACE_PLUGIN.value)
+        )
+        if not granted:
+            return []
+        return [
+            r
+            for r in _live(marketplace_plugins_repo().list_all())
+            if f"{r.get('marketplace_id')}/{r.get('name')}" in granted
+        ]
+    except Exception as e:  # a plugin bucket must never take the search down
+        logger.warning("knowledge search: could not resolve plugin grants: %s", e)
+        return []
+
+
 def _empty_combined_hint(collections: int, tables: int, metrics: int) -> str:
     """Why the combined search is empty, in terms the caller can act on.
 
@@ -125,7 +171,7 @@ async def knowledge_search(
 ):
     """One query across documents, the knowledge base, and the table catalog.
 
-    Results are typed (``chunk | knowledge | table | metric | glossary``); table hits carry a
+    Results are typed (``chunk | knowledge | table | metric | glossary | plugin``); table hits carry a
     pivot hint (query via SQL) instead of rows. Everything is filtered to the
     caller's grants, fail-closed per source.
 
@@ -181,6 +227,12 @@ async def knowledge_search(
     # flattened there instead.
     metrics = [{**m, "description": plain_description(m)} for m in metrics]
 
+    # Plugins, RBAC-filtered the same way /library resolves its plugin band:
+    # grants are `marketplace_plugin` rows keyed on `<marketplace_id>/<name>`.
+    # `admin_disabled` is instance-wide "does not exist" for every user-facing
+    # surface, grants notwithstanding — the same post-filter /library applies.
+    plugins = _accessible_plugins(user)
+
     results = unified_search(
         q,
         corpus_ids=corpus_ids,
@@ -188,6 +240,7 @@ async def knowledge_search(
         granted_domains=domains,
         tables=tables,
         metrics=metrics,
+        plugins=plugins,
         k=k,
     )
     payload: dict = {"query": q, "results": results, "retrieval": retrieval_mode()}

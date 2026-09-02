@@ -255,6 +255,14 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
     return {
         "id": run.get("id"),
         "job_id": run.get("job_id"),
+        # The run row's own phase column — `"crawl"` while the crawl is
+        # walking the corpus, `"facts"` once the LLM stage takes over
+        # (`connectors.sharepoint.crawler._RunRecorder.checkpoint_facts`).
+        # The card's per-phase copy keys off `activity.phase` below (it
+        # rides the SAME checkpoint and is already what a finished run
+        # collapses to `None`); this is the raw source of truth for a
+        # caller that wants it without unpacking `activity`.
+        "phase": run.get("phase"),
         "outcome": outcome["outcome"],
         "stored_status": outcome["stored_status"],
         "stale_s": outcome["stale_s"],
@@ -305,6 +313,14 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         # FINISHED run (nothing is in flight any more, honestly `None` here)
         # and to `progress` for a running one — no separate lookup needed.
         "activity": live.get("activity"),
+        # `{docs_done, docs_total}` for the facts phase specifically — absent
+        # (`None`) while the crawl phase is running or for a run recorded
+        # before this field existed. `docs_total` is the number of documents
+        # SUBMITTED so far, not the final corpus size: like `files_seen`
+        # above, it grows until the facts walk is exhausted (see
+        # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
+        # `on_progress` docstring) — never invented ahead of that.
+        "facts_progress": live.get("facts"),
     }
 
 

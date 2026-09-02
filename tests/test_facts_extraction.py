@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -34,7 +35,9 @@ from connectors.sharepoint.facts_extraction import (
     parse_streams,
     quote_is_verbatim,
     render_ontology,
+    repair_verbatim_failures,
     resolve_concurrency,
+    snap_quote_to_source,
     verbatim_failures,
 )
 from connectors.sharepoint.facts_prompt import (
@@ -315,11 +318,25 @@ def test_a_fabricated_quote_is_not_verbatim():
     )
 
 
-def test_a_quote_may_not_cross_a_chunk_boundary():
-    """Spec §8: the substring test is per chunk. A quote spanning two
-    chunks fails here exactly as it would at the ingest gate."""
+def test_a_quote_matching_neither_chunk_nor_their_join_is_not_verbatim():
+    """A quote whose separator does not match what the model was actually
+    shown (`\\n\\n`-joined chunks) still fails — the gate widened WHERE it
+    looks, not WHAT counts as a match (cost-levers spec §2.1(b)/§2.2)."""
     assert not quote_is_verbatim(
         "March and April", chunk_texts=["... began in March", "and April ..."], filename="a.md", path=None
+    )
+
+
+def test_a_quote_spanning_the_chunk_join_is_verbatim():
+    """The document's FULL joined text — exactly what the model reads
+    (`_document_text`) — now counts too, so a quote that genuinely crosses
+    what was, to the model, an invisible internal chunk split passes on the
+    first attempt instead of costing a corrective retry it cannot fix."""
+    assert quote_is_verbatim(
+        "began in March\n\nand concluded",
+        chunk_texts=["The rollout began in March", "and concluded in April."],
+        filename="a.md",
+        path=None,
     )
 
 
@@ -333,6 +350,87 @@ def test_an_edge_with_no_evidence_fails():
     edge = {"src": "a:b", "type": "t", "dst": "c:d", "evidence": []}
     failures = verbatim_failures([edge], chunk_texts=["text"], filename=None, path=None)
     assert len(failures) == 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic quote repair — cost-levers spec 2026-09-02 §2.1(a)/§2.2.
+# Snaps a failing quote to the exact source bytes BEFORE the corrective
+# retry fires, at zero model cost. The gate itself (above) stays byte-exact.
+# ---------------------------------------------------------------------------
+
+
+def test_snap_quote_repairs_a_curly_apostrophe():
+    fixed = snap_quote_to_source("client's rollout", document_text="The client’s rollout began in March.")
+    assert fixed == "client’s rollout"
+
+
+def test_snap_quote_repairs_a_dash_variant():
+    fixed = snap_quote_to_source("Q1-Q2 results", document_text="Full Q1–Q2 results are attached.")
+    assert fixed == "Q1–Q2 results"
+
+
+def test_snap_quote_repairs_an_nfc_nfd_mismatch():
+    import unicodedata as ud
+
+    quote = ud.normalize("NFC", "Café is on schedule")
+    document_nfd = ud.normalize("NFD", "The Café is on schedule today.")
+
+    fixed = snap_quote_to_source(quote, document_text=document_nfd)
+
+    assert fixed == ud.normalize("NFD", "Café is on schedule")
+
+
+def test_snap_quote_collapses_a_doubled_space():
+    fixed = snap_quote_to_source("rollout began in", document_text="The rollout  began in March.")
+    assert fixed == "rollout  began in"
+
+
+def test_snap_quote_treats_a_soft_hyphen_as_invisible():
+    fixed = snap_quote_to_source("underway", document_text="The engagement is under­way now.")
+    assert fixed == "under­way"
+
+
+def test_snap_quote_finds_a_match_spanning_the_chunk_join():
+    """Whitespace of any shape collapses into one match (§3's "doubled
+    space" case) — a single space in the model's quote finds the `\\n\\n`
+    the chunk join actually left there, same as any other whitespace run."""
+    fixed = snap_quote_to_source("began in March and concluded", document_text="began in March\n\nand concluded")
+    assert fixed == "began in March\n\nand concluded"
+
+
+def test_snap_quote_returns_none_when_nothing_matches():
+    assert snap_quote_to_source("this was never in the document", document_text="The rollout began in March.") is None
+
+
+def test_snap_quote_returns_none_when_the_match_is_ambiguous():
+    """Two DIFFERENT spellings of the same normalized phrase — no way to
+    tell which one the model actually read, so it is left for the retry
+    rather than guessed at."""
+    document = "The client’s rollout began, then the client's rollout paused."
+    assert snap_quote_to_source("client's rollout", document_text=document) is None
+
+
+def test_snap_quote_returns_none_for_a_meaningless_quote():
+    assert snap_quote_to_source(".", document_text="The rollout began in March.") is None
+
+
+def test_repair_verbatim_failures_fixes_evidence_in_place_and_counts():
+    fact = _node("client's rollout")
+    document_text = "The client’s rollout began in March."
+
+    count = repair_verbatim_failures([(fact, "client's rollout")], document_text=document_text)
+
+    assert count == 1
+    assert fact["evidence"][0]["quote"] == "client’s rollout"
+
+
+def test_repair_verbatim_failures_leaves_an_unrepairable_quote_untouched():
+    fact = _node("invented sentence")
+
+    count = repair_verbatim_failures([(fact, "invented sentence")], document_text="The rollout began in March.")
+
+    assert count == 0
+    assert fact["evidence"][0]["quote"] == "invented sentence"
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +483,49 @@ def test_a_clean_first_reply_costs_exactly_one_call():
     assert len(extractor.seen) == 1
     assert result.retried is False
     assert len(result.nodes) == 1
+
+
+def test_a_repairable_quote_costs_no_retry():
+    """cost-levers spec §2.2: a byte-level artifact is fixed IN PROCESS,
+    before a second full-document call is ever considered."""
+    text = "The client’s rollout began in March."
+    bad = _node("client's rollout")  # straight apostrophe; the source has a curly one
+    extractor = StubExtractor([_stream(bad)])
+
+    result = extract_one(extractor, _work(text))
+
+    assert len(extractor.seen) == 1, "repaired before any retry — zero extra model calls"
+    assert result.retried is False
+    assert result.repaired == 1
+    assert result.dropped == 0
+    assert [n["evidence"][0]["quote"] for n in result.nodes] == ["client’s rollout"]
+
+
+def test_a_second_bad_quote_in_a_repaired_fact_still_gets_a_retry():
+    """`verbatim_failures` only reports a fact's FIRST bad quote — after a
+    repair fixes that one, the fact must be RE-checked, not assumed clean,
+    or a second, genuine fabrication on the same fact would ship
+    unverified."""
+    text = "The client’s rollout began in March."
+    fact = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [
+            {"doc_id": "doc1", "quote": "client's rollout"},  # curly apostrophe — repairable
+            {"doc_id": "doc1", "quote": "and was cancelled shortly after"},  # fabricated
+        ],
+    }
+    extractor = StubExtractor([_stream(fact), _stream()])
+
+    result = extract_one(extractor, _work(text))
+
+    assert len(extractor.seen) == 2, "the surviving fabrication still earns exactly one retry"
+    assert extractor.seen[1].count("failing quote:") == 1, "the repaired quote is not re-flagged"
+    assert "and was cancelled shortly after" in extractor.seen[1]
+    assert result.repaired == 1
+    assert result.dropped == 1
+    assert result.nodes == []
 
 
 def test_the_retry_keeps_the_facts_that_already_passed():
@@ -657,7 +798,7 @@ def test_the_seam_refuses_to_spend_tokens_when_the_facts_surface_is_off(monkeypa
     from connectors.sharepoint.facts_extraction import maybe_run_after_crawl
 
     monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
-    monkeypatch.setattr("connectors.sharepoint.facts_extraction._facts_surface_enabled", lambda: False)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: False)
     called = []
     monkeypatch.setattr(
         "connectors.sharepoint.facts_extraction.run_facts_extraction",
@@ -665,6 +806,104 @@ def test_the_seam_refuses_to_spend_tokens_when_the_facts_surface_is_off(monkeypa
     )
     assert maybe_run_after_crawl({"id": "conn1"}) is None
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# Standalone trigger — run a pass without a crawl, over an already-indexed
+# corpus (`run_standalone_facts_extraction`, the seam
+# `sharepoint-facts-extraction`/``POST …/facts-extract``/``agnes admin
+# sharepoint facts-extract`` all delegate to).
+# ---------------------------------------------------------------------------
+
+
+def test_standalone_run_refuses_when_the_cost_switch_is_off(monkeypatch):
+    from connectors.sharepoint.facts_extraction import FactsExtractionDisabled, run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: False)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    called = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: called.append(1),
+    )
+
+    with pytest.raises(FactsExtractionDisabled, match="extraction.facts.enabled"):
+        run_standalone_facts_extraction("conn1")
+    assert called == []
+
+
+def test_standalone_run_refuses_when_the_facts_surface_is_off(monkeypatch):
+    from connectors.sharepoint.facts_extraction import FactsExtractionDisabled, run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: False)
+    called = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda *a, **k: called.append(1),
+    )
+
+    with pytest.raises(FactsExtractionDisabled, match="facts.enabled"):
+        run_standalone_facts_extraction("conn1")
+    assert called == []
+
+
+def test_standalone_run_delegates_with_doc_ids_and_a_deadline_from_timeout_s(monkeypatch):
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    seen = {}
+
+    def _fake_run(connection_id, *, doc_ids=None, deadline=None):
+        seen["connection_id"] = connection_id
+        seen["doc_ids"] = doc_ids
+        seen["deadline"] = deadline
+        return {"docs_extracted": 0}
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_facts_extraction", _fake_run)
+
+    result = run_standalone_facts_extraction("conn1", doc_ids=["d1", "d2"], timeout_s=42)
+
+    assert result == {"docs_extracted": 0}
+    assert seen["connection_id"] == "conn1"
+    assert seen["doc_ids"] == ["d1", "d2"]
+    # A real `_Deadline` (the crawl's own bound type, reused — see the
+    # module import), built from the CALLER's timeout_s, not the run's own
+    # `extraction.timeout_s`.
+    assert seen["deadline"].timeout_s == 42
+    assert seen["deadline"].expired() is False
+
+
+def test_standalone_run_falls_back_to_the_configured_timeout_when_none_given(monkeypatch):
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction._standalone_timeout_seconds", lambda: 111)
+    seen = {}
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.run_facts_extraction",
+        lambda connection_id, *, doc_ids=None, deadline=None: seen.update(deadline=deadline) or {},
+    )
+
+    run_standalone_facts_extraction("conn1")
+
+    assert seen["deadline"].timeout_s == 111
+
+
+def test_standalone_timeout_seconds_defaults_and_reads_config(monkeypatch):
+    from connectors.sharepoint.facts_extraction import (
+        DEFAULT_STANDALONE_TIMEOUT_S,
+        _standalone_timeout_seconds,
+    )
+
+    _config(monkeypatch, {})
+    assert _standalone_timeout_seconds() == DEFAULT_STANDALONE_TIMEOUT_S
+    assert DEFAULT_STANDALONE_TIMEOUT_S > 0, "the default must actually bound a run, not disable it"
+
+    _config(monkeypatch, {("extraction", "facts", "run_timeout_s"): 900})
+    assert _standalone_timeout_seconds() == 900
 
 
 # ---------------------------------------------------------------------------
@@ -730,3 +969,33 @@ class TestDeadlineExpiryIsCalledNotTruthinessTested:
         from connectors.sharepoint.facts_extraction import _deadline_expired
 
         assert _deadline_expired(object()) is False
+
+
+def test_a_document_ended_by_an_unavailable_model_still_counts_as_drained():
+    """`docs_done` means "no longer in flight" — the comment driving that
+    report says so outright: *a document that errored, or the one whose
+    failure just set `hard_stop`, is still one fewer left in flight*.
+
+    But the count was `docs_extracted + facts_failed`, and the
+    `FactsExtractionUnavailable` branch increments neither: it remembers the
+    exception so the remaining paid calls can drain, and returns. So the
+    displayed count stayed one short for the whole drain, contradicting its
+    own comment (Devin Review on #2059).
+
+    Counted separately from `facts_failed` on purpose. That is a REPORTED
+    metric meaning "this document's own extraction failed", and an
+    unavailable model says nothing about the document — folding it in would
+    make the metric lie to make the progress bar right."""
+    src = Path("connectors/sharepoint/facts_extraction.py").read_text(encoding="utf-8")
+    branch = src.split("except FactsExtractionUnavailable as exc:", 1)[1].split("except Exception", 1)[0]
+    assert "docs_unavailable += 1" in branch, (
+        "a document whose model was unavailable has still left the queue and "
+        "must count toward docs_done"
+    )
+    assert "report.facts_failed += 1" not in branch, (
+        "facts_failed is a reported metric about the DOCUMENT — an unavailable "
+        "model must not inflate it"
+    )
+    assert "docs_extracted + report.facts_failed + docs_unavailable" in src, (
+        "the progress count must include it"
+    )
