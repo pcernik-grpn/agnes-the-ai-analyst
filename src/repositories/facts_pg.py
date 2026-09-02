@@ -1546,7 +1546,17 @@ class FactsPgRepository:
         all_evidence = _visibility_mode() == "all_evidence"
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
-        with self._engine.connect() as conn:
+        # No LIMIT here (unlike search()/neighbors()) — this method has no
+        # limit_applied-style truncation signal to pair one with, so a bare
+        # cap would recreate the S6 shortfall-oracle shape those two avoid;
+        # left for a follow-up with its own wire-contract review. The
+        # statement_timeout IS wired here, same as search()/neighbors() —
+        # a subject with a pathological claim count still had nothing
+        # bounding how long the connection sat executing this query.
+        # `.begin()` (not `.connect()`) so `SET LOCAL` applies to the
+        # queries that follow in the same transaction.
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             kind = self._subject_kind(conn, subject_id)
             if kind is None:
                 raise FactNotFound(subject_id)

@@ -28,6 +28,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Internal
 
+- **`facts_pg.py::claims()` now bounds its query with the same `SET LOCAL statement_timeout` `search()`/`neighbors()` already carry.** A subject with a pathological claim count had nothing bounding how long the connection could sit executing this one-subject read — found while auditing the same module for the `fact_type_map` change above. No row cap added (unlike its siblings, `claims()` has no `limit_applied`-style truncation signal to pair one with — a bare cap would recreate the S6 shortfall-oracle shape `search()`/`neighbors()` deliberately avoid); left as a follow-up with its own wire-contract review.
+
 ## [0.96.0] - 2026-09-02
 
 ### Added

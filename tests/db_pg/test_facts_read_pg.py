@@ -2289,6 +2289,38 @@ def test_neighbors_applies_a_statement_timeout(pg_env, repo):
     assert result["nodes"][0]["id"] == fact_id
 
 
+def test_claims_applies_a_statement_timeout(pg_env, repo):
+    """`claims()` had no `SET LOCAL statement_timeout` at all — unlike
+    `search()`/`neighbors()`, its one-subject query has no LIMIT either, so
+    a subject carrying a pathological number of claims had nothing bounding
+    how long the connection could sit executing it. Same mechanism, same
+    wiring proof as `test_search_applies_a_statement_timeout`: record every
+    statement issued on the connection `claims()` opens. (A row cap on
+    `claims()` itself is a separate, larger change — it has no
+    `limit_applied`-style truncation signal today, and adding a silent cap
+    without one would recreate the S6 shortfall-oracle shape `search()`/
+    `neighbors()` deliberately avoid — left for a follow-up with its own
+    wire-contract review.)"""
+    from sqlalchemy import event
+
+    _seed_full_fixture()
+    fact_id = repo.create_fact(type="person")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Exists.")
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        repo.claims(_dict_user("uploader1"), fact_id)
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert any("SET LOCAL statement_timeout" in s for s in statements)
+
+
 # ---------------------------------------------------------------------------
 # Type map — the Library's node-type counts must obey the same gate as
 # search(), or the aggregate becomes the S1/S2 existence oracle in another
