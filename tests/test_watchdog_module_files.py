@@ -15,6 +15,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 MODULE = Path("infra/modules/customer-instance")
 FILES = MODULE / "files"
 
@@ -203,3 +205,106 @@ def test_watchdog_reports_image_and_schema_changes():
     # Info-only runs must still notify: the early-exit guard has to consider
     # both arrays, not just ALERTS.
     assert '[ "${#ALERTS[@]}" -eq 0 ] && [ "${#INFOS[@]}" -eq 0 ] && exit 0' in sh
+
+
+def test_every_alert_site_writes_a_marker_with_a_stable_slug():
+    """The watchdog knows the incident signatures that matter on this stack, but
+    only ever told journald and an optional webhook. A host-level monitoring
+    agent can read a file's mtime and nothing else, so each alert leaves a
+    marker file whose NAME is a stable slug and whose mtime says "firing now".
+
+    The slug is an explicit second argument rather than something derived from
+    the message text: rewording an alert must never silently rename a metric a
+    consumer's monitors are keyed on.
+    """
+    sh = (FILES / "agnes-watchdog.sh").read_text()
+
+    assert 'MARK_DIR="$STATE/markers"' in sh, (
+        "derive the marker dir from $STATE — tests/test_watchdog_role_containers.sh "
+        "sandboxes host paths by rewriting the STATE assignment, and a sibling "
+        "literal would send test runs at the real /var/lib"
+    )
+    assert "mark_signature() {" in sh
+    assert 'add() { ALERTS+=("$1"); mark_signature "${2:-}" "$1"; }' in sh, (
+        "marking from add() puts it BEFORE the hourly anti-spam gate: an incident "
+        "that is still firing must keep looking fresh on the quiet ticks too"
+    )
+
+    calls = re.findall(r'^\s*.*\badd "(?P<msg>[^"]+)"(?P<rest>[^\n]*)$', sh, re.M)
+    assert len(calls) == 14, f"expected 14 alert sites, found {len(calls)}"
+    slugs = set()
+    for msg, rest in calls:
+        slug = rest.strip()
+        assert re.fullmatch(r"[a-z][a-z0-9-]*", slug), (
+            f'alert "{msg[:40]}..." carries no marker slug'
+        )
+        slugs.add(slug)
+
+    assert slugs == {
+        "fleet-empty", "crash", "zombie", "wal-salvage", "index-desync",
+        "index-append-fatal", "coordination", "restarts", "container-down",
+        "oom", "health", "discarded-wal", "scheduler", "disk",
+    }
+    # The two CONTAINER alerts share an anti-spam prefix but are materially
+    # different incidents: one replica missing vs the whole project gone.
+    assert "fleet-empty" in slugs and "container-down" in slugs
+
+
+def test_marker_writes_can_never_abort_a_watchdog_tick():
+    """The script runs `set -u` with no errexit, and every alert site is a
+    `[ cond ] && add "..."` one-liner. A marker write on a full or read-only
+    /var/lib must degrade to "no marker", never to a dead watchdog."""
+    sh = (FILES / "agnes-watchdog.sh").read_text()
+    body = sh[sh.index("mark_signature() {") : sh.index("ALERTS=()")]
+    assert 'mkdir -p "$MARK_DIR" 2>/dev/null || return 0' in body
+    assert '|| true' in body
+    assert "set -e" not in sh, (
+        "~10 alert sites are `[ cond ] && add` one-liners whose false branch "
+        "exits non-zero; errexit would kill the script on the first healthy check"
+    )
+
+
+_ADD_DEF = 'add() { ALERTS+=("$1"); mark_signature "${2:-}" "$1"; }'
+
+
+def _marker_harness(sh: str, mark_dir: Path) -> str:
+    """The shipped mark_signature/add pair, with MARK_DIR pointed at a tmp dir.
+
+    The functions are lifted VERBATIM out of the shipped script — the point is
+    to exercise the code that actually reaches a VM, not a paraphrase of it.
+    """
+    start = sh.index("mark_signature() {")
+    end = sh.index(_ADD_DEF) + len(_ADD_DEF)
+    block = sh[start:end]
+    assert "%{" not in block and "${var" not in block, "this must be plain bash"
+    return f'set -u\nMARK_DIR="{mark_dir}"\nALERTS=()\n{block}\n'
+
+
+def test_markers_land_on_disk_with_the_slug_as_the_filename(tmp_path):
+    """Behaviour, not text: the slug becomes the filename an external check
+    globs, and the fallback derivation keeps working for a future alert site
+    that forgets to pass one."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover
+        pytest.skip("bash not available")
+    sh = (FILES / "agnes-watchdog.sh").read_text()
+    mark_dir = tmp_path / "markers"
+    script = tmp_path / "harness.sh"
+    script.write_text(
+        _marker_harness(sh, mark_dir)
+        + 'ctr=agnes-app-1\n'
+        + 'add "DISK: /data at 91%" disk\n'
+        + 'add "CRASH[$ctr]: 3x \'terminate called\'"\n'
+        + 'add "NEW DISCARDED WAL: /data/state/x.wal.discarded.1"\n'
+    )
+    proc = subprocess.run([bash, str(script)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+    written = {p.name for p in mark_dir.iterdir()}
+    assert written == {"disk", "crash", "new-discarded-wal"}, written
+    # The content is a unix timestamp; the age is what a monitor reads.
+    for path in mark_dir.iterdir():
+        assert path.read_text().strip().isdigit(), path.name
+    # The per-container qualifier is stripped: 14 signatures, not 14 x N
+    # containers, keeps the marker set inside the check's file-gauge cap.
+    assert "crash" in written and not any("agnes-app-1" in name for name in written)
