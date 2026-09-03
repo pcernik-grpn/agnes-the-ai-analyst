@@ -10498,8 +10498,13 @@ def _shares_owned_by(owner_id: str) -> dict:
         items.append({"kind": "agent", "id": a["id"], "name": a.get("name") or a["id"], "href": None})
     for c in file_corpora_repo().list_all() or []:
         if str(c.get("created_by") or "") == owner_id:
+            # `/library/{slug}` — the route resolves by SLUG, and there is
+            # no `/library/d/…` path. This built one anyway, so every
+            # collection link in a person's Shares section 404'd. A
+            # collection without a slug gets no link rather than a broken
+            # one (the template renders the name plain when href is None).
             items.append({"kind": "collection", "id": c["id"], "name": c.get("name") or c["id"],
-                          "href": f"/library/d/{c['id']}"})
+                          "href": f"/library/{c['slug']}" if c.get("slug") else None})
 
     by_kind = {k: grants.list_all(resource_type=k) for k in ("agent", "collection")}
     # Resolve who granted, once: ids to names (the Library records the sharer's

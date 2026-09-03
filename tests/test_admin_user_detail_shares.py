@@ -60,7 +60,16 @@ def test_owned_items_list_their_groups_and_who_did_the_sharing(seeded_app):
     assert "Shares Page Agent" in html and "Shares Page Collection" in html
     assert "shared by them" in html
     assert "granted by admin" in html
-    assert f"/library/d/{col}" in html  # the collection links home
+    # The collection links home — by SLUG, which is what `/library/{slug}`
+    # resolves. This asserted `/library/d/<id>` for as long as the page
+    # built it: an extra segment no route matches, and the id where a slug
+    # goes. The link 404'd here and on /admin/access, and the guard held it
+    # in place. Asserting the ROUTE RESOLVES rather than the string is what
+    # stops the next wrong path from being frozen the same way.
+    assert "/library/shares-page-col" in html
+    assert "/library/d/" not in html
+    resolved = seeded_app["client"].get("/library/shares-page-col", headers=_auth(seeded_app["admin_token"]))
+    assert resolved.status_code == 200, f"the Shares link must lead somewhere: got {resolved.status_code}"
     assert f"/admin/access?group={admin_gid}" in html  # each share can be changed where grants live
     assert "2 of 2 shared" in html
 

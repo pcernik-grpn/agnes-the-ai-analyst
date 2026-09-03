@@ -1087,8 +1087,27 @@
 
     //: Where a row's thing actually lives, when it has a page of its own.
     const ENTITY_PAGE = {
-      collection: (id) => `/library/d/${encodeURIComponent(id)}`,
-      corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
+      /* `/library/{slug}` — the route resolves a collection by SLUG, and
+         there has never been a `/library/d/…` path at all. This built
+         `/library/d/<id>`, which is wrong twice over: an extra segment no
+         route matches, and the id where a slug is needed. Every "where it
+         lives ↗" on a collection row was a 404, in production as much as
+         locally. The projection already sends `slug`
+         (`app/resource_types.py::_collection_blocks`).
+
+         No slug, no link. The page's standing rule is not to offer what
+         cannot succeed, and a link that 404s is the loudest way to break
+         it — the row still says what the thing is and who shared it. */
+      collection: (id, item) => (item && item.slug
+        ? `/library/${encodeURIComponent(item.slug)}`
+        : ""),
+      /* A FILE lives at `/library/{collection-slug}/f/{file_id}`, and a file
+         item carries neither the slug nor its collection's id — its block
+         does, and the block is not passed here. So no link, rather than the
+         same 404 by a different route. Giving `_corpus_file_blocks` a slug
+         per item is the fix if this ever needs to link; it is a projection
+         change, not a page one. */
+      corpus_file: () => "",
       data_app: (id) => `/apps/${encodeURIComponent(id)}`,
       // /agents is the OWNER's builder, fed by /api/v1/agents (the caller's
       // own agents), so for an admin looking at a colleague's agent it opened
