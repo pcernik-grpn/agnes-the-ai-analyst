@@ -2653,6 +2653,115 @@ class TestExtractionTrigger:
         assert extraction_state.get("last_run_at")
 
 
+class TestRetryEmptyExtraction:
+    """``POST /connections/{connection_id}/extraction/retry-empty`` —
+    re-queues a connection's ``convert_empty`` backlog. Same job/readiness
+    machinery as ``TestExtractionTrigger`` above; this class covers what is
+    DIFFERENT about it (the payload's ``retry_empty`` flag, and
+    ``queued_count`` reflecting the persisted backlog)."""
+
+    RETRY_EMPTY = "{base}/{cid}/extraction/retry-empty"
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.RETRY_EMPTY.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.RETRY_EMPTY.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        r = seeded_app["client"].post(
+            self.RETRY_EMPTY.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-off")
+        # The router-level gate refuses first, so this never even reaches
+        # the connection lookup for an existing connection either.
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_an_empty_backlog_still_succeeds_with_a_zero_count(self, seeded_app, monkeypatch):
+        """No `convert_empty` items ever recorded is a normal, successful
+        answer, not an error — the run still completes (its ordinary
+        incremental walk is harmless), it just has nothing to replay."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-none")
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 0
+
+    def test_queued_count_reflects_the_persisted_empty_items_backlog(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "a.pdf"},
+                        "path": "Reports/a.pdf",
+                        "first_seen_at": "2026-09-01T00:00:00+00:00",
+                    },
+                    "graph:item2": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2", "name": "b.pdf"},
+                        "path": "Reports/b.pdf",
+                        "first_seen_at": "2026-09-01T00:00:00+00:00",
+                    },
+                },
+            },
+        )
+
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 2
+
+    def test_the_job_payload_carries_retry_empty_true(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-payload")
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["kind"] == "corpus-extraction"
+        assert job["payload_json"] == {"connection_id": conn_id, "retry_empty": True}
+
+    def test_duplicate_run_is_409_and_shares_the_ordinary_trigger_dedup_key(self, seeded_app, monkeypatch):
+        """A retry-empty run and a plain trigger for the SAME connection
+        must never overlap either — both mutate the same crawl state file."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-dup")
+        first = c.post("{base}/{cid}/extract".format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+
+        second = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "extraction_already_running"
+
+
 class TestExtractionRunDue:
     """``POST /extraction/run-due`` — the scheduler-driven sweep. Not
     connection-scoped in its path; walks every sharepoint connection."""

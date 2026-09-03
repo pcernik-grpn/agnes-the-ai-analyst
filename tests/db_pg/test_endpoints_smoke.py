@@ -3455,6 +3455,17 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestExtractionTrigger /
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
+    # Targeted `convert_empty` backlog replay (scan-OCR triage task) — same
+    # "enqueues into the EXISTING jobs table, reads the connector's own
+    # crawl state via connectors.sharepoint.state_store (Postgres row or
+    # DuckDB-fallback file, itself already dual-backend by construction, not
+    # a `_REGISTRY` pair)" reasoning as `extract` right above: no NEW schema
+    # surface to verify per-backend. Auth matrix, 404-before-work, the
+    # feature-usable gate, duplicate-run dedup (sharing `extract`'s own
+    # idempotency key), and `queued_count` reflecting the persisted backlog
+    # are covered by tests/test_admin_sharepoint.py::TestRetryEmptyExtraction;
+    # not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty",
     "POST /api/admin/sharepoint/extraction/run-due",
     # Graph change-notification receiver (webhook-triggered extraction) — the
     # admin secret-rotation endpoint writes only into the EXISTING

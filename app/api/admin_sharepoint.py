@@ -2633,6 +2633,78 @@ async def trigger_extraction(
     return {"job_id": job["id"], "status": job["status"]}
 
 
+@router.post("/connections/{connection_id}/extraction/retry-empty", status_code=202)
+async def retry_empty_extraction(
+    connection_id: str,
+    _user: dict = Depends(require_admin),
+):
+    """Re-queue this connection's ``convert_empty`` backlog for conversion —
+    the targeted follow-up for "I just turned ``extraction.scan_ocr.enabled``
+    on, will it now read what used to come back blank?".
+
+    A document that converted fine but carried no text (a scan with no text
+    layer, most commonly) is otherwise a dead end: Graph's delta feed never
+    re-offers an unchanged item, so the crawl's ordinary incremental walk
+    would skip it forever even after scan OCR starts being able to read it.
+    Every such item this connection has ever seen is recorded in its crawl
+    state's ``empty_items`` backlog (``connectors.sharepoint.crawler.
+    _note_empty``) as it is encountered; this endpoint enqueues the SAME
+    ``corpus-extraction`` job :func:`trigger_extraction` does, with
+    ``{"retry_empty": true}`` added to its payload, which makes the run
+    replay exactly that backlog (``connectors.sharepoint.crawler.
+    _retry_empty_items``) BEFORE its ordinary incremental delta walk — never
+    on an ordinary trigger, only here.
+
+    Returns ``queued_count`` — the number of backlog items this call is
+    about to replay, read from the connection's PERSISTED crawl state before
+    the job is enqueued (a job result is not available synchronously, and an
+    admin asking "did this do anything?" should not have to go find out).
+    ``0`` when the backlog is empty is a normal, successful answer, not an
+    error — the run still completes (its ordinary delta walk is harmless),
+    it simply has nothing to replay.
+
+    Same preconditions and dedup as :func:`trigger_extraction`: ``404`` for
+    an unknown/non-SharePoint connection, ``409 extraction_disabled`` /
+    ``409 extraction_dependencies_missing`` when the feature isn't usable,
+    and the SAME per-connection idempotency key — a retry-empty run can
+    never overlap an ordinary trigger (or another retry-empty run) for the
+    same connection, since both mutate the same crawl state file.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    usable, error = _extraction_readiness()
+    if not usable:
+        raise HTTPException(status_code=409, detail=error)
+
+    from app.worker.registry import job_max_attempts
+    from connectors.sharepoint.crawler import load_state
+    from src.repositories import jobs_repo
+
+    state = load_state(connection_id)
+    queued_count = len(state.get("empty_items") or {})
+
+    job = jobs_repo().enqueue(
+        "corpus-extraction",
+        {"connection_id": connection_id, "retry_empty": True},
+        idempotency_key=_extraction_idempotency_key(connection_id),
+        max_attempts=job_max_attempts("corpus-extraction"),
+    )
+    if job["deduped"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "job_id": job["id"]},
+        )
+
+    _record_extraction_dispatch(row, job["id"])
+    logger.info(
+        "sharepoint connection %s: extraction job %s enqueued (retry-empty, %d item(s) queued)",
+        connection_id,
+        job["id"],
+        queued_count,
+    )
+    return {"job_id": job["id"], "status": job["status"], "queued_count": queued_count}
+
+
 def _acl_sync_idempotency_key(connection_id: str) -> str:
     """A STABLE per-connection idempotency key for the ``sharepoint-acl-sync``
     job — mirrors :func:`_extraction_idempotency_key`'s shape so a manual

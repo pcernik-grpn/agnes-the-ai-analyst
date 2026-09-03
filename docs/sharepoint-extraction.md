@@ -142,8 +142,54 @@ spot-check shows pseudonyms, not names.
 | Stage | Switch | What it buys | Cost order |
 |---|---|---|---|
 | LLM name detection | `extraction.anonymization.detector: "llm"` | recall on names regex can't pattern-match | ~$5 / 1 000 docs (Haiku) |
-| Scan OCR | `extraction.scan_ocr.enabled` | text from image-only PDFs | ~$0.006 / page |
+| Scan OCR | `extraction.scan_ocr.enabled` | text from image-only PDFs | ~$0.006 / page (triaged — see below) |
 | Facts extraction | `extraction.facts.enabled` (+ `facts.enabled`) | knowledge-graph facts with verbatim evidence | ~$0.05 / doc (Haiku), measured live — see `config/instance.yaml.example`'s `facts` block |
+
+**Scan OCR triages a document before paying to transcribe all of it**
+(`extraction.scan_ocr.triage`, on by default once `scan_ocr.enabled` is —
+`triage.enabled: false` restores the old all-or-nothing behaviour, byte for
+byte). Two stages, cheapest first:
+
+1. **Metadata rules, no model call.** `skip_path_patterns` /
+   `full_path_patterns` (case-insensitive substring or glob against the
+   document's path — e.g. `"Tax Returns"` to skip, `"Data Room/*Contract*"`
+   to always transcribe in full; a `full_path_patterns` match always wins),
+   `max_size_mb` / `max_pages_for_preview` (skip a document too large or too
+   long), and `min_pages` (a document this short just gets transcribed in
+   full — triaging it costs about the same as skipping it).
+2. **A `preview_pages`-page preview (default 5) + one classification call**,
+   for anything the rules above left undecided: the preview pages transcribe
+   exactly like any other page, then ONE extra text-only call (never the
+   page images again) returns `{doc_type, language, scan_quality, continue,
+   reason}` via a strict tool-use schema. `continue: true` is the only thing
+   that pays for the rest of the document (up to `max_pages`, appended to
+   the preview); a malformed or missing verdict is always treated as
+   `continue: false` ("triage_unparseable"), never a guessed yes.
+
+A document that stops after the preview still keeps those pages and a
+one-line marker (`<!-- scan_ocr: preview N of M pages; triage: <doc_type>;
+continue=<bool>; reason=… -->`) so it stays searchable and identifiable —
+unless `preview_pages: 0`, which reproduces the pre-triage "empty" outcome
+(no text at all) for a document a rule already decided to skip. **Cost
+model**: a `skip`/`triage`-stopped document costs `preview_pages` page-calls
+(≈5 × the per-page price above) instead of up to `max_pages`; only a
+`continue: true` verdict (or an explicit `full_path_patterns` match) pays
+the full bill. The run report's new `scan_ocr` block —
+`{previewed, continued, stopped, pages_transcribed, stop_reasons: {…}}` —
+is what an operator reads to see the split; `ocr_usage` (tokens/cost) keeps
+working unchanged alongside it.
+
+**A document that converted with no text is not a permanent dead end.**
+Every `convert_empty` outcome (typically an unreadable scan, most often
+because scan OCR was off when it was crawled) is recorded in the
+connection's persisted crawl state as it is encountered; turning
+`extraction.scan_ocr.enabled` on does nothing for documents already crawled,
+since Graph's delta feed never re-offers an unchanged item on its own.
+`POST …/connections/{id}/extraction/retry-empty`
+(`agnes admin sharepoint retry-empty <connection_id>`) re-queues exactly
+that backlog for another conversion pass, before the connection's ordinary
+incremental crawl — see [`api-reference.md`](api-reference.md) for the exact
+contract.
 
 All three can run against a self-hosted OpenAI-compatible endpoint instead
 of the Anthropic API — globally (`extraction.llm`) or per stage, e.g. the

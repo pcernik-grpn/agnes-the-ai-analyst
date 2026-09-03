@@ -1,13 +1,19 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Seven surfaces:
+Eight surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
     ``--retry-failed``); CLI counterpart to ``POST /api/admin/sharepoint/
     connections/{connection_id}/extract`` — the same job the source card's
     "Run extraction now" button enqueues.
+  - ``retry-empty`` — re-queues the connection's ``convert_empty`` backlog
+    (documents that converted fine but carried no text — a scan, most
+    commonly) for another pass, the targeted follow-up to turning
+    ``extraction.scan_ocr.enabled`` on. CLI counterpart to
+    ``POST /api/admin/sharepoint/connections/{connection_id}/extraction/
+    retry-empty``.
   - ``facts-extract`` — the standalone fact-graph trigger.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
     ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``
@@ -46,15 +52,16 @@ Seven surfaces:
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
 op" exemption class, `tests/test_documentation_api_triple_surface.py`) —
-``extract`` and ``facts-extract`` earn a CLI counterpart because an operator
-asking "how do we re-read everything in this scope?" or "how do we get the
-fact graph populated with what we already have?" needs an answer that does
-not require opening a browser (a support runbook, a script run against a
-remote instance); both are deliberately NOT MCP-exposed — an agent-invokable
-tool that can kick off a full re-crawl or an LLM pass over an entire corpus
-is a cost surface no analyst query needs. ``runs`` earns one for the same
-reason a monitor does: an operator watching a ~20-hour extraction over SSH
-has no browser open at all.
+``extract``, ``retry-empty`` and ``facts-extract`` earn a CLI counterpart
+because an operator asking "how do we re-read everything in this scope?",
+"how do we pick up what scan OCR can now read?" or "how do we get the fact
+graph populated with what we already have?" needs an answer that does not
+require opening a browser (a support runbook, a script run against a remote
+instance); all three are deliberately NOT MCP-exposed — an agent-invokable
+tool that can kick off a full re-crawl, a targeted re-conversion pass, or an
+LLM pass over an entire corpus is a cost surface no analyst query needs.
+``runs`` earns one for the same reason a monitor does: an operator watching
+a ~20-hour extraction over SSH has no browser open at all.
 """
 
 from __future__ import annotations
@@ -194,6 +201,48 @@ def extract(
         typer.echo(json.dumps(body, indent=2))
         return
     typer.echo(f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')})")
+
+
+@admin_sharepoint_app.command("retry-empty")
+def retry_empty(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Re-queue this connection's ``convert_empty`` backlog — documents that
+    converted fine but carried no text (a scan with no text layer, most
+    commonly) — for another conversion pass.
+
+    CLI counterpart to ``POST /api/admin/sharepoint/connections/
+    {connection_id}/extraction/retry-empty``: enqueues the SAME
+    ``corpus-extraction`` job ``extract`` does, with ``retry_empty: true``
+    added, so the run replays exactly that backlog before its ordinary
+    incremental delta walk. The targeted follow-up for "I just turned
+    ``extraction.scan_ocr.enabled`` on, will it now read what used to come
+    back blank?" — no full ``--resync`` needed.
+
+    Prints ``queued_count`` — how many backlog items this run is about to
+    replay, read from the connection's persisted crawl state before the job
+    is enqueued. ``0`` is a normal, successful answer: the run still
+    completes, it simply has nothing to replay.
+
+    Refuses with a clear reason rather than a bare HTTP error: ``409
+    extraction_disabled`` (``sharepoint.enabled`` is off), ``409
+    extraction_dependencies_missing`` (the ``extraction`` extra is not
+    installed), ``409 extraction_already_running`` (a run — an ordinary
+    trigger or another retry-empty — is already queued/running for this
+    connection), ``404`` (unknown or non-SharePoint connection id).
+    """
+    resp = api_post(f"/api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty")
+    if resp.status_code != 202:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    typer.echo(
+        f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')}, "
+        f"queued_count: {body.get('queued_count')})"
+    )
 
 
 @admin_sharepoint_app.command("facts-extract")
