@@ -823,6 +823,15 @@
   /* The roster's two quiet columns. `when` is a date, so it is tabular and
      muted; `act` holds either a Remove button or the reason there is none,
      and both belong at the row's end where an action is looked for. */
+  /* The roster's own type. It inherited `.data-table--compact`, which is
+     sized for a dense admin grid; this table is at most a screenful of
+     names an admin reads one by one, and 10px was too small to be one of
+     them. A step up, with the date a step below the names so the column
+     still reads as metadata. The `#ax-members` prefix is what beats the
+     shared compact rule without editing a component every page uses. */
+  #ax-members .data-table td,
+  #ax-members .data-table td a { font-size: 13px; }
+  #ax-members .data-table td { padding-top: 9px; padding-bottom: 9px; }
   .ax-mem__when { color: var(--ds-text-muted); font-size: 12px; white-space: nowrap; }
   .ax-mem__act { text-align: right; white-space: nowrap; }
   .ax-memcap { margin: 0 0 8px; font-size: 12px; color: var(--ds-text-muted); }
@@ -1512,11 +1521,16 @@
 
   /* Category band: the tint IS the separator, so it carries no border. The
      blurb is a definition — present, and a level below the data. */
+  /* Same band as GROUPS / SYSTEM in the group list. They label the same
+     kind of thing — a run of rows — and were drawn as two different
+     components: one full-bleed with a bottom rule, one inset without, at
+     different weights. A reader crossing between the two lenses had to
+     learn this page's banding twice. */
   .ax-fam__hd {
-    padding: 6px 8px 6px 0; border-bottom: 0;
+    padding: 7px 12px; border-bottom: 1px solid var(--ds-border-light);
     background: var(--ds-surface-dim);
   }
-  .ax-fam__nm { font-size: 10.5px; letter-spacing: .07em; }
+  .ax-fam__nm { font-size: 11px; font-weight: 700; letter-spacing: .06em; }
   .ax-fam__sub { font-size: 11.5px; color: var(--ds-text-muted); }
   .ax-fam__n { font-size: 10.5px; }
 
@@ -1802,6 +1816,8 @@
      of the row above this band — and with the band butting straight up
      against it the two read as one list with a heading dropped into the
      middle. The gap says "different kind of thing" before any word does. */
+  /* The band counts its own run, the way the family bands do. */
+  .ax-glist__n { margin-left: 8px; font-weight: 700; color: var(--ds-text-secondary); }
   .ax-glist__label {
     margin-top: 18px;
     padding: 7px 12px; background: var(--ds-surface-dim);
@@ -2310,16 +2326,30 @@
   .ax-kindrun .fbar-group__title { font-size: 13.5px; font-weight: 600; color: var(--ds-text-primary); }
   .ax-kindrun .fbar-group__n { font-size: 12.5px; color: var(--ds-text-muted); }
 
+  /* The family band and the GROUPS / SYSTEM band label the same kind of
+     thing — a run of rows — and were drawn as two different components:
+     this one stripped back to bare text with no fill and no rule, that one
+     a filled band with a bottom border. A reader crossing between the two
+     lenses had to learn this page's banding twice. One treatment, and it is
+     the filled one, because a run heading needs to be findable while
+     scrolling past rows.
+
+     This block is where the family band's own look is decided — the earlier
+     `.ax-fam__hd` rules lose to it, which is why editing them changed
+     nothing the last time. */
   .ax-fam__hd, .ax-table .ax-fam__hd {
-    background: none; border-bottom: 0; box-shadow: none; padding: 0;
+    background: var(--ds-surface-dim); border-bottom: 1px solid var(--ds-border-light);
+    box-shadow: none; padding: 0;
   }
-  .ax-fam__hd .fbar-grouptoggle { padding: 18px 16px 6px; gap: 8px; }
+  .ax-fam__hd .fbar-grouptoggle { padding: 7px 12px; gap: 8px; }
   .ax-fam__hd .fbar-group__title {
-    font-size: 10.5px; font-weight: 700; letter-spacing: .08em;
+    font-size: 11px; font-weight: 700; letter-spacing: .06em;
     text-transform: uppercase; color: var(--ds-text-muted);
   }
-  .ax-fam__hd .fbar-group__n { font-size: 11px; }
-  .ax-fam:first-child .ax-fam__hd .fbar-grouptoggle { padding-top: 8px; }
+  .ax-fam__hd .fbar-group__n { font-size: 11px; font-weight: 700; color: var(--ds-text-secondary); }
+  .ax-fam { margin-top: 18px; }
+  .ax-fam:first-child { margin-top: 0; }
+  .ax-fam:first-child .ax-fam__hd .fbar-grouptoggle { padding: 7px 12px; }
 
   /* The faces. `.ax-pstrip` — the row that used to hold them alongside a
      provenance split — is gone: the strip it described IS the people strip
@@ -2846,8 +2876,12 @@
       <button type="button" class="ax-who" id="ax-sec-people"
               aria-expanded="false" aria-controls="ax-members"
               aria-label="People in this group">
+        {# No people glyph. It was a filled grey disc the same size as the
+           avatars beside it, so the row opened with two circle treatments —
+           one solid, then outlined ones — and read as an avatar stack whose
+           first face had failed to load. The faces ARE the people mark; a
+           glyph that mimics them says the same thing worse. #}
         <span class="ax-gs__car ax-who__car" aria-hidden="true">›</span>
-        <span class="dsec-ico ax-who__ico">{{ ico.icon('users', 14) }}</span>
         <span class="ax-avs" id="ax-people-faces" aria-hidden="true"></span>
         <span class="ax-who__n" id="ax-people-sum"></span>
         <span class="ax-who__sub" id="ax-people-sub">Who this group reaches.</span>

@@ -579,14 +579,27 @@ class TestTheRowIsOneLineAndTheGroupOpensOnItsGrants:
         assert '"Manage" : "Show"' not in js
         assert '.textContent = open ? "Hide"' not in js
 
-    def test_a_member_row_states_where_it_came_from_once(self, js):
+    def test_a_member_row_does_not_state_where_it_came_from_at_all(self, js):
         """It was printed three times on one row: the strip's "from
         mock_seed", a source column, and "managed by mock_seed" where the
-        Remove button would be. All three said the same word."""
+        Remove button would be. Then once. Then not at all — even alone it
+        answered a question this page is not about, where the ACCOUNT is
+        administered. A row that offers no Remove has already said the
+        membership is not the admin's to change, and WHY is stated once for
+        the whole group in the caption above the table."""
+        import re
+
         roster = js[js.index("function rosterHtml(members)") :]
         roster = roster[: roster.index("Member search")]
-        assert roster.count("SOURCE_LABEL") == 1
-        assert "managed by ${esc(m.source" not in roster
+        # Comments stripped: the note has to keep NAMING the retired string
+        # to explain why it went. What must not survive is a rendered one.
+        code = re.sub(r"/\*.*?\*/", "", roster, flags=re.S)
+        code = re.sub(r"(?m)^\s*//.*$", "", code)
+        assert "SOURCE_LABEL" not in code
+        assert "managed by ${esc(m.source" not in code
+        assert "managed elsewhere" not in code
+        # The caption is where the fact lives now, at the level it is true.
+        assert "Membership ${line}." in js
 
     def test_a_group_name_in_the_resource_lens_is_a_way_into_the_group(self, js):
         """By resource named a group and stopped there — an admin reading

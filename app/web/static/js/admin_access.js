@@ -852,7 +852,11 @@
     // matches one half likewise gets no heading for the half it emptied.
     const custom = groups.filter((g) => !g.is_system);
     const system = groups.filter((g) => g.is_system);
-    const label = (t) => `<div class="ax-glist__label">${t}</div>`;
+    //: The band names the run and counts it — the shape every other band
+    //: on this page uses (a family, a kind), so the group list stops being
+    //: the one list whose count floats above it.
+    const label = (t, n) => `<div class="ax-glist__label">${t}${
+      n === undefined ? "" : `<span class="ax-glist__n">${n}</span>`}</div>`;
     /* Custom groups first. System led while `Everyone` was the page's
        DEFAULT SELECTION — putting the row that opened on load at the top —
        and nothing is selected on arrival any more, so that reason went with
@@ -923,9 +927,9 @@
        against" defines the word GROUP, which the band directly above it has
        just said. */
     host.innerHTML = everyoneEntry + ((custom.length && system.length)
-      ? label("Groups") + newGroupRow + custom.map(row).join("")
-        + label("System") + system.map(row).join("")
-      : label("Groups") + newGroupRow + groups.map(row).join(""));
+      ? label("Groups", custom.length) + newGroupRow + custom.map(row).join("")
+        + label("System", system.length) + system.map(row).join("")
+      : label("Groups", groups.length) + newGroupRow + groups.map(row).join(""));
     homeWork(selectedGroup);
   }
 
@@ -1630,8 +1634,22 @@
        about what you may do inside. (It carried "Manage" / "Show" / "Hide",
        which had to be chosen per group, kept in step with the open state,
        and still sat 900px from the row it belonged to.) */
+    /* Hidden for `Everyone`. Its membership is every account by
+       construction — there is no roster to open, nothing to add or remove,
+       and the audience row above already says "every account". A strip
+       reading "1 account · Every account on this instance, automatically."
+       over a body that then says the same thing again is two restatements
+       of the row that is still on screen above both. */
     const more = el("ax-sec-people");
-    if (more) more.hidden = !selectedGroup;
+    if (more) {
+      const g = (overview && overview.groups || []).find((x) => x.id === selectedGroup);
+      more.hidden = !selectedGroup || !!(g && g.is_everyone);
+      if (more.hidden) {
+        const body = el("ax-members");
+        if (body) body.hidden = true;
+        more.setAttribute("aria-expanded", "false");
+      }
+    }
   }
 
   async function renderMembers() {
@@ -1828,17 +1846,17 @@
       // Only admin-added membership is ours to undo. Google sync and the
       // system seeds own theirs — the API refuses the write, so the row says
       // who to talk to instead of offering a button that 4xxs.
-      /* Where a member came from was printed THREE times on one row — as
-         the strip's "from mock_seed" above the table, as a source column,
-         and again as "managed by mock_seed" where the Remove button would
-         be. All three said the same word. What each was for is different
-         though: the strip says where the group's membership comes from
-         (once, for the group), and the row needs to say why THIS person has
-         no Remove — but only when that is the case, and only as the reason
-         the button is missing. The middle column had no job at all. */
+      /* Nothing where there is no act. "managed elsewhere" was the last of
+         three copies of one fact, and even alone it answered a question this
+         page is not about: where the ACCOUNT is administered. An admin
+         reading a group's roster wants to know who is in it and who they
+         can take out — a row that offers no Remove has said that by not
+         offering one. Why membership is fixed is stated ONCE, for the whole
+         group, in the caption above the table (`Membership from …`), which
+         is the level the fact belongs at. */
       const act = m.source === "admin"
         ? `<button type="button" class="btn btn-secondary btn-sm" data-rmmember="${esc(m.user_id)}">Remove</button>`
-        : `<span class="ax-src ax-src--locked">${esc(SOURCE_LABEL[m.source] || "managed elsewhere")}</span>`;
+        : "";
       return `
       <tr>
         <td><a href="/admin/users/${encodeURIComponent(m.user_id)}">${esc(m.email || m.user_id)}</a></td>
@@ -2388,6 +2406,64 @@
   /* Built from what the ACTIVE view actually holds, with counts, so the
      control never offers a kind that would empty the list. Hidden in the
      person view, which is not a list of things. */
+  /* Where a category's options open.
+
+     `.fbar-cat__pop` is `position: fixed; top: 0; left: 0` in
+     `filter_toolbar.css` — deliberately, so the popover escapes the menu's
+     own scroll container and collision detection is plain viewport
+     arithmetic. The shared stylesheet expects the shared SCRIPT to place it,
+     and `filter_toolbar.js` is not loaded here: this page wears the
+     component's CSS but cannot use its engine, because that engine filters
+     rows already in the DOM and this list is rebuilt from a payload on every
+     change. So every popover opened at the top-left corner of the window,
+     over the nav rail.
+
+     The arithmetic mirrors `placeSubmenu()` in that file, constants
+     included, so the two behave the same; if this page ever adopts the
+     engine, this goes. */
+  const SUBMENU_GAP = 6;
+  const SUBMENU_EDGE = 8;
+  function placeSubmenu(cat) {
+    const pop = cat.querySelector(".fbar-cat__pop");
+    if (!pop || pop.hidden) return;
+    // On a phone the options stack under the row instead (`position: static`
+    // there), so there is nothing to place.
+    if (window.getComputedStyle(pop).position !== "fixed") {
+      pop.style.top = "";
+      pop.style.left = "";
+      return;
+    }
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    /* A zero viewport is not a narrow one — it is a context measuring the
+       page without displaying it. Every clamp below would resolve negative
+       and pin the popover off the left edge, which is the exact symptom
+       this function exists to fix. Leave it to the stylesheet; the next
+       real open places it. */
+    if (!vw || !vh) return;
+    const menu = el("ax-filter-menu");
+    const host = (menu || cat).getBoundingClientRect();
+    const row = cat.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    const h = pop.offsetHeight;
+    // Right of the menu by default, flipped left on collision, clamped to
+    // the nearest edge when neither side can hold it.
+    let left = host.right + SUBMENU_GAP;
+    if (left + w > vw - SUBMENU_EDGE) {
+      const flipped = host.left - SUBMENU_GAP - w;
+      left = flipped >= SUBMENU_EDGE
+        ? flipped
+        : Math.max(SUBMENU_EDGE, vw - SUBMENU_EDGE - w);
+    }
+    // Aligned with its own row, then pulled back inside the viewport so a
+    // category near the bottom still shows all of its options.
+    let top = row.top - 6;
+    if (top + h > vh - SUBMENU_EDGE) top = vh - SUBMENU_EDGE - h;
+    if (top < SUBMENU_EDGE) top = SUBMENU_EDGE;
+    pop.style.left = `${Math.round(left)}px`;
+    pop.style.top = `${Math.round(top)}px`;
+  }
+
   /* ── The filter menu ─────────────────────────────────────────────────
      The Library's own shape: a category per facet, a submenu of checkboxes
      inside each, a count beside every option, and a chip row underneath
@@ -2706,14 +2782,22 @@
     return n;
   }
 
+  /* The standalone count line is gone. "7 groups" and "22 resources" sat
+     alone on a line above the list, where a number with nothing beside it
+     answers a question no one asked — the list is right there, and the
+     band that heads it is where a count reads as a fact ABOUT something.
+
+     It survives in exactly one case: a filtered list, where "7 of 22" is
+     the only thing on screen that says the list has been narrowed and by
+     how much. Unfiltered, the band carries the number and this stays
+     empty, taking no height. */
   function paintCount(shown, total) {
     const countEl = el("ax-count");
     if (!countEl) return;
     const noun = viewMode === "resource" ? "resource" : "group";
     const plural = (n) => `${n} ${n === 1 ? noun : noun + "s"}`;
-    countEl.textContent = shown < total
-      ? `${shown} of ${plural(total)}`
-      : plural(total);
+    countEl.textContent = shown < total ? `${shown} of ${plural(total)}` : "";
+    countEl.hidden = shown >= total;
   }
 
   /* Selected state AND the roving tabindex, in one place — they have to move
@@ -3237,14 +3321,13 @@
     const noneGrantedMsg = (groupFilter.trim() || anyFacetOn())
       ? "Nothing matching this is granted to any group."
       : "Nothing on this instance is granted to anyone yet.";
-    /* Above the list, not under it. "Granted to nobody" is the one state
-       nobody goes looking for, which is exactly why it cannot be the last
-       line on a page that scrolls: at the foot of a long list it is reached
-       only by someone who has already read past everything they came for.
-       It is one collapsed line either way, so it costs the reader nothing
-       to have it where they will see it. */
-    host.innerHTML = nobodyLine + (painted
-      || `<div class="ax-empty">${noneGrantedMsg}</div>`);
+    /* Back under the list. Moved above it to be noticed, and being noticed
+       turned out to be the wrong goal: it is the one line here that carries
+       no decision — things nobody has been given — and at the top it was
+       the first thing read on a page whose subject is what people CAN
+       reach. A footnote is where a footnote goes. */
+    host.innerHTML = (painted
+      || `<div class="ax-empty">${noneGrantedMsg}</div>`) + nobodyLine;
   }
 
   //: Delegated: the row lives inside `#ax-groups`, which every repaint
@@ -3277,6 +3360,7 @@
       if (pop) pop.hidden = false;
       const btn = cat.querySelector(".fbar-cat__btn");
       if (btn) btn.setAttribute("aria-expanded", "true");
+      placeSubmenu(cat);
     }
   });
 
@@ -3478,6 +3562,7 @@
       for (const other of el("ax-filter-menu").querySelectorAll(".fbar-cat__btn")) other.setAttribute("aria-expanded", "false");
       pop.hidden = !opening;
       catBtn.setAttribute("aria-expanded", opening ? "true" : "false");
+      if (opening) placeSubmenu(cat);
       return;
     }
     if (e.target.closest(".ax-filter [data-fbar-clear]")) {
