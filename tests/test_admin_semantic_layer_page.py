@@ -568,11 +568,9 @@ def test_the_data_sources_page_shows_both_mismatch_codes():
     stops the sync outright — and the message tells the admin to go to this
     page, which then did not show it.
     """
-    import pathlib
+    from tests._admin_data_sources_source import read_admin_data_sources_source
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     assert 'w.code === "master_token_project_mismatch"' in src
     assert 'w.code === "token_project_mismatch"' in src
 

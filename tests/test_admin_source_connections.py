@@ -23,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import requests
+
+from tests._admin_data_sources_source import read_admin_data_sources_source
 from cryptography.fernet import Fernet
 
 from app.secrets_vault import _reset_ephemeral_key_for_tests
@@ -2347,11 +2349,8 @@ def test_the_admin_page_offers_a_way_out_of_a_project_binding():
     re-pointing an existing connection at another project on the same stack
     became impossible from the UI.
     """
-    import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
 
     assert "function unbindProject(" in src
     assert 'onclick="unbindProject(' in src, "the control is defined but never rendered"
@@ -2375,11 +2374,8 @@ def test_the_test_button_is_targeted_explicitly_not_by_position():
     header above the action row. The link greyed out, Test stayed live, and
     repeated presses fired duplicate requests with no sign of progress.
     """
-    import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
 
     assert 'data-role="test"' in src, "the Test button carries no stable handle"
     assert 'card.querySelector("button")' not in src, "still selecting by position"
@@ -2466,8 +2462,7 @@ def test_the_add_project_wizard_reuses_its_connection_on_retry():
     import subprocess
     import tempfile
 
-    page = pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    src = page.read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
 
     assert "if (_wizardConnId) {" in src, "the wizard does not reuse the connection it already created"
     reuse = src.index("if (_wizardConnId) {")
@@ -2508,11 +2503,8 @@ def test_the_wizard_retry_also_applies_a_corrected_name():
     A name the admin fixed on the retry was thrown away while the success
     banner went on to claim that name was used.
     """
-    import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     reuse = src.index("if (_wizardConnId) {")
     block = src[reuse : src.index("// 2. Store the token.")]
     assert "name ? { name, config:" in block, "a corrected name is still discarded on retry"
@@ -2591,11 +2583,8 @@ def test_the_error_formatter_is_declared_once():
     agree, and a trap the moment one is edited: the edit would appear to do
     nothing.
     """
-    import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     assert src.count("function detailMessage") == 1, "detailMessage is declared more than once"
 
 
@@ -2606,11 +2595,8 @@ def test_the_wizard_rejects_http_the_way_the_server_does():
     with `https://` — and the server rejects `http://`, so the form waved the
     input through and the server bounced it.
     """
-    import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     assert 'startsWith("https://")' in src
     assert 'startsWith("http")' not in src.replace('startsWith("https://")', "")
 
@@ -2623,12 +2609,9 @@ def test_the_token_save_toasts_read_the_structured_detail():
     The two token-save handlers went straight to `body.detail`, so they must
     go through that one reader too.
     """
-    import pathlib
     import re
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     for name in ("saveMasterToken", "saveRotatedToken"):
         start = src.index(f"async function {name}(")
         end = src.index("\nasync function ", start + 1)

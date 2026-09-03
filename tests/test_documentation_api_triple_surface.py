@@ -1203,6 +1203,17 @@ _EXEMPT: dict[str, str] = {
         "confirm/list/unselect a scope (site/library/folder -> collection) for the "
         "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
     ),
+    # The source card's "Facts → graph" pipeline-strip cell (perf follow-up,
+    # 2026-09-03) — fetched lazily per connection once its card paints,
+    # instead of computed for every connection during /admin/data-sources's
+    # own render (which is what made those two counts dominate a live
+    # instance's page-load time). Same admin-display-primitive class as the
+    # extraction observability reads above: a caller-scoped COUNT, no
+    # analyst CLI/MCP analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/facts-graph-counts": (
+        "caller-scoped fact/edge counts for the source card's pipeline strip — "
+        "admin display primitive, no analyst CLI/MCP analogue"
+    ),
     # Bulk scope-add — same admin-only wizard-bookkeeping class as its
     # singular sibling right above, EXCEPT this one IS CLI-reachable (`agnes
     # admin sharepoint scope bulk-add`), same carve-out shape as

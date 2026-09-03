@@ -1203,6 +1203,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
+- /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts
 - /api/admin/sharepoint/connections/{connection_id}/clone
 - /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
 - /api/admin/sharepoint/connections/{connection_id}/certificate
@@ -1324,6 +1325,19 @@ stays persisted. Optional `collection_id` (an existing, live collection) or
 to ONE shared target instead of minting one per path — mutually exclusive
 (`400 both_collection_id_and_collection`); an unknown `collection_id` is
 `404 collection_not_found`.
+
+`GET …/facts-graph-counts` — perf follow-up (2026-09-03): the source card's
+"Facts → graph" pipeline-strip cell, fetched by the card ONCE it has painted
+rather than computed for every SharePoint connection during
+`/admin/data-sources`'s own render — the two visibility-scoped counts behind
+it (`facts_repo().count_visible_facts_for_collections`/
+`count_visible_edges_for_collections`) run one query per confirmed scope
+each, which dominated the page's own load time on a live instance with
+several large connections. Returns `{"facts": int, "edges": int}` summed
+across this connection's own confirmed scopes; `{"facts": 0, "edges": 0}`
+with no scopes. `404` for a non-SharePoint or missing connection id; typed
+`501` on a DuckDB-backed instance (the fact graph is PG-only, A3 ratchet).
+Admin display primitive, no analyst CLI/MCP analogue.
 
 `POST …/clone` — CLI: `agnes admin sharepoint connection clone
 <connection_id>` — the other half of the split-a-large-site workflow: body

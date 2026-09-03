@@ -33,6 +33,11 @@ from pathlib import Path
 
 import pytest
 
+from tests._admin_data_sources_source import (
+    fetch_admin_data_sources_page,
+    read_admin_data_sources_source,
+)
+
 _ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATES = _ROOT / "app" / "web" / "templates"
 _DATA_SOURCES_TPL = _TEMPLATES / "admin_data_sources.html"
@@ -314,14 +319,7 @@ class TestEveryStepCarriesTheHonestCheck:
 
 class TestTheCardRendersIt:
     def _page(self, seeded_app) -> str:
-        return (
-            seeded_app["client"]
-            .get(
-                "/admin/data-sources",
-                headers=_auth(seeded_app["admin_token"]),
-            )
-            .text
-        )
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_the_page_ships_the_renderer_and_its_style(self, seeded_app, source):
         body = self._page(seeded_app)
@@ -371,7 +369,7 @@ class TestNextStepHtml:
         import subprocess
         import tempfile
 
-        tpl = _DATA_SOURCES_TPL.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _nextStepHtml(row) {")
         )

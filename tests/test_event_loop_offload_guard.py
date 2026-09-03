@@ -21,6 +21,7 @@ import inspect
 import pytest
 
 from app.api.admin_extraction import fleet_extraction_runs
+from app.api.admin_sharepoint import facts_graph_counts
 from app.api.admin_source_connections import list_connections
 from app.api.broker import require_broker_ticket
 from app.api.catalog import (
@@ -140,6 +141,10 @@ _OFFLOADED_API_HANDLERS = [
     admin_data_sources_page,
     list_connections,
     fleet_extraction_runs,
+    # /admin/data-sources perf follow-up: the lazy per-connection graph-
+    # counts endpoint the card fetches after painting — same reasoning,
+    # zero awaits, purely blocking PG I/O.
+    facts_graph_counts,
 ]
 
 

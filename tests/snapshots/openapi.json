@@ -33123,6 +33123,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/facts-graph-counts": {
+      "get": {
+        "description": "Caller-scoped fact/edge counts across this connection's OWN confirmed\nscopes (spec \u00a713.2's \"Facts \u2192 graph\" pipeline-strip cell) \u2014 a LAZY\nsibling of ``GET .../scopes``, fetched by the source card after it\npaints rather than computed as part of ``/admin/data-sources`` itself\n(perf follow-up, 2026-09-03 live finding).\n\n``facts_repo().count_visible_facts_for_collections``/``count_visible_\nedges_for_collections`` are correct and deliberately per-collection \u2014\neach is one query PER corpus_id, because the caller's own readable set\nis resolved once but the count itself is a genuinely separate,\nsecurity-scoped read every time (see their own docstrings). Summed\nacross every SharePoint connection's scopes at PAGE-RENDER time (up to\n~180 each), that dominated the page's own load time on a live instance\n\u2014 22 of ~28 `pg_stat_activity` samples over one page load were exactly\nthese two statements. Scoping the call to ONE connection, fetched only\nwhen its card is on screen, keeps the same per-scope cost but never\nblocks the page response or bundles it with seven OTHER connections'\nworth of scopes in the same request.\n\nPlain ``def`` (zero ``await``s): blocking, synchronous, PG-only I/O\n(Tier-1 convention, ``tests/test_event_loop_offload_guard.py``) \u2014 a\nDuckDB-backed instance gets the typed ``501`` from ``facts_repo()`` via\nthe app-wide handler in ``app/main.py``, same as every other route that\nreaches an A3-ratchet PG-only repo.",
+        "operationId": "facts_graph_counts_api_admin_sharepoint_connections__connection_id__facts_graph_counts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Graph Counts",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": {
       "delete": {
         "description": "Forget one site previously added by URL (see :func:`add_manual_site`).\nPurely local bookkeeping \u2014 unlike a confirmed scope, a manual site owns\nno collection and no grants, so there is nothing else to reconcile.",

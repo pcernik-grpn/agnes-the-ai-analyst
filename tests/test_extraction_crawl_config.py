@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._admin_data_sources_source import read_admin_data_sources_source
+
 BASE = "/api/admin/sharepoint/connections"
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
@@ -246,14 +248,19 @@ class TestAdminUiWiring:
         client, token = seeded_app["client"], seeded_app["admin_token"]
         resp = client.get("/admin/data-sources", headers=_auth(token))
         assert resp.status_code == 200
-        body = resp.text
-        assert "crawlFilterSave" in body
-        assert "crawlFilterClear" in body
-        assert "extraction/crawl-config" in body
+        # The panel's own JS moved into an extracted static asset (perf
+        # follow-up, 2026-09-03) — `read_admin_data_sources_source()`
+        # concatenates the template with every file extracted from it, so
+        # this still proves the PAGE ships the capability, regardless of
+        # which physical file the fragment now lives in.
+        source = read_admin_data_sources_source()
+        assert "crawlFilterSave" in source
+        assert "crawlFilterClear" in source
+        assert "extraction/crawl-config" in source
         # Cookie-session `/api/**` protection: the app-wide CsrfOriginMiddleware
         # origin check, not a form-embedded csrf token — same as the
         # sibling Stop button's own fetch call.
-        assert 'credentials: "include"' in body
+        assert 'credentials: "include"' in source
 
     def test_the_crawl_filter_lives_on_the_card_not_only_the_drawer(self, seeded_app):
         """Gap 2 (2026-09 live walkthrough): buried behind "View
@@ -264,9 +271,10 @@ class TestAdminUiWiring:
         drift from a second copy."""
         client, token = seeded_app["client"], seeded_app["admin_token"]
         resp = client.get("/admin/data-sources", headers=_auth(token))
-        body = resp.text
-        assert "_extRenderCrawlFilter" in body
-        assert "_crawlFilterBaseConfigHtml" not in body
+        assert resp.status_code == 200
+        source = read_admin_data_sources_source()
+        assert "_extRenderCrawlFilter" in source
+        assert "_crawlFilterBaseConfigHtml" not in source
 
 
 class TestCrawlFilterCardRendering:
@@ -276,7 +284,7 @@ class TestCrawlFilterCardRendering:
     `test_admin_data_sources_extraction.py` for its sibling control."""
 
     def _run(self, body_js: str, *, row=None) -> dict:
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         fns = "\n".join(
             _extract_block(tpl, sig) for sig in ("function _esc(s) {", "function _extRenderCrawlFilter(row) {")
         )
@@ -330,7 +338,7 @@ class TestCrawlFilterCardSave:
     its sibling control (`TestFactsPolicySave`)."""
 
     def _run(self, *, action, input_value="", response_status=200, response_body=None, prior_config=None):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         fns = "\n".join(
             _extract_block(tpl, sig)
             for sig in (
