@@ -496,6 +496,23 @@ else
         || echo "WARNING: could not pre-create the dd-agent user — the Datadog package's own postinst will create it instead, unpinned" >&2
     fi
 
+    # datadog-agent.service Wants datadog-agent-installer.service (Fleet
+    # Automation's remote-upgrade daemon), which cannot run here: it exits 255
+    # with "remote config is required to create the updater", because the
+    # rendered datadog.yaml turns remote configuration off. Datadog confirm
+    # that failure is expected once those features are disabled, and their
+    # graceful-exit bug is open (DataDog/datadog-agent#43052). A soft
+    # dependency, so masking does not stop the agent; unmasked it leaves every
+    # consumer a permanently failed unit, which pins a "failed systemd units"
+    # monitor to alert until nobody reads it.
+    #
+    # Before apt, not after: the deb's postinst starts the agent, which is what
+    # pulls this unit in, so a mask applied afterwards arrives one failure too
+    # late. A symlink to /dev/null is exactly what `systemctl mask` writes, and
+    # unlike the subcommand it does not need the unit file to exist yet.
+    ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service \
+        || echo "WARNING: could not mask datadog-agent-installer.service — expect a permanently failed unit" >&2
+
     if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
         echo "installing the Datadog Agent ${datadog_agent_version}..."
         (
@@ -533,17 +550,10 @@ else
             || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
 %{ endfor ~}
         systemctl daemon-reload >/dev/null 2>&1 || true
-        # datadog-agent.service Wants datadog-agent-installer.service (Fleet
-        # Automation's remote-upgrade daemon), which cannot run here: it exits
-        # 255 with "remote config is required to create the updater", because
-        # the rendered datadog.yaml turns remote configuration off. Datadog
-        # confirm that failure is expected once those features are disabled,
-        # and their graceful-exit bug is open (DataDog/datadog-agent#43052).
-        # A soft dependency, so masking does not stop the agent; leaving it
-        # unmasked leaves every consumer a permanently failed unit, which pins
-        # a "failed systemd units" monitor to alert until nobody reads it.
-        systemctl mask datadog-agent-installer.service >/dev/null 2>&1 \
-            || echo "WARNING: could not mask datadog-agent-installer.service — expect a permanently failed unit" >&2
+        # Masking (above the apt step) stops the unit failing from here on, but
+        # it does not clear a failure a PREVIOUS boot already recorded — and a
+        # failed unit is remembered until something resets it.
+        systemctl reset-failed datadog-agent-installer.service >/dev/null 2>&1 || true
         systemctl enable datadog-agent >/dev/null 2>&1 || true
         systemctl restart datadog-agent >/dev/null 2>&1 \
             || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2
