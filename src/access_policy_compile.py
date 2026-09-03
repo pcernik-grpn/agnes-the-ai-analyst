@@ -60,8 +60,9 @@ fails, not by a single blanket rule:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from src.sql_ident import quote_ident
 

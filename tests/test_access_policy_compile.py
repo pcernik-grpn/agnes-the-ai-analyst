@@ -435,14 +435,14 @@ def test_a_column_definition_outside_a_type_is_still_refused():
 
 _LAST4_SQL = (
     'CASE WHEN "national_id" IS NULL THEN NULL '
-    'WHEN LENGTH("national_id") <= 4 THEN \'****\' '
+    "WHEN LENGTH(\"national_id\") <= 4 THEN '****' "
     'ELSE CONCAT(\'****\', SUBSTRING("national_id", -4)) END AS "national_id"'
 )
 
 _EMAIL_PARTIAL_SQL = (
     'CASE WHEN "email" IS NULL THEN NULL '
-    'WHEN "email" LIKE \'_%@%\' '
-    'THEN CONCAT(SUBSTRING("email", 1, 1), \'*****\', REGEXP_REPLACE("email", \'^[^@]*\', \'\')) '
+    "WHEN \"email\" LIKE '_%@%' "
+    "THEN CONCAT(SUBSTRING(\"email\", 1, 1), '*****', REGEXP_REPLACE(\"email\", '^[^@]*', '')) "
     "ELSE '*****' END AS \"email\""
 )
 

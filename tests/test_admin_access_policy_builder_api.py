@@ -520,7 +520,7 @@ class TestPolicyBuilderCompile:
         assert sql.count('AS "email"') == 1
         assert sql.count('AS "national_id"') == 1
         assert "REGEXP_REPLACE(\"email\", '^[^@]*', '')" in sql
-        assert 'CONCAT(\'****\', SUBSTRING("national_id", -4))' in sql
+        assert "CONCAT('****', SUBSTRING(\"national_id\", -4))" in sql
         # The compiled body must survive the gate every save runs, remote
         # transpiles included — the builder may not hand an admin SQL the PUT
         # would then refuse.
