@@ -374,6 +374,32 @@ itself predates the ratchet. The new column lands in Postgres only; the
 DuckDB side of that repo simply does not gain the capability that depends on
 it. (`src/db_pg.py` `Base.metadata` still needs the model change either way.)
 
+## Adding an index on a table that may already be huge in production
+
+A migration runs at process start, inside the startup revision repair's own
+transaction — `CREATE INDEX CONCURRENTLY` cannot run there (it needs
+Alembic's `autocommit_block()` to commit that transaction first; see
+`migrations/versions/0098_corpus_chunks_file_id_index.py`'s docstring). A
+plain `CREATE INDEX` is fine for a cheap B-tree (that migration does exactly
+that, unconditionally) but holds a SHARE lock for as long as the build takes
+— seconds for a small/medium table, several MINUTES for a GIN or other
+expensive index over a table already at production scale (tens of millions
+of rows), stalling every writer for the duration.
+
+The pattern (`migrations/versions/0101_corpus_chunks_fts_index.py`): count
+the target table's rows first (`op.get_bind().execute(sa.text("SELECT
+COUNT(*) FROM …")).scalar()`), build in place under a threshold comfortably
+above what a fresh/lightly-loaded instance has and comfortably below the
+scale that made the migration necessary in the first place, and above it
+SKIP the build with a `logger.warning(...)` naming the EXACT `CREATE INDEX
+CONCURRENTLY IF NOT EXISTS …` statement an operator must run out-of-band,
+once, off-peak. Whatever the index accelerates must still WORK without it —
+just slower (a sequential scan) — so a deployment that hits the skip branch
+degrades, it does not break. Unit-test both branches by faking `alembic.op`
+(`op.get_bind()` returning a stub whose `.scalar()` reports a controlled row
+count) rather than actually seeding millions of rows — see
+`tests/db_pg/test_corpus_chunks_fts_index_migration.py`.
+
 ## The four load-bearing tests
 
 These run on every PR and protect against the most dangerous mistakes:

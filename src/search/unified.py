@@ -202,11 +202,7 @@ def _plugin_scores(query: str, plugins: List[Dict[str, Any]]) -> List[Dict[str, 
         mid, name = p.get("marketplace_id"), p.get("name")
         if not name:
             continue
-        hay = set(
-            _tokenize(
-                f"{name} {p.get('display_name', '')} {p.get('description', '')} {p.get('category', '')}"
-            )
-        )
+        hay = set(_tokenize(f"{name} {p.get('display_name', '')} {p.get('description', '')} {p.get('category', '')}"))
         overlap = len(q_terms & hay)
         if overlap == 0:
             continue
@@ -245,6 +241,13 @@ def unified_search(
     ``tables``); it defaults to ``None`` (treated as empty) so existing callers
     keep working. Glossary is fetched inside via ``_glossary_search`` — it has
     no RBAC (public to any authenticated user), so there is nothing to pre-filter.
+
+    The returned list carries a ``.capped`` attribute (P0 OOM fix, 2026-09):
+    ``True`` when the chunk leg's bounded candidate scan
+    (``src.ingest.retrieval.search``) hit its configured limit, meaning some
+    matching chunks may have been left out. Additive — every existing caller
+    that only iterates/indexes/compares the return value is unaffected; see
+    ``src.ingest.retrieval.SearchResults``, which this reuses.
     """
     if not (query or "").strip():
         return []
@@ -262,11 +265,9 @@ def unified_search(
     # Deduped by document before anything else looks at the bucket: the cap
     # below and `_minmax` both reason about "how many slots this bucket takes",
     # and six passages of one file are one document's worth of answer, not six.
-    chunk_hits = (
-        [dict(h, type="chunk") for h in _chunk_search(corpus_ids, query, k=k)]
-        if corpus_ids
-        else []
-    )
+    _raw_chunk_hits = _chunk_search(corpus_ids, query, k=k) if corpus_ids else []
+    candidates_capped = bool(getattr(_raw_chunk_hits, "capped", False))
+    chunk_hits = [dict(h, type="chunk") for h in _raw_chunk_hits]
     # Cap the NAME-matched hits inside the bucket, rather than only capping a
     # bucket that is entirely name hits: since the fallback keeps body hits
     # and merely rescales them, an all-filename bucket is now rare and an
@@ -395,4 +396,6 @@ def unified_search(
             str(h.get("chunk_id") or h.get("id") or h.get("table_id") or ""),
         )
     )
-    return merged[:k]
+    from src.ingest.retrieval import SearchResults
+
+    return SearchResults(merged[:k], capped=candidates_capped)

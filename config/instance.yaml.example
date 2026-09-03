@@ -1293,6 +1293,21 @@ facts:
   single_valued_edges: ["owned_by", "for_client"]
 
 
+# --- Knowledge search over Collections (src/ingest/retrieval.py) ---
+# `max_candidate_chunks` bounds how many candidate chunk rows a single
+# `GET /api/knowledge/search` / `GET /api/collections/search` call may load
+# before ranking — a caller with a wide grant (an admin, or a group with
+# many collections) previously loaded EVERY chunk in every accessible
+# collection, which OOM-killed the process on a large corpus (P0, 2026-09).
+# Candidate SELECTION runs in SQL (Postgres full-text search, ranked) under
+# this LIMIT; the response carries `candidates_capped: true` when the cap
+# was actually hit. Not a switch — plain instance data, read directly via
+# get_value, same pattern as `facts.single_valued_edges` above.
+knowledge:
+  retrieval:
+    # max_candidate_chunks: 5000
+
+
 # --- SharePoint connector (optional, off by default) ---
 # ONE switch for the WHOLE SharePoint connector (2026-09-01 flag
 # consolidation): the connect wizard and every /api/admin/sharepoint/*

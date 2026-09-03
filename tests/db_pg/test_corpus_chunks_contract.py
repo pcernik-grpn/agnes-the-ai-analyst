@@ -228,3 +228,97 @@ def test_list_for_corpora_spans_multiple(repo):
     corpora = {r["corpus_id"] for r in rows}
     assert {"col_a", "col_b"} <= corpora
     assert repo.list_for_corpora([]) == []
+
+
+# ---------------------------------------------------------------------------
+# search_candidates / search_by_filename (P0 OOM fix, 2026-09)
+# ---------------------------------------------------------------------------
+
+
+def _files_repo_for(repo):
+    """A ``corpus_files`` repo bound to the SAME connection/engine the
+    ``corpus_chunks`` ``repo`` fixture already holds — needed to seed real
+    ``corpus_files`` rows for ``search_by_filename``'s JOIN."""
+    if hasattr(repo, "conn"):
+        from src.repositories.corpus_files import CorpusFilesRepository
+
+        return CorpusFilesRepository(repo.conn)
+    from src.repositories.corpus_files_pg import CorpusFilesPgRepository
+
+    return CorpusFilesPgRepository(repo._engine)
+
+
+def test_search_candidates_matches_lexically_and_is_bounded_by_limit(repo):
+    for i in range(5):
+        repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"shared keyword apple {i}"}])
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 99, "text": "no overlap at all"}])
+
+    all_matches = repo.search_candidates([CORPUS_ID], "apple", limit=100)
+    assert len(all_matches) == 5
+    assert all("apple" in r["text"] for r in all_matches)
+
+    capped = repo.search_candidates([CORPUS_ID], "apple", limit=2)
+    assert len(capped) == 2
+
+
+def test_search_candidates_empty_when_no_lexical_match(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "alpha bravo"}])
+    assert repo.search_candidates([CORPUS_ID], "nosuchwordanywhere", limit=10) == []
+
+
+def test_search_candidates_empty_corpus_ids_or_query(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "alpha bravo"}])
+    assert repo.search_candidates([], "alpha", limit=10) == []
+    assert repo.search_candidates([CORPUS_ID], "   ", limit=10) == []
+
+
+def test_search_candidates_scoped_to_given_corpora(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "shared apple"}])
+    repo.add_many([{"corpus_id": "col_other", "file_id": "cf_other", "ordinal": 0, "text": "shared apple"}])
+    rows = repo.search_candidates([CORPUS_ID], "apple", limit=10)
+    assert rows
+    assert all(r["corpus_id"] == CORPUS_ID for r in rows)
+
+
+def test_search_by_filename_matches_files_and_is_bounded_by_limit(repo):
+    files_repo = _files_repo_for(repo)
+    for i in range(5):
+        fid = files_repo.add(
+            corpus_id=CORPUS_ID,
+            filename=f"quarterly-report-{i}.md",
+            sha256="s",
+            file_type="md",
+            size_bytes=1,
+            storage_path="/x",
+        )
+        repo.add_many([{"corpus_id": CORPUS_ID, "file_id": fid, "ordinal": 0, "text": "unrelated body text"}])
+
+    all_matches = repo.search_by_filename([CORPUS_ID], ["quarterly", "report"], limit=100)
+    assert len(all_matches) == 5
+
+    capped = repo.search_by_filename([CORPUS_ID], ["quarterly", "report"], limit=2)
+    assert len(capped) == 2
+
+
+def test_search_by_filename_ignores_non_matching_names(repo):
+    files_repo = _files_repo_for(repo)
+    fid = files_repo.add(
+        corpus_id=CORPUS_ID, filename="notes.md", sha256="s", file_type="md", size_bytes=1, storage_path="/x"
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": fid, "ordinal": 0, "text": "alpha bravo"}])
+    assert repo.search_by_filename([CORPUS_ID], ["quarterly", "report"], limit=10) == []
+
+
+def test_search_by_filename_empty_terms_or_corpus_ids(repo):
+    files_repo = _files_repo_for(repo)
+    fid = files_repo.add(
+        corpus_id=CORPUS_ID,
+        filename="quarterly-report.md",
+        sha256="s",
+        file_type="md",
+        size_bytes=1,
+        storage_path="/x",
+    )
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": fid, "ordinal": 0, "text": "alpha"}])
+    assert repo.search_by_filename([], ["quarterly"], limit=10) == []
+    assert repo.search_by_filename([CORPUS_ID], [], limit=10) == []

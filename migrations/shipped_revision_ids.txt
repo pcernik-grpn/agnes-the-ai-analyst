@@ -146,3 +146,4 @@
 0098_corpus_chunks_file_id_index
 0099_ingest_runs_edges_skipped
 0100_facts_created_at
+0101_corpus_chunks_fts_index

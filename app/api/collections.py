@@ -427,6 +427,11 @@ async def search_collections(
         allowed = [c for c in allowed if c == corpus_id]
     k = max(1, min(k, 50))
     results = _search(allowed, q, k=k)
+    # P0 OOM fix, 2026-09: `_search`'s candidate scan is now bounded
+    # (`knowledge.retrieval.max_candidate_chunks`) — captured before the
+    # visibility filter below rebuilds `results` as a plain list and would
+    # otherwise drop this attribute.
+    candidates_capped = getattr(results, "capped", False)
 
     # Chunks must not leak what claims withhold (spec §9): a tiered
     # collection's snippets are silently dropped for a caller below its top
@@ -445,6 +450,8 @@ async def search_collections(
 
     results = [r for r in results if _chunk_text_visible(r.get("corpus_id"))]
     payload: dict = {"results": results, "retrieval": retrieval_mode()}
+    if candidates_capped:
+        payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(allowed)
         payload["hint"] = _empty_search_hint(len(allowed), corpus_id)

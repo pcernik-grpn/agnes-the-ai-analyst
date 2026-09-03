@@ -58,21 +58,33 @@ def test_search_is_rbac_scoped_to_listed_corpora(e2e_env):
 
 
 def test_search_hybrid_uses_embeddings(e2e_env, monkeypatch):
+    """Cosine breaks a lexical tie.
+
+    P0 OOM fix (2026-09): candidate SELECTION now happens in SQL
+    (``corpus_chunks_repo().search_candidates``), which is lexical-first —
+    a query with literally no shared vocabulary in ANY candidate's body
+    text no longer reaches the candidate set at all (see the trade-off
+    documented on ``search()``). So both chunks here share a query term
+    (tying their lexical score exactly, per ``_minmax_normalize``'s
+    all-equal case), and only the EMBEDDING distinguishes the winner —
+    still the same assertion as before the bounded rewrite: hybrid ranking
+    picks the cosine-aligned chunk over its lexical twin.
+    """
     import src.ingest.retrieval as retrieval
     from src.ingest.retrieval import search
 
-    # Query vector aligned with the first chunk's embedding; no lexical overlap.
+    # Query vector aligned with the first chunk's embedding.
     monkeypatch.setattr(retrieval, "embed_query", lambda q: [1.0] + [0.0] * 383)
     cid = _seed(
         "rs-vec",
         [
-            {"ordinal": 0, "text": "alpha beta gamma", "embedding": [1.0] + [0.0] * 383},
-            {"ordinal": 1, "text": "delta epsilon zeta", "embedding": [0.0] * 384},
+            {"ordinal": 0, "text": "alpha beta gamma network signal", "embedding": [1.0] + [0.0] * 383},
+            {"ordinal": 1, "text": "delta epsilon zeta network signal", "embedding": [0.0] * 384},
         ],
     )
-    res = search([cid], "no-lexical-overlap-query")
+    res = search([cid], "network signal")
     assert res
-    assert res[0]["ordinal"] == 0  # cosine picked the aligned vector
+    assert res[0]["ordinal"] == 0  # lexical tie; cosine picked the aligned vector
 
 
 def _seed_files(slug: str, files: list[tuple[str, list[dict]]]) -> str:
@@ -194,3 +206,93 @@ def test_retrieval_mode_never_loads_the_model(monkeypatch):
 
     monkeypatch.setattr(embeddings, "_model", object())  # resolved: loaded model
     assert retrieval_mode() == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# P0 OOM fix (2026-09): bounded candidate selection
+# ---------------------------------------------------------------------------
+
+
+def test_search_reports_capped_when_candidates_exceed_the_configured_limit(e2e_env, monkeypatch):
+    """search() must never load more candidate chunks than the configured
+    cap, and must say so via `.capped` when the cap was actually hit — the
+    signal `app.api.knowledge_search` / `app.api.collections` surface as
+    the additive `candidates_capped` response field."""
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 3)
+    cid = _seed_files(
+        "rs-cap",
+        [(f"f{i}.txt", [{"ordinal": 0, "text": "shared keyword apple"}]) for i in range(6)],
+    )
+    res = retrieval.search([cid], "apple")
+    assert res
+    assert res.capped is True
+
+
+def test_search_not_capped_when_candidates_are_under_the_limit(e2e_env, monkeypatch):
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
+    cid = _seed("rs-nocap", [{"ordinal": 0, "text": "shared keyword apple"}])
+    res = retrieval.search([cid], "apple")
+    assert res
+    assert res.capped is False
+
+
+def test_search_results_equal_plain_lists(e2e_env):
+    """`SearchResults` is additive: every pre-existing caller compares/
+    iterates/indexes the return value as a plain `list[dict]`."""
+    from src.ingest.retrieval import search
+
+    cid = _seed("rs-plain", [{"ordinal": 0, "text": "hello world"}])
+    res = search([cid], "hello")
+    assert isinstance(res, list)
+    assert res == list(res)
+    assert res[0]["chunk_id"]
+
+
+def test_search_candidates_and_search_by_filename_are_sql_bounded():
+    """Static guard: both bounded-candidate repo methods, on both backends,
+    must carry a SQL ``LIMIT`` — an in-Python slice AFTER an unbounded
+    fetch is exactly the OOM shape this fixes."""
+    import inspect
+
+    from src.repositories.corpus_chunks import CorpusChunksRepository
+    from src.repositories.corpus_chunks_pg import CorpusChunksPgRepository
+
+    for repo_cls in (CorpusChunksRepository, CorpusChunksPgRepository):
+        for name in ("search_candidates", "search_by_filename"):
+            source = inspect.getsource(getattr(repo_cls, name))
+            assert "LIMIT" in source, f"{repo_cls.__name__}.{name} must bound its query with LIMIT"
+
+
+def test_max_candidate_chunks_default(e2e_env):
+    from src.ingest.retrieval import _DEFAULT_MAX_CANDIDATE_CHUNKS, _max_candidate_chunks
+
+    assert _max_candidate_chunks() == _DEFAULT_MAX_CANDIDATE_CHUNKS == 5000
+
+
+def test_max_candidate_chunks_reads_instance_config(monkeypatch):
+    import app.instance_config as instance_config
+    from src.ingest.retrieval import _max_candidate_chunks
+
+    def _fake_get_value(*keys, default=None):
+        if keys == ("knowledge", "retrieval", "max_candidate_chunks"):
+            return 42
+        return default
+
+    monkeypatch.setattr(instance_config, "get_value", _fake_get_value)
+    assert _max_candidate_chunks() == 42
+
+
+def test_search_finds_a_filename_match_with_zero_body_overlap_even_when_capped(e2e_env, monkeypatch):
+    """The filename fallback's bounded candidate path (`search_by_filename`)
+    is independent of the body cap — a tiny body cap must not disable it."""
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 1)
+    cid = _seed_files("rs-fn-cap", [("quarterly-report.md", [{"ordinal": 0, "text": "alpha bravo"}])])
+    res = retrieval.search([cid], "quarterly-report")
+    assert res, "the filename fallback must survive a tiny body candidate cap"
+    assert res[0]["matched_on"] == "filename"

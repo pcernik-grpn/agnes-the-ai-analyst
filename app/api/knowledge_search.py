@@ -93,9 +93,7 @@ def _accessible_plugins(user) -> List[Dict[str, Any]]:
             return []
         if is_user_admin(user_id):
             return _live(marketplace_plugins_repo().list_all())
-        granted = set(
-            resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.MARKETPLACE_PLUGIN.value)
-        )
+        granted = set(resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.MARKETPLACE_PLUGIN.value))
         if not granted:
             return []
         return [
@@ -244,6 +242,12 @@ async def knowledge_search(
         k=k,
     )
     payload: dict = {"query": q, "results": results, "retrieval": retrieval_mode()}
+    # P0 OOM fix, 2026-09: the chunk leg's candidate scan is now bounded
+    # (`knowledge.retrieval.max_candidate_chunks`) — additive, present only
+    # when the bound was actually hit, so a caller with a huge grant set
+    # knows the chunk results may not be exhaustive.
+    if getattr(results, "capped", False):
+        payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(corpus_ids)
         payload["searched_tables"] = len(tables)

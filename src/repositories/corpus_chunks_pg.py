@@ -141,3 +141,103 @@ class CorpusChunksPgRepository:
                 .all()
             )
         return [dict(r) for r in rows]
+
+    def search_candidates(self, corpus_ids: List[str], query: str, *, limit: int) -> List[Dict[str, Any]]:
+        """Bounded, server-ranked candidate set for retrieval (P0 OOM fix,
+        2026-09).
+
+        Live finding: an admin caller's ``GET /api/knowledge/search`` (also
+        ``/api/collections/search`` and the MCP tools over the same
+        function) resolved every collection it may access — on a
+        production instance, ~390 SharePoint-derived collections — and
+        ``list_for_corpora`` loaded EVERY chunk row across all of them
+        before a single one was scored: a ~10M-row / 12GB table, a
+        100+ second sequential scan, and ~10M materialized Python dicts
+        that pushed uvicorn to 16.7GB RSS and got it OOM-killed (13 restarts
+        in 75 minutes while users retried).
+
+        This method pushes candidate SELECTION into SQL instead: Postgres
+        full-text search (``to_tsvector('simple', text) @@
+        plainto_tsquery('simple', :query)``), ranked by ``ts_rank_cd``,
+        ``LIMIT :limit``. The process never holds more than ``limit`` rows
+        in memory regardless of corpus size — bounded by
+        ``knowledge.retrieval.max_candidate_chunks`` (default 5000; see
+        ``src.ingest.retrieval._max_candidate_chunks``). Ranking WITHIN the
+        candidate set (IDF-lexical + cosine fusion) is unchanged — it still
+        runs in Python (``src.ingest.retrieval.rank_chunks``), just over
+        this bounded set instead of the whole corpus.
+
+        Trade-off, by construction: a query with literally no term overlap
+        with any candidate's body text returns no rows here even if some
+        chunk's EMBEDDING would have matched by pure cosine similarity —
+        there is no vector index behind this table (``embedding`` is a
+        plain ``real[]``; ``pgvector`` is a documented future option, see
+        ``src.models.collections``), so a corpus-wide unindexed vector scan
+        is exactly the unbounded-memory shape this method exists to avoid.
+        The filename fallback is unaffected: it has its own bounded
+        candidate path, ``search_by_filename``.
+
+        A GIN expression index (``idx_corpus_chunks_text_fts``, migration
+        ``0101_corpus_chunks_fts_index``) speeds this query up but is
+        not required for correctness — it may be absent on an instance
+        whose table was too large to build it in-place at migration time
+        (see that migration's docstring for the operator follow-up).
+
+        Empty ``corpus_ids`` → ``[]`` without querying, matching
+        ``list_for_corpora``.
+        """
+        if not corpus_ids:
+            return []
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
+                        "       section_path, page, bbox, metadata, created_at "
+                        "FROM corpus_chunks "
+                        "WHERE corpus_id = ANY(:corpus_ids) "
+                        "  AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
+                        "ORDER BY ts_rank_cd(to_tsvector('simple', text), plainto_tsquery('simple', :query)) DESC "
+                        "LIMIT :limit"
+                    ),
+                    {"corpus_ids": list(corpus_ids), "query": query, "limit": limit},
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
+    def search_by_filename(self, corpus_ids: List[str], terms: List[str], *, limit: int) -> List[Dict[str, Any]]:
+        """Bounded candidate set of chunks whose FILE's name matches any of
+        ``terms`` (P0 OOM fix, 2026-09).
+
+        Backs the filename fallback (``src.ingest.retrieval.
+        apply_filename_fallback``) — see the DuckDB sibling's docstring for
+        why this is a SEPARATE bounded path from ``search_candidates``
+        rather than reusing its (body-text-filtered) result. ``terms`` are
+        pre-tokenized by the caller (stopwords/bare extensions already
+        stripped — ``retrieval._content_terms``); a plain-``ILIKE``-per-term
+        match against ``corpus_files.filename`` rather than Postgres FTS —
+        deliberately, so filename matching behaves identically on both
+        backends instead of depending on how ``plainto_tsquery`` happens to
+        tokenize punctuation-heavy filenames (``quarterly-report.md``).
+        Empty ``corpus_ids``/``terms`` → ``[]``.
+        """
+        if not corpus_ids or not terms:
+            return []
+        params: Dict[str, Any] = {"corpus_ids": list(corpus_ids), "limit": limit}
+        clauses = []
+        for i, term in enumerate(terms):
+            key = f"t{i}"
+            clauses.append(f"cf.filename ILIKE :{key}")
+            params[key] = f"%{term}%"
+        sql = (
+            "SELECT cc.id, cc.corpus_id, cc.file_id, cc.ordinal, cc.text, cc.embedding, "
+            "       cc.section_path, cc.page, cc.bbox, cc.metadata, cc.created_at "
+            "FROM corpus_chunks cc JOIN corpus_files cf ON cf.id = cc.file_id "
+            "WHERE cc.corpus_id = ANY(:corpus_ids) AND (" + " OR ".join(clauses) + ") "
+            "ORDER BY cc.file_id, cc.ordinal LIMIT :limit"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [dict(r) for r in rows]

@@ -8,6 +8,7 @@ Template: src/repositories/corpus_files.py.
 
 from __future__ import annotations
 
+import re
 import secrets
 from typing import Any, Dict, List
 
@@ -27,7 +28,29 @@ _COLS = [
     "created_at",
 ]
 _SELECT = ", ".join(_COLS)
+# Qualified variant for the JOIN queries below, where `corpus_files` also has
+# `id`/`corpus_id`/`created_at` columns and an unqualified SELECT would be
+# ambiguous.
+_SELECT_CC = ", ".join(f"cc.{c}" for c in _COLS)
 _EMBED_DIM = 384
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Bounds the OR'd ILIKE clause below — a pathologically long query must not
+# turn into a pathologically long WHERE clause.
+_MAX_ILIKE_TERMS = 16
+
+
+def _ilike_terms(text: str) -> List[str]:
+    """Lowercased, de-duplicated, order-preserving tokens, capped at
+    ``_MAX_ILIKE_TERMS``. Shared tokenizer for both bounded-candidate
+    queries below."""
+    seen: List[str] = []
+    for t in _TOKEN_RE.findall((text or "").lower()):
+        if t not in seen:
+            seen.append(t)
+        if len(seen) >= _MAX_ILIKE_TERMS:
+            break
+    return seen
 
 
 class CorpusChunksRepository:
@@ -121,5 +144,64 @@ class CorpusChunksRepository:
         rows = self.conn.execute(
             f"SELECT {_SELECT} FROM corpus_chunks WHERE corpus_id IN ({placeholders}) ORDER BY file_id, ordinal",
             list(corpus_ids),
+        ).fetchall()
+        return [dict(zip(_COLS, r)) for r in rows]
+
+    def search_candidates(self, corpus_ids: List[str], query: str, *, limit: int) -> List[Dict[str, Any]]:
+        """Bounded, lexically-filtered candidate set for retrieval (P0 OOM
+        fix, 2026-09 — see ``CorpusChunksPgRepository.search_candidates``
+        for the production incident and the full design).
+
+        Replaces ``list_for_corpora`` on the ``src.ingest.retrieval.search``
+        path: DuckDB has no full-text index wired for this table, so this is
+        a plain any-term ``ILIKE`` prefilter (each query token OR'd) plus
+        ``LIMIT`` rather than ranked FTS — acceptable at the scale a
+        DuckDB-backed app-state install reaches (the backend is frozen and
+        never grows past what it already is; the 10M-row incident this
+        fixes is Postgres-only). Empty ``corpus_ids`` or a query with no
+        indexable tokens → ``[]``.
+        """
+        if not corpus_ids:
+            return []
+        terms = _ilike_terms(query)
+        if not terms:
+            return []
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        term_clause = " OR ".join("text ILIKE ?" for _ in terms)
+        params: List[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
+        rows = self.conn.execute(
+            f"SELECT {_SELECT} FROM corpus_chunks "
+            f"WHERE corpus_id IN ({placeholders}) AND ({term_clause}) "
+            f"ORDER BY file_id, ordinal LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(zip(_COLS, r)) for r in rows]
+
+    def search_by_filename(self, corpus_ids: List[str], terms: List[str], *, limit: int) -> List[Dict[str, Any]]:
+        """Bounded candidate set of chunks whose FILE's name matches any of
+        ``terms`` (P0 OOM fix, 2026-09).
+
+        Backs the filename fallback (``src.ingest.retrieval.
+        apply_filename_fallback``): body-text candidate selection
+        (``search_candidates``) is lexical-first over CHUNK TEXT, so a file
+        findable only by its NAME — the whole reason the fallback exists,
+        see the module docstring in ``src.ingest.retrieval`` — would never
+        reach the candidate set on a corpus large enough to hit the cap.
+        ``terms`` are pre-tokenized by the caller (stopwords/extensions
+        already stripped — see ``retrieval._content_terms``); this method
+        does no NLP of its own, just an OR'd ``ILIKE`` per term. Empty
+        ``corpus_ids``/``terms`` → ``[]``.
+        """
+        if not corpus_ids or not terms:
+            return []
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        term_clause = " OR ".join("cf.filename ILIKE ?" for _ in terms)
+        params: List[Any] = list(corpus_ids) + [f"%{t}%" for t in terms] + [limit]
+        rows = self.conn.execute(
+            f"SELECT {_SELECT_CC} FROM corpus_chunks cc "
+            f"JOIN corpus_files cf ON cf.id = cc.file_id "
+            f"WHERE cc.corpus_id IN ({placeholders}) AND ({term_clause}) "
+            f"ORDER BY cc.file_id, cc.ordinal LIMIT ?",
+            params,
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
