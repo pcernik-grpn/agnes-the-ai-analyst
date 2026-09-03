@@ -613,7 +613,13 @@ class TestThePickerAsksAboutTheTierInsteadOfDeciding:
 
     def test_the_answer_is_honoured_on_apply(self):
         src = self._source()
-        assert 'const tier = TIERED.has(type) ? (pickerState.tier || "available") : "available";' in src
+        # The footer's answer is what gets written for a tiered kind. The line
+        # grew a `&& !userSkill` clause when store_entity joined TIERED (a
+        # user-published skill has one legal tier, whatever the footer says —
+        # see TestAStoreEntityIsATieredKind), so this pins the invariant
+        # rather than the whole expression.
+        assert '? (pickerState.tier || "available") : "available";' in src
+        assert "TIERED.has(type) && !userSkill" in src
         assert 'await writeGrant(type, rid, tier, gid, asScope ? "everyone" : undefined);' in src
 
     def test_it_is_shown_only_where_the_tier_can_act(self):
@@ -1164,3 +1170,34 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
         assert ".ax-by__tool { flex-direction: column" not in src
         assert '.ax-by__kind::before { content: "·";' in src
         assert ".ax-by__kind { display: none; }" in src   # inside the narrow-strip media query
+
+
+class TestAStoreEntityIsATieredKind:
+    """`store_entity` was missing from TIERED — in this page and in the mock it
+    was built from — while the API has always accepted `required` on it. So
+    the F8 branch in controlCell was dead code behind `!tiered`: an
+    organization-published skill rendered no tier control at all, and a
+    user-published one rendered nothing instead of stating its one legal
+    tier. Found by seeding both kinds and looking, not by any test — which is
+    why this one exists.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_store_entity_is_in_the_tiered_set(self):
+        src = self._source()
+        line = src[src.index("const TIERED = new Set(["):]
+        line = line[: line.index("]);")]
+        assert '"store_entity"' in line, "without this the whole F8 branch is unreachable"
+
+    def test_the_picker_writes_a_user_published_skill_at_the_only_legal_tier(self):
+        """The row's rule, applied at write time too — otherwise a batch with
+        Automatic chosen fails on click with the server's 422."""
+        src = self._source()
+        assert 'const userSkill = type === "store_entity" && ((itemOf(type, rid) || {}).publisher_kind || "user") !== "organization";' in src
+        assert 'const tier = TIERED.has(type) && !userSkill ? (pickerState.tier || "available") : "available";' in src

@@ -3092,6 +3092,17 @@
      with a 422 either way; this only stops the page offering the choice. */
   const SCOPE_WITHHELD_TYPES = new Set(["slack_channel", "table", "memory_domain", "memory_item"]);
 
+  //: The resource item behind a `type:rid`, or null. Scans the overview: it
+  //: is called once per applied item, and the alternative is a second index
+  //: to keep in step with the first.
+  const itemOf = (type, rid) => {
+    for (const t of (overview.resources || [])) {
+      if (t.type_key !== type) continue;
+      for (const b of (t.blocks || [])) for (const i of (b.items || [])) if (i.resource_id === rid) return i;
+    }
+    return null;
+  };
+
   //: Does an everyone-wide grant on this resource already exist? Asked of the
   //: carrier, since that is where such a row is stored on both backends.
   const everyoneHeld = (type, rid) => {
@@ -3225,7 +3236,15 @@
     </span>`;
 
   //: Which kinds actually carry the Required/Available tier.
-  const TIERED = new Set(["data_package", "memory_domain", "memory_item", "marketplace_plugin"]);
+  //: Which kinds actually carry the Required/Available tier.
+  //: `store_entity` was missing here — in this page AND in the mock it was
+  //: built from — while the API has always accepted `required` on it ("In
+  //: stack, locked", admissible only on an organization-published item). So
+  //: the F8 branch in controlCell was dead code behind `!tiered`: an
+  //: organization-published skill rendered no tier control at all, and a
+  //: user-published one rendered nothing instead of stating its one legal
+  //: tier. Found by seeding both kinds and looking, not by any test.
+  const TIERED = new Set(["data_package", "memory_domain", "memory_item", "marketplace_plugin", "store_entity"]);
 
   /* ── ADMIN CONTROL, one shape for every row ───────────────────────────
      It used to be two different controls depending on kind, and never both:
@@ -6531,7 +6550,14 @@
         /* The admin's answer, for a kind that has the choice. An untiered
            kind is written at the column default either way — passing the
            answer there would record a tier the kind does not have. */
-        const tier = TIERED.has(type) ? (pickerState.tier || "available") : "available";
+        /* The footer's answer, for a kind that has the choice — with the one
+           per-row exception the API enforces: Automatic on a skill is
+           admissible only when the organization is the publisher, and the
+           server refuses anything else with a 422. A user-published skill is
+           written Optional whatever the footer says, the same rule its row's
+           control applies, rather than letting the batch fail on click. */
+        const userSkill = type === "store_entity" && ((itemOf(type, rid) || {}).publisher_kind || "user") !== "organization";
+        const tier = TIERED.has(type) && !userSkill ? (pickerState.tier || "available") : "available";
         await writeGrant(type, rid, tier, gid, asScope ? "everyone" : undefined);
         ok++;
       } catch (err) {
