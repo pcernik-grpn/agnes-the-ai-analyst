@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import random
@@ -69,6 +70,7 @@ from app.api.broker_vertex import (
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
 from app.chat.turn_usage import add_turn_usage
+from src.observability import otel as _otel
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -861,6 +863,54 @@ async def data_apps_broker(request: Request, row: Dict[str, Any] = Depends(requi
     return _to_response(resp)
 
 
+def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Optional[str], bool]":
+    """``(model, stream)`` as the request declares them — the model from the
+    Vertex path when the call is a native Vertex invocation, else from the
+    Messages body. Never raises: a malformed body is the upstream's 400."""
+    model: Optional[str] = getattr(vertex_target, "model", None) if vertex_target is not None else None
+    stream = False
+    try:
+        parsed = json.loads(raw_body)
+        if isinstance(parsed, dict):
+            model = model or (str(parsed["model"]) if parsed.get("model") else None)
+            stream = bool(parsed.get("stream"))
+    except (ValueError, TypeError):
+        pass
+    return model, stream
+
+
+async def _start_otel_completion_span(
+    *,
+    row: Dict[str, Any],
+    raw_body: bytes,
+    vertex_target: Any,
+    upstream: str,
+    agent_row: Optional[Dict[str, Any]],
+    caller_user_id: Optional[str],
+    session: Any,
+) -> Any:
+    """Open the broker's completion span. The session row is read only when
+    export is on (the caller checks) and not already in hand — one extra
+    read per completion, off the event loop, never on the path when tracing
+    is off. Identity is a label here, never a reason to fail the call."""
+    model, stream = _completion_request_hints(raw_body, vertex_target)
+    if session is None:
+        try:
+            session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        except Exception:  # noqa: BLE001
+            session = None
+    return _otel.start_completion_span(
+        upstream=upstream,
+        model=model,
+        stream=stream,
+        session_id=row.get("session_id"),
+        ticket_scope=row.get("scope"),
+        user_email=getattr(session, "user_email", None),
+        user_id=caller_user_id,
+        agent_id=agent_row.get("id") if agent_row else None,
+    )
+
+
 @router.post("/anthropic", name="anthropic_proxy_bare")
 @router.post("/anthropic/{subpath:path}", name="anthropic_proxy_subpath")
 async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(require_broker_ticket)) -> Response:
@@ -905,8 +955,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # traffic is the busy path, so it keeps paying nothing. Offloaded because a
     # synchronous DB read must not run on the event loop.
     # Found by Devin Review on this PR.
+    otel_session = None
     if row.get("scope") == "llm":
-        if await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"])) is None:
+        otel_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        if otel_session is None:
             raise HTTPException(status_code=401, detail="ticket_session_gone")
     raw_body = await request.body()
     headers = {
@@ -1161,6 +1213,25 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # turn end, so the user stared at silence and then got the entire text
     # at once. No ``async with``: the client must outlive this handler for
     # the streaming case; the pass-through iterator's ``finally`` closes it.
+    # Opt-in OTLP span per completion (src/observability/otel.py): opened
+    # here, after every gate that could refuse the call, and closed where
+    # the forward ends — in the stream's ``finally`` or after the buffered
+    # read below — so its duration is the upstream's, not the gates'.
+    otel_span = None
+    if is_completion and _otel.is_enabled():
+        try:
+            otel_span = await _start_otel_completion_span(
+                row=row,
+                raw_body=raw_body,
+                vertex_target=vertex_target,
+                upstream="dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic"),
+                agent_row=agent_row,
+                caller_user_id=caller_user_id,
+                session=otel_session,
+            )
+        except Exception:  # noqa: BLE001 - a measurement must never cost a forward
+            logger.debug("broker: could not open the completion span", exc_info=True)
+            otel_span = None
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
     # Retry loop for upstream rate limiting. A provider 429 (a Vertex
     # per-minute token/request quota is the usual one) means the request was
@@ -1186,8 +1257,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                 params=request.query_params,
             )
             resp = await client.send(upstream_req, stream=True)
-        except BaseException:
+        except BaseException as _exc:
             await client.aclose()
+            if otel_span is not None:
+                _otel.end_completion_span(otel_span, error=_exc)
             raise
         if resp.status_code not in _RETRYABLE_UPSTREAM_STATUSES or attempt >= _MAX_UPSTREAM_RETRIES:
             break
@@ -1204,8 +1277,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         )
         try:
             await asyncio.sleep(delay)
-        except BaseException:
+        except BaseException as _exc:
             await client.aclose()
+            if otel_span is not None:
+                _otel.end_completion_span(otel_span, error=_exc)
             raise
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
@@ -1257,7 +1332,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         async def _passthrough():
             try:
                 async for chunk in resp.aiter_bytes():
-                    if collect_usage and not state["overflow"]:
+                    if (collect_usage or otel_span is not None) and not state["overflow"]:
                         if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
                             collected.extend(chunk)
                         else:
@@ -1295,6 +1370,16 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
+                if otel_span is not None:
+                    _otel.end_completion_span(
+                        otel_span,
+                        status_code=resp.status_code,
+                        usage=None if state["overflow"] else parse_usage(bytes(collected), ctype),
+                        request_body=raw_body,
+                        response_body=bytes(collected),
+                        content_type=ctype,
+                        response_truncated=state["overflow"],
+                    )
 
         return StreamingResponse(
             _passthrough(),
@@ -1347,6 +1432,15 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             logger.exception(
                 "llm usage recording failed for agent %s (response already forwarded)", agent_row.get("id")
             )
+    if otel_span is not None:
+        _otel.end_completion_span(
+            otel_span,
+            status_code=resp.status_code,
+            usage=parse_usage(resp.content, ctype) if resp.status_code == 200 else None,
+            request_body=raw_body,
+            response_body=resp.content,
+            content_type=ctype,
+        )
 
     return _to_response(resp, budget_headers)
 
