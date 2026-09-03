@@ -61,10 +61,16 @@
      source — thrown away until now, though it is often the one thing that
      tells two same-named files apart. A second, quieter meta line, only
      when the row actually has one. #}
+  {# Wraps rather than truncating, now that the segments are links: a path
+     clipped with an ellipsis put the DEEPEST folder — the one worth clicking
+     — permanently out of reach. #}
   .file__meta--path {
     font-size: 0.72rem; color: var(--ds-text-muted); font-family: var(--ds-font-mono, inherit);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+    max-width: 100%; overflow-wrap: anywhere;
   }
+  .file__pathseg { color: inherit; text-decoration: none; border-radius: 3px; }
+  .file__pathseg:hover { color: var(--kind); text-decoration: underline; }
+  .file__pathsep { color: var(--ds-text-muted); opacity: .6; margin: 0 4px; }
   .file__reason { font-size: 0.76rem; color: var(--ds-warn-ink); margin-top: 2px; }
   .status-pill { flex: none; font-size: 0.72rem; font-weight: var(--font-medium); padding: 2px 10px; border-radius: var(--radius-full); color: var(--ds-text-secondary); background: color-mix(in srgb, var(--ds-text-secondary) 10%, var(--ds-surface)); }
   .status-pill.ok { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); }
@@ -419,9 +425,40 @@
             <div class="file__meta">{{ ft or "file" }}</div>
           {% endif %}
           {# A crawled/source-managed file's folder at the source — see
-             `.file__meta--path`. Omitted for a manual upload, which has none. #}
+             `.file__meta--path`. Omitted for a manual upload, which has none.
+
+             Each segment is a LINK that narrows this page's file list to that
+             folder. It was plain text, which made the one piece of structure a
+             crawled collection has unusable: a reader looking at a file could
+             see the folder it came from and had no way to see its siblings
+             (#2141 item 4). The link is this page's own `?q=` search — which
+             matches filename OR path (`corpus_files._filter_clause`) — so a
+             cumulative prefix is exactly "everything under this folder", and
+             the narrowing is a shareable URL like any other search.
+
+             The trailing segment is dropped when it IS the filename: that is
+             the file, not a folder to browse. #}
           {% if f.path %}
-            <div class="file__meta file__meta--path" title="{{ f.path }}">{{ f.path }}</div>
+            {% set _segs = f.path.strip('/').split('/') | select | list %}
+            {% set _segs = _segs[:-1] if _segs and _segs[-1] == f.filename else _segs %}
+            {% if _segs %}
+            <div class="file__meta file__meta--path" title="{{ f.path }}">
+              {#- Whitespace is controlled on BOTH sides of every tag here: the
+                  template's own newline+indent between the separator and the
+                  next anchor rendered as a space, so a path read "Shared
+                  Documents/ Reports/ 2026" — tight before each slash, loose
+                  after it. The gap belongs to `.file__pathsep`'s margin, which
+                  is symmetric. -#}
+              {%- for seg in _segs -%}
+                {%- if not loop.first -%}
+                  <span class="file__pathsep" aria-hidden="true">/</span>
+                {%- endif -%}
+                <a class="file__pathseg"
+                   href="{{ pager_href({'q': _segs[:loop.index]|join('/'), 'facts_page': pager_qs.facts_page}, 'files_page', 1) }}#files-section"
+                   title="Show everything in {{ _segs[:loop.index]|join('/') }}">{{ seg }}</a>
+              {%- endfor -%}
+            </div>
+            {% endif %}
           {% endif %}
           {% if reason and f.processing_status in ("rejected", "needs_review") %}
             <div class="file__reason">{{ reason }}</div>
