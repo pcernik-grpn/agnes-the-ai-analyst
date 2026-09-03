@@ -1,0 +1,23 @@
+# Disk usage + inodes for the boot disk and the /data volume.
+#
+# use_mount tags by mount point (device:/ and device:/data) rather than by the
+# kernel device name, which is what every consumer-side monitor scopes on.
+# service_check_rw turns a read-only remount — the shape a failing /data takes
+# before anything else notices — into a failing service check.
+init_config: {}
+
+instances:
+  - use_mount: true
+    service_check_rw: true
+    tag_by_filesystem: false
+    mount_point_exclude:
+      - '^/(sys|proc|dev|run|snap)($|/)'
+      - '^/boot/efi($|/)'
+      - '^/var/lib/docker/(overlay2|containers)'
+    file_system_exclude:
+      - 'tmpfs$'
+      - 'devtmpfs$'
+      - 'overlay$'
+      - 'squashfs$'
+      - 'nsfs$'
+      - 'autofs$'

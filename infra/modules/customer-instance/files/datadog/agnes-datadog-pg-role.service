@@ -1,0 +1,8 @@
+[Unit]
+Description=Datadog pg_monitor role bootstrap for the Agnes Postgres side-cars
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/agnes-datadog-pg-role.sh
