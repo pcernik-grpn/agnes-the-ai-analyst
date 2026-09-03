@@ -18,6 +18,10 @@ from src.repositories import (
     user_groups_repo,
     users_repo,
 )
+from src.service_accounts import (
+    ServiceAccountAdminGroupForbidden,
+    ServiceAccountInteractiveLoginError,
+)
 
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDepr
@@ -495,6 +499,7 @@ from app.api.query_hybrid import router as query_hybrid_router
 from app.api.cli_artifacts import router as cli_artifacts_router
 from app.api.cli_auth import router as cli_auth_router
 from app.api.tokens import router as tokens_router, admin_router as tokens_admin_router
+from app.api.admin_service_accounts import router as admin_service_accounts_router
 from app.api.agents_admin import router as agents_admin_router
 from app.api.agent_runtime import router as agent_runtime_router  # noqa: E402
 from app.api.agent_sessions import router as agent_sessions_router  # noqa: E402
@@ -2956,6 +2961,7 @@ def create_app() -> FastAPI:
     app.include_router(cli_auth_router)
     app.include_router(tokens_router)
     app.include_router(tokens_admin_router)
+    app.include_router(admin_service_accounts_router)
     app.include_router(agents_admin_router)
     app.include_router(agent_runtime_router)
     app.include_router(agent_sessions_router)
@@ -3470,6 +3476,33 @@ def create_app() -> FastAPI:
                 "detail": str(exc),
                 "error": "access_policy_requires_undistributed",
                 "table_id": exc.table_id,
+            },
+        )
+
+    @app.exception_handler(ServiceAccountAdminGroupForbidden)
+    async def _service_account_admin_group_forbidden_handler(request, exc: ServiceAccountAdminGroupForbidden):
+        """Guard 2 (issue #1534): a kind='service' user may never join the
+        system Admin group — same translate-a-typed-exception-to-a-clean-
+        response pattern as RequiresPostgresBackend -> 501 above."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "error": "service_account_admin_forbidden",
+            },
+        )
+
+    @app.exception_handler(ServiceAccountInteractiveLoginError)
+    async def _service_account_interactive_login_handler(request, exc: ServiceAccountInteractiveLoginError):
+        """Guard 1 (issue #1534): a kind='service' user may never hold an
+        interactive (typ="session") credential — refused once, at the
+        single JWT-mint choke point every login provider shares
+        (app.auth.jwt.create_access_token)."""
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": str(exc),
+                "error": "service_account_no_interactive_session",
             },
         )
 
