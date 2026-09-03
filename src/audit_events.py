@@ -1171,6 +1171,11 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "A document extraction was started for one SharePoint connection.",
     ),
+    "sharepoint_connection.retry_empty": AuditEvent(
+        "sharepoint_connection.retry_empty",
+        "mutation",
+        "An admin re-queued a SharePoint connection's convert_empty document backlog for conversion.",
+    ),
     # -- Cooperative stop (owner-frustration fix, 2026-09-01) -----------------
     "extraction.stop_requested": AuditEvent(
         "extraction.stop_requested",

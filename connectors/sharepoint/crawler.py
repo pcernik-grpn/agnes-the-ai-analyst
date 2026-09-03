@@ -678,6 +678,18 @@ def load_state(connection_id: str) -> Dict[str, Any]:
     #: see the module docstring's "a per-item failure never advances past
     #: itself" and :func:`_note_retry` / :func:`_retry_failed_items`.
     state.setdefault("failed_items", {})
+    #: ``stable_id -> {state_key, path, item, first_seen_at, last_seen_at}``
+    #: — every item this connection has seen convert to ``convert_empty``
+    #: (converted fine, no text at all — the scan-OCR candidate population).
+    #: NOT replayed by the ordinary per-run backlog (:func:`_retry_failed_
+    #: items`): re-running an empty document changes nothing while scan OCR
+    #: is off, so every ordinary crawl would otherwise pay to re-walk the
+    #: whole backlog for no reason. Replayed only by an explicit admin
+    #: ``retry_empty`` run (:func:`_retry_empty_items`) — e.g. once an
+    #: operator turns ``extraction.scan_ocr.enabled`` on and wants the
+    #: existing backlog reconsidered. See :func:`_note_empty` for the same
+    #: :data:`_FAILED_ITEMS_CAP` bound `failed_items` observes.
+    state.setdefault("empty_items", {})
     return state
 
 
@@ -1953,8 +1965,14 @@ class GraphTransport:
 # --------------------------------------------------------------------------
 
 
-def convert_to_markdown(path: Path, mime: str) -> Any:
+def convert_to_markdown(path: Path, mime: str, *, source_path: Optional[str] = None) -> Any:
     """``connectors.sharepoint.convert.convert_to_markdown`` — the seam.
+
+    ``source_path`` (the document's ORIGINAL drive-relative path, as opposed
+    to ``path``, the local temp file) rides through to the scan-OCR triage
+    stage-0 path rules — see that module's own docstring. Optional and
+    keyword-only so every existing caller (real or a test double) that never
+    passes it keeps working unchanged.
 
     Returns that module's ``ConvertResult`` (``.markdown``, ``.engine``).
     An ``ImportError`` propagates: with no converter there is nothing to
@@ -1962,7 +1980,7 @@ def convert_to_markdown(path: Path, mime: str) -> Any:
     """
     from connectors.sharepoint.convert import convert_to_markdown as _convert
 
-    return _convert(path, mime)
+    return _convert(path, mime, source_path=source_path)
 
 
 def anonymize_markdown(text: str, *, key: bytes, detector: Any = None) -> Any:
@@ -2793,7 +2811,7 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
 
     Installs this worker's own memory ceiling (see
     :func:`_install_memory_limit`) once, then loops reading
-    ``(tmp_path_str, mime)`` off ``conn`` and replying with a
+    ``(tmp_path_str, mime, source_path)`` off ``conn`` and replying with a
     :class:`_ConvertReply`. An ordinary Python exception from
     :func:`convert_to_markdown` — including a ``MemoryError`` from hitting
     that ceiling — is caught HERE, exactly like the pre-isolation code did,
@@ -2837,9 +2855,9 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
             return
         if task is None:  # shutdown sentinel
             return
-        tmp_path_str, mime = task
+        tmp_path_str, mime, source_path = task
         try:
-            converted = convert_to_markdown(Path(tmp_path_str), mime)
+            converted = convert_to_markdown(Path(tmp_path_str), mime, source_path=source_path)
             markdown = str(getattr(converted, "markdown", "") or "")
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
             outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
@@ -3127,7 +3145,7 @@ class _ConvertProcessPool:
         self._spare_procs[slot].append(proc)
         self._spare_conns[slot].append(parent_conn)
 
-    def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
+    def convert(self, slot: int, tmp_path: Path, mime: str, *, source_path: Optional[str] = None) -> _ConvertOutcome:
         """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
         worker and returns its outcome, or raises :class:`_ConvertCrashed`
         when that worker died instead of answering, :class:`_ConvertTimedOut`
@@ -3148,7 +3166,7 @@ class _ConvertProcessPool:
             self._swap_in_spare(slot)  # best-effort recovery for the NEXT file
             raise _ConvertCrashed(detail)
         try:
-            conn.send((str(tmp_path), mime))
+            conn.send((str(tmp_path), mime, source_path))
             reply = self._await_reply(slot, proc, conn)
         except (EOFError, OSError):
             detail = self._exit_detail(proc)
@@ -3596,7 +3614,7 @@ def _prepare_document(
 
     try:
         if convert_pool is not None:
-            outcome = convert_pool.convert(convert_slot, tmp_path, mime)
+            outcome = convert_pool.convert(convert_slot, tmp_path, mime, source_path=path)
             if not outcome.ok:
                 if outcome.detail_type == "MemoryError":
                     detail = "exceeded its own memory limit"
@@ -3611,7 +3629,7 @@ def _prepare_document(
                 return _PreparedDocument("convert_failed", detail=detail)
             markdown = outcome.markdown
         else:
-            converted = convert_to_markdown(tmp_path, mime)
+            converted = convert_to_markdown(tmp_path, mime, source_path=path)
             markdown = str(getattr(converted, "markdown", "") or "")
     except UnsupportedConversionFormat as exc:
         # Only reachable via the non-pool (inline) path above — the pool
@@ -3739,6 +3757,49 @@ def _clear_retry(state: Dict[str, Any], stable_id: str) -> bool:
         if not failed_items:
             return False
         return failed_items.pop(stable_id, None) is not None
+
+
+def _note_empty(state: Dict[str, Any], stable_id: str, *, target: DriveTarget, item: Dict[str, Any], path: str) -> None:
+    """Record one ``convert_empty`` outcome for ``stable_id`` — this is the
+    write ``load_state``'s ``empty_items`` docstring promises, so a future
+    admin-requested ``retry_empty`` run (:func:`_retry_empty_items`) knows
+    which items to reconsider without a full re-enumeration.
+
+    Idempotent, same shape as :func:`_note_retry` minus the retry-attempt
+    bookkeeping (this is not a failure queue an ordinary run replays — see
+    ``empty_items``'s own docstring for why). Bounded to
+    :data:`_FAILED_ITEMS_CAP` total entries, FIFO: once at capacity, the
+    OLDEST-inserted entry is evicted to make room for a new one — the same
+    "an honestly partial list beats an unbounded one" trade the run report's
+    own capped lists make, applied to persisted state. An already-recorded
+    item is only ever updated in place, never counted against the cap again.
+    """
+    with _state_lock:
+        empty_items: Dict[str, Any] = state.setdefault("empty_items", {})
+        entry = empty_items.get(stable_id)
+        if not isinstance(entry, dict):
+            if len(empty_items) >= _FAILED_ITEMS_CAP:
+                oldest = next(iter(empty_items), None)
+                if oldest is not None:
+                    del empty_items[oldest]
+            entry = {"first_seen_at": _now_iso()}
+        entry["state_key"] = target.state_key
+        entry["item"] = item
+        entry["path"] = path
+        entry["last_seen_at"] = _now_iso()
+        empty_items[stable_id] = entry
+
+
+def _clear_empty(state: Dict[str, Any], stable_id: str) -> bool:
+    """Drop ``stable_id`` from the empty-document backlog — it just ingested
+    with real content, however it got there (an ordinary re-crawl after the
+    source document changed, or an admin-requested ``retry_empty`` replay
+    that finally produced text). Mirrors :func:`_clear_retry`."""
+    with _state_lock:
+        empty_items = state.get("empty_items")
+        if not empty_items:
+            return False
+        return empty_items.pop(stable_id, None) is not None
 
 
 async def _process_item(
@@ -3942,12 +4003,16 @@ async def _process_item(
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
         if prepared.outcome == "convert_empty":
-            # Not a failure to retry: the document converted fine and
-            # genuinely has no text. Unlike the other three outcomes here,
-            # running it through the pipeline again cannot change the answer.
+            # Not a failure to retry ON THE ORDINARY per-run backlog: the
+            # document converted fine and, while scan OCR is off, running it
+            # through the pipeline again cannot change the answer. Unlike
+            # the other three outcomes here, `_note_retry` is NOT called.
             # Still recorded in `failed_items` (2026-09-02 owner decision:
             # visibility for "why is this document missing" must not depend
-            # on the retry queue) — never bumps `errors`.
+            # on the retry queue) — never bumps `errors` — AND in the
+            # PERSISTED `empty_items` backlog (`_note_empty`), so an admin
+            # who later turns scan OCR on has something to target with
+            # `retry_empty` instead of a full resync.
             stats.add(convert_failed=1)
             stats.note_failed_item(
                 path=record_path,
@@ -3957,6 +4022,7 @@ async def _process_item(
                 reason="conversion succeeded but produced no extractable text",
                 suffix=suffix,
             )
+            _note_empty(state, stable_id, target=target, item=item, path=path)
             outcome_label = "convert_empty"
             return
         if prepared.outcome == "convert_unsupported":
@@ -4030,6 +4096,10 @@ async def _process_item(
         # just ingested cleanly, so it owes the failure queue nothing more.
         if _clear_retry(state, stable_id):
             stats.add(item_retry_recovered=1)
+        # Same for the empty-document backlog: this item just produced real
+        # text (a source edit, or scan OCR turning it up on a `retry_empty`
+        # replay), so it is no longer a `convert_empty` candidate.
+        _clear_empty(state, stable_id)
     finally:
         stats.exit_item_activity(activity_token, path, outcome_label)
 
@@ -4442,6 +4512,89 @@ async def _retry_failed_items(
         recorder.checkpoint(stats)
 
 
+async def _retry_empty_items(
+    target: DriveTarget,
+    *,
+    ctx: _ScopeContext,
+    transport: GraphTransport,
+    ingestor: _Ingestor,
+    connection_id: str,
+    state: Dict[str, Any],
+    stats: CrawlStats,
+    max_file_mb: int,
+    anonymization_key: Optional[bytes],
+    detector: Any,
+    deadline: Optional[_Deadline],
+    recorder: Optional["_RunRecorder"],
+    convert_pool: Optional[_ConvertProcessPool] = None,
+    run: bool = False,
+) -> None:
+    """Replay every item THIS drive previously converted to ``convert_empty``
+    — the targeted counterpart to :func:`_retry_failed_items`, for the
+    ``retry_empty`` admin action (``POST …/extraction/retry-empty``, see
+    ``app/api/admin_sharepoint.py``) rather than an ordinary run.
+
+    ``run`` defaults to ``False`` and is the whole reason this is a SEPARATE
+    function rather than a branch inside :func:`_retry_failed_items`: the
+    empty-document backlog is routinely thousands of items on a real corpus
+    (leases, tax returns, scans — see ``connectors/sharepoint/scan_ocr.py``),
+    and replaying it on every ordinary crawl would burn a full re-walk of
+    that backlog for no reason while scan OCR stays off. Only an explicit
+    ``retry_empty`` run (which is exactly what turning scan OCR on and
+    wanting the backlog reconsidered looks like) sets it.
+
+    Same item-dict replay contract as :func:`_retry_failed_items`: each
+    entry carries the item AS SEEN when it last converted empty, so a retry
+    costs one re-download/re-convert, not a fresh Graph metadata round trip.
+    A document that STILL converts empty (scan OCR still off, or the scan
+    still yields nothing) re-records itself via :func:`_note_empty` inside
+    :func:`_process_item` exactly as an ordinary crawl would; one that
+    finally produces text is cleared (:func:`_clear_empty`) and ingested.
+    """
+    if not run:
+        return
+    empty_items: Dict[str, Any] = state.setdefault("empty_items", {})
+    pending = [
+        (stable_id, entry)
+        for stable_id, entry in empty_items.items()
+        if entry.get("state_key") == target.state_key and isinstance(entry.get("item"), dict)
+    ]
+    if not pending:
+        return
+    for _stable_id, entry in pending:
+        if deadline is not None:
+            deadline.check()
+        # Same repair as `_retry_failed_items` — see its own comment on this
+        # exact line for why it is safe here too.
+        if convert_pool is not None:
+            convert_pool.repair()
+        stats.add(items_seen=1)
+        stats.enter_item()
+        started = time.monotonic()
+        try:
+            await _process_item(
+                entry["item"],
+                target=target,
+                ctx=ctx,
+                transport=transport,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=max_file_mb,
+                anonymization_key=anonymization_key,
+                detector=detector,
+                convert_pool=convert_pool,
+                convert_slot=0,
+            )
+        finally:
+            stats.exit_item(time.monotonic() - started)
+        stats.add(items_done=1)
+    with _state_lock:
+        save_state(connection_id, state)
+    if recorder is not None:
+        recorder.checkpoint(stats)
+
+
 async def _crawl_drive(
     target: DriveTarget,
     *,
@@ -4461,13 +4614,16 @@ async def _crawl_drive(
     force_reprocess: bool = False,
     convert_pool: Optional[_ConvertProcessPool] = None,
     retry_failed: bool = False,
+    retry_empty: bool = False,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
 
     ``retry_failed`` (the admin-requested run option, see
     :func:`run_builtin_crawl`) is passed straight to :func:`_retry_failed_items`
-    as ``include_given_up`` — see that function's docstring.
+    as ``include_given_up`` — see that function's docstring. ``retry_empty``
+    is the same shape for the ``convert_empty`` backlog — see
+    :func:`_retry_empty_items`.
 
     ``recorder`` (optional, defaults to no recording) rides the checkpoint
     this function already writes — see :class:`_RunRecorder`.
@@ -4523,6 +4679,25 @@ async def _crawl_drive(
         recorder=recorder,
         convert_pool=convert_pool,
         include_given_up=retry_failed,
+    )
+    # The `convert_empty` counterpart — a no-op unless this run was an
+    # explicit `retry_empty` request (see `_retry_empty_items`'s own
+    # docstring for why it never runs on an ordinary crawl).
+    await _retry_empty_items(
+        target,
+        ctx=ctx,
+        transport=transport,
+        ingestor=ingestor,
+        connection_id=connection_id,
+        state=state,
+        stats=stats,
+        max_file_mb=max_file_mb,
+        anonymization_key=anonymization_key,
+        detector=detector,
+        deadline=deadline,
+        recorder=recorder,
+        convert_pool=convert_pool,
+        run=retry_empty,
     )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
@@ -4937,6 +5112,22 @@ def _ocr_run_usage(scan_ocr_module: Any) -> Dict[str, Any]:
     return {k: v for k, v in usage.items() if isinstance(v, (int, float)) and v}
 
 
+def _ocr_triage_usage(scan_ocr_module: Any) -> Dict[str, Any]:
+    """The scan-OCR triage DECISION counters (``previewed``/``continued``/
+    ``stopped``/``pages_transcribed``/``stop_reasons``) for this run's
+    report — distinct from :func:`_ocr_run_usage`'s token/call accounting.
+    ``{}`` when triage never previewed a single document this run (the
+    switch off, everything went through the untriaged ``full`` path, or the
+    connector isn't installed) — never raises, same posture as its sibling."""
+    if scan_ocr_module is None:
+        return {}
+    try:
+        usage = scan_ocr_module.triage_run_usage()
+    except Exception:  # noqa: BLE001
+        return {}
+    return usage if isinstance(usage, dict) and usage else {}
+
+
 def _facts_stream_every() -> int:
     """``extraction.facts.stream_every`` — enqueue a standalone
     ``sharepoint-facts-extraction`` job for this connection after every N
@@ -5164,6 +5355,7 @@ async def _run_crawl_async(
     concurrency: Optional[int] = None,
     force_reprocess: bool = False,
     retry_failed: bool = False,
+    retry_empty: bool = False,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     # A stop requested for a PREVIOUS run (already finished, failed, or one
@@ -5308,6 +5500,7 @@ async def _run_crawl_async(
                         convert_pool=convert_pool,
                         force_reprocess=force_reprocess,
                         retry_failed=retry_failed,
+                        retry_empty=retry_empty,
                     )
         finally:
             # Done converting for this run either way (success, a scope
@@ -5367,6 +5560,9 @@ async def _run_crawl_async(
         ocr_usage = _ocr_run_usage(_scan_ocr)
         if ocr_usage:
             interrupted_report["ocr_usage"] = ocr_usage
+        scan_ocr_triage = _ocr_triage_usage(_scan_ocr)
+        if scan_ocr_triage:
+            interrupted_report["scan_ocr"] = scan_ocr_triage
         stopped_usage: Dict[str, Any] = {}
         if ner_usage:
             stopped_usage["ner"] = ner_usage
@@ -5399,6 +5595,9 @@ async def _run_crawl_async(
     ocr_usage = _ocr_run_usage(_scan_ocr)
     if ocr_usage:
         report["ocr_usage"] = ocr_usage
+    scan_ocr_triage = _ocr_triage_usage(_scan_ocr)
+    if scan_ocr_triage:
+        report["scan_ocr"] = scan_ocr_triage
     facts_usage: Dict[str, Any] = {}
     if facts_report is not None:
         report["facts"] = facts_report
@@ -5518,7 +5717,14 @@ def run_builtin_crawl(payload: dict) -> dict:
     unchanged, including the ordinary incremental delta walk that follows
     the backlog replay. The cheap, targeted alternative to ``resync`` for a
     connection with a handful of permanently-stuck documents — see
-    :func:`_retry_failed_items`'s ``include_given_up`` for the mechanism).
+    :func:`_retry_failed_items`'s ``include_given_up`` for the mechanism),
+    and ``retry_empty`` (truthy — replays every item this connection last
+    converted to ``convert_empty`` — see :func:`_retry_empty_items`. Unlike
+    ``retry_failed`` this NEVER runs implicitly: an ordinary crawl leaves
+    the empty-document backlog alone, since replaying it changes nothing
+    while scan OCR stays off. The targeted admin action for "I just turned
+    ``extraction.scan_ocr.enabled`` on, reconsider what it can now read" —
+    see ``POST …/extraction/retry-empty`` in ``app/api/admin_sharepoint.py``).
     Credentials are resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
@@ -5558,6 +5764,7 @@ def run_builtin_crawl(payload: dict) -> dict:
                 concurrency=payload.get("concurrency"),
                 force_reprocess=bool(payload.get("force_reprocess")),
                 retry_failed=bool(payload.get("retry_failed")),
+                retry_empty=bool(payload.get("retry_empty")),
             )
         )
     except SharePointSettingsError as exc:

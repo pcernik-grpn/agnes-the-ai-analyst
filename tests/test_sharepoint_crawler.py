@@ -190,7 +190,7 @@ def crawl_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gc, "get_app_token", _token)
     monkeypatch.setattr(crawler, "_Ingestor", FakeIngestor)
-    monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# converted"))
+    monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# converted"))
     monkeypatch.setattr(crawler, "_max_file_mb", lambda: 50)
     # Certificate resolution is `connectors.sharepoint.settings`' contract,
     # covered by its own tests — stubbed here so no crawl test needs a real
@@ -267,6 +267,7 @@ def _run(
     scopes: Optional[List[str]] = None,
     force_reprocess: bool = False,
     retry_failed: bool = False,
+    retry_empty: bool = False,
 ) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
@@ -279,6 +280,8 @@ def _run(
         payload["force_reprocess"] = True
     if retry_failed:
         payload["retry_failed"] = True
+    if retry_empty:
+        payload["retry_empty"] = True
     return crawler.run_builtin_crawl(payload)
 
 
@@ -878,6 +881,125 @@ class TestFailureRetryQueue:
         assert second["retry_backlog"]["given_up"] == 1  # sanity: it really was stuck before the retry
 
 
+class TestEmptyItemBacklog:
+    """``state["empty_items"]`` — the persisted backlog of documents that
+    converted to ``convert_empty``, and the admin-requested ``retry_empty``
+    run option that replays it. See ``_note_empty``/``_clear_empty``/
+    ``_retry_empty_items``."""
+
+    def test_a_convert_empty_outcome_is_recorded_in_the_persisted_backlog(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        entry = _state(crawl_env)["empty_items"]["graph:item1"]
+        assert entry["path"].endswith("brief.docx")
+        assert entry["item"]["id"] == "item1"
+        assert entry["state_key"] == "b!drive1"
+        assert entry["first_seen_at"]
+        assert "graph:item1" not in _state(crawl_env)["failed_items"], "convert_empty is not a retry-queue failure"
+
+    def test_an_ordinary_run_never_replays_the_empty_items_backlog(self, crawl_env, monkeypatch):
+        """The whole reason this is a SEPARATE backlog from `failed_items`:
+        replaying thousands of known-empty documents on every ordinary crawl
+        would be pure waste while scan OCR stays off."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "t=1" in url:
+                # Item1 was never re-touched — Graph has nothing new to offer.
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        second = _run(connection, monkeypatch)  # no retry_empty
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_first
+        assert second.get("scan_ocr") is None or second["scan_ocr"].get("previewed") in (None, 0)
+        assert "graph:item1" in _state(crawl_env)["empty_items"]
+
+    def test_retry_empty_replays_the_backlog_and_clears_an_item_that_now_converts(self, crawl_env, monkeypatch):
+        """The admin-facing `retry_empty` run option (`POST …/extraction/
+        retry-empty`): once a document that used to convert empty produces
+        real text (e.g. scan OCR just got turned on), it is ingested and
+        drops out of the backlog — mirrors `retry_failed`'s own test."""
+        converts_empty = {"value": True}
+        monkeypatch.setattr(
+            crawler,
+            "convert_to_markdown",
+            lambda path, mime, **_kw: (
+                ConvertResult("   \n ") if converts_empty["value"] else ConvertResult("# real text")
+            ),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        assert "graph:item1" in _state(crawl_env)["empty_items"]
+
+        converts_empty["value"] = False
+        retried = _run(connection, monkeypatch, retry_empty=True)
+
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item1"
+        assert FakeIngestor.instances[-1].ingested[0]["markdown"] == "# real text"
+        assert "graph:item1" not in _state(crawl_env)["empty_items"]
+        # `convert_empty` never records a cTag (see the docstring on the
+        # `convert_empty` branch), so this ingest lands as `new`, not `changed`.
+        assert retried["new"] == 1
+
+    def test_retry_empty_true_but_an_empty_backlog_is_a_clean_no_op(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch, retry_empty=True)
+
+        assert report["new"] == 1
+        assert report["errors"] == 0
+
+    def test_the_empty_items_backlog_is_bounded_fifo(self, crawl_env, monkeypatch):
+        state: Dict[str, Any] = {"empty_items": {}}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        monkeypatch.setattr(crawler, "_FAILED_ITEMS_CAP", 3)
+
+        for i in range(4):
+            crawler._note_empty(
+                state,
+                f"graph:item{i}",
+                target=target,
+                item={"id": f"item{i}"},
+                path=f"Reports/f{i}.docx",
+            )
+
+        assert len(state["empty_items"]) == 3
+        assert "graph:item0" not in state["empty_items"], "the OLDEST entry is evicted to make room"
+        assert set(state["empty_items"]) == {"graph:item1", "graph:item2", "graph:item3"}
+
+
 class TestForcedResync:
     def test_resync_flag_re_enumerates_from_scratch_but_keeps_ctags(self, crawl_env, monkeypatch):
         """Requirement 4: an operator can recover a connection whose delta
@@ -1147,7 +1269,7 @@ class TestAnonymizeFailClosed:
 
 class TestConversion:
     def test_an_unconvertible_file_is_counted_and_skipped_not_fatal(self, crawl_env, monkeypatch):
-        def _boom(path, mime):
+        def _boom(path, mime, **_kw):
             raise RuntimeError("markitdown said no")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
@@ -1181,7 +1303,7 @@ class TestConversion:
         exactly as before), never an `errors` count and never itemized in
         `errors_detail` — it never reached `errors` before this change and
         must not gain a row just because a neighbouring reason did."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1196,7 +1318,7 @@ class TestConversion:
         assert report["errors_detail"] == {"items": [], "listed": 0, "total": 0, "truncated": False}
 
     def test_an_empty_conversion_is_not_ingested(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1220,7 +1342,7 @@ class TestConversion:
 class TestFailedAndSkippedItemVisibility:
     def test_a_convert_failure_is_recorded_with_item_id_drive_id_and_suffix(self, crawl_env, monkeypatch):
         monkeypatch.setattr(
-            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(RuntimeError("nope"))
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(RuntimeError("nope"))
         )
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1242,7 +1364,7 @@ class TestFailedAndSkippedItemVisibility:
         assert "nope" in row["reason"]
 
     def test_convert_empty_is_recorded_in_failed_items_but_never_counted_an_error(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1259,7 +1381,7 @@ class TestFailedAndSkippedItemVisibility:
     def test_an_anonymized_scope_records_no_raw_path_for_a_failed_item(self, crawl_env, monkeypatch):
         monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
         monkeypatch.setattr(
-            crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(RuntimeError("nope"))
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(RuntimeError("nope"))
         )
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -1289,7 +1411,7 @@ class TestFailedAndSkippedItemVisibility:
         reaches `_prepare_document`/`convert_to_markdown`."""
         from connectors.sharepoint.convert import UnsupportedConversionFormat
 
-        def _boom(path, mime):
+        def _boom(path, mime, **_kw):
             raise UnsupportedConversionFormat("notes.one", "no conversion backend recognizes this file type")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
@@ -1435,7 +1557,7 @@ class TestConversionCrashIsolation:
 
     @staticmethod
     def _crash_on_marker(marker: bytes) -> Callable[[Path, str], Any]:
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == marker:
                 os.kill(os.getpid(), signal.SIGABRT)
             return ConvertResult("# converted fine")
@@ -1506,7 +1628,7 @@ class TestConversionCrashIsolation:
     ):
         _at_concurrency(monkeypatch, 1)
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             content = Path(path).read_bytes()
             if content == b"CRASH-ME":
                 os.kill(os.getpid(), signal.SIGABRT)
@@ -1560,7 +1682,7 @@ class TestItemProcessingTimeoutEndToEnd:
         _at_concurrency(monkeypatch, 1)
         monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 0.3)
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == b"HANG-ME":
                 time.sleep(30)
             return ConvertResult("# converted fine")
@@ -1625,7 +1747,7 @@ class TestConvertProcessPoolRecycling:
         return p
 
     def test_a_slot_is_recycled_after_its_document_budget(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=3, recycle_rss_bytes=0)
         pool.start()
         try:
@@ -1647,7 +1769,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_a_slot_is_recycled_when_its_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             # Inflate THIS (child) process's RSS on purpose, deterministically
             # — the point of testing the trigger in isolation, rather than
             # waiting on a real multi-hundred-document crawl to grow one
@@ -1670,7 +1792,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_recycling_does_not_regress_crash_isolation(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == b"CRASH-ME":
                 os.kill(os.getpid(), signal.SIGABRT)
             return ConvertResult("# ok")
@@ -1711,7 +1833,7 @@ class TestConvertProcessPoolRecycling:
         and just kept running past its budget for the rest of the page. Two
         spares survive exactly two such recycles with no `repair()` call in
         between."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
         pool.start()
         try:
@@ -1739,7 +1861,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_repair_tops_the_spare_queue_back_up_to_the_configured_count(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
         pool.start()
         try:
@@ -1756,7 +1878,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_convert_spares_per_slot_zero_disables_spares_the_pre_spares_behaviour(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=0)
         pool.start()
         try:
@@ -1782,7 +1904,7 @@ class TestConvertProcessPoolRetirement:
         # Reproduce the uvicorn situation: the FORKING process has a
         # Python-level SIGTERM handler that does nothing useful in a child.
         previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0)
         try:
             pool.start()
@@ -1898,7 +2020,7 @@ class TestConvertProcessPoolItemTimeout:
         return p
 
     def test_a_hung_worker_is_killed_after_the_timeout_and_counted_as_a_timeout(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             time.sleep(30)  # far longer than the pool's own timeout below
             return ConvertResult("# never reached")
 
@@ -1924,7 +2046,7 @@ class TestConvertProcessPoolItemTimeout:
         assert first_pid != pool._procs[0].pid if pool._procs[0] else True
 
     def test_the_slot_recovers_via_the_pre_forked_spare_and_keeps_converting(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             # Keyed off the FILE's own content, not a shared counter: each
             # forked child (the active worker AND its pre-forked spare) gets
             # an independent copy of any closure state at fork time, so a
@@ -1951,7 +2073,7 @@ class TestConvertProcessPoolItemTimeout:
             pool.shutdown()
 
     def test_zero_disables_the_bound_the_pre_fix_behaviour_exactly(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, timeout_s=0)
         pool.start()
         try:
@@ -1969,7 +2091,7 @@ class TestConvertProcessPoolItemTimeout:
         timeout, not be masked by an RSS check that would only run AFTER a
         poll interval elapses."""
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             time.sleep(30)
             return ConvertResult("# never reached")
 
@@ -2006,7 +2128,9 @@ class TestConvertChildMemoryLimit:
         that names the cause plainly and attributes it to THIS file, never
         a bare `MemoryError` a reader has to already know the mechanism to
         interpret."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(MemoryError()))
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(MemoryError())
+        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -2035,7 +2159,7 @@ class TestConvertChildMemoryLimit:
         convert normally, not lose the whole child to an unhandled
         exception raised while merely trying to install its own safety
         net."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         # 1 MiB: far below what even a bare Python interpreter maps, so on
         # a platform that DOES enforce this it would fail every real
         # conversion too -- the point here is only that installing it does
@@ -2076,7 +2200,7 @@ class TestConvertChildMemoryLimit:
         headroom = 100 * 1024 * 1024
         over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
 
-        def _convert(path, mime):
+        def _convert(path, mime, **_kw):
             data = bytearray(over_allocation)
             data[0] = 1
             return ConvertResult("# ok")
@@ -2111,7 +2235,7 @@ class TestConvertChildMemoryLimit:
         small_headroom = own_baseline // 2
         modest_allocation = 1024 * 1024  # 1 MiB: far smaller than any real process's own footprint
 
-        def _convert(path, mime):
+        def _convert(path, mime, **_kw):
             data = bytearray(modest_allocation)
             data[0] = 1
             return ConvertResult("# ok")
@@ -2206,7 +2330,7 @@ class TestConvertChildMemoryLimit:
         return p
 
     def test_the_watchdog_is_disabled_when_max_rss_bytes_is_zero(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         polled = {"n": 0}
 
         def _fake_rss(pid):
@@ -2232,7 +2356,7 @@ class TestConvertChildMemoryLimit:
         — see `test_a_runaway_childs_rss_is_caught_by_the_real_watchdog_on_linux`
         below for the real, Linux-only enforcement."""
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             time.sleep(30)  # never reached — the watchdog kills this child first
             return ConvertResult("# never reached")
 
@@ -2260,7 +2384,7 @@ class TestConvertChildMemoryLimit:
         assert first_pid != pool._procs[0].pid if pool._procs[0] else True
 
     def test_the_slot_recovers_via_the_spare_after_a_memory_guard_kill(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == b"HOG-ME":
                 time.sleep(30)
             return ConvertResult("# ok")
@@ -2290,7 +2414,7 @@ class TestConvertChildMemoryLimit:
         still eventually reclaims a hung worker through the OTHER bound,
         exactly as before the RSS watchdog existed."""
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             time.sleep(30)
             return ConvertResult("# never reached")
 
@@ -2314,7 +2438,7 @@ class TestConvertChildMemoryLimit:
         itself — see `_convert_memory_guard_detail`."""
 
         class _FakePool:
-            def convert(self, slot: int, tmp_path: Path, mime: str) -> Any:
+            def convert(self, slot: int, tmp_path: Path, mime: str, **_kw: Any) -> Any:
                 raise crawler._ConvertMemoryGuard(rss_bytes=999 * 1024 * 1024, limit_bytes=512 * 1024 * 1024)
 
         f = self._write(tmp_path, "doc.txt", b"x")
@@ -2345,7 +2469,7 @@ class TestConvertChildMemoryLimit:
         only run) on Linux, this module's deployment target and where the
         memory pressure this guards against was observed."""
 
-        def _convert(path, mime):
+        def _convert(path, mime, **_kw):
             _hog = bytearray(200 * 1024 * 1024)  # noqa: F841 — zero-fills, forcing real RSS growth
             time.sleep(10)  # long enough for the parent's watchdog to notice and kill
             return ConvertResult("# never reached")
@@ -2389,7 +2513,7 @@ class TestConvertedOutputSizeCap:
     """
 
     def test_a_converted_output_over_the_cap_is_refused_before_it_crosses_the_pipe(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 2000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
         pool.start()
         try:
@@ -2405,7 +2529,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_a_converted_output_within_the_cap_is_returned_normally(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("small"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("small"))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1_000_000)
         pool.start()
         try:
@@ -2418,7 +2542,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_zero_disables_the_cap(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 5000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=0)
         pool.start()
         try:
@@ -2436,7 +2560,7 @@ class TestConvertedOutputSizeCap:
         this cap's message never carries document content — only byte
         counts — so it is safe to show verbatim on BOTH kinds of scope, the
         same way a `MemoryError` outcome already is."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 2000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
         pool.start()
         try:
@@ -2460,7 +2584,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_a_crawl_end_to_end_counts_an_oversized_conversion_as_convert_failed(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 5000))
         monkeypatch.setattr(crawler, "_max_converted_output_bytes", lambda: 1000)
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -3511,7 +3635,7 @@ class TestState:
         path = crawler.state_path("conn1")
         path.write_text("{not json")
         state = crawler.load_state("conn1")
-        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
 
     def test_an_unsafe_connection_id_cannot_escape_the_state_directory(self, crawl_env):
         for bad in ("../../etc/passwd", "a/b", "..", ""):
@@ -3537,7 +3661,7 @@ class TestState:
 
         state = crawler.load_state("conn1")
         assert ("get", "crawl", "conn1") in calls
-        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
 
         crawler.save_state("conn1", {"delta_links": {"d": "u"}})
         assert ("put", "crawl", "conn1", {"delta_links": {"d": "u"}}) in calls
@@ -4579,7 +4703,7 @@ class TestItemTimeoutResolution:
                 super().__init__(*args, **kwargs)
 
         monkeypatch.setattr(crawler, "_ConvertProcessPool", _Spy)
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
 
         async def _token(tenant_id: str, client_id: str, private_key: str) -> str:
             return "tok"
@@ -4728,7 +4852,7 @@ class TestParallelCounters:
         _at_concurrency(monkeypatch, 8)
         monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
+        def _convert(path: Path, mime: str, **_kw: Any) -> ConvertResult:
             if path.suffix == ".bad":
                 raise RuntimeError("markitdown said no")
             if path.suffix == ".empty":
@@ -4944,7 +5068,7 @@ class TestParallelOrdering:
         monkeypatch.setattr(
             crawler,
             "convert_to_markdown",
-            lambda path, mime: ConvertResult("UNREDACTABLE" if path.suffix == ".pii" else "# converted"),
+            lambda path, mime, **_kw: ConvertResult("UNREDACTABLE" if path.suffix == ".pii" else "# converted"),
         )
 
         items = [
@@ -5076,7 +5200,7 @@ class TestConcurrencyOneIsTheOldPath:
         _at_concurrency(monkeypatch, n)
         monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
+        def _convert(path: Path, mime: str, **_kw: Any) -> ConvertResult:
             if path.suffix == ".bad":
                 raise RuntimeError("nope")
             return ConvertResult("# converted")

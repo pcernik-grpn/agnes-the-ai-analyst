@@ -1851,6 +1851,41 @@ extraction:
     max_pages: 50
     # Pages transcribed in parallel; clamped to [1, 8], 1 = one at a time.
     concurrency: 3
+    # Triage: before paying to transcribe a scan up to max_pages, transcribe
+    # just a short preview and let a cheap classification call decide
+    # whether the rest is worth it. ON by default once scan_ocr.enabled is
+    # true — set `enabled: false` here to go back to the old "transcribe
+    # everything up to max_pages" behaviour, byte-for-byte.
+    triage:
+      enabled: true
+      # Pages transcribed (and classified) before the continue/stop
+      # decision. A stopped document still keeps these pages, so it stays
+      # searchable/identifiable — set to 0 to skip even the preview for a
+      # document a rule below decided to skip (the pre-triage "empty"
+      # outcome).
+      preview_pages: 5
+      # Case-insensitive substring or glob patterns matched against the
+      # document's path. A `full_path_patterns` match always wins (transcribe
+      # in full, no preview, no classify call) even over a `skip_path_
+      # patterns` match on the same document. Both empty by default —
+      # operator-owned, no built-in guesses about a customer's folder names.
+      skip_path_patterns: []
+      # - "Tax Returns"
+      # - "Archive"
+      full_path_patterns: []
+      # - "Data Room/*Contract*"
+      # - "Financials"
+      # A document over this many MB skips full transcription outright
+      # (still gets a preview). 0 disables the guard.
+      max_size_mb: 0
+      # A document with this many pages OR FEWER just gets transcribed in
+      # full directly — skipping it would cost about the same as preview +
+      # classify, so triaging it is not worth it. 0 disables the guard.
+      min_pages: 0
+      # A document with MORE pages than this skips full transcription
+      # outright (still gets a preview) — the page-count analogue of
+      # max_size_mb. 0 disables the guard.
+      max_pages_for_preview: 0
 
 
 # Microsoft Graph change-notification receiver for SharePoint connections —

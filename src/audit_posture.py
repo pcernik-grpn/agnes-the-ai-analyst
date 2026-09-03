@@ -173,6 +173,13 @@ POSTURE: dict[str, str] = {
     # these; `run_` keeps the run-due sweep inside SCHEDULER_ACTION_SQL's
     # liveness predicate, same reasoning as the other scheduler endpoints.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
+    # Same handler shape as `extract` right above — the fallback middleware
+    # emits this one too; nothing in the handler says more than "job id N,
+    # M items queued", which the fallback's own params already carry via
+    # the response body it captures.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": (
+        "sharepoint_connection.retry_empty"
+    ),
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     # Bulk scope-add (split-a-large-site workflow) and connection clone both
     # write their own row with richer params than the fallback could derive

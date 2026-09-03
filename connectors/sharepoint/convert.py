@@ -256,6 +256,7 @@ def convert_to_markdown(
     mime: str,
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
+    source_path: str | None = None,
 ) -> ConvertResult:
     """Convert one file to markdown.
 
@@ -266,6 +267,14 @@ def convert_to_markdown(
             used only when the suffix is unrecognised.
         max_chars: ceiling on returned characters. Output longer than this is
             cut at the limit and a truncation marker appended.
+        source_path: the document's ORIGINAL drive-relative path (as opposed
+            to ``path``, the local temp file) — threaded through to the scan-
+            OCR triage stage-0 path rules (``extraction.scan_ocr.triage.
+            skip_path_patterns``/``full_path_patterns``), which need the
+            real path to match against. Used for nothing else in this
+            module: routing here still keys off ``path``'s suffix/mime, and
+            ``source_path`` never appears in a raised error's message.
+            ``None`` (any caller with no path context) matches no pattern.
 
     Returns:
         :class:`ConvertResult` — never ``None``, never a partially-written file.
@@ -296,7 +305,7 @@ def convert_to_markdown(
         text = _read_text(path, filename, max_chars)
         engine = ENGINE_PASSTHROUGH
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
-        text, engine = _convert_pdf(path, filename)
+        text, engine = _convert_pdf(path, filename, source_path=source_path)
     elif suffix in LEGACY_OFFICE_SUFFIXES:
         text = _convert_legacy_office(path, filename, suffix)
         engine = ENGINE_LIBREOFFICE_MARKITDOWN
@@ -489,7 +498,7 @@ def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
 # ---------------------------------------------------------------------- pdf
 
 
-def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
+def _convert_pdf(path: Path, filename: str, *, source_path: str | None = None) -> tuple[str, str]:
     """PDF → markdown through the structure pass, and only through it.
 
     :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf` is the ONE
@@ -549,7 +558,7 @@ def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
     if not scan_ocr.scan_ocr_enabled():
         return "", ENGINE_PYPDFIUM2
     try:
-        return scan_ocr.transcribe_scan(path), ENGINE_OCR
+        return scan_ocr.transcribe_scan(path, source_path=source_path), ENGINE_OCR
     except scan_ocr.ScanOcrUnavailable as exc:
         raise ConversionError(filename, f"scan OCR failed: {exc}", engine=ENGINE_OCR) from exc
 

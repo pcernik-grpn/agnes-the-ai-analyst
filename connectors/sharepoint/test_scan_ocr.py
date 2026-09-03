@@ -65,6 +65,24 @@ class _Response:
         self.usage = usage or _Usage()
 
 
+class _ToolUseBlock:
+    def __init__(self, name, input):  # noqa: A002 - mirrors the SDK's own field name
+        self.type = "tool_use"
+        self.name = name
+        self.input = input
+
+
+class _ToolResponse:
+    """A tool-use reply — for the triage classify call. A script entry that
+    is a plain ``dict`` is interpreted as the tool's ``input`` payload; the
+    tool NAME is read off the request's own ``tool_choice`` so this fake
+    never has to know :data:`scan_ocr._TRIAGE_TOOL_NAME` by name."""
+
+    def __init__(self, name, payload, usage=None):
+        self.content = [_ToolUseBlock(name, payload)]
+        self.usage = usage or _Usage()
+
+
 class _Messages:
     def __init__(self, client):
         self._client = client
@@ -75,6 +93,9 @@ class _Messages:
         reply = script[min(len(self._client.calls) - 1, len(script) - 1)]
         if isinstance(reply, BaseException):
             raise reply
+        if isinstance(reply, dict):
+            tool_name = (kwargs.get("tool_choice") or {}).get("name") or "unknown_tool"
+            return _ToolResponse(tool_name, reply)
         return _Response(reply)
 
 

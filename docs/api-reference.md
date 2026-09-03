@@ -1481,6 +1481,27 @@ extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
 per-connection idempotency key shared with the sweep below.
 
+`POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
+backlog — documents that converted fine but carried no text (a scan with no
+text layer, most commonly). Graph's delta feed never re-offers an unchanged
+item, so an ordinary crawl would otherwise never revisit one of these even
+after `extraction.scan_ocr.enabled` (and its `triage` block, see
+[`sharepoint-extraction.md`](sharepoint-extraction.md) § 6) turns on and
+becomes able to read it. Enqueues the SAME `corpus-extraction` job `POST
+…/extract` does, with `{"retry_empty": true}` added, which replays the
+backlog BEFORE the run's ordinary incremental delta walk. Returns `202
+{"job_id", "status", "queued_count"}` — `queued_count` is read from the
+connection's persisted crawl state before the job is enqueued, so an admin
+learns how much work this triggered without waiting for the run to finish;
+`0` is a normal, successful answer, not an error. Same 404/409 preconditions
+as `POST …/extract`, and the SAME per-connection idempotency key — a
+retry-empty run can never overlap an ordinary trigger (or another
+retry-empty run) for the same connection, since both mutate the same crawl
+state. CLI: `agnes admin sharepoint retry-empty <connection_id>`. Deliberately
+NOT MCP-exposed, same reasoning as `extract`/`facts-extract` — an
+agent-invokable trigger for a re-conversion pass over an entire corpus is a
+cost surface no analyst query needs.
+
 `POST /api/admin/sharepoint/anonymization/preview` is the config drawer's
 dry-run: an admin pastes a sample (≤50 000 chars) and gets back what the
 anonymizer would redact, under the instance's real pseudonym key — nothing

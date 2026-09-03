@@ -878,3 +878,40 @@ class TestExtract:
             result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1"])
         assert result.exit_code == 1
         assert "extraction_already_running" in result.output
+
+
+class TestRetryEmpty:
+    """`agnes admin sharepoint retry-empty` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/extraction/
+    retry-empty`."""
+
+    def test_bare_call_posts_to_the_retry_empty_route(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post",
+            return_value=_resp(202, {"job_id": "re1", "status": "queued", "queued_count": 3}),
+        ) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "retry-empty", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "re1" in result.output
+        assert "queued_count: 3" in result.output
+        args, _ = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/retry-empty"
+
+    def test_json_output(self):
+        body = {"job_id": "re2", "status": "queued", "queued_count": 0}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(202, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "retry-empty", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_already_running_is_reported_and_exits_nonzero(self):
+        detail = {"error": "extraction_already_running", "job_id": "re0"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "retry-empty", "conn1"])
+        assert result.exit_code == 1
+        assert "extraction_already_running" in result.output
+
+    def test_not_found_is_reported_and_exits_nonzero(self):
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(404, {"detail": "not found"})):
+            result = runner.invoke(app, ["admin", "sharepoint", "retry-empty", "does-not-exist"])
+        assert result.exit_code == 1

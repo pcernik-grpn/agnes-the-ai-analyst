@@ -32863,6 +32863,69 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": {
+      "post": {
+        "description": "Re-queue this connection's ``convert_empty`` backlog for conversion \u2014\nthe targeted follow-up for \"I just turned ``extraction.scan_ocr.enabled``\non, will it now read what used to come back blank?\".\n\nA document that converted fine but carried no text (a scan with no text\nlayer, most commonly) is otherwise a dead end: Graph's delta feed never\nre-offers an unchanged item, so the crawl's ordinary incremental walk\nwould skip it forever even after scan OCR starts being able to read it.\nEvery such item this connection has ever seen is recorded in its crawl\nstate's ``empty_items`` backlog (``connectors.sharepoint.crawler.\n_note_empty``) as it is encountered; this endpoint enqueues the SAME\n``corpus-extraction`` job :func:`trigger_extraction` does, with\n``{\"retry_empty\": true}`` added to its payload, which makes the run\nreplay exactly that backlog (``connectors.sharepoint.crawler.\n_retry_empty_items``) BEFORE its ordinary incremental delta walk \u2014 never\non an ordinary trigger, only here.\n\nReturns ``queued_count`` \u2014 the number of backlog items this call is\nabout to replay, read from the connection's PERSISTED crawl state before\nthe job is enqueued (a job result is not available synchronously, and an\nadmin asking \"did this do anything?\" should not have to go find out).\n``0`` when the backlog is empty is a normal, successful answer, not an\nerror \u2014 the run still completes (its ordinary delta walk is harmless),\nit simply has nothing to replay.\n\nSame preconditions and dedup as :func:`trigger_extraction`: ``404`` for\nan unknown/non-SharePoint connection, ``409 extraction_disabled`` /\n``409 extraction_dependencies_missing`` when the feature isn't usable,\nand the SAME per-connection idempotency key \u2014 a retry-empty run can\nnever overlap an ordinary trigger (or another retry-empty run) for the\nsame connection, since both mutate the same crawl state file.",
+        "operationId": "retry_empty_extraction_api_admin_sharepoint_connections__connection_id__extraction_retry_empty_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry Empty Extraction",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/runs": {
       "get": {
         "description": "A2 \u2014 the run-history drawer's rows, newest first.\n\n``total`` is every recorded run, not just the returned page, so \"5 more\nruns\" is never a silent truncation.",
