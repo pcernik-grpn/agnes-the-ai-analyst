@@ -146,6 +146,108 @@
     metaEl.textContent = bits.join(' · ');
   }
 
+  /* ── Markdown pipe tables, drawn as grids ───────────────────────────────
+   *  Why here and not a markdown renderer: the ingest pipeline converts
+   *  spreadsheets to markdown, so a .xlsx that arrives through a crawl (as
+   *  opposed to an upload the `sheets` branch handles) previews as a pipe
+   *  table — and in a <pre> that is unreadable. Tables are the one markdown
+   *  construct whose source is materially worse than its rendering, and they
+   *  are the one that can be drawn with no HTML at all: every cell below goes
+   *  in through textContent. Rendering the REST of markdown would need a
+   *  sanitizer on this surface (see chat.js's renderMarkdownSafe and the
+   *  security playbook), so the prose keeps its honest source view. */
+
+  /* How many body rows one table draws. A crawled workbook can convert to
+   * thousands, and the modal is a glance. */
+  var TABLE_ROW_CAP = 200;
+
+  /* Cell values are drawn VERBATIM, `Unnamed: 3` and `NaN` included, even
+   * though those are what #2141 called noise. They are the converted file's
+   * real bytes — the text an agent is given when it reads this file — so a
+   * previewer that quietly blanked them would show the reader something the
+   * agent never sees, and "why did it answer that?" would have one fewer
+   * place to look. The complaint was that the table was unreadable as a WALL
+   * of pipes; drawing it as a grid answers that without editing the file. */
+
+  /* A GFM delimiter row: only pipes, dashes, colons and space. It is what
+   * separates a real table from a line that merely contains a `|`. */
+  function isDelimiterRow(line) {
+    return line.indexOf('|') !== -1 && line.indexOf('-') !== -1 && /^[\s|:-]+$/.test(line);
+  }
+
+  function splitCells(line) {
+    var s = line.trim();
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.charAt(s.length - 1) === '|') s = s.slice(0, -1);
+    var cells = [];
+    var cur = '';
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === '\\' && s.charAt(i + 1) === '|') { cur += '|'; i++; continue; }
+      if (ch === '|') { cells.push(cur.trim()); cur = ''; continue; }
+      cur += ch;
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+
+  /* Text -> a list of {kind:'text', text} and {kind:'table', head, rows,
+   * clipped} blocks, in document order. No table found means one text block,
+   * i.e. exactly the <pre> this always rendered. */
+  function splitMarkdownTables(text) {
+    var lines = String(text).split('\n');
+    var blocks = [];
+    var buf = [];
+    var i = 0;
+    function flush() {
+      if (buf.length) { blocks.push({ kind: 'text', text: buf.join('\n') }); buf = []; }
+    }
+    while (i < lines.length) {
+      var head = lines[i];
+      if (head.indexOf('|') !== -1 && i + 1 < lines.length && isDelimiterRow(lines[i + 1])) {
+        var rows = [];
+        var clipped = false;
+        var j = i + 2;
+        while (j < lines.length && lines[j].trim() !== '' && lines[j].indexOf('|') !== -1) {
+          if (rows.length < TABLE_ROW_CAP) rows.push(splitCells(lines[j]));
+          else clipped = true;
+          j++;
+        }
+        flush();
+        blocks.push({ kind: 'table', head: splitCells(head), rows: rows, clipped: clipped });
+        i = j;
+        continue;
+      }
+      buf.push(head);
+      i++;
+    }
+    flush();
+    return blocks;
+  }
+
+  function tableNode(block) {
+    var wrap = el('div', 'fp-sheet__wrap');
+    var table = el('table', 'fp-sheet__grid');
+    var thead = document.createElement('thead');
+    var htr = document.createElement('tr');
+    (block.head || []).forEach(function (cell) {
+      var th = el('th', null, cell);
+      th.setAttribute('scope', 'col');
+      htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    (block.rows || []).forEach(function (cells) {
+      var tr = document.createElement('tr');
+      (cells || []).forEach(function (cell) { tr.appendChild(el('td', null, cell)); });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
   function render(ui, data, opts) {
     ui.body.textContent = '';
     ui.note.textContent = '';
@@ -240,9 +342,41 @@
     }
 
     if (data.kind === 'text') {
-      ui.body.appendChild(el('pre', 'fp-text', data.text || ''));
+      var text = data.text || '';
+      var blocks = splitMarkdownTables(text);
+      var hasTable = false;
+      var clippedRows = false;
+      var i;
+      for (i = 0; i < blocks.length; i++) if (blocks[i].kind === 'table') hasTable = true;
+      if (hasTable) {
+        // A converted spreadsheet arrives here as a markdown pipe table, and
+        // in a <pre> it is a wall of `|` — the reader has to reconstruct the
+        // grid by eye (#2141 item 4). Drawn as a real table it reads like the
+        // `sheets` preview a native .xlsx gets, which is what it IS. Prose
+        // between tables keeps the source view: rendering the rest of
+        // markdown would mean an HTML sanitizer this surface does not have,
+        // and a half-rendered document is worse than an honest source view.
+        var wrap = el('div', 'fp-blocks');
+        for (i = 0; i < blocks.length; i++) {
+          var b = blocks[i];
+          if (b.kind === 'table') {
+            if (b.clipped) clippedRows = true;
+            wrap.appendChild(tableNode(b));
+          } else if (b.text.trim()) {
+            wrap.appendChild(el('pre', 'fp-text', b.text.replace(/^\n+|\n+$/g, '')));
+          }
+        }
+        ui.body.appendChild(wrap);
+      } else {
+        ui.body.appendChild(el('pre', 'fp-text', text));
+      }
+      // The note has to say WHICH view this is. It said nothing for a source
+      // view of a textual upload, so a markdown file's raw `#`/`|` read as a
+      // broken renderer rather than as the file's own bytes.
       var notes = [];
       if (data.source === 'extracted') notes.push('Extracted text — not the original layout.');
+      else notes.push(hasTable ? 'File contents, with its tables drawn as grids.' : 'File contents, as written.');
+      if (clippedRows) notes.push('Long tables show their first rows.');
       if (data.truncated) notes.push('Showing the beginning of the file.');
       ui.note.textContent = notes.join(' ');
       return;
