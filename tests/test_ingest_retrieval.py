@@ -194,3 +194,107 @@ def test_retrieval_mode_never_loads_the_model(monkeypatch):
 
     monkeypatch.setattr(embeddings, "_model", object())  # resolved: loaded model
     assert retrieval_mode() == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# #2151: rank_chunks accepts a pre-computed q_vec (search_with_meta's
+# two-phase shortlist calls embed_query exactly once, up front, instead of
+# letting rank_chunks call it again internally).
+# ---------------------------------------------------------------------------
+
+
+def test_rank_chunks_uses_precomputed_q_vec_over_calling_embed_query(monkeypatch):
+    import src.ingest.retrieval as retrieval
+
+    def _boom(_q):
+        raise AssertionError("rank_chunks must not call embed_query when q_vec is given")
+
+    monkeypatch.setattr(retrieval, "embed_query", _boom)
+    chunks = [
+        {"id": "a", "file_id": "f1", "text": "no lexical overlap", "embedding": [1.0] + [0.0] * 383},
+        {"id": "b", "file_id": "f2", "text": "no lexical overlap either", "embedding": [0.0] * 384},
+    ]
+    top, _confidence = retrieval.rank_chunks(chunks, "zzz-query-with-no-overlap", q_vec=[1.0] + [0.0] * 383)
+    assert top
+    assert top[0][1]["id"] == "a"
+
+
+def test_rank_chunks_default_still_calls_embed_query(monkeypatch):
+    """Backward compatibility: every existing caller (search_with_meta with
+    no embeddings, src.search.local, scripts/bench_retrieval.py) omits
+    q_vec and relies on rank_chunks calling embed_query itself."""
+    import src.ingest.retrieval as retrieval
+
+    calls = []
+    monkeypatch.setattr(retrieval, "embed_query", lambda q: calls.append(q) or None)
+    retrieval.rank_chunks([{"id": "a", "file_id": "f1", "text": "hello"}], "hello")
+    assert calls == ["hello"]
+
+
+# ---------------------------------------------------------------------------
+# #2151: search_with_meta's two-phase shortlist — fetch text-only, rank
+# lexically to a shortlist, fetch embeddings ONLY for the shortlist.
+# ---------------------------------------------------------------------------
+
+
+def test_search_with_meta_shortlists_before_fetching_embeddings(e2e_env, monkeypatch):
+    """With a query vector available, the candidate set handed to the final
+    ranking must have come through the embeddings-by-id phase — proven here
+    by a corpus whose ONLY embedded chunk is lexically irrelevant (so it
+    would never be re-ranked to the top without a real vector attached)."""
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "embed_query", lambda q: [1.0] + [0.0] * 383)
+    cid = _seed(
+        "rs-shortlist",
+        [
+            {"ordinal": 0, "text": "alpha beta gamma", "embedding": [1.0] + [0.0] * 383},
+            {"ordinal": 1, "text": "delta epsilon zeta", "embedding": [0.0] * 384},
+        ],
+    )
+    meta = retrieval.search_with_meta([cid], "no-lexical-overlap-query")
+    assert meta["results"]
+    assert meta["results"][0]["ordinal"] == 0
+    assert meta["truncated"] is False
+
+
+def test_search_with_meta_shortlist_excludes_low_lexical_rank_from_vector_rerank(e2e_env, monkeypatch):
+    """Documents the accepted approximation (#2151): only the top
+    ``_VECTOR_SHORTLIST_SIZE`` lexical candidates ever get a vector fetched
+    and considered, so a chunk with zero lexical overlap that would have
+    won on pure cosine similarity is invisible once the shortlist is
+    smaller than the corpus — proven with a shortlist forced down to 1."""
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_VECTOR_SHORTLIST_SIZE", 1)
+    monkeypatch.setattr(retrieval, "embed_query", lambda q: [1.0] + [0.0] * 383)
+    cid = _seed(
+        "rs-shortlist-miss",
+        [
+            # Lexically strongest (matches the query terms) but orthogonal
+            # vector — wins the shortlist slot, then loses on cosine.
+            {"ordinal": 0, "text": "shared query terms shared query terms", "embedding": [0.0] * 384},
+            # Perfectly aligned vector but ZERO lexical overlap — excluded
+            # from the size-1 shortlist before it ever gets a vector fetch.
+            {"ordinal": 1, "text": "nothing matches here at all", "embedding": [1.0] + [0.0] * 383},
+        ],
+    )
+    meta = retrieval.search_with_meta([cid], "shared query terms")
+    ordinals = {r["ordinal"] for r in meta["results"]}
+    assert 1 not in ordinals  # the vector-best candidate never got a chance
+
+
+def test_search_with_meta_small_corpus_matches_search(e2e_env):
+    """Regression pin: for a corpus under both the shortlist size and the
+    chunk cap, search_with_meta's results must be identical to plain
+    search() (and, transitively, to the pre-#2151 behavior)."""
+    from src.ingest.retrieval import search, search_with_meta
+
+    cid = _seed(
+        "rs-parity",
+        [
+            {"ordinal": 0, "text": "the quick brown fox jumps over"},
+            {"ordinal": 1, "text": "completely unrelated weather report"},
+        ],
+    )
+    assert search_with_meta([cid], "brown fox")["results"] == search([cid], "brown fox")
