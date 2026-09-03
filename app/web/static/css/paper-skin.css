@@ -111,8 +111,13 @@
 /* filter_toolbar.css's decorative "▾" is drawn for every `.fbar-select`
    unconditionally (other, not-yet-converted selects still need it) — hide it
    only where a claimed ds-dropdown supplies its own chevron, or paper would
-   show two. */
-[data-theme="paper"] .fbar-select:has(> .ds-dropdown[data-ds-dropdown-target])::after {
+   show two. `.sk-selectwrap` (the Skill builder's Category field) draws the
+   same decorative chevron and needs the same guard: its wrapper is
+   full-width while the branded button is not, so the orphaned glyph did not
+   merely double up — it sat alone at the far right of the row, hundreds of
+   pixels from the control it belonged to. */
+[data-theme="paper"] .fbar-select:has(> .ds-dropdown[data-ds-dropdown-target])::after,
+[data-theme="paper"] .sk-selectwrap:has(> .ds-dropdown[data-ds-dropdown-target])::after {
     display: none;
 }
 /* ── Cards — hairline border, hover lift ──────────────────────── */
