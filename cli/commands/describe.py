@@ -11,6 +11,7 @@ real analyst session following the CLAUDE.md "agent rails" workflow.
 
 import json as json_lib
 import typer
+from cli.query_hints import row_scope_note
 from cli.v2_client import api_get_json, V2ClientError
 
 
@@ -34,6 +35,14 @@ def describe(
         else:
             typer.echo(f"Error: describe failed: {e}", err=True)
         raise typer.Exit(5 if e.status_code >= 500 else 8 if e.status_code == 403 else 2)
+
+    # Table access policies (§10): `sample.row_scope` is present when this
+    # table's rows are filtered by an access policy -- disclose it the same
+    # way `agnes query` does, unconditionally on stderr so `--json` stdout
+    # stays a clean parse of the full schema+sample payload.
+    scope_note = row_scope_note(sam.get("row_scope"))
+    if scope_note:
+        typer.echo(scope_note, err=True)
 
     if json:
         typer.echo(json_lib.dumps({"schema": sch, "sample": sam}, indent=2, default=str))
