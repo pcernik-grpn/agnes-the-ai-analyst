@@ -6014,6 +6014,209 @@ class TestRetryUsesTheConversionPool:
         assert "convert_pool=convert_pool" in call, "_crawl_drive must pass its run's pool into the backlog replay"
 
 
+class TestCrawlTargetsShardSeam:
+    """``_crawl_targets`` / ``_ScopeContext.legacy_ctags`` / the shard
+    exclude-prefix merge (2026-09-03 auto-parallel-crawl design, Task 1) —
+    the seam a shard child's own crawl (Task 4) reuses. Exercised directly
+    here since ``run_builtin_crawl``'s payload has no way to hand in a
+    shard's own exclude prefixes or a legacy-ctag seed; ``_crawl_targets``
+    itself is exercised end-to-end by every OTHER test in this module
+    through `_run_crawl_async`'s inline call (`state_for`/`save_for`
+    ignoring their target)."""
+
+    @staticmethod
+    def _minimal_state() -> Dict[str, Any]:
+        return {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+    def _transport(self, stats: "crawler.CrawlStats") -> "crawler.GraphTransport":
+        auth = crawler.GraphAuth(acquire=lambda: gc.get_app_token("t1", "c1", "pem"), stats=stats)
+        return crawler.GraphTransport(auth, stats)
+
+    def _crawl(self, ctx, target, state, **overrides: Any) -> "crawler.CrawlStats":
+        stats = overrides.pop("stats", None) or crawler.CrawlStats()
+        ingestor = overrides.pop("ingestor")
+        kwargs: Dict[str, Any] = dict(
+            targets_by_scope=[(ctx, [target])],
+            transport=self._transport(stats),
+            ingestor=ingestor,
+            stats=stats,
+            max_file_mb=50,
+            anonymization_key=None,
+            recorder=None,
+            detector=None,
+            deadline=None,
+            governor=crawler._ConcurrencyGovernor(1),
+            stop_watcher=None,
+            convert_pool=None,
+            force_reprocess=False,
+            retry_failed=False,
+            retry_empty=False,
+            state_for=lambda _t: state,
+            save_for=lambda _t, _s: None,
+        )
+        kwargs.update(overrides)
+        asyncio.run(crawler._crawl_targets("conn1", **kwargs))
+        return stats
+
+    def test_shard_exclude_prefixes_skip_the_subtree_and_persist_only_that_key(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            "excluded1",
+                            name="secret.docx",
+                            parent_path="/drives/b!drive1/root:/Reports/Excluded",
+                        ),
+                        _file_item("kept1", name="keep.docx", parent_path="/drives/b!drive1/root:/Reports"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        exclusions = crawler._exclusion_index_with_extra_prefixes(crawler._ExclusionIndex(), ["Reports/Excluded"])
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1", collection_id="col1", anonymize=False, exclusions=exclusions
+        )
+        ingestor = FakeIngestor()
+        state = self._minimal_state()
+
+        stats = self._crawl(ctx, target, state, ingestor=ingestor)
+
+        assert [row["stable_id"] for row in ingestor.ingested] == ["graph:kept1"]
+        assert stats.excluded_subtree_skips == 1
+        # ONE state-row key, for THIS target's own state_key — the shard
+        # never touches a sibling's cursor.
+        assert set(state["delta_links"]) == {"b!drive1"}
+
+    def test_legacy_ctag_fallback_counts_unchanged_without_downloading(self, crawl_env, monkeypatch):
+        seen = _install_graph(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={"value": [_file_item("item1", ctag="ctag-1")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            ),
+        )
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1",
+            collection_id="col1",
+            anonymize=False,
+            exclusions=crawler._ExclusionIndex(),
+            legacy_ctags={"graph:item1": "ctag-1"},
+        )
+        ingestor = FakeIngestor()
+        # THIS shard's own row has never seen the item — only the legacy
+        # connection-level seed knows its cTag.
+        state = self._minimal_state()
+
+        stats = self._crawl(ctx, target, state, ingestor=ingestor)
+
+        assert ingestor.ingested == []
+        assert stats.unchanged == 1
+        assert not any(url.endswith("/content") for url in seen)
+        # A cache hit never writes the seed back into the active state.
+        assert state["ctags"] == {}
+
+
+class TestFolderShardDeleteGuard:
+    """``_process_item``'s ``deleted`` branch, folder-shard case (2026-09-03
+    auto-parallel-crawl design §6): a delete observed by a shard whose OWN
+    state row never saw an add/change for that item must not touch the
+    collection — it may be a sibling shard's item that simply moved."""
+
+    def _delete_item(self) -> Dict[str, Any]:
+        return {"id": "item1", "name": "brief.docx", "deleted": {"state": "deleted"}}
+
+    def test_skips_the_delete_when_this_shards_own_ctags_never_saw_it(self, crawl_env, monkeypatch):
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive", root_item_id="folder1")
+        ctx = crawler._ScopeContext(
+            source_scope_id="folder1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"  # ingested by a sibling shard
+        state = {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == []
+        assert stats.deleted == 0
+
+    def test_applies_the_delete_when_this_shards_own_ctags_has_it(self, crawl_env, monkeypatch):
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive", root_item_id="folder1")
+        ctx = crawler._ScopeContext(
+            source_scope_id="folder1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"
+        state = {"delta_links": {}, "ctags": {"graph:item1": "ctag-1"}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == ["graph:item1"]
+        assert stats.deleted == 1
+
+    def test_whole_drive_target_keeps_todays_unconditional_delete(self, crawl_env, monkeypatch):
+        """A whole-drive target (no ``root_item_id``) is never split into
+        shards this way — the guard must not change its behaviour."""
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"
+        state = {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == ["graph:item1"]
+        assert stats.deleted == 1
+
+
 def test_the_converted_size_cap_is_reachable_by_the_converter():
     """A byte ceiling above what the converter can emit guards nothing.
 

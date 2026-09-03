@@ -104,7 +104,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -734,11 +734,19 @@ class _RunRecorder:
     message.
     """
 
-    def __init__(self, connection_id: str, *, job_id: Optional[str] = None) -> None:
+    def __init__(self, connection_id: str, *, job_id: Optional[str] = None, sweep_stale: bool = True) -> None:
         self.connection_id = connection_id
         self.job_id = job_id
         self.run_id: Optional[str] = None
         self._repo: Any = None
+        #: Whether :meth:`start` sweeps this connection's leftover `running`
+        #: rows before opening a new one (see `abandon_stale_running`).
+        #: ``True`` (today's behaviour) for a whole-connection or PARENT run;
+        #: a shard CHILD run (2026-09-03 auto-parallel-crawl design §4.3)
+        #: passes ``False`` — a sibling shard's still-`running` row for the
+        #: SAME connection is not abandoned, it is a peer, and sweeping it
+        #: here would race the peer's own finalize.
+        self._sweep_stale = sweep_stale
         # Bookkeeping for `maybe_checkpoint` — a SEPARATE, rate-limited
         # sibling of `checkpoint`, never the crawl's own resume state.
         self._progress_lock = threading.Lock()
@@ -782,20 +790,23 @@ class _RunRecorder:
         # previous worker's crawl that died without ever calling `finish`.
         # Closing it now is what stops the source card from reading a
         # run that will never move again (see `abandon_stale_running`).
-        try:
-            abandoned = repo.abandon_stale_running(self.connection_id)
-            if abandoned:
-                logger.warning(
-                    "sharepoint crawl: closed %d abandoned run row(s) for connection %s before starting a new one",
-                    len(abandoned),
+        # Skipped when `_sweep_stale` is False — a shard child's siblings
+        # are legitimately still `running` for the same connection.
+        if self._sweep_stale:
+            try:
+                abandoned = repo.abandon_stale_running(self.connection_id)
+                if abandoned:
+                    logger.warning(
+                        "sharepoint crawl: closed %d abandoned run row(s) for connection %s before starting a new one",
+                        len(abandoned),
+                        self.connection_id,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never blocks the new run
+                logger.debug(
+                    "sharepoint crawl: could not sweep abandoned runs for connection %s (%s) — continuing",
                     self.connection_id,
+                    type(exc).__name__,
                 )
-        except Exception as exc:  # noqa: BLE001 — never blocks the new run
-            logger.debug(
-                "sharepoint crawl: could not sweep abandoned runs for connection %s (%s) — continuing",
-                self.connection_id,
-                type(exc).__name__,
-            )
         try:
             self.run_id = repo.start(
                 connection_id=self.connection_id,
@@ -2181,6 +2192,25 @@ async def _excluded_path_prefixes(transport: GraphTransport, scope: Dict[str, An
     )
 
 
+def _exclusion_index_with_extra_prefixes(index: _ExclusionIndex, extra: Sequence[str]) -> _ExclusionIndex:
+    """A copy of ``index`` with ``extra`` folder-prefix exclusions merged in
+    on top of whatever the scope's own ``excluded_subtrees`` already
+    excludes — the remainder-shard mechanism (2026-09-03 auto-parallel-crawl
+    design §4.1 point 3): a remainder shard's ``exclude_prefixes`` (every
+    folder path a sibling shard already owns) must be respected the SAME way
+    an ordinary ``kind=="folder"`` exclusion is (:func:`_under_prefix`,
+    applied in :func:`_process_item`), never a second, separate check.
+    ``extra`` empty (every caller before sharding existed) returns ``index``
+    unchanged, not a copy."""
+    if not extra:
+        return index
+    return _ExclusionIndex(
+        folder_prefixes=tuple(index.folder_prefixes) + tuple(extra),
+        file_paths=index.file_paths,
+        file_ids=index.file_ids,
+    )
+
+
 # --------------------------------------------------------------------------
 # Item handling
 # --------------------------------------------------------------------------
@@ -2314,6 +2344,17 @@ class _ScopeContext:
     #: on the scope context because that is what every per-item pipeline
     #: already has in hand.
     min_modified: Optional[date] = None
+    #: ``stable_id -> cTag`` seed from the CONNECTION-level ``crawl`` state
+    #: row, consulted read-only when a shard's own per-delta-unit state row
+    #: has no entry yet (2026-09-03 auto-parallel-crawl design §4.2): sharding
+    #: an already-crawled drive must re-enumerate it (a shard's own state row
+    #: starts empty) without re-downloading every file that has not actually
+    #: changed. Empty for the inline (unsharded) path, where the single
+    #: connection-wide state dict already IS ``ctags`` and this would be
+    #: redundant. Never written to — only :func:`_process_item`'s "already
+    #: seen" check reads it, and only the ACTIVE state's own ``ctags`` is
+    #: ever updated on success.
+    legacy_ctags: Mapping[str, str] = field(default_factory=dict)
 
     def candidate_collection_ids(self, drive_id: str) -> List[str]:
         """This scope's own collection, then every zone collection this
@@ -3842,6 +3883,18 @@ async def _process_item(
     ctags: Dict[str, Any] = state["ctags"]
 
     if item.get("deleted"):
+        if target.root_item_id is not None and stable_id not in ctags:
+            # Folder-shard delete guard (2026-09-03 auto-parallel-crawl
+            # design §6): an item that moved between shards mid-run can
+            # surface a `deleted` row on a NEIGHBOUR shard's delta feed
+            # before (or without) ever appearing as an add/change on THIS
+            # shard's own state row. Applying the delete here would risk
+            # removing a document a sibling shard just ingested into the
+            # same collection. Only the shard whose own `ctags` carries the
+            # item may act on its delete — a whole-drive target (no
+            # `root_item_id`) is never split this way, so it keeps today's
+            # unconditional behaviour.
+            return
         for candidate in ctx.candidate_collection_ids(target.drive_id):
             if await _run_blocking(pool, ingestor.delete, candidate, stable_id):
                 stats.add(deleted=1)
@@ -3886,7 +3939,13 @@ async def _process_item(
 
     ctag = item.get("cTag") or item.get("eTag")
     with _state_lock:
-        already = bool(ctag) and ctags.get(stable_id) == ctag and not force_reprocess
+        # `ctx.legacy_ctags` (empty on the inline path) is a READ-ONLY seed
+        # from the connection-level state, consulted only when THIS shard's
+        # own row has no entry yet — see `_ScopeContext.legacy_ctags`'s
+        # docstring. Never written back to; a success below still only ever
+        # updates the ACTIVE `ctags` (this target's own state).
+        seen_ctag = ctags.get(stable_id) or ctx.legacy_ctags.get(stable_id)
+        already = bool(ctag) and seen_ctag == ctag and not force_reprocess
     if already:
         stats.add(unchanged=1)
         return
@@ -4431,6 +4490,7 @@ async def _retry_failed_items(
     recorder: Optional["_RunRecorder"],
     convert_pool: Optional[_ConvertProcessPool] = None,
     include_given_up: bool = False,
+    save_state_fn: Optional[Callable[[], None]] = None,
 ) -> None:
     """Replay every item THIS drive previously failed on, before asking
     Graph for what changed.
@@ -4461,7 +4521,14 @@ async def _retry_failed_items(
     backlog is normally tiny (persistently-failing files, not a fresh
     page), and giving it its own governor/pool would buy nothing but risk
     for a path this rarely used.
+
+    ``save_state_fn`` (optional) persists ``state`` in place of the module's
+    own :func:`save_state` — the shard-crawl seam (2026-09-03 auto-parallel-
+    crawl design §4.2): a shard child writes its OWN per-delta-unit state row
+    (``kind='crawl:<state_key>'``), never the whole-connection row. ``None``
+    (every caller before sharding existed) keeps today's behaviour exactly.
     """
+    _save = save_state_fn or (lambda: save_state(connection_id, state))
     failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
     pending = [
         (stable_id, entry)
@@ -4507,7 +4574,7 @@ async def _retry_failed_items(
             stats.exit_item(time.monotonic() - started)
         stats.add(items_done=1)
     with _state_lock:
-        save_state(connection_id, state)
+        _save()
     if recorder is not None:
         recorder.checkpoint(stats)
 
@@ -4528,6 +4595,7 @@ async def _retry_empty_items(
     recorder: Optional["_RunRecorder"],
     convert_pool: Optional[_ConvertProcessPool] = None,
     run: bool = False,
+    save_state_fn: Optional[Callable[[], None]] = None,
 ) -> None:
     """Replay every item THIS drive previously converted to ``convert_empty``
     — the targeted counterpart to :func:`_retry_failed_items`, for the
@@ -4550,9 +4618,13 @@ async def _retry_empty_items(
     still yields nothing) re-records itself via :func:`_note_empty` inside
     :func:`_process_item` exactly as an ordinary crawl would; one that
     finally produces text is cleared (:func:`_clear_empty`) and ingested.
+
+    ``save_state_fn`` — see :func:`_retry_failed_items`'s docstring; same
+    shard-crawl seam, same default.
     """
     if not run:
         return
+    _save = save_state_fn or (lambda: save_state(connection_id, state))
     empty_items: Dict[str, Any] = state.setdefault("empty_items", {})
     pending = [
         (stable_id, entry)
@@ -4590,7 +4662,7 @@ async def _retry_empty_items(
             stats.exit_item(time.monotonic() - started)
         stats.add(items_done=1)
     with _state_lock:
-        save_state(connection_id, state)
+        _save()
     if recorder is not None:
         recorder.checkpoint(stats)
 
@@ -4615,6 +4687,7 @@ async def _crawl_drive(
     convert_pool: Optional[_ConvertProcessPool] = None,
     retry_failed: bool = False,
     retry_empty: bool = False,
+    save_state_fn: Optional[Callable[[], None]] = None,
 ) -> None:
     """Delta-enumerate one drive (or one folder subtree), resuming from its
     persisted ``deltaLink``.
@@ -4654,7 +4727,14 @@ async def _crawl_drive(
     :func:`_process_page`: by the time a page returns its own
     item-concurrency thread pool (if any) has already been joined, which is
     exactly the single-threaded window a fork-based repair needs — see
-    ``_ConvertProcessPool``'s docstring."""
+    ``_ConvertProcessPool``'s docstring.
+
+    ``save_state_fn`` (optional) persists ``state`` in place of the module's
+    own :func:`save_state` — see :func:`_retry_failed_items`'s docstring for
+    the shard-crawl seam this exists for. Threaded straight through to both
+    retry helpers below, so this drive's backlog replays and its ordinary
+    delta walk always land in the SAME row."""
+    _save = save_state_fn or (lambda: save_state(connection_id, state))
     governor = governor or _ConcurrencyGovernor(1)
     delta_links: Dict[str, Any] = state["delta_links"]
     base = f"{target.delta_url}?$top={_DELTA_PAGE_SIZE}"
@@ -4679,6 +4759,7 @@ async def _crawl_drive(
         recorder=recorder,
         convert_pool=convert_pool,
         include_given_up=retry_failed,
+        save_state_fn=_save,
     )
     # The `convert_empty` counterpart — a no-op unless this run was an
     # explicit `retry_empty` request (see `_retry_empty_items`'s own
@@ -4698,6 +4779,7 @@ async def _crawl_drive(
         recorder=recorder,
         convert_pool=convert_pool,
         run=retry_empty,
+        save_state_fn=_save,
     )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
     # fetch, so a 429 storm on the page request itself counts as the tenant
@@ -4727,7 +4809,7 @@ async def _crawl_drive(
                 raise
             with _state_lock:
                 delta_links.pop(target.state_key, None)
-                save_state(connection_id, state)
+                _save()
             stats.add(delta_resyncs=1)
             resynced = True
             logger.info(
@@ -4798,11 +4880,11 @@ async def _crawl_drive(
             # enforced by the lock, not by an argument about who is running.
             with _state_lock:
                 delta_links[target.state_key] = _require_graph_url(str(delta_link))
-                save_state(connection_id, state)
+                _save()
             url = None
         else:
             next_link = page.get("@odata.nextLink")
-            save_state(connection_id, state)
+            _save()
             url = _require_graph_url(str(next_link)) if next_link else None
         # The SAME state-checkpoint boundary, a second destination (design
         # §7.1) — and, unlike `_process_page`'s per-item `maybe_checkpoint`
@@ -5356,6 +5438,7 @@ async def _run_crawl_async(
     force_reprocess: bool = False,
     retry_failed: bool = False,
     retry_empty: bool = False,
+    clear_stale_stop: bool = True,
 ) -> Dict[str, Any]:
     connection_id = str(connection["id"])
     # A stop requested for a PREVIOUS run (already finished, failed, or one
@@ -5363,10 +5446,18 @@ async def _run_crawl_async(
     # one — clear it unconsumed, at the very start, before anything else.
     # Best-effort: a repo hiccup here must not block the run it is trying to
     # let start cleanly.
-    try:
-        _clear_stale_stop(connection_id)
-    except Exception as exc:  # noqa: BLE001 — never load-bearing
-        logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
+    #
+    # ``clear_stale_stop=False`` (2026-09-03 auto-parallel-crawl design §4.3)
+    # is a SHARD CHILD's own call: the cooperative stop flag is connection-
+    # wide, and clearing it here would erase a stop an admin requested WHILE
+    # this connection's parent run was busy planning/enqueuing siblings —
+    # only the PARENT (planner) run owns this clear, once, per top-level
+    # trigger.
+    if clear_stale_stop:
+        try:
+            _clear_stale_stop(connection_id)
+        except Exception as exc:  # noqa: BLE001 — never load-bearing
+            logger.debug("sharepoint crawl: could not clear a stale stop flag for %s: %s", connection_id, exc)
     stop_watcher = _StopWatcher(connection_id)
     scopes = _confirmed_scopes(connection)
     if only_scope_ids:
@@ -5481,27 +5572,33 @@ async def _run_crawl_async(
                 # second axis mostly converts into 429s against the same tenant
                 # rather than into throughput. In-page concurrency already
                 # saturates a 200-row page. Correctness beats the second axis.
-                for target in targets:
-                    await _crawl_drive(
-                        target,
-                        ctx=ctx,
-                        transport=transport,
-                        ingestor=ingestor,
-                        connection_id=connection_id,
-                        state=state,
-                        stats=stats,
-                        max_file_mb=max_file_mb,
-                        anonymization_key=anonymization_key,
-                        recorder=recorder,
-                        detector=detector,
-                        deadline=deadline,
-                        governor=governor,
-                        stop_watcher=stop_watcher,
-                        convert_pool=convert_pool,
-                        force_reprocess=force_reprocess,
-                        retry_failed=retry_failed,
-                        retry_empty=retry_empty,
-                    )
+                #
+                # `_crawl_targets` is the shared body with a shard child's own
+                # crawl (2026-09-03 auto-parallel-crawl design, Task 1/4) — on
+                # THIS, the inline (whole-connection) path, every target
+                # shares the SAME connection-wide `state` dict and the SAME
+                # `save_state`, exactly today's behaviour; `state_for`/
+                # `save_for` ignore the target they are handed.
+                await _crawl_targets(
+                    connection_id,
+                    targets_by_scope=[(ctx, targets)],
+                    transport=transport,
+                    ingestor=ingestor,
+                    stats=stats,
+                    max_file_mb=max_file_mb,
+                    anonymization_key=anonymization_key,
+                    recorder=recorder,
+                    detector=detector,
+                    deadline=deadline,
+                    governor=governor,
+                    stop_watcher=stop_watcher,
+                    convert_pool=convert_pool,
+                    force_reprocess=force_reprocess,
+                    retry_failed=retry_failed,
+                    retry_empty=retry_empty,
+                    state_for=lambda _target: state,
+                    save_for=lambda _target, _state: save_state(connection_id, _state),
+                )
         finally:
             # Done converting for this run either way (success, a scope
             # error that propagated, a timeout, ...) — release the worker
@@ -5648,6 +5745,86 @@ async def _run_crawl_async(
         stats.oversize_files,
     )
     return report
+
+
+# --------------------------------------------------------------------------
+# Shard-crawl seam (2026-09-03 auto-parallel-crawl design, Task 1) — the body
+# shared between the inline whole-connection crawl above and a shard child's
+# crawl (Task 4, ``run_shard_crawl``). Appended here rather than inlined so
+# that neither caller's own body changes shape; see each parameter's
+# docstring below for the exact substitution each caller makes.
+# --------------------------------------------------------------------------
+
+
+async def _crawl_targets(
+    connection_id: str,
+    *,
+    targets_by_scope: Sequence[Tuple["_ScopeContext", Sequence[DriveTarget]]],
+    transport: GraphTransport,
+    ingestor: "_Ingestor",
+    stats: "CrawlStats",
+    max_file_mb: int,
+    anonymization_key: Optional[bytes],
+    recorder: Optional["_RunRecorder"],
+    detector: Any,
+    deadline: Optional["_Deadline"],
+    governor: "_ConcurrencyGovernor",
+    stop_watcher: Optional["_StopWatcher"],
+    convert_pool: Optional["_ConvertProcessPool"],
+    force_reprocess: bool,
+    retry_failed: bool,
+    retry_empty: bool,
+    state_for: Callable[[DriveTarget], Dict[str, Any]],
+    save_for: Callable[[DriveTarget, Dict[str, Any]], None],
+) -> None:
+    """Crawl every already-resolved ``(scope-context, targets)`` pair.
+
+    This is the ONE body :func:`_run_crawl_async` (the inline whole-
+    connection path) and :func:`run_shard_crawl` (Task 4 — a shard child's
+    own crawl, over a persisted plan's targets rather than a freshly-
+    resolved scope) both drive :func:`_crawl_drive` through — a caller never
+    duplicates the per-target state wiring below.
+
+    ``state_for(target)`` returns the state dict THIS target crawls with;
+    ``save_for(target, state)`` persists it. The inline caller passes the
+    single connection-wide ``state``/`` save_state`` for every target
+    (ignoring ``target`` — today's behaviour, unchanged). A shard child
+    passes a closure over its OWN per-delta-unit state row
+    (``kind='crawl:<target.state_key>'``, Task 2) — never the whole
+    connection's row, so two children never write the same row.
+
+    Every other argument rides straight through to :func:`_crawl_drive`
+    unchanged for every target in every scope — a shard child's crawl is
+    otherwise indistinguishable from the inline path's, by design.
+    """
+    for ctx, targets in targets_by_scope:
+        for target in targets:
+            state = state_for(target)
+
+            def _save(_target: DriveTarget = target, _state: Dict[str, Any] = state) -> None:
+                save_for(_target, _state)
+
+            await _crawl_drive(
+                target,
+                ctx=ctx,
+                transport=transport,
+                ingestor=ingestor,
+                connection_id=connection_id,
+                state=state,
+                stats=stats,
+                max_file_mb=max_file_mb,
+                anonymization_key=anonymization_key,
+                recorder=recorder,
+                detector=detector,
+                deadline=deadline,
+                governor=governor,
+                stop_watcher=stop_watcher,
+                convert_pool=convert_pool,
+                force_reprocess=force_reprocess,
+                retry_failed=retry_failed,
+                retry_empty=retry_empty,
+                save_state_fn=_save,
+            )
 
 
 def _apply_resync(connection_id: str) -> None:
