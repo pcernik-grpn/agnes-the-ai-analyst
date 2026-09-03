@@ -5841,8 +5841,10 @@ async def catalog_table_detail(
             columns = []
         else:
             if effective_cols is not None:
-                visible_names = {c["name"] for c in effective_cols if not c.get("hidden")}
-                columns = [c for c in columns if c["name"] in visible_names]
+                by_name = {c["name"]: c for c in effective_cols if not c.get("hidden")}
+                columns = [
+                    {**c, "masked": by_name[c["name"]].get("masked", False)} for c in columns if c["name"] in by_name
+                ]
 
     last_sync_state = sync_state_repo().get_table_state(table_id) or {}
 

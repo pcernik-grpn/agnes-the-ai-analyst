@@ -802,19 +802,17 @@ def effective_schema(table_id: str, principal) -> list[dict] | None:
     ``hidden`` -- the security-critical marker (§11), and the only one this
     function computes.
 
-    ``masked`` is deliberately NOT attempted. The obvious heuristic --
-    comparing type per matching name -- misses the design doc's own
-    canonical example (``md5(email) AS email``: VARCHAR in, VARCHAR out,
-    same name, no type signal at all), and can't even be applied cleanly
-    when a policy body's ``SELECT *`` isn't ALSO excluding the column it
-    re-derives: DuckDB accepts that (two columns literally named the same),
-    and this function dedupes by keeping the first occurrence rather than
-    guessing which one is "the masked one" from a post-hoc DESCRIBE diff.
-    Reliable masked-detection needs a static read of the policy body's own
-    SELECT-list expressions, not a DESCRIBE diff -- left for a follow-up
-    rather than shipping a marker that can be wrong on the exact example
-    the design doc leads with.
+    ``masked`` comes from a STATIC read of the policy body's own SELECT-list
+    expressions (``src.access_policy_schema.masked_output_columns``), not
+    from this DESCRIBE diff -- the obvious heuristic, comparing type per
+    matching name, misses the design doc's own canonical example
+    (``md5(email) AS email``: VARCHAR in, VARCHAR out, same name, no type
+    signal at all). A column absent entirely (``hidden``) and a column
+    ``masked_output_columns`` cannot name because the policy body failed to
+    parse both resolve to ``masked: False`` here -- this function never
+    guesses.
     """
+    from src.access_policy_schema import masked_output_columns
     from src.db import get_analytics_db_readonly
 
     relation = policied_relation(table_id, principal)
@@ -822,6 +820,7 @@ def effective_schema(table_id: str, principal) -> list[dict] | None:
         return None
 
     row = _resolve_table_row(relation.table_id)
+    masked_names = masked_output_columns(row.get("access_policy_sql") or "")
     base_ref = quote_ident(row["name"])
 
     conn = get_analytics_db_readonly()
@@ -853,10 +852,26 @@ def effective_schema(table_id: str, principal) -> list[dict] | None:
         seen_names.add(name)
         hit = effective_by_name.get(name)
         if hit is None:
-            columns.append({"name": name, "type": r[1], "nullable": r[2] == "YES", "description": "", "hidden": True})
+            columns.append(
+                {
+                    "name": name,
+                    "type": r[1],
+                    "nullable": r[2] == "YES",
+                    "description": "",
+                    "hidden": True,
+                    "masked": False,
+                }
+            )
         else:
             columns.append(
-                {"name": hit[0], "type": hit[1], "nullable": hit[2] == "YES", "description": "", "hidden": False}
+                {
+                    "name": hit[0],
+                    "type": hit[1],
+                    "nullable": hit[2] == "YES",
+                    "description": "",
+                    "hidden": False,
+                    "masked": hit[0].lower() in masked_names,
+                }
             )
 
     # A policy can also ADD a column no base column carries (e.g. pulled in
@@ -865,7 +880,16 @@ def effective_schema(table_id: str, principal) -> list[dict] | None:
     # policy body deliberately returns.
     for r in effective_rows:
         if r[0] not in seen_names:
-            columns.append({"name": r[0], "type": r[1], "nullable": r[2] == "YES", "description": "", "hidden": False})
+            columns.append(
+                {
+                    "name": r[0],
+                    "type": r[1],
+                    "nullable": r[2] == "YES",
+                    "description": "",
+                    "hidden": False,
+                    "masked": r[0].lower() in masked_names,
+                }
+            )
             seen_names.add(r[0])
 
     return columns
