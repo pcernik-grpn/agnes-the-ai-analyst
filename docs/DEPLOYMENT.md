@@ -20,10 +20,74 @@ Highlights:
 - Cron-based auto-upgrade (pulls `:stable` image digest every 5 min)
 - Caddy TLS with corporate-CA or self-managed certs mounted from `/data/state/certs`; daily auto-rotation from a URL (`TLS_FULLCHAIN_URL`) with zero-downtime `SIGUSR1` reload
 - Uptime check + alert policy per VM (wire a notification channel to be paged)
+- Opt-in Datadog host agent (`enable_datadog`) — see [Host monitoring with Datadog](#host-monitoring-with-datadog) below
 - CI/CD in the private repo: PR → `terraform plan`, merge to main → `apply-dev` auto, `apply-prod` gated by reviewer
 - First-boot bootstrap via `POST /auth/bootstrap`
 
 Target onboarding time: **< 1 hour** per customer.
+
+### Host monitoring with Datadog
+
+Off by default. `enable_datadog = true` makes the module install a pinned
+Datadog Agent as a **host package** on every VM in the call and render its check
+configs on every boot.
+
+**Before enabling**, create one Secret Manager secret holding a Datadog API key
+for the agent, and pass its NAME (not its value):
+
+```hcl
+enable_datadog         = true
+datadog_api_key_secret = "<customer>-datadog-agent-api-key"
+datadog_site           = "datadoghq.com"   # must match the key's org
+datadog_extra_tags     = ["repo:<your-infra-repo>"]
+extra_labels           = { env = var.gcp_project_id }
+```
+
+The module grants the VM service account `secretAccessor` on exactly that
+secret. The key is fetched at boot and written only into
+`/etc/datadog-agent/datadog.yaml` (`root:dd-agent`, `0640`) — it never enters
+`/opt/agnes/.env`, a command line, or Terraform state. Rotate it with
+`gcloud secrets versions add` followed by a reboot of the VM.
+
+What runs on the host:
+
+| Check | What it answers |
+|---|---|
+| core (cpu, memory, load, uptime, io, network) | host parameters |
+| `disk` | `/` and `/data` usage + inodes; a read-only `/data` remount surfaces as a failed RW check |
+| `docker` + `container` | daemon up, containers running, per-compose-service uptime/cpu/memory/OOM |
+| `systemd` | failed units, incl. the daily backup oneshot named by unit |
+| `directory` | heartbeat ages: state applier, auto-upgrade tick, newest completed backup, watchdog signature markers |
+| `http_check` | `/readyz` (status code), `/api/health` (body — that endpoint is always 200), and the port-80 ACME redirect |
+| `tls` | certificate expiry for the domain and any alias |
+| `postgres` | both side-cars, via Autodiscovery on the `postgres` image: liveness, connection headroom, database size, XID wraparound |
+
+Three things to know:
+
+- **`dd-agent` joins the `docker` group**, which is root-equivalent on this
+  host — the same posture the module already accepts for `agnes-applier`. The
+  rendered `datadog.yaml` turns off everything that could make that membership
+  remotely reachable: remote configuration, APM, logs, DogStatsD,
+  process/container/discovery collection, runtime security, compliance, SBOM,
+  image and lifecycle collection, and both inventory uploads. IPC binds to
+  loopback and container env vars never become tags.
+- **It reaches a running VM only through a recreate.** The agent is installed by
+  the startup script, and `metadata_startup_script` is in `ignore_changes`, so
+  enabling this on a live fleet produces the IAM binding and the labels with no
+  agent and no diff to show for it. Recreate the instance:
+  `terraform apply -replace='module.<name>.google_compute_instance.vm["<vm>"]'`
+  (~5-10 min of downtime; `/data` and the static IP survive).
+- **No thresholds live on the VM.** The checks report; monitors, dashboards and
+  notification targets belong in the caller's own Datadog Terraform. The
+  catalogue this design assumes — which signals are paging and which are
+  dashboard-only — is in
+  [`superpowers/specs/2026-09-03-datadog-host-monitoring-design.md`](superpowers/specs/2026-09-03-datadog-host-monitoring-design.md).
+
+The Postgres side-car check needs a monitoring role inside each container. A
+root-owned timer (`agnes-datadog-pg-role.timer`, every 15 min) creates a
+`datadog` role with `pg_monitor`, renders the check config with its password,
+and re-converges after a side-car volume is recreated. Verify a VM with
+`sudo datadog-agent status`.
 
 ## 2. Docker Compose — OSS self-host
 

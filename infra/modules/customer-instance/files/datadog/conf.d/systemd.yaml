@@ -1,0 +1,25 @@
+# systemd unit health for the host-side jobs the module installs.
+#
+# The units are listed explicitly instead of matched by pattern so a unit that
+# disappears (an unset toggle) surfaces as missing rather than silently
+# dropping out of the check. agnes-db-backup.service is a oneshot: "dead" and
+# "exited" are its healthy resting states, so only "failed" is critical.
+init_config: {}
+
+instances:
+  - unit_names:
+      - docker.service
+      - cron.service
+      - agnes-state-applier.timer
+      - agnes-watchdog.timer
+      - agnes-db-backup.timer
+      - agnes-db-backup.service
+      - agnes-datadog-pg-role.timer
+    substate_status_mapping:
+      agnes-db-backup.service:
+        failed: critical
+        dead: ok
+        exited: ok
+        running: ok
+        start: ok
+        auto-restart: warning
