@@ -889,3 +889,97 @@ def test_revoking_the_last_grant_reopens_the_source_KNOWN_TRAP(seeded_app):
         "documents the trap: removing the last grant re-opens the source to everyone"
     )
     assert seeded is not None
+
+
+# ── behaviour annotations + feature-gated listing (issue #2161) ───────────
+
+
+def _list_tools(caller_id):
+    """Like ``_list_names`` but returns the Tool objects (annotations too)."""
+    import asyncio
+
+    from mcp.server.fastmcp import FastMCP
+
+    from app.api.mcp.tools_generator import (
+        install_grant_filtered_list_tools,
+        register_passthrough_tools,
+    )
+
+    mcp = FastMCP("Test", instructions="t")
+    register_passthrough_tools(mcp)
+    filtered = install_grant_filtered_list_tools(mcp, caller_id_fn=lambda: caller_id)
+    return {t.name: t for t in asyncio.run(filtered())}
+
+
+def test_passthrough_tools_carry_read_only_hint_from_the_mutating_flag(seeded_app):
+    """The kai-agent engine's sandbox auto-approves an MCP tool only when its
+    ``tools/list`` entry says ``readOnlyHint: true`` and raises an approval
+    request for everything else. Passthrough registration used to carry no
+    annotations at all, so every passthrough search tool asked on every call
+    (issue #2161). The hint now follows ``tool_registry.mutating`` — the same
+    flag the passthrough policy gate enforces."""
+    _seed_two_tools_two_groups()  # lookup / private: mutating=False
+    _seed_mutating_tool()  # delete_all: mutating=True
+    tools = _list_tools("admin1")
+    assert tools["lookup"].annotations.readOnlyHint is True
+    assert tools["lookup"].annotations.destructiveHint is False
+    assert tools["delete_all"].annotations.readOnlyHint is False
+    assert tools["delete_all"].annotations.destructiveHint is True
+
+
+def test_list_exposes_the_mutating_flag_for_the_stdio_mirror(seeded_app):
+    """The stdio MCP server derives the same hint from the REST listing, so
+    the listing has to say which rows are mutating."""
+    _seed_two_tools_two_groups()
+    _seed_mutating_tool()
+    client = seeded_app["client"]
+    resp = client.get(
+        "/api/mcp/passthrough/tools",
+        headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+    )
+    assert resp.status_code == 200
+    by_name = {t["exposed_name"]: t for t in resp.json()}
+    assert by_name["lookup"]["mutating"] is False
+    assert by_name["delete_all"]["mutating"] is True
+
+
+def _facts_listing(monkeypatch, flag: str) -> set[str]:
+    import asyncio
+
+    from mcp.server.fastmcp import FastMCP
+
+    from app.api.mcp.tools_generator import install_grant_filtered_list_tools
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", flag)
+    mcp = FastMCP("Test", instructions="t")
+
+    @mcp.tool(description="stand-in for the foundation tool of the same name")
+    def fact_search(q: str) -> dict:
+        return {"q": q}
+
+    @mcp.tool(description="unrelated")
+    def catalog() -> dict:
+        return {}
+
+    filtered = install_grant_filtered_list_tools(mcp, caller_id_fn=lambda: "admin1", passthrough_names=[])
+    return {t.name for t in asyncio.run(filtered())}
+
+
+def test_list_tools_hides_the_fact_tools_while_facts_are_off(seeded_app, monkeypatch):
+    """Every fact tool 404s (``facts_disabled``) while the switch is off, and
+    its own description tells the agent to call it FIRST — so an instance
+    with facts off saw the first tool call of a turn fail (issue #2161)."""
+    assert _facts_listing(monkeypatch, "0") == {"catalog"}
+
+
+def test_list_tools_shows_the_fact_tools_once_facts_are_on(seeded_app, monkeypatch):
+    assert _facts_listing(monkeypatch, "1") == {"catalog", "fact_search"}
+
+
+def test_every_fact_foundation_tool_is_feature_gated():
+    """A new ``fact_*`` foundation tool must join the hidden set, or it is
+    offered (and 404s) on instances with facts off."""
+    from app.api.mcp.foundation_tools import FACT_TOOL_NAMES, FOUNDATION_TOOL_NAMES
+
+    fact_named = {n for n in FOUNDATION_TOOL_NAMES if n.startswith("fact_")}
+    assert fact_named == set(FACT_TOOL_NAMES)
