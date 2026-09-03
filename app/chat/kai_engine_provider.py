@@ -643,6 +643,34 @@ class KaiEngineHandle:
             frame["answers"] = answers
         self.stdout.feed_frame(frame)
 
+    async def _deny_abandoned_question(self, request_id: str) -> None:
+        """Unblock a parked question the turn is walking away from.
+
+        Frame-free and best-effort by design: the card was already retired by
+        the caller, so there is nothing left to resolve on screen, and a 404
+        here only means the engine resolved the call first — which is the
+        outcome this post was trying to reach anyway.
+        """
+        try:
+            token = await self._bearer()
+            resp = await self._client.post(
+                f"{self._base_url}/api/chat/{self._chat_id}/approval",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "toolUseId": request_id,
+                    "approved": False,
+                    "reason": runner.QUESTION_DISMISSED_MESSAGE,
+                },
+            )
+            resp.raise_for_status()
+        except Exception:  # noqa: BLE001 - the turn is already over
+            logger.debug(
+                "kai engine handle: could not deny abandoned question %s on %s",
+                request_id,
+                self._chat_id,
+                exc_info=True,
+            )
+
     async def _stop_within_budget(self, why: str) -> None:
         """Post a stop, bounded and best-effort.
 
@@ -915,6 +943,16 @@ class KaiEngineHandle:
                     "reason": "the engine turn ended before this was answered",
                 }
             )
+            # And tell the ENGINE, not only the client. A parked interactive
+            # approval is the sandbox's `canUseTool` blocked on a response
+            # file, and the abort behind a Stop merely disconnects the host
+            # from that sandbox — the SDK process survives it, and the next
+            # turn reconnects to the very same blocked call. Retiring the card
+            # without writing a decision would leave the session wedged behind
+            # a question nobody can see any more. The runner's gate does the
+            # same on its way out (`QuestionGate.cancel_all` dismisses every
+            # pending request), with the same wording.
+            self._spawn_side_task(self._deny_abandoned_question(request_id))
         # Cleared, not merely reported: a pending expiry task holds this same
         # state object and must find the id gone, or it would post a timeout
         # decision for a card that is already retired.

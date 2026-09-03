@@ -1577,6 +1577,51 @@ def test_an_unanswered_question_card_is_retired_when_the_turn_ends():
     asyncio.run(_run())
 
 
+def test_a_question_abandoned_by_the_turn_is_denied_to_the_engine_too():
+    """Retiring the card is only half of it. A parked interactive approval is
+    the sandbox's `canUseTool` blocked on a response file, and the abort behind
+    a Stop only disconnects the HOST from that sandbox — the SDK process
+    survives, and the next turn reconnects to the very same blocked call. Walk
+    away without writing a decision and the session is wedged behind a question
+    nobody can see any more."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [
+            {
+                "pre": [
+                    {
+                        "type": "tool-input-available",
+                        "toolCallId": "call-q",
+                        "toolName": "AskUserQuestion",
+                        "input": {"questions": [{"question": "Which region?"}]},
+                    },
+                    {"type": "tool-approval-request", "toolCallId": "call-q"},
+                    {"type": "finish"},
+                ]
+            }
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "hi"})
+        frames = await _drain_until_done(handle)
+        for _ in range(50):
+            if engine.approvals:
+                break
+            await asyncio.sleep(0.02)
+        frames += await _read_trailing(handle)
+        await handle.kill()
+
+        assert engine.approvals == [
+            {"toolUseId": "call-q", "approved": False, "reason": runner.QUESTION_DISMISSED_MESSAGE}
+        ], "the parked tool call is unblocked with the gate's own dismissal wording"
+        # Exactly one resolution reaches the client: the deny post is
+        # frame-free, because the card was already retired above.
+        assert _types(frames).count("question_resolved") == 1
+
+    asyncio.run(_run())
+
+
 def test_a_question_the_engine_resolves_itself_retires_the_card():
     """The engine denies every parked approval on its own drain/teardown
     paths, so a tool output can arrive for a question still on screen with
