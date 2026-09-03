@@ -1394,6 +1394,7 @@ class TestFactsReadSurfaceSmoke:
     COVERED_ROUTES = {
         "POST /api/facts/search",
         "POST /api/facts/neighbors",
+        "POST /api/facts/edges",
         "GET /api/facts/{subject_id}/claims",
         "GET /api/facts/facets",
     }
@@ -1405,9 +1406,60 @@ class TestFactsReadSurfaceSmoke:
         client, headers = s["client"], _admin_headers(s)
         assert client.post("/api/facts/search", json={}, headers=headers).status_code == 404
         assert client.post("/api/facts/neighbors", json={"subject_id": "f_x"}, headers=headers).status_code == 404
+        assert client.post("/api/facts/edges", json={"edge_type": "knows"}, headers=headers).status_code == 404
         assert client.get("/api/facts/f_x/claims", headers=headers).status_code == 404
         assert client.get("/api/facts/type-map", headers=headers).status_code == 404
         assert client.get("/api/facts/facets", headers=headers).status_code == 404
+
+    def test_edges_requires_edge_type_on_both_backends(self, seeded_app_both, monkeypatch):
+        """TCRD-295: same shape as the neighbors 422 — Pydantic validation
+        runs before the PG-only repo is reached, identical on both backends."""
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.post("/api/facts/edges", json={}, headers=headers)
+        assert r.status_code == 422
+
+    def test_edges_round_trip_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        """Postgres-backed instance: a directly-seeded edge with a claim is
+        listed by `POST /api/facts/edges` with both endpoints for the (Admin
+        god-mode) caller; an unknown type is an empty page, not an error."""
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        from src.repositories import corpus_files_repo, facts_repo, file_corpora_repo
+
+        corpus_id = file_corpora_repo().create(
+            name="Edges Smoke", slug="edges-smoke", description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="e.md",
+            sha256="sha1",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/e.md",
+        )
+        repo = facts_repo()
+        a = repo.create_fact(type="person")
+        b = repo.create_fact(type="person")
+        for fid, quote in ((a, "A exists."), (b, "B exists.")):
+            repo.add_claim(fact_id=fid, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha1", quote=quote)
+        e = repo.create_edge(src=a, type="knows", dst=b)
+        repo.add_claim(edge_id=e, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha1", quote="A knows B.")
+
+        r = client.post("/api/facts/edges", json={"edge_type": "knows", "include_claims": 1}, headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert [x["id"] for x in body["edges"]] == [e]
+        assert {n["id"] for n in body["nodes"]} == {a, b}
+        assert body["edges"][0]["claims"][0]["quote"] == "A knows B."
+        assert body["truncated"] == {"result": False, "extension": False, "claims": False}
+
+        empty = client.post("/api/facts/edges", json={"edge_type": "no_such_type"}, headers=headers)
+        assert empty.status_code == 200 and empty.json()["edges"] == []
 
     def test_neighbors_requires_subject_id_on_both_backends(self, seeded_app_both, monkeypatch):
         """422 identically on both backends — Pydantic validation runs

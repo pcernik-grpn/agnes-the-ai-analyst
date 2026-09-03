@@ -187,9 +187,13 @@ class TestChatEmptyStatePill:
         # Nothing trails the composer but the ways out.
         below = body[body.index("</form>") :]
         assert 'id="rdb-actions"' not in below
-        # The picker is in the composer, not beside it.
+        # No agent control in the composer. Choosing an agent starts a NEW
+        # session, so a control inside the input promised to adjust the message
+        # being composed while actually abandoning it — the choice lives below
+        # the composer now (#chat-agent-select).
         composer = body[body.index('class="cloud-chat-composer"') : body.index("</form>")]
-        assert 'id="chat-agent-btn"' in composer
+        assert 'id="chat-agent-btn"' not in composer
+        assert 'id="chat-agent-select"' in below
 
     def test_the_cards_sit_by_INSTANCE_STATE_not_by_audience(self, seeded_app, monkeypatch):
         """The two cards close the page — after the composer and after the

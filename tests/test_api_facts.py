@@ -208,3 +208,83 @@ def test_facets_fails_clean_on_duckdb(facts_client):
     r = facts_client["client"].get("/api/facts/facets", headers=_headers(facts_client))
     assert r.status_code == 501, r.text
     assert r.json()["error"] == "requires_postgres_backend"
+
+
+# ---------------------------------------------------------------------------
+# edges (TCRD-295) — the relationship-shaped read; same three HTTP-level
+# contracts as its siblings, plus the new request caps. Visibility depth lives
+# in tests/db_pg/test_facts_edges_pg.py.
+# ---------------------------------------------------------------------------
+
+
+def test_edges_404s_when_flag_off(seeded_app):
+    r = seeded_app["client"].post("/api/facts/edges", json={"edge_type": "owned_by"}, headers=_headers(seeded_app))
+    assert r.status_code == 404
+
+
+def test_edges_requires_authentication(facts_client):
+    r = facts_client["client"].post("/api/facts/edges", json={"edge_type": "owned_by"})
+    assert r.status_code == 401
+
+
+def test_edges_fails_clean_on_duckdb(facts_client):
+    r = facts_client["client"].post("/api/facts/edges", json={"edge_type": "owned_by"}, headers=_headers(facts_client))
+    assert r.status_code == 501, r.text
+    assert r.json()["error"] == "requires_postgres_backend"
+
+
+def test_edges_requires_edge_type(facts_client):
+    r = facts_client["client"].post("/api/facts/edges", json={}, headers=_headers(facts_client))
+    assert r.status_code == 422
+
+
+def test_edges_limit_over_100_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/edges", json={"edge_type": "owned_by", "limit": 101}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_edges_include_claims_over_3_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/edges", json={"edge_type": "owned_by", "include_claims": 4}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_edges_extend_from_must_name_an_endpoint(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/edges",
+        json={"edge_type": "owned_by", "extend_edge_type": "in_industry", "extend_from": "middle"},
+        headers=_headers(facts_client),
+    )
+    assert r.status_code == 422
+
+
+def test_edges_unknown_field_is_422_not_silently_ignored(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/edges", json={"edge_type": "owned_by", "bogus": 1}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_neighbors_include_claims_over_3_is_422(facts_client):
+    r = facts_client["client"].post(
+        "/api/facts/neighbors", json={"subject_id": "f_x", "include_claims": 4}, headers=_headers(facts_client)
+    )
+    assert r.status_code == 422
+
+
+def test_search_include_claims_over_3_is_422(facts_client):
+    r = facts_client["client"].post("/api/facts/search", json={"include_claims": 4}, headers=_headers(facts_client))
+    assert r.status_code == 422
+
+
+def test_claims_limit_over_200_is_422(facts_client):
+    r = facts_client["client"].get("/api/facts/f_x/claims?limit=201", headers=_headers(facts_client))
+    assert r.status_code == 422
+
+
+def test_claims_limit_zero_is_422(facts_client):
+    r = facts_client["client"].get("/api/facts/f_x/claims?limit=0", headers=_headers(facts_client))
+    assert r.status_code == 422

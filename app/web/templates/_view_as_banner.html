@@ -16,6 +16,14 @@
    The token is read server-side from the caller's own HttpOnly cookie; the
    entering POST guarantees one exists.
 
+   It carries NO destination. The form posts only the token, and the exit
+   route reads where to land from the signed ticket
+   (`app.auth.view_as.return_path`). It used to post this page's path back as
+   `next`, which read as "return where you are" and behaved as "abandon the
+   admin wherever they stopped, as themselves, with the person they were
+   investigating forgotten" — a banner on page five of a browse cannot know
+   the page the mode was entered from, and only the ticket does.
+
    Styling lives entirely in app/web/static/css/view_as.css — `--ds-*` tokens
    only, no inline style block in the body, no raw hex. #}
 {% set _va = view_as_state() %}
@@ -29,7 +37,6 @@
     </span>
     <form class="view-as-banner__exit" method="post" action="/admin/view-as/exit">
       <input type="hidden" name="csrf_token" value="{{ _va.csrf_token }}">
-      <input type="hidden" name="next" value="{{ _va.path }}">
       <button type="submit" class="view-as-banner__button">Exit view-as</button>
     </form>
   </div>

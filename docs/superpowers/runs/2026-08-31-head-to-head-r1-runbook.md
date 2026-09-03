@@ -15,31 +15,38 @@ Read this before scheduling anything.
 
 The decision sheet has five pre-registered thresholds
 (`tests/fixtures/eval/workbook_v0_2/thresholds.yaml`, frozen 2026-08-27). The
-harness can drive **two** of the five arms headlessly:
+harness can drive **three** of the five arms headlessly:
 
 | Arm | What it is | Driven by |
 |---|---|---|
 | A0 | bare model, no tools — the hallucination floor | `run_eval.py run` (Messages API) |
 | A1 | model + enterprise file-store connector | **operator, by hand** |
 | A2 | competing assistant + same connector | **operator, by hand** |
-| A3 | model + seed pack (same context, no platform) | **operator, by hand** |
+| A3 | model + seed pack (same context, no platform, no tools) | `run_eval.py run` (Messages API, pack as a prompt-cached `system` turn; hand-run + `import-transcript` stays valid as a fallback) |
 | A4 | Agnes, per persona | `run_eval.py run` (chat surface) |
 
-A1/A2/A3 run inside external product UIs the harness cannot drive
+A1/A2 run inside external product UIs the harness cannot drive
 (`scripts/eval/arms.py` module docstring). The operator runs each prompt there
 and pastes the transcript back via `run_eval.py import-transcript`, which
 normalizes it into the same `RunRecord` shape an API-driven arm produces.
 
-**Consequence:** thresholds #1 (A4 vs A1/A2), #2 (A4 vs A3) and #4
-(tokens vs *best baseline arm*) all depend on hand-run arms. A round of only
-A0 + A4 returns overall verdict `incomplete` — by design, not by bug
-(`scripts/eval/decision.py`, `Decision!F12`). Threshold #2 is labelled THE
-DECIDING TEST in the frozen sheet, and it is one of the manual ones.
+A3 is the same executor as A0 with the seed pack sent as the `system` turn —
+the two arms differ in exactly one request field, and A3's token counts come
+from the API's `usage` like A0's. The pack is cached across the 30 sequential
+runs; cache-read tokens are recorded separately and never folded into the
+total, so a cache hit cannot make A3 look artificially cheap (the workbook's
+own warning, `token_methods.md`). Every A3 record pins the pack's sha256.
 
-So: **either budget the manual transcript work, or accept that R1 answers
-nothing the program was built to answer.** This is the scheduling decision
-TCRD-187 needs made before it can start, and it is why the ticket cannot be
-picked up as a one-afternoon task.
+**Consequence:** threshold #2 (A4 vs A3) — labelled THE DECIDING TEST in the
+frozen sheet — is now fully automated. Thresholds #1 (A4 vs A1/A2) still
+depends entirely on hand-run arms, and #4 (tokens vs *best baseline arm*)
+takes the minimum over whichever of A1/A2/A3 were run, so an A0 + A3 + A4
+round computes #2, #3, #4 and #5 but returns overall verdict `incomplete` on
+#1 — by design, not by bug (`scripts/eval/decision.py`, `Decision!F12`).
+
+So: **either budget the manual transcript work for A1/A2, or accept that R1
+answers the deciding question but not the out-of-box one.** This is the
+scheduling decision TCRD-187 needs made before it can start.
 
 ## 1. Run volume
 
@@ -50,10 +57,11 @@ deduped or cached.
 | Arm | Runs | How |
 |---|---|---|
 | A0 | 10 × 3 = **30** | automated |
+| A3 | 10 × 3 = **30** | automated (same model id as A0 — see §3) |
 | A4 | 10 × 3 × 2 personas = **60** | automated |
-| A1, A2, A3 | 10 × 3 × 3 = **90** | **manual transcripts** |
+| A1, A2 | 10 × 3 × 2 = **60** | **manual transcripts** |
 
-The 90 manual runs are the schedule. Split them across operators by arm, not by
+The 60 manual runs are the schedule. Split them across operators by arm, not by
 prompt, so one person stays in one product UI.
 
 G1 and G2 are the two prompts the design predicts Agnes wins (relational /
@@ -77,7 +85,11 @@ compare, and cherry-picking the two favourable prompts invalidates the round.
 
 ```bash
 cp scripts/eval/example_run_config.yaml runs/r1.yaml
-# edit: round: R1, base_url, agent_slug, persona token env var names
+# edit: round: R1, base_url, agent_slug, persona token env var names,
+#       A3 `system_file` -> the seed pack (kept OUTSIDE this repo; a relative
+#       path resolves against the directory you run from), and `model` in
+#       BOTH the A0 and A3 stanzas -- every Claude arm in a round runs the
+#       SAME model id, a model difference is a confound the sheet cannot see.
 
 export ANTHROPIC_API_KEY=...
 export AGNES_EVAL_TOKEN_PRINCIPAL=...
@@ -85,18 +97,23 @@ export AGNES_EVAL_TOKEN_ASSOCIATE=...
 
 # automated arms
 python -m scripts.eval.run_eval run --config runs/r1.yaml --arm A0
+python -m scripts.eval.run_eval run --config runs/r1.yaml --arm A3
 python -m scripts.eval.run_eval run --config runs/r1.yaml --arm A4
 
-# each manual run, once per arm/prompt/run index
+# each manual run, once per arm/prompt/run index (A1/A2; A3 only as a fallback)
 python -m scripts.eval.run_eval import-transcript \
-    --round R1 --arm A3 --prompt G1 --run 1 \
+    --round R1 --arm A1 --prompt G1 --run 1 \
     --transcript-file /path/to/transcript.txt \
     --input-tokens N --output-tokens N
 ```
 
 Records land at `<output_dir>/<round>/<arm>/<prompt>_<run#>.json`. Capture token
 counts for the manual arms as you go — threshold #4 is a token comparison and
-cannot be reconstructed after the UI session is closed.
+cannot be reconstructed after the UI session is closed. A3's counts need no
+capturing: they come off the API response, with cache reads in
+`tokens.cache_read_tokens` and the pack's sha256 in `raw.system_sha256`. Zero
+cache reads across the whole arm means the pack is under the model's minimum
+cacheable size, not that caching failed.
 
 `--prompt` restricts to one prompt id, useful for re-running a single failed
 transport attempt. A failed run is still an artifact: keep it.

@@ -94,6 +94,8 @@ class FactsSearchRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None
     q: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=20, ge=1, le=100)
+    # TCRD-295: k newest readable claims inline per subject (0 = none).
+    include_claims: int = Field(default=0, ge=0, le=3)
 
 
 class FactsNeighborsRequest(BaseModel):
@@ -104,6 +106,28 @@ class FactsNeighborsRequest(BaseModel):
     depth: int = Field(default=1, ge=1, le=2)
     fanout: int = Field(default=100, ge=1, le=100)
     limit: int = Field(default=500, ge=1, le=500)
+    # TCRD-295: k newest readable claims inline per EDGE (0 = none).
+    include_claims: int = Field(default=0, ge=0, le=3)
+
+
+class FactsEdgesRequest(BaseModel):
+    """``POST /api/facts/edges`` (TCRD-295) — the relationship-shaped read.
+    ``edge_type`` names come from ``GET /api/facts/type-map``'s
+    ``edge_types`` list; nothing here knows a customer's vocabulary (spec
+    §11). ``extend_edge_type`` follows ONE more hop from every listed edge's
+    ``extend_from`` endpoint, so a two-hop question is one request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edge_type: str = Field(min_length=1, max_length=200)
+    src_type: Optional[str] = Field(default=None, max_length=200)
+    dst_type: Optional[str] = Field(default=None, max_length=200)
+    src_id: Optional[str] = Field(default=None, max_length=200)
+    dst_id: Optional[str] = Field(default=None, max_length=200)
+    limit: int = Field(default=100, ge=1, le=100)
+    extend_edge_type: Optional[str] = Field(default=None, max_length=200)
+    extend_from: str = Field(default="dst", pattern="^(src|dst)$")
+    include_claims: int = Field(default=0, ge=0, le=3)
 
 
 DEFAULT_FACET_TYPES = ("client", "industry", "service_offering", "doc_type")
@@ -192,7 +216,14 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     additional matches.
     """
     try:
-        result = facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
+        result = facts_repo().search(
+            user,
+            type=body.type,
+            filters=body.filters or {},
+            q=body.q,
+            limit=body.limit,
+            include_claims=body.include_claims,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     user_id, _email = identity_for_audit(user)
@@ -228,6 +259,7 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
             depth=body.depth,
             fanout=body.fanout,
             limit=body.limit,
+            include_claims=body.include_claims,
         )
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
@@ -241,8 +273,66 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
     return result
 
 
+@router.post("/edges")
+def facts_edges(body: FactsEdgesRequest, user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Every visible edge of ONE type, with both endpoints as full subjects
+    (TCRD-295). The read the five primitives lacked: "which X relate to
+    which Y" was one ``neighbors`` call per root plus one ``claims`` call
+    per citation; this is one request, optionally with a second hop
+    (``extend_edge_type`` from each edge's ``extend_from`` endpoint) and
+    the ``include_claims`` newest readable quotes inline on each edge.
+
+    Same visibility posture as :func:`facts_neighbors`, all of it in SQL
+    before ``LIMIT`` (spec §5): the edge needs its OWN readable claim (or a
+    `revealed` correction), BOTH endpoints must be independently visible to
+    the caller, and ``truncated.result`` / ``truncated.extension`` are the
+    caller's own shortfall, never a signal that grants hid more. A type the
+    caller cannot see and a type that does not exist both answer with an
+    empty page. Response: ``{"nodes": [...], "edges": [{"id", "src",
+    "dst", "type", "attrs", "claims"?}], "truncated": {"result",
+    "extension", "claims"}}``.
+    """
+    try:
+        result = facts_repo().edges(
+            user,
+            edge_type=body.edge_type,
+            src_type=body.src_type,
+            dst_type=body.dst_type,
+            src_id=body.src_id,
+            dst_id=body.dst_id,
+            limit=body.limit,
+            extend_edge_type=body.extend_edge_type,
+            extend_from=body.extend_from,
+            include_claims=body.include_claims,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.edges",
+        params={
+            "edge_type": body.edge_type,
+            "extend_edge_type": body.extend_edge_type,
+            "node_count": len(result.get("nodes", [])),
+            "edge_count": len(result.get("edges", [])),
+            "include_claims": body.include_claims,
+        },
+    )
+    return result
+
+
 @router.get("/{subject_id}/claims")
-def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, Any]:
+def facts_claims(
+    subject_id: str,
+    limit: int = Query(
+        default=25,
+        ge=1,
+        le=200,
+        description="Max claims returned, newest first (TCRD-295 cap). `limit_applied` says whether more exist.",
+    ),
+    user=Depends(get_current_user),
+) -> Dict[str, Any]:
     """The caller's readable evidence for one subject (fact or edge).
 
     Each entry carries the evidencing document's identity (``corpus_id``,
@@ -260,7 +350,7 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
     # collection, so no route-template gate can express the check; every
     # repo read method filters by the caller (spec §5), tested S1-S6.
     try:
-        result = facts_repo().claims(user, subject_id)
+        result = facts_repo().claims(user, subject_id, limit=limit)
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
     user_id, _email = identity_for_audit(user)
@@ -268,7 +358,11 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
         user_id=user_id,
         action="facts.claims",
         resource=f"fact:{subject_id}",
-        params={"claim_count": len(result.get("claims", []))},
+        params={
+            "claim_count": len(result.get("claims", [])),
+            "limit": limit,
+            "limit_applied": bool(result.get("limit_applied")),
+        },
     )
     return result
 

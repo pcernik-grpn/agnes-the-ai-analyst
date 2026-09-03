@@ -502,7 +502,12 @@
            padding, which is a second table in a product that had agreed on
            one. What is left here is only what belongs to THIS table: its
            column behaviour and its cells. */
-        #adminTablesFlat { table-layout: fixed; }
+        /* With a FLOOR — nine columns divided by fixed layout crush rather
+           than scroll, and a crushed table has no scrollbar to tell anyone
+           (the same measurement that put one under /admin/users' eight).
+           Below this the wrap scrolls and the pinned Actions column stays
+           reachable. */
+        #adminTablesFlat { table-layout: fixed; min-width: 1120px; }
         /* Explicit, not left to the UA rule: `[hidden]` is a low-specificity
            author-overridable default, and the shared `.data-table` block is one
            `display` declaration away from silently winning it. The toolbar hides
@@ -6839,7 +6844,7 @@
     // filters and sorts against those without re-fetching.
     function _renderFlatTableRows(tables) {
         var html = ''
-          + '<table class="data-table" id="adminTablesFlat">'
+          + '<table class="data-table data-table--pinned-actions" id="adminTablesFlat">'
           + '<colgroup>'
           +   '<col style="width: 4%">'
           +   '<col style="width: 20%">'

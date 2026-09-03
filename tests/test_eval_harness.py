@@ -9,26 +9,31 @@ verdicts, and the EQ3/EQ9 metrics math on a tiny synthetic manifest.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 from dataclasses import fields
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 import jsonschema
 import pytest
 
-from scripts.eval import decision, grade, metrics
+from scripts.eval import decision, grade, metrics, run_eval
 from scripts.eval.arms import AgnesArm, AnthropicArm, ArmExecutionError, ChatSurface
 from scripts.eval.config import RunConfig, RunConfigError
 from scripts.eval.grade import ArmStats, ScoredRow
 from scripts.eval.prompts import (
+    API_DRIVEN_ARMS,
     ARMS,
     DEFAULT_FIXTURE_DIR,
+    MANUAL_ARMS,
     PROMPT_IDS,
     RUNS_PER_PROMPT,
+    TRANSCRIPT_IMPORT_ARMS,
     FrozenPromptsTamperedError,
     load_prompts,
     load_prompts_by_id,
@@ -938,3 +943,246 @@ def test_chat_surface_raises_on_error_status():
     surface = ChatSurface("https://agnes.example.com", "eval-agent", transport=httpx.MockTransport(handler))
     with pytest.raises(ArmExecutionError):
         surface.ask("hello", token="test-token", timeout_s=5)
+
+
+# ---------------------------------------------------------------------------
+# Arms -- A3 (Claude + context pack in the system prompt) through the API
+# ---------------------------------------------------------------------------
+
+_PACK_TEXT = "# Context pack v1\n\nEvery service line, every client name, every glossary term.\n"
+
+
+def _patch_anthropic(monkeypatch, *, usage, answer: str = "the answer", stop_reason: str = "end_turn") -> list[dict]:
+    """Replace `anthropic.Anthropic` with a fake whose `messages.create`
+    records its kwargs and returns a Messages-API-shaped response. Returns
+    the list the kwargs of every create() call are appended to."""
+    import anthropic
+
+    calls: list[dict] = []
+
+    class _Block:
+        type = "text"
+        text = answer
+
+    class _Response:
+        content = [_Block()]
+
+    _Response.usage = usage
+    _Response.stop_reason = stop_reason
+
+    class _Messages:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return _Response()
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs):
+            self.messages = _Messages()
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
+    return calls
+
+
+def _usage(**overrides) -> SimpleNamespace:
+    base = {
+        "input_tokens": 1200,
+        "output_tokens": 340,
+        "cache_read_input_tokens": 1100,
+        "cache_creation_input_tokens": 0,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_a3_arm_sends_cached_system_pack_and_records_usage(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pack_path = tmp_path / "A3-context-pack-v1.md"
+    pack_path.write_bytes(_PACK_TEXT.encode("utf-8"))
+    calls = _patch_anthropic(monkeypatch, usage=_usage())
+
+    arm = AnthropicArm(arm="A3", model="claude-opus-5", system_file=str(pack_path))
+    prompt = load_prompts_by_id()["X1"]
+    record = arm.run(prompt, persona=None, run_index=2, round_id="R1")
+
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["model"] == "claude-opus-5"
+    # The pack is the cached system turn; the frozen prompt is the SOLE user turn.
+    assert kwargs["system"] == [{"type": "text", "text": _PACK_TEXT, "cache_control": {"type": "ephemeral"}}]
+    assert kwargs["messages"] == [{"role": "user", "content": prompt.text}]
+
+    assert record.arm == "A3"
+    assert record.source == "api"
+    assert record.run_index == 2
+    assert record.answer == "the answer"
+    assert record.tokens == TokenCounts(
+        input_tokens=1200, output_tokens=340, cache_read_tokens=1100, cache_creation_tokens=0
+    )
+    assert record.tokens.cache_hit is True  # flagged separately, never folded into total (README!C24)
+    assert record.tokens.total == 1540
+    # Every record is pinned to the exact pack version that was sent.
+    assert record.raw["system_sha256"] == hashlib.sha256(_PACK_TEXT.encode("utf-8")).hexdigest()
+    assert record.raw["system_path"] == str(pack_path.resolve())
+    assert record.raw["model"] == "claude-opus-5"
+    assert record.raw["stop_reason"] == "end_turn"
+
+
+def test_a0_arm_sends_no_system_when_none_configured(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls = _patch_anthropic(monkeypatch, usage=_usage(cache_read_input_tokens=0))
+
+    arm = AnthropicArm()
+    prompt = load_prompts_by_id()["X1"]
+    record = arm.run(prompt, persona=None, run_index=1, round_id="R1")
+
+    assert record.arm == "A0"
+    assert "system" not in calls[0]
+    assert set(calls[0]) == {"model", "max_tokens", "messages"}
+    # Byte-identical A0 record shape: no pack keys leak into raw.
+    assert record.raw == {"model": "claude-sonnet-5", "stop_reason": "end_turn"}
+
+
+def test_anthropic_arm_rejects_both_system_and_system_file(tmp_path):
+    pack_path = tmp_path / "pack.md"
+    pack_path.write_text("inline", encoding="utf-8")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AnthropicArm(system="inline", system_file=str(pack_path))
+
+
+def test_anthropic_arm_reads_system_file_once_at_construction(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    pack_path = tmp_path / "pack.md"
+    pack_path.write_text("v1", encoding="utf-8")
+    calls = _patch_anthropic(monkeypatch, usage=_usage())
+
+    arm = AnthropicArm(arm="A3", system_file=str(pack_path))
+    pack_path.write_text("v2 -- edited after the executor was built", encoding="utf-8")
+    record = arm.run(load_prompts_by_id()["X1"], persona=None, run_index=1, round_id="R1")
+
+    assert calls[0]["system"][0]["text"] == "v1"
+    assert record.raw["system_sha256"] == hashlib.sha256(b"v1").hexdigest()
+
+
+def test_anthropic_arm_system_file_resolves_relative_to_cwd(monkeypatch, tmp_path):
+    (tmp_path / "pack.md").write_text("pack", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    arm = AnthropicArm(arm="A3", system_file="pack.md")
+    assert arm.system == "pack"
+    assert arm.system_path == (tmp_path / "pack.md").resolve()
+
+
+def test_anthropic_arm_missing_system_file_fails_at_construction(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        AnthropicArm(arm="A3", system_file=str(tmp_path / "does-not-exist.md"))
+
+
+def test_a3_arm_records_missing_api_key_without_network_call(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    arm = AnthropicArm(arm="A3", system=_PACK_TEXT, api_key_env="ANTHROPIC_API_KEY")
+    record = arm.run(load_prompts_by_id()["X1"], persona=None, run_index=1, round_id="R1")
+    assert record.arm == "A3"
+    assert record.source == "api"
+    assert record.errors
+    assert "ANTHROPIC_API_KEY" in record.errors[0]
+    assert record.tokens.total is None
+
+
+def test_build_executor_a3_requires_a_context_pack():
+    with pytest.raises(ValueError, match="system_file"):
+        run_eval.build_executor("A3", {})
+    with pytest.raises(ValueError, match="system_file"):
+        run_eval.build_executor("A3", {"model": "claude-opus-5", "api_key_env": "ANTHROPIC_API_KEY"})
+
+
+def test_build_executor_a3_builds_an_a3_labeled_anthropic_arm(tmp_path):
+    pack_path = tmp_path / "pack.md"
+    pack_path.write_text(_PACK_TEXT, encoding="utf-8")
+    executor = run_eval.build_executor("A3", {"model": "claude-opus-5", "system_file": str(pack_path)})
+    assert isinstance(executor, AnthropicArm)
+    assert executor.arm == "A3"
+    assert executor.model == "claude-opus-5"
+    assert executor.system == _PACK_TEXT
+
+
+def test_build_executor_a0_stays_packless():
+    executor = run_eval.build_executor("A0", {"model": "claude-sonnet-5"})
+    assert isinstance(executor, AnthropicArm)
+    assert executor.arm == "A0"
+    assert executor.system is None
+
+
+def test_build_executor_a0_refuses_a_pack():
+    # A0 is the no-context floor; a pack in its stanza is A3 mislabeled.
+    with pytest.raises(ValueError, match="A3"):
+        run_eval.build_executor("A0", {"model": "claude-sonnet-5", "system": _PACK_TEXT})
+
+
+def test_a3_is_api_driven_and_a1_a2_stay_manual():
+    assert "A3" in API_DRIVEN_ARMS
+    assert "A3" not in MANUAL_ARMS
+    assert MANUAL_ARMS == ("A1", "A2")
+    # The manual fallback stays valid for A3 -- import-transcript keeps accepting it.
+    assert TRANSCRIPT_IMPORT_ARMS == ("A1", "A2", "A3")
+    assert set(API_DRIVEN_ARMS) | set(MANUAL_ARMS) == set(ARMS)
+
+
+def test_run_round_runs_a3_and_skips_a1_a2_with_a_note(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls = _patch_anthropic(monkeypatch, usage=_usage())
+    config = RunConfig.from_dict(
+        {
+            "round": "R1",
+            "arms": ["A1", "A2", "A3"],
+            "runs_per_prompt": 2,
+            "prompt_ids": ["X1", "G1"],
+            "output_dir": str(tmp_path),
+            "arm_config": {"A3": {"model": "claude-opus-5", "system": _PACK_TEXT}},
+        }
+    )
+
+    written = run_eval.run_round(config)
+
+    assert len(written) == 4  # 2 prompts x 2 runs, A3 only
+    assert {p.parent.name for p in written} == {"A3"}
+    assert len(calls) == 4
+    assert all(c["system"][0]["text"] == _PACK_TEXT for c in calls)
+    skipped = [line for line in capsys.readouterr().err.splitlines() if "skipping" in line]
+    assert any("A1" in line and "import-transcript" in line for line in skipped)
+    assert any("A2" in line and "import-transcript" in line for line in skipped)
+    assert not any("A3" in line for line in skipped)
+    records = list(iter_records(tmp_path, "R1", arm="A3"))
+    assert len(records) == 4
+    sha = hashlib.sha256(_PACK_TEXT.encode("utf-8")).hexdigest()
+    assert all(r.raw["system_sha256"] == sha and r.raw["system_path"] is None for r in records)
+
+
+def test_import_transcript_still_accepts_a3(tmp_path):
+    transcript = tmp_path / "transcript.txt"
+    transcript.write_text("pasted answer", encoding="utf-8")
+    rc = run_eval.main(
+        [
+            "import-transcript",
+            "--round", "R1", "--arm", "A3", "--prompt", "G1", "--run", "1",
+            "--transcript-file", str(transcript),
+            "--input-tokens", "1200", "--output-tokens", "340", "--cache-read-tokens", "1100",
+            "--output-dir", str(tmp_path),
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    [record] = iter_records(tmp_path, "R1", arm="A3")
+    assert record.source == "manual"
+    assert record.answer == "pasted answer"
+    assert record.tokens == TokenCounts(input_tokens=1200, output_tokens=340, cache_read_tokens=1100)
+
+
+def test_import_transcript_rejects_api_only_arms(tmp_path):
+    transcript = tmp_path / "transcript.txt"
+    transcript.write_text("pasted answer", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        run_eval.main(
+            [
+                "import-transcript",
+                "--round", "R1", "--arm", "A0", "--prompt", "G1", "--run", "1",
+                "--transcript-file", str(transcript), "--output-dir", str(tmp_path),
+            ]
+        )  # fmt: skip

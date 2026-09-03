@@ -68,6 +68,37 @@ MAX_NEIGHBORS_DEPTH = 2
 MAX_NEIGHBORS_FANOUT = 100
 MAX_NEIGHBORS_RESULT = 500
 MAX_SEARCH_FILTERS = 20
+# Relationship-shaped read (TCRD-295, spec §12 addendum): `edges()` lists
+# every visible edge of ONE type with both endpoints, so a "which X relate to
+# which Y" question is one call instead of one `neighbors()` per root. Same
+# ceiling as `neighbors()`'s fanout — a page, not a dump.
+MAX_EDGES_LIMIT = 100
+# `claims()` row cap (TCRD-295). Measured 2026-09-02 on the Cuesta instance:
+# an uncapped `fact_claims` on a hub subject returned 18.5k tokens that every
+# later step of the turn re-read. Paired with a `limit_applied` signal that
+# is computed from the CALLER'S OWN readable set (never from what grants
+# hid), exactly as `search()` does, so the cap does not recreate the S6
+# shortfall oracle the original no-LIMIT comment guarded against.
+MAX_CLAIMS_LIMIT = 200
+# Bounded inline evidence (TCRD-295): `include_claims=k` on `edges()`,
+# `neighbors()` and `search()` attaches the k NEWEST readable claims per
+# subject — computed AFTER audience-variant dedup, inheriting `claims()`'s
+# revealed/opaque-document rules — so a relationship answer carries its
+# citation without a `fact_claims` round trip per edge. Three ceilings keep
+# the payload the thing this exists to shrink: k itself, a total budget per
+# response (attached in result order until spent, then `truncated.claims`),
+# and a per-quote character cap. `_INLINE_CLAIMS_WINDOW` bounds how many of
+# a subject's newest rows are fetched BEFORE dedup: k is exact whenever a
+# document carries fewer than window/k audience variants (a handful exist in
+# practice), never approximate silently — a subject with more variants than
+# that on its newest documents would attach fewer than k, not a wrong one.
+MAX_INLINE_CLAIMS_K = 3
+MAX_INLINE_CLAIMS_TOTAL = 60
+INLINE_QUOTE_MAX_CHARS = 400
+_INLINE_CLAIMS_WINDOW = 25
+# Hard ceiling on rows `claims()` reads before dedup + cap (bounded DB read
+# for a pathological subject; the statement timeout is the other guard).
+_CLAIMS_FETCH_CAP = 5_000
 # P2 review finding: a 1-char `q` drives a full-scan ILIKE over every
 # fact_aliases row with no useful selectivity. Enforced here (repo layer),
 # not only in the REST Pydantic model, so an MCP/CLI caller reaching
@@ -1090,6 +1121,114 @@ class FactsPgRepository:
             return False
         return bool(status["revealed"] or status["has_claim_visibility"])
 
+    def _fact_visible_sql(self, expr: str, *, is_admin: bool, all_evidence: bool) -> str:
+        """SQL predicate for "the fact named by ``expr`` is visible to the
+        caller" — the rule :meth:`_subject_status` + :meth:`_is_visible`
+        apply one subject at a time (withheld -> never; otherwise
+        ``revealed`` OR readable evidence among the fact's OWN claims ∪ the
+        claims of a non-withheld incident edge, under the any/all_evidence
+        mode), written as an inline predicate so :meth:`edges` can gate BOTH
+        endpoints in SQL, before ``LIMIT`` (spec §5 rule 1 — a Python post-
+        filter here would reopen the S6 shortfall oracle, and rule 3 — a
+        listed edge must never reveal that it continues into a subject the
+        caller may not see). ``expr`` is always a column reference we control
+        (``e.src`` / ``e.dst``), never caller input. Callers bind
+        ``:readable``, ``:tiered_hidden`` and ``:audience_pairs`` when
+        ``is_admin`` is False."""
+        vis = self._visibility_predicate("rc.corpus_id", is_admin)
+        relevant = (
+            "(SELECT rc0.corpus_id, rc0.audience FROM claims rc0 WHERE rc0.fact_id = {expr} "
+            "UNION ALL "
+            "SELECT rc1.corpus_id, rc1.audience FROM claims rc1 JOIN edges e1 ON e1.id = rc1.edge_id "
+            "WHERE (e1.src = {expr} OR e1.dst = {expr}) AND NOT EXISTS ("
+            "SELECT 1 FROM corrections co1 WHERE co1.subject_kind = 'edge' AND co1.subject_id = e1.id "
+            "AND co1.verdict IN ('wrong', 'restricted')))"
+        ).format(expr=expr)
+        if all_evidence:
+            has_vis = (
+                f"(EXISTS (SELECT 1 FROM {relevant} rc) AND NOT EXISTS (SELECT 1 FROM {relevant} rc WHERE NOT ({vis})))"
+            )
+        else:
+            has_vis = f"EXISTS (SELECT 1 FROM {relevant} rc WHERE {vis})"
+        return (
+            "(NOT EXISTS (SELECT 1 FROM corrections cw WHERE cw.subject_kind = 'fact' "
+            f"AND cw.subject_id = {expr} AND cw.verdict IN ('wrong', 'restricted')) "
+            "AND (EXISTS (SELECT 1 FROM corrections cr WHERE cr.subject_kind = 'fact' "
+            f"AND cr.subject_id = {expr} AND cr.verdict = 'revealed') OR {has_vis}))"
+        )
+
+    def _subject_statuses(
+        self,
+        conn,
+        *,
+        subject_kind: str,
+        ids: List[str],
+        is_admin: bool,
+        all_evidence: bool,
+        readable: Optional[frozenset] = None,
+        tiered_hidden: Optional[List[str]] = None,
+        audience_pairs: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, bool]]:
+        """Batched :meth:`_subject_status` — ONE query for a whole hop's
+        worth of endpoints (TCRD-295: ``neighbors()`` used to run the single-
+        subject form once per discovered node, two round trips per node on a
+        hub). Same ``relevant_claims`` definition, same three flags per id,
+        keyed by ``subject_id``; an id with no row (should not happen — every
+        id yields a row via the ``ids`` CTE) reads as invisible."""
+        if not ids:
+            return {}
+        vis = self._visibility_predicate("rc.corpus_id", is_admin)
+        if subject_kind == "fact":
+            relevant_claims_cte = """
+                relevant_claims AS (
+                    SELECT c.fact_id AS subject_id, c.corpus_id, c.audience
+                    FROM claims c JOIN ids i ON i.subject_id = c.fact_id
+                    UNION ALL
+                    SELECT i.subject_id, c.corpus_id, c.audience
+                    FROM ids i
+                    JOIN edges e ON (e.src = i.subject_id OR e.dst = i.subject_id)
+                    JOIN claims c ON c.edge_id = e.id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM corrections co
+                        WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                          AND co.verdict IN ('wrong', 'restricted')
+                    )
+                )
+            """
+        else:
+            relevant_claims_cte = (
+                "relevant_claims AS (SELECT c.edge_id AS subject_id, c.corpus_id, c.audience "
+                "FROM claims c JOIN ids i ON i.subject_id = c.edge_id)"
+            )
+        if all_evidence:
+            has_claim_visibility = (
+                "EXISTS (SELECT 1 FROM relevant_claims rc WHERE rc.subject_id = i.subject_id) "
+                "AND NOT EXISTS (SELECT 1 FROM relevant_claims rc "
+                f"WHERE rc.subject_id = i.subject_id AND NOT ({vis}))"
+            )
+        else:
+            has_claim_visibility = (
+                f"EXISTS (SELECT 1 FROM relevant_claims rc WHERE rc.subject_id = i.subject_id AND {vis})"
+            )
+        sql = sa.text(
+            "WITH ids AS (SELECT unnest(CAST(:ids AS text[])) AS subject_id), "
+            f"{relevant_claims_cte} "
+            "SELECT i.subject_id, "
+            "EXISTS (SELECT 1 FROM corrections co WHERE co.subject_kind = :kind AND co.subject_id = i.subject_id "
+            "        AND co.verdict IN ('wrong', 'restricted')) AS withheld, "
+            "EXISTS (SELECT 1 FROM corrections co WHERE co.subject_kind = :kind AND co.subject_id = i.subject_id "
+            "        AND co.verdict = 'revealed') AS revealed, "
+            f"({has_claim_visibility}) AS has_claim_visibility "
+            "FROM ids i"
+        )
+        params: Dict[str, Any] = {"kind": subject_kind, "ids": list(ids)}
+        if not is_admin:
+            params["readable"] = list(readable) if readable else []
+            params["tiered_hidden"] = tiered_hidden or []
+            params["audience_pairs"] = audience_pairs or []
+        rows = conn.execute(sql, params).mappings().all()
+        return {r["subject_id"]: dict(r) for r in rows}
+
     @staticmethod
     def _projection_cte_sql(*, with_aliases: bool, is_admin: bool) -> str:
         """The per-key latest-document_date-wins attrs projection (spec
@@ -1264,6 +1403,7 @@ class FactsPgRepository:
         filters: Optional[Dict[str, Any]] = None,
         q: Optional[str] = None,
         limit: int = MAX_SEARCH_LIMIT,
+        include_claims: int = 0,
     ) -> Dict[str, Any]:
         """Type/filter search over visible FACT subjects (spec §5). A
         subject's EXISTENCE gate is the endpoint-evidence union (module
@@ -1313,11 +1453,19 @@ class FactsPgRepository:
         ``ValueError`` (P2 review finding — a 1-char query has no useful
         selectivity against a full ILIKE scan). The query itself runs under
         a bounded Postgres statement timeout, same mechanism as
-        ``neighbors()``."""
+        ``neighbors()``.
+
+        ``include_claims=k`` (TCRD-295, ≤ ``MAX_INLINE_CLAIMS_K``) attaches
+        the k newest readable claims to each returned subject via
+        :meth:`_inline_claims` — same rules as :meth:`claims`, under the
+        response budget — and adds ``claims_truncated`` to the response;
+        both are absent at the default of 0, so the response shape is
+        unchanged for existing callers."""
         filters = filters or {}
         if len(filters) > MAX_SEARCH_FILTERS:
             raise ValueError(f"too many filters (max {MAX_SEARCH_FILTERS})")
         limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+        include_claims = max(0, min(include_claims, MAX_INLINE_CLAIMS_K))
 
         readable = _readable_ids(caller)
         is_admin = readable is None
@@ -1498,25 +1646,42 @@ class FactsPgRepository:
             conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
             rows = conn.execute(sql, params).mappings().all()
 
-        limit_applied = len(rows) > limit
-        rows = rows[:limit]
+            limit_applied = len(rows) > limit
+            rows = rows[:limit]
+            inline: Dict[str, List[Dict[str, Any]]] = {}
+            claims_truncated = False
+            if include_claims > 0:
+                inline, claims_truncated = self._inline_claims(
+                    conn,
+                    kind="fact",
+                    ids_with_revealed=[(r["subject_id"], bool(r["is_revealed"])) for r in rows],
+                    k=include_claims,
+                    is_admin=is_admin,
+                    readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
+                )
 
         subjects = []
         for r in rows:
             claim_count = int(r["claim_count"])
             is_revealed = bool(r["is_revealed"])
-            subjects.append(
-                {
-                    "id": r["subject_id"],
-                    "type": r["subject_type"],
-                    "aliases": _decode_jsonb(r["aliases"]) or [],
-                    "attrs": _decode_jsonb(r["attrs"]) or {},
-                    "claim_count": claim_count,
-                    "quote_count": 0 if is_revealed else claim_count,
-                    "revealed": is_revealed,
-                }
-            )
-        return {"subjects": subjects, "limit_applied": limit_applied}
+            subject: Dict[str, Any] = {
+                "id": r["subject_id"],
+                "type": r["subject_type"],
+                "aliases": _decode_jsonb(r["aliases"]) or [],
+                "attrs": _decode_jsonb(r["attrs"]) or {},
+                "claim_count": claim_count,
+                "quote_count": 0 if is_revealed else claim_count,
+                "revealed": is_revealed,
+            }
+            if include_claims > 0 and r["subject_id"] in inline:
+                subject["claims"] = inline[r["subject_id"]]
+            subjects.append(subject)
+        result: Dict[str, Any] = {"subjects": subjects, "limit_applied": limit_applied}
+        if include_claims > 0:
+            result["claims_truncated"] = claims_truncated
+        return result
 
     # ------------------------------------------------------------------
     # neighbors
@@ -1531,10 +1696,27 @@ class FactsPgRepository:
         depth: int = 1,
         fanout: int = MAX_NEIGHBORS_FANOUT,
         limit: int = MAX_NEIGHBORS_RESULT,
+        include_claims: int = 0,
     ) -> Dict[str, Any]:
+        """Bounded traversal from one visible subject (spec §5 rule 3, §12).
+
+        Per hop the discovered endpoints are checked in ONE batched status
+        query and ONE type lookup (:meth:`_subject_statuses` — TCRD-295;
+        this used to be two round trips per discovered node, the N+1 that
+        made a hub walk cost 54 s of steps), with the exact same per-node
+        visibility rule and the same result ordering as before: frontier
+        nodes in sorted order, edges by id, fanout per node, the result cap
+        applied as items are admitted.
+
+        ``include_claims=k`` (≤ ``MAX_INLINE_CLAIMS_K``) attaches the k
+        newest readable claims to each EDGE in the response via
+        :meth:`_inline_claims` (nodes keep ``claim_count``), under the
+        response budget; ``truncated["claims"]`` is present only when
+        requested, so the default response shape is unchanged."""
         depth = max(1, min(depth, MAX_NEIGHBORS_DEPTH))
         fanout = max(1, min(fanout, MAX_NEIGHBORS_FANOUT))
         limit = max(1, min(limit, MAX_NEIGHBORS_RESULT))
+        include_claims = max(0, min(include_claims, MAX_INLINE_CLAIMS_K))
 
         readable = _readable_ids(caller)
         is_admin = readable is None
@@ -1573,10 +1755,35 @@ class FactsPgRepository:
             edges_revealed: Dict[str, bool] = {}
             visited = {subject_id}
             frontier = {subject_id}
-            truncated = {"depth": False, "fanout": False, "result": False}
+            truncated: Dict[str, bool] = {"depth": False, "fanout": False, "result": False}
 
             vis = self._visibility_predicate("c.corpus_id", is_admin)
             edge_types_clause = "AND e.type = ANY(:edge_types)" if edge_types else ""
+            edge_sql = sa.text(
+                f"""
+                SELECT e.id, e.src, e.dst, e.type,
+                       EXISTS (
+                         SELECT 1 FROM corrections co2 WHERE co2.subject_kind = 'edge'
+                           AND co2.subject_id = e.id AND co2.verdict = 'revealed'
+                       ) AS revealed
+                FROM edges e
+                WHERE (e.src = :node_id OR e.dst = :node_id)
+                  {edge_types_clause}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM corrections co WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                      AND co.verdict IN ('wrong', 'restricted')
+                  )
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM corrections co WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
+                        AND co.verdict = 'revealed'
+                    )
+                    OR EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id AND {vis})
+                  )
+                ORDER BY e.id
+                LIMIT :fanout_plus_one
+                """
+            )
 
             for _hop in range(depth):
                 if not frontier:
@@ -1584,36 +1791,11 @@ class FactsPgRepository:
                 if len(nodes) + len(edges_out) >= limit:
                     truncated["result"] = True
                     break
-                next_frontier: set = set()
+
+                # Phase 1 — this hop's edge pages, one per frontier node
+                # (fanout is per node, so the query stays per node).
+                hop_rows: List[Tuple[str, List[Any]]] = []
                 for node_id in sorted(frontier):
-                    if len(nodes) + len(edges_out) >= limit:
-                        truncated["result"] = True
-                        break
-                    edge_sql = sa.text(
-                        f"""
-                        SELECT e.id, e.src, e.dst, e.type,
-                               EXISTS (
-                                 SELECT 1 FROM corrections co2 WHERE co2.subject_kind = 'edge'
-                                   AND co2.subject_id = e.id AND co2.verdict = 'revealed'
-                               ) AS revealed
-                        FROM edges e
-                        WHERE (e.src = :node_id OR e.dst = :node_id)
-                          {edge_types_clause}
-                          AND NOT EXISTS (
-                            SELECT 1 FROM corrections co WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
-                              AND co.verdict IN ('wrong', 'restricted')
-                          )
-                          AND (
-                            EXISTS (
-                              SELECT 1 FROM corrections co WHERE co.subject_kind = 'edge' AND co.subject_id = e.id
-                                AND co.verdict = 'revealed'
-                            )
-                            OR EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id AND {vis})
-                          )
-                        ORDER BY e.id
-                        LIMIT :fanout_plus_one
-                        """
-                    )
                     params: Dict[str, Any] = {"node_id": node_id, "fanout_plus_one": fanout + 1}
                     if not is_admin:
                         params["readable"] = list(readable)
@@ -1625,35 +1807,56 @@ class FactsPgRepository:
                     if len(edge_rows) > fanout:
                         truncated["fanout"] = True
                         edge_rows = edge_rows[:fanout]
+                    hop_rows.append((node_id, edge_rows))
 
+                # Phase 2 — ONE status query + ONE type lookup for every
+                # endpoint this hop could admit (the batched N+1 fix).
+                candidate_ids: List[str] = []
+                for node_id, edge_rows in hop_rows:
+                    for erow in edge_rows:
+                        other_id = erow["dst"] if erow["src"] == node_id else erow["src"]
+                        if other_id not in nodes and other_id not in candidate_ids:
+                            candidate_ids.append(other_id)
+                statuses = self._subject_statuses(
+                    conn,
+                    subject_kind="fact",
+                    ids=candidate_ids,
+                    is_admin=is_admin,
+                    all_evidence=all_evidence,
+                    readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
+                )
+                types: Dict[str, str] = {}
+                if candidate_ids:
+                    types = {
+                        r["id"]: r["type"]
+                        for r in conn.execute(
+                            sa.text("SELECT id, type FROM facts WHERE id = ANY(:ids)"), {"ids": candidate_ids}
+                        ).mappings()
+                    }
+
+                # Phase 3 — admit in the exact order the per-node walk did.
+                next_frontier: set = set()
+                for node_id, edge_rows in hop_rows:
+                    if len(nodes) + len(edges_out) >= limit:
+                        truncated["result"] = True
+                        break
                     for erow in edge_rows:
                         other_id = erow["dst"] if erow["src"] == node_id else erow["src"]
                         if other_id not in nodes:
-                            other_status = self._subject_status(
-                                conn,
-                                subject_kind="fact",
-                                subject_id=other_id,
-                                is_admin=is_admin,
-                                all_evidence=all_evidence,
-                                readable=readable,
-                                tiered_hidden=tiered_hidden,
-                                audience_pairs=audience_pairs,
-                            )
-                            if not self._is_visible(other_status):
+                            other_status = statuses.get(other_id)
+                            if other_status is None or not self._is_visible(other_status):
                                 # traversal does not tunnel (§5 rule 3, S4):
                                 # the endpoint is invisible -> skip the edge
                                 # entirely, never reveal the path continues.
                                 continue
-                            other_row = (
-                                conn.execute(sa.text("SELECT id, type FROM facts WHERE id = :id"), {"id": other_id})
-                                .mappings()
-                                .first()
-                            )
-                            if other_row is None:
+                            other_type = types.get(other_id)
+                            if other_type is None:
                                 continue
                             nodes[other_id] = {
-                                "id": other_row["id"],
-                                "type": other_row["type"],
+                                "id": other_id,
+                                "type": other_type,
                                 "revealed": bool(other_status["revealed"]),
                             }
                         if erow["id"] not in edges_seen:
@@ -1727,16 +1930,29 @@ class FactsPgRepository:
                 tiered_hidden=tiered_hidden,
                 audience_pairs=audience_pairs,
             )
+            edges_with_revealed = [(eid, edges_revealed.get(eid, False)) for eid in edges_seen]
             edge_proj = self._project_subjects(
                 conn,
                 kind="edge",
-                ids_with_revealed=[(eid, edges_revealed.get(eid, False)) for eid in edges_seen],
+                ids_with_revealed=edges_with_revealed,
                 is_admin=is_admin,
                 readable=readable,
                 with_aliases=False,
                 tiered_hidden=tiered_hidden,
                 audience_pairs=audience_pairs,
             )
+            inline: Dict[str, List[Dict[str, Any]]] = {}
+            if include_claims > 0:
+                inline, truncated["claims"] = self._inline_claims(
+                    conn,
+                    kind="edge",
+                    ids_with_revealed=[(e["id"], edges_revealed.get(e["id"], False)) for e in edges_out],
+                    k=include_claims,
+                    is_admin=is_admin,
+                    readable=readable,
+                    tiered_hidden=tiered_hidden,
+                    audience_pairs=audience_pairs,
+                )
 
         nodes_out = []
         for n in nodes.values():
@@ -1755,6 +1971,8 @@ class FactsPgRepository:
             )
         for e in edges_out:
             e["attrs"] = edge_proj.get(e["id"], {"attrs": {}})["attrs"]
+            if include_claims > 0 and e["id"] in inline:
+                e["claims"] = inline[e["id"]]
 
         return {
             "nodes": nodes_out,
@@ -1766,8 +1984,9 @@ class FactsPgRepository:
     # claims
     # ------------------------------------------------------------------
 
-    def claims(self, caller, subject_id: str) -> Dict[str, Any]:
-        """List a subject's OWN claims. The visibility GATE (below, via
+    def claims(self, caller, subject_id: str, *, limit: int = MAX_CLAIMS_LIMIT) -> Dict[str, Any]:
+        """List a subject's OWN claims, newest first, capped at ``limit``
+        (``MAX_CLAIMS_LIMIT`` ceiling). The visibility GATE (below, via
         `_subject_status`) uses the endpoint-evidence union for a fact
         subject, so a visible endpoint-only fact (zero own claims, visible
         only via an incident edge's claim) returns `{"claims": [], ...}`
@@ -1785,19 +2004,25 @@ class FactsPgRepository:
         to one). Skipped entirely for an admin caller OR when ``is_revealed``:
         both admin god-mode and a `revealed` correction outrank the audience
         selector (spec §4.3's conflict table — "sees everything, both
-        layers") and show every variant, exactly as before this task."""
+        layers") and show every variant, exactly as before this task.
+
+        The cap (TCRD-295): this used to be the ONE read with no row limit,
+        deliberately — a bare cap without a truncation signal would have been
+        the S6 shortfall oracle ``search()``/``neighbors()`` avoid. It now
+        carries the same signal ``search()`` does: ``limit_applied`` is true
+        only when the CALLER'S OWN readable, deduplicated set exceeds
+        ``limit`` (or the bounded fetch itself filled up), never a statement
+        about claims grants hid. The cap is applied AFTER dedup, on rows
+        ordered newest-first (``document_date DESC NULLS LAST``, then id), so
+        the page a caller gets is the most recent evidence. Measured reason:
+        an uncapped hub subject returned 18.5k tokens that every later step
+        of a chat turn re-read."""
+        limit = max(1, min(limit, MAX_CLAIMS_LIMIT))
         readable = _readable_ids(caller)
         is_admin = readable is None
         all_evidence = _visibility_mode() == "all_evidence"
         tiered_hidden, audience_pairs = _audience_context(caller, readable)
 
-        # No LIMIT here (unlike search()/neighbors()) — this method has no
-        # limit_applied-style truncation signal to pair one with, so a bare
-        # cap would recreate the S6 shortfall-oracle shape those two avoid;
-        # left for a follow-up with its own wire-contract review. The
-        # statement_timeout IS wired here, same as search()/neighbors() —
-        # a subject with a pathological claim count still had nothing
-        # bounding how long the connection sat executing this query.
         # `.begin()` (not `.connect()`) so `SET LOCAL` applies to the
         # queries that follow in the same transaction.
         with self._engine.begin() as conn:
@@ -1832,16 +2057,18 @@ class FactsPgRepository:
                 JOIN corpus_files cf ON cf.id = c.corpus_file_id
                 LEFT JOIN corpus_file_sources cfs ON cfs.corpus_file_id = c.corpus_file_id
                 WHERE c.{kind_column} = :subject_id AND ({clause})
-                ORDER BY c.id
+                ORDER BY c.document_date DESC NULLS LAST, c.id
+                LIMIT :fetch_cap
                 """
             )
-            params: Dict[str, Any] = {"subject_id": subject_id}
+            params: Dict[str, Any] = {"subject_id": subject_id, "fetch_cap": _CLAIMS_FETCH_CAP}
             if not is_admin and not is_revealed:
                 params["readable"] = list(readable)
                 params["tiered_hidden"] = tiered_hidden
                 params["audience_pairs"] = audience_pairs
             rows = conn.execute(sql, params).mappings().all()
 
+        fetch_capped = len(rows) >= _CLAIMS_FETCH_CAP
         # Dedup is a NON-ADMIN, non-revealed narrowing only: admin god-mode
         # and a `revealed` correction both outrank the audience selector by
         # design (spec §4.3's conflict table — "sees everything, both
@@ -1849,32 +2076,379 @@ class FactsPgRepository:
         if not is_admin and not is_revealed:
             rows = _pick_most_privileged(rows, _class_rank_map())
 
-        out = []
+        limit_applied = fetch_capped or len(rows) > limit
+        rows = rows[:limit]
+        out = [self._shape_claim(r, is_admin=is_admin, readable=readable, is_revealed=is_revealed) for r in rows]
+        return {"claims": out, "revealed": is_revealed, "limit_applied": limit_applied}
+
+    @staticmethod
+    def _shape_claim(
+        r: Any,
+        *,
+        is_admin: bool,
+        readable: Optional[frozenset],
+        is_revealed: bool,
+        quote_max: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """The wire shape of ONE claim, shared by :meth:`claims` and the
+        inline path (:meth:`_inline_claims`) so the two can never drift. A
+        `revealed` correction reveals the FACT, not the geography of its
+        evidence (spec §4, review tightening 2026-08-28): for a claim whose
+        collection the caller cannot read, the document's human identity
+        (name/path/URL) is withheld — opaque ids only — and every quote is
+        suppressed. ``quote_max`` (inline path only) caps the quote's length
+        and marks the cut with ``quote_truncated``."""
+        claim_readable = is_admin or r["corpus_id"] in readable
+        document: Optional[Dict[str, Any]]
+        if claim_readable or not is_revealed:
+            document = {"name": r["filename"], "path": r["path"]}
+            if r.get("source_url"):
+                document["source_url"] = r["source_url"]
+        else:
+            document = None
+        quote = "" if is_revealed else (r["quote"] or "")
+        out: Dict[str, Any] = {
+            "id": r["id"],
+            "corpus_id": r["corpus_id"],
+            "corpus_file_id": r["corpus_file_id"],
+            "document": document,
+            "quote": quote,
+            "attrs": _decode_jsonb(r["attrs"]) or {},
+            "document_date": r["document_date"].isoformat() if r["document_date"] else None,
+        }
+        if quote_max is not None and len(quote) > quote_max:
+            out["quote"] = quote[:quote_max]
+            out["quote_truncated"] = True
+        return out
+
+    def _inline_claims(
+        self,
+        conn,
+        *,
+        kind: str,
+        ids_with_revealed: List[Tuple[str, bool]],
+        k: int,
+        is_admin: bool,
+        readable: Optional[frozenset],
+        tiered_hidden: List[str],
+        audience_pairs: List[str],
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], bool]:
+        """Bounded inline evidence (TCRD-295): for an EXACT, already-visible
+        set of subjects (the caller has decided who is listed — this is never
+        a visibility gate), the k NEWEST claims each, in one query. Returns
+        ``({subject_id: [claim, ...]}, truncated)``.
+
+        Inherits :meth:`claims`'s rules wholesale, in the same order: the
+        SQL keeps only rows the caller can read (or every row for a
+        `revealed` subject — the same ``vis``-or-revealed clause), the newest
+        ``_INLINE_CLAIMS_WINDOW`` rows per subject come back, audience-
+        variant dedup (:func:`_pick_most_privileged`, non-admin and non-
+        revealed only) runs on THOSE rows, and k is taken AFTER it — so a
+        ``full``/``redacted`` pair on one document is one claim, never two
+        rows eating the budget, and a caller never sees a variant outside
+        their class. :meth:`_shape_claim` then applies the revealed/opaque-
+        document rules and the per-quote character cap.
+
+        Budget: subjects are served in the caller's result order until
+        ``MAX_INLINE_CLAIMS_TOTAL`` claims have been attached; the first
+        subject that would overshoot stops the attachment (its claims and
+        every later subject's are omitted, never partially attached) and
+        ``truncated`` is returned true so the caller can say so. A subject
+        with zero readable claims costs nothing and gets an explicit ``[]``."""
+        if not ids_with_revealed or k <= 0:
+            return {}, False
+        kind_column = "fact_id" if kind == "fact" else "edge_id"
+        vis = self._visibility_predicate("c.corpus_id", is_admin)
+        sql = sa.text(
+            f"""
+            WITH target_ids AS (
+                SELECT * FROM unnest(CAST(:ids AS text[]), CAST(:revealed AS bool[])) AS t(subject_id, revealed)
+            ),
+            ranked AS (
+                SELECT t.subject_id, t.revealed,
+                       c.id, c.fact_id, c.edge_id, c.corpus_id, c.corpus_file_id, c.audience,
+                       c.quote, c.attrs, c.document_date,
+                       cf.filename, cf.path, cfs.source_url,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.subject_id ORDER BY c.document_date DESC NULLS LAST, c.id
+                       ) AS rn
+                FROM target_ids t
+                JOIN claims c ON c.{kind_column} = t.subject_id
+                JOIN corpus_files cf ON cf.id = c.corpus_file_id
+                LEFT JOIN corpus_file_sources cfs ON cfs.corpus_file_id = c.corpus_file_id
+                WHERE t.revealed OR ({vis})
+            )
+            SELECT * FROM ranked WHERE rn <= :window ORDER BY subject_id, rn
+            """
+        )
+        params: Dict[str, Any] = {
+            "ids": [i for i, _r in ids_with_revealed],
+            "revealed": [bool(r) for _i, r in ids_with_revealed],
+            "window": _INLINE_CLAIMS_WINDOW,
+        }
+        if not is_admin:
+            params["readable"] = list(readable) if readable else []
+            params["tiered_hidden"] = tiered_hidden or []
+            params["audience_pairs"] = audience_pairs or []
+        rows = conn.execute(sql, params).mappings().all()
+
+        by_subject: Dict[str, List[Any]] = {}
         for r in rows:
-            # A `revealed` correction reveals the FACT, not the geography of
-            # its evidence (spec §4, review tightening 2026-08-28): for a
-            # claim whose collection the caller cannot read, the document's
-            # human identity (name/path/URL) is withheld — opaque ids only.
-            claim_readable = is_admin or r["corpus_id"] in readable
-            document: Optional[Dict[str, Any]]
-            if claim_readable or not is_revealed:
-                document = {"name": r["filename"], "path": r["path"]}
-                if r.get("source_url"):
-                    document["source_url"] = r["source_url"]
-            else:
-                document = None
-            out.append(
+            by_subject.setdefault(r["subject_id"], []).append(r)
+        class_rank = _class_rank_map() if not is_admin else {}
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        total = 0
+        truncated = False
+        for subject_id, revealed in ids_with_revealed:
+            subject_rows = by_subject.get(subject_id, [])
+            if subject_rows and not is_admin and not revealed:
+                subject_rows = _pick_most_privileged(subject_rows, class_rank)
+            subject_rows = subject_rows[:k]
+            if not subject_rows:
+                out[subject_id] = []
+                continue
+            if total + len(subject_rows) > MAX_INLINE_CLAIMS_TOTAL:
+                truncated = True
+                break
+            total += len(subject_rows)
+            out[subject_id] = [
+                self._shape_claim(
+                    r, is_admin=is_admin, readable=readable, is_revealed=revealed, quote_max=INLINE_QUOTE_MAX_CHARS
+                )
+                for r in subject_rows
+            ]
+        return out, truncated
+
+    # ------------------------------------------------------------------
+    # edges — the relationship-shaped read (TCRD-295)
+    # ------------------------------------------------------------------
+
+    def edges(
+        self,
+        caller,
+        *,
+        edge_type: str,
+        src_type: Optional[str] = None,
+        dst_type: Optional[str] = None,
+        src_id: Optional[str] = None,
+        dst_id: Optional[str] = None,
+        limit: int = MAX_EDGES_LIMIT,
+        extend_edge_type: Optional[str] = None,
+        extend_from: str = "dst",
+        include_claims: int = 0,
+    ) -> Dict[str, Any]:
+        """Every visible edge of ONE type, with both endpoints carried as
+        full subjects — the relationship-shaped read the five primitives
+        lacked (TCRD-295). "Which X relate to which Y" was one
+        :meth:`neighbors` call per root plus one :meth:`claims` call per
+        citation; here it is one call: ``edge_type`` (required — the names
+        come from ``count_visible_edges_by_type`` / `fact_type_map`, never
+        from a customer vocabulary baked in here, spec §11), optional
+        endpoint type filters (``src_type``/``dst_type``) and anchors
+        (``src_id``/``dst_id``), a page ``limit`` (``MAX_EDGES_LIMIT``),
+        and an optional ONE-hop ``extend_edge_type`` followed from every
+        listed edge's ``extend_from`` endpoint (``"src"`` or ``"dst"``) —
+        the second hop of a two-hop question in the same response.
+
+        Visibility (spec §5), all of it in SQL, before ``LIMIT``:
+        - the edge itself passes :meth:`_visible_edges_for_corpus_cte`'s
+          gate over ALL collections (own readable claim, or `revealed`;
+          withheld excluded) — S3, never inferred from its endpoints;
+        - BOTH endpoints pass :meth:`_fact_visible_sql` — the same rule
+          :meth:`neighbors` applies per hop, so an edge into a withheld or
+          unreadable fact is not listed and never reveals it exists (rule 3);
+        - ``truncated.result`` / ``truncated.extension`` are computed from
+          the caller's OWN visible set (``limit + 1`` fetched), never from
+          what grants hid (S6). Absence of a type and a type the caller
+          cannot see read identically: an empty page (rule 2).
+
+        Projection runs AFTER truncation (spec §12 cost note) through the
+        same :meth:`_project_subjects` ``search()``/``neighbors()`` use, so
+        a node here carries byte-identical ``attrs``/``aliases``/
+        ``claim_count`` to a search subject. ``include_claims=k`` (≤
+        ``MAX_INLINE_CLAIMS_K``) attaches the k newest readable claims to
+        each EDGE via :meth:`_inline_claims` (the relationship is what gets
+        cited; nodes keep ``claim_count`` and `fact_claims` on demand),
+        under the response budget, flagged on ``truncated.claims``.
+
+        Returns ``{"nodes": [<subject>], "edges": [{"id", "src", "dst",
+        "type", "attrs", "claims"?}], "truncated": {"result", "extension",
+        "claims"}}``. Runs under the shared statement timeout."""
+        if not edge_type or not str(edge_type).strip():
+            raise ValueError("edge_type is required")
+        if extend_from not in ("src", "dst"):
+            raise ValueError("extend_from must be 'src' or 'dst'")
+        limit = max(1, min(limit, MAX_EDGES_LIMIT))
+        include_claims = max(0, min(include_claims, MAX_INLINE_CLAIMS_K))
+
+        readable = _readable_ids(caller)
+        is_admin = readable is None
+        all_evidence = _visibility_mode() == "all_evidence"
+        tiered_hidden, audience_pairs = _audience_context(caller, readable)
+        gate = dict(
+            is_admin=is_admin,
+            all_evidence=all_evidence,
+            readable=readable,
+            tiered_hidden=tiered_hidden,
+            audience_pairs=audience_pairs,
+        )
+        truncated = {"result": False, "extension": False, "claims": False}
+
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows, truncated["result"] = self._edge_rows(
+                conn,
+                edge_type=edge_type,
+                src_type=src_type,
+                dst_type=dst_type,
+                src_ids=[src_id] if src_id else None,
+                dst_ids=[dst_id] if dst_id else None,
+                limit=limit,
+                **gate,
+            )
+            rows = list(rows)
+            if extend_edge_type and rows:
+                anchors = sorted({r[extend_from] for r in rows})
+                seen = {r["id"] for r in rows}
+                ext_rows, truncated["extension"] = self._edge_rows(
+                    conn, edge_type=extend_edge_type, anchor_ids=anchors, limit=limit, **gate
+                )
+                rows.extend(r for r in ext_rows if r["id"] not in seen)
+
+            # Both endpoints of every listed edge are visible (gated in SQL
+            # above); collect them in first-seen order for a stable response.
+            node_types: Dict[str, str] = {}
+            for r in rows:
+                node_types.setdefault(r["src"], r["src_type"])
+                node_types.setdefault(r["dst"], r["dst_type"])
+            node_ids = list(node_types)
+            revealed_nodes: set = set()
+            if node_ids:
+                revealed_nodes = set(
+                    conn.execute(
+                        sa.text(
+                            "SELECT subject_id FROM corrections "
+                            "WHERE subject_kind = 'fact' AND verdict = 'revealed' AND subject_id = ANY(:ids)"
+                        ),
+                        {"ids": node_ids},
+                    )
+                    .scalars()
+                    .all()
+                )
+            proj_gate = dict(
+                is_admin=is_admin, readable=readable, tiered_hidden=tiered_hidden, audience_pairs=audience_pairs
+            )
+            node_proj = self._project_subjects(
+                conn,
+                kind="fact",
+                ids_with_revealed=[(nid, nid in revealed_nodes) for nid in node_ids],
+                with_aliases=True,
+                **proj_gate,
+            )
+            edges_with_revealed = [(r["id"], bool(r["revealed"])) for r in rows]
+            edge_proj = self._project_subjects(
+                conn, kind="edge", ids_with_revealed=edges_with_revealed, with_aliases=False, **proj_gate
+            )
+            inline: Dict[str, List[Dict[str, Any]]] = {}
+            if include_claims > 0:
+                inline, truncated["claims"] = self._inline_claims(
+                    conn, kind="edge", ids_with_revealed=edges_with_revealed, k=include_claims, **proj_gate
+                )
+
+        nodes_out = []
+        for nid in node_ids:
+            proj = node_proj.get(nid, {"aliases": [], "attrs": {}, "claim_count": 0})
+            revealed = nid in revealed_nodes
+            nodes_out.append(
                 {
-                    "id": r["id"],
-                    "corpus_id": r["corpus_id"],
-                    "corpus_file_id": r["corpus_file_id"],
-                    "document": document,
-                    "quote": "" if is_revealed else r["quote"],
-                    "attrs": _decode_jsonb(r["attrs"]) or {},
-                    "document_date": r["document_date"].isoformat() if r["document_date"] else None,
+                    "id": nid,
+                    "type": node_types[nid],
+                    "aliases": proj["aliases"],
+                    "attrs": proj["attrs"],
+                    "claim_count": proj["claim_count"],
+                    "quote_count": 0 if revealed else proj["claim_count"],
+                    "revealed": revealed,
                 }
             )
-        return {"claims": out, "revealed": is_revealed}
+        edges_out = []
+        for r in rows:
+            e: Dict[str, Any] = {
+                "id": r["id"],
+                "src": r["src"],
+                "dst": r["dst"],
+                "type": r["type"],
+                "attrs": edge_proj.get(r["id"], {"attrs": {}})["attrs"],
+            }
+            if include_claims > 0 and r["id"] in inline:
+                e["claims"] = inline[r["id"]]
+            edges_out.append(e)
+        return {"nodes": nodes_out, "edges": edges_out, "truncated": truncated}
+
+    def _edge_rows(
+        self,
+        conn,
+        *,
+        edge_type: str,
+        limit: int,
+        is_admin: bool,
+        all_evidence: bool,
+        readable: Optional[frozenset],
+        tiered_hidden: List[str],
+        audience_pairs: List[str],
+        src_type: Optional[str] = None,
+        dst_type: Optional[str] = None,
+        src_ids: Optional[List[str]] = None,
+        dst_ids: Optional[List[str]] = None,
+        anchor_ids: Optional[List[str]] = None,
+    ) -> Tuple[List[Any], bool]:
+        """One page of visible edges of ``edge_type`` (see :meth:`edges` for
+        the gate). ``anchor_ids`` matches EITHER endpoint — the extension
+        hop follows a relationship in whichever direction it is stored.
+        Returns ``(rows, truncated)`` with ``limit + 1`` fetched so the
+        truncation flag is the caller's own shortfall (S6)."""
+        cte = self._visible_edges_for_corpus_cte(is_admin, all_collections=True)
+        src_ok = self._fact_visible_sql("e.src", is_admin=is_admin, all_evidence=all_evidence)
+        dst_ok = self._fact_visible_sql("e.dst", is_admin=is_admin, all_evidence=all_evidence)
+        clauses = ["e.type = :edge_type"]
+        params: Dict[str, Any] = {"edge_type": edge_type, "limit_plus_one": limit + 1}
+        if src_type:
+            clauses.append("fs.type = :src_type")
+            params["src_type"] = src_type
+        if dst_type:
+            clauses.append("fd.type = :dst_type")
+            params["dst_type"] = dst_type
+        if src_ids:
+            clauses.append("e.src = ANY(:src_ids)")
+            params["src_ids"] = list(src_ids)
+        if dst_ids:
+            clauses.append("e.dst = ANY(:dst_ids)")
+            params["dst_ids"] = list(dst_ids)
+        if anchor_ids:
+            clauses.append("(e.src = ANY(:anchor_ids) OR e.dst = ANY(:anchor_ids))")
+            params["anchor_ids"] = list(anchor_ids)
+        if not is_admin:
+            params["readable"] = list(readable) if readable else []
+            params["tiered_hidden"] = tiered_hidden or []
+            params["audience_pairs"] = audience_pairs or []
+        sql = sa.text(
+            f"""
+            WITH {cte}
+            SELECT e.id, e.src, e.dst, e.type, fs.type AS src_type, fd.type AS dst_type,
+                   (e.id IN (SELECT subject_id FROM edge_revealed_ids)) AS revealed
+            FROM edge_visible v
+            JOIN edges e ON e.id = v.subject_id
+            JOIN facts fs ON fs.id = e.src
+            JOIN facts fd ON fd.id = e.dst
+            WHERE {" AND ".join(clauses)}
+              AND {src_ok}
+              AND {dst_ok}
+            ORDER BY e.id
+            LIMIT :limit_plus_one
+            """
+        )
+        rows = conn.execute(sql, params).mappings().all()
+        return rows[:limit], len(rows) > limit
 
     def _subject_kind(self, conn, subject_id: str) -> Optional[str]:
         row = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": subject_id}).first()

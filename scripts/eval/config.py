@@ -5,13 +5,17 @@ commented copy):
 
 ```yaml
 round: R1
-arms: [A0, A4]
+arms: [A0, A3, A4]
 runs_per_prompt: 3          # optional, default 3 -- workbook protocol #3
 output_dir: runs            # optional, default "runs"
 arm_config:
   A0:
     model: claude-sonnet-5
     api_key_env: ANTHROPIC_API_KEY
+  A3:
+    model: claude-sonnet-5   # every Claude arm in a round runs the SAME model id
+    api_key_env: ANTHROPIC_API_KEY
+    system_file: /path/outside/this/repo/A3-context-pack-v1.md   # or `system:` inline; one is required
   A4:
     surface: chat            # chat | slack
     base_url: https://agnes.example.com

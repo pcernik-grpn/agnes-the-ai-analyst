@@ -397,6 +397,7 @@ POSTURE: dict[str, str] = {
     "POST /api/store/entities/builder/turn": "store.entity_builder_turn",
     # -- app.api.facts ---------------------------------------------------------
     "DELETE /api/facts/corrections/{subject_kind}/{subject_id}": "facts.correction.delete",
+    "POST /api/facts/edges": "facts.edges",
     "POST /api/facts/ingest": "facts.ingest",
     "POST /api/facts/neighbors": "facts.neighbors",
     "POST /api/facts/search": "facts.search",
@@ -1585,6 +1586,7 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "fact_type_map": "mcp.tool_call",
     "fact_facets": "mcp.tool_call",
     "fact_neighbors": "mcp.tool_call",
+    "fact_edges": "mcp.tool_call",
     "fact_claims": "mcp.tool_call",
     "schema": "catalog.schema",
     "describe": "catalog.sample",  # calls schema then sample; sample is the substantive read
