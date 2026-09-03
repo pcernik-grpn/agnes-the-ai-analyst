@@ -982,8 +982,14 @@ variable "enable_datadog" {
   description = <<-EOT
     Install the Datadog Agent as a pinned HOST package (apt, `apt-mark hold`)
     on every VM and ship host, disk, Docker, systemd, TLS, HTTP-health and
-    Postgres side-car checks to Datadog. Off by default; a module bump alone
-    changes nothing for a consumer that does not set this.
+    Postgres side-car checks to Datadog. Off by default: leaving it unset
+    installs nothing, grants nothing and starts nothing.
+
+    One caveat, so nobody is promised an empty apply: picking up this module
+    version labels the data disk and the static IP with the module's own four
+    keys even with Datadog off, because those two resources carried no labels
+    at all before `extra_labels` existed. Metadata-only, in place, nothing
+    recreated — but it is a diff, and it is the only one an opt-out bump has.
 
     Three things worth knowing before turning it on:
 
@@ -1078,6 +1084,31 @@ variable "datadog_extra_tags" {
     condition     = alltrue([for t in var.datadog_extra_tags : can(regex("^[a-z][a-z0-9._/-]*:[a-z0-9][a-z0-9._:/-]*$", t))])
     error_message = "Each entry of datadog_extra_tags must be a lowercase key:value tag."
   }
+
+  validation {
+    condition     = alltrue([for t in var.datadog_extra_tags : length(t) <= 200])
+    error_message = "A Datadog tag is capped at 200 characters."
+  }
+
+  validation {
+    # The rendered datadog.yaml is base64'd into the single startup-script
+    # metadata value, which GCE caps at 256 KiB. A bound here fails the plan
+    # instead of failing instance creation.
+    condition     = length(var.datadog_extra_tags) <= 50
+    error_message = "datadog_extra_tags is capped at 50 entries."
+  }
+
+  validation {
+    # `env` is the top-level key of datadog.yaml and the dimension every monitor
+    # scopes on; the rest are the module's own identity tags. A second value for
+    # one of them does not error in Datadog — it silently gives the host two,
+    # which is worse than an error.
+    condition = alltrue([
+      for t in var.datadog_extra_tags :
+      !contains(["env", "customer", "app", "service", "role", "agnes_instance", "managed"], split(":", t)[0])
+    ])
+    error_message = "datadog_extra_tags must not redefine a module-owned tag key (env, customer, app, service, role, agnes_instance, managed) — use datadog_env for the env dimension."
+  }
 }
 
 variable "extra_labels" {
@@ -1108,5 +1139,13 @@ variable "extra_labels" {
   validation {
     condition     = alltrue([for v in values(var.extra_labels) : can(regex("^[a-z0-9_-]{0,63}$", v))])
     error_message = "GCE label VALUES may contain only lowercase letters, digits, - and _ (max 63 chars) — a value with a dot or an uppercase letter is rejected by the GCE API at apply time, not at plan time."
+  }
+
+  validation {
+    # GCE caps a resource at 64 labels and the module spends four of them, so
+    # more than 60 here plans cleanly and then fails on the VM, the disk or the
+    # address.
+    condition     = length(var.extra_labels) <= 60
+    error_message = "extra_labels is capped at 60 entries: GCE allows 64 labels per resource and the module adds four of its own."
   }
 }

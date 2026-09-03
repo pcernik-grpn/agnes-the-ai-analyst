@@ -68,6 +68,7 @@ locals {
       toset(var.runtime_secrets),
       local.dispatcher_secrets,
       local.kai_agent_secrets,
+      local.per_instance_oauth_secrets,
     ),
   ) : toset([])
 

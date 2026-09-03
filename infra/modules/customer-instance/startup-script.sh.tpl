@@ -371,6 +371,11 @@ _dd_write_keyring() {
 # The API key is substituted through bash parameter expansion on a value read
 # from a variable — never `sed -e "s/…/$KEY/"`, which would put it on argv and
 # from there into /proc and into this script's own log on any error.
+#
+# Called with a trailing `|| echo WARNING`, which is load-bearing under this
+# script's errexit: bash suppresses it inside a command that is part of an ||
+# list, so no step in here — not a failed write on a full disk, not a chmod on a
+# read-only mount — can abort a boot. The guards inside are belt to that braces.
 _dd_install_artifact() {
     _dd_rel="$1"
     _dd_b64="$2"
@@ -392,7 +397,7 @@ _dd_install_artifact() {
     esac
 
     if [ -z "$_dd_b64" ]; then
-        rm -f "$_dd_target"
+        rm -f "$_dd_target" || true
         return 0
     fi
 
@@ -405,13 +410,18 @@ _dd_install_artifact() {
     fi
 
     _dd_tmp=$(mktemp) || return 0
-    chmod 0600 "$_dd_tmp"
-    printf '%s\n' "$_dd_content" > "$_dd_tmp"
+    chmod 0600 "$_dd_tmp" || true
+    if ! printf '%s\n' "$_dd_content" > "$_dd_tmp"; then
+        unset _dd_content
+        rm -f "$_dd_tmp" || true
+        echo "WARNING: could not stage the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    fi
     unset _dd_content
     mkdir -p "$(dirname "$_dd_target")" \
         && install -o "$_dd_owner" -g "$_dd_group" -m "$_dd_mode" "$_dd_tmp" "$_dd_target" \
         || echo "WARNING: could not install the Datadog artifact '$_dd_rel'" >&2
-    rm -f "$_dd_tmp"
+    rm -f "$_dd_tmp" || true
     return 0
 }
 
@@ -446,7 +456,8 @@ else
         usermod -aG docker dd-agent \
             || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
 %{ for dd_path, dd_content in datadog_files_b64 ~}
-        _dd_install_artifact "${dd_path}" "${dd_content}"
+        _dd_install_artifact "${dd_path}" "${dd_content}" \
+            || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
 %{ endfor ~}
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable datadog-agent >/dev/null 2>&1 || true

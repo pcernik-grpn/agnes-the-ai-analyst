@@ -1,9 +1,17 @@
 # Postgres side-car check, delivered through file-based Autodiscovery.
 #
-# ad_identifiers matches the short image name, so ONE template covers every
-# postgres:* container of the compose project (the app's side-car and the
-# kai-agent's) without the module knowing how many there are. %%host%% is
-# resolved per container by the agent.
+# ad_identifiers matches the short IMAGE name, so ONE template covers both
+# side-cars (the app's and the kai-agent's) without the module knowing how many
+# there are. %%host%% is resolved per container by the agent.
+#
+# Be precise about the scope, because it is wider than the role bootstrap's:
+# Autodiscovery matches on the image across the whole host, while
+# agnes-datadog-pg-role.sh deliberately creates the monitoring role only inside
+# the Agnes compose project. An unrelated postgres:* container on the same host
+# would therefore be probed and report postgres.can_connect CRITICAL rather
+# than being ignored. Narrowing this further needs a com.datadoghq.ad.* label
+# on the container, which lives in the app image's compose file, not in this
+# module — so it is a documented limitation, not an oversight.
 #
 # @@DD_PG_PASSWORD@@ is substituted on the host by agnes-datadog-pg-role.sh,
 # which owns the credential; it is not a Terraform value.

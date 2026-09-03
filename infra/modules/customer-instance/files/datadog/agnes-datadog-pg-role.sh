@@ -48,7 +48,13 @@ if [ ! -s "$PW_FILE" ]; then
 fi
 PW=$(cat "$PW_FILE")
 
-for cid in $(docker ps -q 2>/dev/null); do
+# Scoped to the Agnes compose project, not to "every postgres image on the
+# host": creating a LOGIN role in a database this stack does not own would be a
+# host-wide mutation performed by a monitoring add-on. The project name is the
+# compose directory's basename (/opt/agnes -> agnes); a container with no
+# compose project label is never a side-car of ours and is skipped by the
+# filter itself.
+for cid in $(docker ps -q --filter label=com.docker.compose.project=agnes 2>/dev/null); do
     image=$(docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null) || continue
     case "$image" in
         postgres:* | */postgres:*) ;;

@@ -83,10 +83,27 @@ def test_every_datadog_input_that_can_fail_at_apply_time_is_validated_at_plan_ti
         assert "validation" in _var_block(name), f"{name} has no validation block"
 
 
-def test_extra_labels_validates_gce_key_and_value_shapes_separately():
+def test_extra_labels_validates_every_gce_constraint_separately():
+    """GCE constrains label keys, label values and label COUNT differently, and
+    each one is an apply-time failure rather than a plan-time one if unchecked —
+    the expensive kind, mid-rollout."""
     block = _var_block("extra_labels")
-    assert block.count("validation") == 2, "GCE constrains label keys and values differently"
-    assert "keys(var.extra_labels)" in block and "values(var.extra_labels)" in block
+    assert "keys(var.extra_labels)" in block, "label KEY shape is unvalidated"
+    assert "values(var.extra_labels)" in block, "label VALUE shape is unvalidated"
+    assert "length(var.extra_labels)" in block, "GCE caps a resource at 64 labels and the module spends four of them"
+    assert block.count("validation") >= 3
+
+
+def test_datadog_extra_tags_cannot_shadow_a_module_owned_dimension():
+    """A second value for `env` (or role, or service) does not error in Datadog —
+    it silently gives the host two, which breaks the one-deployment-per-env
+    invariant every consumer-side monitor scopes on."""
+    block = _var_block("datadog_extra_tags")
+    assert "length(var.datadog_extra_tags) <= 50" in block, "unbounded tag list"
+    assert "length(t) <= 200" in block, "a Datadog tag is capped at 200 characters"
+    for reserved in ("env", "customer", "app", "service", "role", "agnes_instance", "managed"):
+        assert f'"{reserved}"' in block, f"{reserved} is not a reserved tag key"
+    assert 'split(":", t)[0]' in block, "the reserved check must look at the tag KEY"
 
 
 def test_main_tf_ships_every_artifact_under_files_datadog():

@@ -251,9 +251,38 @@ def test_every_artifact_is_installed_and_an_empty_payload_removes_its_target(on:
     )
 
 
+def test_the_artifact_installer_cannot_abort_the_boot(on: str):
+    """`set -euo pipefail` is active, and the call is NOT inside a conditional
+    unless we put it there. An unguarded failure in the helper — a write on a
+    full disk, a chmod on a read-only mount — would then kill the boot instead
+    of degrading to a warning, which is the one thing this whole block promises
+    not to do. Proven in bash 5.3: an unguarded call aborts the script, and the
+    same call with a trailing `|| echo` suppresses errexit for everything inside.
+    """
+    lines = on.splitlines()
+    sites = [ln for ln in lines if '_dd_install_artifact "' in ln]
+    assert sites, "no artifact install calls in the rendered script"
+    for idx, line in enumerate(lines):
+        if '_dd_install_artifact "' not in line:
+            continue
+        tail = line + "\n" + (lines[idx + 1] if idx + 1 < len(lines) else "")
+        assert "||" in tail, f"unguarded artifact install: {line.strip()}"
+
+    body = on[on.index("_dd_install_artifact() {") : on.index('if [ -z "$DD_API_KEY_VALUE" ]')]
+    # Every fallible operation inside is guarded too, so a future edit that drops
+    # the call-site guard does not silently re-arm the hazard.
+    for risky in ('rm -f "$_dd_target"', 'chmod 0600 "$_dd_tmp"', 'rm -f "$_dd_tmp"'):
+        idx = body.index(risky)
+        assert "||" in body[idx : idx + 60], f"unguarded: {risky}"
+    assert 'if ! printf \'%s\\n\' "$_dd_content" > "$_dd_tmp"; then' in body
+
+
 def test_no_step_of_the_agent_block_can_fail_the_boot(on: str):
     block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time gcplogs driver probe")]
-    assert "set -euo pipefail" not in block
+    # Code, not comments — the block explains WHY errexit matters here, which is
+    # not the same as re-arming it.
+    code = "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
+    assert "set -e" not in code, "the Datadog block must not re-arm errexit"
     # The install subshell must chain with && (errexit is suppressed inside a
     # command that is part of an || list, so `set -e` in there buys nothing).
     install = block[block.index("mkdir -p /usr/share/keyrings") : block.index("apt-mark hold")]
