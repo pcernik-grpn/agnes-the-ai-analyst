@@ -74,9 +74,7 @@ class TestValue:
         assert row[0] == _expected("")
 
     def test_same_input_same_pseudonym_so_it_joins(self, conn):
-        rows = conn.execute(
-            f"SELECT {POLICY_HMAC_FUNCTION}(v) FROM (VALUES ('a'), ('a'), ('b')) AS t(v)"
-        ).fetchall()
+        rows = conn.execute(f"SELECT {POLICY_HMAC_FUNCTION}(v) FROM (VALUES ('a'), ('a'), ('b')) AS t(v)").fetchall()
         assert rows[0][0] == rows[1][0]
         assert rows[0][0] != rows[2][0]
 

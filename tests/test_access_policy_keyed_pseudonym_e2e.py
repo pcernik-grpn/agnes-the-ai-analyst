@@ -241,9 +241,7 @@ class TestSaveTime:
         r = c.put(
             "/api/admin/registry/invoices_keyed_remote",
             json={
-                "access_policy_sql": (
-                    'SELECT "id", agnes_hmac("email") AS "email" FROM "invoices_keyed_remote"'
-                ),
+                "access_policy_sql": ('SELECT "id", agnes_hmac("email") AS "email" FROM "invoices_keyed_remote"'),
                 "access_policy_note": "should never be attachable to a remote table",
             },
             headers=_auth(keyed["admin_token"]),

@@ -169,7 +169,9 @@ class TestValidator:
         import sqlglot
 
         for engine in ("bigquery", "databricks"):
-            out = sqlglot.transpile('SELECT agnes_hmac("email") AS "email" FROM "invoices"', read="duckdb", write=engine)
+            out = sqlglot.transpile(
+                'SELECT agnes_hmac("email") AS "email" FROM "invoices"', read="duckdb", write=engine
+            )
             assert "AGNES_HMAC" in out[0].upper()
 
     def test_md5_is_still_accepted_for_a_remote_table(self):

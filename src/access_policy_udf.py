@@ -56,7 +56,7 @@ import hashlib
 import hmac
 import logging
 import threading
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ POLICY_HMAC_FUNCTION = "agnes_hmac"
 POLICY_UDF_NAMES: frozenset[str] = frozenset({POLICY_HMAC_FUNCTION})
 
 _key_lock = threading.Lock()
-_cached_key: Optional[bytes] = None
+_cached_key: bytes | None = None
 
 
 def reset_key_cache() -> None:
@@ -110,7 +110,7 @@ def _instance_key() -> bytes:
         return _cached_key
 
 
-def _hmac_hex(value: Any) -> Optional[str]:
+def _hmac_hex(value: Any) -> str | None:
     """The UDF body: lowercase hex HMAC-SHA256 of ``value`` under the key.
 
     ``NULL`` in, ``NULL`` out -- a pseudonym must not invent a real-looking
@@ -190,7 +190,7 @@ def _is_registered(conn: Any) -> bool:
         return False
 
 
-def references_policy_udf(sql: str) -> Optional[str]:
+def references_policy_udf(sql: str) -> str | None:
     """The policy-only function ``sql`` calls, or ``None``.
 
     Name-based on the parsed tree -- the same shape (and the same reason) as
@@ -227,7 +227,7 @@ def references_policy_udf(sql: str) -> Optional[str]:
     return None
 
 
-def _text_scan(sql: str) -> Optional[str]:
+def _text_scan(sql: str) -> str | None:
     lowered = (sql or "").lower()
     for name in sorted(POLICY_UDF_NAMES):
         if name in lowered:
