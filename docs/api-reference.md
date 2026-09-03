@@ -776,6 +776,31 @@ fabricated one is dropped rather than corrected.
 - /api/admin/discover-tables
 - /api/admin/discover-and-register
 
+### `/api/admin/service-accounts` — Service accounts (issue #1534)
+
+Postgres-only (A3 ratchet — 501 on a DuckDB-backed instance). A service
+account is a `users` row flagged `kind='service'`: a headless identity with
+its own group grants and its own independently-revocable PATs, never an
+interactive session and never Admin-group-eligible.
+
+- `POST /api/admin/service-accounts` — create (`name`, `slug`); the row gets
+  a synthetic `<slug>@service.local` address.
+- `GET /api/admin/service-accounts` — list, with a per-account PAT summary
+  (count, `last_used_at`, soonest `expires_at`).
+- `POST /api/admin/service-accounts/{service_account_id}/tokens` — mint a
+  PAT FOR the account. Session-token-only (a PAT-authenticated admin gets
+  403), same boundary as `POST /auth/tokens`.
+- `PATCH /api/admin/service-accounts/{service_account_id}` — body
+  `{"active": bool}`; the same `users.active` flip
+  `POST /api/users/{user_id}/deactivate` uses (deactivating stops every PAT
+  the account holds; re-activation clears `deactivated_at`/`deactivated_by`).
+- Revoking one of its tokens reuses the existing
+  `DELETE /auth/admin/tokens/{token_id}` (admin-on-behalf already works
+  there — no new endpoint).
+
+See [`docs/RBAC.md`](RBAC.md#service-accounts) for the identity model and
+the three guards (no interactive session, no Admin group, PAT-only minting).
+
 ### `/api/admin/users` — User management
 
 - /api/admin/users/{user_id}/activity

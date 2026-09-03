@@ -90,13 +90,14 @@ def test_no_handler_dumps_the_raw_response_body(web_client, admin_cookie):
 
 
 def test_every_failure_path_routes_through_the_shared_helper(web_client, admin_cookie):
-    """Six call sites, one helper. Counting them is the point — the original
+    """Nine call sites, one helper. Counting them is the point — the original
     bug was that four siblings had been fixed and the fifth (create-user, the
     one users actually hit) had not. The sixth is the invite drawer's inline
-    *new group*; raise this number when a path is added, never delete the
-    assertion."""
+    *new group*; the seventh through ninth are the Service accounts section's
+    create/mint-token/deactivate-or-activate paths (issue #1534) — raise this
+    number when a path is added, never delete the assertion."""
     html = web_client.get("/admin/users", cookies=admin_cookie).text
-    assert html.count("await errorText(r)") == 6
+    assert html.count("await errorText(r)") == 9
 
 
 def test_modal_newline_preservation_is_opt_in(web_client):

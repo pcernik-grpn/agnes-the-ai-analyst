@@ -528,6 +528,44 @@
   <div class="pp-more__menu" id="pp-menu" role="menu" hidden></div>
 </div>
 
+{# ── Service accounts (issue #1534) ─────────────────────────────────────────
+   A headless identity is not a person — it has no invite flow, no password,
+   no group-membership drawer of its own (that stays Access's job, same as
+   every other group). This section is deliberately a second, smaller table
+   on the SAME page rather than a new nav entry: an admin managing accounts
+   is already looking at "who reaches what", and a service account answers
+   the same question with a token in place of a login. #}
+<div class="sa-page">
+  <div class="apg-sechead">
+    <span class="apg-sechead__count" id="sa-count" role="status" aria-live="polite">Service accounts</span>
+  </div>
+  <div class="fbar apg-bar" role="group" aria-label="Service accounts">
+    <p class="sub" style="margin:0; flex:1 1 auto;">Headless identities for CI/integrations — their own group grants, their own independently-revocable PATs. Never signs in, never joins Admin.</p>
+    {{ ds.button('+ New service account', variant='primary', id='sa-open-create-btn') }}
+  </div>
+  <div class="data-table-wrap">
+    <table class="data-table data-table--pinned-actions" id="sa-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Email</th>
+          <th>Tokens</th>
+          <th>Last used</th>
+          <th>Soonest expiry</th>
+          <th>Active</th>
+          <th><span class="pp-sr">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody id="sa-tbody"></tbody>
+    </table>
+    <div id="sa-loading" class="users-loading">Loading service accounts…</div>
+    <div id="sa-empty" class="users-empty" style="display:none;">
+      <div class="big">No service accounts yet</div>
+      <div>Click <strong>+ New service account</strong> to add the first one.</div>
+    </div>
+  </div>
+</div>
+
 {# ── Invite-person drawer ───────────────────────────────────────────────────
    Was a centred card that asked for an email and then told the reader to go
    and find the detail page to do the half of the job that matters: "New users
@@ -693,6 +731,51 @@
   </div>
 </div>
 
+<!-- Create service account modal -->
+<div class="modal-backdrop" id="sa-create-modal" role="dialog" aria-modal="true" aria-labelledby="sa-create-title">
+  <div class="modal-card">
+    <h3 id="sa-create-title">New service account</h3>
+    <p class="sub">A headless identity — grant it a group afterwards on <a href="/admin/access">Access</a>.</p>
+    <label for="sa-create-name">Name</label>
+    <input id="sa-create-name" type="text" autocomplete="off" placeholder="CI Bot">
+    <label for="sa-create-slug">Slug</label>
+    <input id="sa-create-slug" type="text" autocomplete="off" placeholder="ci-bot">
+    <p class="sub" id="sa-create-hint">Its address will be <code>&lt;slug&gt;@service.local</code>.</p>
+    <div class="ds-drawer__err" id="sa-create-err" hidden></div>
+    <div class="modal-actions">
+      {{ ds.button('Cancel', variant='secondary', attrs='data-close-modal="sa-create-modal"') }}
+      {{ ds.button('Create', variant='primary', id='sa-create-save') }}
+    </div>
+  </div>
+</div>
+
+<!-- Mint token modal (form, then the secret shown once) -->
+<div class="modal-backdrop" id="sa-token-modal" role="dialog" aria-modal="true" aria-labelledby="sa-token-title">
+  <div class="modal-card">
+    <h3 id="sa-token-title">Mint a token</h3>
+    <p class="sub" id="sa-token-target"></p>
+    <div id="sa-token-form">
+      <label for="sa-token-name">Token name</label>
+      <input id="sa-token-name" type="text" autocomplete="off" placeholder="ci">
+      <div class="ds-drawer__err" id="sa-token-err" hidden></div>
+      <div class="modal-actions">
+        {{ ds.button('Cancel', variant='secondary', attrs='data-close-modal="sa-token-modal"') }}
+        {{ ds.button('Mint token', variant='primary', id='sa-token-save') }}
+      </div>
+    </div>
+    <div id="sa-token-result" hidden>
+      <p class="sub">This secret is shown once — copy it now.</p>
+      <div class="token-reveal">
+        <code id="sa-token-text"></code>
+        <button class="copy-btn" id="sa-token-copy-btn">Copy</button>
+      </div>
+      <div class="modal-actions">
+        {{ ds.button('Done', variant='primary', attrs='data-close-modal="sa-token-modal"') }}
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
 <script>
@@ -707,9 +790,13 @@ const GOOGLE_GROUP_PREFIX = {{ config.AGNES_GOOGLE_GROUP_PREFIX | tojson }};
 const TOTAL_USERS = {{ total_users | tojson }};
 
 function esc(s) {
+  // Attribute-safe, not just text-safe: textContent→innerHTML encodes & < >
+  // but NOT quotes, and this page interpolates esc() inside double-quoted
+  // attributes (title="…", data-*="…"), where an unescaped " breaks out of
+  // the attribute and can plant an event handler.
   const d = document.createElement("div");
   d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
+  return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // Strip @domain, then the configured prefix (case-insensitive), then any
@@ -1533,6 +1620,154 @@ function showInviteLink(email, url, emailSent) {
 }
 
 loadUsers();
+
+// ── Service accounts (issue #1534) ──────────────────────────────────────
+const SA_API = "/api/admin/service-accounts";
+
+async function loadServiceAccounts() {
+  const loading = document.getElementById("sa-loading");
+  loading.style.display = "block";
+  try {
+    const r = await fetch(SA_API, { credentials: "include" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    renderServiceAccounts(await r.json());
+  } catch (e) {
+    loading.textContent = "Failed to load service accounts: " + e.message;
+    loading.style.display = "block";
+  }
+}
+
+function renderServiceAccounts(rows) {
+  const loading = document.getElementById("sa-loading");
+  const empty = document.getElementById("sa-empty");
+  const tbody = document.getElementById("sa-tbody");
+  loading.style.display = "none";
+  tbody.innerHTML = "";
+  document.getElementById("sa-count").textContent =
+    `${rows.length} service account${rows.length === 1 ? "" : "s"}`;
+  empty.style.display = rows.length ? "none" : "block";
+
+  for (const a of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(a.name || "")}</td>
+      <td>${esc(a.email)}</td>
+      <td>${a.token_count}</td>
+      <td class="date-cell" title="${esc(fmtDateFull(a.last_used_at))}">${a.last_used_at ? fmtDate(a.last_used_at) : "—"}</td>
+      <td class="date-cell" title="${esc(fmtDateFull(a.soonest_expiry))}">${a.soonest_expiry ? fmtDate(a.soonest_expiry) : "—"}</td>
+      <td>
+        <label class="toggle">
+          <input type="checkbox" ${a.active ? "checked" : ""} data-sa-toggle="${esc(a.id)}" data-sa-email="${esc(a.email)}">
+          <span class="toggle-slider"></span>
+        </label>
+      </td>
+      <td><button type="button" class="btn btn-secondary" data-sa-token="${esc(a.id)}" data-sa-name="${esc(a.name || a.email)}">Mint token</button></td>`;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll("[data-sa-toggle]").forEach(el =>
+    el.addEventListener("change", () => toggleServiceAccount(el.dataset.saToggle, el.dataset.saEmail, el.checked, el)));
+  tbody.querySelectorAll("[data-sa-token]").forEach(btn =>
+    btn.addEventListener("click", () => openMintToken(btn.dataset.saToken, btn.dataset.saName)));
+}
+
+async function toggleServiceAccount(id, email, active, checkbox) {
+  if (!active) {
+    const ok = await confirmModal(`Deactivate ${email}? Every token it holds stops authenticating immediately.`);
+    if (!ok) { checkbox.checked = true; return; }
+  }
+  const r = await fetch(`${SA_API}/${id}`, {
+    method: "PATCH",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active }),
+  });
+  if (!r.ok) {
+    toast("Failed: " + (await errorText(r)), "error");
+    loadServiceAccounts();
+    return;
+  }
+  toast(active ? "Service account activated" : "Service account deactivated", "success");
+  loadServiceAccounts();
+}
+
+// ── Create service account ──
+function saOpenCreate() {
+  document.getElementById("sa-create-name").value = "";
+  document.getElementById("sa-create-slug").value = "";
+  document.getElementById("sa-create-err").hidden = true;
+  openModal("sa-create-modal");
+}
+
+async function saCreateSave() {
+  const name = document.getElementById("sa-create-name").value.trim();
+  const slug = document.getElementById("sa-create-slug").value.trim();
+  const err = document.getElementById("sa-create-err");
+  err.hidden = true;
+  const r = await fetch(SA_API, {
+    method: "POST", credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, slug }),
+  });
+  if (!r.ok) {
+    err.textContent = await errorText(r);
+    err.hidden = false;
+    return;
+  }
+  closeModal("sa-create-modal");
+  toast("Service account created", "success");
+  loadServiceAccounts();
+}
+
+document.getElementById("sa-open-create-btn").addEventListener("click", saOpenCreate);
+document.getElementById("sa-create-save").addEventListener("click", saCreateSave);
+
+// ── Mint token (form, then the secret shown once) ──
+let saTokenTargetId = null;
+
+function openMintToken(id, label) {
+  saTokenTargetId = id;
+  document.getElementById("sa-token-target").textContent = `For ${label}`;
+  document.getElementById("sa-token-name").value = "";
+  document.getElementById("sa-token-err").hidden = true;
+  document.getElementById("sa-token-form").hidden = false;
+  document.getElementById("sa-token-result").hidden = true;
+  openModal("sa-token-modal");
+}
+
+async function saMintToken() {
+  const name = document.getElementById("sa-token-name").value.trim();
+  const err = document.getElementById("sa-token-err");
+  err.hidden = true;
+  if (!name) { err.textContent = "A token name is required."; err.hidden = false; return; }
+  const r = await fetch(`${SA_API}/${saTokenTargetId}/tokens`, {
+    method: "POST", credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok) {
+    err.textContent = await errorText(r);
+    err.hidden = false;
+    return;
+  }
+  const data = await r.json();
+  document.getElementById("sa-token-form").hidden = true;
+  document.getElementById("sa-token-result").hidden = false;
+  document.getElementById("sa-token-text").textContent = data.token;
+  const copyBtn = document.getElementById("sa-token-copy-btn");
+  copyBtn.textContent = "Copy"; copyBtn.classList.remove("copied");
+  copyBtn.onclick = async () => {
+    try {
+      await copyToClipboard(data.token);
+      copyBtn.textContent = "Copied!"; copyBtn.classList.add("copied");
+      setTimeout(() => { copyBtn.textContent = "Copy"; copyBtn.classList.remove("copied"); }, 1500);
+    } catch { toast("Copy failed — select the text manually", "error"); }
+  };
+  loadServiceAccounts();
+}
+
+document.getElementById("sa-token-save").addEventListener("click", saMintToken);
+
+loadServiceAccounts();
 </script>
 {% endblock %}
 
