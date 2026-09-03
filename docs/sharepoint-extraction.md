@@ -115,7 +115,8 @@ cheaply; `--timeout-s` overrides the budget for that one run).
 
 Running crawl + facts over more than one connection (several tenants, or
 several scopes split into separate connections) is one screen:
-`/admin/extraction` — one row per connection with its phase, files
+`/admin/extraction` (the **All connections** button in any SharePoint
+source card's Run row on `/admin/data-sources`) — one row per connection with its phase, files
 done/seen, a derived files/min, the facts pass's own done/pending counts,
 token spend and estimated cost, and how old its last checkpoint is (flagged
 once it passes 10 minutes on a run still marked running — "stuck?", not an
