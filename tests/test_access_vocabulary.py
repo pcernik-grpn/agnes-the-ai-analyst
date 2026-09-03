@@ -1153,3 +1153,14 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
 
     def test_the_toast_agrees(self):
         assert "No longer revealed to this group — nothing was hidden from anyone else" in self._source()
+
+    def test_the_person_tab_stays_one_line(self):
+        """A first pass stacked the tab's children in a column, which dropped
+        the count badge under the label and made this one tab three lines tall
+        beside two one-line siblings — the active underline no longer lined
+        up. Seen in the preview, not in a test. The kind is inline after the
+        count, behind a separator, and yields first on a narrow strip."""
+        src = self._source()
+        assert ".ax-by__tool { flex-direction: column" not in src
+        assert '.ax-by__kind::before { content: "·";' in src
+        assert ".ax-by__kind { display: none; }" in src   # inside the narrow-strip media query

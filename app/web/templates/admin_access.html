@@ -2305,10 +2305,21 @@
   /* The person tab's kind, said small under the label. Not a badge — a badge
      would make it read as a status — and not uppercase, so it does not fight
      the tab label for the eye. */
-  .ax-by__tool { flex-direction: column; align-items: flex-start; gap: 1px; }
+  /* Inline, not stacked. A first pass stacked the tab's children in a column,
+     which dropped the count badge under the label and made this one tab three
+     lines tall beside two one-line siblings — the strip's active underline no
+     longer lined up. One line keeps the strip's geometry exactly; the kind
+     follows the count after a separator, small and muted, so it reads as a
+     gloss on the tab rather than a second tab. */
   .ax-by__kind {
-    font-size: 10.5px; font-weight: 400; color: var(--ds-text-muted);
-    line-height: 1.2; letter-spacing: 0;
+    font-size: 11px; font-weight: 400; color: var(--ds-text-muted);
+    letter-spacing: 0; white-space: nowrap;
+  }
+  .ax-by__kind::before { content: "·"; margin: 0 6px 0 4px; color: var(--ds-border); }
+  @media (max-width: 720px) {
+    /* On a narrow strip the gloss is the first thing to go; the title
+       attribute still carries it. */
+    .ax-by__kind { display: none; }
   }
   /* The collapsed inherited rows. Muted and italic-free — a summary of rows,
      not a row — with the same faint fill the individual inherited rows had,
